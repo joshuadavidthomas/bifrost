@@ -1,9 +1,14 @@
+use crate::analyzer::clone_detection::{
+    CloneCandidateData, CloneCandidateProfile, compact_clone_excerpt,
+    detect_structural_clone_smells,
+};
 use crate::analyzer::{
     AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, Project,
     ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
     TreeSitterAnalyzer, TypeAliasProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
+use crate::{CloneSmell, CloneSmellWeights};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::mem::size_of;
@@ -11,8 +16,9 @@ use std::sync::{Arc, OnceLock};
 use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
 
 use super::javascript_analyzer::{
-    build_weighted_cache, detect_js_ts_test_assertion_smells, extract_js_ts_call_receiver,
-    imported_tokens, module_code_unit, node_text, parse_js_import_infos,
+    build_js_ts_clone_ast_signature, build_weighted_cache, detect_js_ts_test_assertion_smells,
+    extract_js_ts_call_receiver, imported_tokens, module_code_unit, node_text,
+    normalized_clone_tokens_js_ts, parse_js_import_infos, refine_js_ts_clone_similarity,
     resolve_js_ts_import_paths, trim_statement,
 };
 
@@ -517,6 +523,80 @@ impl IAnalyzer for TypescriptAnalyzer {
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             &weights,
         )
+    }
+
+    fn find_structural_clone_smells(
+        &self,
+        file: &ProjectFile,
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        self.find_structural_clone_smells_for_files(std::slice::from_ref(file), weights)
+    }
+
+    fn find_structural_clone_smells_for_files(
+        &self,
+        files: &[ProjectFile],
+        weights: CloneSmellWeights,
+    ) -> Vec<CloneSmell> {
+        let requested_files: Vec<ProjectFile> = files
+            .iter()
+            .filter(|file| file_language(file) == Language::TypeScript)
+            .cloned()
+            .collect();
+        if requested_files.is_empty() {
+            return Vec::new();
+        }
+
+        let all_candidates: Vec<CloneCandidateProfile> = self
+            .get_all_declarations()
+            .into_iter()
+            .filter(|code_unit| {
+                code_unit.is_function()
+                    && matches!(file_language(code_unit.source()), Language::TypeScript)
+            })
+            .filter_map(|code_unit| self.build_clone_candidate_data(&code_unit, weights))
+            .map(|candidate| CloneCandidateProfile::create(candidate, weights))
+            .collect();
+        if all_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        detect_structural_clone_smells(
+            &requested_files,
+            all_candidates,
+            weights,
+            refine_js_ts_clone_similarity,
+        )
+    }
+}
+
+impl TypescriptAnalyzer {
+    fn build_clone_candidate_data(
+        &self,
+        code_unit: &CodeUnit,
+        weights: CloneSmellWeights,
+    ) -> Option<CloneCandidateData> {
+        self.get_source(code_unit, false)
+            .map(|source| source.trim().to_string())
+            .filter(|source| !source.is_empty())
+            .and_then(|source| {
+                let normalized_tokens = normalized_clone_tokens_js_ts(
+                    &source,
+                    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                );
+                if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
+                    return None;
+                }
+                Some(CloneCandidateData {
+                    unit: code_unit.clone(),
+                    normalized_tokens,
+                    ast_signature: build_js_ts_clone_ast_signature(
+                        &source,
+                        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                    ),
+                    excerpt: compact_clone_excerpt(&source),
+                })
+            })
     }
 }
 
