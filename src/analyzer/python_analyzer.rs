@@ -7,6 +7,7 @@ use crate::analyzer::{
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::usages::{ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind};
 use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -273,6 +274,105 @@ impl PythonAnalyzer {
             .find(|code_unit| code_unit.is_module())
             .cloned()
             .or_else(|| self.module_code_units.get(module_fq).cloned())
+    }
+
+    pub fn export_index_of(&self, file: &ProjectFile) -> ExportIndex {
+        let mut index = ExportIndex::empty();
+
+        for code_unit in self.inner.get_top_level_declarations(file) {
+            let identifier = code_unit.identifier().trim();
+            if identifier.is_empty() || identifier.starts_with('_') {
+                continue;
+            }
+            index.exports_by_name.insert(
+                identifier.to_string(),
+                ExportEntry::Local {
+                    local_name: identifier.to_string(),
+                },
+            );
+        }
+
+        for import in self.inner.import_info_of(file) {
+            let Some(details) = parse_python_import_details(&import.raw_snippet) else {
+                continue;
+            };
+            match details {
+                PythonImportDetails::Import { .. } => {}
+                PythonImportDetails::FromImport {
+                    module,
+                    name,
+                    alias,
+                    wildcard,
+                } => {
+                    if wildcard {
+                        continue;
+                    }
+                    let exported_name = alias.unwrap_or(name.clone());
+                    if exported_name.starts_with('_') {
+                        continue;
+                    }
+                    index.exports_by_name.insert(
+                        exported_name,
+                        ExportEntry::ReexportedNamed {
+                            module_specifier: module,
+                            imported_name: name,
+                        },
+                    );
+                }
+            }
+        }
+
+        index
+    }
+
+    pub fn import_binder_of(&self, file: &ProjectFile) -> ImportBinder {
+        let mut binder = ImportBinder::empty();
+
+        for import in self.inner.import_info_of(file) {
+            let Some(details) = parse_python_import_details(&import.raw_snippet) else {
+                continue;
+            };
+            match details {
+                PythonImportDetails::Import { module, alias } => {
+                    let local_name = alias.unwrap_or_else(|| {
+                        module
+                            .split('.')
+                            .next_back()
+                            .unwrap_or(module.as_str())
+                            .to_string()
+                    });
+                    binder.bindings.insert(
+                        local_name,
+                        ImportBinding {
+                            module_specifier: module,
+                            kind: ImportKind::Namespace,
+                            imported_name: None,
+                        },
+                    );
+                }
+                PythonImportDetails::FromImport {
+                    module,
+                    name,
+                    alias,
+                    wildcard,
+                } => {
+                    if wildcard {
+                        continue;
+                    }
+                    let local_name = alias.unwrap_or_else(|| name.clone());
+                    binder.bindings.insert(
+                        local_name,
+                        ImportBinding {
+                            module_specifier: module,
+                            kind: ImportKind::Named,
+                            imported_name: Some(name),
+                        },
+                    );
+                }
+            }
+        }
+
+        binder
     }
 
     fn build_reverse_import_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {

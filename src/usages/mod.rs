@@ -16,8 +16,10 @@
 
 mod candidates;
 mod finder;
+mod graph_core;
 mod js_ts_graph;
 mod model;
+mod python_graph;
 mod regex_analyzer;
 mod traits;
 
@@ -32,6 +34,7 @@ pub use model::{
     ImportKind, ReceiverTargetRef, ReexportStar, ReferenceCandidate, ReferenceHit, ReferenceKind,
     ResolvedReceiverCandidate, UsageHit,
 };
+pub use python_graph::PythonExportUsageGraphStrategy;
 pub use regex_analyzer::RegexUsageAnalyzer;
 pub use traits::{CandidateFileProvider, UsageAnalyzer};
 
