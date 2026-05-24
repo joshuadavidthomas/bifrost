@@ -12,6 +12,7 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "search_file_contents",
     "list_files",
     "skim_files",
+    "most_relevant_files",
     "search_git_commit_messages",
     "get_git_log",
     "get_commit_diff",
@@ -165,6 +166,27 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     }
                 },
                 "required": ["file_paths"]
+            }),
+        ),
+        tool_descriptor(
+            "most_relevant_files",
+            "Given seed source files, rank related code by imports and git history; use after finding one relevant file to expand context.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "seed_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Project-relative seed files used to rank related files."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 20,
+                        "minimum": 0,
+                        "description": "Maximum number of related files to return."
+                    }
+                },
+                "required": ["seed_files"]
             }),
         ),
         tool_descriptor(

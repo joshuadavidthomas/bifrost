@@ -470,7 +470,11 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_summaries",
             "scan_usages",
         ],
-        &["get_file_contents", "report_secret_like_code"],
+        &[
+            "get_file_contents",
+            "most_relevant_files",
+            "report_secret_like_code",
+        ],
     );
     assert_server_tools(
         &fixture_root,
@@ -478,6 +482,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         &[
             "get_file_contents",
             "find_filenames",
+            "most_relevant_files",
             "compute_cyclomatic_complexity",
             "report_comment_density_for_files",
         ],
@@ -505,8 +510,8 @@ fn bifrost_split_servers_reject_tools_outside_their_registry() {
     assert_unknown_tool(
         &fixture_root,
         "core",
-        "get_file_contents",
-        json!({ "filenames": ["A.java"] }),
+        "most_relevant_files",
+        json!({ "seed_files": ["A.java"] }),
     );
     assert_unknown_tool(
         &fixture_root,

@@ -16,7 +16,6 @@ pub const CORE_TOOL_NAMES: &[&str] = &[
     "get_symbol_sources",
     "get_summaries",
     "list_symbols",
-    "most_relevant_files",
     "scan_usages",
 ];
 
@@ -159,27 +158,6 @@ pub(crate) fn core_tool_descriptors() -> Vec<Value> {
             "list_symbols",
             "Outline declarations recursively for source files; use to understand code structure without reading entire files.",
             file_patterns_schema(),
-        ),
-        tool_descriptor(
-            "most_relevant_files",
-            "Given seed source files, rank related code by imports and git history; use after finding one relevant file to expand context.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "seed_files": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Project-relative seed files used to rank related files."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 20,
-                        "minimum": 0,
-                        "description": "Maximum number of related files to return."
-                    }
-                },
-                "required": ["seed_files"]
-            }),
         ),
         tool_descriptor(
             "scan_usages",
