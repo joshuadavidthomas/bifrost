@@ -40,7 +40,8 @@ fn python_boundary_returns_canonical_rendered_text_payload() {
 
     assert_eq!(value["structured"]["sources"][0]["start_line"], 8);
     let rendered = value["rendered_text"].as_str().expect("rendered text");
-    assert!(rendered.contains("A.method2 (A.java:8..10)"), "{rendered}");
+    assert!(rendered.contains("## A.method2"), "{rendered}");
+    assert!(rendered.contains("- Location: A.java:8..10"), "{rendered}");
     assert!(
         rendered.contains("8: public String method2(String input)"),
         "{rendered}"
