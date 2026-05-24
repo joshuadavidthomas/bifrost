@@ -378,7 +378,7 @@ fn escape_markdown_inline_code(text: &str) -> String {
 }
 
 fn escape_markdown_heading(text: &str) -> String {
-    text.replace('\n', " ").replace('\r', " ")
+    text.replace(['\n', '\r'], " ")
 }
 
 fn escape_markdown_table_cell(text: &str) -> String {

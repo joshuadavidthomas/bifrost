@@ -70,7 +70,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
                     "file_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Project-relative paths of files to analyze."
+                        "description": "Project-relative paths of files to analyze, or absolute paths inside the active workspace."
                     },
                     "min_score": {
                         "type": "integer",
@@ -143,7 +143,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
                     "file_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Project-relative paths of files to analyze."
+                        "description": "Project-relative paths of files to analyze, or absolute paths inside the active workspace."
                     },
                     "min_score": {
                         "type": "integer",
@@ -184,7 +184,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
                     "file_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Project-relative paths of files to analyze."
+                        "description": "Project-relative paths of files to analyze, or absolute paths inside the active workspace."
                     },
                     "max_findings": {
                         "type": "integer",
@@ -223,7 +223,7 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
                     "file_paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Project-relative paths of files to analyze."
+                        "description": "Project-relative paths of files to analyze, or absolute paths inside the active workspace."
                     },
                     "fq_names": {
                         "type": "array",

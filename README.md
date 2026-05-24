@@ -109,6 +109,8 @@ The subset servers publish:
 
 `activate_workspace` lets a host swap the analyzer's root mid-session without respawning the subprocess. The path must be absolute and is normalized to the nearest enclosing git root when one exists.
 
+For MCP tool arguments that name files, directories, or file globs, callers may pass project-relative paths or absolute paths inside the active workspace. Absolute paths outside the active workspace are rejected with an explicit tool error.
+
 The intended external manual client is the official MCP Inspector.
 
 ## CLI

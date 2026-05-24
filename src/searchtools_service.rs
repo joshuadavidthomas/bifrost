@@ -317,6 +317,10 @@ impl SearchToolsService {
         }
     }
 
+    pub fn active_workspace_root(&self) -> &Path {
+        self.workspace.analyzer().project().root()
+    }
+
     // Note: `--root` and `new_for_python` take the path as-given (canonicalized
     // by `FilesystemProject::new`) without git-root normalization, while
     // `activate_workspace` normalizes to the nearest enclosing git root. As a

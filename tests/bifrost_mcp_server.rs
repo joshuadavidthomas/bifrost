@@ -766,6 +766,208 @@ fn bifrost_core_server_can_hide_line_numbers_in_text_preview() {
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
 }
 
+#[test]
+fn bifrost_mcp_normalizes_absolute_paths_inside_workspace() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::create_dir(fixture_root.path().join("src")).expect("src dir");
+    let java_path = fixture_root.path().join("src").join("A.java");
+    fs::write(
+        &java_path,
+        r#"
+        public class A {
+            void marker() {
+                String value = "NEEDLE";
+            }
+        }
+        "#,
+    )
+    .expect("write java fixture");
+
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let contents = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_file_contents",
+                "arguments": { "filenames": [java_path.display().to_string()] }
+            }
+        }),
+    );
+    assert_eq!(contents["result"]["isError"], false, "{contents}");
+    assert_eq!(
+        contents["result"]["structuredContent"]["files"][0]["path"],
+        "src/A.java"
+    );
+
+    let summaries = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "get_summaries",
+                "arguments": { "targets": [java_path.display().to_string()] }
+            }
+        }),
+    );
+    assert_eq!(summaries["result"]["isError"], false, "{summaries}");
+    assert_eq!(
+        summaries["result"]["structuredContent"]["summaries"][0]["path"],
+        "src/A.java"
+    );
+
+    let absolute_glob = format!("{}/src/**/*.java", fixture_root.path().display());
+    let search = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "search_file_contents",
+                "arguments": {
+                    "patterns": ["NEEDLE"],
+                    "filepath": absolute_glob,
+                    "context_lines": 0
+                }
+            }
+        }),
+    );
+    assert_eq!(search["result"]["isError"], false, "{search}");
+    assert_eq!(
+        search["result"]["structuredContent"]["matches"][0]["path"],
+        "src/A.java"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_mcp_reports_absolute_paths_outside_workspace_as_tool_errors() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::write(fixture_root.path().join("A.java"), "public class A {}\n")
+        .expect("write java fixture");
+    let outside = TempDir::new().expect("outside dir");
+    let outside_file = outside.path().join("outside.txt");
+    fs::write(&outside_file, "outside").expect("write outside fixture");
+
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_file_contents",
+                "arguments": { "filenames": [outside_file.display().to_string()] }
+            }
+        }),
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert_eq!(response["result"]["isError"], true, "{response}");
+    let message = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool error text");
+    assert!(message.contains("outside active workspace"), "{message}");
+    assert!(!message.contains("not found"), "{message}");
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_mcp_absolute_paths_follow_activated_workspace() {
+    let initial_root = TempDir::new().expect("initial temp dir");
+    fs::write(
+        initial_root.path().join("Initial.java"),
+        "public class Initial {}\n",
+    )
+    .expect("write initial fixture");
+
+    let switched = TempDir::new().expect("switched temp dir");
+    let switched_file = switched.path().join("Switched.java");
+    fs::write(&switched_file, "public class Switched {}\n").expect("write switched fixture");
+    let switched_root = switched.path().canonicalize().expect("canonicalize");
+
+    let mut child = spawn_server(initial_root.path(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let activate = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "activate_workspace",
+                "arguments": { "workspace_path": switched_root.display().to_string() }
+            }
+        }),
+    );
+    assert_eq!(activate["result"]["isError"], false, "{activate}");
+
+    let contents = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "get_file_contents",
+                "arguments": { "filenames": [switched_file.display().to_string()] }
+            }
+        }),
+    );
+    assert_eq!(contents["result"]["isError"], false, "{contents}");
+    assert_eq!(
+        contents["result"]["structuredContent"]["files"][0]["path"],
+        "Switched.java"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
 fn assert_server_tools(root: &std::path::Path, mode: &str, expected: &[&str], unexpected: &[&str]) {
     let mut child = spawn_server(root, mode, &[]);
     let mut stdin = child.stdin.take().expect("stdin");
