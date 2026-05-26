@@ -1,3 +1,5 @@
+use crate::analyzer::common::language_for_target;
+use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, usage_hit};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::traits::UsageAnalyzer;
@@ -6,12 +8,9 @@ use crate::analyzer::{
     Range,
 };
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use crate::text_utils::{compute_line_starts, find_line_index_for_offset, snippet_around_line};
 use std::collections::BTreeSet;
 use tree_sitter::{Node, Parser};
-
-const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
-const SNIPPET_CONTEXT_LINES: usize = 3;
 
 #[derive(Default)]
 pub struct JavaUsageGraphStrategy {
@@ -24,7 +23,7 @@ impl JavaUsageGraphStrategy {
     }
 
     pub fn can_handle(target: &CodeUnit) -> bool {
-        target_language(target) == Language::Java
+        language_for_target(target) == Language::Java
     }
 }
 
@@ -41,7 +40,7 @@ impl UsageAnalyzer for JavaUsageGraphStrategy {
         }
 
         let target = &overloads[0];
-        if target_language(target) != Language::Java {
+        if language_for_target(target) != Language::Java {
             return FuzzyResult::Failure {
                 fq_name: target.fq_name(),
                 reason: "JavaUsageGraphStrategy: target is not Java".to_string(),
@@ -191,16 +190,6 @@ fn resolve_java_analyzer(analyzer: &dyn IAnalyzer) -> Option<&JavaAnalyzer> {
         Some(AnalyzerDelegate::Java(java)) => Some(java),
         _ => None,
     }
-}
-
-fn target_language(target: &CodeUnit) -> Language {
-    target
-        .source()
-        .rel_path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(Language::from_extension)
-        .unwrap_or(Language::None)
 }
 
 fn scan_file(
@@ -711,14 +700,13 @@ fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     let end = node.end_byte();
-    ctx.hits.insert(UsageHit::new(
-        ctx.file.clone(),
-        line_idx + 1,
+    ctx.hits.insert(usage_hit(
+        ctx.file,
+        line_idx,
         start,
         end,
         enclosing,
-        GRAPH_HIT_CONFIDENCE,
-        build_snippet(ctx.source, ctx.line_starts, line_idx),
+        snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
     ));
     if ctx.hits.len() > ctx.max_usages {
         *ctx.limit_exceeded = true;
@@ -744,24 +732,6 @@ fn enclosing_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> EnclosingContext 
     let resolved = EnclosingContext { enclosing, owner };
     ctx.enclosing_cache.insert(key, resolved.clone());
     resolved
-}
-
-fn build_snippet(source: &str, line_starts: &[usize], line_idx: usize) -> String {
-    if line_starts.is_empty() {
-        return String::new();
-    }
-    let snippet_start = line_idx.saturating_sub(SNIPPET_CONTEXT_LINES);
-    let snippet_end = line_idx
-        .saturating_add(SNIPPET_CONTEXT_LINES)
-        .min(line_starts.len().saturating_sub(1));
-
-    let mut snippet = String::new();
-    for idx in snippet_start..=snippet_end {
-        let start = line_starts[idx];
-        let end = line_starts.get(idx + 1).copied().unwrap_or(source.len());
-        snippet.push_str(source.get(start..end).unwrap_or_default());
-    }
-    snippet
 }
 
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
