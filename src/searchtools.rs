@@ -645,7 +645,9 @@ fn summarize_files(
         .filter_map(|file| {
             let mut elements = Vec::new();
             for code_unit in analyzer.top_level_declarations(&file) {
-                elements.extend(summary_elements_for_code_unit(analyzer, code_unit));
+                elements.extend(summary_elements_for_code_unit_in_file(
+                    analyzer, code_unit, &file,
+                ));
             }
 
             if elements.is_empty() {
@@ -1015,6 +1017,25 @@ fn summary_elements_for_code_unit(
                 continue;
             }
             elements.extend(summary_elements_for_code_unit(analyzer, child));
+        }
+    }
+    elements
+}
+
+fn summary_elements_for_code_unit_in_file(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    file: &ProjectFile,
+) -> Vec<SummaryElement> {
+    let mut elements = signature_elements(analyzer, code_unit);
+    if code_unit.is_class() || code_unit.is_module() {
+        for child in analyzer.direct_children(code_unit) {
+            if child.is_anonymous() || child.source() != file {
+                continue;
+            }
+            elements.extend(summary_elements_for_code_unit_in_file(
+                analyzer, child, file,
+            ));
         }
     }
     elements

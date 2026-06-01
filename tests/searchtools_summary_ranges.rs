@@ -135,6 +135,40 @@ fn get_summaries_accepts_mixed_file_and_class_targets() {
 }
 
 #[test]
+fn file_summaries_do_not_include_same_package_sibling_elements() {
+    let analyzer = java_fixture_analyzer();
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["Packaged.java".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{:?}", result.not_found);
+    assert_eq!(1, result.summaries.len());
+    let summary = &result.summaries[0];
+    assert_eq!("Packaged.java", summary.path);
+    assert!(
+        summary
+            .elements
+            .iter()
+            .all(|element| element.path == "Packaged.java")
+    );
+    assert!(
+        summary
+            .elements
+            .iter()
+            .any(|element| element.symbol == "io.github.jbellis.brokk.Foo")
+    );
+    assert!(
+        summary
+            .elements
+            .iter()
+            .all(|element| element.symbol != "io.github.jbellis.brokk.PackagedSibling")
+    );
+}
+
+#[test]
 fn get_summaries_reports_unmatched_file_like_targets() {
     let analyzer = java_fixture_analyzer();
     let result = get_summaries(
