@@ -63,9 +63,10 @@ class SearchToolsClient:
             Path(library_path).expanduser().resolve() if library_path is not None else None
         )
         self._render_line_numbers = render_line_numbers
-        self._lock = threading.Lock()
+        self._runtime_lock = threading.Lock()
         self._native = _load_native_module(self._library_path)
         self._runtime: _RuntimeState | None = None
+        self._closed = False
 
     def __enter__(self) -> SearchToolsClient:
         self._ensure_started()
@@ -75,9 +76,10 @@ class SearchToolsClient:
         self.close()
 
     def close(self) -> None:
-        with self._lock:
+        with self._runtime_lock:
             runtime = self._runtime
             self._runtime = None
+            self._closed = True
 
         if runtime is None:
             return
@@ -178,12 +180,11 @@ class SearchToolsClient:
         )
 
     def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            runtime = self._ensure_started()
-            try:
-                payload = runtime.native.call_tool_json(name, json.dumps(arguments))
-            except Exception as exc:
-                raise SearchToolsError(str(exc)) from exc
+        runtime = self._ensure_started()
+        try:
+            payload = runtime.native.call_tool_json(name, json.dumps(arguments))
+        except Exception as exc:
+            raise SearchToolsError(str(exc)) from exc
 
         try:
             structured = json.loads(payload)
@@ -196,16 +197,15 @@ class SearchToolsClient:
         return structured
 
     def _call_tool_payload(self, name: str, arguments: dict[str, Any]) -> _ToolPayload:
-        with self._lock:
-            runtime = self._ensure_started()
-            try:
-                payload = runtime.native.call_tool_payload_json(
-                    name,
-                    json.dumps(arguments),
-                    self._render_line_numbers,
-                )
-            except Exception as exc:
-                raise SearchToolsError(str(exc)) from exc
+        runtime = self._ensure_started()
+        try:
+            payload = runtime.native.call_tool_payload_json(
+                name,
+                json.dumps(arguments),
+                self._render_line_numbers,
+            )
+        except Exception as exc:
+            raise SearchToolsError(str(exc)) from exc
 
         try:
             decoded = json.loads(payload)
@@ -230,17 +230,20 @@ class SearchToolsClient:
         return _ToolPayload(structured=structured, rendered_text=rendered_text)
 
     def _ensure_started(self) -> _RuntimeState:
-        if self._runtime is not None:
-            return self._runtime
+        with self._runtime_lock:
+            if self._closed:
+                raise SearchToolsError("SearchToolsClient is closed")
+            if self._runtime is not None:
+                return self._runtime
 
-        try:
-            native = self._native.SearchToolsNativeSession(str(self.root))
-        except Exception as exc:
-            raise SearchToolsError(
-                f"Failed to start the bifrost native session: {exc}"
-            ) from exc
-        self._runtime = _RuntimeState(native=native)
-        return self._runtime
+            try:
+                native = self._native.SearchToolsNativeSession(str(self.root))
+            except Exception as exc:
+                raise SearchToolsError(
+                    f"Failed to start the bifrost native session: {exc}"
+                ) from exc
+            self._runtime = _RuntimeState(native=native)
+            return self._runtime
 
 
 def _load_native_module(library_path: Path | None) -> ModuleType:

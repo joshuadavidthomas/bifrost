@@ -61,7 +61,7 @@ pub fn run_stdio_server(
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
 ) -> Result<(), String> {
-    let mut service = SearchToolsService::new(root)?;
+    let service = SearchToolsService::new(root)?;
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -76,7 +76,7 @@ pub fn run_stdio_server(
         }
 
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(message) => dispatch_message(&mut service, message, render_options, spec),
+            Ok(message) => dispatch_message(&service, message, render_options, spec),
             Err(err) => Some(error_response(
                 Value::Null,
                 PARSE_ERROR,
@@ -97,7 +97,7 @@ pub fn run_stdio_server(
 }
 
 fn dispatch_message(
-    service: &mut SearchToolsService,
+    service: &SearchToolsService,
     message: Value,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
@@ -152,7 +152,7 @@ fn dispatch_message(
 }
 
 fn dispatch_request(
-    service: &mut SearchToolsService,
+    service: &SearchToolsService,
     id: Value,
     method: &str,
     params: Value,
@@ -198,7 +198,7 @@ fn list_tools_result(spec: &McpServerSpec) -> Value {
 }
 
 fn handle_tool_call(
-    service: &mut SearchToolsService,
+    service: &SearchToolsService,
     params: Value,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
@@ -222,8 +222,8 @@ fn handle_tool_call(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let arguments = match normalize_tool_arguments(name, arguments, service.active_workspace_root())
-    {
+    let workspace_root = service.active_workspace_root();
+    let arguments = match normalize_tool_arguments(name, arguments, &workspace_root) {
         Ok(arguments) => arguments,
         Err(message) => return Ok(tool_error_result(message)),
     };

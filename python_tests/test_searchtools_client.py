@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import shutil
 import subprocess
 import sys
@@ -96,6 +97,33 @@ class SearchToolsClientTest(unittest.TestCase):
         with SearchToolsClient(root=self.fixture_root) as client:
             with self.assertRaisesRegex(SearchToolsError, "Unknown tool: nope"):
                 client._call_tool("nope", {})
+
+    def test_client_supports_concurrent_requests_from_threads(self) -> None:
+        def call_tool(index: int) -> str:
+            if index % 4 == 0:
+                return client.search_symbols(["A"], include_tests=True, limit=5).render_text()
+            if index % 4 == 1:
+                return client.get_symbol_sources(
+                    ["A.method2"], kind_filter=SymbolKindFilter.FUNCTION
+                ).render_text()
+            if index % 4 == 2:
+                return client.get_summaries(["A.java"]).render_text()
+            return client.most_relevant_files(["A.java"], limit=5).render_text()
+
+        with SearchToolsClient(root=self.fixture_root) as client:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = list(executor.map(call_tool, range(16)))
+
+        self.assertEqual(16, len(results))
+        self.assertTrue(all(result for result in results))
+        self.assertTrue(any("A.method2" in result for result in results))
+
+    def test_client_rejects_calls_after_close(self) -> None:
+        client = SearchToolsClient(root=self.fixture_root)
+        client.close()
+
+        with self.assertRaisesRegex(SearchToolsError, "SearchToolsClient is closed"):
+            client.search_symbols(["A"])
 
     def test_most_relevant_files_returns_ranked_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

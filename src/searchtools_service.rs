@@ -26,7 +26,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchToolsServiceErrorCode {
@@ -117,9 +117,13 @@ enum UpdateStrategy {
 }
 
 pub struct SearchToolsService {
-    workspace: WorkspaceAnalyzer,
-    watcher: Option<ProjectChangeWatcher>,
+    session: RwLock<Option<WorkspaceSession>>,
     update_strategy: UpdateStrategy,
+}
+
+struct WorkspaceSession {
+    snapshot: Arc<WorkspaceAnalyzer>,
+    watcher: Option<ProjectChangeWatcher>,
 }
 
 impl SearchToolsService {
@@ -132,7 +136,7 @@ impl SearchToolsService {
     }
 
     pub fn call_tool_json(
-        &mut self,
+        &self,
         name: &str,
         arguments_json: &str,
     ) -> Result<String, SearchToolsServiceError> {
@@ -148,7 +152,7 @@ impl SearchToolsService {
     }
 
     pub fn call_tool_payload_json(
-        &mut self,
+        &self,
         name: &str,
         arguments_json: &str,
         render_options: RenderOptions,
@@ -163,7 +167,7 @@ impl SearchToolsService {
     }
 
     pub fn call_tool_value(
-        &mut self,
+        &self,
         name: &str,
         arguments: Value,
     ) -> Result<Value, SearchToolsServiceError> {
@@ -173,7 +177,7 @@ impl SearchToolsService {
     }
 
     pub fn call_tool_output(
-        &mut self,
+        &self,
         name: &str,
         arguments: Value,
         render_options: RenderOptions,
@@ -187,129 +191,161 @@ impl SearchToolsService {
             _ => {}
         }
 
-        self.prepare_for_call();
+        let snapshot = self.snapshot_for_query()?;
         match name {
-            "search_symbols" => {
-                self.decode_render_and_run(arguments, render_options, |workspace, params| {
-                    search_symbols(workspace.analyzer(), params)
-                })
-            }
-            "get_symbol_locations" => {
-                self.decode_render_and_run(arguments, render_options, |workspace, params| {
-                    get_symbol_locations(workspace.analyzer(), params)
-                })
-            }
-            "get_symbol_sources" => {
-                self.decode_render_and_run(arguments, render_options, |workspace, params| {
-                    get_symbol_sources(workspace.analyzer(), params)
-                })
-            }
-            "get_summaries" => {
-                self.decode_render_and_run(arguments, render_options, |workspace, params| {
-                    get_summaries(workspace.analyzer(), params)
-                })
-            }
-            "list_symbols" => {
-                self.decode_render_and_run(arguments, render_options, |workspace, params| {
-                    list_symbols(workspace.analyzer(), params)
-                })
-            }
-            "most_relevant_files" => self.decode_render_and_run(
+            "search_symbols" => Self::decode_render_and_run(
+                &snapshot,
+                arguments,
+                render_options,
+                |workspace, params| search_symbols(workspace.analyzer(), params),
+            ),
+            "get_symbol_locations" => Self::decode_render_and_run(
+                &snapshot,
+                arguments,
+                render_options,
+                |workspace, params| get_symbol_locations(workspace.analyzer(), params),
+            ),
+            "get_symbol_sources" => Self::decode_render_and_run(
+                &snapshot,
+                arguments,
+                render_options,
+                |workspace, params| get_symbol_sources(workspace.analyzer(), params),
+            ),
+            "get_summaries" => Self::decode_render_and_run(
+                &snapshot,
+                arguments,
+                render_options,
+                |workspace, params| get_summaries(workspace.analyzer(), params),
+            ),
+            "list_symbols" => Self::decode_render_and_run(
+                &snapshot,
+                arguments,
+                render_options,
+                |workspace, params| list_symbols(workspace.analyzer(), params),
+            ),
+            "most_relevant_files" => Self::decode_render_and_run(
+                &snapshot,
                 arguments,
                 render_options,
                 |workspace, params: MostRelevantFilesParams| {
                     most_relevant_files(workspace.analyzer(), params)
                 },
             ),
-            "scan_usages" => self.decode_and_run(arguments, |workspace, params| {
+            "scan_usages" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 scan_usages(workspace.analyzer(), params)
             }),
-            "get_file_contents" => self.decode_and_run(arguments, |workspace, params| {
-                get_file_contents(workspace.analyzer(), params)
-            }),
-            "find_filenames" => self.decode_and_run(arguments, |workspace, params| {
+            "get_file_contents" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
+                    get_file_contents(workspace.analyzer(), params)
+                })
+            }
+            "find_filenames" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 find_filenames(workspace.analyzer(), params)
             }),
-            "find_files_containing" => self.decode_and_run(arguments, |workspace, params| {
-                find_files_containing(workspace.analyzer(), params)
-            }),
-            "search_file_contents" => self.decode_and_run(arguments, |workspace, params| {
-                search_file_contents(workspace.analyzer(), params)
-            }),
-            "list_files" => self.decode_and_run(arguments, |workspace, params| {
+            "find_files_containing" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
+                    find_files_containing(workspace.analyzer(), params)
+                })
+            }
+            "search_file_contents" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
+                    search_file_contents(workspace.analyzer(), params)
+                })
+            }
+            "list_files" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 list_files(workspace.analyzer(), params)
             }),
-            "search_git_commit_messages" => self.decode_and_run(arguments, |workspace, params| {
-                search_git_commit_messages(workspace.analyzer(), params)
-            }),
-            "get_git_log" => self.decode_and_run(arguments, |workspace, params| {
+            "search_git_commit_messages" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
+                    search_git_commit_messages(workspace.analyzer(), params)
+                })
+            }
+            "get_git_log" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 get_git_log(workspace.analyzer(), params)
             }),
-            "get_commit_diff" => self.decode_and_run(arguments, |workspace, params| {
+            "get_commit_diff" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 get_commit_diff(workspace.analyzer(), params)
             }),
-            "jq" => self.decode_and_run(arguments, |workspace, params| {
+            "jq" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 jq(workspace.analyzer(), params)
             }),
-            "xml_skim" => self.decode_and_run(arguments, |workspace, params| {
+            "xml_skim" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 xml_skim(workspace.analyzer(), params)
             }),
-            "xml_select" => self.decode_and_run(arguments, |workspace, params| {
+            "xml_select" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 xml_select(workspace.analyzer(), params)
             }),
-            "compute_cyclomatic_complexity" => self
-                .decode_and_run(arguments, |workspace, params| {
+            "compute_cyclomatic_complexity" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     compute_cyclomatic_complexity(workspace.analyzer(), params)
-                }),
-            "compute_cognitive_complexity" => self
-                .decode_and_run(arguments, |workspace, params| {
+                })
+            }
+            "compute_cognitive_complexity" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     compute_cognitive_complexity(workspace.analyzer(), params)
-                }),
+                })
+            }
             "report_comment_density_for_code_unit" => {
-                self.decode_and_run(arguments, |workspace, params| {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     report_comment_density_for_code_unit(workspace.analyzer(), params)
                 })
             }
-            "report_comment_density_for_files" => self
-                .decode_and_run(arguments, |workspace, params| {
+            "report_comment_density_for_files" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     report_comment_density_for_files(workspace.analyzer(), params)
-                }),
-            "report_exception_handling_smells" => self
-                .decode_and_run(arguments, |workspace, params| {
+                })
+            }
+            "report_exception_handling_smells" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     report_exception_handling_smells(workspace.analyzer(), params)
-                }),
-            "report_test_assertion_smells" => self
-                .decode_and_run(arguments, |workspace, params| {
+                })
+            }
+            "report_test_assertion_smells" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     report_test_assertion_smells(workspace.analyzer(), params)
-                }),
-            "report_structural_clone_smells" => self
-                .decode_and_run(arguments, |workspace, params| {
+                })
+            }
+            "report_structural_clone_smells" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     report_structural_clone_smells(workspace.analyzer(), params)
-                }),
+                })
+            }
             "report_long_method_and_god_object_smells" => {
-                self.decode_and_run(arguments, |workspace, params| {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     report_long_method_and_god_object_smells(workspace.analyzer(), params)
                 })
             }
             "report_dead_code_and_unused_abstraction_smells" => {
-                self.decode_and_run(arguments, |workspace, params| {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     report_dead_code_and_unused_abstraction_smells(workspace.analyzer(), params)
                 })
             }
-            "report_secret_like_code" => self.decode_and_run(arguments, |workspace, params| {
-                report_secret_like_code(workspace.analyzer(), params)
-            }),
-            "analyze_git_hotspots" => self.decode_and_run(arguments, |workspace, params| {
-                analyze_git_hotspots(workspace.analyzer(), params)
-            }),
+            "report_secret_like_code" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
+                    report_secret_like_code(workspace.analyzer(), params)
+                })
+            }
+            "analyze_git_hotspots" => {
+                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
+                    analyze_git_hotspots(workspace.analyzer(), params)
+                })
+            }
             _ => Err(SearchToolsServiceError::unknown_tool(format!(
                 "Unknown tool: {name}"
             ))),
         }
     }
 
-    pub fn active_workspace_root(&self) -> &Path {
-        self.workspace.analyzer().project().root()
+    pub fn active_workspace_root(&self) -> PathBuf {
+        self.session
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|session| session.snapshot.analyzer().project().root().to_path_buf())
+            })
+            .unwrap_or_default()
     }
 
     // Note: `--root` and `new_for_python` take the path as-given (canonicalized
@@ -324,22 +360,33 @@ impl SearchToolsService {
         let (project, workspace) = build_workspace(root)?;
         let watcher = maybe_start_watcher(project, update_strategy);
         Ok(Self {
-            workspace,
-            watcher,
+            session: RwLock::new(Some(WorkspaceSession {
+                snapshot: Arc::new(workspace),
+                watcher,
+            })),
             update_strategy,
         })
     }
 
-    fn handle_refresh(&mut self, arguments: Value) -> Result<ToolOutput, SearchToolsServiceError> {
+    pub fn close(&self) -> Result<(), SearchToolsServiceError> {
+        let mut guard = self.write_session()?;
+        *guard = None;
+        Ok(())
+    }
+
+    fn handle_refresh(&self, arguments: Value) -> Result<ToolOutput, SearchToolsServiceError> {
         let _params = serde_json::from_value::<RefreshParams>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
-        self.workspace = self.workspace.update_all();
-        self.structured_only(refresh_result(self.workspace.analyzer()))
+        let mut guard = self.write_session()?;
+        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+        let next = session.snapshot.update_all();
+        session.snapshot = Arc::new(next);
+        Self::structured_only(refresh_result(session.snapshot.analyzer()))
     }
 
     fn handle_activate_workspace(
-        &mut self,
+        &self,
         arguments: Value,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
         let params =
@@ -362,7 +409,10 @@ impl SearchToolsService {
             ))
         })?;
 
-        if resolved == self.workspace.analyzer().project().root() {
+        let mut guard = self.write_session()?;
+        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+
+        if resolved == session.snapshot.analyzer().project().root() {
             return active_workspace_result(&resolved);
         }
 
@@ -377,38 +427,44 @@ impl SearchToolsService {
 
         // Drop the old watcher first so its inotify/kqueue handle is released
         // before we start watching the same tree from the new root.
-        self.watcher = None;
-        self.workspace = new_workspace;
-        self.watcher = maybe_start_watcher(new_project, self.update_strategy);
+        *session = WorkspaceSession {
+            snapshot: Arc::new(new_workspace),
+            watcher: maybe_start_watcher(new_project, self.update_strategy),
+        };
 
         active_workspace_result(&resolved)
     }
 
     fn handle_get_active_workspace(
-        &mut self,
+        &self,
         arguments: Value,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
         let _params =
             serde_json::from_value::<GetActiveWorkspaceParams>(arguments).map_err(|err| {
                 SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
             })?;
-        active_workspace_result(self.workspace.analyzer().project().root())
+        let guard = self.read_session()?;
+        let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+        active_workspace_result(session.snapshot.analyzer().project().root())
     }
 
-    fn prepare_for_call(&mut self) {
+    fn snapshot_for_query(&self) -> Result<Arc<WorkspaceAnalyzer>, SearchToolsServiceError> {
+        let mut guard = self.write_session()?;
+        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
         match self.update_strategy {
-            UpdateStrategy::WatchFiles => self.apply_watcher_delta(),
+            UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
         }
+        Ok(Arc::clone(&session.snapshot))
     }
 
-    fn apply_watcher_delta(&mut self) {
-        let Some(watcher) = self.watcher.as_ref() else {
+    fn apply_watcher_delta(session: &mut WorkspaceSession) {
+        let Some(watcher) = session.watcher.as_ref() else {
             return;
         };
 
         let delta = watcher.take_changed_files();
         if delta.requires_full_refresh {
-            self.workspace = self.workspace.update_all();
+            session.snapshot = Arc::new(session.snapshot.update_all());
             return;
         }
 
@@ -417,11 +473,11 @@ impl SearchToolsService {
         }
 
         let changed_files: BTreeSet<ProjectFile> = delta.files.into_iter().collect();
-        self.workspace = self.workspace.update(&changed_files);
+        session.snapshot = Arc::new(session.snapshot.update(&changed_files));
     }
 
     fn decode_and_run<P, R>(
-        &mut self,
+        workspace: &WorkspaceAnalyzer,
         arguments: Value,
         handler: impl FnOnce(&WorkspaceAnalyzer, P) -> R,
     ) -> Result<ToolOutput, SearchToolsServiceError>
@@ -432,7 +488,7 @@ impl SearchToolsService {
         let params = serde_json::from_value::<P>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
-        let result = handler(&self.workspace, params);
+        let result = handler(workspace, params);
         match serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
         })? {
@@ -445,7 +501,7 @@ impl SearchToolsService {
     }
 
     fn decode_render_and_run<P, R>(
-        &mut self,
+        workspace: &WorkspaceAnalyzer,
         arguments: Value,
         render_options: RenderOptions,
         handler: impl FnOnce(&WorkspaceAnalyzer, P) -> R,
@@ -457,7 +513,7 @@ impl SearchToolsService {
         let params = serde_json::from_value::<P>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
         })?;
-        let result = handler(&self.workspace, params);
+        let result = handler(workspace, params);
         let rendered_text = result.render_text(render_options);
         let structured = serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
@@ -468,10 +524,7 @@ impl SearchToolsService {
         })
     }
 
-    fn structured_only<R: Serialize>(
-        &self,
-        result: R,
-    ) -> Result<ToolOutput, SearchToolsServiceError> {
+    fn structured_only<R: Serialize>(result: R) -> Result<ToolOutput, SearchToolsServiceError> {
         let structured = serde_json::to_value(result).map_err(|err| {
             SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
         })?;
@@ -479,6 +532,28 @@ impl SearchToolsService {
             structured,
             rendered_text: None,
         })
+    }
+
+    fn read_session(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, Option<WorkspaceSession>>, SearchToolsServiceError>
+    {
+        self.session
+            .read()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+    }
+
+    fn write_session(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, Option<WorkspaceSession>>, SearchToolsServiceError>
+    {
+        self.session
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+    }
+
+    fn closed_error() -> SearchToolsServiceError {
+        SearchToolsServiceError::internal("SearchToolsService is closed")
     }
 }
 

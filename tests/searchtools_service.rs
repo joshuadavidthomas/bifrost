@@ -1,10 +1,14 @@
 use brokk_bifrost::{
-    SearchToolsService, SearchToolsServiceErrorCode, searchtools_render::RenderOptions,
+    AnalyzerConfig, FilesystemProject, Project, SearchToolsService, SearchToolsServiceErrorCode,
+    WorkspaceAnalyzer, searchtools_render::RenderOptions,
 };
 use git2::{Repository, Signature};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{MAIN_SEPARATOR, PathBuf};
+use std::sync::Arc;
+use std::thread;
 use tempfile::TempDir;
 
 fn fixture_root() -> PathBuf {
@@ -15,8 +19,91 @@ fn fixture_root() -> PathBuf {
 }
 
 #[test]
+fn service_allows_concurrent_read_only_calls() {
+    let service = Arc::new(SearchToolsService::new_for_python(fixture_root()).unwrap());
+    let calls = [
+        (
+            "search_symbols",
+            r#"{"patterns":["A"],"include_tests":true,"limit":5}"#,
+        ),
+        (
+            "get_symbol_sources",
+            r#"{"symbols":["A.method2"],"kind_filter":"function"}"#,
+        ),
+        ("get_summaries", r#"{"targets":["A.java"]}"#),
+        (
+            "most_relevant_files",
+            r#"{"seed_file_paths":["A.java"],"limit":5}"#,
+        ),
+    ];
+
+    let handles: Vec<_> = (0..16)
+        .map(|index| {
+            let service = Arc::clone(&service);
+            let (tool, args) = calls[index % calls.len()];
+            thread::spawn(move || {
+                let payload = service.call_tool_json(tool, args).unwrap();
+                serde_json::from_str::<Value>(&payload).unwrap()
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let value = handle.join().unwrap();
+        assert!(value.is_object(), "payload: {value}");
+    }
+}
+
+#[test]
+fn workspace_update_publishes_new_snapshot_without_mutating_old_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let file_path = temp.path().join("Thing.java");
+    fs::write(&file_path, "public class First {}\n").unwrap();
+
+    let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(temp.path()).unwrap());
+    let old_snapshot = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
+    assert!(
+        old_snapshot
+            .analyzer()
+            .search_definitions("First", true)
+            .iter()
+            .any(|unit| unit.fq_name() == "First")
+    );
+
+    fs::write(&file_path, "public class Second {}\n").unwrap();
+    let changed_file = project
+        .file_by_rel_path(std::path::Path::new("Thing.java"))
+        .unwrap();
+    let new_snapshot = old_snapshot.update(&BTreeSet::from([changed_file]));
+
+    assert!(
+        old_snapshot
+            .analyzer()
+            .search_definitions("First", true)
+            .iter()
+            .any(|unit| unit.fq_name() == "First"),
+        "old snapshot should retain First"
+    );
+    assert!(
+        old_snapshot
+            .analyzer()
+            .search_definitions("Second", true)
+            .is_empty(),
+        "old snapshot should not see Second"
+    );
+    assert!(
+        new_snapshot
+            .analyzer()
+            .search_definitions("Second", true)
+            .iter()
+            .any(|unit| unit.fq_name() == "Second"),
+        "new snapshot should see Second"
+    );
+}
+
+#[test]
 fn python_boundary_returns_structured_json() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
         .call_tool_json("get_summaries", r#"{"targets":["A.java"]}"#)
         .unwrap();
@@ -28,7 +115,7 @@ fn python_boundary_returns_structured_json() {
 
 #[test]
 fn get_summaries_directory_target_returns_skim_symbol_inventory() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_summaries",
@@ -54,7 +141,7 @@ fn get_summaries_directory_target_returns_skim_symbol_inventory() {
 
 #[test]
 fn python_boundary_returns_canonical_rendered_text_payload() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
         .call_tool_payload_json(
             "get_symbol_sources",
@@ -88,7 +175,7 @@ fn python_boundary_returns_structural_clone_report_json() {
     )
     .unwrap();
 
-    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "report_structural_clone_smells",
@@ -112,7 +199,7 @@ fn python_boundary_returns_dead_code_smell_report_json() {
     fs::write(temp.path().join("helpers.rs"), "fn helper() {}\n").unwrap();
     fs::write(temp.path().join("main.rs"), "fn main() {}\n").unwrap();
 
-    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "report_dead_code_and_unused_abstraction_smells",
@@ -156,7 +243,7 @@ fn python_boundary_returns_secret_scan_report_json() {
     )
     .unwrap();
 
-    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "report_secret_like_code",
@@ -201,7 +288,7 @@ fn python_boundary_returns_git_hotspot_report_json() {
         commit_paths(&repo, &["src/ComplexService.java"], &format!("update {i}"));
     }
 
-    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "analyze_git_hotspots",
@@ -222,7 +309,7 @@ fn python_boundary_returns_git_hotspot_report_json() {
 
 #[test]
 fn python_boundary_returns_list_symbols_json() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
         .call_tool_json("list_symbols", r#"{"file_patterns":["A.java"]}"#)
         .unwrap();
@@ -245,7 +332,7 @@ fn python_boundary_returns_list_symbols_json() {
 
 #[test]
 fn python_boundary_surfaces_invalid_params() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let err = service
         .call_tool_json("search_symbols", r#"{"patterns":1}"#)
         .unwrap_err();
@@ -270,7 +357,7 @@ fn python_boundary_returns_most_relevant_files_json() {
     repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
         .unwrap();
 
-    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "most_relevant_files",
@@ -302,7 +389,7 @@ fn search_symbols_limit_selects_git_important_file_then_renders_alphabetically()
     .unwrap();
     commit_paths(&repo, &["z_high.java"], "update high");
 
-    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "search_symbols",
@@ -321,7 +408,7 @@ fn search_symbols_limit_selects_git_important_file_then_renders_alphabetically()
 
 #[test]
 fn get_active_workspace_returns_initial_root() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
         .call_tool_json("get_active_workspace", "{}")
         .unwrap();
@@ -333,7 +420,7 @@ fn get_active_workspace_returns_initial_root() {
 
 #[test]
 fn activate_workspace_rejects_relative_path() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let err = service
         .call_tool_json(
             "activate_workspace",
@@ -351,7 +438,7 @@ fn activate_workspace_rejects_relative_path() {
 
 #[test]
 fn activate_workspace_rejects_nonexistent_path() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let err = service
         .call_tool_json(
             "activate_workspace",
@@ -372,7 +459,7 @@ fn activate_workspace_idempotent_for_same_root() {
     commit_paths(&repo, &["Same.java"], "initial");
     let same_root = temp.path().canonicalize().unwrap();
 
-    let mut service = SearchToolsService::new_for_python(same_root.clone()).unwrap();
+    let service = SearchToolsService::new_for_python(same_root.clone()).unwrap();
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
         serde_json::to_string(&same_root.display().to_string()).unwrap()
@@ -394,7 +481,7 @@ fn activate_workspace_switches_to_new_root() {
     .unwrap();
     let new_root = temp.path().canonicalize().unwrap();
 
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
         serde_json::to_string(&new_root.display().to_string()).unwrap()
@@ -432,7 +519,7 @@ fn activate_workspace_failure_preserves_existing_workspace() {
     fs::write(&bad_path, "not a directory").unwrap();
     let bad_path = bad_path.canonicalize().unwrap();
 
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
 
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
@@ -463,7 +550,7 @@ fn activate_workspace_failure_preserves_existing_workspace() {
 
 #[test]
 fn scan_usages_returns_call_sites_grouped_by_file() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -504,7 +591,7 @@ fn scan_usages_returns_call_sites_grouped_by_file() {
 
 #[test]
 fn scan_usages_reports_unknown_symbol_as_not_found() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -539,7 +626,7 @@ namespace Domain {
 "#,
     )
     .unwrap();
-    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -565,7 +652,7 @@ namespace Domain {
 
 #[test]
 fn scan_usages_skips_blank_symbols_without_error() {
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -603,7 +690,7 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
     )
     .unwrap();
 
-    let mut service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
 
     let production_only = service
         .call_tool_json(
@@ -653,7 +740,7 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
 #[test]
 fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
     // method7 lives on A.AInner.AInnerInner and has no callers in the fixture.
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let payload = service
         .call_tool_json(
             "scan_usages",
@@ -688,7 +775,7 @@ fn activate_workspace_normalizes_to_git_root() {
     let repo_root = temp.path().canonicalize().unwrap();
     let nested = repo_root.join("nested");
 
-    let mut service = SearchToolsService::new_for_python(fixture_root()).unwrap();
+    let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
     let arguments = format!(
         r#"{{"workspace_path":{}}}"#,
         serde_json::to_string(&nested.display().to_string()).unwrap()
