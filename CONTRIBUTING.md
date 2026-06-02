@@ -14,7 +14,7 @@ Python client build/install:
 maturin develop
 ```
 
-This repository has a minimal `pyproject.toml` so `uv run python ...` can execute the `bifrost_searchtools` client against the official Python MCP SDK dependency.
+This repository has a maturin-backed `pyproject.toml` so `uv run python ...` can execute the `bifrost_searchtools` client through the PyO3 native Rust extension.
 
 ## Test
 
