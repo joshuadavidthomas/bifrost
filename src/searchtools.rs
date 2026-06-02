@@ -1347,7 +1347,6 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Vec<P
         let rel_path = Path::new(&normalized);
         if !rel_path.is_absolute()
             && let Some(file) = analyzer.project().file_by_rel_path(rel_path)
-            && file.abs_path().is_file()
         {
             matched.insert(file);
             continue;

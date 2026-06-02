@@ -473,6 +473,35 @@ fn ts_named_import_alias_resolves_to_exported_symbol() {
 }
 
 #[test]
+fn js_named_export_imported_from_parent_directory_counts_calls_in_test_file() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "Maths/Abs.js",
+            "const absVal = (num) => (num < 0 ? -num : num);\nexport { absVal };\n",
+        )
+        .file(
+            "Maths/test/Abs.test.js",
+            "import { absVal } from '../Abs';\n\ndescribe('absVal', () => {\n  const absOfNegativeNumber = absVal(-34);\n});\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("Maths/Abs.js"), |cu| {
+        cu.identifier() == "absVal" && cu.is_function()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.file == project.file("Maths/test/Abs.test.js")),
+        "expected absVal call in importing test file to be counted, got {hits:?}"
+    );
+}
+
+#[test]
 fn ts_namespace_import_resolves_member_reference() {
     let (project, analyzer) = ts_inline_analyzer(|p| {
         p.file("a.ts", "export function foo() {}\n")

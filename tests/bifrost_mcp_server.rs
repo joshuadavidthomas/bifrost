@@ -23,6 +23,60 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         "#,
     )
     .expect("write java fixture");
+    fs::write(
+        fixture_root.path().join("SampleClone.java"),
+        r#"
+        public class SampleClone {
+            int sameValue(int input) {
+                int total = input + 1;
+                int doubled = total * 2;
+                int adjusted = total - 3;
+                if (total > 10) {
+                    total = doubled;
+                } else {
+                    total = adjusted;
+                }
+                for (int index = 0; index < 3; index++) {
+                    total += index;
+                }
+                if (total % 2 == 0) {
+                    total += 5;
+                } else {
+                    total -= 5;
+                }
+                return total;
+            }
+        }
+        "#,
+    )
+    .expect("write clone java fixture");
+    fs::write(
+        fixture_root.path().join("PeerClone.java"),
+        r#"
+        public class PeerClone {
+            int sameValue(int seed) {
+                int amount = seed + 1;
+                int doubled = amount * 2;
+                int adjusted = amount - 3;
+                if (amount > 10) {
+                    amount = doubled;
+                } else {
+                    amount = adjusted;
+                }
+                for (int index = 0; index < 3; index++) {
+                    amount += index;
+                }
+                if (amount % 2 == 0) {
+                    amount += 5;
+                } else {
+                    amount -= 5;
+                }
+                return amount;
+            }
+        }
+        "#,
+    )
+    .expect("write peer clone java fixture");
     let repo = git2::Repository::init(fixture_root.path()).expect("init fixture repo");
     let mut index = repo.index().expect("repo index");
     index
@@ -257,55 +311,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         "{dead_code_report}"
     );
 
-    fs::write(
-        fixture_root.path().join("SampleClone.java"),
-        r#"
-        public class SampleClone {
-            int sameValue(int input) {
-                int total = input + 1;
-                if (total > 10) {
-                    return total * 2;
-                }
-                return total - 3;
-            }
-        }
-        "#,
-    )
-    .expect("write clone java fixture");
-    fs::write(
-        fixture_root.path().join("SampleClone.java"),
-        r#"
-        public class SampleClone {
-            int sameValue(int input) {
-                int total = input + 1;
-                if (total > 10) {
-                    total = total * 2;
-                } else {
-                    total = total - 3;
-                }
-                return total;
-            }
-        }
-        "#,
-    )
-    .expect("rewrite clone java fixture");
-    fs::write(
-        fixture_root.path().join("PeerTest.java"),
-        r#"
-        public class PeerTest {
-            int sameValue(int seed) {
-                int amount = seed + 1;
-                if (amount > 10) {
-                    amount = amount * 2;
-                } else {
-                    amount = amount - 3;
-                }
-                return amount;
-            }
-        }
-        "#,
-    )
-    .expect("rewrite peer java fixture");
     let refresh = round_trip(
         &mut stdin,
         &mut reader,
@@ -333,7 +338,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "params": {
                 "name": "report_structural_clone_smells",
                 "arguments": {
-                    "file_paths": ["SampleClone.java", "PeerTest.java"]
+                    "file_paths": ["SampleClone.java", "PeerClone.java"]
                 }
             }
         }),
@@ -350,7 +355,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         "{clone_report}"
     );
     assert!(
-        clone_report.contains("PeerTest.sameValue"),
+        clone_report.contains("PeerClone.sameValue"),
         "{clone_report}"
     );
 

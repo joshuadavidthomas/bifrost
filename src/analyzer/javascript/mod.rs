@@ -120,8 +120,7 @@ impl LanguageAdapter for JavascriptAdapter {
         }
 
         if module_has_imports {
-            parsed.top_level_declarations.insert(0, module.clone());
-            parsed.declarations.insert(module.clone());
+            parsed.add_code_unit(module.clone(), root, source, None, None);
             parsed.add_signature(module, parsed.import_statements.join("\n"));
         }
 
