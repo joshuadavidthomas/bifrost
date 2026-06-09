@@ -260,6 +260,77 @@ class Other {
 }
 
 #[test]
+fn get_symbol_sources_file_input_uses_include_fallback_when_outline_is_empty() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/only_includes.h",
+            "#pragma once\n#include \"only/include.h\"\n#include <stdint.h>\n",
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let result = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["src/only_includes.h".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.sources.len(), "{result:#?}");
+    let source = &result.sources[0];
+    assert_eq!("src/only_includes.h", source.label);
+    assert_eq!("src/only_includes.h", source.path);
+    assert_eq!(2, source.start_line);
+    assert_eq!(3, source.end_line);
+    assert_eq!(None, source.presentation.as_deref());
+    assert_eq!(
+        "#include \"only/include.h\"\n#include <stdint.h>",
+        source.text
+    );
+}
+
+#[test]
+fn get_symbol_sources_file_input_uses_sampled_excerpt_fallback_when_no_outline_or_includes() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/emptyish_large.h",
+            (1..=60)
+                .map(|line| format!("// line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let result = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["src/emptyish_large.h".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.sources.len(), "{result:#?}");
+    let source = &result.sources[0];
+    assert_eq!("src/emptyish_large.h", source.label);
+    assert_eq!("src/emptyish_large.h", source.path);
+    assert_eq!(1, source.start_line);
+    assert_eq!(60, source.end_line);
+    assert_eq!(Some("sampled_excerpt"), source.presentation.as_deref());
+    assert!(source.text.contains("// line 1"), "{source:#?}");
+    assert!(source.text.contains("// line 25"), "{source:#?}");
+    assert!(
+        source.text.contains("----- OMITTED 10 LINES -----"),
+        "{source:#?}"
+    );
+    assert!(source.text.contains("// line 36"), "{source:#?}");
+    assert!(source.text.contains("// line 60"), "{source:#?}");
+}
+
+#[test]
 fn cpp_macro_and_function_lookup_supports_locations_sources_and_search() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

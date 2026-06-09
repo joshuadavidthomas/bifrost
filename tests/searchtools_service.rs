@@ -234,6 +234,80 @@ class Thing {
 }
 
 #[test]
+fn get_symbol_sources_file_input_uses_include_and_sample_fallbacks() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::write(
+        temp.path().join("src").join("only_includes.h"),
+        "#pragma once\n#include \"only/include.h\"\n#include <stdint.h>\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("src").join("emptyish_large.h"),
+        (1..=60)
+            .map(|line| format!("// line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_payload_json(
+            "get_symbol_sources",
+            r#"{"symbols":["src/only_includes.h","src/emptyish_large.h"]}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let sources = value["structured"]["sources"].as_array().unwrap();
+    let include_source = sources
+        .iter()
+        .find(|source| source["path"] == "src/only_includes.h")
+        .unwrap();
+    assert_eq!(2, include_source["start_line"]);
+    assert_eq!(3, include_source["end_line"]);
+    assert_eq!(
+        "#include \"only/include.h\"\n#include <stdint.h>",
+        include_source["text"]
+    );
+
+    let sampled_source = sources
+        .iter()
+        .find(|source| source["path"] == "src/emptyish_large.h")
+        .unwrap();
+    assert_eq!(1, sampled_source["start_line"]);
+    assert_eq!(60, sampled_source["end_line"]);
+    assert_eq!("sampled_excerpt", sampled_source["presentation"]);
+    let sampled_text = sampled_source["text"].as_str().expect("sampled text");
+    assert!(sampled_text.contains("// line 1"), "{sampled_text}");
+    assert!(
+        sampled_text.contains("----- OMITTED 10 LINES -----"),
+        "{sampled_text}"
+    );
+    assert!(sampled_text.contains("// line 60"), "{sampled_text}");
+
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(
+        rendered.contains("- Location: src/only_includes.h:2..3"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("#include \"only/include.h\""),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("- Location: src/emptyish_large.h:1..60"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("----- OMITTED 10 LINES -----"),
+        "{rendered}"
+    );
+}
+
+#[test]
 fn legacy_kind_filter_is_ignored_for_symbol_sources_and_locations() {
     let service = SearchToolsService::new_for_python(fixture_root()).unwrap();
 

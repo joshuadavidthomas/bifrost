@@ -623,7 +623,7 @@ pub fn get_symbol_sources(
         .map(|(index, symbol)| {
             let file_matches = resolve_file_patterns(analyzer, std::slice::from_ref(&symbol));
             if !file_matches.is_empty() {
-                let sources = top_level_symbol_outline_blocks_for_files(analyzer, file_matches);
+                let sources = source_blocks_for_files(analyzer, file_matches);
                 return if sources.is_empty() {
                     (index, SourceLookupOutcome::NotFound(symbol))
                 } else {
@@ -1392,26 +1392,77 @@ fn source_blocks_for_code_unit(
         .collect()
 }
 
-fn top_level_symbol_outline_blocks_for_files(
-    analyzer: &dyn IAnalyzer,
-    files: Vec<ProjectFile>,
-) -> Vec<SourceBlock> {
+fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Vec<SourceBlock> {
     files
         .into_iter()
-        .map(|file| {
+        .filter_map(|file| {
             let text = analyzer.list_top_level_symbols(&file);
-            let end_line = text.lines().count().max(1);
-            let path = rel_path_string(&file);
-            SourceBlock {
-                label: path.clone(),
-                path,
-                start_line: 1,
-                end_line,
-                text,
-                presentation: None,
+            if !text.trim().is_empty() {
+                let end_line = text.lines().count().max(1);
+                let path = rel_path_string(&file);
+                return Some(SourceBlock {
+                    label: path.clone(),
+                    path,
+                    start_line: 1,
+                    end_line,
+                    text,
+                    presentation: None,
+                });
             }
+
+            if let Some(block) = include_fallback_source_block(analyzer, &file) {
+                return Some(block);
+            }
+
+            excerpt_fallback_source_block(&file)
         })
         .collect()
+}
+
+fn include_fallback_source_block(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<SourceBlock> {
+    let elements = include_fallback_elements(analyzer, file);
+    if elements.is_empty() {
+        return None;
+    }
+    let start_line = elements
+        .iter()
+        .map(|element| element.start_line)
+        .min()
+        .unwrap_or(1);
+    let end_line = elements
+        .iter()
+        .map(|element| element.end_line)
+        .max()
+        .unwrap_or(start_line);
+    let text = elements
+        .into_iter()
+        .map(|element| element.text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let path = rel_path_string(file);
+    Some(SourceBlock {
+        label: path.clone(),
+        path,
+        start_line,
+        end_line,
+        text,
+        presentation: None,
+    })
+}
+
+fn excerpt_fallback_source_block(file: &ProjectFile) -> Option<SourceBlock> {
+    let sampled = excerpt_fallback_elements(file)?.into_iter().next()?;
+    Some(SourceBlock {
+        label: sampled.path.clone(),
+        path: sampled.path,
+        start_line: sampled.start_line,
+        end_line: sampled.end_line,
+        text: sampled.text,
+        presentation: sampled.presentation,
+    })
 }
 
 fn module_file_listing_blocks(code_unit: &CodeUnit) -> Vec<SourceBlock> {
