@@ -119,5 +119,6 @@ fn map_kind(kind: CodeUnitType) -> SymbolKind {
         CodeUnitType::Function => SymbolKind::FUNCTION,
         CodeUnitType::Field => SymbolKind::FIELD,
         CodeUnitType::Module => SymbolKind::MODULE,
+        CodeUnitType::Macro => SymbolKind::CONSTANT,
     }
 }

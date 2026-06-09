@@ -56,7 +56,7 @@ trait LanguageEpoch {
 fn epoch_cell<L: LanguageEpoch>(ts_language: &TsLanguage) -> &'static str {
     L::cell().get_or_init(|| {
         let mut hasher = Sha256::new();
-        hasher.update(b"bifrost-analyzer-epoch-v1\n");
+        hasher.update(b"bifrost-analyzer-epoch-v2\n");
         hasher.update(ANALYZER_VERSION.as_bytes());
         hasher.update(b"\n");
         hasher.update(PAYLOAD_VERSION.to_le_bytes());

@@ -117,17 +117,17 @@ impl<'a> CppVisitor<'a> {
             "function_definition" => self.visit_function_definition(node, scope),
             "declaration" => self.visit_declaration(node, scope, false, stack),
             "field_declaration" => self.visit_declaration(node, scope, true, stack),
-            "type_definition" | "alias_declaration" => {}
+            "type_definition" | "alias_declaration" => {
+                self.visit_type_declaration(node, scope, stack)
+            }
+            "preproc_def" | "preproc_function_def" => self.visit_macro(node),
             "preproc_include" => self.visit_include(node),
-            "preproc_if"
-            | "preproc_ifdef"
-            | "preproc_ifndef"
-            | "preproc_else"
-            | "preproc_elif"
-            | "preproc_function_def" => stack.push(CppWork::Container(CppContainer {
-                node,
-                scope: scope.clone(),
-            })),
+            "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_else" | "preproc_elif" => {
+                stack.push(CppWork::Container(CppContainer {
+                    node,
+                    scope: scope.clone(),
+                }))
+            }
             _ => {}
         }
     }
@@ -334,7 +334,10 @@ impl<'a> CppVisitor<'a> {
         let Some(declarator) = node.child_by_field_name("declarator") else {
             return;
         };
-        let Some(function) = extract_function_info(declarator, self.source, scope) else {
+        let Some(function_declarator) = extract_function_declarator(declarator) else {
+            return;
+        };
+        let Some(function) = extract_function_info(function_declarator, self.source, scope) else {
             return;
         };
         let code_unit = function.code_unit(self.file.clone());
@@ -364,6 +367,7 @@ impl<'a> CppVisitor<'a> {
         stack: &mut Vec<CppWork<'tree>>,
     ) {
         let mut handled_function = false;
+        let mut handled_declarator = false;
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             if in_class_body
@@ -375,17 +379,21 @@ impl<'a> CppVisitor<'a> {
                 self.visit_class_like(child, scope, stack);
                 continue;
             }
-            if child.kind() == "function_declarator" {
-                handled_function = true;
-                self.visit_function_declaration(node, child, scope);
-            } else if child.kind() == "init_declarator"
-                && let Some(inner) = child.child_by_field_name("declarator")
-            {
-                if inner.kind() == "function_declarator" {
-                    handled_function = true;
-                    self.visit_function_declaration(node, inner, scope);
-                } else {
-                    self.visit_variable_declaration(node, inner, scope, in_class_body);
+            if let Some(kind) = classify_declarator(child) {
+                handled_declarator = true;
+                match kind {
+                    DeclaratorKind::Function(function_declarator) => {
+                        handled_function = true;
+                        self.visit_function_declaration(node, function_declarator, scope);
+                    }
+                    DeclaratorKind::Variable(variable_declarator) => {
+                        self.visit_variable_declaration(
+                            node,
+                            variable_declarator,
+                            scope,
+                            in_class_body,
+                        );
+                    }
                 }
             }
         }
@@ -394,10 +402,12 @@ impl<'a> CppVisitor<'a> {
             return;
         }
 
-        if in_class_body {
-            self.visit_class_members_from_declaration(node, scope);
-        } else {
-            self.visit_global_variables_from_declaration(node, scope);
+        if !handled_declarator {
+            if in_class_body {
+                self.visit_class_members_from_declaration(node, scope);
+            } else {
+                self.visit_global_variables_from_declaration(node, scope);
+            }
         }
     }
 
@@ -525,6 +535,77 @@ impl<'a> CppVisitor<'a> {
             alias: None,
         });
     }
+
+    fn visit_type_declaration<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: &ScopeInfo,
+        stack: &mut Vec<CppWork<'tree>>,
+    ) {
+        if let Some(type_node) = node.child_by_field_name("type")
+            && matches!(
+                type_node.kind(),
+                "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+            )
+        {
+            self.visit_class_like(type_node, scope, stack);
+        }
+
+        let signature = normalize_cpp_whitespace(node_text(node, self.source));
+        if signature.is_empty() {
+            return;
+        }
+
+        let type_name = node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_node.child_by_field_name("name"))
+            .map(|name_node| normalize_cpp_whitespace(node_text(name_node, self.source)));
+        let alias_names = match node.kind() {
+            "alias_declaration" => extract_alias_declaration_name(node, self.source)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            "type_definition" => extract_typedef_alias_names(node, self.source),
+            _ => Vec::new(),
+        };
+        for alias_name in alias_names {
+            if alias_name.is_empty() || type_name.as_deref() == Some(alias_name.as_str()) {
+                continue;
+            }
+            let code_unit = CodeUnit::with_signature(
+                self.file.clone(),
+                CodeUnitType::Class,
+                scope.package_name.clone(),
+                alias_name,
+                Some(signature.clone()),
+                false,
+            );
+            if has_matching_declaration(&self.parsed.declarations, &code_unit) {
+                continue;
+            }
+            self.parsed
+                .add_code_unit(code_unit.clone(), node, self.source, None, None);
+            self.parsed
+                .add_signature(code_unit.clone(), signature.clone());
+            self.parsed.mark_type_alias(code_unit);
+        }
+    }
+
+    fn visit_macro(&mut self, node: Node<'_>) {
+        let Some(name) = extract_macro_name(node, self.source) else {
+            return;
+        };
+        let signature = node_text(node, self.source).trim_end().to_string();
+        if signature.is_empty() {
+            return;
+        }
+        let code_unit = CodeUnit::new(self.file.clone(), CodeUnitType::Macro, "", name);
+        if has_matching_declaration(&self.parsed.declarations, &code_unit) {
+            return;
+        }
+        self.parsed
+            .add_code_unit(code_unit.clone(), node, self.source, None, None);
+        self.parsed.add_signature(code_unit, signature);
+    }
 }
 
 pub(crate) fn recover_quoted_includes(
@@ -648,6 +729,11 @@ struct FunctionInfo {
     signature: String,
 }
 
+enum DeclaratorKind<'a> {
+    Function(Node<'a>),
+    Variable(Node<'a>),
+}
+
 impl FunctionInfo {
     fn code_unit(&self, file: ProjectFile) -> CodeUnit {
         self.code_unit_with_synthetic(file, false)
@@ -708,6 +794,73 @@ fn extract_function_info(
     })
 }
 
+fn extract_function_declarator(node: Node<'_>) -> Option<Node<'_>> {
+    match classify_declarator(node)? {
+        DeclaratorKind::Function(function_declarator) => Some(function_declarator),
+        DeclaratorKind::Variable(_) => None,
+    }
+}
+
+fn classify_declarator(node: Node<'_>) -> Option<DeclaratorKind<'_>> {
+    match node.kind() {
+        "function_declarator" => {
+            let inner = node
+                .child_by_field_name("declarator")
+                .or_else(|| node.child_by_field_name("name"))
+                .or_else(|| last_named_child(node));
+            if inner.is_some_and(is_function_pointer_like_inner_declarator) {
+                Some(DeclaratorKind::Variable(node))
+            } else {
+                Some(DeclaratorKind::Function(node))
+            }
+        }
+        "init_declarator"
+        | "pointer_declarator"
+        | "reference_declarator"
+        | "parenthesized_declarator"
+        | "array_declarator"
+        | "attributed_declarator"
+        | "template_function" => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| last_named_child(node))
+            .and_then(classify_declarator),
+        "identifier" | "field_identifier" | "qualified_identifier" => {
+            Some(DeclaratorKind::Variable(node))
+        }
+        _ => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| last_named_child(node))
+            .and_then(classify_declarator),
+    }
+}
+
+fn is_function_pointer_like_inner_declarator(node: Node<'_>) -> bool {
+    match node.kind() {
+        "pointer_declarator" | "reference_declarator" | "array_declarator" => true,
+        "parenthesized_declarator" => node
+            .child_by_field_name("declarator")
+            .or_else(|| last_named_child(node))
+            .is_some_and(is_pointer_wrapper_declarator),
+        "template_function" => node
+            .child_by_field_name("name")
+            .is_some_and(is_function_pointer_like_inner_declarator),
+        _ => false,
+    }
+}
+
+fn is_pointer_wrapper_declarator(node: Node<'_>) -> bool {
+    match node.kind() {
+        "pointer_declarator" | "reference_declarator" | "array_declarator" => true,
+        "parenthesized_declarator" => node
+            .child_by_field_name("declarator")
+            .or_else(|| last_named_child(node))
+            .is_some_and(is_pointer_wrapper_declarator),
+        _ => false,
+    }
+}
+
 fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String, String) {
     let cleaned = raw_name.trim_start_matches("template ").trim();
     let parts: Vec<_> = cleaned.split("::").collect();
@@ -766,7 +919,7 @@ fn extract_declarator_name(node: Node<'_>, source: &str) -> String {
 
 fn extract_variable_name(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
-        "identifier" | "field_identifier" => {
+        "identifier" | "field_identifier" | "type_identifier" | "qualified_identifier" => {
             let name = node_text(node, source).trim().to_string();
             (!name.is_empty()).then_some(name)
         }
@@ -785,6 +938,79 @@ fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
     } else {
         node.named_child(count - 1)
     }
+}
+
+fn extract_alias_declaration_name(node: Node<'_>, source: &str) -> Option<String> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = normalize_cpp_whitespace(node_text(name_node, source));
+    (!name.is_empty()).then_some(name)
+}
+
+fn extract_typedef_alias_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let type_node = node.child_by_field_name("type");
+    let mut names = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if type_node.is_some_and(|type_node| same_node(child, type_node)) {
+            continue;
+        }
+        if let Some(name) = extract_typedef_declarator_name(child, source)
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+fn extract_typedef_declarator_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "field_identifier" | "type_identifier" | "qualified_identifier" => {
+            let name = normalize_cpp_whitespace(node_text(node, source));
+            (!name.is_empty()).then_some(name)
+        }
+        _ => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| last_named_child(node))
+            .and_then(|child| extract_typedef_declarator_name(child, source)),
+    }
+}
+
+fn extract_macro_name(node: Node<'_>, source: &str) -> Option<String> {
+    let name = node
+        .child_by_field_name("name")
+        .map(|name_node| normalize_cpp_whitespace(node_text(name_node, source)))
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| {
+                    matches!(
+                        child.kind(),
+                        "identifier" | "field_identifier" | "type_identifier"
+                    )
+                })
+                .map(|name_node| normalize_cpp_whitespace(node_text(name_node, source)))
+        })?;
+    (!name.is_empty()).then_some(name)
+}
+
+fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
+    left.kind() == right.kind()
+        && left.start_byte() == right.start_byte()
+        && left.end_byte() == right.end_byte()
+}
+
+fn has_matching_declaration(
+    declarations: &crate::hash::HashSet<CodeUnit>,
+    candidate: &CodeUnit,
+) -> bool {
+    declarations.iter().any(|existing| {
+        existing.source() == candidate.source()
+            && existing.kind() == candidate.kind()
+            && existing.package_name() == candidate.package_name()
+            && existing.short_name() == candidate.short_name()
+    })
 }
 
 fn render_cpp_type_signature(

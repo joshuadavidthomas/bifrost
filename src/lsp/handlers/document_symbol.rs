@@ -110,6 +110,7 @@ fn classify_symbol_kind(code_unit: &CodeUnit, parent_kind: Option<SymbolKind>) -
             }
         }
         CodeUnitType::Module => SymbolKind::MODULE,
+        CodeUnitType::Macro => SymbolKind::CONSTANT,
     }
 }
 

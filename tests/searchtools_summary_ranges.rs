@@ -420,3 +420,122 @@ fn summary_renderer_uses_ranges_for_multiline_elements() {
 
     assert_eq!("12..14: class Foo(\n  x: int,\n  y: int", rendered);
 }
+
+#[test]
+fn cpp_file_summaries_surface_macros_and_prototypes_without_fallback() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/detection/codec/codec.h",
+            r#"#pragma once
+#include "common/option.h"
+
+#define FF_CODEC_UNKNOWN 0
+#define FF_CODEC_NAME(x) ffCodecName_##x
+
+const char* ffDetectCodec(void);
+"#,
+        )
+        .build();
+    let analyzer = brokk_bifrost::CppAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["src/detection/codec/codec.h".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.summaries.len(), "{result:#?}");
+    let summary = &result.summaries[0];
+    assert_eq!(None, summary.fallback_reason.as_deref());
+    assert!(
+        summary
+            .elements
+            .iter()
+            .any(|element| element.kind == "macro" && element.symbol == "FF_CODEC_UNKNOWN"),
+        "{:#?}",
+        summary.elements
+    );
+    assert!(
+        summary
+            .elements
+            .iter()
+            .any(|element| element.kind == "function" && element.symbol == "ffDetectCodec"),
+        "{:#?}",
+        summary.elements
+    );
+}
+
+#[test]
+fn include_only_cpp_headers_use_include_summary_fallback() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/only_includes.h",
+            r#"#pragma once
+#include "only/include.h"
+#include <stdint.h>
+"#,
+        )
+        .build();
+    let analyzer = brokk_bifrost::CppAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["src/only_includes.h".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.summaries.len(), "{result:#?}");
+    let summary = &result.summaries[0];
+    assert_eq!(
+        Some("no indexed declarations found; showing top-level includes"),
+        summary.fallback_reason.as_deref()
+    );
+    assert_eq!(2, summary.elements.len(), "{:#?}", summary.elements);
+    assert_eq!("include", summary.elements[0].kind);
+    assert_eq!("only/include.h", summary.elements[0].symbol);
+    assert_eq!("#include \"only/include.h\"", summary.elements[0].text);
+    assert_eq!("stdint.h", summary.elements[1].symbol);
+    assert_eq!("#include <stdint.h>", summary.elements[1].text);
+}
+
+#[test]
+fn empty_cpp_headers_use_excerpt_summary_fallback() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/emptyish.h",
+            (1..=25)
+                .map(|line| format!("// line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .build();
+    let analyzer = brokk_bifrost::CppAnalyzer::from_project(project.project().clone());
+
+    let result = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["src/emptyish.h".to_string()],
+        },
+    );
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.summaries.len(), "{result:#?}");
+    let summary = &result.summaries[0];
+    assert_eq!(
+        Some("no indexed declarations or top-level includes found; showing first 20 lines"),
+        summary.fallback_reason.as_deref()
+    );
+    assert_eq!(1, summary.elements.len(), "{:#?}", summary.elements);
+    let excerpt = &summary.elements[0];
+    assert_eq!("excerpt", excerpt.kind);
+    assert_eq!("src/emptyish.h", excerpt.symbol);
+    assert_eq!(1, excerpt.start_line);
+    assert_eq!(20, excerpt.end_line);
+    assert!(excerpt.text.contains("// line 1"), "{excerpt:#?}");
+    assert!(excerpt.text.contains("// line 20"), "{excerpt:#?}");
+    assert!(!excerpt.text.contains("// line 21"), "{excerpt:#?}");
+}

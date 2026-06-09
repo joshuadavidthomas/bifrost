@@ -183,6 +183,7 @@ fn render_search_symbol_file(file: &SearchSymbolsFile, options: RenderOptions) -
     );
     append_symbol_hits(&mut lines, "Field", "Fields", &file.fields, options);
     append_symbol_hits(&mut lines, "Module", "Modules", &file.modules, options);
+    append_symbol_hits(&mut lines, "Macro", "Macros", &file.macros, options);
     lines.join("\n")
 }
 
@@ -231,6 +232,9 @@ fn render_summary_block(block: &SummaryBlock, options: RenderOptions) -> String 
     let mut chunks = vec![block.path.clone()];
     if !block.preamble.is_empty() {
         chunks.push(block.preamble.clone());
+    }
+    if let Some(fallback_reason) = &block.fallback_reason {
+        chunks.push(format!("Note: {fallback_reason}"));
     }
     chunks.extend(
         block
@@ -462,6 +466,7 @@ mod tests {
                 }],
                 fields: Vec::new(),
                 modules: Vec::new(),
+                macros: Vec::new(),
             }],
         };
 

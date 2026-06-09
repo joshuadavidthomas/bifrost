@@ -278,6 +278,75 @@ fn get_symbol_ancestors_rejects_non_type_targets() {
 }
 
 #[test]
+fn get_summaries_renders_include_and_excerpt_fallbacks() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src")).unwrap();
+    fs::write(
+        temp.path().join("src").join("only_includes.h"),
+        "#pragma once\n#include \"only/include.h\"\n#include <stdint.h>\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("src").join("emptyish.h"),
+        (1..=25)
+            .map(|line| format!("// line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    let service = SearchToolsService::new_for_python(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_payload_json(
+            "get_summaries",
+            r#"{"targets":["src/only_includes.h","src/emptyish.h"]}"#,
+            RenderOptions::default(),
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let summaries = value["structured"]["summaries"].as_array().unwrap();
+    let include_summary = summaries
+        .iter()
+        .find(|summary| summary["path"] == "src/only_includes.h")
+        .unwrap();
+    assert_eq!(
+        "no indexed declarations found; showing top-level includes",
+        include_summary["fallback_reason"]
+    );
+    assert_eq!("include", include_summary["elements"][0]["kind"]);
+    assert_eq!("only/include.h", include_summary["elements"][0]["symbol"]);
+
+    let excerpt_summary = summaries
+        .iter()
+        .find(|summary| summary["path"] == "src/emptyish.h")
+        .unwrap();
+    assert_eq!(
+        "no indexed declarations or top-level includes found; showing first 20 lines",
+        excerpt_summary["fallback_reason"]
+    );
+    assert_eq!("excerpt", excerpt_summary["elements"][0]["kind"]);
+    assert_eq!(20, excerpt_summary["elements"][0]["end_line"]);
+
+    let rendered = value["rendered_text"].as_str().expect("rendered text");
+    assert!(
+        rendered.contains("Note: no indexed declarations found; showing top-level includes"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("#include \"only/include.h\""),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(
+            "Note: no indexed declarations or top-level includes found; showing first 20 lines"
+        ),
+        "{rendered}"
+    );
+    assert!(rendered.contains("1..20: // line 1"), "{rendered}");
+}
+
+#[test]
 fn python_boundary_returns_structural_clone_report_json() {
     let temp = TempDir::new().unwrap();
     fs::write(

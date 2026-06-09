@@ -1202,13 +1202,94 @@ fn test_cpp_type_alias_and_stable_definition_ordering() {
                 .any(|name| cu.short_name().contains(name))
         })
         .collect();
-    assert!(aliases.is_empty());
+    assert!(
+        aliases
+            .iter()
+            .any(|cu| cu.short_name().contains("ColorValue")),
+        "{aliases:#?}"
+    );
+    assert!(
+        aliases
+            .iter()
+            .any(|cu| cu.short_name().contains("PixelBuffer")),
+        "{aliases:#?}"
+    );
 
     let defs = analyzer.get_definitions("overloadedFunction");
     assert!(defs.len() >= 3);
     let unique_signatures: BTreeSet<_> = defs.iter().filter_map(|cu| cu.signature()).collect();
     assert!(!unique_signatures.is_empty());
     assert!(unique_signatures.len() >= 2);
+}
+
+#[test]
+fn cpp_analyzer_indexes_macros_and_pointer_returning_prototypes() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/detection/codec/codec.h",
+            r#"#pragma once
+#include "common/option.h"
+
+#define FF_CODEC_UNKNOWN 0
+#define FF_CODEC_NAME(x) ffCodecName_##x
+#define FF_AUTO_CLOSE(name) \
+    do { \
+        close(name); \
+    } while (0)
+
+const char* ffDetectCodec(void);
+"#,
+        )
+        .file(
+            "src/detection/bootmgr/bootmgr_apple.c",
+            r#"#include "bootmgr.h"
+
+const char* ffDetectBootmgr(FFBootmgrResult* result) {
+    return "iBoot";
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let header = project.file("src/detection/codec/codec.h");
+    let header_decls = analyzer.get_declarations(&header);
+    assert!(
+        header_decls
+            .iter()
+            .any(|cu| cu.kind() == CodeUnitType::Macro && cu.short_name() == "FF_CODEC_UNKNOWN"),
+        "{header_decls:#?}"
+    );
+    assert!(
+        header_decls
+            .iter()
+            .any(|cu| cu.kind() == CodeUnitType::Macro && cu.short_name() == "FF_AUTO_CLOSE"),
+        "{header_decls:#?}"
+    );
+    let prototype = header_decls
+        .iter()
+        .find(|cu| cu.kind() == CodeUnitType::Function && base_function_name(cu) == "ffDetectCodec")
+        .unwrap();
+    assert_eq!(Some("(void)"), prototype.signature());
+    let prototype_skeleton = analyzer.get_skeleton(prototype).unwrap();
+    assert!(
+        prototype_skeleton.contains("const char* ffDetectCodec(void);"),
+        "{prototype_skeleton}"
+    );
+
+    let source = project.file("src/detection/bootmgr/bootmgr_apple.c");
+    let source_decls = analyzer.get_declarations(&source);
+    let definition = source_decls
+        .iter()
+        .find(|cu| {
+            cu.kind() == CodeUnitType::Function && base_function_name(cu) == "ffDetectBootmgr"
+        })
+        .unwrap();
+    let source_skeleton = analyzer.get_skeleton(definition).unwrap();
+    assert!(
+        source_skeleton.contains("const char* ffDetectBootmgr(FFBootmgrResult* result)"),
+        "{source_skeleton}"
+    );
 }
 
 #[test]

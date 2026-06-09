@@ -191,6 +191,7 @@ pub(crate) fn code_unit_kind_str(kind: CodeUnitType) -> &'static str {
         CodeUnitType::Function => "Function",
         CodeUnitType::Field => "Field",
         CodeUnitType::Module => "Module",
+        CodeUnitType::Macro => "Macro",
     }
 }
 
@@ -202,6 +203,7 @@ pub(crate) fn parse_kind(s: &str) -> Option<CodeUnitType> {
         "Function" => CodeUnitType::Function,
         "Field" => CodeUnitType::Field,
         "Module" => CodeUnitType::Module,
+        "Macro" => CodeUnitType::Macro,
         _ => return None,
     })
 }

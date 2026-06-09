@@ -151,6 +151,7 @@ pub enum CodeUnitType {
     Function,
     Field,
     Module,
+    Macro,
 }
 
 impl CodeUnitType {
@@ -163,6 +164,7 @@ impl CodeUnitType {
             CodeUnitType::Function => "function",
             CodeUnitType::Field => "field",
             CodeUnitType::Module => "module",
+            CodeUnitType::Macro => "macro",
         }
     }
 }
@@ -426,6 +428,10 @@ impl CodeUnit {
 
     pub fn is_module(&self) -> bool {
         self.0.kind == CodeUnitType::Module
+    }
+
+    pub fn is_macro(&self) -> bool {
+        self.0.kind == CodeUnitType::Macro
     }
 }
 

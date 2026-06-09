@@ -3,8 +3,8 @@ mod common;
 use brokk_bifrost::{
     CSharpAnalyzer, CppAnalyzer, IAnalyzer, JavaAnalyzer, Language, PhpAnalyzer, ScalaAnalyzer,
     searchtools::{
-        ScanUsagesParams, SymbolLookupParams, SymbolSourcesResult, get_symbol_locations,
-        get_symbol_sources, scan_usages,
+        ScanUsagesParams, SearchSymbolsParams, SymbolLookupParams, SymbolSourcesResult,
+        get_symbol_locations, get_symbol_sources, scan_usages, search_symbols,
     },
 };
 use common::InlineTestProject;
@@ -256,6 +256,101 @@ class Other {
             .iter()
             .map(|source| source.label.clone())
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn cpp_macro_and_function_lookup_supports_locations_sources_and_search() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/detection/codec/codec.h",
+            r#"#pragma once
+#include "common/option.h"
+
+#define FF_CODEC_UNKNOWN 0
+#define FF_AUTO_CLOSE(name) \
+    do { \
+        close(name); \
+    } while (0)
+
+const char* ffDetectCodec(void);
+"#,
+        )
+        .file(
+            "src/detection/bootmgr/bootmgr_apple.c",
+            r#"#include "bootmgr.h"
+
+static const char* detectSecureBoot(void) {
+    return NULL;
+}
+
+const char* ffDetectBootmgr(FFBootmgrResult* result) {
+    return "iBoot";
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let search = search_symbols(
+        &analyzer,
+        SearchSymbolsParams {
+            patterns: vec!["FF_".to_string()],
+            include_tests: true,
+            limit: 20,
+        },
+    );
+    assert_eq!(1, search.files.len(), "{search:#?}");
+    assert_eq!(
+        vec!["FF_AUTO_CLOSE".to_string(), "FF_CODEC_UNKNOWN".to_string()],
+        search.files[0]
+            .macros
+            .iter()
+            .map(|hit| hit.symbol.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let locations = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["FF_CODEC_UNKNOWN".to_string()],
+        },
+    );
+    assert!(locations.not_found.is_empty(), "{locations:#?}");
+    assert_eq!(1, locations.locations.len(), "{locations:#?}");
+    assert_eq!("FF_CODEC_UNKNOWN", locations.locations[0].symbol);
+    assert_eq!("src/detection/codec/codec.h", locations.locations[0].path);
+    assert_eq!(4, locations.locations[0].start_line);
+
+    let macro_source = source_for(&analyzer, "FF_AUTO_CLOSE");
+    assert!(macro_source.not_found.is_empty(), "{macro_source:#?}");
+    assert_eq!(1, macro_source.sources.len(), "{macro_source:#?}");
+    assert!(
+        macro_source.sources[0]
+            .text
+            .contains("#define FF_AUTO_CLOSE(name) \\"),
+        "{macro_source:#?}"
+    );
+    assert!(
+        macro_source.sources[0].text.contains("close(name);"),
+        "{macro_source:#?}"
+    );
+
+    let function_source = source_for(&analyzer, "ffDetectBootmgr");
+    assert!(function_source.not_found.is_empty(), "{function_source:#?}");
+    assert_eq!(1, function_source.sources.len(), "{function_source:#?}");
+    assert_eq!("ffDetectBootmgr", function_source.sources[0].label);
+    assert!(
+        function_source.sources[0]
+            .text
+            .contains("const char* ffDetectBootmgr(FFBootmgrResult* result)"),
+        "{function_source:#?}"
+    );
+    assert!(
+        function_source.sources[0]
+            .text
+            .contains("return \"iBoot\";"),
+        "{function_source:#?}"
     );
 }
 

@@ -1,5 +1,5 @@
 use brokk_bifrost::{
-    JavaAnalyzer, Language, ScalaAnalyzer, TestProject,
+    CppAnalyzer, JavaAnalyzer, Language, ScalaAnalyzer, TestProject,
     searchtools::{FilePatternsParams, list_symbols},
 };
 
@@ -93,5 +93,86 @@ object InstanceChoiceControl {
         result.files[0].lines.contains(&"  - select".to_string()),
         "{:#?}",
         result.files[0].lines
+    );
+}
+
+#[test]
+fn list_symbols_includes_cpp_functions_macros_and_prototypes() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "src/detection/bootmgr/bootmgr_apple.c",
+            r#"#include "bootmgr.h"
+#include "common/io.h"
+
+static const char* detectSecureBoot(void) {
+    return NULL;
+}
+
+const char* ffDetectBootmgr(FFBootmgrResult* result) {
+    return "iBoot";
+}
+"#,
+        )
+        .file(
+            "src/detection/codec/codec.h",
+            r#"#pragma once
+#include "common/option.h"
+
+#define FF_CODEC_UNKNOWN 0
+#define FF_CODEC_NAME(x) ffCodecName_##x
+
+const char* ffDetectCodec(void);
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+
+    let result = list_symbols(
+        &analyzer,
+        FilePatternsParams {
+            file_patterns: vec![
+                "src/detection/bootmgr/bootmgr_apple.c".to_string(),
+                "src/detection/codec/codec.h".to_string(),
+            ],
+        },
+    );
+
+    assert_eq!(2, result.files.len(), "{:#?}", result.files);
+
+    let bootmgr = result
+        .files
+        .iter()
+        .find(|file| file.path == "src/detection/bootmgr/bootmgr_apple.c")
+        .unwrap();
+    assert!(
+        bootmgr.lines.contains(&"- detectSecureBoot".to_string()),
+        "{:#?}",
+        bootmgr.lines
+    );
+    assert!(
+        bootmgr.lines.contains(&"- ffDetectBootmgr".to_string()),
+        "{:#?}",
+        bootmgr.lines
+    );
+
+    let codec = result
+        .files
+        .iter()
+        .find(|file| file.path == "src/detection/codec/codec.h")
+        .unwrap();
+    assert!(
+        codec.lines.contains(&"- FF_CODEC_UNKNOWN".to_string()),
+        "{:#?}",
+        codec.lines
+    );
+    assert!(
+        codec.lines.contains(&"- FF_CODEC_NAME".to_string()),
+        "{:#?}",
+        codec.lines
+    );
+    assert!(
+        codec.lines.contains(&"- ffDetectCodec".to_string()),
+        "{:#?}",
+        codec.lines
     );
 }

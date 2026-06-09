@@ -101,6 +101,7 @@ pub struct SearchSymbolsFile {
     pub functions: Vec<SearchSymbolHit>,
     pub fields: Vec<SearchSymbolHit>,
     pub modules: Vec<SearchSymbolHit>,
+    pub macros: Vec<SearchSymbolHit>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +157,8 @@ pub struct SummaryBlock {
     pub label: String,
     pub path: String,
     pub preamble: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
     pub elements: Vec<SummaryElement>,
 }
 
@@ -360,6 +363,7 @@ pub fn search_symbols(
             functions: collect_kind_names(analyzer, &code_units, CodeUnitType::Function),
             fields: collect_kind_names(analyzer, &code_units, CodeUnitType::Field),
             modules: collect_kind_names(analyzer, &code_units, CodeUnitType::Module),
+            macros: collect_kind_names(analyzer, &code_units, CodeUnitType::Macro),
         })
         .collect();
 
@@ -724,14 +728,17 @@ fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Summary
                 ));
             }
 
-            if elements.is_empty() {
-                return None;
-            }
+            let (elements, fallback_reason) = if elements.is_empty() {
+                summary_fallback_for_file(analyzer, &file)?
+            } else {
+                (elements, None)
+            };
 
             Some(SummaryBlock {
                 label: rel_path_string(&file),
                 path: rel_path_string(&file),
                 preamble: file_preamble(&file, &elements),
+                fallback_reason,
                 elements,
             })
         })
@@ -747,6 +754,118 @@ fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Summary
         not_found: Vec::new(),
         ambiguous: Vec::new(),
     }
+}
+
+fn summary_fallback_for_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> Option<(Vec<SummaryElement>, Option<String>)> {
+    let include_elements = include_fallback_elements(analyzer, file);
+    if !include_elements.is_empty() {
+        return Some((
+            include_elements,
+            Some("no indexed declarations found; showing top-level includes".to_string()),
+        ));
+    }
+
+    excerpt_fallback_elements(file).map(|elements| {
+        (
+            elements,
+            Some(
+                "no indexed declarations or top-level includes found; showing first 20 lines"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
+fn include_fallback_elements(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<SummaryElement> {
+    let include_lines: Vec<_> = analyzer
+        .import_statements(file)
+        .iter()
+        .filter(|statement| is_include_statement(statement))
+        .cloned()
+        .collect();
+    if include_lines.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(content) = file.read_to_string() else {
+        return Vec::new();
+    };
+    let path = rel_path_string(file);
+    let physical_lines: Vec<&str> = content.lines().collect();
+    let normalized_lines: Vec<String> = physical_lines
+        .iter()
+        .map(|line| normalize_include_line(line))
+        .collect();
+
+    let mut next_search_index = 0usize;
+    let mut elements = Vec::new();
+    for include in include_lines {
+        let Some((line_index, line_text)) = normalized_lines
+            .iter()
+            .enumerate()
+            .skip(next_search_index)
+            .find_map(|(line_index, normalized)| {
+                (normalized == &include).then(|| {
+                    (
+                        line_index,
+                        physical_lines.get(line_index).copied().unwrap_or(""),
+                    )
+                })
+            })
+        else {
+            continue;
+        };
+        next_search_index = line_index + 1;
+        elements.push(SummaryElement {
+            path: path.clone(),
+            symbol: extract_include_target(&include),
+            kind: "include".to_string(),
+            start_line: line_index + 1,
+            end_line: line_index + 1,
+            text: line_text.trim_end().to_string(),
+        });
+    }
+    elements
+}
+
+fn excerpt_fallback_elements(file: &ProjectFile) -> Option<Vec<SummaryElement>> {
+    let content = file.read_to_string().ok()?;
+    let excerpt_lines: Vec<&str> = content.lines().take(20).collect();
+    if excerpt_lines.is_empty() {
+        return None;
+    }
+    let end_line = excerpt_lines.len();
+    Some(vec![SummaryElement {
+        path: rel_path_string(file),
+        symbol: rel_path_string(file),
+        kind: "excerpt".to_string(),
+        start_line: 1,
+        end_line,
+        text: excerpt_lines.join("\n"),
+    }])
+}
+
+fn is_include_statement(statement: &str) -> bool {
+    statement.trim_start().starts_with("#include")
+}
+
+fn normalize_include_line(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn extract_include_target(statement: &str) -> String {
+    let trimmed = statement.trim();
+    let rest = trimmed.strip_prefix("#include").unwrap_or(trimmed).trim();
+    if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+        return rest[1..rest.len() - 1].to_string();
+    }
+    if rest.starts_with('<') && rest.ends_with('>') && rest.len() >= 2 {
+        return rest[1..rest.len() - 1].to_string();
+    }
+    rest.to_string()
 }
 
 fn summarize_routed_targets(
@@ -1031,6 +1150,7 @@ fn summary_block_for_code_unit(
         label: display_symbol_for_target(code_unit),
         path: rel_path_string(code_unit.source()),
         preamble: file_preamble(code_unit.source(), &elements),
+        fallback_reason: None,
         elements,
     })
 }
@@ -1097,6 +1217,10 @@ fn display_signatures(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Str
         CodeUnitType::Module => {
             display_symbol_name(language_for_target(code_unit), code_unit.short_name())
         }
+        CodeUnitType::Macro => code_unit
+            .signature()
+            .map(str::to_string)
+            .unwrap_or_else(|| display_identifier_for_target(code_unit).to_string()),
     };
     vec![fallback]
 }
@@ -1172,6 +1296,7 @@ fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
         CodeUnitType::Function => "function",
         CodeUnitType::Field => "field",
         CodeUnitType::Module => "module",
+        CodeUnitType::Macro => "macro",
     }
 }
 

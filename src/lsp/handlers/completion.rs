@@ -261,5 +261,6 @@ fn map_completion_kind(kind: CodeUnitType) -> CompletionItemKind {
         CodeUnitType::Function => CompletionItemKind::FUNCTION,
         CodeUnitType::Field => CompletionItemKind::FIELD,
         CodeUnitType::Module => CompletionItemKind::MODULE,
+        CodeUnitType::Macro => CompletionItemKind::CONSTANT,
     }
 }
