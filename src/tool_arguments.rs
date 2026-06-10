@@ -11,6 +11,9 @@ pub fn normalize_tool_arguments(
         "list_symbols" => {
             normalize_string_array_field(&mut arguments, "file_patterns", workspace_root)?
         }
+        "scan_usages" => {
+            normalize_string_array_field(&mut arguments, "paths", workspace_root)?
+        }
         "most_relevant_files" => {
             normalize_string_array_field(&mut arguments, "seed_file_paths", workspace_root)?
         }

@@ -66,7 +66,7 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "scan_usages",
-            "Find references, call sites, and related tests for known fully qualified symbols. Prefer over grep when changing existing behavior and callers may matter; use search_symbols first for partial names. Static analysis may include false positives. Graph-analysis fallbacks and resolved-symbol failures are returned with structured reasons.",
+            "Find references, call sites, usages, callers, and related tests for known fully qualified symbols. Prefer over grep when changing existing behavior and callers may matter; use search_symbols first for partial names. Results are tiered by volume: few callers include code snippets, many callers return per-file counts. Narrow with paths or one symbol at a time for detail. Symbols with zero proven callers are re-checked textually, and explicit notes distinguish no-callers from callers that may be outside visible scopes.",
             json!({
                 "type": "object",
                 "properties": {
@@ -79,6 +79,11 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
                         "type": "boolean",
                         "default": false,
                         "description": "Include call sites in test files."
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional project-relative file paths or glob patterns used to narrow where usages are searched."
                     }
                 },
                 "required": ["symbols"]

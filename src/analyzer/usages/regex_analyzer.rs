@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 /// Lines of context to include before/after a match in [`UsageHit::snippet`].
-const SNIPPET_CONTEXT_LINES: usize = 3;
+const SNIPPET_CONTEXT_LINES: usize = 1;
 /// Hard cap on the confidence reported for a regex hit. The regex strategy never
 /// disambiguates, so every hit it produces lands at 1.0.
 const REGEX_HIT_CONFIDENCE: f64 = 1.0;

@@ -4,7 +4,7 @@ use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer};
 use crate::text_utils::find_line_index_for_offset;
 use tree_sitter::Node;
 
-const SNIPPET_CONTEXT_LINES: usize = 3;
+const SNIPPET_CONTEXT_LINES: usize = 1;
 
 pub(super) fn add_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if *ctx.limit_exceeded {

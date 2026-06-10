@@ -7,7 +7,8 @@ use crate::analyzer::symbol_lookup::{
     strip_trailing_call_suffix,
 };
 use crate::analyzer::usages::{
-    CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder, UsageHit,
+    CONFIDENCE_THRESHOLD, DEFAULT_MAX_FILES, FuzzyResult, RegexUsageAnalyzer, UsageFinder,
+    UsageHit, UsageAnalyzer,
 };
 use crate::analyzer::{CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::HashMap;
@@ -20,6 +21,7 @@ use crate::profiling;
 use crate::relevance::{most_important_project_files, most_relevant_project_files};
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use glob::Pattern;
+use glob::MatchOptions;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -29,6 +31,10 @@ use std::sync::Arc;
 
 const FILE_SEARCH_LIMIT: usize = 100;
 const FILE_SKIM_LIMIT: usize = 20;
+pub const SCAN_USAGES_RESPONSE_BUDGET_BYTES: usize = 24_000;
+const SCAN_USAGES_MAX_EXACT_CALLSITES: usize = 300;
+const SCAN_USAGES_SUMMARY_FILE_LIMIT: usize = 20;
+const SCAN_USAGES_TOP_ENCLOSING_LIMIT: usize = 10;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshParams {}
 
@@ -76,6 +82,8 @@ pub struct ScanUsagesParams {
     pub symbols: Vec<String>,
     #[serde(default)]
     pub include_tests: bool,
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,35 +274,65 @@ pub struct SkimFile {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanUsagesResult {
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub usages: Vec<SymbolUsages>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub not_found: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub fallbacks: Vec<UsageFallbackInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub failures: Vec<UsageFailureInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous: Vec<AmbiguousUsageSymbol>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub too_many_callsites: Vec<TooManyCallsitesInfo>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageRendering {
+    Full,
+    Lines,
+    Summary,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolUsages {
     pub symbol: String,
     pub total_hits: usize,
+    pub rendering: UsageRendering,
     /// True when the candidate file set exceeded the analyzer's per-query cap
     /// and an arbitrary subset was scanned. Results are partial when set.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub candidate_files_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_sites_excluded: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_truncated: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub top_enclosing: Vec<UsageEnclosingCount>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub files: Vec<UsageFileGroup>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageFileGroup {
     pub path: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub hits: Vec<UsageLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hit_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageLocation {
     pub line: usize,
     pub enclosing: String,
-    pub snippet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(skip_serializing_if = "is_full_confidence")]
     pub confidence: f64,
 }
 
@@ -303,10 +341,28 @@ pub struct AmbiguousUsageSymbol {
     pub symbol: String,
     pub short_name: String,
     pub candidate_targets: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub candidates: Vec<AmbiguousUsageCandidate>,
     /// True when the candidate file set exceeded the analyzer's per-query cap
     /// and an arbitrary subset was scanned. Results are partial when set.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub candidate_files_truncated: bool,
-    pub files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_sites_excluded: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AmbiguousUsageCandidate {
+    pub target: String,
+    pub total_hits: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageEnclosingCount {
+    pub enclosing: String,
+    pub hits: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -349,6 +405,8 @@ pub struct TooManyCallsitesInfo {
     pub short_name: String,
     pub total_callsites: usize,
     pub limit: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 pub fn refresh_result(analyzer: &dyn IAnalyzer) -> RefreshResult {
@@ -1050,10 +1108,11 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         .into_iter()
         .filter(|symbol| !symbol.trim().is_empty())
         .collect();
+    let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref());
 
     // Pre-compute the test-file set once when filtering tests so each per-symbol
     // UsageFinder can drop test files *before* the regex scan and the
-    // DEFAULT_MAX_USAGES cap. Filtering post-hoc would let test hits eat into
+    // scan_usages cap. Filtering post-hoc would let test hits eat into
     // the cap and turn production-only queries into TooManyCallsites errors.
     let test_files: Option<Arc<std::collections::HashSet<ProjectFile>>> = if params.include_tests {
         None
@@ -1072,6 +1131,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     let mut failures = Vec::new();
     let mut ambiguous = Vec::new();
     let mut too_many_callsites = Vec::new();
+    let mut render_states = Vec::new();
 
     for symbol in symbols {
         let overloads = match resolve_codeunit_fuzzy(analyzer, &symbol) {
@@ -1080,9 +1140,14 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 ambiguous.push(AmbiguousUsageSymbol {
                     symbol: symbol.clone(),
                     short_name: symbol,
-                    candidate_targets,
+                    candidate_targets: dedupe_preserving_order(candidate_targets),
+                    candidates: Vec::new(),
                     candidate_files_truncated: false,
-                    files: Vec::new(),
+                    definition_sites_excluded: None,
+                    note: Some(
+                        "Ambiguous; re-call with one fully qualified name from candidate_targets."
+                            .to_string(),
+                    ),
                 });
                 continue;
             }
@@ -1095,9 +1160,23 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
         let mut finder = UsageFinder::new();
         if let Some(test_files) = test_files.as_ref() {
             let test_files = Arc::clone(test_files);
-            finder = finder.with_file_filter(move |file| !test_files.contains(file));
+            let path_filter = path_filter.clone();
+            finder = finder.with_file_filter(move |file| {
+                !test_files.contains(file)
+                    && path_filter
+                        .as_ref()
+                        .map(|filter| filter.matches(file))
+                        .unwrap_or(true)
+            });
+        } else if let Some(path_filter) = path_filter.clone() {
+            finder = finder.with_file_filter(move |file| path_filter.matches(file));
         }
-        let query = finder.query(analyzer, &overloads, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES);
+        let query = finder.query(
+            analyzer,
+            &overloads,
+            DEFAULT_MAX_FILES,
+            SCAN_USAGES_MAX_EXACT_CALLSITES,
+        );
         let truncated = query.candidate_files_truncated;
         if let Some(diagnostic) = query.graph_fallback.as_ref() {
             fallbacks.push(UsageFallbackInfo {
@@ -1112,39 +1191,124 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
 
         match query.result {
             FuzzyResult::Success { hits_by_overload } => {
-                let hits: BTreeSet<UsageHit> = hits_by_overload
+                let hits: Vec<UsageHit> = hits_by_overload
                     .into_values()
                     .flat_map(BTreeSet::into_iter)
                     .collect();
-                // A resolved symbol with no call sites is still emitted with
-                // zero hits, so callers can distinguish "unknown symbol" (not_found)
-                // from "symbol exists but has no callers" (usages with total_hits = 0).
-                usages.push(SymbolUsages {
+                let mut base_note = None;
+                let mut filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
+                if filtered.hits.is_empty() && query.graph_fallback.is_none() {
+                    match RegexUsageAnalyzer::new().find_usages(
+                        analyzer,
+                        &overloads,
+                        &query.candidate_files,
+                        SCAN_USAGES_MAX_EXACT_CALLSITES,
+                    ) {
+                        FuzzyResult::Success { hits_by_overload }
+                        | FuzzyResult::Ambiguous {
+                            hits_by_overload, ..
+                        } => {
+                            let fallback_hits: Vec<UsageHit> = hits_by_overload
+                                .into_values()
+                                .flat_map(BTreeSet::into_iter)
+                                .collect();
+                            filtered = filter_and_dedupe_hits(analyzer, &overloads, fallback_hits);
+                            if !filtered.hits.is_empty() {
+                                fallbacks.push(UsageFallbackInfo {
+                                    symbol: symbol.clone(),
+                                    fq_name: overloads[0].fq_name(),
+                                    strategy: "RegexUsageAnalyzer".to_string(),
+                                    reason_kind: "zero_structured_hits".to_string(),
+                                    reason: "Structured usage analysis found no callers; regex fallback supplied text matches."
+                                        .to_string(),
+                                    fallback_policy: "regex".to_string(),
+                                });
+                            } else {
+                                base_note = Some(
+                                    "No callers found by graph or text scan. Callers in excluded scopes (tests, underscore-prefixed dirs, generated code) may not be visible to this tool."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        FuzzyResult::TooManyCallsites {
+                            short_name,
+                            total_callsites,
+                            limit,
+                        } => {
+                            too_many_callsites.push(TooManyCallsitesInfo {
+                                symbol,
+                                short_name,
+                                total_callsites,
+                                limit,
+                                note: Some(too_many_callsites_note(limit)),
+                            });
+                            continue;
+                        }
+                        FuzzyResult::Failure { .. } => {
+                            base_note = Some(
+                                "No callers found by graph or text scan. Callers in excluded scopes (tests, underscore-prefixed dirs, generated code) may not be visible to this tool."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+
+                render_states.push(SymbolUsageRenderState::new(
                     symbol,
-                    total_hits: hits.len(),
-                    candidate_files_truncated: truncated,
-                    files: group_hits_by_file(hits),
-                });
+                    truncated,
+                    filtered.definition_sites_excluded,
+                    filtered.hits,
+                    base_note,
+                ));
             }
             FuzzyResult::Ambiguous {
                 short_name,
                 candidate_targets,
                 hits_by_overload,
             } => {
-                let high_confidence: BTreeSet<UsageHit> = hits_by_overload
-                    .into_values()
-                    .flat_map(BTreeSet::into_iter)
-                    .filter(|hit| hit.confidence >= CONFIDENCE_THRESHOLD)
-                    .collect();
+                let deduped_targets = dedupe_preserving_order(
+                    candidate_targets
+                        .iter()
+                        .map(|code_unit| code_unit.fq_name())
+                        .collect(),
+                );
+                let mut candidates = Vec::new();
+                let mut definition_sites_excluded = 0usize;
+                for target in &deduped_targets {
+                    let grouped_overloads: Vec<CodeUnit> = candidate_targets
+                        .iter()
+                        .filter(|code_unit| code_unit.fq_name() == *target)
+                        .cloned()
+                        .collect();
+                    let grouped_hits: Vec<UsageHit> = grouped_overloads
+                        .iter()
+                        .flat_map(|code_unit| {
+                            hits_by_overload
+                                .get(code_unit)
+                                .into_iter()
+                                .flat_map(|hits| hits.iter().cloned())
+                        })
+                        .filter(|hit| hit.confidence >= CONFIDENCE_THRESHOLD)
+                        .collect();
+                    let filtered =
+                        filter_and_dedupe_hits(analyzer, &grouped_overloads, grouped_hits);
+                    definition_sites_excluded += filtered.definition_sites_excluded;
+                    candidates.push(AmbiguousUsageCandidate {
+                        target: target.clone(),
+                        total_hits: filtered.hits.len(),
+                    });
+                }
                 ambiguous.push(AmbiguousUsageSymbol {
                     symbol,
                     short_name,
-                    candidate_targets: candidate_targets
-                        .into_iter()
-                        .map(|code_unit| code_unit.fq_name())
-                        .collect(),
+                    candidate_targets: deduped_targets,
+                    candidates,
                     candidate_files_truncated: truncated,
-                    files: group_hits_by_file(high_confidence),
+                    definition_sites_excluded: some_if_nonzero(definition_sites_excluded),
+                    note: Some(
+                        "Ambiguous; re-call with one fully qualified name from candidate_targets."
+                            .to_string(),
+                    ),
                 });
             }
             FuzzyResult::Failure { fq_name, reason } => {
@@ -1172,10 +1336,13 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     short_name,
                     total_callsites,
                     limit,
+                    note: Some(too_many_callsites_note(limit)),
                 });
             }
         }
     }
+
+    usages = render_scan_usages_with_budget(render_states);
 
     ScanUsagesResult {
         usages,
@@ -1187,33 +1354,457 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
     }
 }
 
-fn group_hits_by_file(hits: BTreeSet<UsageHit>) -> Vec<UsageFileGroup> {
-    let mut grouped: BTreeMap<ProjectFile, Vec<UsageLocation>> = BTreeMap::new();
+#[derive(Debug, Clone)]
+struct FilteredUsageHits {
+    hits: Vec<UsageHitRow>,
+    definition_sites_excluded: usize,
+}
+
+#[derive(Debug, Clone)]
+struct UsageHitRow {
+    path: String,
+    line: usize,
+    enclosing: String,
+    snippet: String,
+    confidence: f64,
+}
+
+#[derive(Debug, Clone)]
+struct SummaryFileCount {
+    path: String,
+    hits: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SymbolUsageRenderState {
+    symbol: String,
+    total_hits: usize,
+    candidate_files_truncated: bool,
+    definition_sites_excluded: usize,
+    hits: Vec<UsageHitRow>,
+    summary_files: Vec<SummaryFileCount>,
+    top_enclosing: Vec<UsageEnclosingCount>,
+    base_note: Option<String>,
+    rendering: UsageRendering,
+    file_limit: Option<usize>,
+    top_enclosing_limit: usize,
+}
+
+impl SymbolUsageRenderState {
+    fn new(
+        symbol: String,
+        candidate_files_truncated: bool,
+        definition_sites_excluded: usize,
+        hits: Vec<UsageHitRow>,
+        base_note: Option<String>,
+    ) -> Self {
+        let total_hits = hits.len();
+        let rendering = if total_hits <= 10 {
+            UsageRendering::Full
+        } else if total_hits <= 100 {
+            UsageRendering::Lines
+        } else {
+            UsageRendering::Summary
+        };
+        let mut file_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut enclosing_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for hit in &hits {
+            *file_counts.entry(hit.path.clone()).or_default() += 1;
+            *enclosing_counts.entry(hit.enclosing.clone()).or_default() += 1;
+        }
+        let mut summary_files: Vec<SummaryFileCount> = file_counts
+            .into_iter()
+            .map(|(path, hits)| SummaryFileCount { path, hits })
+            .collect();
+        summary_files.sort_by(|left, right| {
+            right
+                .hits
+                .cmp(&left.hits)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let mut top_enclosing: Vec<UsageEnclosingCount> = enclosing_counts
+            .into_iter()
+            .map(|(enclosing, hits)| UsageEnclosingCount { enclosing, hits })
+            .collect();
+        top_enclosing.sort_by(|left, right| {
+            right
+                .hits
+                .cmp(&left.hits)
+                .then_with(|| left.enclosing.cmp(&right.enclosing))
+        });
+
+        Self {
+            symbol,
+            total_hits,
+            candidate_files_truncated,
+            definition_sites_excluded,
+            hits,
+            summary_files,
+            top_enclosing,
+            base_note,
+            rendering,
+            file_limit: None,
+            top_enclosing_limit: SCAN_USAGES_TOP_ENCLOSING_LIMIT,
+        }
+    }
+}
+
+fn filter_and_dedupe_hits(
+    analyzer: &dyn IAnalyzer,
+    overloads: &[CodeUnit],
+    hits: Vec<UsageHit>,
+) -> FilteredUsageHits {
+    let mut definition_ranges: BTreeMap<ProjectFile, Vec<Range>> = BTreeMap::new();
+    for overload in overloads {
+        definition_ranges
+            .entry(overload.source().clone())
+            .or_default()
+            .extend(analyzer.ranges_of(overload));
+    }
+
+    let mut rows: BTreeMap<(String, usize, String), UsageHitRow> = BTreeMap::new();
+    let mut definition_sites_excluded = 0usize;
+    for hit in hits {
+        if definition_ranges
+            .get(&hit.file)
+            .is_some_and(|ranges| ranges.iter().any(|range| ranges_overlap(range, &hit)))
+        {
+            definition_sites_excluded += 1;
+            continue;
+        }
+
+        let path = rel_path_string(&hit.file);
+        let enclosing = hit.enclosing.fq_name();
+        let row = UsageHitRow {
+            path: path.clone(),
+            line: hit.line,
+            enclosing: enclosing.clone(),
+            snippet: hit.snippet.trim_end().to_string(),
+            confidence: hit.confidence,
+        };
+        let key = (path, hit.line, enclosing);
+        rows.entry(key)
+            .and_modify(|existing| {
+                if row.confidence > existing.confidence
+                    || (row.confidence == existing.confidence
+                        && row.snippet.len() > existing.snippet.len())
+                {
+                    *existing = row.clone();
+                }
+            })
+            .or_insert(row);
+    }
+
+    let mut hits: Vec<_> = rows.into_values().collect();
+    hits.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.enclosing.cmp(&right.enclosing))
+    });
+
+    FilteredUsageHits {
+        hits,
+        definition_sites_excluded,
+    }
+}
+
+fn ranges_overlap(range: &Range, hit: &UsageHit) -> bool {
+    range.start_byte < hit.end_offset && hit.start_offset < range.end_byte
+}
+
+fn render_scan_usages_with_budget(states: Vec<SymbolUsageRenderState>) -> Vec<SymbolUsages> {
+    let mut states = states;
+    loop {
+        let rendered: Vec<SymbolUsages> = states.iter().map(render_symbol_usages).collect();
+        let result = ScanUsagesResult {
+            usages: rendered.clone(),
+            not_found: Vec::new(),
+            fallbacks: Vec::new(),
+            failures: Vec::new(),
+            ambiguous: Vec::new(),
+            too_many_callsites: Vec::new(),
+        };
+        if serde_json::to_string(&result)
+            .map(|text| text.len() <= SCAN_USAGES_RESPONSE_BUDGET_BYTES)
+            .unwrap_or(true)
+        {
+            return rendered;
+        }
+
+        if !demote_largest_symbol(&mut states) && !truncate_largest_summary_symbol(&mut states) {
+            return states.iter().map(render_symbol_usages).collect();
+        }
+    }
+}
+
+fn demote_largest_symbol(states: &mut [SymbolUsageRenderState]) -> bool {
+    let any_full = states.iter().any(|state| state.rendering == UsageRendering::Full);
+    let mut best_index = None;
+    let mut best_size = 0usize;
+    for (idx, state) in states.iter().enumerate() {
+        let eligible = match state.rendering {
+            UsageRendering::Full => true,
+            UsageRendering::Lines => !any_full,
+            UsageRendering::Summary => false,
+        };
+        if !eligible {
+            continue;
+        }
+        let size = serialized_len(&render_symbol_usages(state));
+        if size > best_size {
+            best_size = size;
+            best_index = Some(idx);
+        }
+    }
+    let Some(idx) = best_index else {
+        return false;
+    };
+    states[idx].rendering = match states[idx].rendering {
+        UsageRendering::Full => UsageRendering::Lines,
+        UsageRendering::Lines => UsageRendering::Summary,
+        UsageRendering::Summary => UsageRendering::Summary,
+    };
+    true
+}
+
+fn truncate_largest_summary_symbol(states: &mut [SymbolUsageRenderState]) -> bool {
+    let mut best_index = None;
+    let mut best_size = 0usize;
+    for (idx, state) in states.iter().enumerate() {
+        if state.rendering != UsageRendering::Summary {
+            continue;
+        }
+        let can_limit_files = state.summary_files.len()
+            > state.file_limit.unwrap_or(SCAN_USAGES_SUMMARY_FILE_LIMIT);
+        let can_reduce_files = state.file_limit.is_some_and(|limit| limit > 1);
+        let can_reduce_enclosing = state.top_enclosing_limit > 0;
+        if !(can_limit_files || can_reduce_files || can_reduce_enclosing) {
+            continue;
+        }
+        let size = serialized_len(&render_symbol_usages(state));
+        if size > best_size {
+            best_size = size;
+            best_index = Some(idx);
+        }
+    }
+    let Some(idx) = best_index else {
+        return false;
+    };
+    let state = &mut states[idx];
+    if state.file_limit.is_none() && state.summary_files.len() > SCAN_USAGES_SUMMARY_FILE_LIMIT {
+        state.file_limit = Some(SCAN_USAGES_SUMMARY_FILE_LIMIT);
+        return true;
+    }
+    if let Some(limit) = state.file_limit {
+        if limit > 1 {
+            state.file_limit = Some((limit / 2).max(1));
+            return true;
+        }
+    }
+    if state.top_enclosing_limit > 0 {
+        state.top_enclosing_limit /= 2;
+        return true;
+    }
+    false
+}
+
+fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
+    let (files, files_truncated, top_enclosing) = match state.rendering {
+        UsageRendering::Full => (
+            render_usage_file_groups(&state.hits, true),
+            None,
+            Vec::new(),
+        ),
+        UsageRendering::Lines => (
+            render_usage_file_groups(&state.hits, false),
+            None,
+            Vec::new(),
+        ),
+        UsageRendering::Summary => {
+            let limit = state.file_limit.unwrap_or(state.summary_files.len());
+            let kept = state
+                .summary_files
+                .iter()
+                .take(limit)
+                .map(|item| UsageFileGroup {
+                    path: item.path.clone(),
+                    hits: Vec::new(),
+                    hit_count: Some(item.hits),
+                })
+                .collect::<Vec<_>>();
+            let truncated = state.summary_files.len().saturating_sub(kept.len());
+            (
+                kept,
+                some_if_nonzero(truncated),
+                state.top_enclosing
+                    .iter()
+                    .take(state.top_enclosing_limit)
+                    .cloned()
+                    .collect(),
+            )
+        }
+    };
+
+    let mut notes = Vec::new();
+    if let Some(base) = state.base_note.clone() {
+        notes.push(base);
+    }
+    match state.rendering {
+        UsageRendering::Full => {}
+        UsageRendering::Lines => notes.push(format!(
+            "{} hits; showing line-level callers without snippets. Re-call with a single symbol or narrower scope for snippet detail.",
+            state.total_hits
+        )),
+        UsageRendering::Summary => notes.push(format!(
+            "{} hits; showing per-file counts. Re-call with a single symbol or narrower scope for line detail.",
+            state.total_hits
+        )),
+    }
+    if files_truncated.is_some() {
+        notes.push("Summary file list truncated to fit the response budget.".to_string());
+    }
+
+    SymbolUsages {
+        symbol: state.symbol.clone(),
+        total_hits: state.total_hits,
+        rendering: state.rendering,
+        candidate_files_truncated: state.candidate_files_truncated,
+        definition_sites_excluded: some_if_nonzero(state.definition_sites_excluded),
+        files_truncated,
+        note: if notes.is_empty() {
+            None
+        } else {
+            Some(notes.join(" "))
+        },
+        top_enclosing,
+        files,
+    }
+}
+
+fn render_usage_file_groups(hits: &[UsageHitRow], include_snippets: bool) -> Vec<UsageFileGroup> {
+    let mut grouped: BTreeMap<String, Vec<UsageLocation>> = BTreeMap::new();
     for hit in hits {
         grouped
-            .entry(hit.file.clone())
+            .entry(hit.path.clone())
             .or_default()
             .push(UsageLocation {
                 line: hit.line,
-                enclosing: hit.enclosing.fq_name(),
-                snippet: hit.snippet.trim_end().to_string(),
+                enclosing: hit.enclosing.clone(),
+                snippet: include_snippets.then(|| hit.snippet.clone()),
                 confidence: hit.confidence,
             });
     }
     grouped
         .into_iter()
-        .map(|(file, mut hits)| {
+        .map(|(path, mut hits)| {
             hits.sort_by(|left, right| {
                 left.line
                     .cmp(&right.line)
                     .then_with(|| left.enclosing.cmp(&right.enclosing))
             });
             UsageFileGroup {
-                path: rel_path_string(&file),
+                path,
                 hits,
+                hit_count: None,
             }
         })
         .collect()
+}
+
+#[derive(Debug, Clone)]
+struct ScanUsagesPathFilter {
+    rules: Vec<ScanUsagesPathRule>,
+}
+
+#[derive(Debug, Clone)]
+enum ScanUsagesPathRule {
+    Glob(Pattern),
+    Exact(String),
+}
+
+impl ScanUsagesPathFilter {
+    fn matches(&self, file: &ProjectFile) -> bool {
+        let rel = rel_path_string(file);
+        self.rules.iter().any(|rule| match rule {
+            ScanUsagesPathRule::Glob(glob) => glob.matches_with(&rel, strict_separator_options()),
+            ScanUsagesPathRule::Exact(path) => rel == *path,
+        })
+    }
+}
+
+fn build_scan_usages_path_filter(
+    analyzer: &dyn IAnalyzer,
+    paths: Option<&[String]>,
+) -> Option<ScanUsagesPathFilter> {
+    let paths = paths?;
+    let resolver = WorkspaceFileResolver::new(analyzer.project());
+    let mut rules = Vec::new();
+    for raw in paths {
+        let normalized = normalize_pattern(raw.trim());
+        if normalized.is_empty() {
+            continue;
+        }
+        if is_glob_pattern(&normalized) {
+            if let Ok(glob) = Pattern::new(&normalized) {
+                rules.push(ScanUsagesPathRule::Glob(glob));
+            }
+            continue;
+        }
+        match resolver.resolve_literal(&normalized) {
+            ResolvedFileInput::File(file) => {
+                rules.push(ScanUsagesPathRule::Exact(rel_path_string(&file)));
+            }
+            ResolvedFileInput::Ambiguous(item) => {
+                rules.extend(
+                    item.matches
+                        .into_iter()
+                        .map(ScanUsagesPathRule::Exact),
+                );
+            }
+            ResolvedFileInput::NotFound(_) => {
+                rules.push(ScanUsagesPathRule::Exact(normalized));
+            }
+        }
+    }
+    (!rules.is_empty()).then_some(ScanUsagesPathFilter { rules })
+}
+
+fn strict_separator_options() -> MatchOptions {
+    MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    }
+}
+
+fn serialized_len<T: Serialize>(value: &T) -> usize {
+    serde_json::to_string(value).map(|text| text.len()).unwrap_or(0)
+}
+
+fn dedupe_preserving_order(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            deduped.push(value);
+        }
+    }
+    deduped
+}
+
+fn some_if_nonzero(value: usize) -> Option<usize> {
+    (value > 0).then_some(value)
+}
+
+fn too_many_callsites_note(limit: usize) -> String {
+    format!(
+        "Stopped after {limit} callsites. Re-call with a single symbol or narrower paths for detail."
+    )
+}
+
+fn is_full_confidence(confidence: &f64) -> bool {
+    (*confidence - 1.0).abs() < f64::EPSILON
 }
 
 fn rank_search_symbol_candidates(

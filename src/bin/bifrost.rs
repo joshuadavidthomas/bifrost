@@ -126,8 +126,8 @@ fn run_tool(
             structured,
             rendered_text,
         } => rendered_text.unwrap_or_else(|| {
-            serde_json::to_string_pretty(&structured)
-                .unwrap_or_else(|_| "Failed to pretty-print tool result".to_string())
+            serde_json::to_string(&structured)
+                .unwrap_or_else(|_| "Failed to serialize tool result".to_string())
         }),
     };
     print!("{text}");
