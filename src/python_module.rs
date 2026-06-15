@@ -14,10 +14,17 @@ pub struct SearchToolsNativeSession {
 #[pymethods]
 impl SearchToolsNativeSession {
     #[new]
-    fn new(py: Python<'_>, root: &str) -> PyResult<Self> {
+    #[pyo3(signature = (root, manual=false))]
+    fn new(py: Python<'_>, root: &str, manual: bool) -> PyResult<Self> {
         let root = PathBuf::from(root);
         let service = py
-            .allow_threads(|| SearchToolsService::new_for_python(root))
+            .allow_threads(|| {
+                if manual {
+                    SearchToolsService::new_for_python_manual(root)
+                } else {
+                    SearchToolsService::new_for_python(root)
+                }
+            })
             .map_err(PyRuntimeError::new_err)?;
         Ok(Self { inner: service })
     }

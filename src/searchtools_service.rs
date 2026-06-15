@@ -288,6 +288,12 @@ impl ToolOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateStrategy {
     WatchFiles,
+    /// No background file watcher; the caller drives updates explicitly via the
+    /// incremental `update_paths` tool. Used by batch consumers (e.g. the localizer
+    /// embedding pipeline) that check out successive revisions into one worktree and
+    /// know exactly which files changed -- avoiding a whole-tree watcher and a full
+    /// re-analysis per revision.
+    Manual,
 }
 
 pub struct SearchToolsService {
@@ -358,6 +364,13 @@ impl SearchToolsService {
         Self::new_with_strategy(root, UpdateStrategy::WatchFiles, false)
     }
 
+    /// Construct with no file watcher and no semantic indexer: the caller drives
+    /// updates via the incremental `update_paths` tool. For batch consumers that
+    /// re-use one session across many revisions of one worktree.
+    pub fn new_for_python_manual(root: PathBuf) -> Result<Self, String> {
+        Self::new_with_strategy(root, UpdateStrategy::Manual, false)
+    }
+
     pub fn call_tool_json(
         &self,
         name: &str,
@@ -409,6 +422,7 @@ impl SearchToolsService {
         // explicitly, activate replaces the whole workspace, and get is cheap.
         match name {
             "refresh" => return self.handle_refresh(arguments),
+            "update_paths" => return self.handle_update_paths(arguments),
             "activate_workspace" => return self.handle_activate_workspace(arguments),
             "get_active_workspace" => return self.handle_get_active_workspace(arguments),
             _ => {}
@@ -635,6 +649,34 @@ impl SearchToolsService {
         Self::structured_only(refresh_result(session.snapshot.analyzer()))
     }
 
+    /// Incrementally re-analyze exactly the given project-relative paths, reusing the
+    /// existing analysis for every other file. Unlike `refresh` (which rebuilds the
+    /// whole project), this is O(changed files) and is how a caller that knows what
+    /// changed (e.g. between two checked-out revisions) drives updates cheaply.
+    fn handle_update_paths(&self, arguments: Value) -> Result<ToolOutput, SearchToolsServiceError> {
+        let paths: Vec<String> = arguments
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut guard = self.write_session()?;
+        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
+        let root = session.snapshot.analyzer().project().root().to_path_buf();
+        let changed: BTreeSet<ProjectFile> = paths
+            .iter()
+            .map(|rel| ProjectFile::new(root.clone(), rel.as_str()))
+            .collect();
+        if !changed.is_empty() {
+            let next = session.snapshot.update(&changed);
+            session.snapshot = Arc::new(next);
+        }
+        Self::structured_only(refresh_result(session.snapshot.analyzer()))
+    }
+
     fn handle_activate_workspace(
         &self,
         arguments: Value,
@@ -713,6 +755,7 @@ impl SearchToolsService {
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
         match self.update_strategy {
             UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
+            UpdateStrategy::Manual => {}
         }
         Ok(Arc::clone(&session.snapshot))
     }
@@ -726,6 +769,7 @@ impl SearchToolsService {
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
         match self.update_strategy {
             UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
+            UpdateStrategy::Manual => {}
         }
         Ok((Arc::clone(&session.snapshot), session.semantic.clone()))
     }
@@ -985,6 +1029,7 @@ fn maybe_start_watcher(
 ) -> Option<ProjectChangeWatcher> {
     match update_strategy {
         UpdateStrategy::WatchFiles => ProjectChangeWatcher::start(project).ok(),
+        UpdateStrategy::Manual => None,
     }
 }
 

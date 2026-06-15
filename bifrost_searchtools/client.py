@@ -62,7 +62,11 @@ class SearchToolsClient:
         root: Path | str,
         library_path: Path | str | None = None,
         render_line_numbers: bool = True,
+        manual: bool = False,
     ) -> None:
+        # manual=True: no file watcher; caller drives incremental updates via
+        # update_paths(). For batch consumers reusing one session across revisions.
+        self._manual = manual
         self.root = Path(root).expanduser().resolve()
         self._library_path = (
             Path(library_path).expanduser().resolve() if library_path is not None else None
@@ -96,6 +100,12 @@ class SearchToolsClient:
 
     def refresh(self) -> dict[str, Any]:
         return self._call_tool("refresh", {})
+
+    def update_paths(self, paths: list[str]) -> dict[str, Any]:
+        """Incrementally re-analyze only the given project-relative paths (O(changed)),
+        reusing analysis for all other files. Pair with a `manual` client whose worktree
+        has been updated to a new revision."""
+        return self._call_tool("update_paths", {"paths": list(paths)})
 
     def search_symbols(
         self,
@@ -318,7 +328,7 @@ class SearchToolsClient:
                 return self._runtime
 
             try:
-                native = self._native.SearchToolsNativeSession(str(self.root))
+                native = self._native.SearchToolsNativeSession(str(self.root), self._manual)
             except Exception as exc:
                 raise SearchToolsError(
                     f"Failed to start the bifrost native session: {exc}"
