@@ -13,6 +13,7 @@ use crate::{
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
     },
+    get_summaries_output::fit_get_summaries_output_to_budget,
     git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
@@ -383,10 +384,13 @@ impl SearchToolsService {
             ),
             "get_summaries" => Self::decode_render_and_run(
                 &snapshot,
-                arguments,
+                arguments.clone(),
                 render_options,
                 |workspace, params| get_summaries(workspace.analyzer(), params),
-            ),
+            )
+            .and_then(|output| {
+                fit_get_summaries_output_to_budget(self, output, &arguments, render_options)
+            }),
             "list_symbols" => Self::decode_render_and_run(
                 &snapshot,
                 arguments,
