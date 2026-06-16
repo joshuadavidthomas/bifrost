@@ -4,7 +4,9 @@ use crate::analyzer::usages::js_ts_graph::extractor::{
     compute_export_index, compute_import_binder,
 };
 use crate::analyzer::usages::model::{ExportIndex, ImportBinder};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, resolve_js_ts_module_specifier};
+use crate::analyzer::{
+    AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_js_ts_module_specifier,
+};
 use crate::hash::{HashMap, map_with_capacity};
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -16,9 +18,12 @@ use tree_sitter::{Parser, Tree};
 pub(super) struct ParsedFile {
     pub(super) source: Arc<String>,
     pub(super) tree: Tree,
+    /// Byte offsets of each line start, computed once at parse time so the
+    /// inverted edge scan can attribute references to lines without recomputing.
+    pub(super) line_starts: Vec<usize>,
 }
 
-pub(super) struct JsTsProjectGraph {
+pub(crate) struct JsTsProjectGraph {
     /// Parsed source + tree per file. Reused by the scan phase to avoid double parsing.
     pub(super) parsed: HashMap<ProjectFile, ParsedFile>,
     pub(super) usage_graph: ProjectUsageGraph,
@@ -46,11 +51,13 @@ pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) ->
             let tree = parser.parse(source.as_str(), None)?;
             let exports = compute_export_index(&source, &tree);
             let binder = compute_import_binder(&source, &tree);
+            let line_starts = crate::text_utils::compute_line_starts(&source);
             Some((
                 file.clone(),
                 ParsedFile {
                     source: Arc::new(source),
                     tree,
+                    line_starts,
                 },
                 exports,
                 binder,
@@ -70,11 +77,14 @@ pub(super) fn build_js_ts_graph(analyzer: &dyn IAnalyzer, language: Language) ->
         binders_by_file.insert(file, binder);
     }
 
+    let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
     let usage_graph = ProjectUsageGraph::build(
         files,
         exports_by_file,
         &binders_by_file,
-        |file, module_specifier| resolve_js_ts_module_specifier(file, module_specifier, language),
+        |file, module_specifier| {
+            resolve_js_ts_module_specifier(file, module_specifier, language, Some(&aliases))
+        },
     );
 
     JsTsProjectGraph {
