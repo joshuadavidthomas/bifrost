@@ -166,7 +166,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
-            "get_definition",
+            "get_definition_by_location",
             "usage_graph",
             "refresh",
             "activate_workspace",
@@ -203,7 +203,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
-            "get_definition",
+            "get_definition_by_location",
             "usage_graph",
             "semantic_search",
             "refresh",
@@ -669,7 +669,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
         "get_symbol_sources",
         "get_summaries",
         "scan_usages",
-        "get_definition",
+        "get_definition_by_location",
         "usage_graph",
     ];
     #[cfg(feature = "nlp")]
@@ -677,6 +677,18 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
     core_expected.extend(["refresh", "activate_workspace", "get_active_workspace"]);
 
     assert_server_tool_names(&fixture_root, "core", &core_expected);
+    assert_unknown_tool(
+        &fixture_root,
+        "core",
+        "get_definition_by_reference",
+        json!({
+            "references": [{
+                "path": "A.java",
+                "context": "class A",
+                "target": "A"
+            }]
+        }),
+    );
     assert_server_tool_names(
         &fixture_root,
         "workspace|symbol",
@@ -688,7 +700,7 @@ fn bifrost_split_servers_publish_expected_tool_sets() {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
-            "get_definition",
+            "get_definition_by_location",
             "usage_graph",
         ],
     );
@@ -997,6 +1009,46 @@ fn bifrost_searchtools_server_can_hide_line_numbers_in_text_preview() {
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
+    let list_tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 10, "method": "tools/list" }),
+    );
+    let names = tool_names(
+        list_tools["result"]["tools"]
+            .as_array()
+            .expect("tools array"),
+    );
+    assert!(names.contains(&"get_definition_by_reference"), "{names:?}");
+    assert!(!names.contains(&"get_definition_by_location"), "{names:?}");
+
+    let unavailable_location_tool = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "get_definition_by_location",
+                "arguments": {
+                    "references": [{
+                        "path": "A.java",
+                        "line": 1,
+                        "column": 1
+                    }]
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        unavailable_location_tool["result"]["content"][0]["text"],
+        "Unknown tool: get_definition_by_location",
+        "{unavailable_location_tool}"
+    );
+
     let summaries = round_trip(
         &mut stdin,
         &mut reader,
@@ -1044,6 +1096,46 @@ fn bifrost_core_server_can_hide_line_numbers_in_text_preview() {
     let mut reader = BufReader::new(stdout);
 
     initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let list_tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 10, "method": "tools/list" }),
+    );
+    let names = tool_names(
+        list_tools["result"]["tools"]
+            .as_array()
+            .expect("tools array"),
+    );
+    assert!(names.contains(&"get_definition_by_reference"), "{names:?}");
+    assert!(!names.contains(&"get_definition_by_location"), "{names:?}");
+
+    let unavailable_location_tool = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "get_definition_by_location",
+                "arguments": {
+                    "references": [{
+                        "path": "A.java",
+                        "line": 1,
+                        "column": 1
+                    }]
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        unavailable_location_tool["result"]["content"][0]["text"],
+        "Unknown tool: get_definition_by_location",
+        "{unavailable_location_tool}"
+    );
 
     let summaries = round_trip(
         &mut stdin,

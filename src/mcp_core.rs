@@ -9,7 +9,7 @@ pub fn run_core_stdio_server(
     root: PathBuf,
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
-    let spec = crate::mcp_registry::resolve_server_spec("core")?;
+    let spec = crate::mcp_registry::resolve_server_spec_for_render_options("core", render_options)?;
     run_stdio_server(root, render_options, &spec)
 }
 
@@ -17,11 +17,18 @@ pub fn run_searchtools_stdio_server(
     root: PathBuf,
     render_options: McpRenderOptions,
 ) -> Result<(), String> {
-    let spec = crate::mcp_registry::resolve_server_spec("searchtools")?;
+    let spec =
+        crate::mcp_registry::resolve_server_spec_for_render_options("searchtools", render_options)?;
     run_stdio_server(root, render_options, &spec)
 }
 
-pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
+pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
+    let definition_descriptor = if render_line_numbers {
+        get_definition_by_location_descriptor()
+    } else {
+        get_definition_by_reference_descriptor()
+    };
+
     vec![
         tool_descriptor(
             "search_symbols",
@@ -84,58 +91,7 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
                 "required": ["symbols"]
             }),
         ),
-        tool_descriptor(
-            "get_definition",
-            "Resolve source reference sites back to workspace definition metadata. Use when you know a file and source location and need usage-to-definition navigation without building the whole usage_graph. Results distinguish resolved definitions from no_definition, unresolvable_import_boundary, ambiguous, unsupported_language, invalid_location, and not_found states.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "references": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "path": {
-                                    "type": "string",
-                                    "description": "Project-relative source file path containing the reference."
-                                },
-                                "line": {
-                                    "type": "integer",
-                                    "minimum": 1,
-                                    "description": "1-based line containing the reference. Use with column when byte offsets are not available."
-                                },
-                                "column": {
-                                    "type": "integer",
-                                    "minimum": 1,
-                                    "description": "1-based column containing the reference token."
-                                },
-                                "start_byte": {
-                                    "type": "integer",
-                                    "minimum": 0,
-                                    "description": "0-based byte offset at or inside the reference token."
-                                },
-                                "end_byte": {
-                                    "type": "integer",
-                                    "minimum": 0,
-                                    "description": "Optional exclusive byte end offset for a selected reference range."
-                                },
-                                "symbol": {
-                                    "type": "string",
-                                    "description": "Optional disambiguating symbol name. The location remains the primary lookup input."
-                                }
-                            },
-                            "required": ["path"]
-                        }
-                    },
-                    "include_tests": {
-                        "type": "boolean",
-                        "default": false,
-                        "description": "Allow reference lookups inside detected test files."
-                    }
-                },
-                "required": ["references"]
-            }),
-        ),
+        definition_descriptor,
         tool_descriptor(
             "usage_graph",
             "Return the whole-workspace caller->callee reference graph in one call: classes and functions as nodes, resolved references as weighted edges. Use to build a code map or rank symbols by importance (e.g. PageRank) instead of issuing one scan_usages call per symbol. Edges reuse scan_usages resolution; symbols whose call sites exceed the enumeration guardrail are listed under truncated_symbols with their inbound edges omitted.",
@@ -156,6 +112,96 @@ pub(crate) fn symbol_tool_descriptors() -> Vec<Value> {
             }),
         ),
     ]
+}
+
+fn get_definition_by_location_descriptor() -> Value {
+    tool_descriptor(
+        "get_definition_by_location",
+        "Resolve source reference sites back to workspace definition metadata from exact line/column or byte locations. Use when line numbers are visible and you need usage-to-definition navigation without building the whole usage_graph.",
+        json!({
+            "type": "object",
+            "properties": {
+                "references": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Project-relative source file path containing the reference."
+                            },
+                            "line": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "1-based line containing the reference. Use with column when byte offsets are not available."
+                            },
+                            "column": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "1-based character column containing the reference token."
+                            },
+                            "start_byte": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "0-based byte offset at or inside the reference token."
+                            },
+                            "end_byte": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "description": "Optional exclusive byte end offset for a selected reference range."
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                },
+                "include_tests": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Allow reference lookups inside detected test files."
+                }
+            },
+            "required": ["references"]
+        }),
+    )
+}
+
+fn get_definition_by_reference_descriptor() -> Value {
+    tool_descriptor(
+        "get_definition_by_reference",
+        "Resolve source reference sites back to workspace definition metadata from copied source context and a target token. Use when line numbers are hidden or unreliable. If repeated target occurrences in the context resolve differently, the result is ambiguous.",
+        json!({
+            "type": "object",
+            "properties": {
+                "references": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Project-relative source file path containing the reference."
+                            },
+                            "context": {
+                                "type": "string",
+                                "description": "Exact source text copied from the file around the reference."
+                            },
+                            "target": {
+                                "type": "string",
+                                "description": "Exact reference text to resolve inside the context."
+                            }
+                        },
+                        "required": ["path", "context", "target"]
+                    }
+                },
+                "include_tests": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Allow reference lookups inside detected test files."
+                }
+            },
+            "required": ["references"]
+        }),
+    )
 }
 
 pub(crate) fn workspace_tool_descriptors() -> Vec<Value> {

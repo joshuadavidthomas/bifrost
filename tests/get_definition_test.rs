@@ -2,15 +2,24 @@ mod common;
 
 use brokk_bifrost::{Language, SearchToolsService};
 use common::InlineTestProject;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn lookup(root: &std::path::Path, args: &str) -> Value {
     let service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
         .expect("failed to build searchtools service");
     let payload = service
-        .call_tool_json("get_definition", args)
-        .expect("get_definition call failed");
-    serde_json::from_str(&payload).expect("get_definition returned invalid JSON")
+        .call_tool_json("get_definition_by_location", args)
+        .expect("get_definition_by_location call failed");
+    serde_json::from_str(&payload).expect("get_definition_by_location returned invalid JSON")
+}
+
+fn lookup_reference(root: &std::path::Path, args: &str) -> Value {
+    let service = SearchToolsService::new_without_semantic_index(root.to_path_buf())
+        .expect("failed to build searchtools service");
+    let payload = service
+        .call_tool_json("get_definition_by_reference", args)
+        .expect("get_definition_by_reference call failed");
+    serde_json::from_str(&payload).expect("get_definition_by_reference returned invalid JSON")
 }
 
 fn column_of(line: &str, needle: &str) -> usize {
@@ -57,9 +66,129 @@ pub fn format_value() {}
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["reference"]["text"], "format_value", "{value}");
+    assert_eq!(result["reference"]["target"], "format_value", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "format_value", "{value}");
     assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+}
+
+#[test]
+fn rust_reference_context_resolves_target_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod util;
+use crate::util::helper;
+
+pub fn run() {
+    let value = helper();
+}
+"#,
+        )
+        .file("util.rs", "pub fn helper() {}\n")
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "path": "lib.rs",
+                "context": "let value = helper();",
+                "target": "helper"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert!(
+        result.as_object().unwrap().get("reference").is_none(),
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+}
+
+#[test]
+fn rust_reference_context_collapses_repeated_targets_with_same_definition() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod util;
+use crate::util::helper;
+
+pub fn run() {
+    helper(); helper();
+}
+"#,
+        )
+        .file("util.rs", "pub fn helper() {}\n")
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "path": "lib.rs",
+                "context": "helper(); helper();",
+                "target": "helper"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
+}
+
+#[test]
+fn rust_reference_context_reports_ambiguous_when_targets_resolve_differently() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod util;
+
+fn helper() {}
+
+pub fn run() {
+    crate::util::helper(); helper();
+}
+"#,
+        )
+        .file("util.rs", "pub fn helper() {}\n")
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "path": "lib.rs",
+                "context": "crate::util::helper(); helper();",
+                "target": "helper"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().unwrap().len(),
+        2,
+        "{value}"
+    );
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "ambiguous_reference_target",
+        "{value}"
+    );
 }
 
 #[test]
@@ -90,7 +219,7 @@ pub fn run() {
 
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["reference"]["text"], "helper", "{value}");
+    assert_eq!(result["reference"]["target"], "helper", "{value}");
     assert_eq!(result["definitions"][0]["path"], "util.rs", "{value}");
 }
 

@@ -1,16 +1,26 @@
-use crate::mcp_common::{McpServerSpec, SEARCHTOOLS_INSTRUCTIONS, build_server_spec_with_hidden};
+use crate::mcp_common::{
+    McpRenderOptions, McpServerSpec, SEARCHTOOLS_INSTRUCTIONS, build_server_spec_with_hidden,
+};
 use serde_json::Value;
 use std::collections::HashSet;
 
 const SEARCHTOOLS_ORDER: &[&str] = &["symbol", "nlp", "workspace", "extended", "text", "slopcop"];
 
 pub fn resolve_server_spec(mode_expr: &str) -> Result<McpServerSpec, String> {
+    resolve_server_spec_for_render_options(mode_expr, McpRenderOptions::default())
+}
+
+pub fn resolve_server_spec_for_render_options(
+    mode_expr: &str,
+    render_options: McpRenderOptions,
+) -> Result<McpServerSpec, String> {
     let mut descriptors = Vec::new();
     let mut seen = HashSet::new();
     let mut hidden_tool_names = Vec::new();
     let mut seen_hidden = HashSet::new();
     resolve_mode_expr(
         mode_expr,
+        render_options,
         &mut descriptors,
         &mut seen,
         &mut hidden_tool_names,
@@ -24,6 +34,7 @@ pub fn resolve_server_spec(mode_expr: &str) -> Result<McpServerSpec, String> {
 
 fn resolve_mode_expr(
     mode_expr: &str,
+    render_options: McpRenderOptions,
     descriptors: &mut Vec<Value>,
     seen: &mut HashSet<String>,
     hidden_tool_names: &mut Vec<String>,
@@ -34,46 +45,95 @@ fn resolve_mode_expr(
         if name.is_empty() {
             return Err("server mode expression contains an empty segment".to_string());
         }
-        expand_toolset(name, descriptors, seen, hidden_tool_names, seen_hidden)?;
+        expand_toolset(
+            name,
+            render_options,
+            descriptors,
+            seen,
+            hidden_tool_names,
+            seen_hidden,
+        )?;
     }
     Ok(())
 }
 
 fn expand_toolset(
     name: &str,
+    render_options: McpRenderOptions,
     descriptors: &mut Vec<Value>,
     seen: &mut HashSet<String>,
     hidden_tool_names: &mut Vec<String>,
     seen_hidden: &mut HashSet<String>,
 ) -> Result<(), String> {
     match name {
-        "symbol" => {
-            append_named_toolset("symbol", descriptors, seen, hidden_tool_names, seen_hidden)
-        }
-        "nlp" => append_named_toolset("nlp", descriptors, seen, hidden_tool_names, seen_hidden),
+        "symbol" => append_named_toolset(
+            "symbol",
+            render_options,
+            descriptors,
+            seen,
+            hidden_tool_names,
+            seen_hidden,
+        ),
+        "nlp" => append_named_toolset(
+            "nlp",
+            render_options,
+            descriptors,
+            seen,
+            hidden_tool_names,
+            seen_hidden,
+        ),
         "workspace" => append_named_toolset(
             "workspace",
+            render_options,
             descriptors,
             seen,
             hidden_tool_names,
             seen_hidden,
         ),
-        "text" => append_named_toolset("text", descriptors, seen, hidden_tool_names, seen_hidden),
+        "text" => append_named_toolset(
+            "text",
+            render_options,
+            descriptors,
+            seen,
+            hidden_tool_names,
+            seen_hidden,
+        ),
         "extended" => append_named_toolset(
             "extended",
+            render_options,
             descriptors,
             seen,
             hidden_tool_names,
             seen_hidden,
         ),
-        "slopcop" => {
-            append_named_toolset("slopcop", descriptors, seen, hidden_tool_names, seen_hidden)
-        }
+        "slopcop" => append_named_toolset(
+            "slopcop",
+            render_options,
+            descriptors,
+            seen,
+            hidden_tool_names,
+            seen_hidden,
+        ),
         "core" => {
-            expand_toolset("symbol", descriptors, seen, hidden_tool_names, seen_hidden)?;
-            expand_toolset("nlp", descriptors, seen, hidden_tool_names, seen_hidden)?;
+            expand_toolset(
+                "symbol",
+                render_options,
+                descriptors,
+                seen,
+                hidden_tool_names,
+                seen_hidden,
+            )?;
+            expand_toolset(
+                "nlp",
+                render_options,
+                descriptors,
+                seen,
+                hidden_tool_names,
+                seen_hidden,
+            )?;
             expand_toolset(
                 "workspace",
+                render_options,
                 descriptors,
                 seen,
                 hidden_tool_names,
@@ -82,7 +142,14 @@ fn expand_toolset(
         }
         "searchtools" => {
             for alias in SEARCHTOOLS_ORDER {
-                expand_toolset(alias, descriptors, seen, hidden_tool_names, seen_hidden)?;
+                expand_toolset(
+                    alias,
+                    render_options,
+                    descriptors,
+                    seen,
+                    hidden_tool_names,
+                    seen_hidden,
+                )?;
             }
             Ok(())
         }
@@ -92,12 +159,13 @@ fn expand_toolset(
 
 fn append_named_toolset(
     name: &str,
+    render_options: McpRenderOptions,
     descriptors: &mut Vec<Value>,
     seen: &mut HashSet<String>,
     hidden_tool_names: &mut Vec<String>,
     seen_hidden: &mut HashSet<String>,
 ) -> Result<(), String> {
-    for descriptor in descriptors_for_toolset(name) {
+    for descriptor in descriptors_for_toolset(name, render_options) {
         let Some(name) = descriptor.get("name").and_then(Value::as_str) else {
             return Err("tool descriptor missing string name".to_string());
         };
@@ -113,9 +181,9 @@ fn append_named_toolset(
     Ok(())
 }
 
-fn descriptors_for_toolset(name: &str) -> Vec<Value> {
+fn descriptors_for_toolset(name: &str, render_options: McpRenderOptions) -> Vec<Value> {
     match name {
-        "symbol" => crate::mcp_core::symbol_tool_descriptors(),
+        "symbol" => crate::mcp_core::symbol_tool_descriptors(render_options.render_line_numbers),
         "nlp" => crate::mcp_nlp::nlp_tool_descriptors(),
         "workspace" => crate::mcp_core::workspace_tool_descriptors(),
         "text" => crate::mcp_text::text_tool_descriptors(),
@@ -160,7 +228,7 @@ mod tests {
             "get_symbol_sources",
             "get_summaries",
             "scan_usages",
-            "get_definition",
+            "get_definition_by_location",
             "usage_graph",
         ]
         .into_iter()

@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use brokk_bifrost::lsp::run_lsp_stdio_server;
 use brokk_bifrost::mcp_common::{McpRenderOptions, run_stdio_server};
-use brokk_bifrost::mcp_registry::resolve_server_spec;
+use brokk_bifrost::mcp_registry::resolve_server_spec_for_render_options;
 use brokk_bifrost::searchtools_render::RenderOptions;
 use brokk_bifrost::tool_arguments::normalize_tool_arguments;
 use brokk_bifrost::{SearchToolsService, ToolOutput};
@@ -93,7 +93,7 @@ fn run() -> Result<(), String> {
     match server_mode.as_deref().unwrap_or("searchtools") {
         "lsp" => run_lsp_stdio_server(root),
         mode => {
-            let spec = resolve_server_spec(mode)?;
+            let spec = resolve_server_spec_for_render_options(mode, render_options)?;
             run_stdio_server(root, render_options, &spec)
         }
     }

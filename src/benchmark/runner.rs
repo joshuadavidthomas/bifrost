@@ -216,7 +216,7 @@ fn run_mcp_scenario(
     for _ in 0..manifest.warmup_iterations {
         let start = Instant::now();
         let outcome = session
-            .call_tool(scenario.label(), tool_arguments(target, scenario))
+            .call_tool(scenario.tool_name(), tool_arguments(target, scenario))
             .and_then(|result| assert_scenario_result(target, scenario, &result));
         match outcome {
             Ok(()) => warmup_durations_ms.push(elapsed_ms(start)),
@@ -236,7 +236,7 @@ fn run_mcp_scenario(
     for _ in 0..manifest.measured_iterations {
         let start = Instant::now();
         let outcome = session
-            .call_tool(scenario.label(), tool_arguments(target, scenario))
+            .call_tool(scenario.tool_name(), tool_arguments(target, scenario))
             .and_then(|result| assert_scenario_result(target, scenario, &result));
         match outcome {
             Ok(()) => measured_durations_ms.push(elapsed_ms(start)),

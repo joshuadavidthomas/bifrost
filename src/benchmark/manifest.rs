@@ -194,6 +194,13 @@ impl BenchmarkScenario {
             Self::GetDefinition => "get_definition",
         }
     }
+
+    pub fn tool_name(self) -> &'static str {
+        match self {
+            Self::GetDefinition => "get_definition_by_location",
+            _ => self.label(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
