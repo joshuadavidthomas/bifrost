@@ -842,6 +842,11 @@ fn resolve_go(
             return candidates_outcome(candidates);
         }
         if resolution.shadowed {
+            if let Some(outcome) =
+                resolve_go_shadowed_selector_chain(analyzer, support, file, source, site, reference)
+            {
+                return outcome;
+            }
             return no_definition(
                 "no_indexed_definition",
                 format!("`{reference}` is shadowed by a local Go binding"),
@@ -938,6 +943,154 @@ fn go_import_paths(
 
 fn go_import_path_is_workspace(support: &DefinitionLookupIndex, import_path: &str) -> bool {
     support.fqn_prefix_exists(import_path)
+}
+
+fn resolve_go_shadowed_selector_chain(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    site: &ResolvedReferenceSite,
+    reference: &str,
+) -> Option<DefinitionLookupOutcome> {
+    let segments: Vec<_> = reference.split('.').collect();
+    if segments.len() < 3 {
+        return None;
+    }
+
+    let mut parser = Parser::new();
+    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
+    let tree = parser.parse(source, None)?;
+    let mut owner_fqn = go_receiver_binding_type_fqn(
+        support,
+        file,
+        source,
+        tree.root_node(),
+        segments[0],
+        site.focus_start_byte,
+    )?;
+    for field in &segments[1..segments.len() - 1] {
+        owner_fqn = go_indexed_field_type_fqn(analyzer, support, &owner_fqn, field)?;
+    }
+    let member = segments.last()?;
+    let candidates = support.fqn(&format!("{owner_fqn}.{member}"));
+    (!candidates.is_empty()).then(|| candidates_outcome(candidates))
+}
+
+fn go_receiver_binding_type_fqn(
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    name: &str,
+    byte: usize,
+) -> Option<String> {
+    let mut current = smallest_named_node_covering(root, byte, byte)?;
+    loop {
+        if current.kind() == "method_declaration"
+            && let Some(receiver) = current.child_by_field_name("receiver")
+            && let Some(type_node) = go_parameter_type_for_name(receiver, source, name)
+        {
+            return go_resolve_type_fqn(support, file, source, type_node);
+        }
+        current = current.parent()?;
+    }
+}
+
+fn go_parameter_type_for_name<'tree>(
+    parameter_list: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<Node<'tree>> {
+    let mut cursor = parameter_list.walk();
+    for parameter in parameter_list.named_children(&mut cursor) {
+        if parameter.kind() != "parameter_declaration" {
+            continue;
+        }
+        let mut names = Vec::new();
+        let mut type_node = None;
+        let mut inner = parameter.walk();
+        for child in parameter.named_children(&mut inner) {
+            match child.kind() {
+                "identifier" => names.push(go_node_text(child, source)),
+                _ => type_node = Some(child),
+            }
+        }
+        if names.iter().any(|candidate| *candidate == name) {
+            return type_node;
+        }
+    }
+    None
+}
+
+fn go_indexed_field_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    field: &str,
+) -> Option<String> {
+    let field_unit = support
+        .fqn(&format!("{owner_fqn}.{field}"))
+        .into_iter()
+        .next()?;
+    let signature = field_unit
+        .signature()
+        .map(str::to_string)
+        .or_else(|| analyzer.signatures(&field_unit).into_iter().next().cloned())?;
+    let type_text = signature
+        .trim()
+        .strip_prefix(field)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
+    go_resolve_type_name_in_package(support, package, type_text)
+}
+
+fn go_resolve_type_fqn(
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    type_node: Node<'_>,
+) -> Option<String> {
+    go_resolve_type_name_in_package(
+        support,
+        &go_package_name(file, source),
+        go_node_text(type_node, source),
+    )
+}
+
+fn go_resolve_type_name_in_package(
+    support: &DefinitionLookupIndex,
+    package: &str,
+    type_text: &str,
+) -> Option<String> {
+    let name = go_simple_type_name(type_text)?;
+    let fqn = format!("{package}.{name}");
+    support.fqn_exists(&fqn).then_some(fqn)
+}
+
+fn go_simple_type_name(type_text: &str) -> Option<&str> {
+    let trimmed = type_text
+        .trim()
+        .trim_start_matches('*')
+        .trim_start_matches("[]")
+        .trim();
+    let name = trimmed
+        .split(['[', '{', ' ', '\t', '\n', '\r'])
+        .next()
+        .unwrap_or(trimmed)
+        .rsplit_once('.')
+        .map(|(_, name)| name)
+        .unwrap_or(trimmed)
+        .trim();
+    (!name.is_empty()).then_some(name)
+}
+
+fn go_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or_default()
+        .trim()
 }
 
 fn resolve_cpp(

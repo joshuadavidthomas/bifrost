@@ -248,6 +248,50 @@ pub fn caller() {
 }
 
 #[test]
+fn get_definition_by_reference_resolves_go_method_receiver_field_chain() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("go.mod"),
+        "module example.com/app\n\ngo 1.22\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("main.go"),
+        r#"package app
+
+type Helper struct{}
+
+func (h Helper) UpdatePackageMetadata() error { return nil }
+
+type Client struct { npmMetadataHelper Helper }
+
+func (c *Client) Build() error {
+    return c.npmMetadataHelper.UpdatePackageMetadata()
+}
+"#,
+    )
+    .unwrap();
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "get_definition_by_reference",
+            r#"{"references":[{"symbol":"example.com/app.Client.Build","context":"    return c.npmMetadataHelper.UpdatePackageMetadata()","target":"UpdatePackageMetadata"}]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    let result = &value["results"][0];
+    assert_eq!("resolved", result["status"], "{value}");
+    assert_eq!(
+        "example.com/app.Helper.UpdatePackageMetadata",
+        result["definition"]["fqn"],
+        "{value}"
+    );
+}
+
+#[test]
 fn python_boundary_returns_canonical_rendered_text_payload() {
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
     let payload = service
