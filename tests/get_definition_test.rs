@@ -879,6 +879,54 @@ function render() {
 }
 
 #[test]
+fn javascript_member_expression_receiver_focus_resolves_receiver_definition() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "app.js",
+            r#"
+var re_aggrWithExpression = /^(SUM|MAX)$/;
+
+function accepts(value) {
+  return re_aggrWithExpression.test(value);
+}
+"#,
+        )
+        .build();
+
+    let line = "  return re_aggrWithExpression.test(value);";
+    let receiver_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":5,"column":{}}}]}}"#,
+            column_of(line, "re_aggrWithExpression")
+        ),
+    );
+
+    let result = &receiver_value["results"][0];
+    assert_eq!(result["status"], "resolved", "{receiver_value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.js.re_aggrWithExpression",
+        "{receiver_value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["start_line"], 2,
+        "{receiver_value}"
+    );
+
+    let property_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.js","line":5,"column":{}}}]}}"#,
+            column_of(line, "test")
+        ),
+    );
+    assert_eq!(
+        property_value["results"][0]["status"], "no_definition",
+        "{property_value}"
+    );
+}
+
+#[test]
 fn javascript_unknown_receiver_member_does_not_guess_same_file_function() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(

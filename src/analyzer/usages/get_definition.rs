@@ -232,6 +232,11 @@ fn resolve_one(
             );
         }
     };
+    let site = if matches!(language, Language::JavaScript | Language::TypeScript) {
+        jsts_site_for_focus(site)
+    } else {
+        site
+    };
 
     let tree = context.tree(&request.file, language, &source);
     let resolved = match language {
@@ -981,6 +986,38 @@ fn jsts_module_export_candidates(
     } else {
         jsts_type_space_candidates(analyzer, candidates)
     }
+}
+
+fn jsts_site_for_focus(mut site: ResolvedReferenceSite) -> ResolvedReferenceSite {
+    if let Some(reference) = jsts_reference_prefix_for_focus(&site) {
+        site.range.end_byte = site.range.start_byte + reference.len();
+        site.text = reference;
+    }
+    site
+}
+
+fn jsts_reference_prefix_for_focus(site: &ResolvedReferenceSite) -> Option<String> {
+    if !site.text.contains('.') {
+        return None;
+    }
+    let relative_start = site.focus_start_byte.checked_sub(site.range.start_byte)?;
+    let relative_end = site.focus_end_byte.checked_sub(site.range.start_byte)?;
+    if relative_start >= relative_end || relative_end > site.text.len() {
+        return None;
+    }
+
+    let mut segment_start = 0;
+    for segment in site.text.split('.') {
+        let segment_end = segment_start + segment.len();
+        if relative_start >= segment_start && relative_end <= segment_end {
+            if segment_end == site.text.len() {
+                return None;
+            }
+            return Some(site.text[..segment_end].to_string());
+        }
+        segment_start = segment_end + 1;
+    }
+    None
 }
 
 fn jsts_member_candidates(

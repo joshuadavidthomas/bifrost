@@ -1123,6 +1123,7 @@ fn is_simple_js_initializer(node: Node<'_>) -> bool {
             | "false"
             | "null"
             | "undefined"
+            | "regex"
             | "template_string"
             | "unary_expression"
             | "binary_expression"
