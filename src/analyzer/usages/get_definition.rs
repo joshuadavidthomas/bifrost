@@ -2200,6 +2200,7 @@ const CPP_SCOPE_NODES: &[&str] = &[
     "compound_statement",
     "function_definition",
     "lambda_expression",
+    "for_range_loop",
     "for_statement",
     "while_statement",
     "if_statement",
@@ -2267,6 +2268,9 @@ fn cpp_seed_active_path(
         {
             cpp_seed_typed_binding(visibility, file, source, node, bindings)
         }
+        "for_range_loop" if node.start_byte() < cutoff_start => {
+            cpp_seed_for_range_binding(visibility, file, source, node, cutoff_start, bindings)
+        }
         "declaration" | "field_declaration" if node.start_byte() < cutoff_start => {
             cpp_seed_variable_declaration(visibility, file, source, node, cutoff_start, bindings)
         }
@@ -2289,6 +2293,41 @@ fn cpp_seed_typed_binding(
     node: Node<'_>,
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
+    let Some(declarator) = node.child_by_field_name("declarator") else {
+        return;
+    };
+    let Some(name) = extract_variable_name(declarator, source) else {
+        return;
+    };
+    let type_text = node
+        .child_by_field_name("type")
+        .or_else(|| cpp_first_type_child(node))
+        .map(|type_node| normalize_cpp_type_text(cpp_node_text(type_node, source)));
+    cpp_seed_binding(
+        visibility,
+        file,
+        source,
+        &name,
+        type_text.as_deref(),
+        None,
+        bindings,
+    );
+}
+
+fn cpp_seed_for_range_binding(
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    cutoff_start: usize,
+    bindings: &mut LocalInferenceEngine<CodeUnit>,
+) {
+    if node
+        .child_by_field_name("body")
+        .is_none_or(|body| body.start_byte() > cutoff_start)
+    {
+        return;
+    }
     let Some(declarator) = node.child_by_field_name("declarator") else {
         return;
     };

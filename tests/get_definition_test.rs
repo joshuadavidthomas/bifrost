@@ -2931,6 +2931,49 @@ fn cpp_relative_namespace_call_resolves_to_definition() {
 }
 
 #[test]
+fn cpp_range_for_pointer_binding_resolves_member_field() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "graph.h",
+            r#"
+namespace ns {
+class Operator { public: int params; };
+class Graph { public: Operator* ops; };
+}
+"#,
+        )
+        .file(
+            "app.cpp",
+            r#"
+#include "graph.h"
+using namespace ns;
+void run(Graph& graph) {
+    for (Operator* op : graph.ops) {
+        op->params = 1;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        op->params = 1;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":6,"column":{}}}]}}"#,
+            column_of(line, "params")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ns.Operator.params",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_external_include_reports_boundary() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
