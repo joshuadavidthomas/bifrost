@@ -2672,6 +2672,25 @@ fn resolve_cpp_type(
     if text.is_empty() {
         return no_definition("no_reference_text", "C++ type reference is blank");
     }
+    if cpp_qualified_identifier_is_declaration_name(node) {
+        return no_definition(
+            "declaration_or_import_site",
+            format!("`{text}` is not a C++ reference site"),
+        );
+    }
+    if node.kind() == "qualified_identifier"
+        && let (Some(scope), Some(name)) = (
+            node.child_by_field_name("scope"),
+            node.child_by_field_name("name"),
+        )
+        && let Some(owner) = visibility.resolve_type(file, cpp_node_text(scope, source))
+    {
+        let candidates =
+            cpp_direct_member_candidates(support, &[owner], cpp_node_text(name, source));
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+    }
     if let Some(unit) = visibility.resolve_type(file, &text) {
         let candidates = support.fqn(&unit.fq_name());
         return if candidates.is_empty() {
@@ -2934,6 +2953,16 @@ fn cpp_unit_matches_kind(
         CppTargetKind::MemberField => unit.is_field(),
         CppTargetKind::Constructor | CppTargetKind::Method => true,
     }
+}
+
+fn cpp_qualified_identifier_is_declaration_name(node: Node<'_>) -> bool {
+    node.kind() == "qualified_identifier"
+        && node.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                "function_declarator" | "pointer_declarator" | "reference_declarator"
+            ) && parent.child_by_field_name("declarator") == Some(node)
+        })
 }
 
 fn cpp_parent_is_class(support: &DefinitionLookupIndex, unit: &CodeUnit) -> bool {

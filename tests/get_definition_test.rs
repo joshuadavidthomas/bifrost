@@ -3826,6 +3826,35 @@ Mode current() { return Ready; }
 }
 
 #[test]
+fn cpp_scoped_enum_enumerator_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+enum class PowerSaveLevel { LOW_POWER, PERFORMANCE };
+PowerSaveLevel current() { return PowerSaveLevel::PERFORMANCE; }
+"#,
+        )
+        .build();
+
+    let line = "PowerSaveLevel current() { return PowerSaveLevel::PERFORMANCE; }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":3,"column":{}}}]}}"#,
+            column_of(line, "PERFORMANCE")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "PowerSaveLevel.PERFORMANCE",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_bare_member_field_resolves_in_method_body() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
