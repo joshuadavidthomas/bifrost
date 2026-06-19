@@ -3204,6 +3204,95 @@ public class UsePerson {
 }
 
 #[test]
+fn java_lombok_data_boolean_getter_resolves_is_accessor_to_backing_field() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Person.java",
+            r#"
+package app;
+
+import lombok.Data;
+
+@Data
+public class Person {
+    private final boolean ready;
+}
+"#,
+        )
+        .file(
+            "app/UsePerson.java",
+            r#"
+package app;
+
+public class UsePerson {
+    boolean run(Person person) {
+        return person.isReady();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return person.isReady();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UsePerson.java","line":6,"column":{}}}]}}"#,
+            column_of(line, "isReady")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Person.ready",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_lombok_data_is_getter_requires_boolean_backing_field() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Person.java",
+            r#"
+package app;
+
+import lombok.Data;
+
+@Data
+public class Person {
+    private final String ready;
+}
+"#,
+        )
+        .file(
+            "app/UsePerson.java",
+            r#"
+package app;
+
+public class UsePerson {
+    boolean run(Person person) {
+        return person.isReady();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return person.isReady();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UsePerson.java","line":6,"column":{}}}]}}"#,
+            column_of(line, "isReady")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn java_missing_getter_without_lombok_does_not_guess_field() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

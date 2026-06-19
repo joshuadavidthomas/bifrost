@@ -9404,29 +9404,38 @@ enum JavaAccessorKind {
     Setter,
 }
 
+struct JavaAccessorProperty {
+    kind: JavaAccessorKind,
+    field_name: String,
+    requires_boolean_field: bool,
+}
+
 fn java_lombok_accessor_field_candidates(
     analyzer: &dyn IAnalyzer,
     support: &DefinitionLookupIndex,
     owner: &CodeUnit,
     member: &str,
 ) -> Vec<CodeUnit> {
-    let Some((kind, field_name)) = java_accessor_property_name(member) else {
+    let Some(accessor) = java_accessor_property(member) else {
         return Vec::new();
     };
     let mut fields: Vec<_> = support
-        .fqn(&format!("{}.{}", owner.fq_name(), field_name))
+        .fqn(&format!("{}.{}", owner.fq_name(), accessor.field_name))
         .into_iter()
         .filter(CodeUnit::is_field)
         .collect();
     sort_units(&mut fields);
     fields.dedup();
+    if accessor.requires_boolean_field {
+        fields.retain(|field| java_field_is_boolean(analyzer, field));
+    }
     if fields.is_empty() {
         return Vec::new();
     }
 
-    let owner_has_accessor_annotation = analyzer
-        .get_source(owner, false)
-        .is_some_and(|source| java_class_source_has_lombok_accessor_annotation(&source, kind));
+    let owner_has_accessor_annotation = analyzer.get_source(owner, false).is_some_and(|source| {
+        java_class_source_has_lombok_accessor_annotation(&source, accessor.kind)
+    });
     if owner_has_accessor_annotation {
         return fields;
     }
@@ -9435,19 +9444,19 @@ fn java_lombok_accessor_field_candidates(
         .into_iter()
         .filter(|field| {
             analyzer.get_source(field, false).is_some_and(|source| {
-                java_field_source_has_lombok_accessor_annotation(&source, kind)
+                java_field_source_has_lombok_accessor_annotation(&source, accessor.kind)
             })
         })
         .collect()
 }
 
-fn java_accessor_property_name(member: &str) -> Option<(JavaAccessorKind, String)> {
-    let (kind, suffix) = if let Some(suffix) = member.strip_prefix("get") {
-        (JavaAccessorKind::Getter, suffix)
+fn java_accessor_property(member: &str) -> Option<JavaAccessorProperty> {
+    let (kind, suffix, requires_boolean_field) = if let Some(suffix) = member.strip_prefix("get") {
+        (JavaAccessorKind::Getter, suffix, false)
     } else if let Some(suffix) = member.strip_prefix("is") {
-        (JavaAccessorKind::Getter, suffix)
+        (JavaAccessorKind::Getter, suffix, true)
     } else if let Some(suffix) = member.strip_prefix("set") {
-        (JavaAccessorKind::Setter, suffix)
+        (JavaAccessorKind::Setter, suffix, false)
     } else {
         return None;
     };
@@ -9459,7 +9468,23 @@ fn java_accessor_property_name(member: &str) -> Option<(JavaAccessorKind, String
     {
         return None;
     }
-    Some((kind, java_bean_decapitalize(suffix)))
+    Some(JavaAccessorProperty {
+        kind,
+        field_name: java_bean_decapitalize(suffix),
+        requires_boolean_field,
+    })
+}
+
+fn java_field_is_boolean(analyzer: &dyn IAnalyzer, field: &CodeUnit) -> bool {
+    let signature = field
+        .signature()
+        .map(str::to_string)
+        .or_else(|| analyzer.signatures(field).iter().next().cloned());
+    signature
+        .as_deref()
+        .and_then(|signature| java_field_type_text_from_signature(signature, field.identifier()))
+        .and_then(|type_text| java_raw_type_name(&type_text))
+        .is_some_and(|raw| matches!(raw.as_str(), "boolean" | "Boolean"))
 }
 
 fn java_bean_decapitalize(name: &str) -> String {
