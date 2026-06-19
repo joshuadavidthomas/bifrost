@@ -6916,57 +6916,30 @@ fn resolve_scala(
         );
     }
 
+    let ctx = ScalaLookupCtx {
+        scala,
+        analyzer,
+        support,
+        types: types.as_ref(),
+        file,
+        source,
+    };
+
     match scala_reference_node(node) {
         Some(ScalaReferenceNode::Type(type_node)) => {
-            let ctx = ScalaLookupCtx {
-                scala,
-                analyzer,
-                support,
-                file,
-                source,
-            };
             resolve_scala_type(ctx, &resolver, root, type_node)
         }
-        Some(ScalaReferenceNode::Call(call)) => {
-            let ctx = ScalaLookupCtx {
-                scala,
-                analyzer,
-                support,
-                file,
-                source,
-            };
-            resolve_scala_call(ctx, &resolver, root, call)
+        Some(ScalaReferenceNode::Call(call)) => resolve_scala_call(ctx, &resolver, root, call),
+        Some(ScalaReferenceNode::Field(field)) => resolve_scala_field(ctx, &resolver, root, field),
+        Some(ScalaReferenceNode::StableIdentifier(identifier)) => {
+            resolve_scala_stable_identifier(ctx, &resolver, root, identifier)
         }
-        Some(ScalaReferenceNode::Field(field)) => resolve_scala_field(
-            ScalaLookupCtx {
-                scala,
-                analyzer,
-                support,
-                file,
-                source,
-            },
-            &resolver,
-            root,
-            field,
-        ),
-        Some(ScalaReferenceNode::StableIdentifier(identifier)) => resolve_scala_stable_identifier(
-            ScalaLookupCtx {
-                scala,
-                analyzer,
-                support,
-                file,
-                source,
-            },
-            &resolver,
-            root,
-            identifier,
-        ),
         Some(ScalaReferenceNode::Identifier(identifier)) => {
             let text = scala_node_text(identifier, source).trim();
             if text.is_empty() {
                 return no_definition("no_reference_text", "Scala identifier is blank");
             }
-            let bindings = scala_bindings_before(&resolver, source, root, identifier.start_byte());
+            let bindings = scala_bindings_before(ctx, &resolver, root, identifier.start_byte());
             if bindings.is_shadowed(text) {
                 return no_definition(
                     "local_variable_reference",
@@ -7085,6 +7058,7 @@ struct ScalaLookupCtx<'a> {
     scala: &'a ScalaAnalyzer,
     analyzer: &'a dyn IAnalyzer,
     support: &'a DefinitionLookupIndex,
+    types: &'a ScalaProjectTypes,
     file: &'a ProjectFile,
     source: &'a str,
 }
@@ -7100,7 +7074,7 @@ fn resolve_scala_type(
         return no_definition("no_reference_text", "Scala type reference is blank");
     }
     if !scala_is_type_position(node) {
-        let bindings = scala_bindings_before(resolver, ctx.source, root, node.start_byte());
+        let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
         if bindings.is_shadowed(text) {
             return no_definition(
                 "local_variable_reference",
@@ -7138,7 +7112,7 @@ fn resolve_scala_call(
             if name.is_empty() {
                 return no_definition("no_function_name", "Scala call name is blank");
             }
-            let bindings = scala_bindings_before(resolver, ctx.source, root, function.start_byte());
+            let bindings = scala_bindings_before(ctx, resolver, root, function.start_byte());
             if bindings.is_shadowed(name) {
                 return no_definition(
                     "local_variable_reference",
@@ -7150,7 +7124,8 @@ fn resolve_scala_call(
                     scala_enclosing_class(ctx.analyzer, ctx.file, function.start_byte())
                 && owner.identifier() != name
             {
-                let mut candidates = scala_member_candidate_units(ctx, &owner.fq_name(), name);
+                let mut candidates =
+                    scala_member_candidate_units(ctx, &owner.fq_name(), name, false);
                 if candidates.is_empty() {
                     candidates = scala_source_ancestor_member_units(ctx, resolver, function, name);
                 }
@@ -7206,7 +7181,7 @@ fn resolve_scala_field(
     };
     if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, field.start_byte())
     {
-        return scala_member_candidates(ctx, &owner, member);
+        return scala_member_candidates(ctx, &owner, member, false);
     }
     no_definition(
         "unsupported_scala_receiver",
@@ -7227,14 +7202,14 @@ fn resolve_scala_stable_identifier(
     if owner_text.is_empty() || member.is_empty() {
         return no_definition("no_reference_text", "Scala stable identifier is blank");
     }
-    let bindings = scala_bindings_before(resolver, ctx.source, root, identifier.start_byte());
+    let bindings = scala_bindings_before(ctx, resolver, root, identifier.start_byte());
     let owner = first_precise(&bindings, owner_text).or_else(|| {
         (!bindings.is_shadowed(owner_text))
             .then(|| resolver.resolve(owner_text))
             .flatten()
     });
     if let Some(owner) = owner {
-        return scala_member_candidates(ctx, &owner, member);
+        return scala_member_candidates(ctx, &owner, member, true);
     }
     if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, owner_text) {
         return boundary(format!(
@@ -7251,8 +7226,9 @@ fn scala_member_candidates(
     ctx: ScalaLookupCtx<'_>,
     owner_fqn: &str,
     member: &str,
+    include_companion: bool,
 ) -> DefinitionLookupOutcome {
-    let candidates = scala_member_candidate_units(ctx, owner_fqn, member);
+    let candidates = scala_member_candidate_units(ctx, owner_fqn, member, include_companion);
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -7264,7 +7240,29 @@ fn scala_member_candidate_units(
     ctx: ScalaLookupCtx<'_>,
     owner_fqn: &str,
     member: &str,
+    include_companion: bool,
 ) -> Vec<CodeUnit> {
+    let mut seen_owner_fqns = HashSet::default();
+    scala_member_candidate_units_with_seen(
+        ctx,
+        owner_fqn,
+        member,
+        include_companion,
+        &mut seen_owner_fqns,
+    )
+}
+
+fn scala_member_candidate_units_with_seen(
+    ctx: ScalaLookupCtx<'_>,
+    owner_fqn: &str,
+    member: &str,
+    include_companion: bool,
+    seen_owner_fqns: &mut HashSet<String>,
+) -> Vec<CodeUnit> {
+    if !seen_owner_fqns.insert(owner_fqn.to_string()) {
+        return Vec::new();
+    }
+
     let mut candidates = ctx.support.fqn(&format!("{owner_fqn}.{member}"));
     sort_units(&mut candidates);
     candidates.dedup();
@@ -7272,7 +7270,7 @@ fn scala_member_candidate_units(
         return candidates;
     }
 
-    if !owner_fqn.ends_with('$') {
+    if include_companion && !owner_fqn.ends_with('$') {
         let mut object_candidates = ctx.support.fqn(&format!("{owner_fqn}$.{member}"));
         sort_units(&mut object_candidates);
         object_candidates.dedup();
@@ -7307,7 +7305,140 @@ fn scala_member_candidate_units(
         }
     }
 
+    scala_owner_source_ancestor_member_units(ctx, owner_fqn, member, seen_owner_fqns)
+}
+
+fn scala_owner_source_ancestor_member_units(
+    ctx: ScalaLookupCtx<'_>,
+    owner_fqn: &str,
+    member: &str,
+    seen_owner_fqns: &mut HashSet<String>,
+) -> Vec<CodeUnit> {
+    for owner in ctx
+        .analyzer
+        .definitions(owner_fqn)
+        .filter(|unit| unit.is_class())
+    {
+        let Some(source) = ctx.analyzer.get_source(owner, false) else {
+            continue;
+        };
+        let Some(tree) = parse_scala_tree(&source) else {
+            continue;
+        };
+        let Some(owner_node) = scala_find_type_declaration_node_for_unit(
+            ctx.analyzer,
+            tree.root_node(),
+            &source,
+            owner,
+        ) else {
+            continue;
+        };
+
+        let mut ancestor_types = Vec::new();
+        scala_collect_extends_type_text(owner_node, &source, &mut ancestor_types);
+        if ancestor_types.is_empty() {
+            continue;
+        }
+
+        let owner_resolver = ScalaNameResolver::for_file(ctx.scala, owner.source(), ctx.types);
+        for ancestor_type in ancestor_types {
+            let Some(ancestor_fqn) = owner_resolver.resolve(&ancestor_type) else {
+                continue;
+            };
+            let candidates = scala_member_candidate_units_with_seen(
+                ctx,
+                &ancestor_fqn,
+                member,
+                false,
+                seen_owner_fqns,
+            );
+            if !candidates.is_empty() {
+                return candidates;
+            }
+        }
+    }
+
     Vec::new()
+}
+
+fn scala_find_type_declaration_node_for_unit<'tree>(
+    analyzer: &dyn IAnalyzer,
+    root: Node<'tree>,
+    source: &str,
+    owner: &CodeUnit,
+) -> Option<Node<'tree>> {
+    let ranges = analyzer.ranges(owner);
+    let owner_path = scala_owner_relative_type_path(owner);
+    scala_find_type_declaration_node(
+        root,
+        source,
+        owner.identifier(),
+        ranges,
+        &owner_path,
+        &mut Vec::new(),
+    )
+}
+
+fn scala_find_type_declaration_node<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    owner_identifier: &str,
+    ranges: &[Range],
+    owner_path: &[String],
+    current_path: &mut Vec<String>,
+) -> Option<Node<'tree>> {
+    let is_type = matches!(
+        node.kind(),
+        "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+    );
+    if is_type && let Some(name_node) = node.child_by_field_name("name") {
+        let name = scala_node_text(name_node, source).trim();
+        let path_name = if node.kind() == "object_definition" {
+            format!("{name}$")
+        } else {
+            name.to_string()
+        };
+        current_path.push(path_name);
+        let name_matches = name == owner_identifier || format!("{name}$") == owner_identifier;
+        let path_matches = current_path == owner_path;
+        let range_matches = ranges.iter().any(|range| {
+            let start_line = node.start_position().row + 1;
+            range.start_line <= start_line && start_line <= range.end_line
+        });
+        if name_matches && (path_matches || range_matches) {
+            return Some(node);
+        }
+    }
+
+    let mut cursor = node.walk();
+    let found = node.named_children(&mut cursor).find_map(|child| {
+        scala_find_type_declaration_node(
+            child,
+            source,
+            owner_identifier,
+            ranges,
+            owner_path,
+            current_path,
+        )
+    });
+    if is_type {
+        current_path.pop();
+    }
+    found
+}
+
+fn scala_owner_relative_type_path(owner: &CodeUnit) -> Vec<String> {
+    let fqn = owner.fq_name();
+    let package = owner.package_name();
+    let relative = fqn
+        .strip_prefix(package)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or(fqn.as_str());
+    relative
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn scala_source_ancestor_member_units(
@@ -7325,7 +7456,7 @@ fn scala_source_ancestor_member_units(
         let Some(owner_fqn) = resolver.resolve(&ancestor_type) else {
             continue;
         };
-        let candidates = scala_member_candidate_units(ctx, &owner_fqn, member);
+        let candidates = scala_member_candidate_units(ctx, &owner_fqn, member, false);
         if !candidates.is_empty() {
             return candidates;
         }
@@ -7347,6 +7478,23 @@ fn scala_enclosing_definition_node(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn scala_collect_extends_type_text(node: Node<'_>, source: &str, out: &mut Vec<String>) {
+    scala_collect_extends_type_text_inner(node, source, out, true);
+}
+
+fn scala_collect_extends_type_text_inner(
+    node: Node<'_>,
+    source: &str,
+    out: &mut Vec<String>,
+    is_root: bool,
+) {
+    if !is_root
+        && matches!(
+            node.kind(),
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+        )
+    {
+        return;
+    }
     let in_extends = node.kind() == "extends_clause";
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -7362,7 +7510,7 @@ fn scala_collect_extends_type_text(node: Node<'_>, source: &str, out: &mut Vec<S
             }
             continue;
         }
-        scala_collect_extends_type_text(child, source, out);
+        scala_collect_extends_type_text_inner(child, source, out, false);
     }
 }
 
@@ -7394,18 +7542,9 @@ fn scala_receiver_type_fqn(
                     .enclosing(receiver.start_byte())
                     .map(str::to_string);
             }
-            let bindings = scala_bindings_before(resolver, ctx.source, root, cutoff_start);
+            let bindings = scala_bindings_before(ctx, resolver, root, cutoff_start);
             first_precise(&bindings, name).or_else(|| {
-                scala_enclosing_class_parameter_type(
-                    ctx.scala,
-                    ctx.analyzer,
-                    ctx.file,
-                    receiver,
-                    name,
-                    resolver,
-                    ctx.source,
-                )
-                .or_else(|| {
+                scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).or_else(|| {
                     (!bindings.is_shadowed(name))
                         .then(|| resolver.resolve(name))
                         .flatten()
@@ -7417,17 +7556,11 @@ fn scala_receiver_type_fqn(
 }
 
 fn scala_enclosing_class_parameter_type(
-    scala: &ScalaAnalyzer,
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
+    ctx: ScalaLookupCtx<'_>,
     node: Node<'_>,
     name: &str,
     resolver: &ScalaNameResolver,
-    source: &str,
 ) -> Option<String> {
-    let current_class = ClassRangeIndex::build(analyzer, file)
-        .enclosing(node.start_byte())
-        .map(str::to_string);
     let mut current = node.parent();
     while let Some(parent) = current {
         if parent.kind() == "class_definition" {
@@ -7440,12 +7573,12 @@ fn scala_enclosing_class_parameter_type(
                 let Some(param_name) = parameter.child_by_field_name("name") else {
                     continue;
                 };
-                if scala_node_text(param_name, source).trim() != name {
+                if scala_node_text(param_name, ctx.source).trim() != name {
                     continue;
                 }
                 if scala_active_path_declares_name_after(
                     parent,
-                    source,
+                    ctx.source,
                     name,
                     parameter.end_byte(),
                     node.start_byte(),
@@ -7453,16 +7586,8 @@ fn scala_enclosing_class_parameter_type(
                     return None;
                 }
                 return parameter.child_by_field_name("type").and_then(|type_node| {
-                    let type_text = scala_node_text(type_node, source);
-                    scala_resolve_type_annotation(resolver, type_text).or_else(|| {
-                        current_class
-                            .as_deref()
-                            .and_then(|class_fqn| scala_same_package_type_fqn(class_fqn, type_text))
-                            .or_else(|| {
-                                scala_package_name_of(scala, file)
-                                    .and_then(|package| scala_package_type_fqn(&package, type_text))
-                            })
-                    })
+                    let type_text = scala_node_text(type_node, ctx.source);
+                    scala_resolve_visible_type_annotation(ctx, resolver, type_text)
                 });
             }
             return None;
@@ -7541,11 +7666,14 @@ fn scala_node_declares_name_before(
     }
 }
 
-fn scala_same_package_type_fqn(current_class_fqn: &str, type_text: &str) -> Option<String> {
-    let package = current_class_fqn
-        .rsplit_once('.')
-        .map(|(package, _)| package)?;
-    scala_package_type_fqn(package, type_text)
+fn scala_existing_package_type_fqn(
+    analyzer: &dyn IAnalyzer,
+    package: &str,
+    type_text: &str,
+) -> Option<String> {
+    let fqn = scala_package_type_fqn(package, type_text)?;
+    let exists = analyzer.definitions(&fqn).any(|unit| unit.is_class());
+    exists.then_some(fqn)
 }
 
 fn scala_package_type_fqn(package: &str, type_text: &str) -> Option<String> {
@@ -7575,6 +7703,76 @@ fn scala_resolve_type_annotation(resolver: &ScalaNameResolver, type_text: &str) 
         .resolve(type_text)
         .or_else(|| scala_type_base_text(trimmed).and_then(|base| resolver.resolve(base)))?;
     Some(fqn.trim_end_matches('$').to_string())
+}
+
+fn scala_resolve_visible_type_annotation(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    type_text: &str,
+) -> Option<String> {
+    if type_text.trim().ends_with(".type") {
+        return scala_resolve_type_annotation(resolver, type_text);
+    }
+    let current_package = scala_package_name_of(ctx.scala, ctx.file).unwrap_or_default();
+    let resolved = scala_resolve_type_annotation(resolver, type_text);
+    if resolved.as_deref().is_some_and(|fqn| {
+        scala_fqn_package(fqn) != current_package
+            && scala_type_annotation_imported(ctx, type_text, fqn)
+    }) {
+        return resolved;
+    }
+    if scala_type_annotation_has_explicit_import(ctx, type_text) {
+        return None;
+    }
+    scala_package_name_of(ctx.scala, ctx.file)
+        .and_then(|package| scala_existing_package_type_fqn(ctx.analyzer, &package, type_text))
+        .or(resolved)
+}
+
+fn scala_type_annotation_has_explicit_import(ctx: ScalaLookupCtx<'_>, type_text: &str) -> bool {
+    let simple = scala_simple_name(type_text);
+    ctx.scala.import_info_of(ctx.file).iter().any(|import| {
+        if import.is_wildcard {
+            return false;
+        }
+        let Some(path) = scala_import_path(import) else {
+            return false;
+        };
+        let local_name = import
+            .identifier
+            .as_deref()
+            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
+        local_name == simple
+    })
+}
+
+fn scala_type_annotation_imported(
+    ctx: ScalaLookupCtx<'_>,
+    type_text: &str,
+    resolved_fqn: &str,
+) -> bool {
+    let simple = scala_simple_name(type_text);
+    let resolved_package = scala_fqn_package(resolved_fqn);
+    ctx.scala.import_info_of(ctx.file).iter().any(|import| {
+        let Some(path) = scala_import_path(import) else {
+            return false;
+        };
+        if import.is_wildcard {
+            return path == resolved_package;
+        }
+        let local_name = import
+            .identifier
+            .as_deref()
+            .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path.as_str()));
+        local_name == simple
+    })
+}
+
+fn scala_fqn_package(fqn: &str) -> &str {
+    fqn.trim_end_matches('$')
+        .rsplit_once('.')
+        .map(|(package, _)| package)
+        .unwrap_or("")
 }
 
 fn scala_type_base_text(type_text: &str) -> Option<&str> {
@@ -7626,19 +7824,19 @@ const SCALA_SCOPE_NODES: &[&str] = &[
 ];
 
 fn scala_bindings_before(
+    ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
-    source: &str,
     root: Node<'_>,
     cutoff_start: usize,
 ) -> LocalInferenceEngine<String> {
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    scala_seed_active_path(resolver, source, root, cutoff_start, &mut bindings);
+    scala_seed_active_path(ctx, resolver, root, cutoff_start, &mut bindings);
     bindings
 }
 
 fn scala_seed_active_path(
+    ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
-    source: &str,
     node: Node<'_>,
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<String>,
@@ -7657,10 +7855,10 @@ fn scala_seed_active_path(
         }
         match node.kind() {
             "class_definition" | "function_definition" => {
-                scala_seed_parameters(resolver, source, node, cutoff_start, bindings)
+                scala_seed_parameters(ctx, resolver, node, cutoff_start, bindings)
             }
             "val_definition" | "var_definition" if node.start_byte() < cutoff_start => {
-                scala_seed_value_definition(resolver, source, node, cutoff_start, bindings)
+                scala_seed_value_definition(ctx, resolver, node, cutoff_start, bindings)
             }
             _ => {}
         }
@@ -7676,8 +7874,8 @@ fn scala_seed_active_path(
 }
 
 fn scala_seed_parameters(
+    ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
-    source: &str,
     node: Node<'_>,
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<String>,
@@ -7694,15 +7892,15 @@ fn scala_seed_parameters(
             if matches!(parameter.kind(), "parameter" | "class_parameter")
                 && parameter.start_byte() < cutoff_start
             {
-                scala_seed_parameter(resolver, source, parameter, cutoff_start, bindings);
+                scala_seed_parameter(ctx, resolver, parameter, cutoff_start, bindings);
             }
         }
     }
 }
 
 fn scala_seed_parameter(
+    ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
-    source: &str,
     parameter: Node<'_>,
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<String>,
@@ -7713,7 +7911,7 @@ fn scala_seed_parameter(
     if name.start_byte() >= cutoff_start {
         return;
     }
-    let binding_name = scala_node_text(name, source).trim();
+    let binding_name = scala_node_text(name, ctx.source).trim();
     if binding_name.is_empty() {
         return;
     }
@@ -7721,15 +7919,15 @@ fn scala_seed_parameter(
         .child_by_field_name("type")
         .filter(|type_node| type_node.end_byte() <= cutoff_start)
         .and_then(|type_node| {
-            let type_text = scala_node_text(type_node, source);
-            scala_resolve_type_annotation(resolver, type_text)
+            let type_text = scala_node_text(type_node, ctx.source);
+            scala_resolve_visible_type_annotation(ctx, resolver, type_text)
         });
     scala_seed_typed(binding_name, resolved, bindings);
 }
 
 fn scala_seed_value_definition(
+    ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
-    source: &str,
     node: Node<'_>,
     cutoff_start: usize,
     bindings: &mut LocalInferenceEngine<String>,
@@ -7738,15 +7936,20 @@ fn scala_seed_value_definition(
         .child_by_field_name("type")
         .filter(|type_node| type_node.end_byte() <= cutoff_start)
         .and_then(|type_node| {
-            scala_resolve_type_annotation(resolver, scala_node_text(type_node, source))
+            scala_resolve_visible_type_annotation(
+                ctx,
+                resolver,
+                scala_node_text(type_node, ctx.source),
+            )
         })
         .or_else(|| {
             node.child_by_field_name("value")
                 .filter(|value| value.end_byte() <= cutoff_start)
-                .and_then(|value| scala_constructed_type(value, resolver, source))
+                .and_then(|value| scala_constructed_type(ctx, value, resolver))
                 .or_else(|| {
-                    scala_constructor_type_text(scala_node_text(node, source))
-                        .and_then(|type_text| scala_resolve_type_annotation(resolver, type_text))
+                    scala_constructor_type_text(scala_node_text(node, ctx.source)).and_then(
+                        |type_text| scala_resolve_visible_type_annotation(ctx, resolver, type_text),
+                    )
                 })
         });
     let Some(pattern) = node.child_by_field_name("pattern") else {
@@ -7755,22 +7958,22 @@ fn scala_seed_value_definition(
     if pattern.start_byte() >= cutoff_start {
         return;
     }
-    for name in scala_pattern_names(pattern, source) {
+    for name in scala_pattern_names(pattern, ctx.source) {
         scala_seed_typed(name, resolved.clone(), bindings);
     }
 }
 
 fn scala_constructed_type(
+    ctx: ScalaLookupCtx<'_>,
     node: Node<'_>,
     resolver: &ScalaNameResolver,
-    source: &str,
 ) -> Option<String> {
     if node.kind() == "call_expression"
         && let Some(function) = node
             .child_by_field_name("function")
             .or_else(|| node.named_child(0))
     {
-        return scala_constructed_type(function, resolver, source);
+        return scala_constructed_type(ctx, function, resolver);
     }
     if !matches!(
         node.kind(),
@@ -7789,7 +7992,11 @@ fn scala_constructed_type(
             .then_some(node)
         })
         .and_then(|type_node| {
-            scala_resolve_type_annotation(resolver, scala_node_text(type_node, source))
+            scala_resolve_visible_type_annotation(
+                ctx,
+                resolver,
+                scala_node_text(type_node, ctx.source),
+            )
         })
 }
 

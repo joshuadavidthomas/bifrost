@@ -6653,6 +6653,160 @@ object Api extends RestHelper {
 }
 
 #[test]
+fn scala_instance_member_prefers_inherited_member_over_companion_object() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            "package app\nclass Base { def value: Int = 1 }\nclass Child extends Base\nobject Child { def value: Int = 2 }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def run(child: Child): Int = child.value }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(child: Child): Int = child.value }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Base.value", "{value}");
+}
+
+#[test]
+fn scala_source_ancestor_fallback_uses_matching_owner_not_first_simple_name() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            r#"
+package app
+
+class Wrong
+object Outer {
+  class Child extends Wrong
+}
+class Base { def value: Int = 1 }
+class Child extends Base
+"#,
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def run(child: Child): Int = child.value }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(child: Child): Int = child.value }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.Base.value", "{value}");
+}
+
+#[test]
+fn scala_imported_type_annotation_beats_same_package_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            "package app\nclass Child { def local: Int = 0 }\n",
+        )
+        .file(
+            "other/Model.scala",
+            "package other\nclass Child { def value: Int = 1 }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nimport other.Child\nclass Controller { def run(child: Child): Int = child.value }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(child: Child): Int = child.value }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "other.Child.value",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_missing_imported_type_annotation_does_not_fall_back_to_same_package_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            "package app\nclass Child { def local: Int = 0 }\n",
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nimport external.Child\nclass Controller { def run(child: Child): Int = child.local }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(child: Child): Int = child.local }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "local")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_nested_class_ancestor_does_not_leak_to_outer_owner() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Model.scala",
+            r#"
+package app
+
+class Base { def value: Int = 1 }
+class Outer {
+  class Inner extends Base
+}
+"#,
+        )
+        .file(
+            "app/Controller.scala",
+            "package app\nclass Controller { def run(outer: Outer): Int = outer.value }\n",
+        )
+        .build();
+
+    let line = "class Controller { def run(outer: Outer): Int = outer.value }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Controller.scala","line":2,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn scala_unqualified_member_call_beats_same_named_object_apply() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
