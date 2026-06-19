@@ -26,6 +26,9 @@ Before pushing Rust changes, run the same core checks that CI enforces locally w
 
 At minimum, run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings`. If clippy fails, fix that locally before pushing rather than waiting for the CI matrix to report it back.
 
+We are okay with allow(clippy::too_many_arguments) rather than packing necessary parms into a struct just to
+make clippy shut up.
+
 # Design philosophy
 
 We build for correctness and generality. Adding narrow "fallbacks" is a smell. Always follow problems
