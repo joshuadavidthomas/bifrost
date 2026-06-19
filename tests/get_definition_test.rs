@@ -1414,6 +1414,135 @@ public class UseTarget {
 }
 
 #[test]
+fn java_lambda_parameter_field_resolves_from_collection_chain() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Container.java",
+            r#"
+package app;
+import java.util.ArrayList;
+import java.util.NavigableMap;
+import java.util.TreeMap;
+
+class Location {
+    public final String signature;
+    Location(String signature) {
+        this.signature = signature;
+    }
+}
+
+class Container {
+    public transient NavigableMap<String, ArrayList<Location>> methodMembers = new TreeMap<>();
+}
+"#,
+        )
+        .file(
+            "Action.java",
+            r#"
+package app;
+
+class Action {
+    private final Container container = new Container();
+    void run(Location method) {
+        container.methodMembers.values().forEach(methods -> methods.forEach(ignored -> {
+            methods.stream().filter(location -> location.signature.equals(method.signature)).forEach(location -> {});
+        }));
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "            methods.stream().filter(location -> location.signature.equals(method.signature)).forEach(location -> {});";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"Action.java","line":8,"column":{}}}]}}"#,
+            column_of(line, "location.signature")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Location.signature",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_method_token_on_external_field_receiver_does_not_return_field() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Action.java",
+            r#"
+package app;
+
+class Location {
+    public final String signature = "";
+}
+
+class Action {
+    void run(Location location) {
+        location.signature.equals("");
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        location.signature.equals(\"\");";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"Action.java","line":10,"column":{}}}]}}"#,
+            column_of(line, "equals")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn java_custom_foreach_generic_does_not_infer_collection_element() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Action.java",
+            r#"
+package app;
+
+interface Consumer<T> { void accept(T value); }
+
+class Location {
+    public final String signature = "";
+}
+
+class CustomBox<T> {
+    void forEach(Consumer<T> consumer) {}
+}
+
+class Action {
+    void run(CustomBox<Location> box) {
+        box.forEach(location -> location.signature.equals(""));
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        box.forEach(location -> location.signature.equals(\"\"));";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"Action.java","line":16,"column":{}}}]}}"#,
+            column_of(line, "location.signature")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn java_new_receiver_method_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
