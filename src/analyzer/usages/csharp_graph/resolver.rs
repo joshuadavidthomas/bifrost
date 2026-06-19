@@ -145,6 +145,10 @@ fn seed_variable_declaration(
                     resolve_type_fq_name(csharp, file, node_text(initializer_type, source))
             {
                 bindings.seed_symbol(node_text(name_node, source), target);
+            } else if let Some(target) =
+                var_initializer_member_type(child, csharp, file, source, bindings)
+            {
+                bindings.seed_symbol(node_text(name_node, source), target);
             } else {
                 bindings.declare_shadow(node_text(name_node, source));
             }
@@ -152,6 +156,235 @@ fn seed_variable_declaration(
             seed_symbol_for_type(name_node, type_node, csharp, file, source, bindings);
         }
     }
+}
+
+fn var_initializer_member_type(
+    declarator: Node<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    let initializer = variable_declarator_initializer(declarator)?;
+    expression_type_fq_name(initializer, csharp, file, source, bindings)
+}
+
+fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
+    declarator
+        .child_by_field_name("value")
+        .or_else(|| declarator.child_by_field_name("initializer"))
+        .or_else(|| {
+            let mut cursor = declarator.walk();
+            declarator
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "equals_value_clause")
+                .and_then(|clause| {
+                    clause
+                        .child_by_field_name("value")
+                        .or_else(|| clause.named_child(0))
+                })
+        })
+        .or_else(|| {
+            let name = declarator.child_by_field_name("name")?;
+            let mut cursor = declarator.walk();
+            declarator
+                .named_children(&mut cursor)
+                .find(|child| child.start_byte() > name.end_byte())
+        })
+}
+
+fn expression_type_fq_name(
+    expression: Node<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    match expression.kind() {
+        "identifier" => {
+            let name = node_text(expression, source);
+            first_precise_binding(bindings, name).or_else(|| {
+                let owner = enclosing_declared_type(expression, csharp, file, source)?;
+                member_declared_type_fq_name(csharp, file, &owner, name)
+            })
+        }
+        "member_access_expression" => {
+            let receiver = member_access_receiver(expression)?;
+            let name = member_access_name(expression)?;
+            let owners = receiver_type_units(receiver, csharp, file, source, bindings);
+            owners.into_iter().find_map(|owner| {
+                member_declared_type_fq_name(csharp, file, &owner, node_text(name, source))
+            })
+        }
+        _ => None,
+    }
+}
+
+fn receiver_type_units(
+    receiver: Node<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+) -> Vec<CodeUnit> {
+    match receiver.kind() {
+        "identifier" => {
+            let name = node_text(receiver, source);
+            if let Some(target) = first_precise_binding(bindings, name) {
+                return csharp
+                    .get_all_declarations()
+                    .into_iter()
+                    .filter(|unit| unit.is_class() && unit.fq_name() == target)
+                    .collect();
+            }
+            if bindings.is_shadowed(name) {
+                Vec::new()
+            } else {
+                enclosing_declared_type(receiver, csharp, file, source)
+                    .and_then(|owner| member_declared_type_fq_name(csharp, file, &owner, name))
+                    .into_iter()
+                    .flat_map(|fq_name| {
+                        csharp
+                            .get_all_declarations()
+                            .into_iter()
+                            .filter(move |unit| unit.is_class() && unit.fq_name() == fq_name)
+                    })
+                    .collect()
+            }
+        }
+        "this" => enclosing_declared_type(receiver, csharp, file, source)
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn first_precise_binding(bindings: &LocalInferenceEngine<String>, name: &str) -> Option<String> {
+    let crate::analyzer::usages::local_inference::SymbolResolution::Precise(targets) =
+        bindings.resolve_symbol(name)
+    else {
+        return None;
+    };
+    (targets.len() == 1)
+        .then(|| targets.into_iter().next())
+        .flatten()
+}
+
+fn member_access_receiver(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("expression")
+        .or_else(|| node.child_by_field_name("object"))
+        .or_else(|| node.child_by_field_name("receiver"))
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() != "identifier")
+        })
+}
+
+fn member_access_name(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("name").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .filter(|child| child.kind() == "identifier")
+            .last()
+    })
+}
+
+fn enclosing_declared_type(
+    node: Node<'_>,
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    _source: &str,
+) -> Option<CodeUnit> {
+    let byte = node.start_byte();
+    csharp
+        .get_declarations(file)
+        .into_iter()
+        .filter(|unit| unit.is_class())
+        .filter_map(|unit| {
+            csharp
+                .ranges(&unit)
+                .iter()
+                .filter(|range| range.start_byte <= byte && byte < range.end_byte)
+                .map(|range| (range.end_byte - range.start_byte, unit.clone()))
+                .min_by_key(|(len, _)| *len)
+        })
+        .min_by_key(|(len, _)| *len)
+        .map(|(_, unit)| unit)
+}
+
+pub(in crate::analyzer::usages) fn member_declared_type_fq_name(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+    member_name: &str,
+) -> Option<String> {
+    let member_fqn = format!("{}.{}", owner.fq_name(), member_name);
+    csharp
+        .get_all_declarations()
+        .into_iter()
+        .filter(|unit| unit.is_field() && unit.fq_name() == member_fqn)
+        .filter_map(|unit| member_declared_type(csharp, &unit))
+        .find_map(|type_text| resolve_member_type_fq_name(csharp, file, owner, &type_text))
+}
+
+fn resolve_member_type_fq_name(
+    csharp: &CSharpAnalyzer,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+    type_text: &str,
+) -> Option<String> {
+    let nested_fq_name = if owner.package_name().is_empty() {
+        format!("{}${type_text}", owner.short_name())
+    } else {
+        format!(
+            "{}.{}${type_text}",
+            owner.package_name(),
+            owner.short_name()
+        )
+    };
+    csharp
+        .get_all_declarations()
+        .into_iter()
+        .find(|unit| unit.is_class() && unit.fq_name() == nested_fq_name)
+        .map(|unit| unit.fq_name())
+        .or_else(|| resolve_type_fq_name(csharp, file, type_text))
+}
+
+fn member_declared_type(csharp: &CSharpAnalyzer, member: &CodeUnit) -> Option<String> {
+    let signatures = csharp.signatures_of(member);
+    let signature = member
+        .signature()
+        .or_else(|| signatures.first().map(String::as_str))?
+        .trim();
+    let name = member.identifier();
+    let before_name = signature.rsplit_once(name)?.0.trim();
+    let before_name = before_name.trim_end_matches(|ch: char| ch == '?' || ch.is_whitespace());
+    let type_text = before_name
+        .split_whitespace()
+        .rfind(|part| !member_modifier(part))?;
+    let type_text = normalize_type_text(type_text);
+    (!type_text.is_empty()).then_some(type_text)
+}
+
+fn member_modifier(part: &str) -> bool {
+    matches!(
+        part,
+        "public"
+            | "private"
+            | "protected"
+            | "internal"
+            | "static"
+            | "readonly"
+            | "volatile"
+            | "const"
+            | "new"
+            | "virtual"
+            | "override"
+            | "abstract"
+            | "sealed"
+            | "required"
+    )
 }
 
 fn seed_symbol_for_type(

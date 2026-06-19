@@ -2881,6 +2881,64 @@ fn csharp_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn csharp_instance_member_receiver_resolves_from_enclosing_property_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App/List.cs",
+            "namespace App { public class List<T> { public class Node<T> { public T Data { get; set; } } private Node<T> lastNode { get; set; } public T Last() { return lastNode.Data; } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class List<T> { public class Node<T> { public T Data { get; set; } } private Node<T> lastNode { get; set; } public T Last() { return lastNode.Data; } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/List.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "Data;")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "App.List$Node.Data",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_var_initialized_from_instance_member_seeds_receiver_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "App/List.cs",
+            "namespace App { public class List<T> { public class Node<T> { public Node<T> Next { get; set; } public T Data { get; set; } } private Node<T> firstNode { get; set; } public T Get() { var currentNode = firstNode; currentNode = currentNode.Next; return currentNode.Data; } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class List<T> { public class Node<T> { public Node<T> Next { get; set; } public T Data { get; set; } } private Node<T> firstNode { get; set; } public T Get() { var currentNode = firstNode; currentNode = currentNode.Next; return currentNode.Data; } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/List.cs","line":1,"column":{}}},{{"path":"App/List.cs","line":1,"column":{}}}]}}"#,
+            column_of(line, "Next;"),
+            column_of(line, "Data;")
+        ),
+    );
+
+    for result in value["results"].as_array().unwrap() {
+        assert_eq!(result["status"], "resolved", "{value}");
+    }
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "App.List$Node.Next",
+        "{value}"
+    );
+    assert_eq!(
+        value["results"][1]["definitions"][0]["fqn"], "App.List$Node.Data",
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_extension_method_resolves_from_visible_namespace() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

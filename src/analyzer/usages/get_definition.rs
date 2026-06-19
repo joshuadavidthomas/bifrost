@@ -6,8 +6,9 @@ use crate::analyzer::usages::cpp_graph::{
 };
 use crate::analyzer::usages::csharp_graph::{
     csharp_argument_count, csharp_first_type_child, csharp_is_declaration_name,
-    csharp_is_type_reference_node, csharp_node_text, csharp_reference_type_text,
-    csharp_signature_arity, member_access_name as csharp_member_access_name,
+    csharp_is_type_reference_node, csharp_member_declared_type_fq_name, csharp_node_text,
+    csharp_reference_type_text, csharp_signature_arity,
+    member_access_name as csharp_member_access_name,
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
@@ -6965,7 +6966,13 @@ fn csharp_receiver_type_units(
             if bindings.is_shadowed(name) {
                 Vec::new()
             } else {
-                csharp_visible_type_candidates(csharp, file, name)
+                let mut candidates = csharp_enclosing_member_type_units(
+                    analyzer, csharp, support, file, receiver, name,
+                );
+                if candidates.is_empty() {
+                    candidates = csharp_visible_type_candidates(csharp, file, name);
+                }
+                candidates
             }
         }
         "this" => csharp_enclosing_class(analyzer, file, receiver.start_byte())
@@ -6983,6 +6990,49 @@ fn csharp_receiver_type_units(
             csharp_visible_type_candidates(csharp, file, csharp_node_text(receiver, source))
         }
         _ => Vec::new(),
+    }
+}
+
+fn csharp_enclosing_member_type_units(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    receiver: Node<'_>,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let Some(owner) = csharp_enclosing_class(analyzer, file, receiver.start_byte()) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    csharp_collect_member_type_units(csharp, support, file, &owner, name, &mut candidates);
+    if let Some(provider) = analyzer.type_hierarchy_provider() {
+        for ancestor in provider.get_ancestors(&owner) {
+            csharp_collect_member_type_units(
+                csharp,
+                support,
+                file,
+                &ancestor,
+                name,
+                &mut candidates,
+            );
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn csharp_collect_member_type_units(
+    csharp: &CSharpAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+    name: &str,
+    candidates: &mut Vec<CodeUnit>,
+) {
+    if let Some(type_fqn) = csharp_member_declared_type_fq_name(csharp, file, owner, name) {
+        candidates.extend(support.fqn(&type_fqn));
     }
 }
 
