@@ -58,7 +58,7 @@ pub(crate) struct DefinitionLookupRequest {
 pub(crate) struct DefinitionLookupOutcome {
     pub(crate) status: DefinitionLookupStatus,
     pub(crate) reference: Option<ResolvedReferenceSite>,
-    pub(crate) definition: Option<CodeUnit>,
+    pub(crate) definitions: Vec<CodeUnit>,
     pub(crate) diagnostics: Vec<DefinitionLookupDiagnostic>,
 }
 
@@ -5162,7 +5162,7 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
     candidates.dedup();
     let mut semantic_keys = HashSet::default();
     for candidate in &candidates {
-        semantic_keys.insert(definition_semantic_key(candidate));
+        semantic_keys.insert(definition_symbol_key(candidate));
     }
     let status = if semantic_keys.len() == 1 {
         DefinitionLookupStatus::Resolved
@@ -5180,20 +5180,17 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
     DefinitionLookupOutcome {
         status,
         reference: None,
-        definition: candidates
-            .into_iter()
-            .next()
-            .filter(|_| status == DefinitionLookupStatus::Resolved),
+        definitions: if status == DefinitionLookupStatus::Resolved {
+            candidates
+        } else {
+            Vec::new()
+        },
         diagnostics,
     }
 }
 
-fn definition_semantic_key(unit: &CodeUnit) -> (String, Option<String>, String) {
-    (
-        unit.fq_name(),
-        unit.signature().map(str::to_string),
-        format!("{:?}", unit.kind()),
-    )
+fn definition_symbol_key(unit: &CodeUnit) -> (String, String) {
+    (unit.fq_name(), format!("{:?}", unit.kind()))
 }
 
 fn boundary(message: String) -> DefinitionLookupOutcome {
@@ -5216,7 +5213,7 @@ fn diagnostic_outcome(
     DefinitionLookupOutcome {
         status,
         reference: None,
-        definition: None,
+        definitions: Vec::new(),
         diagnostics: vec![DefinitionLookupDiagnostic {
             kind: kind.into(),
             message: message.into(),

@@ -244,7 +244,7 @@ pub fn caller() {
 
     let result = &value["results"][0];
     assert_eq!("resolved", result["status"], "{value}");
-    assert_eq!("helper", result["definition"]["fqn"], "{value}");
+    assert_eq!("helper", result["definitions"][0]["fqn"], "{value}");
 }
 
 #[test]
@@ -285,7 +285,7 @@ func (c *Client) Build() error {
     let result = &value["results"][0];
     assert_eq!("resolved", result["status"], "{value}");
     assert_eq!(
-        "example.com/app.Helper.UpdatePackageMetadata", result["definition"]["fqn"],
+        "example.com/app.Helper.UpdatePackageMetadata", result["definitions"][0]["fqn"],
         "{value}"
     );
 }
@@ -334,11 +334,11 @@ void PYBIND11_MODULE(Net& net, DataReaderFromMemoryCopy& dr) {
     let result = &value["results"][0];
     assert_eq!("resolved", result["status"], "{value}");
     assert_eq!(
-        "ncnn.Net.load_model", result["definition"]["fqn"],
+        "ncnn.Net.load_model", result["definitions"][0]["fqn"],
         "{value}"
     );
     assert_eq!(
-        "(DataReader &)", result["definition"]["signature"],
+        "(DataReader &)", result["definitions"][0]["signature"],
         "{value}"
     );
 }
@@ -392,11 +392,11 @@ void PYBIND11_MODULE(Net& net, const char* mem) {
     let result = &value["results"][0];
     assert_eq!("resolved", result["status"], "{value}");
     assert_eq!(
-        "ncnn.Net.load_model", result["definition"]["fqn"],
+        "ncnn.Net.load_model", result["definitions"][0]["fqn"],
         "{value}"
     );
     assert_eq!(
-        "(DataReader &)", result["definition"]["signature"],
+        "(DataReader &)", result["definitions"][0]["signature"],
         "{value}"
     );
 }
@@ -457,7 +457,7 @@ private[stream] class TimeGrouped(
     let result = &value["results"][0];
     assert_eq!("resolved", result["status"], "{value}");
     assert_eq!(
-        "com.netflix.atlas.eval.stream.StreamContext.registry", result["definition"]["fqn"],
+        "com.netflix.atlas.eval.stream.StreamContext.registry", result["definitions"][0]["fqn"],
         "{value}"
     );
 }

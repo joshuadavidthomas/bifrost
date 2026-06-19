@@ -467,12 +467,16 @@ fn assert_scenario_result(
                 }
 
                 if let Some(expected_fqn) = query.expected_fqn.as_deref() {
-                    let definition = result["definition"].as_object().ok_or_else(|| {
-                        format!(
-                            "get_definition result {index} missing definition object for `{}`",
-                            target.name
-                        )
-                    })?;
+                    let definition = result["definitions"]
+                        .as_array()
+                        .and_then(|definitions| definitions.first())
+                        .and_then(|definition| definition.as_object())
+                        .ok_or_else(|| {
+                            format!(
+                                "get_definition result {index} missing definitions object for `{}`",
+                                target.name
+                            )
+                        })?;
                     let actual_fqn = definition.get("fqn").and_then(|value| value.as_str());
                     if actual_fqn != Some(expected_fqn) {
                         return Err(format!(
