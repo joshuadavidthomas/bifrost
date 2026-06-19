@@ -1204,6 +1204,47 @@ public class UseTarget {
 }
 
 #[test]
+fn java_new_receiver_method_resolves_to_definition() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/google/gson/GsonBuilder.java",
+            "package com.google.gson; public class GsonBuilder { public GsonBuilder enableComplexMapKeySerialization() { return this; } }\n",
+        )
+        .file(
+            "app/UseGson.java",
+            r#"
+package app;
+
+import com.google.gson.GsonBuilder;
+
+public class UseGson {
+    public void call() {
+        new GsonBuilder().enableComplexMapKeySerialization();
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        new GsonBuilder().enableComplexMapKeySerialization();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/UseGson.java","line":8,"column":{}}}]}}"#,
+            column_of(line, "enableComplexMapKeySerialization")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"],
+        "com.google.gson.GsonBuilder.enableComplexMapKeySerialization",
+        "{value}"
+    );
+}
+
+#[test]
 fn java_static_method_receiver_resolves_imported_type_to_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(

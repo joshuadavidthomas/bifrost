@@ -3663,6 +3663,9 @@ fn java_receiver_type_for_java(
     object: Node<'_>,
 ) -> Option<CodeUnit> {
     match object.kind() {
+        "object_creation_expression" => object
+            .child_by_field_name("type")
+            .and_then(|type_node| java_type_from_node(java, file, source, type_node)),
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
             let raw = java_node_text(object, source);
             java.resolve_type_name_in_file(file, normalize_java_type_text(raw))
