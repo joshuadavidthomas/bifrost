@@ -109,14 +109,12 @@ fn recover_exported_class_function_definition(node: Node<'_>, source: &str) -> O
     if node.kind() != "function_definition" {
         return None;
     }
-    let type_node = node.child_by_field_name("type")?;
-    if !matches!(
-        type_node.kind(),
-        "class_specifier" | "struct_specifier" | "union_specifier"
-    ) {
+    let text = node_text(node, source);
+    let header = text.split('{').next().unwrap_or(text).trim();
+    if header.contains('(') {
         return None;
     }
-    exported_class_name_from_text(node_text(node, source))
+    exported_class_name_from_text(text)
 }
 
 fn first_class_like_child(node: Node<'_>) -> Option<Node<'_>> {

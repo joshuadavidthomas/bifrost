@@ -5307,6 +5307,97 @@ typedef struct RawData { unsigned char * data; unsigned long size; } RawData;
 }
 
 #[test]
+fn cpp_local_type_uses_class_body_over_forward_declaration() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+class DeepImage;
+class Image {
+public:
+    void resize();
+};
+class DeepImage : public Image {
+public:
+    void level();
+};
+void run() {
+    DeepImage img;
+    img.resize();
+    img.level();
+}
+"#,
+        )
+        .build();
+
+    let resize = "    img.resize();";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":13,"column":{}}},{{"path":"app.cpp","line":14,"column":{}}}]}}"#,
+            column_of(resize, "resize"),
+            column_of("    img.level();", "level")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Image.resize",
+        "{value}"
+    );
+    assert_eq!(value["results"][1]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][1]["definitions"][0]["fqn"], "DeepImage.level",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_export_macro_class_body_seeds_local_receiver_type() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "app.cpp",
+            r#"
+#define API
+#define NS_ENTER namespace Project {
+#define NS_EXIT }
+NS_ENTER
+class Image {
+public:
+    void resize();
+};
+class API DeepImage : public Image {
+public:
+    void level();
+};
+NS_EXIT
+void run() {
+    DeepImage img;
+    img.resize();
+    img.level();
+}
+"#,
+        )
+        .build();
+
+    let value = lookup(
+        project.root(),
+        r#"{"references":[{"path":"app.cpp","line":17,"column":9},{"path":"app.cpp","line":18,"column":9}]}"#,
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "Image.resize",
+        "{value}"
+    );
+    assert_eq!(value["results"][1]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][1]["definitions"][0]["fqn"], "DeepImage.level",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_local_function_declaration_does_not_seed_receiver_binding() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

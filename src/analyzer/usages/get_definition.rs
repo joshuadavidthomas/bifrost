@@ -5341,7 +5341,9 @@ fn cpp_direct_base_types(
     };
     let bases = bases.split('{').next().unwrap_or(bases);
     cpp_split_top_level_commas(bases)
-        .filter_map(|base| visibility.resolve_type(file, &cpp_base_type_text(base)))
+        .filter_map(|base| {
+            cpp_resolve_type_unit(analyzer, visibility, file, &cpp_base_type_text(base))
+        })
         .collect()
 }
 
@@ -6069,10 +6071,7 @@ fn cpp_declaration_type_text(node: Node<'_>, source: &str) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn cpp_declaration_prefix_before_first_declarator(
-    node: Node<'_>,
-    source: &str,
-) -> Option<String> {
+fn cpp_declaration_prefix_before_first_declarator(node: Node<'_>, source: &str) -> Option<String> {
     let mut cursor = node.walk();
     let first_declarator = node.named_children(&mut cursor).find_map(|child| {
         if child.kind() == "init_declarator" {
