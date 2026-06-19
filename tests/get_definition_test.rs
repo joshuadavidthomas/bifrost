@@ -2473,7 +2473,7 @@ fn cpp_workspace_angle_include_receiver_method_resolves_to_definition() {
 #[test]
 fn cpp_workspace_angle_include_missing_type_returns_no_definition() {
     let project = InlineTestProject::with_language(Language::Cpp)
-        .file("include/target.h", "namespace ns { class Service {}; }\n")
+        .file("target.h", "namespace ns { class Service {}; }\n")
         .file(
             "src/app.cpp",
             "#include <target.h>\nusing namespace ns;\nMissingType value;\n",
@@ -2586,6 +2586,28 @@ fn cpp_external_include_reports_boundary() {
         &format!(
             r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
             column_of(line, "Service")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_extensionless_angle_include_with_unrelated_basename_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("vendor/vector", "namespace local { class NotStd {}; }\n")
+        .file("app.cpp", "#include <vector>\nstd::Vector values;\n")
+        .build();
+
+    let line = "std::Vector values;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.cpp","line":2,"column":{}}}]}}"#,
+            column_of(line, "Vector")
         ),
     );
 

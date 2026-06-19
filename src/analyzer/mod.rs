@@ -37,7 +37,7 @@ pub use config::AnalyzerConfig;
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
     include_paths as cpp_include_paths, node_text as cpp_node_text, normalize_cpp_whitespace,
-    resolve_include_targets_with_unique_fallback,
+    resolve_include_targets, resolve_include_targets_with_unique_fallback,
 };
 pub use csharp::CSharpAnalyzer;
 pub use definition_lookup_index::DefinitionLookupIndex;
