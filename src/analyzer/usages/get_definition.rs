@@ -5,8 +5,9 @@ use crate::analyzer::usages::cpp_graph::{
     cpp_split_top_level_commas, extract_variable_name, normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
-    csharp_first_type_child, csharp_is_declaration_name, csharp_is_type_reference_node,
-    csharp_node_text, csharp_reference_type_text, member_access_name as csharp_member_access_name,
+    csharp_argument_count, csharp_first_type_child, csharp_is_declaration_name,
+    csharp_is_type_reference_node, csharp_node_text, csharp_reference_type_text,
+    csharp_signature_arity, member_access_name as csharp_member_access_name,
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
@@ -3682,7 +3683,8 @@ fn resolve_csharp(
                 tree.root_node(),
                 receiver,
             );
-            csharp_member_outcome(analyzer, support, owners, member)
+            let arity = csharp_invocation_arity(name, source);
+            csharp_member_outcome(analyzer, support, owners, member, arity)
         }
         Some(CSharpReferenceNode::UnqualifiedMember(name)) => {
             let member = csharp_node_text(name, source);
@@ -3702,7 +3704,8 @@ fn resolve_csharp(
             let owners = csharp_enclosing_class(analyzer, file, name.start_byte())
                 .into_iter()
                 .collect();
-            let outcome = csharp_member_outcome(analyzer, support, owners, member);
+            let arity = csharp_invocation_arity(name, source);
+            let outcome = csharp_member_outcome(analyzer, support, owners, member, arity);
             if outcome.status == DefinitionLookupStatus::NoDefinition
                 && csharp_static_using_boundary_for_member(csharp, support, file)
             {
@@ -3802,6 +3805,23 @@ fn csharp_is_unqualified_invocation_target(node: Node<'_>) -> bool {
     })
 }
 
+fn csharp_invocation_arity(node: Node<'_>, source: &str) -> Option<usize> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(parent.kind(), "member_access_expression" | "qualified_name") {
+            current = parent;
+            continue;
+        }
+        if parent.kind() == "invocation_expression"
+            && parent.child_by_field_name("function") == Some(current)
+        {
+            return Some(csharp_argument_count(parent, source));
+        }
+        break;
+    }
+    None
+}
+
 fn csharp_type_outcome(
     csharp: &CSharpAnalyzer,
     support: &DefinitionLookupIndex,
@@ -3831,6 +3851,7 @@ fn csharp_member_outcome(
     support: &DefinitionLookupIndex,
     owners: Vec<CodeUnit>,
     member: &str,
+    arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
     if owners.is_empty() {
         return no_definition(
@@ -3839,24 +3860,65 @@ fn csharp_member_outcome(
         );
     };
 
-    let mut candidates = Vec::new();
+    let mut direct_candidates = Vec::new();
     for owner in &owners {
-        candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
-        if let Some(provider) = analyzer.type_hierarchy_provider() {
-            for ancestor in provider.get_ancestors(owner) {
-                candidates.extend(support.fqn(&format!("{}.{}", ancestor.fq_name(), member)));
+        direct_candidates.extend(support.fqn(&format!("{}.{}", owner.fq_name(), member)));
+    }
+    sort_units(&mut direct_candidates);
+    direct_candidates.dedup();
+    let direct_candidates = csharp_filter_candidates_by_arity(direct_candidates, arity);
+    if !direct_candidates.is_empty() {
+        return candidates_outcome(direct_candidates);
+    }
+
+    if let Some(provider) = analyzer.type_hierarchy_provider() {
+        let mut seen = HashSet::default();
+        let mut level = Vec::new();
+        for owner in owners {
+            seen.insert(owner.clone());
+            level.extend(provider.get_direct_ancestors(&owner));
+        }
+        while !level.is_empty() {
+            let mut level_candidates = Vec::new();
+            let mut next_level = Vec::new();
+            for ancestor in level {
+                if !seen.insert(ancestor.clone()) {
+                    continue;
+                }
+                level_candidates.extend(support.fqn(&format!("{}.{}", ancestor.fq_name(), member)));
+                next_level.extend(provider.get_direct_ancestors(&ancestor));
             }
+            sort_units(&mut level_candidates);
+            level_candidates.dedup();
+            let level_candidates = csharp_filter_candidates_by_arity(level_candidates, arity);
+            if !level_candidates.is_empty() {
+                return candidates_outcome(level_candidates);
+            }
+            level = next_level;
         }
     }
-    sort_units(&mut candidates);
-    candidates.dedup();
-    if candidates.is_empty() {
-        no_definition(
-            "no_indexed_definition",
-            format!("C# member `{member}` is not indexed as a definition"),
-        )
+    no_definition(
+        "no_indexed_definition",
+        format!("C# member `{member}` is not indexed as a definition"),
+    )
+}
+
+fn csharp_filter_candidates_by_arity(
+    candidates: Vec<CodeUnit>,
+    arity: Option<usize>,
+) -> Vec<CodeUnit> {
+    let Some(expected) = arity else {
+        return candidates;
+    };
+    let filtered: Vec<_> = candidates
+        .iter()
+        .filter(|unit| unit.is_function() && csharp_signature_arity(unit.signature()) == expected)
+        .cloned()
+        .collect();
+    if filtered.is_empty() {
+        candidates
     } else {
-        candidates_outcome(candidates)
+        filtered
     }
 }
 

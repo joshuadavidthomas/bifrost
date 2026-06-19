@@ -1616,6 +1616,64 @@ fn csharp_typed_receiver_method_resolves_to_definition() {
 }
 
 #[test]
+fn csharp_typed_receiver_method_filters_overloads_by_call_arity() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Service.cs",
+            "namespace Lib { public class Service { public void GetFilePaths(string path) {} public void GetFilePaths(string path, bool clearCache) {} } }\n",
+        )
+        .file(
+            "App/Controller.cs",
+            "using Lib;\nnamespace App { public class Controller { public void Handle(Service service, string folder, bool clearCache) { service.GetFilePaths(folder, clearCache); } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Controller { public void Handle(Service service, string folder, bool clearCache) { service.GetFilePaths(folder, clearCache); } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Controller.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "GetFilePaths")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definition"]["fqn"], "Lib.Service.GetFilePaths",
+        "{value}"
+    );
+    assert_eq!(result["definition"]["signature"], "(string, bool)", "{value}");
+}
+
+#[test]
+fn csharp_inherited_member_prefers_nearest_declaring_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Lib/Types.cs",
+            "namespace Lib { public class Grand { public void Run() {} } public class Base : Grand { public new void Run() {} } public class Child : Base {} }\n",
+        )
+        .file(
+            "App/Controller.cs",
+            "using Lib;\nnamespace App { public class Controller { public void Handle(Child child) { child.Run(); } } }\n",
+        )
+        .build();
+
+    let line = "namespace App { public class Controller { public void Handle(Child child) { child.Run(); } } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/Controller.cs","line":2,"column":{}}}]}}"#,
+            column_of(line, "Run")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definition"]["fqn"], "Lib.Base.Run", "{value}");
+}
+
+#[test]
 fn csharp_this_method_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(

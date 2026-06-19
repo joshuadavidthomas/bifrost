@@ -50,7 +50,7 @@ impl TargetSpec {
     }
 }
 
-fn signature_arity(signature: Option<&str>) -> usize {
+pub(in crate::analyzer::usages) fn signature_arity(signature: Option<&str>) -> usize {
     let Some(signature) = signature else {
         return 0;
     };
@@ -323,7 +323,7 @@ pub(in crate::analyzer::usages) fn is_type_reference_node(mut node: Node<'_>) ->
     false
 }
 
-pub(super) fn argument_count(node: Node<'_>, _source: &str) -> usize {
+pub(in crate::analyzer::usages) fn argument_count(node: Node<'_>, _source: &str) -> usize {
     let Some(arguments) = node
         .child_by_field_name("arguments")
         .or_else(|| first_named_child_of_kind(node, "argument_list"))
