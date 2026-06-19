@@ -829,20 +829,17 @@ fn rust_binding_type_fqn(
     before_byte: usize,
 ) -> Option<String> {
     let mut found = None;
-    rust_collect_binding_type_fqn(
+    let ctx = RustBindingLookupCtx {
         analyzer,
         support,
         file,
         source,
         root,
-        root,
         name,
         before_byte,
-        &mut found,
-    );
-    found.or_else(|| {
-        rust_binding_type_from_source_text(analyzer, support, file, source, name, before_byte)
-    })
+    };
+    rust_collect_binding_type_fqn(ctx, root, &mut found);
+    found
 }
 
 fn rust_binding_type_text(
@@ -855,90 +852,63 @@ fn rust_binding_type_text(
     before_byte: usize,
 ) -> Option<String> {
     let mut found = None;
-    rust_collect_binding_type_text(
+    let ctx = RustBindingLookupCtx {
         analyzer,
         support,
         file,
         source,
         root,
-        root,
         name,
         before_byte,
-        &mut found,
-    );
+    };
+    rust_collect_binding_type_text(ctx, root, &mut found);
     found
 }
 
-fn rust_binding_type_from_source_text(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    file: &ProjectFile,
-    source: &str,
-    name: &str,
+#[derive(Clone, Copy)]
+struct RustBindingLookupCtx<'a, 'tree> {
+    analyzer: &'a dyn IAnalyzer,
+    support: &'a DefinitionLookupIndex,
+    file: &'a ProjectFile,
+    source: &'a str,
+    root: Node<'tree>,
+    name: &'a str,
     before_byte: usize,
-) -> Option<String> {
-    let before = source.get(..before_byte)?;
-    for line in before.lines().rev() {
-        let trimmed = line.trim().trim_end_matches(';').trim();
-        let Some(rest) = trimmed.strip_prefix("let ") else {
-            continue;
-        };
-        let rest = rest.strip_prefix("mut ").unwrap_or(rest).trim();
-        if let Some(after_name) = rest.strip_prefix(name) {
-            let after_name = after_name.trim();
-            if let Some(type_text) = after_name.strip_prefix(':').and_then(|rest| {
-                rest.split_once('=')
-                    .map(|(ty, _)| ty.trim())
-                    .or(Some(rest.trim()))
-            }) {
-                return rust_resolve_type_node_fqn(analyzer, support, file, type_text);
-            }
-            if let Some(value) = after_name.strip_prefix('=').map(str::trim) {
-                return rust_call_text_name(value).and_then(|call| {
-                    let candidates = rust_named_candidates(support, file, call);
-                    rust_callable_return_type(analyzer, candidates).and_then(|type_text| {
-                        rust_resolve_type_node_fqn(analyzer, support, file, &type_text)
-                    })
-                });
-            }
-        }
-    }
-    None
 }
 
 fn rust_collect_binding_type_text(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
+    ctx: RustBindingLookupCtx<'_, '_>,
     node: Node<'_>,
-    name: &str,
-    before_byte: usize,
     found: &mut Option<String>,
 ) {
-    if node.start_byte() >= before_byte {
+    if node.start_byte() >= ctx.before_byte {
         return;
     }
     match node.kind() {
         "parameter" => {
-            if let Some((binding, type_node)) = rust_typed_binding(node, source)
-                && binding == name
+            if let Some((binding, type_node)) = rust_typed_binding(node, ctx.source)
+                && binding == ctx.name
             {
-                *found = Some(rust_node_text(type_node, source).trim().to_string());
+                *found = Some(rust_node_text(type_node, ctx.source).trim().to_string());
             }
         }
         "let_declaration" => {
             if let Some(binding) = node
                 .child_by_field_name("pattern")
-                .and_then(|pattern| rust_simple_identifier_text(pattern, source))
-                && binding == name
+                .and_then(|pattern| rust_simple_identifier_text(pattern, ctx.source))
+                && binding == ctx.name
             {
                 if let Some(type_node) = node.child_by_field_name("type") {
-                    *found = Some(rust_node_text(type_node, source).trim().to_string());
+                    *found = Some(rust_node_text(type_node, ctx.source).trim().to_string());
                 } else if let Some(value) = node.child_by_field_name("value")
-                    && let Some(type_text) =
-                        rust_value_type_text(analyzer, support, file, source, root, value)
+                    && let Some(type_text) = rust_value_type_text(
+                        ctx.analyzer,
+                        ctx.support,
+                        ctx.file,
+                        ctx.source,
+                        ctx.root,
+                        value,
+                    )
                 {
                     *found = Some(type_text);
                 }
@@ -949,46 +919,34 @@ fn rust_collect_binding_type_text(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= before_byte {
+        if child.start_byte() >= ctx.before_byte {
             break;
         }
-        rust_collect_binding_type_text(
-            analyzer,
-            support,
-            file,
-            source,
-            root,
-            child,
-            name,
-            before_byte,
-            found,
-        );
+        if rust_scope_boundary_excludes_reference(child, ctx.before_byte) {
+            continue;
+        }
+        rust_collect_binding_type_text(ctx, child, found);
     }
 }
 
 fn rust_collect_binding_type_fqn(
-    analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
+    ctx: RustBindingLookupCtx<'_, '_>,
     node: Node<'_>,
-    name: &str,
-    before_byte: usize,
     found: &mut Option<String>,
 ) {
-    if node.start_byte() >= before_byte {
+    if node.start_byte() >= ctx.before_byte {
         return;
     }
     match node.kind() {
         "parameter" => {
-            if let Some((binding, type_node)) = rust_typed_binding(node, source)
-                && binding == name
+            if let Some((binding, type_node)) = rust_typed_binding(node, ctx.source)
+                && binding == ctx.name
                 && let Some(fqn) = rust_resolve_type_node_fqn(
-                    analyzer,
-                    support,
-                    file,
-                    rust_node_text(type_node, source),
+                    ctx.analyzer,
+                    ctx.support,
+                    ctx.file,
+                    rust_node_text(type_node, ctx.source),
+                    Some(type_node.start_byte()),
                 )
             {
                 *found = Some(fqn);
@@ -997,21 +955,28 @@ fn rust_collect_binding_type_fqn(
         "let_declaration" => {
             if let Some(binding) = node
                 .child_by_field_name("pattern")
-                .and_then(|pattern| rust_simple_identifier_text(pattern, source))
-                && binding == name
+                .and_then(|pattern| rust_simple_identifier_text(pattern, ctx.source))
+                && binding == ctx.name
             {
                 if let Some(type_node) = node.child_by_field_name("type")
                     && let Some(fqn) = rust_resolve_type_node_fqn(
-                        analyzer,
-                        support,
-                        file,
-                        rust_node_text(type_node, source),
+                        ctx.analyzer,
+                        ctx.support,
+                        ctx.file,
+                        rust_node_text(type_node, ctx.source),
+                        Some(type_node.start_byte()),
                     )
                 {
                     *found = Some(fqn);
                 } else if let Some(value) = node.child_by_field_name("value")
-                    && let Some(fqn) =
-                        rust_value_type_fqn(analyzer, support, file, source, root, value)
+                    && let Some(fqn) = rust_value_type_fqn(
+                        ctx.analyzer,
+                        ctx.support,
+                        ctx.file,
+                        ctx.source,
+                        ctx.root,
+                        value,
+                    )
                 {
                     *found = Some(fqn);
                 }
@@ -1022,21 +987,36 @@ fn rust_collect_binding_type_fqn(
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.start_byte() >= before_byte {
+        if child.start_byte() >= ctx.before_byte {
             break;
         }
-        rust_collect_binding_type_fqn(
-            analyzer,
-            support,
-            file,
-            source,
-            root,
-            child,
-            name,
-            before_byte,
-            found,
-        );
+        if rust_scope_boundary_excludes_reference(child, ctx.before_byte) {
+            continue;
+        }
+        rust_collect_binding_type_fqn(ctx, child, found);
     }
+}
+
+fn rust_scope_boundary_excludes_reference(node: Node<'_>, reference_byte: usize) -> bool {
+    rust_is_scope_boundary(node.kind())
+        && !(node.start_byte() <= reference_byte && reference_byte <= node.end_byte())
+}
+
+fn rust_is_scope_boundary(kind: &str) -> bool {
+    matches!(
+        kind,
+        "block"
+            | "block_expression"
+            | "closure_expression"
+            | "const_item"
+            | "enum_item"
+            | "function_item"
+            | "impl_item"
+            | "macro_definition"
+            | "mod_item"
+            | "static_item"
+            | "trait_item"
+    )
 }
 
 fn rust_typed_binding<'tree>(node: Node<'tree>, source: &str) -> Option<(String, Node<'tree>)> {
@@ -1055,7 +1035,13 @@ fn rust_value_type_fqn(
     value: Node<'_>,
 ) -> Option<String> {
     let type_text = rust_value_type_text(analyzer, support, file, source, root, value)?;
-    rust_resolve_type_node_fqn(analyzer, support, file, &type_text)
+    rust_resolve_type_node_fqn(
+        analyzer,
+        support,
+        file,
+        &type_text,
+        Some(value.start_byte()),
+    )
 }
 
 fn rust_unwrapped_expression_type_fqn(
@@ -1077,7 +1063,13 @@ fn rust_unwrapped_expression_type_fqn(
         before_byte,
     )?;
     let inner = rust_unwrap_container_type(&type_text)?;
-    rust_resolve_type_node_fqn(analyzer, support, file, inner)
+    rust_resolve_type_node_fqn(
+        analyzer,
+        support,
+        file,
+        inner,
+        Some(expression.start_byte()),
+    )
 }
 
 fn rust_expression_type_text(
