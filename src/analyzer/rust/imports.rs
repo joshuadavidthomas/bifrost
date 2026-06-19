@@ -192,13 +192,17 @@ pub(super) fn split_rust_import_module_and_name(raw_import: &str) -> Option<(Str
     Some((module_specifier.to_string(), imported_name.to_string()))
 }
 
-pub(super) fn resolve_rust_module_path(package: &str, module_specifier: &str) -> Option<String> {
+pub(super) fn resolve_rust_module_path_with_crate(
+    package: &str,
+    crate_package: &str,
+    module_specifier: &str,
+) -> Option<String> {
     let trimmed = module_specifier.trim();
     if trimmed.is_empty() {
         return None;
     }
     if trimmed == "crate" {
-        return Some(String::new());
+        return Some(crate_package.to_string());
     }
 
     let segments: Vec<_> = trimmed
@@ -210,12 +214,20 @@ pub(super) fn resolve_rust_module_path(package: &str, module_specifier: &str) ->
     }
 
     let resolved = if segments[0] == "crate" {
-        segments[1..].join(".")
+        crate_package
+            .split('.')
+            .filter(|segment| !segment.is_empty())
+            .chain(segments[1..].iter().copied())
+            .collect::<Vec<_>>()
+            .join(".")
     } else if segments[0] == "super" {
         let mut package_parts: Vec<_> = package
             .split('.')
             .filter(|segment| !segment.is_empty())
             .collect();
+        if package_parts.is_empty() {
+            return None;
+        }
         package_parts.pop();
         package_parts
             .into_iter()
@@ -233,11 +245,11 @@ pub(super) fn resolve_rust_module_path(package: &str, module_specifier: &str) ->
         segments.join(".")
     };
 
-    (!resolved.is_empty()).then_some(resolved)
+    Some(resolved)
 }
 
 pub(super) fn resolve_rust_import_fq_name(
-    _source_file: &ProjectFile,
+    source_file: &ProjectFile,
     package: &str,
     raw_import: &str,
 ) -> Option<String> {
@@ -261,5 +273,22 @@ pub(super) fn resolve_rust_import_fq_name(
         return None;
     }
 
-    resolve_rust_module_path(package, path)
+    let crate_package = rust_crate_root_package(source_file);
+    resolve_rust_module_path_with_crate(package, &crate_package, path)
+}
+
+pub(super) fn rust_crate_root_package(file: &ProjectFile) -> String {
+    let rel = file.rel_path();
+    let mut components: Vec<_> = rel
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect();
+    let Some(src_index) = components.iter().position(|component| component == "src") else {
+        return rust_package_name(file);
+    };
+    if src_index == 0 {
+        return String::new();
+    }
+    components.truncate(src_index + 1);
+    components.join(".")
 }

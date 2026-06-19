@@ -8,7 +8,9 @@ use tree_sitter::{Node, Parser};
 
 use super::RustAnalyzer;
 use super::declarations::rust_package_name;
-use super::imports::{resolve_rust_module_path, split_rust_import_module_and_name};
+use super::imports::{
+    resolve_rust_module_path_with_crate, rust_crate_root_package, split_rust_import_module_and_name,
+};
 
 /// Per-file reference-resolution context for Rust — the one primitive both usage
 /// paths share. Holds the binder-derived maps a reference resolves through, built
@@ -22,6 +24,8 @@ use super::imports::{resolve_rust_module_path, split_rust_import_module_and_name
 pub struct RustReferenceContext {
     /// Dotted module/package name for the file this context resolves from.
     package: String,
+    /// Dotted module/package name for this file's crate root.
+    crate_package: String,
     /// local name -> fqn for `use path::Item;` / `use path::func;` named bindings.
     pub(super) named: HashMap<String, String>,
     /// local alias -> package for `use crate::util;` namespace bindings.
@@ -49,18 +53,23 @@ impl RustReferenceContext {
             return Some(format!("{package}.{name}"));
         }
         if is_rooted_rust_module_path(path)
-            && let Some(package) = resolve_rust_module_path(&self.package, path)
+            && let Some(package) =
+                resolve_rust_module_path_with_crate(&self.package, &self.crate_package, path)
         {
-            return Some(if package.is_empty() {
-                name.to_string()
-            } else {
-                format!("{package}.{name}")
-            });
+            return Some(join_rust_fqn(&package, name));
         }
         self.named
             .get(path)
             .or_else(|| self.same_file.get(path))
             .map(|type_fqn| format!("{type_fqn}.{name}"))
+    }
+}
+
+fn join_rust_fqn(package: &str, name: &str) -> String {
+    if package.is_empty() {
+        name.to_string()
+    } else {
+        format!("{package}.{name}")
     }
 }
 
@@ -222,7 +231,8 @@ impl RustAnalyzer {
         module_specifier: &str,
     ) -> Option<String> {
         let package = rust_package_name(importing_file);
-        resolve_rust_module_path(&package, module_specifier)
+        let crate_package = rust_crate_root_package(importing_file);
+        resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
     }
 
     /// The cached per-file [`RustReferenceContext`] — the one primitive both the
@@ -251,7 +261,7 @@ impl RustAnalyzer {
                         && let Some(package) =
                             self.resolve_module_package(file, &binding.module_specifier)
                     {
-                        named.insert(local.clone(), format!("{package}.{imported}"));
+                        named.insert(local.clone(), join_rust_fqn(&package, imported));
                     }
                 }
                 ImportKind::Namespace => {
@@ -270,6 +280,7 @@ impl RustAnalyzer {
             .collect();
         RustReferenceContext {
             package: rust_package_name(file),
+            crate_package: rust_crate_root_package(file),
             named,
             namespace,
             same_file,
@@ -282,7 +293,10 @@ impl RustAnalyzer {
         module_specifier: &str,
     ) -> Vec<ProjectFile> {
         let package = rust_package_name(importing_file);
-        let Some(resolved_module) = resolve_rust_module_path(&package, module_specifier) else {
+        let crate_package = rust_crate_root_package(importing_file);
+        let Some(resolved_module) =
+            resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
+        else {
             return Vec::new();
         };
 

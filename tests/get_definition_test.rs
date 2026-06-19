@@ -183,6 +183,85 @@ pub fn run() {
 }
 
 #[test]
+fn rust_crate_scoped_macro_resolves_from_nested_crate_root() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "printf/src/lib.rs",
+            r#"
+#[macro_export]
+macro_rules! sprintf {
+    ($fmt:expr) => { $fmt };
+}
+
+#[cfg(test)]
+mod tests;
+"#,
+        )
+        .file(
+            "printf/src/tests.rs",
+            r#"
+pub fn test_crate_macros() {
+    let target = crate::sprintf!("noargs1");
+}
+"#,
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "printf.src.test_crate_macros",
+                "context": "let target = crate::sprintf!(\"noargs1\");",
+                "target": "sprintf"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definition"]["fqn"], "printf.src.sprintf", "{value}");
+    assert_eq!(result["definition"]["path"], "printf/src/lib.rs", "{value}");
+}
+
+#[test]
+fn rust_crate_scoped_macro_resolves_inside_inline_module() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "src/lib.rs",
+            r#"
+pub mod inner {
+    macro_rules! helper {
+        () => {};
+    }
+
+    pub fn caller() {
+        crate::inner::helper!();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "inner.caller",
+                "context": "crate::inner::helper!();",
+                "target": "helper"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definition"]["fqn"], "inner.helper", "{value}");
+}
+
+#[test]
 fn line_column_uses_character_columns_not_byte_offsets() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
@@ -1643,7 +1722,10 @@ fn csharp_typed_receiver_method_filters_overloads_by_call_arity() {
         result["definition"]["fqn"], "Lib.Service.GetFilePaths",
         "{value}"
     );
-    assert_eq!(result["definition"]["signature"], "(string, bool)", "{value}");
+    assert_eq!(
+        result["definition"]["signature"], "(string, bool)",
+        "{value}"
+    );
 }
 
 #[test]

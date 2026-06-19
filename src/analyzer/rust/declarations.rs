@@ -68,6 +68,16 @@ pub(super) fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> 
                     &mut parsed,
                 );
             }
+            "macro_definition" => {
+                visit_rust_macro(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &parsed.package_name.clone(),
+                    &mut parsed,
+                );
+            }
             "type_item" => {
                 visit_rust_alias(
                     file,
@@ -253,6 +263,9 @@ fn visit_rust_module(
                 "mod_item" => {
                     visit_rust_module(file, source, child, Some(&code_unit), package_name, parsed);
                 }
+                "macro_definition" => {
+                    visit_rust_macro(file, source, child, Some(&code_unit), package_name, parsed);
+                }
                 _ => {}
             }
         }
@@ -298,6 +311,41 @@ fn visit_rust_function(
         Some(top_level),
     );
     parsed.add_signature(code_unit.clone(), rust_function_signature(node, source));
+    Some(code_unit)
+}
+
+fn visit_rust_macro(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    parent: Option<&CodeUnit>,
+    package_name: &str,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) -> Option<CodeUnit> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = rust_node_text(name_node, source).trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let short_name = parent
+        .map(|parent| format!("{}.{}", parent.short_name(), name))
+        .unwrap_or_else(|| name.to_string());
+    let code_unit = CodeUnit::new(
+        file.clone(),
+        crate::analyzer::CodeUnitType::Macro,
+        package_name.to_string(),
+        short_name,
+    );
+    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        parent.cloned(),
+        Some(top_level),
+    );
+    parsed.add_signature(code_unit.clone(), rust_macro_signature(node, source));
     Some(code_unit)
 }
 
@@ -454,6 +502,15 @@ fn rust_function_signature(node: Node<'_>, source: &str) -> String {
     } else {
         format!("{header} {{ ... }}")
     }
+}
+
+fn rust_macro_signature(node: Node<'_>, source: &str) -> String {
+    rust_node_text(node, source)
+        .lines()
+        .find(|line| line.contains("macro_rules!"))
+        .map(str::trim)
+        .unwrap_or("macro_rules!")
+        .to_string()
 }
 
 pub(super) fn collect_rust_type_identifiers(
