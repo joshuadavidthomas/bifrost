@@ -4619,8 +4619,7 @@ fn php_reference_node(node: Node<'_>) -> Option<PhpReferenceNode<'_>> {
             .filter(|name| matches!(name.kind(), "name" | "qualified_name"))
             .map(PhpReferenceNode::Function),
         "scoped_call_expression" | "class_constant_access_expression" => {
-            let scope = node.child_by_field_name("scope")?;
-            let name = node.child_by_field_name("name")?;
+            let (scope, name) = php_static_member_parts(node)?;
             Some(PhpReferenceNode::StaticMember { scope, name })
         }
         "member_call_expression" | "member_access_expression" => {
@@ -4638,9 +4637,9 @@ fn php_reference_node(node: Node<'_>) -> Option<PhpReferenceNode<'_>> {
                     Some(PhpReferenceNode::Function(node))
                 }
                 "scoped_call_expression" | "class_constant_access_expression"
-                    if parent.child_by_field_name("name") == Some(node) =>
+                    if php_static_member_name(parent) == Some(node) =>
                 {
-                    let scope = parent.child_by_field_name("scope")?;
+                    let (scope, _) = php_static_member_parts(parent)?;
                     Some(PhpReferenceNode::StaticMember { scope, name: node })
                 }
                 "member_call_expression" | "member_access_expression"
@@ -4658,6 +4657,22 @@ fn php_reference_node(node: Node<'_>) -> Option<PhpReferenceNode<'_>> {
             php_reference_node(parent)
         }
     }
+}
+
+fn php_static_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let scope = node
+        .child_by_field_name("scope")
+        .or_else(|| node.child_by_field_name("class"))
+        .or_else(|| node.named_child(0))?;
+    let name = node
+        .child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("constant"))
+        .or_else(|| node.named_child(1))?;
+    Some((scope, name))
+}
+
+fn php_static_member_name(node: Node<'_>) -> Option<Node<'_>> {
+    php_static_member_parts(node).map(|(_, name)| name)
 }
 
 fn php_qualified_reference_node(mut node: Node<'_>) -> Node<'_> {
