@@ -497,6 +497,62 @@ func (m *Model) Handle() {
 }
 
 #[test]
+fn go_imported_package_var_resolves_inside_longer_selector_chain() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("go.mod", "module example.com/app\n\ngo 1.22\n")
+        .file(
+            "pkg/assets/assets.go",
+            r#"
+package assets
+
+type FS struct{}
+
+var Rewrites FS
+"#,
+        )
+        .file(
+            "service/rewrite.go",
+            r#"
+package service
+
+import "example.com/app/pkg/assets"
+
+func run() {
+    _, _ = assets.Rewrites.ReadFile("rewrite/default.conf")
+}
+"#,
+        )
+        .build();
+
+    let line = r#"    _, _ = assets.Rewrites.ReadFile("rewrite/default.conf")"#;
+    let rewrites = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"service/rewrite.go","line":7,"column":{}}}]}}"#,
+            column_of(line, "Rewrites")
+        ),
+    );
+    assert_eq!(rewrites["results"][0]["status"], "resolved", "{rewrites}");
+    assert_eq!(
+        rewrites["results"][0]["definitions"][0]["fqn"],
+        "example.com/app/pkg/assets._module_.Rewrites",
+        "{rewrites}"
+    );
+
+    let read_file = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"service/rewrite.go","line":7,"column":{}}}]}}"#,
+            column_of(line, "ReadFile")
+        ),
+    );
+    assert_eq!(
+        read_file["results"][0]["status"], "no_definition",
+        "{read_file}"
+    );
+}
+
+#[test]
 fn python_class_and_instance_attributes_resolve_to_definitions() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(

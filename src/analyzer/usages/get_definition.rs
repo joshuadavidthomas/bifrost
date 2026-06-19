@@ -628,11 +628,11 @@ fn rust_resolve_dotted_reference_text(
     tree: &Tree,
     site: &ResolvedReferenceSite,
 ) -> Option<DefinitionLookupOutcome> {
-    let segments = rust_dotted_reference_segments(site)?;
+    let segments = dotted_reference_segments(site)?;
     if segments.len() < 2 {
         return None;
     }
-    let focus_index = rust_dotted_focus_segment_index(site, &segments)?;
+    let focus_index = dotted_focus_segment_index(site, &segments)?;
     if focus_index == 0 {
         return None;
     }
@@ -678,9 +678,7 @@ fn rust_resolve_dotted_reference_text(
     None
 }
 
-fn rust_dotted_reference_segments(
-    site: &ResolvedReferenceSite,
-) -> Option<Vec<(String, usize, usize)>> {
+fn dotted_reference_segments(site: &ResolvedReferenceSite) -> Option<Vec<(String, usize, usize)>> {
     let mut segments = Vec::new();
     let mut offset = 0usize;
     for part in site.text.split('.') {
@@ -699,7 +697,7 @@ fn rust_dotted_reference_segments(
     Some(segments)
 }
 
-fn rust_dotted_focus_segment_index(
+fn dotted_focus_segment_index(
     site: &ResolvedReferenceSite,
     segments: &[(String, usize, usize)],
 ) -> Option<usize> {
@@ -3376,6 +3374,9 @@ fn resolve_go(
             if !candidates.is_empty() {
                 return candidates_outcome(candidates);
             }
+            if let Some(outcome) = go_package_selector_chain_outcome(support, package, site) {
+                return outcome;
+            }
             if !go_import_path_is_workspace(support, package) {
                 return boundary(format!(
                     "`{package}` is outside this partial Go workspace analysis"
@@ -3404,6 +3405,9 @@ fn resolve_go(
             let candidates = go_package_member_candidates(support, import_path, name);
             if !candidates.is_empty() {
                 return candidates_outcome(candidates);
+            }
+            if let Some(outcome) = go_package_selector_chain_outcome(support, import_path, site) {
+                return outcome;
             }
             if !go_import_path_is_workspace(support, import_path) {
                 return boundary(format!(
@@ -3500,6 +3504,21 @@ fn go_package_member_candidates(
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn go_package_selector_chain_outcome(
+    support: &DefinitionLookupIndex,
+    package: &str,
+    site: &ResolvedReferenceSite,
+) -> Option<DefinitionLookupOutcome> {
+    let segments = dotted_reference_segments(site)?;
+    let focus_index = dotted_focus_segment_index(site, &segments)?;
+    if focus_index != 1 {
+        return None;
+    }
+    let member = &segments.get(1)?.0;
+    let candidates = go_package_member_candidates(support, package, member);
+    (!candidates.is_empty()).then(|| candidates_outcome(candidates))
 }
 
 fn go_external_dot_import_path(
