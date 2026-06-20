@@ -1,0 +1,641 @@
+use super::*;
+
+pub(super) fn resolve_php(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+) -> DefinitionLookupOutcome {
+    let Some(php) = resolve_analyzer::<PhpAnalyzer>(analyzer) else {
+        return no_definition("php_analyzer_unavailable", "PHP analyzer is unavailable");
+    };
+    let Some(tree) = tree else {
+        return no_definition("php_parse_failed", "PHP source could not be parsed");
+    };
+    let root = tree.root_node();
+    let Some(node) = smallest_named_node_covering(root, site.range.start_byte, site.range.end_byte)
+    else {
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{}` did not resolve to an indexed PHP definition",
+                site.text
+            ),
+        );
+    };
+    if php_is_non_reference_context(node) || php_is_declaration_name(node) {
+        return no_definition(
+            "declaration_or_import_site",
+            format!("`{}` is not a PHP reference site", site.text),
+        );
+    }
+    if php_is_variable_reference(node) {
+        return no_definition(
+            "local_variable_reference",
+            format!(
+                "`{}` is a PHP variable reference, not an indexed definition",
+                site.text
+            ),
+        );
+    }
+
+    let ctx = FileContext {
+        namespace: php.namespace_of_file(file),
+        aliases: parse_php_use_aliases_from_source(source),
+    };
+    let class_ranges = ClassRangeIndex::build(analyzer, file);
+    match php_reference_node(node) {
+        Some(PhpReferenceNode::Type(type_node)) => {
+            let raw = php_qualified_candidate_text(type_node, source);
+            php_fqn_outcome(support, resolve_php_type(&raw, &ctx), &raw)
+        }
+        Some(PhpReferenceNode::Function(name_node)) => {
+            let raw = php_qualified_candidate_text(name_node, source);
+            php_fqn_outcome(support, resolve_php_function(&raw, &ctx), &raw)
+        }
+        Some(PhpReferenceNode::Constant(name_node)) => {
+            let raw = php_qualified_candidate_text(name_node, source);
+            php_fqn_outcome(support, resolve_php_constant(&raw, &ctx), &raw)
+        }
+        Some(PhpReferenceNode::StaticMember { scope, name }) => {
+            let member = php_node_text(name, source).trim_start_matches('$');
+            let owner = php_static_scope_fqn(php, support, scope, source, &ctx, &class_ranges);
+            php_member_outcome(php, analyzer, support, owner, member)
+        }
+        Some(PhpReferenceNode::InstanceMember { object, name }) => {
+            let member = php_node_text(name, source).trim_start_matches('$');
+            let bindings =
+                php_bindings_before(php, file, source, root, site.range.start_byte, &ctx);
+            let owner = php_instance_receiver_fqn(object, source, &class_ranges, &bindings);
+            php_member_outcome(php, analyzer, support, owner, member)
+        }
+        None => no_definition(
+            "unsupported_php_reference_shape",
+            format!(
+                "`{}` is a PHP `{}` reference shape that get_definition does not resolve yet",
+                site.text,
+                node.kind()
+            ),
+        ),
+    }
+}
+
+pub(super) fn parse_php_tree(source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+        .ok()?;
+    parser.parse(source, None)
+}
+
+enum PhpReferenceNode<'tree> {
+    Type(Node<'tree>),
+    Function(Node<'tree>),
+    Constant(Node<'tree>),
+    StaticMember {
+        scope: Node<'tree>,
+        name: Node<'tree>,
+    },
+    InstanceMember {
+        object: Node<'tree>,
+        name: Node<'tree>,
+    },
+}
+
+fn php_reference_node<'tree>(node: Node<'tree>) -> Option<PhpReferenceNode<'tree>> {
+    let node = php_qualified_reference_node(node);
+    match node.kind() {
+        "object_creation_expression" => php_object_creation_type(node).map(PhpReferenceNode::Type),
+        "named_type" => (!php_is_in_object_creation(node)).then_some(PhpReferenceNode::Type(node)),
+        "function_call_expression" => node
+            .child_by_field_name("function")
+            .filter(|name| matches!(name.kind(), "name" | "qualified_name"))
+            .map(PhpReferenceNode::Function),
+        "scoped_call_expression" | "class_constant_access_expression" => {
+            let (scope, name) = php_static_member_parts(node)?;
+            Some(PhpReferenceNode::StaticMember { scope, name })
+        }
+        "member_call_expression" | "member_access_expression" => {
+            let object = node.child_by_field_name("object")?;
+            let name = node.child_by_field_name("name")?;
+            Some(PhpReferenceNode::InstanceMember { object, name })
+        }
+        "name" | "qualified_name" => {
+            let parent = node.parent()?;
+            match parent.kind() {
+                "object_creation_expression" | "named_type" => Some(PhpReferenceNode::Type(node)),
+                "function_call_expression"
+                    if parent.child_by_field_name("function") == Some(node) =>
+                {
+                    Some(PhpReferenceNode::Function(node))
+                }
+                "scoped_call_expression" | "class_constant_access_expression"
+                    if php_static_member_name(parent) == Some(node) =>
+                {
+                    let (scope, _) = php_static_member_parts(parent)?;
+                    Some(PhpReferenceNode::StaticMember { scope, name: node })
+                }
+                "member_call_expression" | "member_access_expression"
+                    if parent.child_by_field_name("name") == Some(node) =>
+                {
+                    let object = parent.child_by_field_name("object")?;
+                    Some(PhpReferenceNode::InstanceMember { object, name: node })
+                }
+                _ if php_is_instanceof_type_name(node) => Some(PhpReferenceNode::Type(node)),
+                _ if php_is_bare_constant_reference(node) => Some(PhpReferenceNode::Constant(node)),
+                _ => None,
+            }
+        }
+        _ => {
+            let parent = node.parent()?;
+            php_reference_node(parent)
+        }
+    }
+}
+
+/// True when `node` is the type operand of a PHP `instanceof`. The grammar models
+/// `$x instanceof Foo` as a `binary_expression` whose `operator` child is the
+/// `instanceof` token and whose `right` field is the class name.
+fn php_is_instanceof_type_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "binary_expression"
+        && parent
+            .child_by_field_name("operator")
+            .is_some_and(|operator| operator.kind() == "instanceof")
+        && parent.child_by_field_name("right").is_some_and(|right| {
+            right.start_byte() <= node.start_byte() && node.end_byte() <= right.end_byte()
+        })
+}
+
+fn php_static_member_parts(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let scope = node
+        .child_by_field_name("scope")
+        .or_else(|| node.child_by_field_name("class"))
+        .or_else(|| node.named_child(0))?;
+    let name = node
+        .child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("constant"))
+        .or_else(|| node.named_child(1))?;
+    Some((scope, name))
+}
+
+fn php_static_member_name(node: Node<'_>) -> Option<Node<'_>> {
+    php_static_member_parts(node).map(|(_, name)| name)
+}
+
+fn php_qualified_reference_node(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "namespace_name" | "qualified_name") {
+            node = parent;
+        } else {
+            break;
+        }
+    }
+    node
+}
+
+fn php_fqn_outcome(
+    support: &DefinitionLookupIndex,
+    fqn: Option<String>,
+    raw: &str,
+) -> DefinitionLookupOutcome {
+    let Some(fqn) = fqn else {
+        return no_definition(
+            "no_indexed_definition",
+            format!("`{raw}` did not resolve to a PHP definition name"),
+        );
+    };
+    let candidates = support.fqn(&fqn);
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
+    if php_crosses_unindexed_boundary(support, &fqn) {
+        return boundary(format!(
+            "`{raw}` resolves to `{fqn}`, which is outside this partial PHP workspace analysis"
+        ));
+    }
+    no_definition(
+        "no_indexed_definition",
+        format!("`{raw}` resolved to `{fqn}`, but no indexed PHP definition was found"),
+    )
+}
+
+fn php_member_outcome(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner: Option<String>,
+    member: &str,
+) -> DefinitionLookupOutcome {
+    let Some(owner) = owner else {
+        return no_definition(
+            "unsupported_php_receiver",
+            format!("receiver for PHP member `{member}` is not resolved"),
+        );
+    };
+    let fqn = format!("{owner}.{member}");
+    let candidates = support.fqn(&fqn);
+    if !candidates.is_empty() {
+        return candidates_outcome(candidates);
+    }
+    let inherited = php_inherited_member_candidates(php, analyzer, support, &owner, member);
+    if !inherited.is_empty() {
+        return candidates_outcome(inherited);
+    }
+    if php_crosses_unindexed_boundary(support, &owner) {
+        return boundary(format!(
+            "`{member}` appears to cross a PHP boundary at `{owner}` not indexed in this workspace"
+        ));
+    }
+    no_definition(
+        "no_indexed_definition",
+        format!("`{fqn}` is not indexed as a PHP definition"),
+    )
+}
+
+fn php_inherited_member_candidates(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let mut seen = HashSet::default();
+    let mut level = php_direct_parent_fqns(php, analyzer, support, owner_fqn);
+    seen.insert(owner_fqn.to_string());
+    while !level.is_empty() {
+        let mut level_candidates = Vec::new();
+        let mut next_level = Vec::new();
+        for ancestor in level {
+            if !seen.insert(ancestor.clone()) {
+                continue;
+            }
+            level_candidates.extend(support.fqn(&format!("{ancestor}.{member}")));
+            next_level.extend(php_direct_parent_fqns(php, analyzer, support, &ancestor));
+        }
+        sort_units(&mut level_candidates);
+        level_candidates.dedup();
+        if !level_candidates.is_empty() {
+            return level_candidates;
+        }
+        level = next_level;
+    }
+    Vec::new()
+}
+
+fn php_direct_parent_fqns(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    owner_fqn: &str,
+) -> Vec<String> {
+    php_parent_fqn(php, support, owner_fqn)
+        .into_iter()
+        .filter(|parent| analyzer.definitions(parent).next().is_some())
+        .collect()
+}
+
+fn php_crosses_unindexed_boundary(support: &DefinitionLookupIndex, fqn: &str) -> bool {
+    let Some((namespace, _)) = fqn.rsplit_once('.') else {
+        return !php_workspace_exact_namespace_exists(support, "");
+    };
+    !php_workspace_exact_namespace_exists(support, namespace)
+}
+
+fn php_workspace_exact_namespace_exists(support: &DefinitionLookupIndex, namespace: &str) -> bool {
+    support.package_exists(namespace)
+}
+
+fn php_static_scope_fqn(
+    php: &PhpAnalyzer,
+    support: &DefinitionLookupIndex,
+    scope: Node<'_>,
+    source: &str,
+    ctx: &FileContext,
+    class_ranges: &ClassRangeIndex,
+) -> Option<String> {
+    let text = php_node_text(scope, source);
+    match text {
+        "self" | "static" => class_ranges
+            .enclosing(scope.start_byte())
+            .map(str::to_string),
+        "parent" => php_parent_fqn(php, support, class_ranges.enclosing(scope.start_byte())?),
+        _ => resolve_php_type(text, ctx),
+    }
+}
+
+fn php_parent_fqn(
+    php: &PhpAnalyzer,
+    support: &DefinitionLookupIndex,
+    enclosing_fqn: &str,
+) -> Option<String> {
+    let child = support.fqn(enclosing_fqn).into_iter().next()?;
+    let source = child.source();
+    let raw_source = source.read_to_string().ok()?;
+    let tree = parse_php_tree(&raw_source)?;
+    let ctx = FileContext {
+        namespace: php.namespace_of_file(source),
+        aliases: parse_php_use_aliases_from_source(&raw_source),
+    };
+    let ranges = php.ranges(&child);
+    let class_range = ranges.first()?;
+    php_declared_parent_type(
+        tree.root_node(),
+        &raw_source,
+        &ctx,
+        class_range.start_byte,
+        class_range.end_byte,
+    )
+}
+
+fn php_declared_parent_type(
+    mut node: Node<'_>,
+    source: &str,
+    ctx: &FileContext,
+    start: usize,
+    end: usize,
+) -> Option<String> {
+    loop {
+        if node.start_byte() <= start
+            && node.end_byte() >= end
+            && matches!(
+                node.kind(),
+                "class_declaration" | "interface_declaration" | "trait_declaration"
+            )
+        {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if matches!(child.kind(), "base_clause" | "class_interface_clause") {
+                    let mut clause_cursor = child.walk();
+                    for clause_child in child.named_children(&mut clause_cursor) {
+                        if matches!(
+                            clause_child.kind(),
+                            "name" | "qualified_name" | "namespace_name"
+                        ) {
+                            return resolve_php_type(
+                                &php_qualified_candidate_text(clause_child, source),
+                                ctx,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        let mut next = None;
+        for child in node.named_children(&mut cursor) {
+            if child.start_byte() <= start && child.end_byte() >= end {
+                next = Some(child);
+                break;
+            }
+        }
+        match next {
+            Some(child) => node = child,
+            None => return None,
+        }
+    }
+}
+
+fn php_instance_receiver_fqn(
+    object: Node<'_>,
+    source: &str,
+    class_ranges: &ClassRangeIndex,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    match object.kind() {
+        "variable_name" => {
+            let name = php_variable_identifier(object, source);
+            if name == "this" {
+                return class_ranges
+                    .enclosing(object.start_byte())
+                    .map(str::to_string);
+            }
+            first_precise(bindings, name)
+        }
+        _ => None,
+    }
+}
+
+fn php_bindings_before(
+    php: &PhpAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    byte: usize,
+    ctx: &FileContext,
+) -> LocalInferenceEngine<String> {
+    let scope = php_enclosing_scope(root, byte).unwrap_or(root);
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= byte {
+            continue;
+        }
+        if node != scope && PHP_SCOPE_NODES.contains(&node.kind()) {
+            continue;
+        }
+        php_seed_parameters(node, source, ctx, &mut bindings);
+        if node.end_byte() <= byte {
+            php_seed_assignment(php, file, node, source, ctx, &mut bindings);
+        }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            if child.start_byte() < byte {
+                stack.push(child);
+            }
+        }
+    }
+    bindings
+}
+
+const PHP_SCOPE_NODES: &[&str] = &[
+    "function_definition",
+    "method_declaration",
+    "anonymous_function",
+    "arrow_function",
+];
+
+fn php_enclosing_scope<'tree>(root: Node<'tree>, byte: usize) -> Option<Node<'tree>> {
+    let mut best = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() <= byte && byte < node.end_byte() {
+            if PHP_SCOPE_NODES.contains(&node.kind()) {
+                best = Some(node);
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                stack.push(child);
+            }
+        }
+    }
+    best
+}
+
+fn php_seed_parameters(
+    node: Node<'_>,
+    source: &str,
+    ctx: &FileContext,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        if !matches!(
+            child.kind(),
+            "simple_parameter" | "property_promotion_parameter"
+        ) {
+            continue;
+        }
+        let Some(name_node) = child.child_by_field_name("name") else {
+            continue;
+        };
+        let name = php_variable_identifier(name_node, source);
+        if name.is_empty() {
+            continue;
+        }
+        match child
+            .child_by_field_name("type")
+            .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx))
+        {
+            Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
+            None => bindings.declare_shadow(name.to_string()),
+        }
+    }
+}
+
+fn php_seed_assignment(
+    _php: &PhpAnalyzer,
+    _file: &ProjectFile,
+    node: Node<'_>,
+    source: &str,
+    ctx: &FileContext,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
+    if node.kind() != "assignment_expression" {
+        return;
+    }
+    let (Some(left), Some(right)) = (
+        node.child_by_field_name("left"),
+        node.child_by_field_name("right"),
+    ) else {
+        return;
+    };
+    if left.kind() != "variable_name" {
+        return;
+    }
+    let name = php_variable_identifier(left, source);
+    if name.is_empty() {
+        return;
+    }
+    let resolved = (right.kind() == "object_creation_expression")
+        .then(|| php_object_creation_type(right))
+        .flatten()
+        .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx));
+    match resolved {
+        Some(fqn) => bindings.seed_symbol(name.to_string(), fqn),
+        None => bindings.declare_shadow(name.to_string()),
+    }
+}
+
+fn php_object_creation_type(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "name" | "qualified_name"))
+}
+
+fn php_is_in_object_creation(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "object_creation_expression")
+}
+
+fn php_is_bare_constant_reference(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    !matches!(
+        parent.kind(),
+        "function_call_expression"
+            | "member_access_expression"
+            | "member_call_expression"
+            | "scoped_call_expression"
+            | "class_constant_access_expression"
+            | "named_type"
+            | "object_creation_expression"
+            | "function_definition"
+            | "method_declaration"
+            | "const_element"
+            | "namespace_use_clause"
+            | "namespace_definition"
+            | "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "qualified_name"
+            | "base_clause"
+            | "class_interface_clause"
+    )
+}
+
+fn php_variable_identifier<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    php_node_text(node, source).trim_start_matches('$')
+}
+
+fn php_is_declaration_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.child_by_field_name("name") == Some(node)
+        && matches!(
+            parent.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "trait_declaration"
+                | "function_definition"
+                | "method_declaration"
+                | "enum_declaration"
+                | "enum_case"
+                | "const_element"
+                | "property_element"
+                | "simple_parameter"
+                | "property_promotion_parameter"
+        )
+}
+
+fn php_is_variable_reference(node: Node<'_>) -> bool {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "variable_name" {
+            return true;
+        }
+        current = candidate.parent();
+    }
+    false
+}
+
+fn php_is_non_reference_context(node: Node<'_>) -> bool {
+    let mut parent = Some(node);
+    while let Some(current) = parent {
+        if matches!(
+            current.kind(),
+            "namespace_use_declaration"
+                | "namespace_use_clause"
+                | "comment"
+                | "string"
+                | "encapsed_string"
+                | "string_value"
+                | "heredoc"
+                | "nowdoc"
+        ) {
+            return true;
+        }
+        parent = current.parent();
+    }
+    false
+}
