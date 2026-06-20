@@ -3686,7 +3686,7 @@ fn ts_resolve_type_text_to_property_owners(
         );
     }
 
-    if let Some(inner) = ts_generic_type_argument(&type_text, "z.infer") {
+    if let Some(inner) = ts_schema_infer_argument(&type_text) {
         return ts_resolve_type_text_to_property_owners(
             analyzer,
             support,
@@ -4018,6 +4018,22 @@ fn ts_generic_type_argument<'a>(text: &'a str, generic: &str) -> Option<&'a str>
     let rest = text.strip_prefix(generic)?;
     let rest = rest.trim_start();
     let inner = rest.strip_prefix('<')?.strip_suffix('>')?;
+    Some(inner.trim())
+}
+
+/// Recognizes a schema library's type-inference helper applied to a value, e.g. zod's
+/// `z.infer<typeof Schema>` (and the `Infer` alias other libraries expose), so navigation can
+/// follow the wrapped argument to the schema's shape. Matches the qualified `.infer`/`.Infer`
+/// member-name convention regardless of the namespace alias, rather than the literal `z.infer`.
+fn ts_schema_infer_argument(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let open = text.find('<')?;
+    let head = text[..open].trim();
+    let last = head.rsplit('.').next()?;
+    if !head.contains('.') || !(last == "infer" || last == "Infer") {
+        return None;
+    }
+    let inner = text[open..].strip_prefix('<')?.strip_suffix('>')?;
     Some(inner.trim())
 }
 

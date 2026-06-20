@@ -1070,7 +1070,7 @@ fn ts_call_preserves_object_argument_shape(
     source: &str,
     argument_index: usize,
 ) -> bool {
-    if argument_index == 0 && ts_call_is_z_object(call, source) {
+    if argument_index == 0 && ts_call_is_schema_object_builder(call, source) {
         return true;
     }
     let Some(callee_name) = ts_call_identifier_name(call, source) else {
@@ -1079,20 +1079,22 @@ fn ts_call_preserves_object_argument_shape(
     ts_source_function_preserves_parameter_shape(anchor, source, &callee_name, argument_index)
 }
 
-fn ts_call_is_z_object(call: Node<'_>, source: &str) -> bool {
+/// Recognizes a schema-builder call whose first object-literal argument defines the value's
+/// navigable shape, e.g. zod's `z.object({ ... })`. Schema libraries (zod, yup, valibot,
+/// superstruct, ...) universally expose this via an `object(...)` builder, so we match the
+/// `object` member-name convention rather than a specific import alias — `z` is only a
+/// conventional name and breaks under `import * as zod` or aliased imports.
+fn ts_call_is_schema_object_builder(call: Node<'_>, source: &str) -> bool {
     let Some(function) = call.child_by_field_name("function") else {
         return false;
     };
     if function.kind() != "member_expression" {
         return false;
     }
-    let Some(object) = function.child_by_field_name("object") else {
-        return false;
-    };
     let Some(property) = function.child_by_field_name("property") else {
         return false;
     };
-    node_text(object, source).trim() == "z" && node_text(property, source).trim() == "object"
+    node_text(property, source).trim() == "object"
 }
 
 fn ts_call_identifier_name(call: Node<'_>, source: &str) -> Option<String> {
