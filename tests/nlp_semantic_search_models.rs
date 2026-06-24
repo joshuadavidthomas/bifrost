@@ -1,8 +1,7 @@
 //! Real-model smoke test for semantic_search.
 //!
-//! Ignored by default: it downloads the granite embedding model and the gte
-//! reranker from HuggingFace (or honors BIFROST_EMBED_MODEL_DIR /
-//! BIFROST_RERANK_MODEL_DIR) and runs real ONNX inference. Run with:
+//! Ignored by default: it downloads the granite embedding model from HuggingFace
+//! (or honors BIFROST_EMBED_MODEL_DIR) and runs real ONNX inference. Run with:
 //!
 //! ```bash
 //! BIFROST_NLP_MODEL_TESTS=1 cargo test --test nlp_semantic_search_models -- --ignored
@@ -21,7 +20,7 @@ fn write_java(dir: &Path, name: &str, body: &str) {
 }
 
 #[test]
-#[ignore = "downloads and runs real embedding/reranking models"]
+#[ignore = "downloads and runs the real embedding model"]
 fn semantic_search_with_real_models_ranks_expected_file() {
     if std::env::var("BIFROST_NLP_MODEL_TESTS").as_deref() != Ok("1") {
         eprintln!("BIFROST_NLP_MODEL_TESTS != 1; skipping real-model smoke test");
@@ -103,14 +102,17 @@ public class HttpFetcher {
         "expected no degraded-mode notes: {:?}",
         result.notes
     );
-    assert_eq!(
-        result.hits.first().map(|hit| hit.path.as_str()),
-        Some("ConfigLoader.java"),
-        "hits: {:?}",
+    // The dense retriever should rank the settings-reading function first by fqfn.
+    assert!(
         result
-            .hits
+            .vector_ranked
+            .first()
+            .is_some_and(|row| row.fqfn.contains("loadSettings")),
+        "vector_ranked: {:?}",
+        result
+            .vector_ranked
             .iter()
-            .map(|hit| (&hit.path, hit.score))
+            .map(|row| (&row.fqfn, row.score))
             .collect::<Vec<_>>()
     );
     indexer.close();

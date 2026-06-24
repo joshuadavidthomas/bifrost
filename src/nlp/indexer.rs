@@ -27,8 +27,7 @@ use crate::path_utils::rel_path_string;
 use super::bm25::fts_text;
 use super::chunker::{ChunkText, extract_file_chunks};
 use super::engine::{
-    Embedder, FakeHashEmbedder, FakeOverlapReranker, Reranker, load_production_embedder,
-    load_production_reranker, resolve_embed_model, resolve_rerank_model,
+    Embedder, FakeHashEmbedder, load_production_embedder, resolve_embed_model,
 };
 use super::keys::{Key, component_key, compose, composed_key, content_hash};
 use super::store::{ChunkRowIn, FileState, SemanticStore, semantic_db_path};
@@ -49,7 +48,6 @@ pub const READY_TIMEOUT_MESSAGE: &str =
 /// Supplies the model-backed engines; injectable so tests run without ONNX.
 pub trait EngineProvider: Send + 'static {
     fn embedder(&self) -> Result<Arc<dyn Embedder>, String>;
-    fn reranker(&self) -> Result<Arc<dyn Reranker>, String>;
 }
 
 /// Production provider: resolves models from env/HF hub and loads gte-rs.
@@ -59,11 +57,6 @@ impl EngineProvider for DefaultEngineProvider {
     fn embedder(&self) -> Result<Arc<dyn Embedder>, String> {
         let resolved = resolve_embed_model()?;
         load_production_embedder(&resolved)
-    }
-
-    fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
-        let resolved = resolve_rerank_model()?;
-        load_production_reranker(&resolved)
     }
 }
 
@@ -75,10 +68,6 @@ pub struct FakeEngineProvider {
 impl EngineProvider for FakeEngineProvider {
     fn embedder(&self) -> Result<Arc<dyn Embedder>, String> {
         Ok(self.embedder.clone())
-    }
-
-    fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
-        Ok(Arc::new(FakeOverlapReranker))
     }
 }
 
@@ -100,8 +89,6 @@ struct Shared {
     pending: AtomicU64,
     store: OnceLock<Arc<SemanticStore>>,
     embedder: OnceLock<Arc<dyn Embedder>>,
-    /// `Err` keeps the failure message so queries can degrade with a note.
-    reranker: OnceLock<Result<Arc<dyn Reranker>, String>>,
     workspace_id: OnceLock<i64>,
 }
 
@@ -143,7 +130,6 @@ impl SemanticIndexer {
             pending: AtomicU64::new(1),
             store: OnceLock::new(),
             embedder: OnceLock::new(),
-            reranker: OnceLock::new(),
             workspace_id: OnceLock::new(),
         });
         let (tx, rx) = mpsc::channel();
@@ -229,14 +215,6 @@ impl SemanticIndexer {
     }
 
     /// `Err` carries the load failure so callers can surface a note.
-    pub fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
-        match self.shared.reranker.get() {
-            Some(Ok(reranker)) => Ok(reranker.clone()),
-            Some(Err(message)) => Err(message.clone()),
-            None => Err("reranker not loaded yet".to_string()),
-        }
-    }
-
     pub fn workspace_id(&self) -> Option<i64> {
         self.shared.workspace_id.get().copied()
     }
@@ -444,9 +422,6 @@ fn worker_loop(
         }
         if !first_build_done {
             first_build_done = true;
-            // Load the reranker after the index is usable; a failure here
-            // degrades reranking but never blocks retrieval.
-            shared.reranker.set(provider.reranker()).ok();
             let mut phase = shared
                 .phase
                 .lock()
@@ -891,10 +866,6 @@ mod tests {
     impl EngineProvider for BlockingEngineProvider {
         fn embedder(&self) -> Result<Arc<dyn Embedder>, String> {
             Ok(self.embedder.clone())
-        }
-
-        fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
-            Ok(Arc::new(FakeOverlapReranker))
         }
     }
 

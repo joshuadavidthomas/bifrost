@@ -1,15 +1,22 @@
 //! End-to-end semantic_search pipeline test with deterministic fake engines:
-//! index build -> vector scan -> co-edit blend -> grounded bm25 -> rerank.
+//! index build -> vector scan -> grounded bm25 -> co-edit relevance, returned as
+//! three independent ranked lists.
 #![cfg(feature = "nlp")]
 
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use brokk_bifrost::nlp::engine::{Embedder, FakeHashEmbedder, FakeOverlapReranker, Reranker};
+use brokk_bifrost::nlp::engine::{Embedder, FakeHashEmbedder};
 use brokk_bifrost::nlp::indexer::{EngineProvider, FakeEngineProvider, SemanticIndexer};
-use brokk_bifrost::nlp::query::{SemanticSearchParams, semantic_search};
+use brokk_bifrost::nlp::query::{SemanticSearchResult, SemanticSearchParams, semantic_search};
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
+
+fn all_legs_empty(result: &SemanticSearchResult) -> bool {
+    result.vector_ranked.is_empty()
+        && result.bm25_ranked.is_empty()
+        && result.coedit_ranked.is_empty()
+}
 
 fn write_java(dir: &Path, name: &str, body: &str) {
     std::fs::write(dir.join(name), body).unwrap();
@@ -99,14 +106,10 @@ impl EngineProvider for BlockingEngineProvider {
     fn embedder(&self) -> Result<Arc<dyn Embedder>, String> {
         Ok(self.embedder.clone())
     }
-
-    fn reranker(&self) -> Result<Arc<dyn Reranker>, String> {
-        Ok(Arc::new(FakeOverlapReranker))
-    }
 }
 
 #[test]
-fn semantic_search_returns_hits_with_summaries() {
+fn semantic_search_returns_constituent_rankings() {
     let dir = tempfile::tempdir().unwrap();
     write_java(
         dir.path(),
@@ -130,24 +133,28 @@ fn semantic_search_returns_hits_with_summaries() {
         &snapshot,
         &indexer,
         SemanticSearchParams {
-            // "loadConfig" grounds against the repo symbol universe, so the
-            // bm25 leg and the fake overlap reranker both favor ConfigLoader.
+            // "loadConfig" grounds against the repo symbol universe, so the bm25
+            // leg surfaces the loadConfig function chunk by fqfn.
             query: "where does loadConfig read the configuration".to_string(),
             k: 2,
         },
     )
     .expect("semantic_search succeeds");
 
-    assert!(!result.hits.is_empty());
-    let config_hit = result
-        .hits
-        .iter()
-        .find(|hit| hit.path == "ConfigLoader.java")
-        .expect("ConfigLoader.java among hits");
+    // The vector leg ranks the function chunks (file-summary chunks excluded).
     assert!(
-        config_hit.summary.contains("class ConfigLoader"),
-        "hit carries the file summary: {}",
-        config_hit.summary
+        !result.vector_ranked.is_empty(),
+        "vector leg returns function symbols"
+    );
+    // The grounded bm25 leg keys on fully-qualified names, so the loadConfig
+    // function is recovered by symbol.
+    assert!(
+        result
+            .bm25_ranked
+            .iter()
+            .any(|row| row.fqfn.contains("loadConfig")),
+        "bm25 leg surfaces the loadConfig symbol: {:?}",
+        result.bm25_ranked
     );
     indexer.close();
 }
@@ -178,7 +185,11 @@ fn semantic_search_blocks_until_initial_build() {
         },
     )
     .expect("query issued during build waits for readiness");
-    assert_eq!(result.hits.len(), 1);
+    assert_eq!(
+        result.vector_ranked.len(),
+        1,
+        "the single greet() function chunk is ranked"
+    );
 
     // And the indexer reports ready immediately afterwards.
     indexer.wait_ready(Duration::from_secs(1)).unwrap();
@@ -214,7 +225,10 @@ fn semantic_search_times_out_and_returns_current_results() {
     )
     .expect("query should fall back while index build is still running");
 
-    assert!(result.hits.is_empty(), "no vectors have been committed yet");
+    assert!(
+        all_legs_empty(&result),
+        "no vectors have been committed yet"
+    );
     assert!(
         result
             .notes
@@ -287,6 +301,6 @@ fn semantic_search_caps_requested_k() {
         },
     )
     .expect("oversized k is clamped before internal candidate math");
-    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.vector_ranked.len(), 1);
     indexer.close();
 }

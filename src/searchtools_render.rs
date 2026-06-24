@@ -27,7 +27,9 @@ pub trait RenderText {
 #[cfg(feature = "nlp")]
 impl RenderText for crate::nlp::query::SemanticSearchResult {
     fn render_text(&self, _options: RenderOptions) -> String {
-        let mut blocks: Vec<String> = Vec::with_capacity(self.hits.len() + 1);
+        use crate::nlp::query::{RankedFile, RankedSymbol};
+
+        let mut blocks: Vec<String> = Vec::new();
         if !self.notes.is_empty() {
             blocks.push(
                 self.notes
@@ -37,15 +39,37 @@ impl RenderText for crate::nlp::query::SemanticSearchResult {
                     .join("\n"),
             );
         }
-        for hit in &self.hits {
-            let mut block = format!("=== {} (score {:.3}) ===", hit.path, hit.score);
-            if !hit.summary.is_empty() {
-                block.push('\n');
-                block.push_str(&hit.summary);
+
+        let symbol_section = |title: &str, rows: &[RankedSymbol]| -> Option<String> {
+            if rows.is_empty() {
+                return None;
             }
-            blocks.push(block);
-        }
-        if self.hits.is_empty() {
+            let mut block = format!("=== {title} ===");
+            for row in rows {
+                block.push_str(&format!("\n{} (score {:.3})", row.fqfn, row.score));
+            }
+            Some(block)
+        };
+        let file_section = |title: &str, rows: &[RankedFile]| -> Option<String> {
+            if rows.is_empty() {
+                return None;
+            }
+            let mut block = format!("=== {title} ===");
+            for row in rows {
+                block.push_str(&format!("\n{} (score {:.3})", row.path, row.score));
+            }
+            Some(block)
+        };
+
+        let sections = [
+            symbol_section("vector", &self.vector_ranked),
+            symbol_section("bm25", &self.bm25_ranked),
+            file_section("co-edit", &self.coedit_ranked),
+        ];
+        let any_results = sections.iter().any(Option::is_some);
+        blocks.extend(sections.into_iter().flatten());
+
+        if !any_results {
             blocks.push("No semantically similar code found.".to_string());
         }
         blocks.join("\n\n")

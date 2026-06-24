@@ -93,6 +93,9 @@ pub struct ScanRow {
     pub file_path: String,
     pub kind_is_summary: bool,
     pub chunk_ord: i64,
+    /// Fully-qualified function name for function chunks; `None` for the
+    /// file-summary chunk.
+    pub symbol: Option<String>,
     pub vector: Vec<f32>,
 }
 
@@ -394,7 +397,7 @@ impl SemanticStore {
         let effective_batch = batch_size.max(1);
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
         let mut stmt = conn.prepare(
-            "SELECT c.file_path, c.kind, c.chunk_ord, v.vector
+            "SELECT c.file_path, c.kind, c.chunk_ord, c.symbol, v.vector
              FROM chunks c
              JOIN vectors v ON v.key = c.composed_key
              WHERE c.workspace_id = ?1
@@ -404,11 +407,12 @@ impl SemanticStore {
         let mut batch = Vec::with_capacity(effective_batch);
         while let Some(row) = rows.next()? {
             let kind: String = row.get(1)?;
-            let vector_blob: Vec<u8> = row.get(3)?;
+            let vector_blob: Vec<u8> = row.get(4)?;
             batch.push(ScanRow {
                 file_path: row.get(0)?,
                 kind_is_summary: kind == "file_summary",
                 chunk_ord: row.get(2)?,
+                symbol: row.get(3)?,
                 vector: blob_to_vector(&vector_blob),
             });
             if batch.len() == effective_batch {
@@ -422,7 +426,9 @@ impl SemanticStore {
         Ok(())
     }
 
-    pub fn bm25_file_scores(
+    /// BM25 relevance per function symbol (fqfn). The file-summary chunk has no
+    /// symbol and is excluded; a symbol's score is the max over its chunks.
+    pub fn bm25_symbol_scores(
         &self,
         workspace_id: i64,
         match_query: &str,
@@ -451,27 +457,28 @@ impl SemanticStore {
             return Ok(Vec::new());
         }
 
-        let mut file_scores = HashMap::<String, f64>::new();
+        let mut symbol_scores = HashMap::<String, f64>::new();
         let doc_ids: Vec<i64> = doc_scores.keys().copied().collect();
         for chunk in doc_ids.chunks(SQLITE_IN_LIMIT) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT file_path, bm25_doc_id
+                "SELECT symbol, bm25_doc_id
                  FROM chunks
-                 WHERE workspace_id = ? AND bm25_doc_id IN ({placeholders})"
+                 WHERE workspace_id = ? AND symbol IS NOT NULL
+                   AND bm25_doc_id IN ({placeholders})"
             );
             let mut stmt = conn.prepare(&sql)?;
             let params_iter = std::iter::once(rusqlite::types::Value::Integer(workspace_id))
                 .chain(chunk.iter().copied().map(rusqlite::types::Value::Integer));
             let mut rows = stmt.query(rusqlite::params_from_iter(params_iter))?;
             while let Some(row) = rows.next()? {
-                let file_path: String = row.get(0)?;
+                let symbol: String = row.get(0)?;
                 let doc_id: i64 = row.get(1)?;
                 if let Some(score) = doc_scores.get(&doc_id) {
-                    file_scores
-                        .entry(file_path)
+                    symbol_scores
+                        .entry(symbol)
                         .and_modify(|best| {
                             if *score > *best {
                                 *best = *score;
@@ -482,15 +489,15 @@ impl SemanticStore {
             }
         }
 
-        let mut scored_files: Vec<(String, f64)> = file_scores.into_iter().collect();
-        scored_files.sort_by(|(path_a, score_a), (path_b, score_b)| {
+        let mut scored: Vec<(String, f64)> = symbol_scores.into_iter().collect();
+        scored.sort_by(|(sym_a, score_a), (sym_b, score_b)| {
             score_b
                 .partial_cmp(score_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| path_a.cmp(path_b))
+                .then_with(|| sym_a.cmp(sym_b))
         });
-        scored_files.truncate(limit);
-        Ok(scored_files)
+        scored.truncate(limit);
+        Ok(scored)
     }
 
     pub fn gc(&self, component_ttl_secs: i64) -> Result<()> {
@@ -957,13 +964,17 @@ mod tests {
         assert_eq!(batches[0].len(), 2);
         assert_eq!(batches[1].len(), 1);
         assert!(batches[0][0].kind_is_summary);
+        assert_eq!(batches[0][0].symbol, None);
         assert_eq!(batches[0][0].vector, vec![1.0, 0.0]);
+        assert_eq!(batches[0][1].symbol.as_deref(), Some("alpha_fn"));
 
+        // "rarealpha" matches the summary chunk (no symbol, excluded) and the
+        // alpha_fn function chunk, so only the function symbol is returned.
         let scores = store
-            .bm25_file_scores(workspace_id, "rarealpha", 1)
+            .bm25_symbol_scores(workspace_id, "rarealpha", 5)
             .unwrap();
         assert_eq!(scores.len(), 1);
-        assert_eq!(scores[0].0, "a.rs");
+        assert_eq!(scores[0].0, "alpha_fn");
     }
 
     #[test]

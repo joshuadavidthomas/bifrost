@@ -1,8 +1,8 @@
-//! Embedding and reranking engines.
+//! Embedding engine.
 //!
-//! `Embedder`/`Reranker` are the seams the indexer and query pipeline depend
-//! on; production impls wrap `gte-rs` ONNX pipelines, and deterministic fakes
-//! back the model-free tests. Model files resolve from env-pointed local
+//! `Embedder` is the seam the indexer and query pipeline depend on; the
+//! production impl wraps a `gte-rs` ONNX pipeline, and a deterministic fake
+//! backs the model-free tests. Model files resolve from env-pointed local
 //! directories first (fine-tune escape hatch), then the HF hub cache.
 
 use std::collections::VecDeque;
@@ -21,9 +21,6 @@ use super::{MAX_SEQ_TOKENS, PARENT_ALPHA, PASSAGE_PREFIX, QUERY_PREFIX, REPRESEN
 /// batches under that quadratic cost (see [`EmbedBatch`]); this cap only
 /// bounds how many short texts share a call.
 const EMBED_BATCH: usize = 16;
-
-/// Query/document pairs scored per ONNX call.
-const RERANK_BATCH: usize = 8;
 
 const ACCELERATOR_ENV: &str = "BIFROST_ACCELERATOR";
 const CUDA_DEVICES_ENV: &str = "BIFROST_CUDA_DEVICES";
@@ -51,11 +48,6 @@ pub trait Embedder: Send + Sync {
     fn fingerprint(&self) -> String;
 }
 
-pub trait Reranker: Send + Sync {
-    /// Cross-encoder relevance of each doc to the query, higher is better.
-    fn score_pairs(&self, query: &str, docs: &[String]) -> Result<Vec<f32>, String>;
-}
-
 /// Fingerprint recipe shared by all embedders: model label + dimensionality +
 /// the exact prefix strings + vector representation contract.
 fn fingerprint_for(label: &str, dim: usize) -> String {
@@ -81,12 +73,9 @@ fn fingerprint_for(label: &str, dim: usize) -> String {
 // ---------------------------------------------------------------------------
 
 pub const DEFAULT_EMBED_MODEL_ID: &str = "onnx-community/granite-embedding-small-english-r2-ONNX";
-pub const DEFAULT_RERANK_MODEL_ID: &str = "Alibaba-NLP/gte-reranker-modernbert-base";
 
 pub const EMBED_MODEL_DIR_ENV: &str = "BIFROST_EMBED_MODEL_DIR";
-pub const RERANK_MODEL_DIR_ENV: &str = "BIFROST_RERANK_MODEL_DIR";
 pub const EMBED_MODEL_ID_ENV: &str = "BIFROST_EMBED_MODEL_ID";
-pub const RERANK_MODEL_ID_ENV: &str = "BIFROST_RERANK_MODEL_ID";
 pub const CUDA_DEVICE_ENV: &str = "BIFROST_CUDA_DEVICE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,19 +452,6 @@ pub fn resolve_embed_model() -> Result<ResolvedModel, String> {
     }
 }
 
-pub fn resolve_rerank_model() -> Result<ResolvedModel, String> {
-    if let Ok(dir) = std::env::var(RERANK_MODEL_DIR_ENV) {
-        return resolve_local_dir(Path::new(&dir));
-    }
-    let repo_id =
-        std::env::var(RERANK_MODEL_ID_ENV).unwrap_or_else(|_| DEFAULT_RERANK_MODEL_ID.to_string());
-    if has_accelerated_target() {
-        resolve_hf(&repo_id, "onnx/model.onnx")
-    } else {
-        resolve_hf(&repo_id, "onnx/model_int8.onnx")
-    }
-}
-
 pub fn load_production_embedder(resolved: &ResolvedModel) -> Result<Arc<dyn Embedder>, String> {
     let targets = selected_embedding_targets()?;
     if targets.len() == 1 && matches!(targets[0], RuntimeTarget::Cpu) {
@@ -490,11 +466,6 @@ pub fn load_production_embedder(resolved: &ResolvedModel) -> Result<Arc<dyn Embe
             .push(Arc::new(GteEmbedder::load_for_target(resolved, target)?) as Arc<dyn Embedder>);
     }
     Ok(Arc::new(ScheduledEmbedder::new(workers)))
-}
-
-pub fn load_production_reranker(resolved: &ResolvedModel) -> Result<Arc<dyn Reranker>, String> {
-    let target = selected_query_target()?;
-    Ok(Arc::new(GteReranker::load_for_target(resolved, target)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -760,58 +731,6 @@ impl Embedder for GteEmbedder {
     }
 }
 
-pub struct GteReranker {
-    model: orp::model::Model,
-    pipeline: gte::rerank::pipeline::RerankingPipeline,
-    params: gte::params::Parameters,
-}
-
-impl GteReranker {
-    pub fn load(resolved: &ResolvedModel) -> Result<Self, String> {
-        Self::load_for_target(resolved, selected_query_target()?)
-    }
-
-    fn load_for_target(resolved: &ResolvedModel, target: RuntimeTarget) -> Result<Self, String> {
-        let params = gte::params::Parameters::default()
-            .with_max_length(Some(MAX_SEQ_TOKENS))
-            .with_sigmoid(true);
-        let pipeline = gte::rerank::pipeline::RerankingPipeline::new(&resolved.tokenizer, &params)
-            .map_err(|err| format!("rerank pipeline init failed: {err}"))?;
-        let model =
-            orp::model::Model::new(&resolved.model, runtime_params_for(target)).map_err(|err| {
-                format!(
-                    "rerank model load failed ({} on {}): {err}",
-                    resolved.label,
-                    target.label()
-                )
-            })?;
-        Ok(Self {
-            model,
-            pipeline,
-            params,
-        })
-    }
-}
-
-impl Reranker for GteReranker {
-    fn score_pairs(&self, query: &str, docs: &[String]) -> Result<Vec<f32>, String> {
-        let mut scores = Vec::with_capacity(docs.len());
-        for batch in docs.chunks(RERANK_BATCH) {
-            let pairs: Vec<(String, String)> = batch
-                .iter()
-                .map(|doc| (query.to_string(), doc.clone()))
-                .collect();
-            let input = gte::rerank::input::TextInput::new(pairs);
-            let output = self
-                .model
-                .inference(input, &self.pipeline, &self.params)
-                .map_err(|err| format!("rerank inference failed: {err}"))?;
-            scores.extend(output.scores.iter().copied());
-        }
-        Ok(scores)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Deterministic fakes for model-free tests
 // ---------------------------------------------------------------------------
@@ -885,26 +804,6 @@ impl Embedder for FakeHashEmbedder {
 
     fn fingerprint(&self) -> String {
         fingerprint_for("fake-hash-embedder", self.dim)
-    }
-}
-
-/// Test-only reranker: score = case-insensitive token overlap with the query.
-pub struct FakeOverlapReranker;
-
-impl Reranker for FakeOverlapReranker {
-    fn score_pairs(&self, query: &str, docs: &[String]) -> Result<Vec<f32>, String> {
-        let query_tokens: Vec<String> =
-            query.split_whitespace().map(|t| t.to_lowercase()).collect();
-        Ok(docs
-            .iter()
-            .map(|doc| {
-                let doc_lower = doc.to_lowercase();
-                query_tokens
-                    .iter()
-                    .filter(|token| doc_lower.contains(*token))
-                    .count() as f32
-            })
-            .collect())
     }
 }
 
@@ -984,16 +883,6 @@ mod tests {
         assert_ne!(vectors[0], vectors[1]);
     }
 
-    #[test]
-    fn fake_reranker_scores_overlap() {
-        let scores = FakeOverlapReranker
-            .score_pairs(
-                "parse config file",
-                &["loads the config file".to_string(), "unrelated".to_string()],
-            )
-            .unwrap();
-        assert!(scores[0] > scores[1]);
-    }
 
     #[test]
     fn fingerprint_changes_with_label_and_dim() {
