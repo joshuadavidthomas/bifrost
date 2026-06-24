@@ -57,6 +57,29 @@ pub(crate) fn display_symbol_for_target(target: &CodeUnit) -> String {
     display_symbol_name(language_for_target(target), &target.fq_name())
 }
 
+/// The display symbol of the code unit's enclosing scope (the receiver/declaring type for
+/// a method, the outer type for a nested type), or `None` for a top-level declaration.
+///
+/// Methods are not always lexically nested in their type (Go receivers, Rust `impl`,
+/// C++ out-of-line definitions), so consumers can't reliably reconstruct the parent from
+/// line spans. The hierarchy is encoded in `short_name` (members after `.`, nested types
+/// via `$`), so we strip the last segment and re-qualify with the package.
+pub(crate) fn display_parent_symbol_for_target(target: &CodeUnit) -> Option<String> {
+    let short = target.short_name();
+    let cut = short.rfind(['.', '$'])?;
+    let parent_short = &short[..cut];
+    if parent_short.is_empty() {
+        return None;
+    }
+    let package = target.package_name();
+    let parent_fq = if package.is_empty() {
+        parent_short.to_string()
+    } else {
+        format!("{package}.{parent_short}")
+    };
+    Some(display_symbol_name(language_for_target(target), &parent_fq))
+}
+
 pub(crate) fn display_identifier_for_target(target: &CodeUnit) -> String {
     let display_name = display_symbol_name(language_for_target(target), target.short_name());
     display_name

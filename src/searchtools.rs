@@ -1,6 +1,6 @@
 use crate::analyzer::common::{
-    display_identifier_for_target, display_symbol_for_target, display_symbol_name,
-    is_scala_object_like, language_for_target,
+    display_identifier_for_target, display_parent_symbol_for_target, display_symbol_for_target,
+    display_symbol_name, is_scala_object_like, language_for_target,
 };
 use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy,
@@ -357,6 +357,11 @@ pub struct SummaryElement {
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
+    /// Display symbol of the enclosing scope (declaring/receiver type) for a method, else
+    /// None for a top-level declaration. Lets consumers resolve a method's parent without
+    /// the brittle line-span/string heuristics that break on Go/Rust/C++ method layouts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presentation: Option<String>,
 }
@@ -1518,6 +1523,7 @@ fn include_fallback_elements(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Ve
             start_line: line_index + 1,
             end_line: line_index + 1,
             text: line_text.trim_end().to_string(),
+            parent_symbol: None,
             presentation: None,
         });
     }
@@ -1537,6 +1543,7 @@ fn excerpt_fallback_elements(file: &ProjectFile) -> Option<Vec<SummaryElement>> 
         start_line: 1,
         end_line: sampled.total_lines,
         text: sampled.text,
+        parent_symbol: None,
         presentation: Some("sampled_excerpt".to_string()),
     }])
 }
@@ -4098,6 +4105,7 @@ fn signature_elements(analyzer: &dyn IAnalyzer, code_unit: &CodeUnit) -> Vec<Sum
                 start_line,
                 end_line,
                 text,
+                parent_symbol: display_parent_symbol_for_target(code_unit),
                 presentation: None,
             })
         })
@@ -4910,6 +4918,7 @@ mod tests {
             start_line: 10,
             end_line: 10,
             text: "class A {".to_string(),
+            parent_symbol: None,
             presentation: None,
         };
     }

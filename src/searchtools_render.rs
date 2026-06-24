@@ -632,6 +632,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             text: long,
+            parent_symbol: None,
             presentation: None,
         };
 
@@ -648,6 +649,7 @@ mod tests {
             start_line: 1,
             end_line: 60,
             text: "// line 1\n\n----- OMITTED 10 LINES -----\n\n// line 60".to_string(),
+            parent_symbol: None,
             presentation: Some("sampled_excerpt".to_string()),
         };
 

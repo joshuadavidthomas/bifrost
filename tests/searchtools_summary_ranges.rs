@@ -427,6 +427,7 @@ fn summary_renderer_uses_ranges_for_multiline_elements() {
         start_line: 12,
         end_line: 14,
         text: "class Foo(\n  x: int,\n  y: int".to_string(),
+        parent_symbol: None,
         presentation: None,
     });
 

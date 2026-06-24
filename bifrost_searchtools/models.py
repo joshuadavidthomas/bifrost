@@ -399,6 +399,7 @@ class SummaryElement:
     start_line: int
     end_line: int
     text: str
+    parent_symbol: str | None = None
     render_line_numbers: bool = True
 
     @classmethod
@@ -410,6 +411,7 @@ class SummaryElement:
             start_line=data["start_line"],
             end_line=data["end_line"],
             text=data["text"],
+            parent_symbol=data.get("parent_symbol"),
             render_line_numbers=render_line_numbers,
         )
 
