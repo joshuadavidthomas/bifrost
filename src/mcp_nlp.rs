@@ -5,6 +5,12 @@ pub(crate) fn nlp_tool_descriptors() -> Vec<Value> {
     use crate::mcp_common::tool_descriptor;
     use serde_json::json;
 
+    // voyage-4-nano needs a CUDA/Metal accelerator; on CPU-only hosts the tool is
+    // omitted entirely unless the operator passes --force-semantic-cpu.
+    if !crate::nlp::semantic_search_available() {
+        return Vec::new();
+    }
+
     vec![tool_descriptor(
         "semantic_search",
         "Search source code by meaning: returns the files whose functions or summaries best match a natural-language description, each with a summary of the file. Searches CODE ONLY (functions, classes, file structure) - it does not index prose, markdown, or other documentation. Complements exact-match tools like search_symbols and search_file_contents. May block while the background semantic index finishes building after startup or large file changes.",

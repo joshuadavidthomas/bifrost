@@ -164,103 +164,40 @@ fn maybe_start_semantic(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
 ) -> Option<Arc<SemanticIndexer>> {
-    maybe_start_semantic_checked(enabled, snapshot, onnx_runtime_available)
+    maybe_start_semantic_checked(enabled, snapshot, semantic_accelerator_ready)
+}
+
+/// Ok when the voyage-4-nano embedder can run: a CUDA/Metal accelerator is
+/// present, or the operator forced CPU. Mirrors `nlp::semantic_search_available`
+/// so the tool is never advertised without also being startable.
+#[cfg(feature = "nlp")]
+fn semantic_accelerator_ready() -> Result<(), String> {
+    if crate::nlp::semantic_search_available() {
+        Ok(())
+    } else {
+        Err(
+            "no CUDA or Metal accelerator detected; pass --force-semantic-cpu to run the \
+             embedder on CPU"
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(feature = "nlp")]
 fn maybe_start_semantic_checked(
     enabled: bool,
     snapshot: &Arc<WorkspaceAnalyzer>,
-    runtime_available: impl FnOnce() -> Result<(), String>,
+    accelerator_ready: impl FnOnce() -> Result<(), String>,
 ) -> Option<Arc<SemanticIndexer>> {
     if !enabled {
         return None;
     }
-    if let Err(err) = runtime_available() {
-        eprintln!("bifrost semantic index disabled: ONNX Runtime unavailable: {err}");
+    if let Err(err) = accelerator_ready() {
+        eprintln!("bifrost semantic index disabled: {err}");
         return None;
     }
     let root = snapshot.analyzer().project().root().to_path_buf();
     Some(SemanticIndexer::start(root, snapshot.clone()))
-}
-
-#[cfg(all(feature = "nlp", unix))]
-fn onnx_runtime_available() -> Result<(), String> {
-    use std::ffi::{CStr, CString};
-    use std::os::raw::{c_char, c_int, c_void};
-    use std::os::unix::ffi::OsStrExt;
-
-    unsafe extern "C" {
-        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
-        fn dlclose(handle: *mut c_void) -> c_int;
-        fn dlerror() -> *const c_char;
-    }
-
-    const RTLD_LAZY: c_int = 1;
-
-    let path = onnx_runtime_path();
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| format!("invalid runtime path {}", path.display()))?;
-    // Clear any stale loader error before this attempt.
-    unsafe {
-        let _ = dlerror();
-    }
-    let handle = unsafe { dlopen(c_path.as_ptr(), RTLD_LAZY) };
-    if handle.is_null() {
-        let error = unsafe {
-            let ptr = dlerror();
-            if ptr.is_null() {
-                "unknown loader error".to_string()
-            } else {
-                CStr::from_ptr(ptr).to_string_lossy().into_owned()
-            }
-        };
-        return Err(format!("{} ({error})", path.display()));
-    }
-    unsafe {
-        let _ = dlclose(handle);
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "nlp", not(unix)))]
-fn onnx_runtime_available() -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(all(feature = "nlp", unix))]
-fn onnx_runtime_path() -> PathBuf {
-    let configured = std::env::var("ORT_DYLIB_PATH")
-        .ok()
-        .filter(|value| !value.is_empty());
-    let path = PathBuf::from(configured.unwrap_or_else(default_onnx_runtime_name));
-    if path.is_absolute() {
-        return path;
-    }
-    let Ok(exe) = std::env::current_exe() else {
-        return path;
-    };
-    let Some(exe_dir) = exe.parent() else {
-        return path;
-    };
-    let relative_to_exe = exe_dir.join(&path);
-    if relative_to_exe.exists() {
-        relative_to_exe
-    } else {
-        path
-    }
-}
-
-#[cfg(all(feature = "nlp", unix))]
-fn default_onnx_runtime_name() -> String {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        "libonnxruntime.dylib".to_string()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-    {
-        "libonnxruntime.so".to_string()
-    }
 }
 
 impl SearchToolsService {
@@ -1056,7 +993,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_onnx_runtime_disables_semantic_indexer_startup() {
+    fn missing_accelerator_disables_semantic_indexer_startup() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Thing.java"),
@@ -1066,8 +1003,9 @@ mod tests {
         let (_project, workspace) = build_workspace(dir.path().to_path_buf()).unwrap();
         let snapshot = Arc::new(workspace);
 
+        // No CUDA/Metal and no --force-semantic-cpu: the indexer must not start.
         let semantic = maybe_start_semantic_checked(true, &snapshot, || {
-            Err("libonnxruntime.so is not loadable".to_string())
+            Err("no CUDA or Metal accelerator detected".to_string())
         });
 
         assert!(semantic.is_none());

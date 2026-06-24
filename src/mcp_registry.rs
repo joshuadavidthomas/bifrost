@@ -207,7 +207,15 @@ mod tests {
     use super::resolve_server_spec;
     use serde_json::Value;
 
+    /// `semantic_search` is only advertised when an accelerator is available; force
+    /// the CPU override so these structural tests are hardware-independent. (No-op
+    /// without the `nlp` feature.)
+    fn force_semantic_for_tests() {
+        unsafe { std::env::set_var("BIFROST_FORCE_SEMANTIC_CPU", "1") };
+    }
+
     fn tool_names(mode_expr: &str) -> Vec<String> {
+        force_semantic_for_tests();
         resolve_server_spec(mode_expr)
             .expect("server spec")
             .tool_descriptors
@@ -245,6 +253,7 @@ mod tests {
     }
 
     fn accepted_tool_names(mode_expr: &str) -> Vec<String> {
+        force_semantic_for_tests();
         let mut names: Vec<String> = resolve_server_spec(mode_expr)
             .expect("server spec")
             .tool_names
@@ -326,6 +335,7 @@ mod tests {
 
     #[test]
     fn nlp_accepts_status_without_advertising_it() {
+        force_semantic_for_tests();
         if !cfg!(feature = "nlp") {
             assert!(resolve_server_spec("nlp").is_err());
             return;

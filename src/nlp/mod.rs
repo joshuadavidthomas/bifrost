@@ -13,6 +13,22 @@ pub mod indexer;
 pub mod keys;
 pub mod query;
 pub mod store;
+pub mod voyage;
+
+/// Whether `semantic_search` should be offered. The voyage-4-nano embedder needs a
+/// CUDA or Metal accelerator; on CPU-only hosts the tool is hidden unless the
+/// operator opts in with `--force-semantic-cpu` (`BIFROST_FORCE_SEMANTIC_CPU=1`).
+pub fn semantic_search_available() -> bool {
+    force_semantic_cpu() || engine::accelerator_available()
+}
+
+/// Operator override to run the embedder on CPU where no accelerator exists.
+pub fn force_semantic_cpu() -> bool {
+    matches!(
+        std::env::var("BIFROST_FORCE_SEMANTIC_CPU").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("enabled")
+    )
+}
 
 /// Weight of the chunk vector when averaging with its parent context vector.
 pub const PARENT_ALPHA: f64 = 0.5;
@@ -30,12 +46,12 @@ pub const COEDIT_HALF_LIFE: f64 = 250.0;
 pub const MAX_QUERY_TOKENS: usize = 256;
 
 /// Asymmetric query/passage prefixes. Applied exactly once, only inside the
-/// `Embedder` impls, so indexed text never carries a prefix. These match the
-/// granite localizer fine-tune's training prefixes and are part of the
-/// embedding fingerprint: changing them invalidates cached vectors.
-pub const QUERY_PREFIX: &str =
-    "Given a GitHub issue, retrieve code that must be changed to fix it.\nQuery: ";
-pub const PASSAGE_PREFIX: &str = "Passage: Code chunk from repository.\n";
+/// `Embedder` impls, so indexed text never carries a prefix. These are
+/// voyageai/voyage-4-nano's SentenceTransformer `prompts` ("query"/"document"),
+/// verbatim including the trailing space, and are part of the embedding
+/// fingerprint: changing them invalidates cached vectors.
+pub const QUERY_PREFIX: &str = "Represent the query for retrieving supporting documents: ";
+pub const PASSAGE_PREFIX: &str = "Represent the document for retrieval: ";
 
 /// Versioned contracts shared with the prototype's vector cache key recipe.
 pub const COMPONENT_CONTRACT_VERSION: &str = "component_v1";

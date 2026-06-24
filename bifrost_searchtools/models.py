@@ -719,26 +719,33 @@ class MostRelevantFilesResult:
 
 
 @dataclass(frozen=True)
-class SemanticSearchHit:
-    path: str
+class RankedSymbol:
+    fqfn: str
     score: float
-    summary: str
 
     @classmethod
-    def from_dict(cls, data: dict) -> SemanticSearchHit:
-        return cls(
-            path=data["path"],
-            score=float(data["score"]),
-            summary=data["summary"],
-        )
+    def from_dict(cls, data: dict) -> RankedSymbol:
+        return cls(fqfn=data["fqfn"], score=float(data["score"]))
 
-    def render_text(self) -> str:
-        return f"=== {self.path} (score {self.score:.3f}) ===\n{self.summary}"
+
+@dataclass(frozen=True)
+class RankedFile:
+    path: str
+    score: float
+
+    @classmethod
+    def from_dict(cls, data: dict) -> RankedFile:
+        return cls(path=data["path"], score=float(data["score"]))
 
 
 @dataclass(frozen=True)
 class SemanticSearchResult:
-    hits: list[SemanticSearchHit]
+    """The three independent retrieval signals over function chunks. Reranking/fusing
+    them is the caller's job."""
+
+    vector_ranked: list[RankedSymbol]
+    bm25_ranked: list[RankedSymbol]
+    coedit_ranked: list[RankedFile]
     notes: list[str]
     render_line_numbers: bool = True
     rendered_text: str | None = None
@@ -748,7 +755,9 @@ class SemanticSearchResult:
         cls, data: dict, render_line_numbers: bool = True, rendered_text: str | None = None
     ) -> SemanticSearchResult:
         return cls(
-            hits=[SemanticSearchHit.from_dict(item) for item in data["hits"]],
+            vector_ranked=[RankedSymbol.from_dict(item) for item in data.get("vector_ranked", [])],
+            bm25_ranked=[RankedSymbol.from_dict(item) for item in data.get("bm25_ranked", [])],
+            coedit_ranked=[RankedFile.from_dict(item) for item in data.get("coedit_ranked", [])],
             notes=list(data.get("notes", [])),
             render_line_numbers=render_line_numbers,
             rendered_text=rendered_text,
@@ -756,14 +765,22 @@ class SemanticSearchResult:
 
     @property
     def count(self) -> int:
-        return len(self.hits)
+        return len(self.vector_ranked)
 
     def render_text(self) -> str:
         if self.rendered_text is not None:
             return self.rendered_text
         lines = [f"note: {note}" for note in self.notes]
-        lines.extend(hit.render_text() for hit in self.hits)
-        return "\n\n".join(lines) if lines else "No semantic search results found."
+        if self.vector_ranked:
+            lines.append("=== vector ===")
+            lines.extend(f"{r.fqfn} (score {r.score:.3f})" for r in self.vector_ranked)
+        if self.bm25_ranked:
+            lines.append("=== bm25 ===")
+            lines.extend(f"{r.fqfn} (score {r.score:.3f})" for r in self.bm25_ranked)
+        if self.coedit_ranked:
+            lines.append("=== co-edit ===")
+            lines.extend(f"{r.path} (score {r.score:.3f})" for r in self.coedit_ranked)
+        return "\n".join(lines) if lines else "No semantically similar code found."
 
 
 @dataclass(frozen=True)

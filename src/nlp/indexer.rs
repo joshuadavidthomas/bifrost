@@ -26,9 +26,7 @@ use crate::path_utils::rel_path_string;
 
 use super::bm25::fts_text;
 use super::chunker::{ChunkText, extract_file_chunks};
-use super::engine::{
-    Embedder, FakeHashEmbedder, load_production_embedder, resolve_embed_model,
-};
+use super::engine::{Embedder, FakeHashEmbedder, load_production_embedder};
 use super::keys::{Key, component_key, compose, composed_key, content_hash};
 use super::store::{ChunkRowIn, FileState, SemanticStore, semantic_db_path};
 use super::{BM25_TOKENIZER_VERSION, CHUNKER_VERSION};
@@ -50,13 +48,12 @@ pub trait EngineProvider: Send + 'static {
     fn embedder(&self) -> Result<Arc<dyn Embedder>, String>;
 }
 
-/// Production provider: resolves models from env/HF hub and loads gte-rs.
+/// Production provider: resolves the model from env/HF hub and loads it via Candle.
 pub struct DefaultEngineProvider;
 
 impl EngineProvider for DefaultEngineProvider {
     fn embedder(&self) -> Result<Arc<dyn Embedder>, String> {
-        let resolved = resolve_embed_model()?;
-        load_production_embedder(&resolved)
+        load_production_embedder()
     }
 }
 

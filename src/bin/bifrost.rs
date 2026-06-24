@@ -62,6 +62,11 @@ fn run() -> Result<(), String> {
             "--no-line-numbers" => {
                 render_options.render_line_numbers = false;
             }
+            "--force-semantic-cpu" => {
+                // Lets semantic_search run (and be advertised) on hosts without a
+                // CUDA/Metal accelerator. Consumed via env by the registry + service.
+                unsafe { env::set_var("BIFROST_FORCE_SEMANTIC_CPU", "1") };
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -144,6 +149,9 @@ fn print_help() {
     println!("       bifrost [--root PROJECT_ROOT] --server text|extended");
     println!("       bifrost [--root PROJECT_ROOT] --server slopcop");
     println!("       bifrost [--root PROJECT_ROOT] --server lsp");
+    println!(
+        "       bifrost [--force-semantic-cpu]   run semantic_search without a CUDA/Metal accelerator"
+    );
     println!(
         "       bifrost [--root PROJECT_ROOT] --tool TOOL_NAME [--args '{{\"key\":\"value\"}}'] [--no-line-numbers]"
     );
