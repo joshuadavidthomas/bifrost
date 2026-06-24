@@ -22,7 +22,6 @@ use super::bm25::{RepoEntityUniverse, build_match_query, grounded_prompt_text, t
 use std::time::Duration;
 
 use super::indexer::{READY_TIMEOUT_MESSAGE, SemanticIndexer};
-use super::keys::dot;
 use super::{COEDIT_HALF_LIFE, RRF_K};
 
 /// Rows decoded per scan batch.
@@ -134,12 +133,18 @@ pub fn semantic_search(
     //    vector is then resolved to its function occurrences (fqfn + file).
     //    Summary chunks have no fqfn and are dropped by `resolve`.
     let query_vector = embedder.embed_query(query)?;
+    let scorer = super::quant::query_scorer(&query_vector);
     let mut hash_scores: Vec<([u8; 32], f32)> = Vec::new();
     store
         .scan_active_vectors(SCAN_BATCH, &mut |batch| {
             let scored: Vec<([u8; 32], f32)> = batch
                 .par_iter()
-                .map(|row| (row.composed_hash, dot(&row.vector, &query_vector)))
+                .filter_map(|row| {
+                    scorer
+                        .score(&row.code)
+                        .ok()
+                        .map(|score| (row.composed_hash, score))
+                })
                 .collect();
             hash_scores.extend(scored);
         })

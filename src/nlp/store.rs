@@ -1,4 +1,3 @@
-use super::keys::{blob_to_vector, vector_to_blob};
 use git2::Repository;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::{HashMap, HashSet};
@@ -111,11 +110,12 @@ pub struct BlobChunkRow {
     pub composed_hash: [u8; 32],
 }
 
-/// One row streamed by `scan_active_vectors`: a searchable vector and its key.
+/// One row streamed by `scan_active_vectors`: a searchable vector (as fastrq code
+/// bytes, see [`super::quant`]) and its key.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorRow {
     pub composed_hash: [u8; 32],
-    pub vector: Vec<f32>,
+    pub code: Vec<u8>,
 }
 
 impl SemanticStore {
@@ -213,6 +213,8 @@ impl SemanticStore {
         self.missing_hashes("vectors", "composed_hash", hashes)
     }
 
+    /// Component vectors are stored as fastrq codes; decode them (lossily) back to
+    /// f32 for re-composition.
     pub fn component_vectors(&self, hashes: &[[u8; 32]]) -> Result<HashMap<[u8; 32], Vec<f32>>> {
         let conn = self.conn.lock().expect("semantic store mutex poisoned");
         let mut select = conn.prepare("SELECT vector FROM component_vectors WHERE hash = ?1")?;
@@ -222,25 +224,28 @@ impl SemanticStore {
             if !seen.insert(*hash) {
                 continue;
             }
-            let vector_blob: Option<Vec<u8>> = select
+            let code: Option<Vec<u8>> = select
                 .query_row(params![hash.as_slice()], |row| row.get(0))
                 .optional()?;
-            if let Some(vector_blob) = vector_blob {
-                out.insert(*hash, blob_to_vector(&vector_blob));
+            if let Some(code) = code {
+                out.insert(*hash, super::quant::decode_vector(&code).map_err(StoreError::new)?);
             }
         }
         Ok(out)
     }
 
     pub fn upsert_component_vectors(&self, items: &[([u8; 32], Vec<f32>)]) -> Result<()> {
-        self.upsert_vectors("component_vectors", "hash", items)
+        self.upsert_codes("component_vectors", "hash", items)
     }
 
     pub fn upsert_composed_vectors(&self, items: &[([u8; 32], Vec<f32>)]) -> Result<()> {
-        self.upsert_vectors("vectors", "composed_hash", items)
+        self.upsert_codes("vectors", "composed_hash", items)
     }
 
-    fn upsert_vectors(
+    /// Encode each vector to a fastrq 8-bit code (~4x smaller than f32; see
+    /// [`super::quant`]) and persist it. `dim` keeps the original f32 dimension for
+    /// diagnostics; the searchable/component blob is the code, never raw f32.
+    fn upsert_codes(
         &self,
         table: &str,
         key_col: &str,
@@ -257,7 +262,8 @@ impl SemanticStore {
         );
         let mut stmt = tx.prepare(&sql)?;
         for (key, vector) in items {
-            stmt.execute(params![key.as_slice(), vector.len() as i64, vector_to_blob(vector)])?;
+            let code = super::quant::encode_vector(vector);
+            stmt.execute(params![key.as_slice(), vector.len() as i64, code])?;
         }
         drop(stmt);
         tx.commit()?;
@@ -449,7 +455,7 @@ impl SemanticStore {
         while let Some(row) = rows.next()? {
             batch.push(VectorRow {
                 composed_hash: decode_key_blob(row.get::<_, Vec<u8>>(0)?)?,
-                vector: blob_to_vector(&row.get::<_, Vec<u8>>(1)?),
+                code: row.get::<_, Vec<u8>>(1)?,
             });
             if batch.len() == effective_batch {
                 visit(std::mem::take(&mut batch));

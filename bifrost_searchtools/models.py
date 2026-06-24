@@ -785,16 +785,14 @@ class SemanticSearchResult:
 
 @dataclass(frozen=True)
 class SemanticSearchStatus:
-    indexed_files: int
-    waiting_files: int
+    indexed_chunks: int
     pending_batches: int
     phase: str
 
     @classmethod
     def from_dict(cls, data: dict) -> SemanticSearchStatus:
         return cls(
-            indexed_files=int(data["indexed_files"]),
-            waiting_files=int(data["waiting_files"]),
+            indexed_chunks=int(data["indexed_chunks"]),
             pending_batches=int(data["pending_batches"]),
             phase=str(data["phase"]),
         )

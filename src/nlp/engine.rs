@@ -47,6 +47,9 @@ pub(crate) fn fingerprint_for(label: &str, dim: usize) -> String {
         PASSAGE_PREFIX,
         REPRESENTATION_KIND,
         &format!("alpha={PARENT_ALPHA}"),
+        // Stored-vector format. Bumping this invalidates caches written in a prior
+        // format (e.g. raw f32 before fastrq) without changing the content keys.
+        "storage=rq8_v1",
     ] {
         hasher.update(part.as_bytes());
         hasher.update(b"\0");

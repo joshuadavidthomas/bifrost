@@ -29,6 +29,9 @@ candle-nn = { git = "https://github.com/huggingface/candle", rev = "f53ed3bf", o
 candle-transformers = { git = "https://github.com/huggingface/candle", rev = "f53ed3bf", optional = true }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
 tokenizers = { version = "0.21", optional = true }
+# 8-bit rotational quantization for the searchable composed vectors (~4x smaller
+# blobs + a branch-free u8 scan). Path dep until the crate is published.
+fastrq = { path = "../fastrq", optional = true }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 git2 = { version = "0.20.2", default-features = false }
 glob = "0.3.3"
@@ -82,7 +85,7 @@ xot = "0.31"
 default = []
 # Semantic search: voyageai/voyage-4-nano embeddings via Candle. Opt in with
 # `--features nlp`. CPU-only by default; add an accelerator feature below.
-nlp = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub", "dep:tokenizers"]
+nlp = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub", "dep:tokenizers", "dep:fastrq"]
 # Adds Candle's CUDA backend; the runtime still falls back to CPU if unavailable.
 nlp-gpu = ["nlp", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 # Adds Candle's Metal backend for Apple platforms (the "Metal" accelerator path).
