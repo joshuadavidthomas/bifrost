@@ -11,9 +11,9 @@ use crate::analyzer::js_ts::{
     build_weighted_cache, weight_code_unit_set_by_unit, weight_code_unit_vec_by_unit,
 };
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, build_direct_descendant_index,
+    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
+    ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -60,9 +60,40 @@ impl ScalaAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
+        Self::new_with_config_storage(project, config, storage, None)
+    }
+
+    pub(crate) fn new_with_config_storage_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: BuildProgress,
+    ) -> Self {
+        Self::new_with_config_storage(project, config, storage, Some(progress))
+    }
+
+    fn new_with_config_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: Option<BuildProgress>,
+    ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        let inner =
-            TreeSitterAnalyzer::new_with_config_and_storage(project, ScalaAdapter, config, storage);
+        let inner = match progress {
+            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
+                project,
+                ScalaAdapter,
+                config,
+                storage,
+                move |event| progress(event),
+            ),
+            None => TreeSitterAnalyzer::new_with_config_and_storage(
+                project,
+                ScalaAdapter,
+                config,
+                storage,
+            ),
+        };
         Self::from_inner(inner, memo_budget)
     }
 

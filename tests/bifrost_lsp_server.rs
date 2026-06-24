@@ -95,6 +95,290 @@ fn bifrost_lsp_server_handles_initialize_and_shutdown() {
 }
 
 #[test]
+fn bifrost_lsp_server_reports_cold_start_progress_when_client_supports_it() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("ProgressFixture.java");
+    fs::write(
+        &file_path,
+        "class ProgressFixture {\n    void work() {}\n}\n",
+    )
+    .expect("write progress fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": uri_for(&root),
+                "capabilities": {"window": {"workDoneProgress": true}}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    let create = read_message(&mut reader, &mut stderr);
+    assert_eq!(create["method"], "window/workDoneProgress/create");
+    let token = create["params"]["token"].clone();
+    assert_eq!(token, "bifrost-startup-index");
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": create["id"].clone(), "result": null}),
+    );
+
+    let begin = read_notification(&mut reader, &mut stderr, "$/progress");
+    assert_eq!(begin["params"]["token"], token);
+    assert_eq!(begin["params"]["value"]["kind"], "begin");
+    assert_eq!(
+        begin["params"]["value"]["title"], "Indexing workspace",
+        "unexpected begin payload: {begin}"
+    );
+
+    let mut saw_report = false;
+    let mut saw_end = false;
+    for _ in 0..32 {
+        let msg = read_notification(&mut reader, &mut stderr, "$/progress");
+        assert_eq!(msg["params"]["token"], token);
+        match msg["params"]["value"]["kind"].as_str() {
+            Some("report") => {
+                saw_report = true;
+                if let Some(percentage) = msg["params"]["value"]["percentage"].as_u64() {
+                    assert!(
+                        percentage <= 99,
+                        "startup reports should leave completion to end: {msg}"
+                    );
+                }
+            }
+            Some("end") => {
+                saw_end = true;
+                break;
+            }
+            other => panic!("unexpected progress kind {other:?}: {msg}"),
+        }
+    }
+    assert!(saw_report, "expected at least one progress report");
+    assert!(saw_end, "expected final progress end notification");
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&file_path)}}
+        }),
+    );
+    let symbols = read_response_for_id(&mut reader, &mut stderr, 2);
+    assert!(
+        symbols["result"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "documentSymbol should still work after startup progress: {symbols}"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 3);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_skips_startup_progress_without_client_support() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("NoProgress.java");
+    fs::write(&file_path, "class NoProgress {}\n").expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": uri_for(&root),
+                "capabilities": {}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&file_path)}}
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    assert_ne!(
+        response["method"], "window/workDoneProgress/create",
+        "server must not create progress when client did not advertise support"
+    );
+    assert_ne!(
+        response["method"], "$/progress",
+        "server must not emit progress when client did not advertise support"
+    );
+    assert_eq!(
+        response["id"], 2,
+        "expected documentSymbol response: {response}"
+    );
+    assert!(
+        !root.join(".bifrost").exists(),
+        "server should not create analyzer storage for clients without work-done progress"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 3);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_lsp_server_disables_startup_progress_when_token_create_fails() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canon temp");
+    let file_path = root.join("RejectedProgress.java");
+    fs::write(&file_path, "class RejectedProgress {}\n").expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bifrost"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--server")
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bifrost");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "processId": null,
+                "rootUri": uri_for(&root),
+                "capabilities": {"window": {"workDoneProgress": true}}
+            }
+        }),
+    );
+    let initialize = read_message(&mut reader, &mut stderr);
+    assert_eq!(initialize["id"], 1);
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+
+    let create = read_message(&mut reader, &mut stderr);
+    assert_eq!(create["method"], "window/workDoneProgress/create");
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": create["id"].clone(),
+            "error": {"code": -32603, "message": "token rejected"}
+        }),
+    );
+    write_message(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "textDocument/documentSymbol",
+            "params": {"textDocument": {"uri": uri_for(&file_path)}}
+        }),
+    );
+    let response = read_message(&mut reader, &mut stderr);
+    assert_ne!(
+        response["method"], "$/progress",
+        "server must not emit progress after token creation fails"
+    );
+    assert_eq!(
+        response["id"], 2,
+        "expected documentSymbol response after rejected progress token: {response}"
+    );
+    assert!(
+        !root.join(".bifrost").exists(),
+        "server should not create analyzer storage after progress token creation fails"
+    );
+
+    write_message(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let _ = read_response_for_id(&mut reader, &mut stderr, 3);
+    write_message(&mut stdin, json!({"jsonrpc": "2.0", "method": "exit"}));
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
 fn bifrost_lsp_server_returns_document_symbols_for_a_java() {
     let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

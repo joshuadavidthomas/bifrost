@@ -4,8 +4,8 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    AliasResolver, AnalyzerConfig, CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo,
-    Language, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
+    AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
+    ImportInfo, Language, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
     build_reverse_import_index,
 };
@@ -201,15 +201,43 @@ impl TypescriptAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
+        Self::new_with_config_storage(project, config, storage, None)
+    }
+
+    pub(crate) fn new_with_config_storage_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: BuildProgress,
+    ) -> Self {
+        Self::new_with_config_storage(project, config, storage, Some(progress))
+    }
+
+    fn new_with_config_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: Option<BuildProgress>,
+    ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
         let alias_resolver = Arc::new(AliasResolver::new(project.root().to_path_buf()));
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_storage(
+        let inner = match progress {
+            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
+                project,
+                TypescriptAdapter,
+                config,
+                storage,
+                move |event| progress(event),
+            ),
+            None => TreeSitterAnalyzer::new_with_config_and_storage(
                 project,
                 TypescriptAdapter,
                 config,
                 storage,
             ),
+        };
+        Self {
+            inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 3, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 6, weight_project_file_set),

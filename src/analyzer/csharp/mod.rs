@@ -9,9 +9,9 @@ mod tests;
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider,
+    AnalyzerConfig, BuildProgress, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider,
+    Language, Project, ProjectFile, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::HashSet;
 use crate::{CloneSmell, CloneSmellWeights};
@@ -48,14 +48,42 @@ impl CSharpAnalyzer {
         config: AnalyzerConfig,
         storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
     ) -> Self {
+        Self::new_with_config_storage(project, config, storage, None)
+    }
+
+    pub(crate) fn new_with_config_storage_and_progress(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: BuildProgress,
+    ) -> Self {
+        Self::new_with_config_storage(project, config, storage, Some(progress))
+    }
+
+    fn new_with_config_storage(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        storage: Arc<crate::analyzer::persistence::AnalyzerStorage>,
+        progress: Option<BuildProgress>,
+    ) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
-        Self {
-            inner: TreeSitterAnalyzer::new_with_config_and_storage(
+        let inner = match progress {
+            Some(progress) => TreeSitterAnalyzer::new_with_config_storage_and_progress(
+                project,
+                CSharpAdapter,
+                config,
+                storage,
+                move |event| progress(event),
+            ),
+            None => TreeSitterAnalyzer::new_with_config_and_storage(
                 project,
                 CSharpAdapter,
                 config,
                 storage,
             ),
+        };
+        Self {
+            inner,
             memo_caches: Arc::new(CSharpMemoCaches::new(memo_budget)),
         }
     }
