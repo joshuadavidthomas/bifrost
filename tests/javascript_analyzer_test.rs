@@ -2,15 +2,181 @@ mod common;
 
 use brokk_bifrost::{
     CodeUnit, CodeUnitType, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TestProject,
+    TypeHierarchyProvider,
 };
 use pretty_assertions::assert_eq;
 use std::collections::BTreeSet;
 use tempfile::tempdir;
 
-use common::{assert_code_eq, definition, js_fixture_project, write_file};
+use common::{InlineTestProject, assert_code_eq, definition, js_fixture_project, write_file};
 
 fn fixture_analyzer() -> JavascriptAnalyzer {
     JavascriptAnalyzer::from_project(js_fixture_project())
+}
+
+fn js_inline_analyzer(
+    files: &[(&str, &str)],
+) -> (common::BuiltInlineTestProject, JavascriptAnalyzer) {
+    let mut builder = InlineTestProject::with_language(Language::JavaScript);
+    for (path, contents) in files {
+        builder = builder.file(*path, *contents);
+    }
+    let project = builder.build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+fn fq_names(units: impl IntoIterator<Item = CodeUnit>) -> Vec<String> {
+    let mut names: Vec<_> = units.into_iter().map(|unit| unit.fq_name()).collect();
+    names.sort();
+    names
+}
+
+fn definition_in_file(
+    analyzer: &JavascriptAnalyzer,
+    file: &ProjectFile,
+    fq_name: &str,
+) -> CodeUnit {
+    analyzer
+        .get_declarations(file)
+        .into_iter()
+        .find(|unit| unit.fq_name() == fq_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "missing definition for {fq_name} in {}",
+                file.rel_path().display()
+            )
+        })
+}
+
+#[test]
+fn javascript_type_hierarchy_resolves_same_file_extends() {
+    let (_project, analyzer) =
+        js_inline_analyzer(&[("models.js", "class Base {}\nclass Child extends Base {}\n")]);
+
+    let base = definition(&analyzer, "Base");
+    let child = definition(&analyzer, "Child");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&child)),
+        vec!["Base"]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        vec!["Child"]
+    );
+}
+
+#[test]
+fn javascript_type_hierarchy_resolves_imported_extends() {
+    let (_project, analyzer) = js_inline_analyzer(&[
+        ("base.js", "export class Base {}\n"),
+        (
+            "child.js",
+            "import { Base } from './base';\nexport class Child extends Base {}\n",
+        ),
+    ]);
+
+    let base = definition(&analyzer, "Base");
+    let child = definition(&analyzer, "Child");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&child)),
+        vec!["Base"]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        vec!["Child"]
+    );
+}
+
+#[test]
+fn javascript_type_hierarchy_keeps_ambiguous_barrel_import_conservative() {
+    let (_project, analyzer) = js_inline_analyzer(&[
+        ("one.js", "export class Base {}\n"),
+        ("two.js", "export class Base {}\n"),
+        (
+            "barrel.js",
+            "export * from './one';\nexport * from './two';\n",
+        ),
+        (
+            "child.js",
+            "import { Base } from './barrel';\nexport class Child extends Base {}\n",
+        ),
+    ]);
+
+    let child = definition(&analyzer, "Child");
+
+    assert!(analyzer.get_direct_ancestors(&child).is_empty());
+}
+
+#[test]
+fn javascript_type_hierarchy_direct_descendants_are_not_transitive() {
+    let (_project, analyzer) = js_inline_analyzer(&[(
+        "models.js",
+        "class Base {}\nclass Mid extends Base {}\nclass Child extends Mid {}\n",
+    )]);
+
+    let base = definition(&analyzer, "Base");
+    let mid = definition(&analyzer, "Mid");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        vec!["Mid"]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&mid)),
+        vec!["Child"]
+    );
+}
+
+#[test]
+fn javascript_type_hierarchy_keeps_same_named_modules_distinct() {
+    let (project, analyzer) = js_inline_analyzer(&[
+        ("one.js", "export class Base {}\n"),
+        ("two.js", "export class Base {}\n"),
+        (
+            "child.js",
+            "import { Base } from './one';\nexport class Child extends Base {}\n",
+        ),
+    ]);
+
+    let one_base = definition_in_file(&analyzer, &project.file("one.js"), "Base");
+    let two_base = definition_in_file(&analyzer, &project.file("two.js"), "Base");
+    let child = definition(&analyzer, "Child");
+
+    assert_eq!(
+        analyzer.get_direct_ancestors(&child),
+        vec![one_base.clone()]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&one_base)),
+        vec!["Child"]
+    );
+    assert!(analyzer.get_direct_descendants(&two_base).is_empty());
+}
+
+#[test]
+fn javascript_type_hierarchy_resolves_commonjs_default_parent() {
+    let (_project, analyzer) = js_inline_analyzer(&[
+        ("base.js", "class Base {}\nmodule.exports = Base;\n"),
+        (
+            "child.js",
+            "const Base = require('./base');\nclass Child extends Base {}\n",
+        ),
+    ]);
+
+    let base = definition(&analyzer, "Base");
+    let child = definition(&analyzer, "Child");
+
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&child)),
+        vec!["Base"]
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        vec!["Child"]
+    );
 }
 
 #[test]
