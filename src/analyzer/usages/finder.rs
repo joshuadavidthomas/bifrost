@@ -12,6 +12,7 @@ use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::php_graph::PhpUsageGraphStrategy;
 use crate::analyzer::usages::python_graph::PythonExportUsageGraphStrategy;
+use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
 use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
 use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer};
@@ -201,6 +202,7 @@ impl_graph_usage_analyzer!(CSharpUsageGraphStrategy);
 impl_graph_usage_analyzer!(CppUsageGraphStrategy);
 impl_graph_usage_analyzer!(GoUsageGraphStrategy);
 impl_graph_usage_analyzer!(ScalaUsageGraphStrategy);
+impl_graph_usage_analyzer!(RubyUsageGraphStrategy);
 
 fn graph_strategy_find_usages(
     strategy: &dyn GraphUsageAnalyzer,
@@ -278,6 +280,13 @@ fn graph_find_usages(
         ),
         Language::Scala => graph_strategy_find_usages(
             &ScalaUsageGraphStrategy::new(),
+            analyzer,
+            overloads,
+            candidates,
+            max_usages,
+        ),
+        Language::Ruby => graph_strategy_find_usages(
+            &RubyUsageGraphStrategy::new(),
             analyzer,
             overloads,
             candidates,
