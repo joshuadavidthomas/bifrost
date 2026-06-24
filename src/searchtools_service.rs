@@ -532,6 +532,38 @@ impl SearchToolsService {
         Ok(())
     }
 
+    /// Run a forced git-reachability GC on the semantic index and block until it
+    /// completes. Off the retrieval path (does not affect `wait_ready`), intended
+    /// for occasional maintenance. The session lock is released before blocking.
+    pub fn request_semantic_gc(&self) -> Result<(), SearchToolsServiceError> {
+        #[cfg(not(feature = "nlp"))]
+        {
+            Err(SearchToolsServiceError::internal(
+                "semantic index requires the nlp feature",
+            ))
+        }
+        #[cfg(feature = "nlp")]
+        {
+            let indexer = {
+                let guard = self.session.read().map_err(|_| {
+                    SearchToolsServiceError::internal("workspace session lock poisoned")
+                })?;
+                let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+                match &session.semantic {
+                    Some(indexer) => indexer.clone(),
+                    None => {
+                        return Err(SearchToolsServiceError::invalid_params(
+                            "semantic index is disabled for this session",
+                        ));
+                    }
+                }
+            };
+            indexer
+                .run_gc_blocking()
+                .map_err(SearchToolsServiceError::internal)
+        }
+    }
+
     fn handle_refresh(&self, arguments: Value) -> Result<ToolOutput, SearchToolsServiceError> {
         let _params = serde_json::from_value::<RefreshParams>(arguments).map_err(|err| {
             SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))

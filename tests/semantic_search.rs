@@ -348,6 +348,42 @@ fn revert_reuses_cached_blob_vectors() {
 }
 
 #[test]
+fn run_gc_blocking_completes_and_is_repeatable() {
+    let dir = tempfile::tempdir().unwrap();
+    write_java(
+        dir.path(),
+        "Greeter.java",
+        "public class Greeter {\n  public String greet(String name) { return name; }\n}\n",
+    );
+    init_git(dir.path());
+    let snapshot = snapshot_for(dir.path());
+    let embedder = Arc::new(FakeHashEmbedder::new(16));
+    let indexer = SemanticIndexer::start_with_provider(
+        dir.path().to_path_buf(),
+        snapshot.clone(),
+        FakeEngineProvider { embedder },
+    );
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
+
+    // The forced GC runs on the worker and replies on its own channel; the
+    // active worktree's blobs stay live, so a follow-up query still resolves.
+    indexer.run_gc_blocking().expect("gc completes");
+    indexer.run_gc_blocking().expect("gc is repeatable");
+
+    let result = semantic_search(
+        &snapshot,
+        &indexer,
+        SemanticSearchParams {
+            query: "greet a user by name".to_string(),
+            k: 1,
+        },
+    )
+    .expect("query after gc");
+    assert_eq!(result.vector_ranked.len(), 1, "live blob survives gc");
+    indexer.close();
+}
+
+#[test]
 fn semantic_search_caps_requested_k() {
     let dir = tempfile::tempdir().unwrap();
     write_java(

@@ -86,6 +86,9 @@ struct Shared {
 enum IndexerMsg {
     FullBuild(Arc<WorkspaceAnalyzer>),
     Update(Arc<WorkspaceAnalyzer>, BTreeSet<ProjectFile>),
+    /// Force a git-reachability GC now; the result is sent back on completion.
+    /// Deliberately off the `pending`/`wait_ready` path so queries never block on it.
+    Gc(Sender<Result<(), String>>),
     Shutdown,
 }
 
@@ -152,6 +155,22 @@ impl SemanticIndexer {
             return;
         }
         self.enqueue(IndexerMsg::Update(snapshot, changed_files));
+    }
+
+    /// Run a forced git-reachability GC and block until it completes. Off the
+    /// `wait_ready` path, so it never stalls in-flight queries; intended for
+    /// occasional maintenance, not the retrieval path.
+    pub fn run_gc_blocking(&self) -> Result<(), String> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err("semantic index closed".to_string());
+        }
+        let (done_tx, done_rx) = mpsc::channel();
+        self.tx
+            .send(IndexerMsg::Gc(done_tx))
+            .map_err(|_| "semantic indexer worker is gone".to_string())?;
+        done_rx
+            .recv()
+            .map_err(|_| "semantic indexer closed before gc completed".to_string())?
     }
 
     fn enqueue(&self, msg: IndexerMsg) {
@@ -335,6 +354,12 @@ fn worker_loop(
         }
         let result = match msg {
             IndexerMsg::Shutdown => break,
+            IndexerMsg::Gc(done) => {
+                // Forced, unthrottled; reply on the request's channel and skip
+                // the readiness bookkeeping (gc doesn't affect query freshness).
+                done.send(run_gc(&store, &repo)).ok();
+                continue;
+            }
             IndexerMsg::FullBuild(snapshot) => {
                 full_build(&shared, &store, embedder.as_ref(), &repo, &snapshot, &active)
             }
@@ -478,6 +503,20 @@ fn language_of(file: &ProjectFile) -> Option<String> {
 
 /// Best-effort GC: drop cache entries no longer reachable from git (or held by a
 /// worktree's uncommitted working set). Throttled; failures are non-fatal.
+/// Compute the live OID set (reachable ∪ each worktree's uncommitted) and sweep.
+/// Used unthrottled by an explicit GC request and (throttled) by `maybe_gc`.
+fn run_gc(store: &SemanticStore, repo: &git2::Repository) -> Result<(), String> {
+    let mut live = gitcache::reachable_oids(repo)?;
+    let roots = gitcache::worktree_roots(repo)?;
+    for root in roots {
+        if let Ok(dirty) = gitcache::uncommitted_oids(&root) {
+            live.extend(dirty);
+        }
+    }
+    store.gc(&live).map_err(|err| err.to_string())
+}
+
+/// Best-effort throttled GC run after a full build; errors are swallowed.
 fn maybe_gc(store: &SemanticStore, repo: &git2::Repository) {
     let due = match store.seconds_since_gc() {
         Ok(Some(secs)) => secs >= GC_MIN_INTERVAL_SECS,
@@ -487,15 +526,5 @@ fn maybe_gc(store: &SemanticStore, repo: &git2::Repository) {
     if !due {
         return;
     }
-    let Ok(mut live) = gitcache::reachable_oids(repo) else {
-        return;
-    };
-    if let Ok(roots) = gitcache::worktree_roots(repo) {
-        for root in roots {
-            if let Ok(dirty) = gitcache::uncommitted_oids(&root) {
-                live.extend(dirty);
-            }
-        }
-    }
-    let _ = store.gc(&live);
+    let _ = run_gc(store, repo);
 }
