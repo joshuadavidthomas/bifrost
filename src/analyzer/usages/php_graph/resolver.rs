@@ -1,3 +1,4 @@
+pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, PhpAnalyzer, PhpFileContext, ProjectFile, Range,
@@ -245,8 +246,4 @@ fn semantic_parent(node: Node<'_>) -> Option<Node<'_>> {
         }
     }
     None
-}
-
-pub(in crate::analyzer::usages) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }

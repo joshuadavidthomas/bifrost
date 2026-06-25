@@ -1,0 +1,99 @@
+//! Cross-file re-export seed resolution shared by the Go and JS/TS usage graphs.
+//!
+//! Both languages model a file's exports as an [`ExportIndex`] plus pre-built
+//! re-export edge maps, then resolve a target symbol to the set of `(file, name)`
+//! seeds reachable through named and star re-export chains. The walk operates only
+//! on the shared [`model`](crate::analyzer::usages::model) types and
+//! [`ImportEdge`]s, so it lives here instead of being duplicated per language. The
+//! per-language resolvers stay thin: they build the maps with language-specific
+//! module resolution, then delegate the chain walk and edge matching to these
+//! functions.
+
+use crate::analyzer::ProjectFile;
+use crate::analyzer::usages::model::{ExportEntry, ExportIndex};
+use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
+use crate::hash::HashMap;
+use std::collections::{BTreeSet, VecDeque};
+
+/// Export seeds for `target_short` in `target_file`, following named and star
+/// re-export chains across files.
+pub(crate) fn seeds_for_target(
+    exports_by_file: &HashMap<ProjectFile, ExportIndex>,
+    reexport_edges: &HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
+    star_reexports: &HashMap<ProjectFile, Vec<ProjectFile>>,
+    target_file: &ProjectFile,
+    target_short: &str,
+) -> BTreeSet<(ProjectFile, String)> {
+    let mut seeds: BTreeSet<(ProjectFile, String)> = BTreeSet::new();
+    if let Some(exports) = exports_by_file.get(target_file) {
+        for (exported_name, entry) in &exports.exports_by_name {
+            let local = match entry {
+                ExportEntry::Local { local_name } => Some(local_name.as_str()),
+                ExportEntry::Default { local_name } => local_name.as_deref(),
+                ExportEntry::ReexportedNamed { .. } => None,
+            };
+            if let Some(local_name) = local
+                && local_name == target_short
+            {
+                seeds.insert((target_file.clone(), exported_name.clone()));
+            }
+        }
+    }
+    let mut frontier: VecDeque<(ProjectFile, String)> = seeds.iter().cloned().collect();
+    while let Some(seed) = frontier.pop_front() {
+        if let Some(reexports) = reexport_edges.get(&seed) {
+            for next in reexports {
+                if seeds.insert(next.clone()) {
+                    frontier.push_back(next.clone());
+                }
+            }
+        }
+        if let Some(star_files) = star_reexports.get(&seed.0) {
+            for star_file in star_files {
+                let next = (star_file.clone(), seed.1.clone());
+                if seeds.insert(next.clone()) {
+                    frontier.push_back(next);
+                }
+            }
+        }
+    }
+    seeds
+}
+
+/// The import edges in `importer` that bind one of the `seeds`.
+pub(crate) fn matching_edges_for_importer(
+    importer_reverse: &HashMap<ProjectFile, Vec<ImportEdge>>,
+    importer: &ProjectFile,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+) -> Vec<ImportEdge> {
+    let mut matches = Vec::new();
+    for (target_file, _) in seeds {
+        let Some(edges) = importer_reverse.get(target_file) else {
+            continue;
+        };
+        matches.extend(
+            edges
+                .iter()
+                .filter(|edge| &edge.importer == importer && edge_matches_seed(edge, seeds))
+                .cloned(),
+        );
+    }
+    matches
+}
+
+/// Whether `edge` binds one of the `seeds`, accounting for each import kind.
+pub(crate) fn edge_matches_seed(
+    edge: &ImportEdge,
+    seeds: &BTreeSet<(ProjectFile, String)>,
+) -> bool {
+    match &edge.kind {
+        ImportEdgeKind::Named(name) => seeds.contains(&(edge.target_file.clone(), name.clone())),
+        ImportEdgeKind::Default => {
+            seeds.contains(&(edge.target_file.clone(), "default".to_string()))
+        }
+        ImportEdgeKind::Namespace => seeds.iter().any(|(file, _)| file == &edge.target_file),
+        ImportEdgeKind::CommonJsRequire(export_name) => {
+            seeds.contains(&(edge.target_file.clone(), export_name.clone()))
+        }
+    }
+}

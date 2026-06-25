@@ -1,3 +1,4 @@
+pub(in crate::analyzer::usages) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile};
 use tree_sitter::Node;
@@ -811,11 +812,4 @@ fn first_named_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>>
 
 pub(super) fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
     left.start_byte() == right.start_byte() && left.end_byte() == right.end_byte()
-}
-
-pub(in crate::analyzer::usages) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
-        .trim()
 }

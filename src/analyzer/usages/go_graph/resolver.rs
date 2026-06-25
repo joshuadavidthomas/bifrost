@@ -1,10 +1,12 @@
 use crate::analyzer::go::packages::{canonical_go_package_name, read_go_module_path};
+pub(super) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::go_graph::extractor::{first_named_child, type_ref_from_node};
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
 };
 use crate::analyzer::usages::parsed_tree::parse_tree_sitter_file;
+use crate::analyzer::usages::reexport_seeds;
 use crate::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::{
     CodeUnit, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
@@ -13,7 +15,6 @@ use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::BTreeSet;
-use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -113,40 +114,13 @@ impl GoProjectGraph {
         target_file: &ProjectFile,
         target_short: &str,
     ) -> BTreeSet<(ProjectFile, String)> {
-        let mut seeds: BTreeSet<(ProjectFile, String)> = BTreeSet::new();
-        if let Some(exports) = self.exports_by_file.get(target_file) {
-            for (exported_name, entry) in &exports.exports_by_name {
-                let local = match entry {
-                    ExportEntry::Local { local_name } => Some(local_name.as_str()),
-                    ExportEntry::Default { local_name } => local_name.as_deref(),
-                    ExportEntry::ReexportedNamed { .. } => None,
-                };
-                if let Some(local_name) = local
-                    && local_name == target_short
-                {
-                    seeds.insert((target_file.clone(), exported_name.clone()));
-                }
-            }
-        }
-        let mut frontier: VecDeque<(ProjectFile, String)> = seeds.iter().cloned().collect();
-        while let Some(seed) = frontier.pop_front() {
-            if let Some(reexports) = self.reexport_edges.get(&seed) {
-                for next in reexports {
-                    if seeds.insert(next.clone()) {
-                        frontier.push_back(next.clone());
-                    }
-                }
-            }
-            if let Some(star_files) = self.star_reexports.get(&seed.0) {
-                for star_file in star_files {
-                    let next = (star_file.clone(), seed.1.clone());
-                    if seeds.insert(next.clone()) {
-                        frontier.push_back(next);
-                    }
-                }
-            }
-        }
-        seeds
+        reexport_seeds::seeds_for_target(
+            &self.exports_by_file,
+            &self.reexport_edges,
+            &self.star_reexports,
+            target_file,
+            target_short,
+        )
     }
 
     /// The import edges in `importer` that bind one of the `seeds`.
@@ -155,32 +129,7 @@ impl GoProjectGraph {
         importer: &ProjectFile,
         seeds: &BTreeSet<(ProjectFile, String)>,
     ) -> Vec<ImportEdge> {
-        let mut matches = Vec::new();
-        for (target_file, _) in seeds {
-            let Some(edges) = self.importer_reverse.get(target_file) else {
-                continue;
-            };
-            matches.extend(
-                edges
-                    .iter()
-                    .filter(|edge| &edge.importer == importer && edge_matches_seed(edge, seeds))
-                    .cloned(),
-            );
-        }
-        matches
-    }
-}
-
-fn edge_matches_seed(edge: &ImportEdge, seeds: &BTreeSet<(ProjectFile, String)>) -> bool {
-    match &edge.kind {
-        ImportEdgeKind::Named(name) => seeds.contains(&(edge.target_file.clone(), name.clone())),
-        ImportEdgeKind::Default => {
-            seeds.contains(&(edge.target_file.clone(), "default".to_string()))
-        }
-        ImportEdgeKind::Namespace => seeds.iter().any(|(file, _)| file == &edge.target_file),
-        ImportEdgeKind::CommonJsRequire(export_name) => {
-            seeds.contains(&(edge.target_file.clone(), export_name.clone()))
-        }
+        reexport_seeds::matching_edges_for_importer(&self.importer_reverse, importer, seeds)
     }
 }
 
@@ -1034,12 +983,6 @@ pub(crate) fn default_go_import_local_name(import_path_or_identifier: &str) -> S
     VERSION_SUFFIX_RE.replace(tail, "").to_string()
 }
 
-pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
-        .trim()
-}
 
 static VERSION_SUFFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.v\d+$").expect("valid Go module version suffix regex"));

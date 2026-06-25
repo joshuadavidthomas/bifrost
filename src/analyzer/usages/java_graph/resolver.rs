@@ -1,3 +1,4 @@
+pub(super) use crate::analyzer::usages::common::node_text;
 use crate::analyzer::usages::java_graph::extractor::ScanCtx;
 use crate::analyzer::usages::java_graph::hits::enclosing_context;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
@@ -245,11 +246,4 @@ pub(super) fn is_declaration_name(node: Node<'_>) -> bool {
     node.parent()
         .and_then(|parent| parent.child_by_field_name("name"))
         == Some(node)
-}
-
-pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
-    source
-        .get(node.start_byte()..node.end_byte())
-        .unwrap_or_default()
-        .trim()
 }

@@ -1,6 +1,7 @@
 use crate::analyzer::common as analyzer_common;
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{CodeUnit, Language, ProjectFile};
+use tree_sitter::Node;
 
 /// Graph-strategy hits land at maximum confidence.
 pub(super) const GRAPH_HIT_CONFIDENCE: f64 = 1.0;
@@ -25,6 +26,16 @@ pub(super) fn language_for_target_filtered(
 
 pub(super) fn language_for_file(file: &ProjectFile) -> Language {
     analyzer_common::language_for_file(file)
+}
+
+/// The trimmed source text spanned by `node`, or `""` if the byte range is not a
+/// valid `str` boundary. Shared by the per-language usage resolvers that key on a
+/// node's identifier/type text.
+pub(super) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or_default()
+        .trim()
 }
 
 pub(super) fn usage_hit(
