@@ -14,10 +14,12 @@ After model load it emits one ready frame: JSON {"ready": true, "dim": 512}.
 fd 1 is redirected to stderr so library logging can't corrupt the protocol; frames go
 to a dup'd copy of the real stdout.
 
-Attention is fused: the HF model runs attn_implementation="sdpa"; with our additive
-padding mask, torch selects the memory-efficient SDPA kernel (O(seq), Blackwell-ok).
-SDPA only fuses in fp16/bf16, so we run bf16 on CUDA and fp16 on Apple Metal (MPS);
-CPU falls back to fp32 (math kernel).
+Attention is fused: weights and the Qwen block forward path come from HF, but the
+sidecar registers a custom attention implementation. CUDA uses native GQA; MPS uses
+explicit repeated K/V plus query blocking for long sequences, because PyTorch's
+full-prompt MPS SDPA path otherwise materializes/caches large score tensors. SDPA
+only fuses in fp16/bf16, so we run bf16 on CUDA and fp16 on Apple Metal (MPS); CPU
+falls back to fp32 (math kernel).
 
 Run the sidecar:   uv run scripts/voyage_sidecar.py
 Self-test parity:  uv run scripts/voyage_sidecar.py --selftest
@@ -34,10 +36,13 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 MODEL_ID = "voyageai/voyage-4-nano"
 OUT_DIM = 512
 MAX_SEQ = 8192
+MPS_SDPA_QUERY_BLOCK = 512
+MPS_CACHE_DRAIN_FRACTION = 0.80
 # Max padded tokens (batch * longest_seq) per forward — bounds activation memory so a
 # few long chunks can't balloon a batch. Mem-efficient SDPA lets this exceed candle's.
 PADDED_TOKEN_BUDGET = 16384
@@ -49,21 +54,109 @@ def log(*a):
     print("[sidecar]", *a, file=sys.stderr, flush=True)
 
 
-def patch_masking_kwargs() -> None:
-    import transformers.masking_utils as mu
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Equivalent to HF repeat_kv, kept local so direct attention avoids HF dispatch."""
+    batch, num_key_value_heads, seq, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, seq, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq, head_dim)
 
-    orig = mu.create_causal_mask
 
-    def patched(*args, **kw):
-        kw.pop("input_embeds", None)
-        return orig(*args, **kw)
+def _slice_attention_mask(mask: torch.Tensor | None, start: int, end: int) -> torch.Tensor | None:
+    if mask is None or mask.dim() < 4 or mask.shape[-2] == 1:
+        return mask
+    return mask[..., start:end, :]
 
-    mu.create_causal_mask = patched
+
+def _mps_blocked_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+) -> torch.Tensor:
+    q_len = query.shape[2]
+    if q_len <= MPS_SDPA_QUERY_BLOCK:
+        return F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            scale=scaling,
+            is_causal=False,
+        )
+
+    chunks = []
+    for start in range(0, q_len, MPS_SDPA_QUERY_BLOCK):
+        end = min(start + MPS_SDPA_QUERY_BLOCK, q_len)
+        chunks.append(
+            F.scaled_dot_product_attention(
+                query[:, :, start:end, :],
+                key,
+                value,
+                attn_mask=_slice_attention_mask(attention_mask, start, end),
+                dropout_p=0.0,
+                scale=scaling,
+                is_causal=False,
+            )
+        )
+    return torch.cat(chunks, dim=2)
+
+
+def bifrost_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    is_causal: bool | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    if dropout != 0.0:
+        raise RuntimeError("voyage sidecar attention is inference-only; dropout must be zero")
+    scaling = scaling if scaling is not None else getattr(module, "scaling", None)
+
+    if query.device.type == "cuda":
+        attn_output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            scale=scaling,
+            is_causal=False,
+            enable_gqa=hasattr(module, "num_key_value_groups"),
+        )
+    else:
+        if hasattr(module, "num_key_value_groups"):
+            key = repeat_kv(key, module.num_key_value_groups)
+            value = repeat_kv(value, module.num_key_value_groups)
+        if query.device.type == "mps":
+            attn_output = _mps_blocked_sdpa(query, key, value, attention_mask, scaling)
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                scale=scaling,
+                is_causal=False,
+            )
+
+    return attn_output.transpose(1, 2).contiguous(), None
 
 
 class Embedder:
     def __init__(self) -> None:
         from transformers import AutoModel, AutoTokenizer
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
         # Device priority: CUDA -> Apple Metal (MPS) -> CPU. SDPA only fuses in fp16/bf16;
         # bf16 is the model's native dtype on CUDA, while MPS bf16 support is partial across
@@ -76,7 +169,6 @@ class Embedder:
             self.device, self.dtype = torch.device("mps"), torch.float16
         else:
             self.device, self.dtype = torch.device("cpu"), torch.float32
-        patch_masking_kwargs()
         log(f"loading {MODEL_ID} on {self.device} ({self.dtype})")
         model = AutoModel.from_pretrained(MODEL_ID, trust_remote_code=True, dtype=self.dtype,
                                           attn_implementation="sdpa").eval()
@@ -93,7 +185,13 @@ class Embedder:
                 log(f"CUDA init failed (attempt {attempt + 1}): {e}; retrying")
                 torch.cuda.empty_cache()
                 time.sleep(2.0)
+        ALL_ATTENTION_FUNCTIONS.register("bifrost_sdpa", bifrost_attention_forward)
+        self.model.config._attn_implementation = "bifrost_sdpa"
+        self.model.model.config._attn_implementation = "bifrost_sdpa"
         self.tok = AutoTokenizer.from_pretrained(MODEL_ID)
+        layer_types = self.model.model.config.layer_types[: self.model.model.config.num_hidden_layers]
+        if any(t != "full_attention" for t in layer_types):
+            raise RuntimeError(f"voyage sidecar only supports full attention layers: {layer_types}")
         # Enable the fused SDPA kernels (CUDA only; MPS selects its own fused kernel).
         if self.cuda:
             torch.backends.cuda.enable_flash_sdp(True)
@@ -166,22 +264,25 @@ class Embedder:
 
         inner = self.model.model  # Qwen3Model
         embeds = inner.embed_tokens(input_ids)
-        # Broadcast key-padding bias (b,1,1,seq): SDPA broadcasts over heads & queries,
-        # so the dense (seq,seq) score matrix is never materialized (mem-efficient kernel).
+        # Pass an explicit full-attention mask mapping so HF Qwen does not synthesize a
+        # causal mask. The registered attention implementation handles MPS query blocking.
         min_val = torch.finfo(self.dtype).min
         key_valid = attention_mask[:, None, None, :].to(torch.bool)
-        bias = torch.zeros_like(key_valid, dtype=self.dtype).masked_fill(~key_valid, min_val)
-        o = inner(inputs_embeds=embeds, attention_mask={"full_attention": bias},
-                  use_cache=False)
-        hidden = self.model.linear(o.last_hidden_state).float()  # (b,seq,2048) fp32
+        attention_bias = torch.zeros_like(key_valid, dtype=self.dtype).masked_fill(~key_valid, min_val)
+        o = inner(inputs_embeds=embeds, attention_mask={"full_attention": attention_bias}, use_cache=False)
+        hidden = self.model.linear(o.last_hidden_state)
 
-        m = attention_mask[:, :, None].float()
+        m = attention_mask[:, :, None].to(dtype=self.dtype)
         pooled = (hidden * m).sum(1) / m.sum(1)        # masked mean -> (b,2048)
-        v = pooled[:, :OUT_DIM]                         # MRL truncate
+        v = pooled[:, :OUT_DIM].float()                 # MRL truncate, then fp32
         v = v / (v.norm(dim=-1, keepdim=True) + 1e-12)  # renorm
         vecs = v.cpu().numpy().astype(np.float32)
         for j, i in enumerate(idxs):
             out[i] = vecs[j]
+        if self.mps:
+            del input_ids, attention_mask, attention_bias, hidden, m, pooled, v
+            if torch.mps.driver_allocated_memory() > MPS_CACHE_DRAIN_FRACTION * torch.mps.recommended_max_memory():
+                torch.mps.empty_cache()
         if self._prof:
             self._fwd_s += time.time() - _t
             self._n_batches += 1
