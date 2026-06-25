@@ -13,6 +13,8 @@
 //! See the parity reference: brokkbench/localizer tools/native_localizer_helper.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Embedding, Linear, Module, RmsNorm, VarBuilder};
@@ -31,6 +33,22 @@ pub const VOYAGE_OUTPUT_DIM: usize = 512;
 /// memory into the tens of GB. Capping padded tokens bounds peak memory; a single
 /// chunk longer than the budget still runs alone (it can't be split).
 const PADDED_TOKEN_BUDGET: usize = MAX_SEQ_TOKENS;
+const EMBED_PROFILE_ENV: &str = "BIFROST_EMBED_PROFILE";
+const EMBED_DTYPE_ENV: &str = "BIFROST_EMBED_DTYPE";
+
+static FORCE_EMBED_PROFILE: AtomicBool = AtomicBool::new(false);
+
+pub fn enable_embed_profile_logging() {
+    FORCE_EMBED_PROFILE.store(true, Ordering::Relaxed);
+}
+
+fn embed_profile_enabled() -> bool {
+    FORCE_EMBED_PROFILE.load(Ordering::Relaxed)
+        || matches!(
+            std::env::var(EMBED_PROFILE_ENV).as_deref(),
+            Ok("1") | Ok("true") | Ok("on") | Ok("enabled")
+        )
+}
 
 /// Qwen3 hyper-parameters for voyage-4-nano. Parsed from the model `config.json`;
 /// fields not needed by the encoder forward are ignored.
@@ -294,7 +312,7 @@ impl VoyageEmbedder {
     /// Load from a local model directory containing config.json, tokenizer.json, and
     /// model.safetensors.
     pub fn load(model_dir: &Path, device: Device, label: String) -> Result<Self, String> {
-        let dtype = preferred_dtype(&device);
+        let dtype = preferred_dtype(&device)?;
         let cfg: VoyageConfig = {
             let text = std::fs::read_to_string(model_dir.join("config.json"))
                 .map_err(|err| format!("read config.json: {err}"))?;
@@ -309,6 +327,7 @@ impl VoyageEmbedder {
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|err| format!("load tokenizer: {err}"))?;
         let weights = model_dir.join("model.safetensors");
+        let label = format!("{label}:dtype={}", dtype_label(dtype));
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[weights], dtype, &device)
                 .map_err(|err| format!("load safetensors: {err}"))?
@@ -334,7 +353,7 @@ impl VoyageEmbedder {
             .map(|text| {
                 self.tokenizer
                     .encode(text.as_str(), true)
-                    .map(|enc| enc.get_ids().len().min(MAX_SEQ_TOKENS).max(1))
+                    .map(|enc| enc.get_ids().len().clamp(1, MAX_SEQ_TOKENS))
                     .unwrap_or(1)
             })
             .collect();
@@ -369,7 +388,7 @@ impl VoyageEmbedder {
     ) -> Result<(), String> {
         let subset: Vec<String> = idx.iter().map(|&i| texts[i].clone()).collect();
         let vecs = self.embed_sub_batch(&subset)?;
-        for (&i, vec) in idx.iter().zip(vecs.into_iter()) {
+        for (&i, vec) in idx.iter().zip(vecs) {
             out[i] = vec;
         }
         Ok(())
@@ -390,6 +409,13 @@ impl VoyageEmbedder {
             .unwrap_or(1)
             .max(1);
         let b = encodings.len();
+        let token_lens: Vec<usize> = encodings
+            .iter()
+            .map(|encoding| encoding.get_ids().len().clamp(1, MAX_SEQ_TOKENS))
+            .collect();
+        let min_len = token_lens.iter().copied().min().unwrap_or(1);
+        let avg_len = token_lens.iter().sum::<usize>() as f64 / token_lens.len() as f64;
+        let padded_tokens = b * max_len;
         let mut ids = vec![0u32; b * max_len];
         let mut mask = vec![0f32; b * max_len];
         for (row, enc) in encodings.iter().enumerate() {
@@ -405,6 +431,7 @@ impl VoyageEmbedder {
         let attention_mask = Tensor::from_vec(mask, (b, max_len), &self.device)
             .map_err(|err| format!("attention_mask tensor: {err}"))?;
 
+        let start = Instant::now();
         let hidden = self
             .model
             .forward(&input_ids, &attention_mask)
@@ -415,10 +442,26 @@ impl VoyageEmbedder {
             .narrow(1, 0, VOYAGE_OUTPUT_DIM)
             .map_err(|err| format!("mrl truncate: {err}"))?;
         let normed = l2_normalize_rows(&truncated).map_err(|err| format!("normalize: {err}"))?;
-        normed
+        let vectors = normed
             .to_dtype(DType::F32)
             .and_then(|t| t.to_vec2::<f32>())
-            .map_err(|err| format!("collect vectors: {err}"))
+            .map_err(|err| format!("collect vectors: {err}"))?;
+        if embed_profile_enabled() {
+            let elapsed = start.elapsed();
+            let seconds = elapsed.as_secs_f64();
+            eprintln!(
+                "[embed] batch_vectors={} min_seq={} avg_seq={:.1} max_seq={} padded_tokens={} elapsed_s={:.3} vectors_per_s={:.2} padded_tokens_per_s={:.0}",
+                b,
+                min_len,
+                avg_len,
+                max_len,
+                padded_tokens,
+                seconds,
+                b as f64 / seconds,
+                padded_tokens as f64 / seconds,
+            );
+        }
+        Ok(vectors)
     }
 }
 
@@ -465,8 +508,27 @@ fn l2_normalize_rows(x: &Tensor) -> candle_core::Result<Tensor> {
     x.broadcast_div(&norm)
 }
 
-/// Weights load and run in f32. bf16 on accelerators is a later optimization; f32
-/// keeps CPU-force runs and the torch-parity test numerically clean.
-fn preferred_dtype(_device: &Device) -> DType {
-    DType::F32
+fn dtype_label(dtype: DType) -> &'static str {
+    match dtype {
+        DType::F32 => "f32",
+        DType::F16 => "f16",
+        DType::BF16 => "bf16",
+        _ => "other",
+    }
+}
+
+/// Use the model's native bf16 by default. Set `BIFROST_EMBED_DTYPE` to override.
+fn preferred_dtype(_device: &Device) -> Result<DType, String> {
+    let Some(value) = std::env::var(EMBED_DTYPE_ENV).ok() else {
+        return Ok(DType::BF16);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "f32" | "float32" => Ok(DType::F32),
+        "f16" | "fp16" | "float16" => Ok(DType::F16),
+        "bf16" | "bfloat16" => Ok(DType::BF16),
+        "auto" | "native" => Ok(DType::BF16),
+        other => Err(format!(
+            "unsupported {EMBED_DTYPE_ENV}={other:?}; expected f32, f16, bf16, or auto"
+        )),
+    }
 }
