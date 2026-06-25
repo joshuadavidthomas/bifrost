@@ -252,29 +252,34 @@ pub fn finish_group(
             .map_err(|e| e.to_string())?;
     }
 
-    // 4. Persist each blob's chunk metadata.
-    metrics::trace(format_args!("put_blobs ({} blobs)", pending_blobs.len()));
-    for blob in &pending_blobs {
-        let rows: Vec<BlobChunkIn> = blob
-            .chunks
-            .iter()
-            .map(|chunk| BlobChunkIn {
-                chunk_ord: chunk.chunk_ord,
-                kind: chunk.kind,
-                symbol: chunk.symbol.as_deref(),
-                start_line: chunk.start_line,
-                end_line: chunk.end_line,
-                fts_tokens: &chunk.fts_tokens,
-                hash: chunk.hash,
-                parent_summary_hash: chunk.parent_summary_hash,
-                composed_hash: chunk.composed_hash,
-            })
-            .collect();
-        metrics::time(&metrics::SQLITE_NS, || {
-            store.put_blob(&blob.oid, blob.language.as_deref(), &rows)
+    // 4. Persist all blobs' chunk metadata in a single transaction (vs ~one per blob).
+    let all_rows: Vec<Vec<BlobChunkIn>> = pending_blobs
+        .iter()
+        .map(|blob| {
+            blob.chunks
+                .iter()
+                .map(|chunk| BlobChunkIn {
+                    chunk_ord: chunk.chunk_ord,
+                    kind: chunk.kind,
+                    symbol: chunk.symbol.as_deref(),
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    fts_tokens: &chunk.fts_tokens,
+                    hash: chunk.hash,
+                    parent_summary_hash: chunk.parent_summary_hash,
+                    composed_hash: chunk.composed_hash,
+                })
+                .collect()
         })
+        .collect();
+    let blob_args: Vec<(&str, Option<&str>, &[BlobChunkIn])> = pending_blobs
+        .iter()
+        .zip(&all_rows)
+        .map(|(blob, rows)| (blob.oid.as_str(), blob.language.as_deref(), rows.as_slice()))
+        .collect();
+    metrics::trace(format_args!("put_blobs ({} blobs)", blob_args.len()));
+    metrics::time(&metrics::SQLITE_NS, || store.put_blobs(&blob_args))
         .map_err(|e| e.to_string())?;
-    }
 
     Ok(())
 }

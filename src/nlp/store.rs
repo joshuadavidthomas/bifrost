@@ -132,6 +132,16 @@ impl SemanticStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+        // Write-throughput tuning. This is a rebuildable cache, so synchronous=NORMAL is
+        // safe (a crash can lose the last committed txns but never corrupts the DB) and
+        // is the big WAL win — ~10x fewer fsyncs. temp_store=MEMORY keeps indices/temp
+        // B-trees off disk; a large page cache and mmap cut read I/O during the heavy
+        // materialize writes.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "cache_size", -65536)?; // ~64 MiB page cache
+        conn.pragma_update(None, "mmap_size", 268435456i64)?; // 256 MiB
+        conn.pragma_update(None, "wal_autocheckpoint", 2000)?; // fewer checkpoint stalls
 
         migrate(&mut conn)?;
         conn.execute_batch(
@@ -270,6 +280,70 @@ impl SemanticStore {
         }
         drop(stmt);
         super::metrics::time(&super::metrics::SQLITE_NS, || tx.commit())?;
+        Ok(())
+    }
+
+    /// Replace several blobs' materialized chunks in a single transaction. With a
+    /// group of 64 blobs this collapses ~64 transactions (and their fsyncs) into one,
+    /// the dominant SQLite cost during materialization.
+    pub fn put_blobs(&self, blobs: &[(&str, Option<&str>, &[BlobChunkIn<'_>])]) -> Result<()> {
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
+        let tx = conn.transaction()?;
+        {
+            let mut upsert_blob = tx.prepare(
+                "INSERT INTO blobs(blob_oid, language) VALUES(?1, ?2)
+                 ON CONFLICT(blob_oid) DO UPDATE SET
+                     language = excluded.language,
+                     materialized_at = datetime('now')",
+            )?;
+            let mut delete_chunks = tx.prepare("DELETE FROM blob_chunks WHERE blob_oid = ?1")?;
+            let mut intern_summary = tx
+                .prepare("INSERT INTO blob_summaries(hash) VALUES(?1) ON CONFLICT(hash) DO NOTHING")?;
+            let mut select_summary =
+                tx.prepare("SELECT blob_summary_id FROM blob_summaries WHERE hash = ?1")?;
+            let mut insert_chunk = tx.prepare(
+                "INSERT INTO blob_chunks(
+                     blob_oid, chunk_ord, kind, symbol, start_line, end_line,
+                     fts_tokens, hash, parent_summary_id, composed_hash
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            let mut summary_ids: HashMap<[u8; 32], i64> = HashMap::new();
+            for (blob_oid, language, chunks) in blobs {
+                upsert_blob.execute(params![blob_oid, language])?;
+                delete_chunks.execute([blob_oid])?;
+                for chunk in *chunks {
+                    let parent_summary_id = match chunk.parent_summary_hash {
+                        None => None,
+                        Some(hash) => Some(match summary_ids.get(&hash) {
+                            Some(id) => *id,
+                            None => {
+                                intern_summary.execute(params![hash.as_slice()])?;
+                                let id: i64 = select_summary
+                                    .query_row(params![hash.as_slice()], |row| row.get(0))?;
+                                summary_ids.insert(hash, id);
+                                id
+                            }
+                        }),
+                    };
+                    insert_chunk.execute(params![
+                        blob_oid,
+                        chunk.chunk_ord,
+                        chunk.kind,
+                        chunk.symbol,
+                        chunk.start_line,
+                        chunk.end_line,
+                        chunk.fts_tokens,
+                        chunk.hash.as_slice(),
+                        parent_summary_id,
+                        chunk.composed_hash.as_slice(),
+                    ])?;
+                }
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 

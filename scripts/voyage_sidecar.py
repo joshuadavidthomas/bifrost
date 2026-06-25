@@ -91,11 +91,13 @@ class Embedder:
 
     @torch.no_grad()
     def embed(self, texts: list[str], prefix: str) -> np.ndarray:
-        # Length-bucketed sub-batching: bound padded tokens (b*seq) per forward so a few
-        # long chunks can't pad a huge batch and blow up memory. Process short->long.
+        # Tokenize ONCE (no padding), then length-bucket and pad each sub-batch from the
+        # cached ids — avoids a second tokenization pass over every chunk. Bucketing
+        # bounds padded tokens (b*seq) per forward so a few long chunks can't balloon a
+        # batch. Process short->long.
         prefixed = [prefix + t for t in texts]
-        lens = [min(len(e), MAX_SEQ)
-                for e in self.tok(prefixed, truncation=True, max_length=MAX_SEQ)["input_ids"]]
+        encoded = self.tok(prefixed, truncation=True, max_length=MAX_SEQ)["input_ids"]
+        lens = [len(e) for e in encoded]
         order = sorted(range(len(texts)), key=lambda i: lens[i])
         out: list[np.ndarray | None] = [None] * len(texts)
 
@@ -104,21 +106,27 @@ class Embedder:
         for i in order:
             new_max = max(bmax, lens[i])
             if batch and (len(batch) + 1) * new_max > PADDED_TOKEN_BUDGET:
-                self._run_batch([prefixed[j] for j in batch], batch, out)
+                self._run_batch([encoded[j] for j in batch], batch, out)
                 batch, bmax = [], 0
             batch.append(i)
             bmax = max(bmax, lens[i])
-        self._run_batch([prefixed[j] for j in batch], batch, out)
+        self._run_batch([encoded[j] for j in batch], batch, out)
         return np.stack(out)  # type: ignore[arg-type]
 
     @torch.no_grad()
-    def _run_batch(self, sub: list[str], idxs: list[int], out: list) -> None:
-        if not sub:
+    def _run_batch(self, id_lists: list[list[int]], idxs: list[int], out: list) -> None:
+        if not id_lists:
             return
-        enc = self.tok(sub, padding=True, truncation=True, max_length=MAX_SEQ,
-                       return_tensors="pt")
-        input_ids = enc["input_ids"].to(self.device)
-        attention_mask = enc["attention_mask"].to(self.device)
+        b = len(id_lists)
+        maxlen = max(len(x) for x in id_lists)
+        pad_id = self.tok.pad_token_id or 0
+        input_ids = torch.full((b, maxlen), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((b, maxlen), dtype=torch.long)
+        for row, ids in enumerate(id_lists):
+            input_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[row, : len(ids)] = 1
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
 
         inner = self.model.model  # Qwen3Model
         embeds = inner.embed_tokens(input_ids)
