@@ -151,13 +151,34 @@ pub fn extract_group(
     }
 }
 
-/// Phases 2-4 (GPU embed + DB writes): embed the missing components, compose the
-/// missing chunk vectors, and persist chunk metadata.
+/// A group's composed vectors + blob metadata, ready to persist. Produced by
+/// [`embed_group`] (GPU) and consumed by [`write_group`] (DB) on a separate thread so
+/// the DB writes overlap the next group's embed.
+pub struct EmbeddedGroup {
+    pending_blobs: Vec<PendingBlob>,
+    composed_items: Vec<(Key, Vec<f32>)>,
+}
+
+/// Embed + compose (phases 2-3) then persist (phase 4), in one call. The pipelined
+/// indexer splits these into [`embed_group`] and [`write_group`]; this is the simple
+/// path used by `materialize_blobs`.
 pub fn finish_group(
     store: &SemanticStore,
     embedder: &dyn Embedder,
     extracted: ExtractedGroup,
 ) -> Result<(), String> {
+    write_group(store, embed_group(store, embedder, extracted)?)
+}
+
+/// Phases 2-3 (GPU): embed the missing components and compose the missing chunk
+/// vectors. Component vectors are upserted here (compose reads them back), but the
+/// composed vectors and blob rows are returned for [`write_group`] to persist so those
+/// writes can overlap the next group's embed.
+pub fn embed_group(
+    store: &SemanticStore,
+    embedder: &dyn Embedder,
+    extracted: ExtractedGroup,
+) -> Result<EmbeddedGroup, String> {
     let ExtractedGroup {
         pending_blobs,
         component_texts,
@@ -202,6 +223,7 @@ pub fn finish_group(
     .map_err(|e| e.to_string())?
     .into_iter()
     .collect();
+    let mut composed_items: Vec<(Key, Vec<f32>)> = Vec::new();
     if !missing_composed.is_empty() {
         let mut needed: BTreeSet<Key> = BTreeSet::new();
         for blob in &pending_blobs {
@@ -218,7 +240,6 @@ pub fn finish_group(
             store.component_vectors(&needed.iter().copied().collect::<Vec<_>>())
         })
         .map_err(|e| e.to_string())?;
-        let mut composed_items: Vec<(Key, Vec<f32>)> = Vec::new();
         let mut emitted: BTreeSet<Key> = BTreeSet::new();
         metrics::trace(format_args!("compose {} vectors", missing_composed.len()));
         metrics::time(&metrics::COMPOSE_NS, || -> Result<(), String> {
@@ -246,13 +267,30 @@ pub fn finish_group(
             }
             Ok(())
         })?;
+        // composed vectors persisted by write_group on the writer thread.
+    }
+
+    Ok(EmbeddedGroup {
+        pending_blobs,
+        composed_items,
+    })
+}
+
+/// Phase 4 (DB): persist a group's composed vectors and blob metadata. Runs on the
+/// writer thread so these writes overlap the next group's embed.
+pub fn write_group(store: &SemanticStore, embedded: EmbeddedGroup) -> Result<(), String> {
+    let EmbeddedGroup {
+        pending_blobs,
+        composed_items,
+    } = embedded;
+    if !composed_items.is_empty() {
         metrics::trace(format_args!("upsert_composed {} vectors", composed_items.len()));
         store
             .upsert_composed_vectors(&composed_items)
             .map_err(|e| e.to_string())?;
     }
 
-    // 4. Persist all blobs' chunk metadata in a single transaction (vs ~one per blob).
+    // Persist all blobs' chunk metadata in a single transaction (vs ~one per blob).
     let all_rows: Vec<Vec<BlobChunkIn>> = pending_blobs
         .iter()
         .map(|blob| {

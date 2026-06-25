@@ -25,7 +25,9 @@ use crate::path_utils::rel_path_string;
 use super::active_index::ActiveIndex;
 use super::engine::{Embedder, FakeHashEmbedder, load_production_embedder};
 use super::gitcache;
-use super::materialize::{BlobTarget, ExtractedGroup, extract_group, finish_group};
+use super::materialize::{
+    BlobTarget, EmbeddedGroup, ExtractedGroup, embed_group, extract_group, write_group,
+};
 use super::metrics;
 use super::store::{SemanticStore, semantic_db_path};
 use super::{BM25_TOKENIZER_VERSION, CHUNKER_VERSION};
@@ -524,35 +526,50 @@ fn materialize_missing(
         return Ok(());
     }
 
-    // Pipeline: a producer thread runs CPU chunk extraction for upcoming groups while
-    // this thread embeds (GPU) + writes the current one, so the GPU never starves
-    // waiting on tree-sitter. The channel is bounded so the producer stays at most a
-    // couple of groups ahead (memory).
-    let (tx, rx) = std::sync::mpsc::sync_channel::<ExtractedGroup>(2);
+    // 3-stage pipeline so the GPU never starves: a producer thread runs CPU chunk
+    // extraction, an embed thread runs the GPU forward + compose, and this thread is the
+    // single SQLite writer. The writer persisting group N overlaps the embed of group
+    // N+1 (the embed holds no DB lock during the GPU forward). Bounded channels keep at
+    // most a couple of groups in flight per stage (memory).
+    let (tx_extract, rx_extract) = std::sync::mpsc::sync_channel::<ExtractedGroup>(2);
+    let (tx_embed, rx_embed) = std::sync::mpsc::sync_channel::<EmbeddedGroup>(2);
     std::thread::scope(|scope| -> BuildResult {
         let producer = scope.spawn(move || -> BuildResult {
             for group in targets.chunks(FILE_GROUP) {
                 check_cancelled(shared)?;
                 let extracted =
                     metrics::time(&metrics::EXTRACT_NS, || extract_group(embedder, analyzer, group));
-                if tx.send(extracted).is_err() {
-                    break; // consumer stopped (error or cancellation)
+                if tx_extract.send(extracted).is_err() {
+                    break; // downstream stopped (error or cancellation)
+                }
+            }
+            Ok(())
+        });
+
+        let embed_stage = scope.spawn(move || -> BuildResult {
+            for extracted in rx_extract {
+                check_cancelled(shared)?;
+                let embedded =
+                    embed_group(store, embedder, extracted).map_err(BuildError::Failed)?;
+                if tx_embed.send(embedded).is_err() {
+                    break; // writer stopped (error or cancellation)
                 }
             }
             Ok(())
         });
 
         let mut consumed: BuildResult = Ok(());
-        for extracted in rx {
+        for embedded in rx_embed {
             if let Err(err) = check_cancelled(shared)
-                .and_then(|()| finish_group(store, embedder, extracted).map_err(BuildError::Failed))
+                .and_then(|()| write_group(store, embedded).map_err(BuildError::Failed))
             {
                 consumed = Err(err);
                 break;
             }
         }
+        let embedded_res = embed_stage.join().expect("embed thread panicked");
         let produced = producer.join().expect("extract thread panicked");
-        consumed.and(produced)
+        consumed.and(embedded_res).and(produced)
     })
 }
 
