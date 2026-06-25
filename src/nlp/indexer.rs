@@ -25,7 +25,8 @@ use crate::path_utils::rel_path_string;
 use super::active_index::ActiveIndex;
 use super::engine::{Embedder, FakeHashEmbedder, load_production_embedder};
 use super::gitcache;
-use super::materialize::{BlobTarget, materialize_blobs};
+use super::materialize::{BlobTarget, ExtractedGroup, extract_group, finish_group};
+use super::metrics;
 use super::store::{SemanticStore, semantic_db_path};
 use super::{BM25_TOKENIZER_VERSION, CHUNKER_VERSION};
 
@@ -188,7 +189,11 @@ impl SemanticIndexer {
     /// the indexer's terminal error.
     pub fn wait_ready(&self, timeout: Duration) -> Result<(), String> {
         let deadline = std::time::Instant::now() + timeout;
-        let mut phase = self.shared.phase.lock().expect("semantic indexer mutex poisoned");
+        let mut phase = self
+            .shared
+            .phase
+            .lock()
+            .expect("semantic indexer mutex poisoned");
         loop {
             match &*phase {
                 Phase::Failed(message) => {
@@ -254,7 +259,10 @@ impl SemanticIndexer {
     pub fn close(&self) {
         mark_closed(&self.shared);
         self.tx.send(IndexerMsg::Shutdown).ok();
-        self.join.lock().expect("semantic indexer mutex poisoned").take();
+        self.join
+            .lock()
+            .expect("semantic indexer mutex poisoned")
+            .take();
     }
 }
 
@@ -262,7 +270,10 @@ impl Drop for SemanticIndexer {
     fn drop(&mut self) {
         mark_closed(&self.shared);
         self.tx.send(IndexerMsg::Shutdown).ok();
-        self.join.lock().expect("semantic indexer mutex poisoned").take();
+        self.join
+            .lock()
+            .expect("semantic indexer mutex poisoned")
+            .take();
     }
 }
 
@@ -279,7 +290,10 @@ fn mark_closed(shared: &Shared) {
         return;
     }
     shared.pending.store(0, Ordering::SeqCst);
-    let mut phase = shared.phase.lock().expect("semantic indexer mutex poisoned");
+    let mut phase = shared
+        .phase
+        .lock()
+        .expect("semantic indexer mutex poisoned");
     *phase = Phase::Closed;
     shared.cond.notify_all();
 }
@@ -311,8 +325,10 @@ fn worker_loop(
         if shared.closed.load(Ordering::SeqCst) {
             return;
         }
-        *shared.phase.lock().expect("semantic indexer mutex poisoned") =
-            Phase::Failed(message);
+        *shared
+            .phase
+            .lock()
+            .expect("semantic indexer mutex poisoned") = Phase::Failed(message);
         shared.pending.store(0, Ordering::SeqCst);
         shared.cond.notify_all();
     };
@@ -360,9 +376,14 @@ fn worker_loop(
                 done.send(run_gc(&store, &repo)).ok();
                 continue;
             }
-            IndexerMsg::FullBuild(snapshot) => {
-                full_build(&shared, &store, embedder.as_ref(), &repo, &snapshot, &active)
-            }
+            IndexerMsg::FullBuild(snapshot) => full_build(
+                &shared,
+                &store,
+                embedder.as_ref(),
+                &repo,
+                &snapshot,
+                &active,
+            ),
             IndexerMsg::Update(snapshot, changed) => update_files(
                 &shared,
                 &store,
@@ -382,7 +403,10 @@ fn worker_loop(
         }
         if !first_build_done {
             first_build_done = true;
-            let mut phase = shared.phase.lock().expect("semantic indexer mutex poisoned");
+            let mut phase = shared
+                .phase
+                .lock()
+                .expect("semantic indexer mutex poisoned");
             if matches!(*phase, Phase::Starting) {
                 *phase = Phase::Ready;
             }
@@ -405,9 +429,9 @@ fn full_build(
     let files: Vec<ProjectFile> = analyzer.analyzed_files().cloned().collect();
     let rel_paths: Vec<String> = files.iter().map(rel_path_string).collect();
 
-    let path_to_oid = gitcache::working_tree_oids(repo, &rel_paths)
-        .map_err(BuildError::Failed)?;
+    let path_to_oid = gitcache::working_tree_oids(repo, &rel_paths).map_err(BuildError::Failed)?;
     materialize_missing(shared, store, embedder, analyzer, &files, &path_to_oid)?;
+    eprintln!("bifrost semantic index: {}", metrics::report());
 
     check_cancelled(shared)?;
     let index = ActiveIndex::build(store, &path_to_oid).map_err(BuildError::Failed)?;
@@ -440,9 +464,16 @@ fn update_files(
     }
 
     let rel_paths: Vec<String> = changed_files.iter().map(rel_path_string).collect();
-    let path_to_oid = gitcache::working_tree_oids_targeted(repo, &rel_paths)
-        .map_err(BuildError::Failed)?;
-    materialize_missing(shared, store, embedder, analyzer, &changed_files, &path_to_oid)?;
+    let path_to_oid =
+        gitcache::working_tree_oids_targeted(repo, &rel_paths).map_err(BuildError::Failed)?;
+    materialize_missing(
+        shared,
+        store,
+        embedder,
+        analyzer,
+        &changed_files,
+        &path_to_oid,
+    )?;
 
     check_cancelled(shared)?;
     if let Some(index) = active.write().expect("active index lock poisoned").as_mut() {
@@ -468,7 +499,9 @@ fn materialize_missing(
     for file in files {
         let rel = rel_path_string(file);
         if let Some(oid) = path_to_oid.get(&rel) {
-            oid_to_file.entry(oid.clone()).or_insert_with(|| file.clone());
+            oid_to_file
+                .entry(oid.clone())
+                .or_insert_with(|| file.clone());
         }
     }
     let oids: Vec<String> = oid_to_file.keys().cloned().collect();
@@ -487,11 +520,40 @@ fn materialize_missing(
         })
         .collect();
 
-    for group in targets.chunks(FILE_GROUP) {
-        check_cancelled(shared)?;
-        materialize_blobs(store, embedder, analyzer, group).map_err(BuildError::Failed)?;
+    if targets.is_empty() {
+        return Ok(());
     }
-    Ok(())
+
+    // Pipeline: a producer thread runs CPU chunk extraction for upcoming groups while
+    // this thread embeds (GPU) + writes the current one, so the GPU never starves
+    // waiting on tree-sitter. The channel is bounded so the producer stays at most a
+    // couple of groups ahead (memory).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ExtractedGroup>(2);
+    std::thread::scope(|scope| -> BuildResult {
+        let producer = scope.spawn(move || -> BuildResult {
+            for group in targets.chunks(FILE_GROUP) {
+                check_cancelled(shared)?;
+                let extracted =
+                    metrics::time(&metrics::EXTRACT_NS, || extract_group(embedder, analyzer, group));
+                if tx.send(extracted).is_err() {
+                    break; // consumer stopped (error or cancellation)
+                }
+            }
+            Ok(())
+        });
+
+        let mut consumed: BuildResult = Ok(());
+        for extracted in rx {
+            if let Err(err) = check_cancelled(shared)
+                .and_then(|()| finish_group(store, embedder, extracted).map_err(BuildError::Failed))
+            {
+                consumed = Err(err);
+                break;
+            }
+        }
+        let produced = producer.join().expect("extract thread panicked");
+        consumed.and(produced)
+    })
 }
 
 fn language_of(file: &ProjectFile) -> Option<String> {

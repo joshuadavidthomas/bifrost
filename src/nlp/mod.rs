@@ -14,6 +14,7 @@ pub mod gitcache;
 pub mod indexer;
 pub mod keys;
 pub mod materialize;
+pub mod metrics;
 pub mod quant;
 pub mod query;
 pub mod store;

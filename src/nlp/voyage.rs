@@ -50,6 +50,24 @@ fn embed_profile_enabled() -> bool {
         )
 }
 
+/// Smallest padded sequence length; below this, padding savings aren't worth an
+/// extra distinct buffer shape.
+const MIN_SEQ_BUCKET: usize = 512;
+
+/// Round a sequence length up to a canonical bucket (powers of two, in
+/// `[MIN_SEQ_BUCKET, MAX_SEQ_TOKENS]`). Every forward pads to a bucket so only a
+/// handful of distinct `(batch, seq)` tensor shapes ever occur. Candle's CUDA
+/// allocator caches device buffers per shape and never frees them, so without
+/// bucketing a large repo's ever-varying `max_len` accumulates a buffer set per
+/// shape and grows GPU memory without bound until the smallest GPU fills and its
+/// next allocation wedges (observed: a 20 GB card pinned at 100%/full, pipeline
+/// frozen). Bucketing bounds the live shapes to ~5, so memory plateaus.
+fn seq_bucket(len: usize) -> usize {
+    len.max(1)
+        .next_power_of_two()
+        .clamp(MIN_SEQ_BUCKET, MAX_SEQ_TOKENS)
+}
+
 /// Qwen3 hyper-parameters for voyage-4-nano. Parsed from the model `config.json`;
 /// fields not needed by the encoder forward are ignored.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -130,7 +148,12 @@ impl Attention {
     }
 
     /// `x`: (b, seq, hidden). `mask`: (b, 1, seq, seq) additive (0 / -inf), bidirectional.
-    fn forward(&self, x: &Tensor, mask: &Tensor, rotary: &RotaryEmbedding) -> candle_core::Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        rotary: &RotaryEmbedding,
+    ) -> candle_core::Result<Tensor> {
         let (b, seq, _) = x.dims3()?;
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
@@ -223,7 +246,12 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&self, x: &Tensor, mask: &Tensor, rotary: &RotaryEmbedding) -> candle_core::Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: &Tensor,
+        rotary: &RotaryEmbedding,
+    ) -> candle_core::Result<Tensor> {
         let residual = x;
         let h = self.input_layernorm.forward(x)?;
         let h = self.self_attn.forward(&h, mask, rotary)?;
@@ -247,7 +275,12 @@ struct Qwen3BidirectionalModel {
 }
 
 impl Qwen3BidirectionalModel {
-    fn load(cfg: &VoyageConfig, vb: VarBuilder, device: &Device, dtype: DType) -> candle_core::Result<Self> {
+    fn load(
+        cfg: &VoyageConfig,
+        vb: VarBuilder,
+        device: &Device,
+        dtype: DType,
+    ) -> candle_core::Result<Self> {
         let model = vb.pp("model");
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, model.pp("embed_tokens"))?;
@@ -284,7 +317,11 @@ impl Qwen3BidirectionalModel {
 
     /// Additive bidirectional mask (b, 1, seq, seq): 0 where the key token is real,
     /// -inf where it is padding. No causal component.
-    fn bidirectional_mask(&self, attention_mask: &Tensor, seq: usize) -> candle_core::Result<Tensor> {
+    fn bidirectional_mask(
+        &self,
+        attention_mask: &Tensor,
+        seq: usize,
+    ) -> candle_core::Result<Tensor> {
         let (b, _) = attention_mask.dims2()?;
         // A large FINITE negative, not -inf: `(1 - 1) * -inf = NaN` would poison every
         // real key. With a finite value `0 * NEG = 0`, and `exp(NEG - max)` underflows
@@ -348,13 +385,15 @@ impl VoyageEmbedder {
         }
         // Length-aware packing: sort by token length and greedily fill batches up to
         // the padded-token budget, so short chunks aren't padded up to a long one.
+        // Bucket each length so packing accounts for the same padded footprint the
+        // tensor will use (see `seq_bucket`); keeps the set of forward shapes small.
         let lens: Vec<usize> = prefixed
             .iter()
             .map(|text| {
                 self.tokenizer
                     .encode(text.as_str(), true)
-                    .map(|enc| enc.get_ids().len().clamp(1, MAX_SEQ_TOKENS))
-                    .unwrap_or(1)
+                    .map(|enc| seq_bucket(enc.get_ids().len().min(MAX_SEQ_TOKENS)))
+                    .unwrap_or(MIN_SEQ_BUCKET)
             })
             .collect();
         let mut order: Vec<usize> = (0..prefixed.len()).collect();
@@ -402,12 +441,15 @@ impl VoyageEmbedder {
             .tokenizer
             .encode_batch(prefixed.to_vec(), true)
             .map_err(|err| format!("tokenize: {err}"))?;
-        let max_len = encodings
-            .iter()
-            .map(|e| e.get_ids().len().min(MAX_SEQ_TOKENS))
-            .max()
-            .unwrap_or(1)
-            .max(1);
+        // Pad to a canonical bucket so the (batch, seq) tensor shape — and thus the
+        // cached CUDA device buffers — come from a small fixed set (see `seq_bucket`).
+        let max_len = seq_bucket(
+            encodings
+                .iter()
+                .map(|e| e.get_ids().len().min(MAX_SEQ_TOKENS))
+                .max()
+                .unwrap_or(1),
+        );
         let b = encodings.len();
         let token_lens: Vec<usize> = encodings
             .iter()
@@ -436,8 +478,8 @@ impl VoyageEmbedder {
             .model
             .forward(&input_ids, &attention_mask)
             .map_err(|err| format!("forward: {err}"))?; // (b, seq, 2048)
-        let pooled = masked_mean(&hidden, &attention_mask)
-            .map_err(|err| format!("mean pool: {err}"))?; // (b, 2048)
+        let pooled =
+            masked_mean(&hidden, &attention_mask).map_err(|err| format!("mean pool: {err}"))?; // (b, 2048)
         let truncated = pooled
             .narrow(1, 0, VOYAGE_OUTPUT_DIM)
             .map_err(|err| format!("mrl truncate: {err}"))?;
@@ -471,7 +513,10 @@ impl Embedder for VoyageEmbedder {
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
-        let prefixed: Vec<String> = texts.iter().map(|t| format!("{PASSAGE_PREFIX}{t}")).collect();
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|t| format!("{PASSAGE_PREFIX}{t}"))
+            .collect();
         self.embed_prefixed(&prefixed)
     }
 
@@ -504,7 +549,11 @@ fn masked_mean(hidden: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
 
 /// Row-wise L2 normalize a (b, d) tensor.
 fn l2_normalize_rows(x: &Tensor) -> candle_core::Result<Tensor> {
-    let norm = x.sqr()?.sum_keepdim(1)?.sqrt()?.clamp(1e-12, f64::INFINITY)?;
+    let norm = x
+        .sqr()?
+        .sum_keepdim(1)?
+        .sqrt()?
+        .clamp(1e-12, f64::INFINITY)?;
     x.broadcast_div(&norm)
 }
 

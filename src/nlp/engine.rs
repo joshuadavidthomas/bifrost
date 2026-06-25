@@ -8,8 +8,8 @@
 //! own device backends.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use candle_core::Device;
 use sha2::{Digest, Sha256};
@@ -116,6 +116,50 @@ pub fn select_device() -> Result<Device, String> {
     }
 }
 
+/// Every visible CUDA device, probed by ordinal (Candle/cudarc only see devices
+/// permitted by `CUDA_VISIBLE_DEVICES`, so this respects it automatically).
+fn all_cuda_devices() -> Vec<Device> {
+    let mut devices = Vec::new();
+    let mut ordinal = 0;
+    while let Ok(device) = Device::new_cuda(ordinal) {
+        devices.push(device);
+        ordinal += 1;
+    }
+    devices
+}
+
+/// Every Candle device the embedder should fan across, honoring `BIFROST_ACCELERATOR`.
+/// `Auto`/`Cuda` use ALL visible CUDA devices (so one repo's index can saturate the
+/// whole box); Metal and CPU are single-device.
+pub fn select_devices() -> Result<Vec<Device>, String> {
+    match accelerator_preference() {
+        AcceleratorPreference::Cpu => Ok(vec![Device::Cpu]),
+        AcceleratorPreference::Cuda => {
+            let devices = all_cuda_devices();
+            if devices.is_empty() {
+                Err("no CUDA devices available".to_string())
+            } else {
+                Ok(devices)
+            }
+        }
+        AcceleratorPreference::Metal => {
+            Ok(vec![Device::new_metal(0).map_err(|err| {
+                format!("Metal device unavailable: {err}")
+            })?])
+        }
+        AcceleratorPreference::Auto => {
+            let cuda = all_cuda_devices();
+            if !cuda.is_empty() {
+                return Ok(cuda);
+            }
+            if let Ok(device) = Device::new_metal(0) {
+                return Ok(vec![device]);
+            }
+            Ok(vec![Device::Cpu])
+        }
+    }
+}
+
 /// Whether a CUDA or Metal accelerator is actually usable under the current
 /// preference. Drives whether `semantic_search` is offered (an explicit `cpu`
 /// preference reports `false` — it must be force-enabled).
@@ -157,9 +201,122 @@ fn resolve_embed_model_dir() -> Result<PathBuf, String> {
 }
 
 pub fn load_production_embedder() -> Result<Arc<dyn Embedder>, String> {
-    let device = select_device()?;
+    let devices = select_devices()?;
     let dir = resolve_embed_model_dir()?;
-    Ok(Arc::new(VoyageEmbedder::load(&dir, device, embed_repo_id())?))
+    let label = embed_repo_id();
+    // Load (and pre-warm) one embedder per device in parallel — each load + warmup is
+    // an independent multi-second GPU op, so doing them serially made startup scale
+    // with device count. Pre-warming forces the lazily-mmapped weights onto the device
+    // now, so a cold worker doesn't lose the first pull race and sit idle.
+    let dir_ref = &dir;
+    let label_ref = &label;
+    let workers: Vec<Arc<dyn Embedder>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = devices
+            .into_iter()
+            .map(|device| {
+                scope.spawn(move || -> Result<Arc<dyn Embedder>, String> {
+                    let worker = VoyageEmbedder::load(dir_ref, device, label_ref.clone())?;
+                    let _ = worker.embed_passages(&["warmup"]);
+                    Ok(Arc::new(worker) as Arc<dyn Embedder>)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("embedder load thread panicked"))
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+    eprintln!(
+        "bifrost semantic index: {} embedder device(s)",
+        workers.len()
+    );
+    Ok(Arc::new(ScheduledEmbedder::new(workers)))
+}
+
+/// Smallest pull, to keep GPU batches efficient (avoid kernel-launch-bound tiny calls).
+const MIN_SCHEDULE_CHUNK: usize = 8;
+/// Target pulls per worker per batch: enough for dynamic load-balancing (faster GPUs
+/// pull more) while still engaging every worker on a modest batch.
+const PULLS_PER_WORKER: usize = 4;
+
+/// Fans `embed_passages` across one embedder per GPU via a shared pull queue, so a
+/// single repo's index uses every visible device. Queries (a single vector) run on
+/// the first worker.
+pub struct ScheduledEmbedder {
+    workers: Vec<Arc<dyn Embedder>>,
+}
+
+impl ScheduledEmbedder {
+    pub fn new(workers: Vec<Arc<dyn Embedder>>) -> Self {
+        assert!(
+            !workers.is_empty(),
+            "ScheduledEmbedder needs at least one worker"
+        );
+        Self { workers }
+    }
+}
+
+impl Embedder for ScheduledEmbedder {
+    fn dim(&self) -> usize {
+        self.workers[0].dim()
+    }
+
+    fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+        let n = self.workers.len();
+        // Pull granularity: aim for ~PULLS_PER_WORKER pulls each, so every GPU gets a
+        // share of a modest batch yet a faster GPU can still pull extra.
+        let chunk = (texts.len() / (n * PULLS_PER_WORKER)).max(MIN_SCHEDULE_CHUNK);
+        if n == 1 || texts.len() <= chunk {
+            return self.workers[0].embed_passages(texts);
+        }
+        let next = AtomicUsize::new(0);
+        let results: Mutex<Vec<Vec<f32>>> = Mutex::new(vec![Vec::new(); texts.len()]);
+        let first_err: Mutex<Option<String>> = Mutex::new(None);
+        std::thread::scope(|scope| {
+            for worker in &self.workers {
+                scope.spawn(|| {
+                    loop {
+                        if first_err.lock().expect("schedule err lock").is_some() {
+                            return;
+                        }
+                        let start = next.fetch_add(chunk, Ordering::SeqCst);
+                        if start >= texts.len() {
+                            return;
+                        }
+                        let end = (start + chunk).min(texts.len());
+                        match worker.embed_passages(&texts[start..end]) {
+                            Ok(vecs) => {
+                                let mut guard = results.lock().expect("schedule results lock");
+                                for (offset, vec) in vecs.into_iter().enumerate() {
+                                    guard[start + offset] = vec;
+                                }
+                            }
+                            Err(err) => {
+                                *first_err.lock().expect("schedule err lock") = Some(err);
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(err) = first_err.into_inner().expect("schedule err lock") {
+            return Err(err);
+        }
+        Ok(results.into_inner().expect("schedule results lock"))
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.workers[0].embed_query(text)
+    }
+
+    fn count_tokens(&self, text: &str) -> usize {
+        self.workers[0].count_tokens(text)
+    }
+
+    fn fingerprint(&self) -> String {
+        self.workers[0].fingerprint()
+    }
 }
 
 // ---------------------------------------------------------------------------
