@@ -28,6 +28,7 @@ import json
 import os
 import struct
 import sys
+import time
 
 import numpy as np
 import torch
@@ -89,6 +90,23 @@ class Embedder:
         torch.backends.cuda.enable_mem_efficient_sdp(True)
         torch.backends.cuda.enable_math_sdp(True)
 
+        # Optional embed profiling (BIFROST_SIDECAR_PROFILE=1): tokenize vs GPU-forward
+        # time and actual batch sizes, to tell whether embed is overhead- or GPU-bound.
+        self._prof = os.environ.get("BIFROST_SIDECAR_PROFILE") == "1"
+        self._tok_s = self._fwd_s = 0.0
+        self._n_texts = self._n_calls = self._n_batches = self._sum_b = self._max_b = 0
+        self._t_report = time.time()
+
+    def _maybe_report(self) -> None:
+        now = time.time()
+        if now - self._t_report < 20:
+            return
+        self._t_report = now
+        log(f"PROF texts={self._n_texts} calls={self._n_calls} batches={self._n_batches} "
+            f"avg_texts/call={self._n_texts / max(self._n_calls, 1):.1f} "
+            f"avg_batch={self._sum_b / max(self._n_batches, 1):.1f} max_batch={self._max_b} "
+            f"tok_s={self._tok_s:.1f} fwd_s={self._fwd_s:.1f}")
+
     @torch.no_grad()
     def embed(self, texts: list[str], prefix: str) -> np.ndarray:
         # Tokenize ONCE (no padding), then length-bucket and pad each sub-batch from the
@@ -96,7 +114,12 @@ class Embedder:
         # bounds padded tokens (b*seq) per forward so a few long chunks can't balloon a
         # batch. Process short->long.
         prefixed = [prefix + t for t in texts]
+        _t = time.time()
         encoded = self.tok(prefixed, truncation=True, max_length=MAX_SEQ)["input_ids"]
+        if self._prof:
+            self._tok_s += time.time() - _t
+            self._n_calls += 1
+            self._n_texts += len(texts)
         lens = [len(e) for e in encoded]
         order = sorted(range(len(texts)), key=lambda i: lens[i])
         out: list[np.ndarray | None] = [None] * len(texts)
@@ -111,12 +134,15 @@ class Embedder:
             batch.append(i)
             bmax = max(bmax, lens[i])
         self._run_batch([encoded[j] for j in batch], batch, out)
+        if self._prof:
+            self._maybe_report()
         return np.stack(out)  # type: ignore[arg-type]
 
     @torch.no_grad()
     def _run_batch(self, id_lists: list[list[int]], idxs: list[int], out: list) -> None:
         if not id_lists:
             return
+        _t = time.time()
         b = len(id_lists)
         maxlen = max(len(x) for x in id_lists)
         pad_id = self.tok.pad_token_id or 0
@@ -146,6 +172,11 @@ class Embedder:
         vecs = v.cpu().numpy().astype(np.float32)
         for j, i in enumerate(idxs):
             out[i] = vecs[j]
+        if self._prof:
+            self._fwd_s += time.time() - _t
+            self._n_batches += 1
+            self._sum_b += b
+            self._max_b = max(self._max_b, b)
 
 
 def _read_exact(stream, n: int) -> bytes | None:
