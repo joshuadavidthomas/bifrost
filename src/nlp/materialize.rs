@@ -6,7 +6,7 @@
 //! cached (by content hash), and a blob whose OID is already present is never
 //! re-materialized. A group is materialized together so embedding batches well.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::analyzer::{IAnalyzer, ProjectFile};
 
@@ -156,6 +156,9 @@ pub fn extract_group(
 /// the DB writes overlap the next group's embed.
 pub struct EmbeddedGroup {
     pending_blobs: Vec<PendingBlob>,
+    /// Just-embedded component vectors to persist (kept in-memory so embed_group does
+    /// no writes — it only reads, which WAL runs concurrently with the writer).
+    component_items: Vec<(Key, Vec<f32>)>,
     composed_items: Vec<(Key, Vec<f32>)>,
 }
 
@@ -196,6 +199,9 @@ pub fn embed_group(
         .iter()
         .filter(|(key, _)| missing.contains(key))
         .collect();
+    // Just-embedded component vectors, kept in-memory; the writer persists them so
+    // embed_group never holds the DB write lock during the GPU forward.
+    let mut component_items: Vec<(Key, Vec<f32>)> = Vec::new();
     if !to_embed.is_empty() {
         let texts: Vec<&str> = to_embed.iter().map(|(_, text)| text.as_str()).collect();
         let max_bytes = texts.iter().map(|t| t.len()).max().unwrap_or(0);
@@ -204,12 +210,7 @@ pub fn embed_group(
             format_args!("embed {} texts (max_bytes={max_bytes})", texts.len()),
             || embedder.embed_passages(&texts),
         )?;
-        let items: Vec<(Key, Vec<f32>)> =
-            to_embed.iter().map(|(key, _)| *key).zip(vectors).collect();
-        metrics::trace(format_args!("upsert_component {} vectors", items.len()));
-        store
-            .upsert_component_vectors(&items)
-            .map_err(|e| e.to_string())?;
+        component_items = to_embed.iter().map(|(key, _)| *key).zip(vectors).collect();
     }
 
     // 3. Compose missing chunk vectors from their (now cached) components.
@@ -236,10 +237,26 @@ pub fn embed_group(
                 }
             }
         }
-        let component_vectors = metrics::time(&metrics::SQLITE_NS, || {
-            store.component_vectors(&needed.iter().copied().collect::<Vec<_>>())
-        })
-        .map_err(|e| e.to_string())?;
+        // rq8-round the just-embedded components so compose sees the same precision as
+        // the cached ones (which were stored + read back as rq8 codes).
+        let mut available: HashMap<Key, Vec<f32>> = component_items
+            .iter()
+            .map(|(k, v)| {
+                let rounded = super::quant::decode_vector(&super::quant::encode_vector(v))
+                    .unwrap_or_else(|_| v.clone());
+                (*k, rounded)
+            })
+            .collect();
+        // Read only the components NOT just embedded — those aren't in the store yet
+        // (the writer persists them). A pure read => WAL-concurrent with the writer.
+        let cached_needed: Vec<Key> = needed
+            .iter()
+            .copied()
+            .filter(|k| !available.contains_key(k))
+            .collect();
+        let cached = metrics::time(&metrics::SQLITE_NS, || store.component_vectors(&cached_needed))
+            .map_err(|e| e.to_string())?;
+        available.extend(cached);
         let mut emitted: BTreeSet<Key> = BTreeSet::new();
         metrics::trace(format_args!("compose {} vectors", missing_composed.len()));
         metrics::time(&metrics::COMPOSE_NS, || -> Result<(), String> {
@@ -250,12 +267,12 @@ pub fn embed_group(
                     {
                         continue;
                     }
-                    let child = component_vectors
+                    let child = available
                         .get(&chunk.hash)
                         .ok_or_else(|| "component vector missing after embed".to_string())?;
                     let vector = match chunk.parent_summary_hash {
                         Some(parent) => {
-                            let parent_vec = component_vectors
+                            let parent_vec = available
                                 .get(&parent)
                                 .ok_or_else(|| "parent vector missing after embed".to_string())?;
                             compose(child, parent_vec)
@@ -267,11 +284,11 @@ pub fn embed_group(
             }
             Ok(())
         })?;
-        // composed vectors persisted by write_group on the writer thread.
     }
 
     Ok(EmbeddedGroup {
         pending_blobs,
+        component_items,
         composed_items,
     })
 }
@@ -281,8 +298,15 @@ pub fn embed_group(
 pub fn write_group(store: &SemanticStore, embedded: EmbeddedGroup) -> Result<(), String> {
     let EmbeddedGroup {
         pending_blobs,
+        component_items,
         composed_items,
     } = embedded;
+    if !component_items.is_empty() {
+        metrics::trace(format_args!("upsert_component {} vectors", component_items.len()));
+        store
+            .upsert_component_vectors(&component_items)
+            .map_err(|e| e.to_string())?;
+    }
     if !composed_items.is_empty() {
         metrics::trace(format_args!("upsert_composed {} vectors", composed_items.len()));
         store
