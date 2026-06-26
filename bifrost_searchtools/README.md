@@ -112,9 +112,10 @@ passed through `options` (keys map 1:1 to the Rust tool arguments).
 
 ## Semantic search
 
-`semantic_search(...)` finds files by meaning rather than name: function-level
-chunks are embedded, fused with BM25 and git co-edit signals, then reranked by a
-cross-encoder. It searches code, not prose.
+`semantic_search(...)` searches code by meaning rather than name and returns the
+three retrieval legs directly: function-oriented vector and BM25 rankings over
+function-level chunks, plus a file-oriented co-edit ranking. It searches code,
+not prose.
 
 It is opt-in. Set `BIFROST_SEMANTIC_INDEX=auto` to enable background indexing;
 the models load via ONNX and download from the HuggingFace hub on first use. The

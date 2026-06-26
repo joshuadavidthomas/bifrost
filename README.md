@@ -222,7 +222,7 @@ The subset toolsets are now composable rather than fixed server modes. `core` is
 
 ### Semantic search
 
-`semantic_search` (in the `nlp` toolset) finds source files by meaning: function-level chunks are embedded (averaged with their enclosing class or file summary), fused with grounded-strings BM25 and git co-edit relevance, then reranked by a cross-encoder. It searches code only, not prose or markdown.
+`semantic_search` (in the `nlp` toolset) searches code by meaning and returns its constituent rankings directly: vector and BM25 legs are function-oriented (`fqfn` hits over function-level chunks, averaged with enclosing class or file summary context), while the co-edit leg remains file-oriented. It searches code only, not prose or markdown.
 
 The index lives in `.brokk/semantic_index.db` of the **primary** repository (linked git worktrees share the primary's index). Vectors and BM25 rows are keyed by content hash, so switching branches re-points rows instead of re-embedding. Once enabled, a background build starts when the workspace is activated; `semantic_search` blocks until the index is ready, and the file watcher keeps it updated incrementally.
 
