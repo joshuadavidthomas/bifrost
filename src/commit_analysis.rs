@@ -157,7 +157,11 @@ pub fn analyze_commit(
     match commit.parent_count() {
         0 => return Err("analyze_commit does not support root commits".to_string()),
         1 => {}
-        n => return Err(format!("analyze_commit does not support merge commits ({n} parents)")),
+        n => {
+            return Err(format!(
+                "analyze_commit does not support merge commits ({n} parents)"
+            ));
+        }
     }
 
     let parent = commit
@@ -246,8 +250,10 @@ pub fn analyze_commit(
     );
     let (call_edge_changes, dependency_symbols) =
         call_edge_changes_and_dependencies(&graph_before.edges, &graph_after.edges, &after);
-    let large_callsite_symbols =
-        large_callsite_symbols(graph_before.truncated_symbols, graph_after.truncated_symbols);
+    let large_callsite_symbols = large_callsite_symbols(
+        graph_before.truncated_symbols,
+        graph_after.truncated_symbols,
+    );
 
     let changed_test_symbols = ChangedTestSymbols {
         introduced: introduced.iter().filter(|s| s.is_test).cloned().collect(),
@@ -307,7 +313,10 @@ fn diff_metadata(
     for delta in diff.deltas() {
         let old_path = delta.old_file().path().map(path_string);
         let new_path = delta.new_file().path().map(path_string);
-        let display_path = new_path.clone().or_else(|| old_path.clone()).unwrap_or_default();
+        let display_path = new_path
+            .clone()
+            .or_else(|| old_path.clone())
+            .unwrap_or_default();
         changes.push(FileChange {
             old_path: old_path.filter(|old| Some(old) != new_path.as_ref()),
             path: new_path,

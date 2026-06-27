@@ -384,11 +384,13 @@ impl SearchToolsService {
             "usage_graph" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 usage_graph(workspace.analyzer(), params)
             }),
-            "analyze_commit" => {
-                Self::decode_and_try_run(&snapshot, arguments, |workspace, params: AnalyzeCommitParams| {
+            "analyze_commit" => Self::decode_and_try_run(
+                &snapshot,
+                arguments,
+                |workspace, params: AnalyzeCommitParams| {
                     analyze_commit(workspace.analyzer(), params)
-                })
-            }
+                },
+            ),
             "get_file_contents" => {
                 Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                     get_file_contents(workspace.analyzer(), params)

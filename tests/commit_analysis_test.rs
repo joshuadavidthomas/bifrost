@@ -109,10 +109,11 @@ func Caller() string {
             .as_array()
             .unwrap()
             .iter()
-            .any(|change| change["added"].as_array().unwrap().iter().any(|item| item
-                .as_str()
+            .any(|change| change["added"]
+                .as_array()
                 .unwrap()
-                .contains("strings")))
+                .iter()
+                .any(|item| item.as_str().unwrap().contains("strings")))
     );
     assert!(
         result["call_edge_changes"]
