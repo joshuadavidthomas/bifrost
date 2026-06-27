@@ -1583,6 +1583,15 @@ fn node_range(node: Node<'_>) -> Range {
     }
 }
 
+/// Expand `start_byte` upward to include the declaration's own leading comment
+/// block (its docstring / JSDoc / Rust attributes).
+///
+/// Only a comment block *contiguously attached* to the declaration counts: a
+/// blank line terminates the walk. This is what keeps a file-level license
+/// header — separated from the first declaration by a blank line — from being
+/// misattributed as that declaration's docstring, which previously made chunk
+/// `text` start at the file header while `start_line`/`end_line` still pointed
+/// at the declaration body.
 pub(crate) fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
     let line_starts = compute_line_starts(source);
     let line_index = find_line_index_for_offset(&line_starts, start_byte);
@@ -1597,8 +1606,10 @@ pub(crate) fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
         let line = &source[line_start..line_end];
         let trimmed = line.trim_start();
 
+        // A blank line separates the declaration (or its attached comment block)
+        // from whatever precedes it; stop rather than reaching across the gap.
         if trimmed.trim().is_empty() {
-            continue;
+            break;
         }
 
         if is_comment_like(trimmed) {

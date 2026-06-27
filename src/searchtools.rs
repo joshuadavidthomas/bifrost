@@ -26,7 +26,6 @@ use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
 use glob::MatchOptions;
 use glob::Pattern;
 use rayon::prelude::*;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -4918,37 +4917,10 @@ fn expanded_comment_start(language: Language, source: &str, start_byte: usize) -
     if language == Language::Python {
         return python_expanded_comment_start(source, start_byte);
     }
-
-    let line_starts = line_starts(source);
-    let line_index = find_line_index_for_offset(&line_starts, start_byte);
-
-    let mut comment_start = start_byte;
-    for line_idx in (0..line_index).rev() {
-        let line_start = line_starts[line_idx];
-        let line_end = line_starts
-            .get(line_idx + 1)
-            .copied()
-            .unwrap_or(source.len());
-        let line = &source[line_start..line_end];
-        let trimmed = line.trim_start();
-
-        if trimmed.trim().is_empty() {
-            continue;
-        }
-
-        if is_comment_like(trimmed) {
-            comment_start = line_start;
-            continue;
-        }
-
-        if let Some(offset) = first_comment_offset(line) {
-            comment_start = line_start + offset;
-        }
-
-        break;
-    }
-
-    comment_start
+    // Share the analyzer's comment-walk so both source-rendering paths agree on
+    // what counts as a declaration's attached comment block (and inherit fixes
+    // like the blank-line terminator that excludes file-level license headers).
+    crate::analyzer::tree_sitter_analyzer::expanded_comment_start(source, start_byte)
 }
 
 fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
@@ -4982,21 +4954,6 @@ fn python_expanded_comment_start(source: &str, start_byte: usize) -> usize {
 
 fn line_starts(source: &str) -> Vec<usize> {
     compute_line_starts(source)
-}
-
-fn is_comment_like(trimmed_line: &str) -> bool {
-    trimmed_line.starts_with("//")
-        || trimmed_line.starts_with("/*")
-        || trimmed_line.starts_with('*')
-        || trimmed_line.starts_with("*/")
-}
-
-fn first_comment_offset(line: &str) -> Option<usize> {
-    static COMMENT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    COMMENT_RE
-        .get_or_init(|| Regex::new(r"(?://|/\*|\*)").expect("valid comment regex"))
-        .find(line)
-        .map(|capture| capture.start())
 }
 
 #[cfg(test)]

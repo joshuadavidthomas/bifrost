@@ -295,6 +295,54 @@ mod tests {
     }
 
     #[test]
+    fn function_chunk_excludes_file_license_header() {
+        use crate::analyzer::TypescriptAnalyzer;
+
+        // A function that is the first code in the file, with only a license
+        // header and blank lines above it. The chunk text must be the function
+        // itself, not the license header — and must line up with start_line.
+        let source = "\
+/**
+ * Copyright (c) 2017-present, Facebook, Inc.
+ *
+ * This source code is licensed under the MIT license.
+ */
+
+export function loadRoutes(routes: number): number {
+  return routes + 1;
+}
+";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root.clone(), std::path::PathBuf::from("routes.ts"));
+        file.write(source).unwrap();
+        let analyzer =
+            TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+
+        let result = extract_file_chunks(&analyzer, &file, &word_count);
+        let function = result
+            .chunks
+            .iter()
+            .find(|chunk| chunk.kind == ChunkKind::Function)
+            .expect("loadRoutes chunk");
+
+        assert!(
+            !function.text.contains("Copyright"),
+            "child text must not include the file license header: {:?}",
+            function.text
+        );
+        assert!(
+            function
+                .text
+                .trim_start()
+                .starts_with("export function loadRoutes")
+        );
+        // The license header lives in the file summary / parent context, never
+        // the function's own embedded text.
+        assert_eq!(function.start_line, Some(7));
+    }
+
+    #[test]
     fn truncate_to_budget_halves_until_fit() {
         let text = (0..64)
             .map(|i| format!("line {i} with several words here"))
