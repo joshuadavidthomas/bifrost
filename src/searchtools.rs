@@ -1816,6 +1816,18 @@ pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>)
                 ));
             }
 
+            // A module-level declaration can appear both as its own entry in
+            // top_level_declarations and as a child of the synthetic module unit
+            // (which is itself top-level), so the recursion above emits it twice --
+            // for Python this doubles every module-level `def`. Collapse to one
+            // element per (symbol, line span) so each declaration is summarized
+            // exactly once; this feeds both the structured `elements` and the
+            // derived render_text.
+            let mut seen = HashSet::default();
+            elements.retain(|element| {
+                seen.insert((element.symbol.clone(), element.start_line, element.end_line))
+            });
+
             let (elements, fallback_reason) = if elements.is_empty() {
                 summary_fallback_for_file(analyzer, &file)?
             } else {
@@ -5250,6 +5262,48 @@ mod tests {
     fn trims_synthetic_summary_lines() {
         assert_eq!(trim_summary_signature("class A {\n}\n"), "class A");
         assert_eq!(trim_summary_signature("[...]\n"), "");
+    }
+
+    #[test]
+    fn python_module_functions_are_not_duplicated_in_file_summary() {
+        use crate::analyzer::{Language, PythonAnalyzer, TestProject};
+
+        // Module-level Python defs are registered both as their own top-level
+        // declarations and as children of the synthetic module unit (which is
+        // itself top-level), so the file-summary recursion previously emitted each
+        // one twice. The file summary must list each declaration exactly once.
+        let source = "\
+def alpha(x):
+    return x
+
+def beta(y):
+    return y + 1
+
+def gamma():
+    return 0
+";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root.clone(), std::path::PathBuf::from("mod.py"));
+        file.write(source).unwrap();
+        let analyzer = PythonAnalyzer::from_project(TestProject::new(root, Language::Python));
+
+        let result = super::summarize_files(&analyzer, vec![file]);
+        let block = result.summaries.first().expect("one file summary");
+        let names: Vec<&str> = block.elements.iter().map(|e| e.symbol.as_str()).collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "each module-level function must appear once, got {names:?}"
+        );
+        assert_eq!(
+            unique.len(),
+            3,
+            "expected alpha/beta/gamma once each, got {names:?}"
+        );
     }
 
     #[test]
