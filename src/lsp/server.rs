@@ -1284,7 +1284,12 @@ fn build_workspace_for_lsp(
                 progress.report_analyzer_event(event)
             })
         }
-        None => WorkspaceAnalyzer::build_persisted(project, config),
+        // Persistence is intentionally gated on work-done progress support: a
+        // client that cannot receive startup progress is treated as transient
+        // and must not have a `.bifrost` cache created for it. This contract is
+        // enforced by bifrost_lsp_server_skips_startup_progress_without_client_support
+        // and ..._disables_startup_progress_when_token_create_fails.
+        None => WorkspaceAnalyzer::build(project, config),
     }
 }
 
