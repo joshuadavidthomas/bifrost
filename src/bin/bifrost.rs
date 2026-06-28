@@ -144,20 +144,57 @@ fn run_tool(
 }
 
 fn print_help() {
-    println!("Usage: bifrost [--root PROJECT_ROOT] [--server searchtools] [--no-line-numbers]");
-    println!("       bifrost [--root PROJECT_ROOT] --server core");
-    println!("       bifrost [--root PROJECT_ROOT] --server symbol|workspace");
-    println!("       bifrost [--root PROJECT_ROOT] --server text|extended");
-    println!("       bifrost [--root PROJECT_ROOT] --server slopcop");
-    println!("       bifrost [--root PROJECT_ROOT] --server lsp");
     println!(
-        "       bifrost [--force-semantic-cpu]   run semantic_search without a CUDA/Metal accelerator"
+        "bifrost {} — Tree-sitter-backed code analyzer with MCP search-tool and LSP servers (stdio).",
+        env!("CARGO_PKG_VERSION")
     );
-    println!(
-        "       bifrost [--root PROJECT_ROOT] --tool TOOL_NAME [--args '{{\"key\":\"value\"}}'] [--no-line-numbers]"
+    // Printed as a plain string (not a format template) so the JSON braces in
+    // the examples stay literal.
+    print!(
+        "{}",
+        r#"
+USAGE:
+    bifrost [--root DIR] [--server MODE] [--no-line-numbers]   Run an MCP server over stdio (default)
+    bifrost [--root DIR] --server lsp                          Run a Language Server (LSP) over stdio
+    bifrost [--root DIR] --tool NAME [--args JSON]             Run one tool once, print the result, exit
+    bifrost --version | --help
+
+OPTIONS:
+    --root DIR             Project root to analyze (default: current directory)
+    --server MODE          Server mode / toolset (default: searchtools; see SERVER MODES)
+    --tool NAME            Run a single tool once instead of starting a server
+                           (e.g. search_symbols, get_symbol_sources, get_summaries, scan_usages)
+    --args JSON            Inline JSON arguments for --tool, e.g. '{"patterns":["MyClass"]}' (default: {})
+    --no-line-numbers      Render source output without leading line numbers
+    --force-semantic-cpu   Allow semantic_search without a CUDA/Metal accelerator (run the embedder on CPU)
+    -h, --help             Show this help and exit
+    -V, --version          Show version and exit
+
+SERVER MODES (--server):
+    searchtools   (default) Every toolset below
+    core          Symbol search, usages, summaries, semantic search, and workspace lifecycle
+                  — the set agents typically connect to
+    lsp           Language Server Protocol: definitions, references, hover, rename, diagnostics, ...
+    symbol        Symbol discovery, sources, summaries, usages, type/definition lookup, commit analysis
+    workspace     Index lifecycle: refresh, activate_workspace, get_active_workspace
+    text          File contents, text/grep search, git log & diff, jq, XML
+    extended      Symbol locations & ancestors, file listing, most-relevant-files, git, structured data
+    slopcop       Code-quality smells: complexity, comment density, clones, dead code, secrets
+    nlp           Semantic (embedding) search
+    Combine toolsets with '|', e.g. --server symbol|workspace
+
+EXAMPLES:
+    # MCP server an agent connects to (core toolset), speaking MCP over stdio:
+    bifrost --root /path/to/project --server core
+
+    # One-shot: run a single tool and print its result, then exit:
+    bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyClass"]}'
+
+    # Language server over stdio:
+    bifrost --root /path/to/project --server lsp
+
+Servers speak their protocol over stdio (no network port). The workspace index is built
+in the background: the server is ready immediately and the first request waits for indexing.
+"#
     );
-    println!(
-        "Defaults: --root is the current working directory, --server is searchtools when --tool is not used"
-    );
-    println!("       bifrost --version");
 }
