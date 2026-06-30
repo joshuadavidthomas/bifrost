@@ -134,13 +134,13 @@ fn assert_reference_lines(locations: &[RefLocation], file: &Path, expected_lines
 // definer. IntelliJ counts 5 = 3 in the definer (two assignments + the print)
 // and 2 in the consumer (the import + the print).
 //
-// bifrost resolves the cross-file consumer *read* (`print(SOME_CONST)`) but
-// currently finds none of the definer's same-file references and not the import
-// statement: same-file usages of a module-level FIELD via its bare name are not
-// resolved (module-level FUNCTIONS are — so this is a field-path gap, distinct
-// from the class-member work). Counts per file end up [definer=0, consumer=1].
+// bifrost now resolves the same-file definer *read* and the cross-file consumer
+// read -> [definer=1, consumer=1]. The remaining divergence is the same one as
+// WrappedMethod: the two definer assignment *targets* are modeled as
+// declarations (not usages), and the `from ... import SOME_CONST` binding is not
+// counted as a usage either.
 #[test]
-#[ignore = "bifrost gap: same-file bare-name usages of a module-level field are not resolved (functions are)"]
+#[ignore = "bifrost finds reads [1, 1]; omits assignment-target writes and the import binding"]
 fn const_imported_from_another_file() {
     let (_t, _root, locations) = references_multifile(&[
         (

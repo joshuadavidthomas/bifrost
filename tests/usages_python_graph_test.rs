@@ -2027,3 +2027,25 @@ fn untyped_receiver_does_not_resolve_ambiguous_same_file_member() {
         0,
     );
 }
+
+// Bug (regression from the module-scope seeding fix): a same-file bare-name read
+// of a module-level field is a usage. A module-level assignment of the target's
+// own name is its definition, not a shadow that should hide its usages.
+#[test]
+fn module_level_field_same_file_read_resolves() {
+    assert_eq!(
+        single_file_member_hits("SOME_CONST = 1\nprint(SOME_CONST)\n", "m.SOME_CONST"),
+        1,
+    );
+}
+
+#[test]
+fn module_level_field_resolves_despite_reassignment() {
+    assert_eq!(
+        single_file_member_hits(
+            "SOME_CONST = 1\nif cond:\n    SOME_CONST = 2\nprint(SOME_CONST)\n",
+            "m.SOME_CONST",
+        ),
+        1,
+    );
+}

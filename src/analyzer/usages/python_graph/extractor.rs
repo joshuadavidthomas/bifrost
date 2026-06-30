@@ -663,8 +663,14 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
         let Some(source) = analyzer.get_source(declaration, false) else {
             continue;
         };
-        let facts =
-            collect_scope_facts_from_source(&source, edges, target_short, target_self_file, true);
+        let facts = collect_scope_facts_from_source(
+            &source,
+            edges,
+            target_short,
+            target_self_file,
+            true,
+            false,
+        );
         class_facts_by_name.insert(
             declaration.short_name().to_string(),
             facts.filtered_visible_bindings(|symbol, _| symbol.starts_with("self.")),
@@ -679,8 +685,14 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
         let Some(source) = analyzer.get_source(declaration, false) else {
             continue;
         };
-        let mut facts =
-            collect_scope_facts_from_source(&source, edges, target_short, target_self_file, false);
+        let mut facts = collect_scope_facts_from_source(
+            &source,
+            edges,
+            target_short,
+            target_self_file,
+            false,
+            false,
+        );
         if let Some((owner, _)) = declaration.short_name().rsplit_once('.')
             && let Some(class_facts) = class_facts_by_name.get(owner)
         {
@@ -697,8 +709,14 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
         let Some(source) = analyzer.get_source(declaration, false) else {
             continue;
         };
-        let facts =
-            collect_scope_facts_from_source(&source, edges, target_short, target_self_file, false);
+        let facts = collect_scope_facts_from_source(
+            &source,
+            edges,
+            target_short,
+            target_self_file,
+            false,
+            true,
+        );
         scope_facts.insert(declaration.clone(), facts);
     }
     scope_facts
@@ -707,9 +725,10 @@ pub(in crate::analyzer::usages) fn collect_scope_facts(
 fn collect_scope_facts_from_source(
     source: &str,
     _edges: &[ImportEdge],
-    _target_short: &str,
+    target_short: &str,
     _target_self_file: bool,
     allow_self_receivers: bool,
+    is_module_scope: bool,
 ) -> LocalBindingsSnapshot<String> {
     let events = collect_scope_fact_events(source);
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -744,7 +763,11 @@ fn collect_scope_facts_from_source(
                     annotation: None, ..
                 } => {}
                 ScopeFactEvent::Assignment { lhs, rhs } => {
-                    if !engine.is_shadowed(lhs) {
+                    // A module-level assignment of the target's own name is its
+                    // definition, not a shadow that hides an outer binding, so
+                    // it must not block the target's same-file usages.
+                    let is_target_module_definition = is_module_scope && lhs == target_short;
+                    if !is_target_module_definition && !engine.is_shadowed(lhs) {
                         engine.declare_shadow(lhs.clone());
                     }
                     if lhs.starts_with("self.") && !allow_self_receivers {

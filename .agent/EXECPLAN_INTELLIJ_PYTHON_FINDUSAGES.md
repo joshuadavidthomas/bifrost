@@ -77,6 +77,18 @@ scope by architecture and are not ported.
   of a module-level FIELD are not found (module-level functions are — so this is
   a field-path gap, analogous to the class-member bare-name work but at module
   scope). Ported as an `#[ignore]` documenting the gap.
+- 2026-06-30: Fixed the module-level-field same-file gap. Root cause was a
+  regression from the Bug 2b module-scope seeding: `collect_scope_facts_from_source`
+  called `declare_shadow` for every module-level assignment, so a top-level
+  `SOME_CONST = 1` marked `SOME_CONST` as shadowed and `binds_target` rejected its
+  own usages (functions are not assignments, so they were unaffected — which is
+  why functions worked and fields did not). Fix: at module scope, an assignment of
+  the target's own name is its definition, not a shadow (new `is_module_scope`
+  flag suppresses that one `declare_shadow`). Regressions
+  `module_level_field_same_file_read_resolves` (+ reassignment variant), 64 pass.
+  ConstImportedFromAnotherFile now resolves reads [1, 1]; remaining divergence is
+  the WrappedMethod-class one (assignment-target writes + import binding not
+  counted). No regressions; clippy clean.
 
 
 ## Surprises and Discoveries
