@@ -268,20 +268,19 @@ fn wrapped_method() {
 }
 
 // ---------------------------------------------------------------------------
-// Single-file, in-envelope cases — DEFERRED (best-effort permitted, not done)
+// Single-file, in-envelope cases — name-based best-effort for untyped receivers
 //
-// These are not design prohibitions. A precise answer is unavailable because a
-// receiver type cannot be inferred, and a structured name-based best-effort
-// would resolve them (see the "Design philosophy" note in AGENTS.md). They are
-// left ignored for now rather than chased in this pass.
+// When a receiver type cannot be inferred, `recv.member` is attributed to the
+// target by name, but only as a contained same-file best-effort: the owner is in
+// this file and the member name is unique among local classes. Cross-file untyped
+// receivers stay conservative (see the no-hit parity tests in
+// usages_python_graph_test.rs).
 // ---------------------------------------------------------------------------
 
 // IntelliJ ImplicitlyResolvedUsages: caret on method `unique_long_identifier`.
-// `q` is an untyped parameter, so `q.unique_long_identifier()` cannot be resolved
-// by receiver type. A name-based best-effort (the member name is unique in the
-// project) would match it; bifrost does not yet do this for untyped receivers.
+// `q` is an untyped parameter; `q.unique_long_identifier()` resolves by name
+// because `unique_long_identifier` is unique to `Foo` in this file.
 #[test]
-#[ignore = "deferred: name-based best-effort member resolution for untyped receivers not yet implemented"]
 fn implicitly_resolved_usages() {
     let (_temp, file, locations) = references_for(
         "ImplicitlyResolvedUsages.py",
@@ -292,9 +291,8 @@ fn implicitly_resolved_usages() {
 
 // IntelliJ ImplicitlyResolvedFieldUsages: caret on the attribute write
 // `self.unique_some_identifier = 12`. The read `q.unique_some_identifier` has an
-// untyped receiver `q`; same deferred name-based best-effort as above.
+// untyped receiver `q`; same name-based best-effort as above.
 #[test]
-#[ignore = "deferred: name-based best-effort member resolution for untyped receivers not yet implemented"]
 fn implicitly_resolved_field_usages() {
     let (_temp, file, locations) = references_for(
         "ImplicitlyResolvedFieldUsages.py",

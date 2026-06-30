@@ -56,6 +56,16 @@ scope by architecture and are not ported.
   regressions added (`constructor_call_is_a_usage_of_init`,
   `class_body_decorator_member_reference_resolves`, 60 pass). No regressions;
   clippy clean.
+- 2026-06-30: Implemented the untyped-receiver best-effort. Key finding: the
+  existing no-hit parity tests (`unseeded_receiver_does_not_count`, etc.) are all
+  *cross-file*, while the ImplicitlyResolved* fixtures are *single-file* — so the
+  principled seam is same-file. Rule: an un-inferrable receiver `recv.member`
+  resolves to the target only when the target owner is in this file AND the member
+  name is unique among local classes (and the receiver is genuinely unseeded, not
+  typed to something else). ImplicitlyResolvedUsages/FieldUsages now PASS; all
+  cross-file no-hit parity tests preserved. Ported suite 11 pass / 4 ignored.
+  Regressions `untyped_receiver_resolves_unique_same_file_member` (+ negative
+  `..._does_not_resolve_ambiguous_same_file_member`), 62 pass. clippy clean.
 
 
 ## Surprises and Discoveries
@@ -201,19 +211,15 @@ the cross-file seeding path. Fix the root cause; no text-search fallback.
 
 ## Triage table (every PyFindUsagesTest method)
 
-PASS (9):
+PASS (11):
 - ClassUsages, UnresolvedClassInit, FunctionUsagesWithSameNameDecorator,
   ConditionalFunctions (self-attribute, Bug 2a; adapted to includeDeclaration=false),
-  InitUsages (constructor -> __init__), NameShadowing (decorator member refs).
+  InitUsages (constructor -> __init__), NameShadowing (decorator member refs),
+  ImplicitlyResolvedUsages, ImplicitlyResolvedFieldUsages (untyped-receiver
+  same-file best-effort).
 - Regressions: `method_name_cursor_resolves_in_single_method_class` (Bug 1),
   `self_receiver_method_usage_resolves`, `self_receiver_inherited_method_usage_resolves`
   (Bug 2a).
-
-DEFERRED (`#[ignore]`, best-effort permitted but not yet implemented):
-- ImplicitlyResolvedUsages, ImplicitlyResolvedFieldUsages — untyped receiver; a
-  structured name-based best-effort would resolve them. (After the AGENTS.md
-  design-philosophy clarification, these are deferred enhancements, not design
-  prohibitions.)
 
 OUT OF SCOPE / model divergence (`#[ignore]`):
 - ReassignedInstanceAttribute, ReassignedClassAttribute — bifrost models

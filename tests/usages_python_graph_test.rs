@@ -2001,3 +2001,29 @@ fn class_body_decorator_member_reference_resolves() {
         2,
     );
 }
+
+// Same-file best-effort: an un-inferrable receiver (`q` untyped) resolves
+// `q.member` to the target when the member name is unique to one local class.
+#[test]
+fn untyped_receiver_resolves_unique_same_file_member() {
+    assert_eq!(
+        single_file_member_hits(
+            "class Foo:\n    def unique_member(self):\n        pass\n\ndef run(q):\n    q.unique_member()\n",
+            "m.Foo.unique_member",
+        ),
+        1,
+    );
+}
+
+// The uniqueness gate: when two local classes declare the member, an untyped
+// `q.member` is ambiguous and is NOT attributed to either.
+#[test]
+fn untyped_receiver_does_not_resolve_ambiguous_same_file_member() {
+    assert_eq!(
+        single_file_member_hits(
+            "class Foo:\n    def shared(self):\n        pass\n\nclass Bar:\n    def shared(self):\n        pass\n\ndef run(q):\n    q.shared()\n",
+            "m.Foo.shared",
+        ),
+        0,
+    );
+}

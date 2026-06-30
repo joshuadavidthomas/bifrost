@@ -172,6 +172,18 @@ pub(super) fn scan_files_for_seeds(
     let target_short = top_level_identifier(target).to_string();
     let target_member = member_name(target);
     let target_owner = target_owner_code_unit(analyzer, target);
+    // A same-file best-effort for unresolvable receivers is only safe when the
+    // member name is unambiguous in the target's file (exactly one class there
+    // declares it), so `recv.member` can only mean the target.
+    let member_unique_in_target_file = target_member.as_deref().is_some_and(|member| {
+        let owners: HashSet<CodeUnit> = analyzer
+            .get_declarations(target.source())
+            .into_iter()
+            .filter(|decl| member_name(decl).as_deref() == Some(member))
+            .filter_map(|decl| target_owner_code_unit(analyzer, &decl))
+            .collect();
+        owners.len() == 1
+    });
     let files_vec: Vec<&ProjectFile> = files.iter().collect();
     let parser_language = tree_sitter_python::LANGUAGE.into();
 
@@ -226,6 +238,7 @@ pub(super) fn scan_files_for_seeds(
             target_owner: target_owner.clone(),
             edges: &edges,
             target_self_file,
+            member_best_effort_unique: target_self_file && member_unique_in_target_file,
             local_conflicts: &local_conflicts,
             scope_facts: &scope_facts,
             hits: &mut local_hits,
@@ -256,6 +269,12 @@ pub(super) struct ScanCtx<'a> {
     target_owner: Option<CodeUnit>,
     edges: &'a [ImportEdge],
     target_self_file: bool,
+    /// True when a same-file best-effort is justified for an unresolvable
+    /// receiver: the target is a member, its owner is in this file, and exactly
+    /// one class in this file declares that member name (so `recv.member` with
+    /// an un-inferrable `recv` unambiguously means the target). Cross-file
+    /// untyped receivers stay conservative.
+    member_best_effort_unique: bool,
     local_conflicts: &'a HashSet<String>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -354,6 +373,16 @@ impl ScanCtx<'_> {
             return false;
         }
         target_owner_code_unit(self.analyzer, &enclosing).as_ref() == Some(target_owner)
+    }
+
+    /// Whether `expr`'s type is genuinely un-inferrable in `node`'s scope (an
+    /// unseeded receiver such as an unannotated parameter), as opposed to a
+    /// receiver we resolved to some specific — possibly different — type.
+    fn receiver_type_is_unknown(&self, expr: &str, node: Node<'_>) -> bool {
+        match self.scope_facts_for_node(node) {
+            Some(facts) => facts.resolution_for(expr).is_unknown(),
+            None => true,
+        }
     }
 
     /// Whether the class enclosing `node` is the target member's owner (or a
@@ -494,6 +523,22 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && ctx.node_directly_in_owner_class_body(object)
     {
         record_hit(object, ctx);
+    }
+
+    // Best-effort for an un-inferrable receiver: `recv.member` where `recv`'s
+    // type cannot be resolved is attributed to the target when the target's
+    // owner is in this file and the member name is unique among local classes
+    // (so `recv.member` can only mean the target). `self`/`cls` are handled
+    // structurally above; cross-file untyped receivers stay conservative.
+    if ctx.member_best_effort_unique
+        && let Some(member) = ctx.target_member
+        && attribute_text == member
+        && object.kind() == "identifier"
+        && !matches!(object_text, "self" | "cls")
+        && !ctx.receiver_binds_target(object_text, node)
+        && ctx.receiver_type_is_unknown(object_text, node)
+    {
+        record_hit(attribute, ctx);
     }
 
     let namespace_match = ctx.edges.iter().any(|edge| {
