@@ -91,11 +91,9 @@ fn qualified_field_access() {
 }
 
 // IntelliJ testVisibility3: `getABC().i` resolves `i` through the method return
-// type `ABC` to `public int i = 0;` (line 2). bifrost resolves a member on a
-// typed *variable* (see `qualified_field_access`) but does not infer the return
-// type of a *method call* receiver, so `getABC().i` does not resolve.
+// type `ABC` to `public int i = 0;` (line 2). bifrost infers the call receiver's
+// type from the resolved method's declared return type.
 #[test]
-#[ignore = "bifrost gap: member access on a method-call result is not resolved (no return-type inference for the call receiver)"]
 fn member_through_method_return_type() {
     assert_resolves_to_line(
         "Visibility3.java",

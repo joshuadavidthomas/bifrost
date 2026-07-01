@@ -617,8 +617,71 @@ fn java_receiver_type_for_java(
                     .flatten()
             })
         }
+        // A method-call receiver (`getABC().i`) is typed by the called method's
+        // declared return type.
+        "method_invocation" => {
+            let support = analyzer.definition_lookup_index();
+            let outcome =
+                resolve_java_method_invocation(analyzer, support, file, source, root, object);
+            let method_unit = outcome.definitions.into_iter().next()?;
+            java_method_return_type_unit(analyzer, java, file, source, root, &method_unit)
+        }
         _ => None,
     }
+}
+
+/// Resolve the class named by a method's declared return type. The return type
+/// lives on the method's declaration AST node (the stored signature keeps only
+/// the parameter list), so read the `type` field from the declaration — using
+/// the current tree when the method is in this file, otherwise re-parsing the
+/// method's own file.
+fn java_method_return_type_unit(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    method_unit: &CodeUnit,
+) -> Option<CodeUnit> {
+    let method_range = analyzer.ranges(method_unit).first().copied()?;
+    let method_file = method_unit.source();
+    if method_file == file {
+        let type_node = java_return_type_node_covering(root, &method_range)?;
+        return java_type_from_node_with_context(analyzer, java, file, source, type_node);
+    }
+    let method_source = method_file.read_to_string().ok()?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(method_source.as_str(), None)?;
+    let type_node = java_return_type_node_covering(tree.root_node(), &method_range)?;
+    java_type_from_node_with_context(analyzer, java, method_file, &method_source, type_node)
+}
+
+/// The `type` (return-type) node of the innermost `method_declaration` whose
+/// span covers `range`.
+fn java_return_type_node_covering<'tree>(
+    root: Node<'tree>,
+    range: &Range,
+) -> Option<Node<'tree>> {
+    let mut result = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() > range.start_byte || node.end_byte() < range.end_byte {
+            continue;
+        }
+        if node.kind() == "method_declaration"
+            && let Some(type_node) = node.child_by_field_name("type")
+        {
+            result = Some(type_node);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    result
 }
 
 fn java_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
