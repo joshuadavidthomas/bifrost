@@ -137,12 +137,10 @@ fn roslyn_def_namespace_qualified_type() {
 // reproduce in C# namespaces? A *bare* `Config` used inside namespace `B` must
 // resolve to B's class (line 4), not A's same-named class (line 1).
 //
-// DEFERRED to #431 — CONFIRMED to reproduce: bifrost resolves the bare `Config` to
-// A's class (line 1), the wrong namespace. Third language after Rust (inline
-// modules) and C++ (namespaces) to exhibit the same position-blind reference
-// resolution filed in #431.
+// Fixed via the shared enclosing-scope resolver (#431): the bare `Config` inside
+// namespace `B` resolves to `B.Config`, not `A.Config`. Resolution now uses the
+// reference's position instead of a scope-blind type index.
 #[test]
-#[ignore = "deferred to #431: bare-in-scope namespace reference collapses to a same-named sibling namespace"]
 fn roslyn_probe_namespace_collision_bare_inside_scope() {
     let src = "namespace A {\n    class Config {}\n}\nnamespace B {\n    class Config {}\n    class User {\n        Config<caret> c = null;\n    }\n}\n";
     assert_resolves_to_line("a.cs", src, 4);

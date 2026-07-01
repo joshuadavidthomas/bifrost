@@ -92,6 +92,61 @@ pub(crate) use go::{GoTypeLookupResolutionKind, go_type_lookup_resolution};
 pub(crate) use java::{JavaTypeLookupResolution, java_type_lookup_resolution};
 pub(crate) use scala::{ScalaTypeLookupResolution, scala_type_lookup_resolution};
 
+/// Resolve a bare `name` against the lexically enclosing scope chain, innermost
+/// first — the language-agnostic generalization of Java's nested-type resolution
+/// (`java_nested_type_from_context`).
+///
+/// Finds the enclosing declaration at `byte` via the generic `enclosing_code_unit`
+/// primitive (which every analyzer implements), then walks its fully-qualified name
+/// outward one segment at a time, trying `{scope}.{name}` at each level and
+/// returning the innermost match. This makes a bare reference inside `mod b` (Rust)
+/// / `namespace B` (C++/C#) / `class B` resolve to `B`'s member rather than a
+/// same-named sibling scope's — the #431 scope-blind collapse — because it uses the
+/// reference's *position* instead of a flat, position-blind short-name map.
+///
+/// Walking fqn segments (rather than `parent_of`) is what makes it uniform across
+/// languages: scopes that are CodeUnits (Rust modules) and scopes that are only fqn
+/// prefixes (C#/C++ namespaces, which are not indexed as units) are handled the same
+/// way. `accept` filters the wanted declaration kind (e.g. `CodeUnit::is_class`).
+pub(super) fn resolve_in_enclosing_scopes(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    name: &str,
+    byte: usize,
+    accept: impl Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    if name.is_empty() || name.contains('.') {
+        return None;
+    }
+    let range = Range {
+        start_byte: byte,
+        end_byte: byte + 1,
+        start_line: 0,
+        end_line: 0,
+    };
+    let mut scope = analyzer.enclosing_code_unit(file, &range)?.fq_name();
+    loop {
+        if scope.is_empty() {
+            // Only *enclosing* named scopes are tried here; the bare top level is
+            // left to the caller's normal name resolution, which applies imports
+            // and shadowing (so this cannot override a glob import / local shadow).
+            return None;
+        }
+        let child_fqn = format!("{scope}.{name}");
+        if let Some(child) = analyzer
+            .definitions(&child_fqn)
+            .find(|unit| accept(unit))
+            .cloned()
+        {
+            return Some(child);
+        }
+        match scope.rfind('.') {
+            Some(idx) => scope.truncate(idx),
+            None => return None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DefinitionLookupRequest {
     pub(crate) file: ProjectFile,

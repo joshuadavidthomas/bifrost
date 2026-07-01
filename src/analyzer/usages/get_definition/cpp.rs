@@ -260,6 +260,20 @@ fn resolve_cpp_type(
             return candidates_outcome(candidates);
         }
     }
+    // Prefer a type declared in the lexically enclosing scope (namespace/class)
+    // over the scope-blind visibility index, so a bare `Config` inside `namespace B`
+    // resolves to `B::Config` rather than a same-named sibling namespace's (#431).
+    if node.kind() == "type_identifier"
+        && let Some(unit) = resolve_in_enclosing_scopes(
+            analyzer,
+            file,
+            &text,
+            node.start_byte(),
+            CodeUnit::is_class,
+        )
+    {
+        return candidates_outcome(vec![unit]);
+    }
     if let Some(unit) = visibility.resolve_type(file, &text) {
         let candidates = support.fqn(&unit.fq_name());
         return if candidates.is_empty() {

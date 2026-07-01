@@ -58,6 +58,20 @@ pub(super) fn resolve_rust(
             });
         (resolved, true)
     } else {
+        // Prefer a type declared in the lexically enclosing scope (module) over the
+        // flat same-file name map, so a bare `Config` inside `mod b` resolves to
+        // `b::Config` rather than a same-named sibling module's `Config` (#431). The
+        // `is_class` filter keeps this to type references — a bare function call is
+        // left to the name map below, so free-function resolution is unchanged.
+        if let Some(unit) = resolve_in_enclosing_scopes(
+            analyzer,
+            file,
+            reference,
+            site.focus_start_byte,
+            CodeUnit::is_class,
+        ) {
+            return candidates_outcome(vec![unit]);
+        }
         let mut resolved = refs
             .resolve_bare(reference)
             .map(|fqn| support.fqn(fqn))

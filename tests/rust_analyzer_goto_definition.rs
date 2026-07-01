@@ -164,3 +164,16 @@ fn ra_goto_def_module_qualified_assoc_fn() {
         4,
     );
 }
+
+// #431 (scope-aware resolution): a bare `Config` inside `mod b` resolves to
+// `b::Config` (line 4), not the same-named `a::Config` (line 1). Previously the
+// flat same-file name map picked one nondeterministically; now the shared
+// enclosing-scope resolver (generalized from Java) resolves by position.
+#[test]
+fn ra_goto_def_bare_type_in_enclosing_module() {
+    assert_resolves_to_line(
+        "lib.rs",
+        "mod a {\n    pub struct Config;\n}\nmod b {\n    pub struct Config;\n    pub struct User {\n        c: Config<caret>,\n    }\n}\n",
+        4,
+    );
+}

@@ -58,6 +58,19 @@ pub(super) fn resolve_csharp(
     match csharp_reference_node(node) {
         Some(CSharpReferenceNode::Type(type_node)) => {
             let reference = csharp_reference_type_text(type_node, source);
+            // Prefer a type in the lexically enclosing scope (namespace/class) over
+            // the scope-blind type resolver, so a bare `Config` inside `namespace B`
+            // resolves to `B.Config` rather than a same-named sibling namespace's
+            // (#431).
+            if let Some(unit) = resolve_in_enclosing_scopes(
+                analyzer,
+                file,
+                &reference,
+                type_node.start_byte(),
+                CodeUnit::is_class,
+            ) {
+                return candidates_outcome(vec![unit]);
+            }
             csharp_type_outcome(csharp, support, file, &reference)
         }
         Some(CSharpReferenceNode::Constructor(creation)) => {

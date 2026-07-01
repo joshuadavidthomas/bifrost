@@ -127,14 +127,12 @@ fn clangd_probe_namespace_collision_qualified() {
 // `Config` used inside namespace `b` (the parameter type on line 5) must resolve
 // to b's `Config` (line 4), not a's same-named struct (line 1).
 //
-// DEFERRED to #431 — CONFIRMED to reproduce here: bifrost resolves the bare
-// `Config` to a's struct (line 1), the wrong namespace. This is the C++
-// manifestation of the same scope-blind, position-less reference resolution filed
-// for Rust in #431, demonstrating the issue is cross-language (namespaces/objects
-// in C++/C#/Scala, inline modules in Rust). The qualified `b::Config` case above
-// resolves correctly; only the bare-in-scope reference collapses.
+// Fixed via the shared enclosing-scope resolver (#431): resolution now uses the
+// reference's position, so the bare `Config` inside namespace `b` resolves to b's
+// struct. Previously bifrost's C++ visibility index was scope-blind and picked one
+// of the same-named namespaces arbitrarily. The qualified `b::Config` case above
+// already worked; this was the bare-in-scope collapse.
 #[test]
-#[ignore = "deferred to #431: bare-in-scope namespace reference collapses to a same-named sibling namespace"]
 fn clangd_probe_namespace_collision_bare_inside_scope() {
     let src = "namespace a {\nstruct Config {};\n}\nnamespace b {\nstruct Config {};\nvoid use(Con<caret>fig* p) {}\n}\n";
     assert_resolves_to_line("a.cpp", src, 4);
