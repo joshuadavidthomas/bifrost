@@ -88,14 +88,12 @@ fn clangd_refs_method_call() {
 // clangd FindReferences.WithinAST "Function": a function referenced by address-of
 // (line 2) and a call (line 3). Caret on the function decl.
 //
-// DEFERRED: bifrost counts the call `foo(42)` (line 3) but not the address-of
-// value reference `&foo` (line 2). `maybe_record_free_function_hit` only records
-// at a `call_expression`, so any non-call reference to a free function (address-of,
-// `fp = foo`, passing `foo` as an argument) is missed. The right fix is general —
-// count any identifier reference that resolves to the function, with scope/shadow
-// care — not a narrow address-of-only special case.
+// Was failing: `maybe_record_free_function_hit` only recorded at a
+// `call_expression`, so a non-call value reference to a free function (`&foo`,
+// `fp = foo`, `foo` as an argument) was missed. Fixed by an identifier arm that
+// records any reference resolving to the function, guarding against the call's own
+// callee (handled by the call arm) and the declaration/definition name.
 #[test]
-#[ignore = "deferred: non-call free-function references (&foo) not counted; needs general function-reference support"]
 fn clangd_refs_function() {
     assert_refs(
         &[(

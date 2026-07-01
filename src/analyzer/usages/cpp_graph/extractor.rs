@@ -319,6 +319,10 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         maybe_record_free_function_definition_hit(node, ctx);
         return;
     }
+    if node.kind() == "identifier" {
+        maybe_record_free_function_value_reference(node, ctx);
+        return;
+    }
     if node.kind() != "call_expression" {
         return;
     }
@@ -356,6 +360,57 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     } else {
         *ctx.saw_unproven_match = true;
     }
+}
+
+/// Record a *non-call* reference to a free function used as a value: `&foo`,
+/// `fp = foo`, `foo` passed as an argument, etc. The callee identifier of a call
+/// `foo()` is recorded by the call_expression arm, and the function's own
+/// declaration/definition name is not a reference.
+fn maybe_record_free_function_value_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let text = node_text(node, ctx.source);
+    if !name_matches_callable(text, &ctx.spec.member_name) {
+        return;
+    }
+    if is_declaration_name(node) || cpp_reference_is_call_callee(node) {
+        return;
+    }
+    *ctx.raw_match_count += 1;
+    if ctx.visibility.contains_named_symbol(
+        ctx.file,
+        text,
+        TargetKind::FreeFunction,
+        &ctx.spec.target,
+    ) {
+        push_hit(node, ctx);
+    } else if ctx.visibility.resolve_known_non_target(
+        ctx.file,
+        text,
+        TargetKind::FreeFunction,
+        &ctx.spec.target,
+    ) {
+        // A qualified reference proven to a different namespace is not a match.
+    } else {
+        *ctx.saw_unproven_match = true;
+    }
+}
+
+/// Whether `node` is (part of) the callee expression of a call — walking through
+/// the qualified/template/field wrappers so `foo`, `ns::foo`, and `obj.foo` in
+/// `…()` are all recognised (and thus left to the call_expression arm).
+fn cpp_reference_is_call_callee(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "call_expression" => {
+                return parent
+                    .child_by_field_name("function")
+                    .or_else(|| parent.named_child(0))
+                    == Some(node);
+            }
+            "qualified_identifier" | "template_function" | "field_expression" => node = parent,
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
