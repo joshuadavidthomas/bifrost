@@ -1,11 +1,11 @@
 use lsp_types::{Location, ReferenceParams, Uri};
 
 use crate::analyzer::usages::UsageHit;
-use crate::analyzer::{CodeUnit, IAnalyzer, Project, Range as ByteRange, WorkspaceAnalyzer};
+use crate::analyzer::{Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string};
 use crate::lsp::handlers::broad_symbol::broad_symbol_target_at_position;
 use crate::lsp::handlers::usage_hits::usage_hits_for_candidates;
-use crate::lsp::handlers::util::FileContentCache;
+use crate::lsp::handlers::util::{FileContentCache, code_unit_location_from_content};
 
 /// Resolve `textDocument/references`. Strategy:
 /// 1. Prove the cursor is on a real declaration or structured reference.
@@ -35,9 +35,16 @@ pub fn handle(
 
     if params.context.include_declaration {
         for cu in &target.candidates {
-            if let Some(loc) = code_unit_location(analyzer, cu, &mut content_cache) {
-                locations.push(loc);
-            }
+            let entry = content_cache.read_disk(&cu.source().abs_path());
+            locations.extend(entry.and_then(|entry| {
+                code_unit_location_from_content(
+                    analyzer,
+                    cu.source(),
+                    &entry.body,
+                    &entry.line_starts,
+                    cu,
+                )
+            }));
         }
     }
 
@@ -62,32 +69,6 @@ fn usage_hit_to_location(hit: &UsageHit, cache: &mut FileContentCache) -> Option
         start_line: hit.line,
         end_line: hit.line,
     };
-    let lsp_range = byte_range_to_lsp_range(&entry.body, &entry.line_starts, &range);
-    let uri: Uri = path_to_uri_string(&abs_path).parse().ok()?;
-    Some(Location {
-        uri,
-        range: lsp_range,
-    })
-}
-
-fn code_unit_location(
-    analyzer: &dyn IAnalyzer,
-    code_unit: &CodeUnit,
-    cache: &mut FileContentCache,
-) -> Option<Location> {
-    let abs_path = code_unit.source().abs_path();
-    let entry = cache.read_disk(&abs_path)?;
-    let range = analyzer
-        .ranges(code_unit)
-        .iter()
-        .min()
-        .copied()
-        .unwrap_or(ByteRange {
-            start_byte: 0,
-            end_byte: entry.body.len(),
-            start_line: 0,
-            end_line: 0,
-        });
     let lsp_range = byte_range_to_lsp_range(&entry.body, &entry.line_starts, &range);
     let uri: Uri = path_to_uri_string(&abs_path).parse().ok()?;
     Some(Location {

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, Project, ProjectFile, Range as ByteRange};
 use crate::lsp::conversion::{byte_range_to_lsp_range, path_to_uri_string, uri_to_path};
+use crate::lsp::handlers::broad_symbol::code_unit_declaration_name_range;
 #[cfg(test)]
 use crate::text_utils::identifier_at_offset;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
@@ -84,6 +85,16 @@ pub(super) fn code_unit_location(
 ) -> Option<Location> {
     let body = project.read_source(code_unit.source()).ok()?;
     let line_starts = compute_line_starts(&body);
+    code_unit_location_from_content(analyzer, code_unit.source(), &body, &line_starts, code_unit)
+}
+
+pub(super) fn code_unit_location_from_content(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    body: &str,
+    line_starts: &[usize],
+    code_unit: &CodeUnit,
+) -> Option<Location> {
     let range = analyzer
         .ranges(code_unit)
         .iter()
@@ -95,10 +106,11 @@ pub(super) fn code_unit_location(
             start_line: 0,
             end_line: 0,
         });
-    let lsp_range = byte_range_to_lsp_range(&body, &line_starts, &range);
-    let uri: Uri = path_to_uri_string(&code_unit.source().abs_path())
-        .parse()
-        .ok()?;
+    let lsp_range = code_unit_declaration_name_range(analyzer, file, body, code_unit)
+        .map(|name_range| byte_range_to_lsp_range(body, line_starts, &name_range))
+        .or_else(|| identifier_selection_range(code_unit, body, line_starts, &range))
+        .unwrap_or_else(|| byte_range_to_lsp_range(body, line_starts, &range));
+    let uri: Uri = path_to_uri_string(&file.abs_path()).parse().ok()?;
     Some(Location {
         uri,
         range: lsp_range,

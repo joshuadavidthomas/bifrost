@@ -26,7 +26,7 @@ fn split_caret(source: &str) -> (String, u64, u64) {
     (source.replacen("<caret>", "", 1), line, character)
 }
 
-fn definition_lines(name: &str, source_with_caret: &str) -> (TempDir, Vec<u64>) {
+fn definition_positions(name: &str, source_with_caret: &str) -> (TempDir, Vec<(u64, u64)>) {
     let (source, line, character) = split_caret(source_with_caret);
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
@@ -43,15 +43,30 @@ fn definition_lines(name: &str, source_with_caret: &str) -> (TempDir, Vec<u64>) 
     server.shutdown();
 
     let file_uri = uri_for(&file);
-    let lines = match &response["result"] {
+    let positions = match &response["result"] {
         Value::Array(items) => items
             .iter()
             .filter(|loc| loc["uri"].as_str() == Some(file_uri.as_str()))
-            .filter_map(|loc| loc["range"]["start"]["line"].as_u64())
+            .filter_map(|loc| {
+                Some((
+                    loc["range"]["start"]["line"].as_u64()?,
+                    loc["range"]["start"]["character"].as_u64()?,
+                ))
+            })
             .collect(),
-        Value::Object(loc) => loc["range"]["start"]["line"].as_u64().into_iter().collect(),
+        Value::Object(loc) => loc["range"]["start"]["line"]
+            .as_u64()
+            .zip(loc["range"]["start"]["character"].as_u64())
+            .into_iter()
+            .collect(),
         _ => Vec::new(),
     };
+    (temp, positions)
+}
+
+fn definition_lines(name: &str, source_with_caret: &str) -> (TempDir, Vec<u64>) {
+    let (temp, positions) = definition_positions(name, source_with_caret);
+    let lines = positions.into_iter().map(|(line, _)| line).collect();
     (temp, lines)
 }
 
@@ -68,6 +83,19 @@ fn assert_does_not_resolve_to_line(name: &str, source_with_caret: &str, forbidde
     assert!(
         !lines.contains(&forbidden),
         "expected {name} NOT to resolve to line {forbidden}, got {lines:?}"
+    );
+}
+
+fn assert_resolves_to_position(
+    name: &str,
+    source_with_caret: &str,
+    expected_line: u64,
+    expected_character: u64,
+) {
+    let (_t, positions) = definition_positions(name, source_with_caret);
+    assert!(
+        positions.contains(&(expected_line, expected_character)),
+        "expected {name} to resolve to ({expected_line}, {expected_character}), got {positions:?}"
     );
 }
 
@@ -88,6 +116,16 @@ fn jdt_def_inherited_method() {
         "A.java",
         "class Base {\n    int bar() { return 1; }\n}\nclass Derived extends Base {}\nclass Program {\n    void run() {\n        Derived d = new Derived();\n        d.bar<caret>();\n    }\n}\n",
         1,
+    );
+}
+
+#[test]
+fn jdt_def_annotated_override_method_targets_name_token() {
+    assert_resolves_to_position(
+        "A.java",
+        "class Base {\n    String handle(String input) { return input; }\n}\nclass Derived extends Base {\n    @Override\n    public String handle(String input) {\n        return input.trim();\n    }\n    void run() {\n        Derived d = new Derived();\n        d.handle<caret>(\"x\");\n    }\n}\n",
+        5,
+        18,
     );
 }
 
