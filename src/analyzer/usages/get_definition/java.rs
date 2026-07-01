@@ -661,10 +661,7 @@ fn java_method_return_type_unit(
 
 /// The `type` (return-type) node of the innermost `method_declaration` whose
 /// span covers `range`.
-fn java_return_type_node_covering<'tree>(
-    root: Node<'tree>,
-    range: &Range,
-) -> Option<Node<'tree>> {
+fn java_return_type_node_covering<'tree>(root: Node<'tree>, range: &Range) -> Option<Node<'tree>> {
     let mut result = None;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
