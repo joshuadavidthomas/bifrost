@@ -599,6 +599,68 @@ namespace App {
 }
 
 #[test]
+fn csharp_graph_receiver_method_calls_skip_precise_nonmatching_owners() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Handlers.cs",
+            r#"
+public interface IHandler {
+    string Handle(string value);
+}
+
+public class ConsoleHandler : IHandler {
+    public string Handle(string value) {
+        return value;
+    }
+}
+"#,
+        ),
+        (
+            "src/Consumers.cs",
+            r#"
+public class Consumers {
+    public void Run() {
+        IHandler handler = new ConsoleHandler();
+        var a = handler.Handle("Ada");
+        ConsoleHandler concrete = new ConsoleHandler();
+        var b = concrete.Handle("Ben");
+    }
+}
+"#,
+        ),
+    ]);
+
+    let interface_handle = member_function(&analyzer, "IHandler", "Handle");
+    let concrete_handle = member_function(&analyzer, "ConsoleHandler", "Handle");
+
+    let interface_hits = graph_hits(&analyzer, &interface_handle);
+    assert_eq!(
+        1,
+        interface_hits.len(),
+        "IHandler.Handle should include only the interface-typed receiver: {interface_hits:#?}"
+    );
+    assert!(
+        interface_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("handler.Handle(\"Ada\")")),
+        "IHandler.Handle should include handler.Handle(\"Ada\"): {interface_hits:#?}"
+    );
+
+    let concrete_hits = graph_hits(&analyzer, &concrete_handle);
+    assert_eq!(
+        1,
+        concrete_hits.len(),
+        "ConsoleHandler.Handle should include only the concrete-typed receiver: {concrete_hits:#?}"
+    );
+    assert!(
+        concrete_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("concrete.Handle(\"Ben\")")),
+        "ConsoleHandler.Handle should include concrete.Handle(\"Ben\"): {concrete_hits:#?}"
+    );
+}
+
+#[test]
 fn csharp_graph_keeps_receiver_bindings_method_scoped() {
     let (_project, analyzer) = csharp_analyzer_with_files(&[
         (

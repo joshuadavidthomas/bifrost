@@ -197,14 +197,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.source,
         &mut bindings,
     );
-    match receiver_targets_owner(
-        receiver_node,
-        &ctx.spec.owner,
-        ctx.csharp,
-        ctx.file,
-        ctx.source,
-        &bindings,
-    ) {
+    match receiver_targets_owner(receiver_node, ctx.csharp, ctx.file, ctx.source, &bindings) {
         crate::analyzer::usages::local_inference::SymbolResolution::Precise(targets)
             if targets
                 .iter()
@@ -215,10 +208,10 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         crate::analyzer::usages::local_inference::SymbolResolution::Ambiguous => {
             *ctx.saw_unproven_match = true;
         }
-        crate::analyzer::usages::local_inference::SymbolResolution::Unknown
-        | crate::analyzer::usages::local_inference::SymbolResolution::Precise(_) => {
+        crate::analyzer::usages::local_inference::SymbolResolution::Unknown => {
             *ctx.saw_unproven_match = true;
         }
+        crate::analyzer::usages::local_inference::SymbolResolution::Precise(_) => {}
     }
 }
 

@@ -625,21 +625,12 @@ pub(in crate::analyzer::usages) fn binding_scope_node(mut node: Node<'_>) -> Nod
 
 pub(super) fn receiver_targets_owner(
     receiver_node: Node<'_>,
-    owner: &CodeUnit,
     csharp: &CSharpAnalyzer,
     file: &ProjectFile,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
 ) -> SymbolResolution<String> {
-    match receiver_type_fq_names(receiver_node, csharp, file, source, bindings) {
-        SymbolResolution::Precise(targets)
-            if targets.iter().any(|target| target == &owner.fq_name()) =>
-        {
-            SymbolResolution::Precise(targets)
-        }
-        SymbolResolution::Precise(_) => SymbolResolution::Unknown,
-        resolution => resolution,
-    }
+    receiver_type_fq_names(receiver_node, csharp, file, source, bindings)
 }
 
 fn receiver_type_fq_names(
