@@ -487,6 +487,7 @@ fn scan_selector_like(
             .as_precise()
             .is_some_and(|targets| targets.contains(OWNER_TOKEN))
             || field_receiver_matches_owner(qualifier_node, ctx, locals)
+            || composite_literal_receiver_matches_owner(qualifier_node, ctx)
         {
             record_hit(field_node, ctx);
         }
@@ -499,6 +500,19 @@ fn scan_selector_like(
     {
         record_hit(field_node, ctx);
     }
+}
+
+/// Whether a *direct composite-literal* receiver (`e{}.field`) is typed as the
+/// target owner — the receiver's literal type is the owner. The var-receiver form
+/// is already handled by the seeded local symbol; this covers the case where the
+/// literal is the selector operand with no intervening binding.
+fn composite_literal_receiver_matches_owner(qualifier_node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    qualifier_node.kind() == "composite_literal"
+        && qualifier_node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_ref_from_node(type_node, ctx.source))
+            .map(|ty| ctx.bindings.receiver_tokens_for_type(&ty))
+            .is_some_and(|tokens| tokens.iter().any(|token| token == OWNER_TOKEN))
 }
 
 fn field_receiver_matches_owner(

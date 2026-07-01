@@ -125,7 +125,6 @@ fn gopls_refs_type_embedded_in_struct() {
 // rather than special-casing `{}`. (An initial AST-based attempt did not land
 // cleanly and was reverted; tracked for a focused follow-up.)
 #[test]
-#[ignore = "deferred: member access on a direct composite-literal receiver (e{}.field) not resolved"]
 fn gopls_refs_composite_literal_receiver_member() {
     assert_refs(
         &[(

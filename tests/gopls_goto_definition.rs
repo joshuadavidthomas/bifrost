@@ -101,6 +101,19 @@ fn gopls_def_package_var_reference() {
     );
 }
 
+// Member access on a *direct* composite-literal receiver (`e{}.Name`) resolves to
+// the field declaration (line 3). The reference-text expander drops the `e{}`
+// receiver (`}` is not an ident byte), so this is resolved by typing the selector
+// base from its AST node instead of the reference text.
+#[test]
+fn gopls_def_composite_literal_receiver_member() {
+    assert_resolves_to_line(
+        "a.go",
+        "package a\n\ntype e struct {\n\tName string\n}\n\nfunc use() {\n\t_ = e{}.Name<caret>\n}\n",
+        3,
+    );
+}
+
 // gopls-style: a method call on an interface-typed parameter resolves to the
 // interface method declaration (line 3).
 #[test]

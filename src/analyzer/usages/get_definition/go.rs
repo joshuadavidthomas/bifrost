@@ -267,15 +267,37 @@ fn resolve_go_local_selector_chain(
     }
 
     let tree = parse_go_tree(source)?;
-    let mut owner_fqn = go_binding_type_fqn(
-        analyzer,
-        support,
-        file,
-        source,
-        tree.root_node(),
-        segments[0],
-        site.focus_start_byte,
-    )?;
+    let root = tree.root_node();
+    // Type the chain's base from its AST node, not the reference text. The text
+    // reference expander drops non-identifier receivers (a `T{}` composite literal,
+    // an `f()` call), yielding a base like `` in `.Name`, so `segments[0]` can't be
+    // typed. `go_expression_type_fqn` types identifiers, composite literals, and
+    // calls uniformly from the AST; fall back to the name lookup for a plain-ident
+    // base the expander captured.
+    let mut owner_fqn =
+        go_selector_chain_base_node(root, site.focus_start_byte, site.focus_end_byte)
+            .and_then(|base| {
+                go_expression_type_fqn(
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    root,
+                    base,
+                    site.focus_start_byte,
+                )
+            })
+            .or_else(|| {
+                go_binding_type_fqn(
+                    analyzer,
+                    support,
+                    file,
+                    source,
+                    root,
+                    segments[0],
+                    site.focus_start_byte,
+                )
+            })?;
     let mut deepest_workspace_field = None;
     for (index, member) in segments[1..].iter().enumerate() {
         let candidates = go_indexed_field_candidates(analyzer, support, &owner_fqn, member);
@@ -298,6 +320,30 @@ fn resolve_go_local_selector_chain(
         owner_fqn = next_owner;
     }
     None
+}
+
+/// The base (leftmost operand) node of the selector chain covering the cursor —
+/// e.g. `e{}` in `e{}.a.b`. Returns `None` when the cursor is not inside a
+/// selector chain.
+fn go_selector_chain_base_node(root: Node<'_>, start: usize, end: usize) -> Option<Node<'_>> {
+    let mut top = smallest_named_node_covering(root, start, end)?;
+    while let Some(parent) = top.parent() {
+        if parent.kind() == "selector_expression" {
+            top = parent;
+        } else {
+            break;
+        }
+    }
+    if top.kind() != "selector_expression" {
+        return None;
+    }
+    let mut base = top;
+    while base.kind() == "selector_expression" {
+        base = base
+            .child_by_field_name("operand")
+            .or_else(|| go_first_named_child(base))?;
+    }
+    Some(base)
 }
 
 fn go_partial_selector_chain_outcome(
