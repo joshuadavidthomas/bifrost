@@ -755,7 +755,14 @@ impl TargetSpec {
         let compatible_receiver_types = owner
             .as_ref()
             .map(|owner| {
-                collect_compatible_receiver_types(graph, target.source(), owner, &identifier)
+                collect_compatible_receiver_types(
+                    analyzer,
+                    graph,
+                    target,
+                    target.source(),
+                    owner,
+                    &identifier,
+                )
             })
             .unwrap_or_default();
         let field_owner_direct_names =
@@ -772,10 +779,14 @@ impl TargetSpec {
             }
             seeds
         });
-        let owner_constructor_names = owner
-            .as_ref()
-            .map(|owner| collect_owner_constructor_names(graph, owner, target.source()))
-            .unwrap_or_default();
+        let mut owner_constructor_names = HashSet::default();
+        for (receiver_file, receiver) in &compatible_receiver_types {
+            owner_constructor_names.extend(collect_owner_constructor_names(
+                graph,
+                receiver,
+                receiver_file,
+            ));
+        }
 
         Self {
             target: target.clone(),
@@ -814,37 +825,172 @@ impl TargetSpec {
 }
 
 fn collect_compatible_receiver_types(
+    analyzer: &GoAnalyzer,
     graph: &GoProjectGraph,
+    target: &CodeUnit,
     owner_source: &ProjectFile,
     owner: &str,
     method: &str,
 ) -> BTreeSet<(ProjectFile, String)> {
     let mut receivers = BTreeSet::from([(owner_source.clone(), owner.to_string())]);
-    let Some(target_signature) = target_method_signature(graph, owner_source, owner, method) else {
-        return receivers;
-    };
-    for (file, parsed) in &graph.parsed {
-        if !same_go_package(graph, file, owner_source) {
-            continue;
-        }
-        let root = parsed.tree.root_node();
-        let source = parsed.source.as_str();
-        let mut cursor = root.walk();
-        for child in root.named_children(&mut cursor) {
-            if child.kind() != "type_declaration" {
+    if let Some(target_signature) = target_method_signature(graph, owner_source, owner, method) {
+        for (file, parsed) in &graph.parsed {
+            if !same_go_package(graph, file, owner_source) {
                 continue;
             }
-            collect_interface_types_with_method(
-                child,
-                source,
-                method,
-                &target_signature,
-                file,
-                &mut receivers,
-            );
+            let root = parsed.tree.root_node();
+            let source = parsed.source.as_str();
+            let mut cursor = root.walk();
+            for child in root.named_children(&mut cursor) {
+                if child.kind() != "type_declaration" {
+                    continue;
+                }
+                collect_interface_types_with_method(
+                    child,
+                    source,
+                    method,
+                    &target_signature,
+                    file,
+                    &mut receivers,
+                );
+            }
         }
     }
+    collect_promoted_receiver_types(analyzer, graph, target, method, &mut receivers);
     receivers
+}
+
+fn collect_promoted_receiver_types(
+    analyzer: &GoAnalyzer,
+    graph: &GoProjectGraph,
+    target: &CodeUnit,
+    member: &str,
+    receivers: &mut BTreeSet<(ProjectFile, String)>,
+) {
+    let target_fqn = target.fq_name();
+    for unit in graph_declarations(analyzer, graph) {
+        if !unit.is_class() || unit.fq_name() == target_fqn {
+            continue;
+        }
+        let direct =
+            |owner: &str, member: &str| graph_direct_member_fqns(analyzer, graph, owner, member);
+        let embedded = |owner: &str| graph_embedded_field_type_fqns(analyzer, graph, owner);
+        let Some((_, candidates)) = go_indexed_member_candidates_at_nearest_depth(
+            &unit.fq_name(),
+            member,
+            &direct,
+            &embedded,
+        ) else {
+            continue;
+        };
+        if candidates.iter().any(|candidate| candidate == &target_fqn) {
+            receivers.insert((unit.source().clone(), unit.short_name().to_string()));
+        }
+    }
+}
+
+fn graph_declarations(analyzer: &GoAnalyzer, graph: &GoProjectGraph) -> Vec<CodeUnit> {
+    let mut units = Vec::new();
+    for file in graph.parsed.keys() {
+        units.extend(analyzer.declarations(file).cloned());
+    }
+    units
+}
+
+fn graph_direct_member_fqns(
+    analyzer: &GoAnalyzer,
+    graph: &GoProjectGraph,
+    owner_fqn: &str,
+    member: &str,
+) -> Vec<String> {
+    let member_fqn = format!("{owner_fqn}.{member}");
+    graph_declarations(analyzer, graph)
+        .into_iter()
+        .filter(|unit| (unit.is_function() || unit.is_field()) && unit.fq_name() == member_fqn)
+        .map(|unit| unit.fq_name())
+        .collect()
+}
+
+fn graph_direct_children(
+    analyzer: &GoAnalyzer,
+    graph: &GoProjectGraph,
+    owner_fqn: &str,
+) -> Vec<CodeUnit> {
+    let prefix = format!("{owner_fqn}.");
+    graph_declarations(analyzer, graph)
+        .into_iter()
+        .filter(|unit| {
+            unit.fq_name()
+                .strip_prefix(&prefix)
+                .is_some_and(|suffix| !suffix.contains('.'))
+        })
+        .collect()
+}
+
+fn graph_embedded_field_type_fqns(
+    analyzer: &GoAnalyzer,
+    graph: &GoProjectGraph,
+    owner_fqn: &str,
+) -> Vec<String> {
+    graph_direct_children(analyzer, graph, owner_fqn)
+        .into_iter()
+        .filter_map(|field| {
+            let field_name = field.identifier().to_string();
+            let type_text = go_field_unit_type_text(analyzer, &field, &field_name)?;
+            let simple = go_simple_type_name(&type_text)?;
+            (simple == field_name).then(|| {
+                go_resolve_graph_field_type_fqn(
+                    analyzer,
+                    graph,
+                    owner_fqn,
+                    field.source(),
+                    &type_text,
+                )
+            })?
+        })
+        .collect()
+}
+
+fn go_resolve_graph_field_type_fqn(
+    analyzer: &GoAnalyzer,
+    graph: &GoProjectGraph,
+    owner_fqn: &str,
+    field_file: &ProjectFile,
+    type_text: &str,
+) -> Option<String> {
+    if let Some(fqn) =
+        go_resolve_graph_qualified_type_from_file(analyzer, graph, field_file, type_text)
+    {
+        return Some(fqn);
+    }
+    let package = owner_fqn.rsplit_once('.').map(|(package, _)| package)?;
+    let name = go_simple_type_name(type_text)?;
+    let fqn = format!("{package}.{name}");
+    graph_fqn_exists(analyzer, graph, &fqn).then_some(fqn)
+}
+
+fn go_resolve_graph_qualified_type_from_file(
+    analyzer: &GoAnalyzer,
+    graph: &GoProjectGraph,
+    file: &ProjectFile,
+    type_text: &str,
+) -> Option<String> {
+    let (Some(qualifier), name) = go_type_name_parts(type_text)? else {
+        return None;
+    };
+    let (namespaces, _) = graph.namespace_packages(analyzer, file);
+    namespaces.get(qualifier).and_then(|packages| {
+        packages.iter().find_map(|package| {
+            let fqn = format!("{package}.{name}");
+            graph_fqn_exists(analyzer, graph, &fqn).then_some(fqn)
+        })
+    })
+}
+
+fn graph_fqn_exists(analyzer: &GoAnalyzer, graph: &GoProjectGraph, fqn: &str) -> bool {
+    graph_declarations(analyzer, graph)
+        .iter()
+        .any(|unit| unit.fq_name() == fqn)
 }
 
 fn target_method_signature(
@@ -1221,6 +1367,116 @@ fn owner_name(target: &CodeUnit) -> Option<String> {
 
 fn is_module_field(target: &CodeUnit) -> bool {
     target.is_field() && target.short_name().starts_with("_module_.")
+}
+
+pub(crate) fn go_indexed_member_candidates_at_nearest_depth<T: Clone>(
+    owner_fqn: &str,
+    member: &str,
+    direct: &impl Fn(&str, &str) -> Vec<T>,
+    embedded: &impl Fn(&str) -> Vec<String>,
+) -> Option<(usize, Vec<T>)> {
+    let mut path = HashSet::default();
+    go_indexed_member_candidates_at_nearest_depth_with_path(
+        owner_fqn, member, direct, embedded, &mut path,
+    )
+}
+
+fn go_indexed_member_candidates_at_nearest_depth_with_path<T: Clone>(
+    owner_fqn: &str,
+    member: &str,
+    direct: &impl Fn(&str, &str) -> Vec<T>,
+    embedded: &impl Fn(&str) -> Vec<String>,
+    path: &mut HashSet<String>,
+) -> Option<(usize, Vec<T>)> {
+    if !path.insert(owner_fqn.to_string()) {
+        return None;
+    }
+    let result = go_indexed_member_candidates_at_nearest_depth_inner(
+        owner_fqn, member, direct, embedded, path,
+    );
+    path.remove(owner_fqn);
+    result
+}
+
+fn go_indexed_member_candidates_at_nearest_depth_inner<T: Clone>(
+    owner_fqn: &str,
+    member: &str,
+    direct: &impl Fn(&str, &str) -> Vec<T>,
+    embedded: &impl Fn(&str) -> Vec<String>,
+    path: &mut HashSet<String>,
+) -> Option<(usize, Vec<T>)> {
+    let direct_candidates = direct(owner_fqn, member);
+    if !direct_candidates.is_empty() {
+        return Some((0, direct_candidates));
+    }
+
+    let mut best_depth = usize::MAX;
+    let mut best_candidates = Vec::new();
+    for embedded_owner in embedded(owner_fqn) {
+        let Some((depth, candidates)) = go_indexed_member_candidates_at_nearest_depth_with_path(
+            &embedded_owner,
+            member,
+            direct,
+            embedded,
+            path,
+        ) else {
+            continue;
+        };
+        let promoted_depth = depth + 1;
+        match promoted_depth.cmp(&best_depth) {
+            std::cmp::Ordering::Less => {
+                best_depth = promoted_depth;
+                best_candidates = candidates;
+            }
+            std::cmp::Ordering::Equal => best_candidates.extend(candidates),
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+
+    (best_depth != usize::MAX).then_some((best_depth, best_candidates))
+}
+
+fn go_field_unit_type_text(
+    analyzer: &dyn IAnalyzer,
+    field_unit: &CodeUnit,
+    field: &str,
+) -> Option<String> {
+    let signature = field_unit
+        .signature()
+        .map(str::to_string)
+        .or_else(|| analyzer.signatures(field_unit).iter().next().cloned())?;
+    let trimmed = signature.trim();
+    if let Some(type_text) = trimmed
+        .strip_prefix(field)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(type_text.to_string());
+    }
+    let simple = go_simple_type_name(trimmed)?;
+    (simple == field).then(|| trimmed.to_string())
+}
+
+pub(crate) fn go_simple_type_name(type_text: &str) -> Option<&str> {
+    go_type_name_parts(type_text).map(|(_, name)| name)
+}
+
+pub(crate) fn go_type_name_parts(type_text: &str) -> Option<(Option<&str>, &str)> {
+    let trimmed = type_text
+        .trim()
+        .trim_start_matches('*')
+        .trim_start_matches("[]")
+        .trim();
+    let raw = trimmed
+        .split(['[', '{', ' ', '\t', '\n', '\r'])
+        .next()
+        .unwrap_or(trimmed);
+    let (qualifier, name) = raw
+        .rsplit_once('.')
+        .map(|(qualifier, name)| (Some(qualifier.trim()), name))
+        .unwrap_or((None, raw));
+    let name = name.trim();
+    (!name.is_empty()).then_some((qualifier.filter(|value| !value.is_empty()), name))
 }
 
 pub(super) struct ScanBindings {

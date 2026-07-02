@@ -589,6 +589,95 @@ func Read(album model.Album) string {
 }
 
 #[test]
+fn go_graph_strategy_finds_promoted_go_embedded_member_usages() {
+    let (_project, analyzer) = go_analyzer_with_files(&[(
+        "example/audit.go",
+        r#"
+package example
+
+type AuditLog struct {
+    Last string
+}
+
+func (a *AuditLog) Record(message string) string {
+    a.Last = message
+    return a.Last
+}
+
+type Worker struct {
+    *AuditLog
+}
+
+func NewWorker() *Worker {
+    return &Worker{AuditLog: &AuditLog{}}
+}
+
+type Unrelated struct{}
+
+func (u Unrelated) Record(message string) string {
+    return message
+}
+
+func Run() {
+    worker := NewWorker()
+    worker.Record("start")
+    _ = worker.Last
+
+    unrelated := Unrelated{}
+    _ = unrelated.Record("skip")
+}
+"#,
+    )]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = GoUsageGraphStrategy::new();
+
+    let method = definition(&analyzer, "example.com/app/example.AuditLog.Record");
+    let method_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&method), &candidates, 1000)
+        .into_either()
+        .expect("promoted embedded method usage should resolve");
+    assert_eq!(1, method_hits.len(), "method hits: {method_hits:?}");
+    assert!(
+        method_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("worker.Record(\"start\")")),
+        "worker.Record should resolve to AuditLog.Record: {method_hits:?}",
+    );
+    assert!(
+        method_hits
+            .iter()
+            .all(|hit| !hit.snippet.contains("unrelated.Record")),
+        "same-name method on unrelated receiver must not match: {method_hits:?}",
+    );
+
+    let field = definition(&analyzer, "example.com/app/example.AuditLog.Last");
+    let field_hits = strategy
+        .find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000)
+        .into_either()
+        .expect("promoted embedded field usage should resolve");
+    assert_eq!(3, field_hits.len(), "field hits: {field_hits:?}");
+    assert!(
+        field_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("a.Last = message")),
+        "internal assignment should still resolve: {field_hits:?}",
+    );
+    assert!(
+        field_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("return a.Last")),
+        "internal return should still resolve: {field_hits:?}",
+    );
+    assert!(
+        field_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("_ = worker.Last")),
+        "worker.Last should resolve to AuditLog.Last: {field_hits:?}",
+    );
+}
+
+#[test]
 fn go_graph_strategy_seeds_members_from_pointer_params_constructors_and_alias_chains() {
     let (_project, analyzer) = go_analyzer_with_files(&[
         (
@@ -1250,18 +1339,32 @@ func readEmbedded(wrapper Wrapper) string {
         .find_usages(&analyzer, std::slice::from_ref(&field), &candidates, 1000)
         .into_either()
         .expect("field negative query should succeed");
+    assert_eq!(
+        1,
+        field_hits.len(),
+        "only embedded-promoted fields should count: {field_hits:?}"
+    );
     assert!(
-        field_hits.is_empty(),
-        "unproven, unrelated, and embedded-promoted fields should not count"
+        field_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("wrapper.ImageFiles")),
+        "promoted wrapper.ImageFiles should count: {field_hits:?}",
     );
 
     let method_hits = strategy
         .find_usages(&analyzer, std::slice::from_ref(&method), &candidates, 1000)
         .into_either()
         .expect("method negative query should succeed");
+    assert_eq!(
+        1,
+        method_hits.len(),
+        "only embedded-promoted methods should count: {method_hits:?}"
+    );
     assert!(
-        method_hits.is_empty(),
-        "dynamic interface, unrelated owner, and embedded-promoted methods should not count"
+        method_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("wrapper.Title()")),
+        "promoted wrapper.Title should count: {method_hits:?}",
     );
 }
 

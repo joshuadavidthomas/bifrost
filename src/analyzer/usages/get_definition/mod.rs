@@ -14,6 +14,7 @@ use crate::analyzer::usages::csharp_graph::{
 };
 use crate::analyzer::usages::go_graph::{
     GoProjectGraph, build_workspace_go_graph, default_go_import_local_name, extract_go_import_path,
+    go_indexed_member_candidates_at_nearest_depth, go_simple_type_name, go_type_name_parts,
     preparse_go_files, resolve_go_reference,
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
