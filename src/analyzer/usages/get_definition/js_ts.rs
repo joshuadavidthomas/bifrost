@@ -17,6 +17,15 @@ pub(super) fn resolve_js_ts(
     let imports = compute_jsts_import_binder(source, tree);
     let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
 
+    if language == Language::TypeScript {
+        let contextual_members = ts_contextual_object_literal_key_candidates(
+            analyzer, support, file, source, tree, site, &imports, &aliases,
+        );
+        if !contextual_members.is_empty() {
+            return candidates_outcome(contextual_members);
+        }
+    }
+
     // AST path for an inline construction receiver `new Foo().member` — the
     // text-split path below cannot express `new Foo()` as a qualifier.
     if let Some(members) =
@@ -79,7 +88,7 @@ pub(super) fn resolve_js_ts(
             return candidates_outcome(member_candidates);
         }
         match jsts_receiver_provider_member_candidates(
-            analyzer, file, language, source, tree, site, name,
+            analyzer, support, file, language, source, tree, site, name,
         ) {
             ReceiverAnalysisOutcome::Precise(candidates) if !candidates.is_empty() => {
                 return candidates_outcome(if language == Language::TypeScript {
@@ -181,8 +190,20 @@ pub(super) fn resolve_js_ts(
             let inferred_receivers = ts_local_receiver_owner_candidates(
                 analyzer, support, file, source, tree, site, &imports, &aliases, qualifier,
             );
-            let inferred_member_candidates =
-                jsts_member_candidates(analyzer, support, inferred_receivers, name, value_position);
+            let mut inferred_member_candidates =
+                ts_member_candidates(analyzer, support, inferred_receivers, name, value_position);
+            if inferred_member_candidates.is_empty() {
+                let inferred_receivers = ts_local_receiver_owner_candidates(
+                    analyzer, support, file, source, tree, site, &imports, &aliases, qualifier,
+                );
+                inferred_member_candidates = jsts_member_candidates(
+                    analyzer,
+                    support,
+                    inferred_receivers,
+                    name,
+                    value_position,
+                );
+            }
             if !inferred_member_candidates.is_empty() {
                 return candidates_outcome(inferred_member_candidates);
             }
@@ -243,6 +264,122 @@ pub(super) fn resolve_js_ts(
     no_definition(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed JS/TS definition"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_contextual_object_literal_key_candidates(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+) -> Vec<CodeUnit> {
+    let Some(node) =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)
+    else {
+        return Vec::new();
+    };
+    let Some((property, object, name)) = ts_object_literal_property_at_key(node, source) else {
+        return Vec::new();
+    };
+    if !(property.start_byte() <= site.focus_start_byte
+        && site.focus_end_byte <= property.end_byte())
+    {
+        return Vec::new();
+    }
+    let owners = ts_contextual_object_literal_owners(
+        analyzer, support, file, source, imports, aliases, object,
+    );
+    ts_member_candidates(analyzer, support, owners, &name, true)
+}
+
+fn ts_object_literal_property_at_key<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>, String)> {
+    let property = match node.kind() {
+        "pair" | "shorthand_property_identifier" | "method_definition" => node,
+        _ => node.parent().filter(|parent| {
+            matches!(
+                parent.kind(),
+                "pair" | "shorthand_property_identifier" | "method_definition"
+            ) && parent
+                .child_by_field_name("key")
+                .or_else(|| parent.child_by_field_name("name"))
+                .or_else(|| parent.named_child(0))
+                .is_some_and(|key| key.id() == node.id())
+        })?,
+    };
+    let object = property
+        .parent()
+        .filter(|parent| parent.kind() == "object")?;
+    let name = crate::analyzer::typescript::ts_object_literal_property_name(property, source)?;
+    Some((property, object, name))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ts_contextual_object_literal_owners(
+    analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    imports: &ImportBinder,
+    aliases: &AliasResolver,
+    object: Node<'_>,
+) -> Vec<CodeUnit> {
+    if let Some(variable) = object
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")
+        && variable
+            .child_by_field_name("value")
+            .is_some_and(|value| value.id() == object.id())
+        && let Some(type_node) = variable.child_by_field_name("type")
+    {
+        return ts_resolve_type_text_to_property_owners(
+            analyzer,
+            support,
+            file,
+            source,
+            imports,
+            aliases,
+            ts_type_annotation_text(type_node, source).as_str(),
+            0,
+        );
+    }
+
+    let Some(return_statement) = object
+        .parent()
+        .filter(|parent| parent.kind() == "return_statement")
+    else {
+        return Vec::new();
+    };
+    let mut cursor = return_statement.walk();
+    if return_statement
+        .named_children(&mut cursor)
+        .next()
+        .is_none_or(|value| value.id() != object.id())
+    {
+        return Vec::new();
+    }
+    let Some(function) = jsts_enclosing_function_scope(object, object.start_byte()) else {
+        return Vec::new();
+    };
+    let Some(type_node) = function.child_by_field_name("return_type") else {
+        return Vec::new();
+    };
+    ts_resolve_type_text_to_property_owners(
+        analyzer,
+        support,
+        file,
+        source,
+        imports,
+        aliases,
+        ts_type_annotation_text(type_node, source).as_str(),
+        0,
     )
 }
 
@@ -749,8 +886,10 @@ fn jsts_construction_receiver_members(
     (!members.is_empty()).then_some(members)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn jsts_receiver_provider_member_candidates(
     analyzer: &dyn IAnalyzer,
+    support: &DefinitionLookupIndex,
     file: &ProjectFile,
     language: Language,
     source: &str,
@@ -782,8 +921,15 @@ fn jsts_receiver_provider_member_candidates(
     let Some(object) = member_expr.child_by_field_name("object") else {
         return ReceiverAnalysisOutcome::Unknown;
     };
-    let provider =
-        JsTsReceiverFactProvider::new(analyzer, language, file, source, tree.root_node());
+    let provider = JsTsReceiverFactProvider::new(
+        analyzer,
+        support,
+        language,
+        file,
+        source,
+        tree.root_node(),
+        compute_jsts_import_binder(source, tree),
+    );
     provider.resolve_member_targets(
         object,
         member,

@@ -164,8 +164,12 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
             }
         } else {
             let importers = index.importers_of_seeds(&seeds);
-            let scan_files: HashSet<ProjectFile> =
-                candidate_files.iter().cloned().chain(importers).collect();
+            let scan_files: HashSet<ProjectFile> = candidate_files
+                .iter()
+                .cloned()
+                .chain(importers)
+                .chain(std::iter::once(target.source().clone()))
+                .collect();
 
             scan_files_for_seeds(analyzer, index, &scan_files, target, &seeds, language)
         };

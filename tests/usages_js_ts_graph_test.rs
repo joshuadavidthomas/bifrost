@@ -883,6 +883,64 @@ fn ts_typed_receivers_count_as_member_usages() {
 }
 
 #[test]
+fn ts_interface_property_usages_include_typed_reads_and_contextual_return_keys() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "api.ts",
+            "export interface User {\n  id: string;\n  name: string;\n}\nexport interface Other {\n  name: string;\n}\nexport class ApiClient {\n  makeUser(): User {\n    return { id: '', name: this.baseUrl };\n  }\n}\n",
+        )
+        .file(
+            "app.ts",
+            "import { User } from './api';\nfunction show(user: User) {\n  return user.name;\n}\n",
+        )
+        .build()
+    });
+
+    let user_name = find_ts_target(&analyzer, &project.file("api.ts"), |cu| {
+        cu.fq_name() == "User.name" && cu.is_field()
+    });
+    let other_name = find_ts_target(&analyzer, &project.file("api.ts"), |cu| {
+        cu.fq_name() == "Other.name" && cu.is_field()
+    });
+
+    let candidate_files: brokk_bifrost::hash::HashSet<ProjectFile> =
+        [project.file("api.ts"), project.file("app.ts")]
+            .into_iter()
+            .collect();
+    let strategy = JsTsExportUsageGraphStrategy::new();
+    let user_hits = flatten_hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&user_name),
+        &candidate_files,
+        1000,
+    ));
+    let other_hits = flatten_hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&other_name),
+        &candidate_files,
+        1000,
+    ));
+
+    assert_eq!(2, user_hits.len(), "User.name hits: {user_hits:?}");
+    assert!(
+        user_hits
+            .iter()
+            .any(|hit| hit.file == project.file("app.ts") && hit.snippet.contains("user.name")),
+        "expected typed parameter read, got {user_hits:?}"
+    );
+    assert!(
+        user_hits
+            .iter()
+            .any(|hit| hit.file == project.file("api.ts") && hit.snippet.contains("name:")),
+        "expected declared-return literal key, got {user_hits:?}"
+    );
+    assert!(
+        other_hits.is_empty(),
+        "unrelated same-name interface property must not match: {other_hits:?}"
+    );
+}
+
+#[test]
 fn js_this_receiver_is_editor_only_member_usage() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(

@@ -1643,6 +1643,58 @@ fn typescript_factory_receiver_member_resolves_to_definition() {
 }
 
 #[test]
+fn typescript_interface_typed_parameter_property_resolves_to_declaration() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "api.ts",
+            "export interface User {\n  id: string;\n  name: string;\n}\n",
+        )
+        .file(
+            "app.ts",
+            "import { User } from './api';\nfunction show(user: User) {\n  return user.name;\n}\n",
+        )
+        .build();
+
+    let line = "  return user.name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.ts","line":3,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "User.name", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "api.ts", "{value}");
+}
+
+#[test]
+fn typescript_declared_return_object_key_resolves_to_interface_property() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "api.ts",
+            "export interface User {\n  id: string;\n  name: string;\n}\nexport class ApiClient {\n  makeUser(): User {\n    return { id: '', name: this.baseUrl };\n  }\n}\n",
+        )
+        .build();
+
+    let line = "    return { id: '', name: this.baseUrl };";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"api.ts","line":7,"column":{}}}]}}"#,
+            column_of(line, "name")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "User.name", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "api.ts", "{value}");
+}
+
+#[test]
 fn typescript_static_method_call_resolves_to_static_definition() {
     let project = InlineTestProject::with_language(Language::TypeScript)
         .file(
@@ -1699,7 +1751,8 @@ fn typescript_parameter_shadow_blocks_outer_factory_receiver_definition() {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Other.run", "{value}");
     assert!(
         value.to_string().find("Service.run").is_none(),
         "parameter receiver must not resolve through the outer Service factory: {value}"

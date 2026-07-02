@@ -6,12 +6,18 @@
 //! returns a constructed value.
 
 use super::extractor::slice;
+use crate::analyzer::usages::get_definition::js_ts::{
+    ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
+};
+use crate::analyzer::usages::model::ImportBinder;
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisBudgetTracker, ReceiverAnalysisCacheKey,
     ReceiverAnalysisOutcome, ReceiverAnalysisQuery, ReceiverContext, ReceiverFactProvider,
     ReceiverSummaryQuery, ReceiverValue,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{
+    AliasResolver, CodeUnit, DefinitionLookupIndex, IAnalyzer, Language, ProjectFile, Range,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use std::cell::RefCell;
@@ -21,10 +27,13 @@ const MAX_JSTS_RECEIVER_RECURSION: usize = 8;
 
 pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
     analyzer: &'a dyn IAnalyzer,
+    support: &'a DefinitionLookupIndex,
     language: Language,
     file: &'a ProjectFile,
     source: &'a str,
     root: Node<'tree>,
+    imports: ImportBinder,
+    aliases: AliasResolver,
     function_declarations_by_name: HashMap<String, Vec<Node<'tree>>>,
     class_declarations_by_name: HashMap<String, Vec<Node<'tree>>>,
     member_target_cache:
@@ -34,19 +43,25 @@ pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
     pub(crate) fn new(
         analyzer: &'a dyn IAnalyzer,
+        support: &'a DefinitionLookupIndex,
         language: Language,
         file: &'a ProjectFile,
         source: &'a str,
         root: Node<'tree>,
+        imports: ImportBinder,
     ) -> Self {
         let (function_declarations_by_name, class_declarations_by_name) =
             index_js_ts_declarations(root, source);
+        let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
         Self {
             analyzer,
+            support,
             language,
             file,
             source,
             root,
+            imports,
+            aliases,
             function_declarations_by_name,
             class_declarations_by_name,
             member_target_cache: RefCell::new(HashMap::default()),
@@ -106,6 +121,32 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .borrow_mut()
             .insert(cache_key, outcome.clone());
         outcome
+    }
+
+    pub(crate) fn resolve_contextual_object_literal_key_targets(
+        &self,
+        key: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> Vec<CodeUnit> {
+        if self.language != Language::TypeScript {
+            return Vec::new();
+        }
+        let Some((property, object, member)) = object_literal_property_at_key(key, self.source)
+        else {
+            return Vec::new();
+        };
+        if !(property.start_byte() <= key.start_byte() && key.end_byte() <= property.end_byte()) {
+            return Vec::new();
+        }
+        let owners = self.contextual_object_literal_receiver_values(object, budget);
+        let mut targets = owners
+            .iter()
+            .flat_map(|value| self.member_targets(value.owner(), &member))
+            .collect::<Vec<_>>();
+        sort_units(&mut targets);
+        targets.dedup();
+        targets.truncate(budget.max_targets.saturating_add(1));
+        targets
     }
 
     fn resolve_expression(
@@ -228,17 +269,32 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             if node.id() != scope.id() && is_scope_boundary(node.kind()) {
                 continue;
             }
-            if binding_node_shadows_receiver(node, self.source, receiver) {
+            if self.language == Language::TypeScript
+                && matches!(node.kind(), "required_parameter" | "optional_parameter")
+                && node
+                    .child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("pattern"))
+                    .is_some_and(|name| node_text_matches(name, self.source, receiver))
+                && let Some(type_node) = node.child_by_field_name("type")
+            {
+                let values = self.type_annotation_receiver_values(type_node, budget);
+                latest = Some(if values.is_empty() {
+                    ReceiverAnalysisOutcome::Unknown
+                } else {
+                    ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget)
+                });
+            } else if binding_node_shadows_receiver(node, self.source, receiver) {
                 latest = Some(ReceiverAnalysisOutcome::Unknown);
             } else if node.kind() == "variable_declarator"
                 && let Some(name) = node.child_by_field_name("name")
                 && node_text_matches(name, self.source, receiver)
             {
-                latest = Some(
-                    node.child_by_field_name("value")
-                        .map(|value| self.resolve_expression(value, depth + 1, budget, tracker))
-                        .unwrap_or(ReceiverAnalysisOutcome::Unknown),
-                );
+                latest = Some(self.resolve_variable_declarator_binding(
+                    node,
+                    depth + 1,
+                    budget,
+                    tracker,
+                ));
             } else if node.kind() == "assignment_expression"
                 && let Some(left) = node.child_by_field_name("left")
                 && matches!(left.kind(), "identifier" | "type_identifier")
@@ -262,6 +318,87 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             }
         }
         latest
+    }
+
+    fn resolve_variable_declarator_binding(
+        &self,
+        declarator: Node<'tree>,
+        depth: usize,
+        budget: ReceiverAnalysisBudget,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        if self.language == Language::TypeScript
+            && let Some(type_node) = declarator.child_by_field_name("type")
+        {
+            let owners = self.type_annotation_receiver_values(type_node, budget);
+            if !owners.is_empty() {
+                return ReceiverAnalysisOutcome::single_precise_or_ambiguous(owners, budget);
+            }
+        }
+        declarator
+            .child_by_field_name("value")
+            .map(|value| self.resolve_expression(value, depth + 1, budget, tracker))
+            .unwrap_or(ReceiverAnalysisOutcome::Unknown)
+    }
+
+    fn type_annotation_receiver_values(
+        &self,
+        type_node: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> Vec<ReceiverValue> {
+        ts_resolve_type_text_to_property_owners(
+            self.analyzer,
+            self.support,
+            self.file,
+            self.source,
+            &self.imports,
+            &self.aliases,
+            ts_type_annotation_text(type_node, self.source).as_str(),
+            0,
+        )
+        .into_iter()
+        .take(budget.max_targets)
+        .map(ReceiverValue::InstanceType)
+        .collect()
+    }
+
+    fn contextual_object_literal_receiver_values(
+        &self,
+        object: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> Vec<ReceiverValue> {
+        if let Some(variable) = object
+            .parent()
+            .filter(|parent| parent.kind() == "variable_declarator")
+            && variable
+                .child_by_field_name("value")
+                .is_some_and(|value| value.id() == object.id())
+            && let Some(type_node) = variable.child_by_field_name("type")
+        {
+            return self.type_annotation_receiver_values(type_node, budget);
+        }
+
+        let Some(return_statement) = object
+            .parent()
+            .filter(|parent| parent.kind() == "return_statement")
+        else {
+            return Vec::new();
+        };
+        let mut cursor = return_statement.walk();
+        if return_statement
+            .named_children(&mut cursor)
+            .next()
+            .is_none_or(|value| value.id() != object.id())
+        {
+            return Vec::new();
+        }
+        let Some(function) = enclosing_function_scope(object) else {
+            return Vec::new();
+        };
+        let Some(type_node) = function.child_by_field_name("return_type") else {
+            return Vec::new();
+        };
+        self.type_annotation_receiver_values(type_node, budget)
     }
 
     fn resolve_static_object_expression(
@@ -431,7 +568,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .analyzer
             .definitions(&fqn)
             .filter(|unit| unit.source() == owner.source())
-            .filter(|unit| unit.is_function())
+            .filter(|unit| unit.is_function() || unit.is_field())
             .cloned()
             .collect::<Vec<_>>();
         sort_units(&mut units);
@@ -556,6 +693,42 @@ fn lexical_scopes_for_node<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
         current = parent;
     }
     scopes
+}
+
+fn enclosing_function_scope<'tree>(mut node: Node<'tree>) -> Option<Node<'tree>> {
+    loop {
+        if matches!(
+            node.kind(),
+            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn object_literal_property_at_key<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, Node<'tree>, String)> {
+    let property = match node.kind() {
+        "pair" | "shorthand_property_identifier" | "method_definition" => node,
+        _ => node.parent().filter(|parent| {
+            matches!(
+                parent.kind(),
+                "pair" | "shorthand_property_identifier" | "method_definition"
+            ) && parent
+                .child_by_field_name("key")
+                .or_else(|| parent.child_by_field_name("name"))
+                .or_else(|| parent.named_child(0))
+                .is_some_and(|key| key.id() == node.id())
+        })?,
+    };
+    let object = property
+        .parent()
+        .filter(|parent| parent.kind() == "object")?;
+    let member = crate::analyzer::typescript::ts_object_literal_property_name(property, source)?;
+    Some((property, object, member))
 }
 
 fn lexical_scope_ids_for_node(node: Node<'_>) -> HashSet<usize> {
@@ -829,10 +1002,12 @@ export function caller() {
         let tree = parse(source);
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
+            analyzer.definition_lookup_index(),
             Language::TypeScript,
             &file,
             source,
             tree.root_node(),
+            ImportBinder::empty(),
         );
         let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
 
@@ -876,10 +1051,12 @@ export function second() {
         let tree = parse(source);
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
+            analyzer.definition_lookup_index(),
             Language::TypeScript,
             &file,
             source,
             tree.root_node(),
+            ImportBinder::empty(),
         );
         let first = receiver_node(tree.root_node(), source, "first call", "service");
         let second = receiver_node(tree.root_node(), source, "second call", "service");
@@ -922,10 +1099,12 @@ export function caller(which: number) {
         let tree = parse(source);
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
+            analyzer.definition_lookup_index(),
             Language::TypeScript,
             &file,
             source,
             tree.root_node(),
+            ImportBinder::empty(),
         );
         let receiver = receiver_node(tree.root_node(), source, "service.run", "service");
 

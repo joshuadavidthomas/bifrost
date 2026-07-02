@@ -2,6 +2,9 @@ use crate::analyzer::js_ts::imports::{
     CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
     parse_commonjs_require_bindings_from_node, require_call_module_specifier,
 };
+use crate::analyzer::usages::get_definition::js_ts::{
+    ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
+};
 use crate::analyzer::usages::graph_core::{ImportEdge, ImportEdgeKind};
 use crate::analyzer::usages::js_ts_graph::hits::{
     record_hit, record_import_hit, record_self_receiver_hit,
@@ -14,7 +17,7 @@ use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind, UsageHit,
 };
 use crate::analyzer::usages::parsed_tree::js_ts_tree_sitter_language_for_file;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{AliasResolver, CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
@@ -71,6 +74,8 @@ pub(super) fn scan_files_for_seeds(
         let tree_ref = &tree;
 
         let edges = index.matching_edges_for_importer(file, seeds);
+        let imports = index.binders_by_file.get(file).cloned().unwrap_or_default();
+        let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
 
         let mut local_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let line_starts = compute_line_starts(source_str);
@@ -98,6 +103,8 @@ pub(super) fn scan_files_for_seeds(
             target_is_static_member: is_static_member(target),
             target_owner: target_owner.as_ref(),
             target_owner_source: target_owner_source.as_ref(),
+            imports,
+            aliases,
             scope_stack: vec![HashMap::default()],
             binding_engine,
             hits: &mut local_hits,
@@ -135,6 +142,8 @@ pub(super) struct ScanCtx<'a> {
     target_is_static_member: bool,
     target_owner: Option<&'a CodeUnit>,
     target_owner_source: Option<&'a ProjectFile>,
+    imports: ImportBinder,
+    aliases: AliasResolver,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     binding_engine: LocalInferenceEngine<&'static str>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
@@ -229,6 +238,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             handle_identifier_candidate(node, ctx);
         }
         "member_expression" => handle_member_expression(node, ctx),
+        "object" => handle_contextual_object_literal(node, ctx),
         "jsx_opening_element" | "jsx_self_closing_element" => handle_jsx_element(node, ctx),
         _ => {}
     }
@@ -549,6 +559,109 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if member_object_matches_target(object, object_text, ctx) {
             record_hit(property, ctx);
         }
+    }
+}
+
+fn handle_contextual_object_literal(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let (Some(target_member), Some(target_owner)) = (ctx.target_member, ctx.target_owner) else {
+        return;
+    };
+    let owners = contextual_object_literal_owners(node, ctx);
+    if !owners.iter().any(|owner| {
+        owner.source() == target_owner.source() && owner.fq_name() == target_owner.fq_name()
+    }) {
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let Some(name) =
+            crate::analyzer::typescript::ts_object_literal_property_name(child, ctx.source)
+        else {
+            continue;
+        };
+        if name != target_member {
+            continue;
+        }
+        if let Some(key) = object_literal_property_key_node(child) {
+            record_hit(key, ctx);
+        }
+    }
+}
+
+fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<CodeUnit> {
+    if let Some(variable) = node
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")
+        && variable
+            .child_by_field_name("value")
+            .is_some_and(|value| value.id() == node.id())
+        && let Some(type_node) = variable.child_by_field_name("type")
+    {
+        return ts_resolve_type_text_to_property_owners(
+            ctx.analyzer,
+            ctx.analyzer.definition_lookup_index(),
+            ctx.file,
+            ctx.source,
+            &ctx.imports,
+            &ctx.aliases,
+            ts_type_annotation_text(type_node, ctx.source).as_str(),
+            0,
+        );
+    }
+
+    let Some(return_statement) = node
+        .parent()
+        .filter(|parent| parent.kind() == "return_statement")
+    else {
+        return Vec::new();
+    };
+    let mut cursor = return_statement.walk();
+    if return_statement
+        .named_children(&mut cursor)
+        .next()
+        .is_none_or(|value| value.id() != node.id())
+    {
+        return Vec::new();
+    }
+    let Some(function) = enclosing_function_scope(node) else {
+        return Vec::new();
+    };
+    let Some(type_node) = function.child_by_field_name("return_type") else {
+        return Vec::new();
+    };
+    ts_resolve_type_text_to_property_owners(
+        ctx.analyzer,
+        ctx.analyzer.definition_lookup_index(),
+        ctx.file,
+        ctx.source,
+        &ctx.imports,
+        &ctx.aliases,
+        ts_type_annotation_text(type_node, ctx.source).as_str(),
+        0,
+    )
+}
+
+fn object_literal_property_key_node(property: Node<'_>) -> Option<Node<'_>> {
+    match property.kind() {
+        "pair" => property
+            .child_by_field_name("key")
+            .or_else(|| property.named_child(0)),
+        "shorthand_property_identifier" => Some(property),
+        "method_definition" => property.child_by_field_name("name"),
+        _ => None,
+    }
+}
+
+fn enclosing_function_scope(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if matches!(
+            node.kind(),
+            "function_declaration" | "function_expression" | "arrow_function" | "method_definition"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
     }
 }
 

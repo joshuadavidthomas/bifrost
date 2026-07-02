@@ -100,10 +100,12 @@ where
                     source,
                     receiver_provider: JsTsReceiverFactProvider::new(
                         analyzer,
+                        analyzer.definition_lookup_index(),
                         language,
                         file,
                         source,
                         parsed.tree.root_node(),
+                        binder.clone(),
                     ),
                     named_imports,
                     namespace_locals,
@@ -167,10 +169,12 @@ where
                     source: parsed.source.as_str(),
                     receiver_provider: JsTsReceiverFactProvider::new(
                         analyzer,
+                        analyzer.definition_lookup_index(),
                         language,
                         file,
                         parsed.source.as_str(),
                         parsed.tree.root_node(),
+                        compute_import_binder(parsed.source.as_str(), &parsed.tree),
                     ),
                     index,
                     declarations: &declarations,
@@ -644,6 +648,8 @@ fn scan_node_enter(
         "identifier" | "type_identifier" | "shorthand_property_identifier" => {
             handle_identifier(node, ctx, locals)
         }
+        "property_identifier" | "pair" => handle_contextual_object_key(node, ctx),
+        "object" => handle_contextual_object_literal(node, ctx),
         "member_expression" => handle_member(node, ctx, locals),
         "jsx_opening_element" | "jsx_self_closing_element" => handle_jsx(node, ctx, locals),
         _ => {}
@@ -708,6 +714,8 @@ fn scan_scoped_node_enter(
         "identifier" | "type_identifier" | "shorthand_property_identifier" => {
             handle_scoped_identifier(node, ctx, locals)
         }
+        "property_identifier" | "pair" => handle_scoped_contextual_object_key(node, ctx),
+        "object" => handle_scoped_contextual_object_literal(node, ctx),
         "member_expression" => handle_scoped_member(node, ctx, locals),
         "jsx_opening_element" | "jsx_self_closing_element" => handle_scoped_jsx(node, ctx, locals),
         _ => {}
@@ -834,6 +842,22 @@ fn handle_member(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferen
     }
 }
 
+fn handle_contextual_object_key(node: Node<'_>, ctx: &mut TsScan<'_, '_>) {
+    for target in ctx
+        .receiver_provider
+        .resolve_contextual_object_literal_key_targets(node, ReceiverAnalysisBudget::default())
+    {
+        ctx.record(target.fq_name(), node);
+    }
+}
+
+fn handle_contextual_object_literal(node: Node<'_>, ctx: &mut TsScan<'_, '_>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        handle_contextual_object_key(child, ctx);
+    }
+}
+
 fn handle_scoped_member(
     node: Node<'_>,
     ctx: &mut ScopedTsScan<'_, '_>,
@@ -885,6 +909,25 @@ fn handle_scoped_member(
         for member in ctx.scoped_member_declaration_keys(&class, property_text) {
             ctx.record(member, property);
         }
+    }
+}
+
+fn handle_scoped_contextual_object_key(node: Node<'_>, ctx: &mut ScopedTsScan<'_, '_>) {
+    for target in ctx
+        .receiver_provider
+        .resolve_contextual_object_literal_key_targets(node, ReceiverAnalysisBudget::default())
+    {
+        ctx.record(
+            UsageNodeKey::new(target.source().clone(), target.fq_name()),
+            node,
+        );
+    }
+}
+
+fn handle_scoped_contextual_object_literal(node: Node<'_>, ctx: &mut ScopedTsScan<'_, '_>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        handle_scoped_contextual_object_key(child, ctx);
     }
 }
 
