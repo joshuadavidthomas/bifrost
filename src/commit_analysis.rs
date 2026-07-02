@@ -26,9 +26,7 @@ fn default_include_tests() -> bool {
 pub struct CommitAnalysisResult {
     pub commit: CommitPair,
     pub file_changes: Vec<FileChange>,
-    pub introduced_symbols: Vec<CommitSymbol>,
-    pub edited_symbols: Vec<CommitSymbol>,
-    pub deleted_symbols: Vec<CommitSymbol>,
+    pub patch_symbols: PatchSymbols,
     pub moved_symbols: Vec<MovedSymbol>,
     pub dependency_symbols: Vec<CommitSymbol>,
     pub signature_changes: Vec<SignatureChange>,
@@ -59,6 +57,7 @@ pub struct FileChange {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CommitSymbol {
     pub fqn: String,
+    pub name: String,
     pub kind: String,
     pub signature: String,
     pub path: String,
@@ -66,6 +65,40 @@ pub struct CommitSymbol {
     pub end_line: usize,
     pub language: String,
     pub is_test: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PatchSymbols {
+    pub preimage: PreimagePatchSymbols,
+    pub postimage: PostimagePatchSymbols,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PreimagePatchSymbols {
+    pub edited: Vec<PatchTouchedSymbol>,
+    pub deleted: Vec<PatchTouchedSymbol>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PostimagePatchSymbols {
+    pub edited: Vec<PatchTouchedSymbol>,
+    pub introduced: Vec<PatchTouchedSymbol>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PatchTouchedSymbol {
+    pub fqn: String,
+    pub name: String,
+    pub kind: String,
+    pub signature: String,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub language: String,
+    pub is_test: bool,
+    pub touched_old_lines: Vec<usize>,
+    pub touched_new_lines: Vec<usize>,
+    pub change_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -99,9 +132,9 @@ pub struct CallEdgeChange {
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ChangedTestSymbols {
-    pub introduced: Vec<CommitSymbol>,
-    pub edited: Vec<CommitSymbol>,
-    pub deleted: Vec<CommitSymbol>,
+    pub introduced: Vec<PatchTouchedSymbol>,
+    pub edited: Vec<PatchTouchedSymbol>,
+    pub deleted: Vec<PatchTouchedSymbol>,
     pub moved: Vec<MovedSymbol>,
     pub signature_changes: Vec<SignatureChange>,
 }
@@ -186,15 +219,20 @@ pub fn analyze_commit(
     let before = symbol_index(parent_analyzer.analyzer(), params.include_tests);
     let after = symbol_index(commit_analyzer.analyzer(), params.include_tests);
 
-    let mut introduced = Vec::new();
-    let mut edited = Vec::new();
-    let mut deleted = Vec::new();
+    let mut postimage_introduced = Vec::new();
+    let mut postimage_edited = Vec::new();
+    let mut preimage_edited = Vec::new();
+    let mut preimage_deleted = Vec::new();
     let mut moved = Vec::new();
     let mut signature_changes = Vec::new();
 
     for (key, post) in &after {
         match before.get(key) {
-            None => introduced.push(post.symbol.clone()),
+            None => {
+                if let Some(symbol) = postimage_touched_symbol(&post.symbol, &changed_lines) {
+                    postimage_introduced.push(symbol);
+                }
+            }
             Some(pre) => {
                 if pre.symbol.path != post.symbol.path
                     || pre.symbol.start_line != post.symbol.start_line
@@ -210,23 +248,39 @@ pub fn analyze_commit(
                         after: post.symbol.clone(),
                     });
                 }
-                if symbol_touched(&pre.symbol, &post.symbol, &changed_lines) {
-                    edited.push(post.symbol.clone());
+                if let Some(symbol) = postimage_touched_symbol(&post.symbol, &changed_lines) {
+                    postimage_edited.push(symbol);
                 }
             }
         }
     }
     for (key, pre) in &before {
-        if !after.contains_key(key) {
-            deleted.push(pre.symbol.clone());
+        if after.contains_key(key) {
+            if let Some(symbol) = preimage_touched_symbol(&pre.symbol, &changed_lines) {
+                preimage_edited.push(symbol);
+            }
+        } else if let Some(symbol) = preimage_touched_symbol(&pre.symbol, &changed_lines) {
+            preimage_deleted.push(symbol);
         }
     }
 
-    sort_symbols(&mut introduced);
-    sort_symbols(&mut edited);
-    sort_symbols(&mut deleted);
+    sort_patch_symbols(&mut postimage_introduced);
+    sort_patch_symbols(&mut postimage_edited);
+    sort_patch_symbols(&mut preimage_edited);
+    sort_patch_symbols(&mut preimage_deleted);
     moved.sort_by(|a, b| a.after.cmp(&b.after));
     signature_changes.sort_by(|a, b| a.after.cmp(&b.after));
+
+    let patch_symbols = PatchSymbols {
+        preimage: PreimagePatchSymbols {
+            edited: preimage_edited,
+            deleted: preimage_deleted,
+        },
+        postimage: PostimagePatchSymbols {
+            edited: postimage_edited,
+            introduced: postimage_introduced,
+        },
+    };
 
     let import_changes = import_changes(
         parent_analyzer.analyzer(),
@@ -255,9 +309,28 @@ pub fn analyze_commit(
     );
 
     let changed_test_symbols = ChangedTestSymbols {
-        introduced: introduced.iter().filter(|s| s.is_test).cloned().collect(),
-        edited: edited.iter().filter(|s| s.is_test).cloned().collect(),
-        deleted: deleted.iter().filter(|s| s.is_test).cloned().collect(),
+        introduced: patch_symbols
+            .postimage
+            .introduced
+            .iter()
+            .filter(|s| s.is_test)
+            .cloned()
+            .collect(),
+        edited: patch_symbols
+            .preimage
+            .edited
+            .iter()
+            .chain(patch_symbols.postimage.edited.iter())
+            .filter(|s| s.is_test)
+            .cloned()
+            .collect(),
+        deleted: patch_symbols
+            .preimage
+            .deleted
+            .iter()
+            .filter(|s| s.is_test)
+            .cloned()
+            .collect(),
         moved: moved
             .iter()
             .filter(|m| m.before.is_test || m.after.is_test)
@@ -276,9 +349,7 @@ pub fn analyze_commit(
             parent_hash: parent_oid.to_string(),
         },
         file_changes,
-        introduced_symbols: introduced,
-        edited_symbols: edited,
-        deleted_symbols: deleted,
+        patch_symbols,
         moved_symbols: moved,
         dependency_symbols,
         signature_changes,
@@ -329,27 +400,39 @@ fn diff_metadata(
     let mut changed_lines: BTreeMap<String, ChangedLines> = BTreeMap::new();
     let mut loc_by_path: BTreeMap<String, usize> = BTreeMap::new();
     diff.print(DiffFormat::Patch, |delta, _hunk, line| {
-        let Some(path) = delta
+        let display_path = delta
             .new_file()
             .path()
             .or_else(|| delta.old_file().path())
-            .map(path_string)
-        else {
-            return true;
-        };
-        let entry = changed_lines.entry(path.clone()).or_default();
+            .map(path_string);
         match line.origin() {
             '+' => {
-                if let Some(line_no) = line.new_lineno() {
-                    entry.new.insert(line_no as usize);
+                if let (Some(path), Some(line_no)) =
+                    (delta.new_file().path().map(path_string), line.new_lineno())
+                {
+                    changed_lines
+                        .entry(path)
+                        .or_default()
+                        .new
+                        .insert(line_no as usize);
                 }
-                *loc_by_path.entry(path).or_default() += 1;
+                if let Some(path) = display_path {
+                    *loc_by_path.entry(path).or_default() += 1;
+                }
             }
             '-' => {
-                if let Some(line_no) = line.old_lineno() {
-                    entry.old.insert(line_no as usize);
+                if let (Some(path), Some(line_no)) =
+                    (delta.old_file().path().map(path_string), line.old_lineno())
+                {
+                    changed_lines
+                        .entry(path)
+                        .or_default()
+                        .old
+                        .insert(line_no as usize);
                 }
-                *loc_by_path.entry(path).or_default() += 1;
+                if let Some(path) = display_path {
+                    *loc_by_path.entry(path).or_default() += 1;
+                }
             }
             _ => {}
         }
@@ -530,6 +613,7 @@ fn symbol_index(
                 key,
                 symbol: CommitSymbol {
                     fqn: unit.fq_name(),
+                    name: unit.identifier().to_string(),
                     kind,
                     signature,
                     path,
@@ -544,23 +628,61 @@ fn symbol_index(
     out
 }
 
-fn symbol_touched(
-    before: &CommitSymbol,
-    after: &CommitSymbol,
+fn preimage_touched_symbol(
+    symbol: &CommitSymbol,
     changed_lines: &BTreeMap<String, ChangedLines>,
-) -> bool {
-    changed_lines
-        .get(&before.path)
-        .map(|lines| intersects(&lines.old, before.start_line, before.end_line))
-        .unwrap_or(false)
-        || changed_lines
-            .get(&after.path)
-            .map(|lines| intersects(&lines.new, after.start_line, after.end_line))
-            .unwrap_or(false)
+) -> Option<PatchTouchedSymbol> {
+    let touched = touched_lines(
+        changed_lines.get(&symbol.path).map(|lines| &lines.old),
+        symbol.start_line,
+        symbol.end_line,
+    );
+    (!touched.is_empty()).then(|| PatchTouchedSymbol {
+        fqn: symbol.fqn.clone(),
+        name: symbol.name.clone(),
+        kind: symbol.kind.clone(),
+        signature: symbol.signature.clone(),
+        path: symbol.path.clone(),
+        start_line: symbol.start_line,
+        end_line: symbol.end_line,
+        language: symbol.language.clone(),
+        is_test: symbol.is_test,
+        touched_old_lines: touched,
+        touched_new_lines: Vec::new(),
+        change_reason: "old_hunk_overlap".to_string(),
+    })
 }
 
-fn intersects(lines: &BTreeSet<usize>, start: usize, end: usize) -> bool {
-    lines.range(start..=end).next().is_some()
+fn postimage_touched_symbol(
+    symbol: &CommitSymbol,
+    changed_lines: &BTreeMap<String, ChangedLines>,
+) -> Option<PatchTouchedSymbol> {
+    let touched = touched_lines(
+        changed_lines.get(&symbol.path).map(|lines| &lines.new),
+        symbol.start_line,
+        symbol.end_line,
+    );
+    (!touched.is_empty()).then(|| PatchTouchedSymbol {
+        fqn: symbol.fqn.clone(),
+        name: symbol.name.clone(),
+        kind: symbol.kind.clone(),
+        signature: symbol.signature.clone(),
+        path: symbol.path.clone(),
+        start_line: symbol.start_line,
+        end_line: symbol.end_line,
+        language: symbol.language.clone(),
+        is_test: symbol.is_test,
+        touched_old_lines: Vec::new(),
+        touched_new_lines: touched,
+        change_reason: "new_hunk_overlap".to_string(),
+    })
+}
+
+fn touched_lines(lines: Option<&BTreeSet<usize>>, start: usize, end: usize) -> Vec<usize> {
+    lines
+        .into_iter()
+        .flat_map(|lines| lines.range(start..=end).copied())
+        .collect()
 }
 
 fn import_changes(
@@ -706,6 +828,10 @@ fn primary_range(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<crate::ana
 }
 
 fn sort_symbols(symbols: &mut [CommitSymbol]) {
+    symbols.sort();
+}
+
+fn sort_patch_symbols(symbols: &mut [PatchTouchedSymbol]) {
     symbols.sort();
 }
 

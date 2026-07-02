@@ -28,6 +28,19 @@ fn commit(root: &Path, message: &str) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
+fn patch_array<'a>(result: &'a Value, pointer: &str) -> &'a Vec<Value> {
+    result
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing array at {pointer}: {result}"))
+}
+
+fn find_symbol<'a>(symbols: &'a [Value], name: &str) -> Option<&'a Value> {
+    symbols
+        .iter()
+        .find(|symbol| symbol["name"].as_str() == Some(name))
+}
+
 #[test]
 fn analyze_commit_reports_symbol_and_edge_effects() {
     let temp = TempDir::new().expect("tempdir");
@@ -91,19 +104,42 @@ func Caller() string {
         "resolved hash is returned"
     );
     assert!(
-        result["introduced_symbols"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|symbol| symbol["fqn"].as_str().unwrap().ends_with("Added"))
+        result.get("introduced_symbols").is_none(),
+        "old top-level introduced_symbols field should be removed"
     );
     assert!(
-        result["edited_symbols"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|symbol| symbol["fqn"].as_str().unwrap().ends_with("Existing"))
+        result.get("edited_symbols").is_none(),
+        "old top-level edited_symbols field should be removed"
     );
+    assert!(
+        result.get("deleted_symbols").is_none(),
+        "old top-level deleted_symbols field should be removed"
+    );
+
+    let preimage_edited = patch_array(&result, "/patch_symbols/preimage/edited");
+    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
+    let postimage_introduced = patch_array(&result, "/patch_symbols/postimage/introduced");
+
+    let old_existing = find_symbol(preimage_edited, "Existing").expect("old Existing touched");
+    assert!(old_existing["fqn"].as_str().unwrap().ends_with("Existing"));
+    assert_eq!(old_existing["path"], "lib.go");
+    assert_eq!(old_existing["touched_old_lines"], serde_json::json!([4]));
+    assert_eq!(old_existing["touched_new_lines"], serde_json::json!([]));
+    assert_eq!(old_existing["change_reason"], "old_hunk_overlap");
+
+    let new_existing = find_symbol(postimage_edited, "Existing").expect("new Existing touched");
+    assert!(new_existing["fqn"].as_str().unwrap().ends_with("Existing"));
+    assert_eq!(new_existing["path"], "lib.go");
+    assert_eq!(new_existing["touched_old_lines"], serde_json::json!([]));
+    assert_eq!(new_existing["touched_new_lines"], serde_json::json!([6, 7]));
+    assert_eq!(new_existing["change_reason"], "new_hunk_overlap");
+
+    let added = find_symbol(postimage_introduced, "Added").expect("Added introduced");
+    assert!(added["fqn"].as_str().unwrap().ends_with("Added"));
+    assert_eq!(added["path"], "lib.go");
+    assert_eq!(added["touched_old_lines"], serde_json::json!([]));
+    assert_eq!(added["change_reason"], "new_hunk_overlap");
+
     assert!(
         result["import_changes"]
             .as_array()
@@ -168,12 +204,68 @@ fn analyze_commit_reads_from_bare_repo_without_worktree() {
 
     assert_eq!(result["commit"]["hash"].as_str().unwrap(), head);
     assert!(
-        result["introduced_symbols"]
-            .as_array()
-            .unwrap()
+        patch_array(&result, "/patch_symbols/postimage/introduced")
             .iter()
-            .any(|symbol| symbol["fqn"].as_str().unwrap().ends_with("B"))
+            .any(|symbol| symbol["name"] == "B" && symbol["fqn"].as_str().unwrap().ends_with("B"))
     );
+}
+
+#[test]
+fn analyze_commit_reports_renamed_file_touches_on_exact_image_paths() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+
+    fs::write(
+        root.join("old.go"),
+        r#"package sample
+
+func Keep() int {
+	return 1
+}
+"#,
+    )
+    .unwrap();
+    commit(root, "base");
+
+    git(root, &["mv", "old.go", "new.go"]);
+    fs::write(
+        root.join("new.go"),
+        r#"package sample
+
+func Keep() int {
+	return 2
+}
+"#,
+    )
+    .unwrap();
+    let head = commit(root, "rename and edit");
+
+    let service = SearchToolsService::new(root.to_path_buf()).expect("service");
+    let result: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_commit",
+                &serde_json::json!({"revision": head}).to_string(),
+            )
+            .expect("analyze_commit"),
+    )
+    .expect("json");
+
+    let preimage_edited = patch_array(&result, "/patch_symbols/preimage/edited");
+    let postimage_edited = patch_array(&result, "/patch_symbols/postimage/edited");
+
+    let old_keep = find_symbol(preimage_edited, "Keep").expect("old Keep touched");
+    assert_eq!(old_keep["path"], "old.go");
+    assert_eq!(old_keep["touched_old_lines"], serde_json::json!([4]));
+    assert_eq!(old_keep["touched_new_lines"], serde_json::json!([]));
+
+    let new_keep = find_symbol(postimage_edited, "Keep").expect("new Keep touched");
+    assert_eq!(new_keep["path"], "new.go");
+    assert_eq!(new_keep["touched_old_lines"], serde_json::json!([]));
+    assert_eq!(new_keep["touched_new_lines"], serde_json::json!([4]));
 }
 
 #[test]
