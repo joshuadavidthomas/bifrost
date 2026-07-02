@@ -3,12 +3,11 @@ use crate::searchtools::{
     UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
 };
 use crate::{FilesystemProject, WorkspaceAnalyzer};
-use git2::{Delta, DiffFormat, DiffOptions, Oid, Repository};
+use git2::{Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository, Tree};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -373,45 +372,49 @@ fn diff_metadata(
 }
 
 struct MaterializedRevision {
-    path: PathBuf,
-    repo_root: PathBuf,
+    temp: RevisionTempDir,
 }
 
 impl MaterializedRevision {
     fn new(repo: &Repository, oid: Oid) -> Result<Self, String> {
-        let path = std::env::temp_dir().join(format!(
-            "bifrost-analyze-{}-{}-{oid}",
-            std::process::id(),
-            SystemTime::now()
+        let temp = RevisionTempDir::new(oid)?;
+        export_commit_tree(repo, oid, temp.path())?;
+        Ok(Self { temp })
+    }
+
+    fn path(&self) -> &Path {
+        self.temp.path()
+    }
+}
+
+struct RevisionTempDir {
+    path: PathBuf,
+}
+
+impl RevisionTempDir {
+    fn new(oid: Oid) -> Result<Self, String> {
+        let base = std::env::temp_dir();
+        for attempt in 0..100 {
+            let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_nanos())
-                .unwrap_or_default()
-        ));
-        if path.exists() {
-            fs::remove_dir_all(&path)
-                .map_err(|err| format!("unable to clear temp worktree path: {err}"))?;
+                .unwrap_or_default();
+            let path = base.join(format!(
+                "bifrost-analyze-{}-{nanos}-{attempt}-{oid}",
+                std::process::id()
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(format!(
+                        "unable to create temp revision directory {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
         }
-        let repo_root = repo
-            .workdir()
-            .ok_or_else(|| "repository has no workdir".to_string())?;
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(repo_root)
-            .arg("worktree")
-            .arg("add")
-            .arg("--detach")
-            .arg("--quiet")
-            .arg(&path)
-            .arg(oid.to_string())
-            .status()
-            .map_err(|err| format!("unable to run git worktree add: {err}"))?;
-        if !status.success() {
-            return Err(format!("git worktree add failed for {oid}"));
-        }
-        Ok(Self {
-            path,
-            repo_root: repo_root.to_path_buf(),
-        })
+        Err("unable to create unique temp revision directory".to_string())
     }
 
     fn path(&self) -> &Path {
@@ -419,18 +422,68 @@ impl MaterializedRevision {
     }
 }
 
-impl Drop for MaterializedRevision {
+impl Drop for RevisionTempDir {
     fn drop(&mut self) {
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo_root)
-            .arg("worktree")
-            .arg("remove")
-            .arg("--force")
-            .arg(&self.path)
-            .status();
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn export_commit_tree(repo: &Repository, oid: Oid, root: &Path) -> Result<(), String> {
+    let tree = repo
+        .find_commit(oid)
+        .and_then(|commit| commit.tree())
+        .map_err(|err| format!("unable to read tree for {oid}: {err}"))?;
+    export_tree(repo, &tree, root)
+}
+
+fn export_tree(repo: &Repository, root_tree: &Tree<'_>, root: &Path) -> Result<(), String> {
+    let mut stack = vec![(root_tree.clone(), root.to_path_buf())];
+    while let Some((tree, directory)) = stack.pop() {
+        fs::create_dir_all(&directory)
+            .map_err(|err| format!("unable to create {}: {err}", directory.display()))?;
+
+        for entry in &tree {
+            let name = entry
+                .name()
+                .ok_or_else(|| "tree entry name is not valid UTF-8".to_string())?;
+            let rel = safe_tree_entry_component(name)?;
+            let path = directory.join(rel);
+
+            match entry.kind() {
+                Some(ObjectType::Tree) => {
+                    let subtree = entry
+                        .to_object(repo)
+                        .and_then(|object| object.peel_to_tree())
+                        .map_err(|err| format!("unable to read subtree `{name}`: {err}"))?;
+                    stack.push((subtree, path));
+                }
+                Some(ObjectType::Blob) if is_regular_file_mode(entry.filemode()) => {
+                    let blob = repo
+                        .find_blob(entry.id())
+                        .map_err(|err| format!("unable to read blob `{name}`: {err}"))?;
+                    fs::write(&path, blob.content())
+                        .map_err(|err| format!("unable to write {}: {err}", path.display()))?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn safe_tree_entry_component(name: &str) -> Result<&Path, String> {
+    let path = Path::new(name);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(path),
+        _ => Err(format!("unsafe tree entry name `{name}`")),
+    }
+}
+
+fn is_regular_file_mode(mode: i32) -> bool {
+    mode == i32::from(FileMode::Blob)
+        || mode == i32::from(FileMode::BlobGroupWritable)
+        || mode == i32::from(FileMode::BlobExecutable)
 }
 
 fn build_analyzer(root: &Path) -> Result<WorkspaceAnalyzer, String> {
