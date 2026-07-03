@@ -3,8 +3,7 @@ use crate::analyzer::common::{
     display_symbol_name, is_scala_object_like, language_for_target,
 };
 use crate::analyzer::symbol_lookup::{
-    CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy,
-    resolve_typeish_codeunit_fuzzy, strip_trailing_call_suffix,
+    CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy, strip_trailing_call_suffix,
 };
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
@@ -248,6 +247,8 @@ pub struct SearchSymbolsResult {
     pub truncated: bool,
     pub total_files: usize,
     pub files: Vec<SearchSymbolsFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -310,13 +311,13 @@ struct FileRankingKey {
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolLocationsResult {
     pub locations: Vec<SymbolLocation>,
-    pub not_found: Vec<String>,
+    pub not_found: Vec<NotFoundInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolAncestorsResult {
     pub ancestors: Vec<SymbolAncestors>,
-    pub not_found: Vec<String>,
+    pub not_found: Vec<NotFoundInput>,
     pub ambiguous: Vec<AmbiguousSymbol>,
 }
 
@@ -425,16 +426,58 @@ pub struct DefinitionDiagnostic {
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryResult {
     pub summaries: Vec<SummaryBlock>,
-    pub not_found: Vec<String>,
+    pub not_found: Vec<NotFoundInput>,
     pub ambiguous: Vec<AmbiguousSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct NotFoundInput {
+    pub input: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+const SYMBOL_NOT_FOUND_NOTE: &str =
+    "no symbol matched; try search_symbols with a substring or regex pattern";
+const FILE_NOT_FOUND_NOTE: &str =
+    "no workspace file matched this path; check the relative path or pass a glob pattern";
+
+fn not_found_input(input: impl Into<String>, note: Option<String>) -> NotFoundInput {
+    NotFoundInput {
+        input: input.into(),
+        note,
+    }
+}
+
+fn symbol_not_found_input(input: impl Into<String>) -> NotFoundInput {
+    not_found_input(input, Some(SYMBOL_NOT_FOUND_NOTE.to_string()))
+}
+
+fn file_not_found_input(input: impl Into<String>) -> NotFoundInput {
+    not_found_input(input, Some(FILE_NOT_FOUND_NOTE.to_string()))
+}
+
+fn anchor_not_found_input(input: impl Into<String>, anchor: &str, name: &str) -> NotFoundInput {
+    not_found_input(
+        input,
+        Some(format!(
+            "`{name}` resolved, but no definition is in `{anchor}`; re-call with the bare name to list valid selectors"
+        )),
+    )
+}
+
+fn renderable_not_found_input(input: impl Into<String>) -> NotFoundInput {
+    not_found_input(input, None)
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AmbiguousSymbol {
     pub target: String,
     pub matches: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -467,7 +510,7 @@ pub struct SummaryElement {
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolSourcesResult {
     pub sources: Vec<SourceBlock>,
-    pub not_found: Vec<String>,
+    pub not_found: Vec<NotFoundInput>,
     pub ambiguous: Vec<AmbiguousSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
@@ -491,6 +534,8 @@ pub struct SkimFilesResult {
     pub truncated: bool,
     pub total_files: usize,
     pub files: Vec<SkimFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
 }
@@ -498,7 +543,7 @@ pub struct SkimFilesResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct MostRelevantFilesResult {
     pub files: Vec<String>,
-    pub not_found: Vec<String>,
+    pub not_found: Vec<NotFoundInput>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -522,7 +567,7 @@ pub struct ScanUsagesResult {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub usages: Vec<SymbolUsages>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub not_found: Vec<String>,
+    pub not_found: Vec<NotFoundInput>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub failures: Vec<UsageFailureInfo>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -692,6 +737,8 @@ pub struct UsageFailureInfo {
     /// True when the candidate file set exceeded the analyzer's per-query cap
     /// and an arbitrary subset was scanned before the failure was produced.
     pub candidate_files_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -780,7 +827,7 @@ pub fn search_symbols(
     );
     file_entries.truncate(effective_limit);
 
-    let files = file_entries
+    let files: Vec<SearchSymbolsFile> = file_entries
         .into_iter()
         .map(|(file, code_units)| SearchSymbolsFile {
             path: rel_path_string(&file),
@@ -795,12 +842,29 @@ pub fn search_symbols(
             macros: collect_ranked_kind_names(analyzer, &code_units, CodeUnitType::Macro),
         })
         .collect();
+    let note = search_symbols_note(truncated, files.len(), total_files);
 
     SearchSymbolsResult {
         patterns,
         truncated,
         total_files,
         files,
+        note,
+    }
+}
+
+fn search_symbols_note(truncated: bool, shown: usize, total: usize) -> Option<String> {
+    if truncated {
+        Some(format!(
+            "Showing {shown} of {total} matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."
+        ))
+    } else if total == 0 {
+        Some(
+            "No files matched. Try a broader identifier, qualified, or regex-like pattern; if matches may be in test files, set `include_tests` to true."
+                .to_string(),
+        )
+    } else {
+        None
     }
 }
 
@@ -822,7 +886,7 @@ pub fn get_symbol_locations(
                 CodeUnitResolution::Ambiguous(_) | CodeUnitResolution::NotFound => None,
             };
             let Some(code_units) = code_units else {
-                return Some((index, Err(symbol)));
+                return Some((index, Err(symbol_not_found_input(symbol))));
             };
             let locations: Vec<_> = code_units
                 .into_iter()
@@ -843,7 +907,7 @@ pub fn get_symbol_locations(
                 })
                 .collect();
             if locations.is_empty() {
-                Some((index, Err(symbol)))
+                Some((index, Err(renderable_not_found_input(symbol))))
             } else {
                 Some((index, Ok(locations)))
             }
@@ -1502,17 +1566,18 @@ fn definition_display_range(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option
 pub fn get_symbol_ancestors(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
-) -> Result<SymbolAncestorsResult, String> {
+) -> SymbolAncestorsResult {
     let Some(provider) = analyzer.type_hierarchy_provider() else {
-        return Ok(SymbolAncestorsResult {
+        return SymbolAncestorsResult {
             ancestors: Vec::new(),
             not_found: params
                 .symbols
                 .into_iter()
                 .filter(|symbol| !symbol.trim().is_empty())
+                .map(renderable_not_found_input)
                 .collect(),
             ambiguous: Vec::new(),
-        });
+        };
     };
 
     let mut ancestors = Vec::new();
@@ -1524,41 +1589,129 @@ pub fn get_symbol_ancestors(
         .into_iter()
         .filter(|symbol| !symbol.trim().is_empty())
     {
-        match resolve_codeunit_fuzzy(analyzer, &symbol) {
-            CodeUnitResolution::Resolved(code_units) => {
-                let Some(code_unit) = code_units.into_iter().next() else {
-                    not_found.push(symbol);
-                    continue;
-                };
-                if !is_ancestor_target(&code_unit) {
-                    return Err(format!(
-                        "get_symbol_ancestors only accepts class/module/type symbols; `{symbol}` resolved to a {}",
-                        code_unit_kind_name(code_unit.kind())
-                    ));
+        match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
+            SelectableDefinitionResolution::Resolved(code_units) => {
+                let mut resolved = Vec::new();
+                let mut rejected_kind = None;
+                for code_unit in code_units {
+                    if !is_ancestor_target(&code_unit) {
+                        rejected_kind.get_or_insert(code_unit_kind_name(code_unit.kind()));
+                        continue;
+                    }
+                    resolved.push(SymbolAncestors {
+                        symbol: display_symbol_for_target(&code_unit),
+                        ancestors: provider
+                            .get_ancestors(&code_unit)
+                            .into_iter()
+                            .map(|ancestor| display_symbol_for_target(&ancestor))
+                            .collect(),
+                    });
                 }
-                ancestors.push(SymbolAncestors {
-                    symbol: display_symbol_for_target(&code_unit),
-                    ancestors: provider
-                        .get_ancestors(&code_unit)
-                        .into_iter()
-                        .map(|ancestor| display_symbol_for_target(&ancestor))
-                        .collect(),
-                });
+                if resolved.is_empty() {
+                    let note = rejected_kind.map(|kind| {
+                        format!(
+                            "resolves to a {kind}; get_symbol_ancestors only accepts class/module/type symbols"
+                        )
+                    });
+                    not_found.push(not_found_input(symbol, note));
+                } else {
+                    ancestors.extend(resolved);
+                }
             }
-            CodeUnitResolution::Ambiguous(matches) => {
-                ambiguous.push(AmbiguousSymbol {
-                    target: symbol,
-                    matches: code_unit_match_names(matches),
-                });
-            }
-            CodeUnitResolution::NotFound => not_found.push(symbol),
+            SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
+            SelectableDefinitionResolution::NotFound(target) => not_found.push(target),
         }
     }
 
-    Ok(SymbolAncestorsResult {
+    SymbolAncestorsResult {
         ancestors,
         not_found,
         ambiguous,
+    }
+}
+
+#[derive(Debug)]
+enum SelectableDefinitionResolution {
+    Resolved(Vec<CodeUnit>),
+    Ambiguous(AmbiguousSymbol),
+    NotFound(NotFoundInput),
+}
+
+fn exact_codeunit_resolution(analyzer: &dyn IAnalyzer, input: &str) -> CodeUnitResolution {
+    let units = resolve_codeunit_exact(analyzer, input);
+    if units.is_empty() {
+        CodeUnitResolution::NotFound
+    } else {
+        CodeUnitResolution::Resolved(units)
+    }
+}
+
+fn exact_then_fuzzy_codeunit_resolution(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+) -> CodeUnitResolution {
+    let exact = resolve_codeunit_exact(analyzer, input);
+    if exact.is_empty() {
+        resolve_codeunit_fuzzy(analyzer, input)
+    } else {
+        CodeUnitResolution::Resolved(exact)
+    }
+}
+
+/// Resolve a symbol input into one selectable definition group. A file anchor
+/// (`src/plugin/relativeTime/index.js#default`) narrows same-name module-scoped
+/// definitions to the exact relative path before grouping; a bare name that
+/// spans multiple selectors is ambiguous and returns requestable selectors.
+fn resolve_selectable_definitions(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
+) -> SelectableDefinitionResolution {
+    let (anchor, lookup) = split_definition_selector(input);
+    let code_units = match resolve(analyzer, lookup) {
+        CodeUnitResolution::Resolved(code_units) => code_units,
+        CodeUnitResolution::Ambiguous(matches) => matches,
+        CodeUnitResolution::NotFound => {
+            return SelectableDefinitionResolution::NotFound(symbol_not_found_input(input));
+        }
+    };
+
+    let code_units = match anchor {
+        Some(anchor) => {
+            let narrowed: Vec<CodeUnit> = code_units
+                .into_iter()
+                .filter(|unit| rel_path_string(unit.source()) == anchor)
+                .collect();
+            if narrowed.is_empty() {
+                return SelectableDefinitionResolution::NotFound(anchor_not_found_input(
+                    input, anchor, lookup,
+                ));
+            }
+            narrowed
+        }
+        None => code_units,
+    };
+
+    let groups = distinct_definitions(code_units);
+    match groups.as_slice() {
+        [] => SelectableDefinitionResolution::NotFound(symbol_not_found_input(input)),
+        [(_, _)] => SelectableDefinitionResolution::Resolved(
+            groups.into_iter().flat_map(|(_, units)| units).collect(),
+        ),
+        _ => {
+            let matches: Vec<String> = groups.into_iter().map(|(selector, _)| selector).collect();
+            SelectableDefinitionResolution::Ambiguous(AmbiguousSymbol {
+                target: input.to_string(),
+                note: ambiguous_symbol_selector_note(&matches),
+                matches,
+            })
+        }
+    }
+}
+
+fn ambiguous_symbol_selector_note(matches: &[String]) -> Option<String> {
+    matches.first().map(|example| {
+        format!("Ambiguous; re-call with one selector from `matches` (e.g. {example}).")
     })
 }
 
@@ -1579,7 +1732,7 @@ struct ResolvedFilePatterns {
 
 enum SourceLookupOutcome {
     Found(Vec<SourceBlock>),
-    NotFound(String),
+    NotFound(NotFoundInput),
     Ambiguous(AmbiguousSymbol),
     AmbiguousPath(AmbiguousPathInput),
 }
@@ -1597,6 +1750,11 @@ fn route_summary_targets(analyzer: &dyn IAnalyzer, targets: &[String]) -> Summar
         .map(|target| target.trim())
         .filter(|target| !target.is_empty())
     {
+        if split_definition_selector(target).0.is_some() {
+            symbol_targets.push(target.to_string());
+            continue;
+        }
+
         let directory_matches = resolve_directory_target(analyzer, target);
         if !directory_matches.is_empty() {
             directory_targets.extend(directory_matches);
@@ -1638,8 +1796,8 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
     let mut ambiguous = Vec::new();
 
     for target in targets {
-        match resolve_typeish_codeunit_fuzzy(analyzer, &target) {
-            CodeUnitResolution::Resolved(code_units) => {
+        match resolve_selectable_definitions(analyzer, &target, resolve_codeunit_fuzzy) {
+            SelectableDefinitionResolution::Resolved(code_units) => {
                 let start_len = summaries.len();
                 for code_unit in code_units {
                     if let Some(block) = summary_block_for_code_unit(analyzer, &code_unit) {
@@ -1647,14 +1805,11 @@ fn summarize_symbol_targets(analyzer: &dyn IAnalyzer, targets: Vec<String>) -> S
                     }
                 }
                 if summaries.len() == start_len {
-                    not_found.push(target);
+                    not_found.push(renderable_not_found_input(target));
                 }
             }
-            CodeUnitResolution::Ambiguous(matches) => ambiguous.push(AmbiguousSymbol {
-                target,
-                matches: code_unit_match_names(matches),
-            }),
-            CodeUnitResolution::NotFound => not_found.push(target),
+            SelectableDefinitionResolution::Ambiguous(item) => ambiguous.push(item),
+            SelectableDefinitionResolution::NotFound(target) => not_found.push(target),
         }
     }
 
@@ -1711,17 +1866,51 @@ pub fn get_symbol_sources(
         .into_par_iter()
         .enumerate()
         .map(|(index, symbol)| {
+            if split_definition_selector(&symbol).0.is_some() {
+                return match resolve_selectable_definitions(
+                    analyzer,
+                    &symbol,
+                    exact_then_fuzzy_codeunit_resolution,
+                ) {
+                    SelectableDefinitionResolution::Resolved(code_units) => {
+                        let sources = source_blocks_for_resolved_units(analyzer, &code_units);
+                        if sources.is_empty() {
+                            (
+                                index,
+                                SourceLookupOutcome::NotFound(renderable_not_found_input(symbol)),
+                            )
+                        } else {
+                            (index, SourceLookupOutcome::Found(sources))
+                        }
+                    }
+                    SelectableDefinitionResolution::Ambiguous(item) => {
+                        (index, SourceLookupOutcome::Ambiguous(item))
+                    }
+                    SelectableDefinitionResolution::NotFound(target) => {
+                        (index, SourceLookupOutcome::NotFound(target))
+                    }
+                };
+            }
+
             // Exact fully-qualified lookup wins before file patterns, so a
             // canonical symbol containing `/` (e.g. a Go import path) is never
             // misrouted as a filesystem path.
-            let exact = resolve_codeunit_exact(analyzer, &symbol);
-            if !exact.is_empty() {
-                let sources = source_blocks_for_resolved_units(analyzer, &exact);
-                return if sources.is_empty() {
-                    (index, SourceLookupOutcome::NotFound(symbol))
-                } else {
-                    (index, SourceLookupOutcome::Found(sources))
-                };
+            match resolve_selectable_definitions(analyzer, &symbol, exact_codeunit_resolution) {
+                SelectableDefinitionResolution::Resolved(code_units) => {
+                    let sources = source_blocks_for_resolved_units(analyzer, &code_units);
+                    return if sources.is_empty() {
+                        (
+                            index,
+                            SourceLookupOutcome::NotFound(renderable_not_found_input(symbol)),
+                        )
+                    } else {
+                        (index, SourceLookupOutcome::Found(sources))
+                    };
+                }
+                SelectableDefinitionResolution::Ambiguous(item) => {
+                    return (index, SourceLookupOutcome::Ambiguous(item));
+                }
+                SelectableDefinitionResolution::NotFound(_) => {}
             }
 
             let file_matches = resolve_file_patterns(analyzer, std::slice::from_ref(&symbol));
@@ -1731,33 +1920,40 @@ pub fn get_symbol_sources(
             if !file_matches.files.is_empty() {
                 let sources = source_blocks_for_files(analyzer, file_matches.files);
                 return if sources.is_empty() {
-                    (index, SourceLookupOutcome::NotFound(symbol))
+                    (
+                        index,
+                        SourceLookupOutcome::NotFound(renderable_not_found_input(symbol)),
+                    )
                 } else {
                     (index, SourceLookupOutcome::Found(sources))
                 };
             }
 
             if looks_like_file_target(&symbol) {
-                return (index, SourceLookupOutcome::NotFound(symbol));
+                return (
+                    index,
+                    SourceLookupOutcome::NotFound(file_not_found_input(symbol)),
+                );
             }
 
-            match resolve_codeunit_fuzzy(analyzer, &symbol) {
-                CodeUnitResolution::Resolved(code_units) => {
+            match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
+                SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = source_blocks_for_resolved_units(analyzer, &code_units);
                     if sources.is_empty() {
-                        (index, SourceLookupOutcome::NotFound(symbol))
+                        (
+                            index,
+                            SourceLookupOutcome::NotFound(renderable_not_found_input(symbol)),
+                        )
                     } else {
                         (index, SourceLookupOutcome::Found(sources))
                     }
                 }
-                CodeUnitResolution::Ambiguous(matches) => (
-                    index,
-                    SourceLookupOutcome::Ambiguous(AmbiguousSymbol {
-                        target: symbol,
-                        matches: code_unit_match_names(matches),
-                    }),
-                ),
-                CodeUnitResolution::NotFound => (index, SourceLookupOutcome::NotFound(symbol)),
+                SelectableDefinitionResolution::Ambiguous(item) => {
+                    (index, SourceLookupOutcome::Ambiguous(item))
+                }
+                SelectableDefinitionResolution::NotFound(target) => {
+                    (index, SourceLookupOutcome::NotFound(target))
+                }
             }
         })
         .collect();
@@ -1787,7 +1983,11 @@ pub fn get_symbol_sources(
 pub fn get_summaries(analyzer: &dyn IAnalyzer, params: SummariesParams) -> SummaryResult {
     let (mut summaries, _directory_symbols, directory_target_inputs) =
         summarize_targets_with_directory_inventory(analyzer, &params.targets);
-    summaries.not_found.extend(directory_target_inputs);
+    summaries.not_found.extend(
+        directory_target_inputs
+            .into_iter()
+            .map(renderable_not_found_input),
+    );
     summaries
 }
 
@@ -1812,13 +2012,23 @@ fn skim_files_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Sk
         })
         .collect();
     files.sort_by(|left, right| left.path.cmp(&right.path));
+    let note = skim_files_note(truncated, files.len(), total_files);
 
     SkimFilesResult {
         truncated,
         total_files,
         files,
+        note,
         ambiguous_paths: Vec::new(),
     }
+}
+
+fn skim_files_note(truncated: bool, shown: usize, total: usize) -> Option<String> {
+    truncated.then(|| {
+        format!(
+            "Showing {shown} of {total} selected files. Narrow `file_patterns` on list_symbols or `targets` on get_summaries to see the rest."
+        )
+    })
 }
 
 pub(crate) fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> SummaryResult {
@@ -2007,9 +2217,13 @@ fn summarize_routed_targets(
     let symbol_output = summarize_symbol_targets(analyzer, summary_targets.symbol_targets.clone());
 
     file_output.summaries.extend(symbol_output.summaries);
-    file_output
-        .not_found
-        .extend(summary_targets.unmatched_file_targets.clone());
+    file_output.not_found.extend(
+        summary_targets
+            .unmatched_file_targets
+            .iter()
+            .cloned()
+            .map(file_not_found_input),
+    );
     file_output.not_found.extend(symbol_output.not_found);
     file_output.ambiguous.extend(symbol_output.ambiguous);
     file_output
@@ -2068,7 +2282,7 @@ pub fn most_relevant_files(
                     seeds.push((file, weight));
                 }
                 ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
-                ResolvedFileInput::NotFound(item) => not_found.push(item),
+                ResolvedFileInput::NotFound(item) => not_found.push(file_not_found_input(item)),
             }
         }
     }
@@ -2184,11 +2398,11 @@ fn scoped_usage_finder(
     finder
 }
 
-/// Split a `scan_usages` symbol input into an optional file anchor and the name
-/// to resolve. A plain input (`Anchor`) has no anchor; a file-anchored selector
-/// (`charts/Anchor.ts#Anchor`), returned in a prior call's `candidate_targets`,
-/// picks one of several same-named definitions. The `#` separator does not occur
-/// in any language's symbol grammar, so a bare name is never misread as anchored.
+/// Split a definition selector into an optional file anchor and the name to
+/// resolve. A plain input (`Anchor`) has no anchor; a file-anchored selector
+/// (`charts/Anchor.ts#Anchor`), returned in a prior ambiguity result, picks one
+/// of several same-named definitions. The `#` separator does not occur in any
+/// language's symbol grammar, so a bare name is never misread as anchored.
 fn split_definition_selector(input: &str) -> (Option<&str>, &str) {
     match input.split_once('#') {
         Some((anchor, name)) if !anchor.is_empty() && !name.is_empty() => (Some(anchor), name),
@@ -2196,7 +2410,7 @@ fn split_definition_selector(input: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// The selector a caller re-queries to scan exactly this definition. Module-
+/// The selector a caller re-queries to choose exactly this definition. Module-
 /// scoped ecosystems (JS/TS) share bare fqns across files, so the selector is
 /// file-anchored to stay unique; elsewhere the fqn already is.
 fn definition_selector(unit: &CodeUnit) -> String {
@@ -2227,7 +2441,12 @@ fn distinct_definitions(overloads: Vec<CodeUnit>) -> Vec<(String, Vec<CodeUnit>)
 }
 
 fn code_unit_match_names(matches: Vec<CodeUnit>) -> Vec<String> {
-    dedupe_preserving_order(matches.into_iter().map(|unit| unit.fq_name()).collect())
+    dedupe_preserving_order(
+        matches
+            .into_iter()
+            .map(|unit| definition_selector(&unit))
+            .collect(),
+    )
 }
 
 fn ambiguous_usage_symbol_from_groups(
@@ -2291,7 +2510,7 @@ enum ScanUsageTargetResolution {
         symbol: String,
         overloads: Vec<CodeUnit>,
     },
-    NotFound(String),
+    NotFound(NotFoundInput),
     Ambiguous(AmbiguousUsageSymbol),
     Failure(UsageFailureInfo),
 }
@@ -2324,6 +2543,7 @@ fn location_selector_failure(
     reason_kind: &str,
     reason: impl Into<String>,
 ) -> ScanUsageTargetResolution {
+    let hint = usage_failure_hint(reason_kind, false);
     ScanUsageTargetResolution::Failure(UsageFailureInfo {
         symbol: scan_usages_target_label(target),
         fq_name: String::new(),
@@ -2331,7 +2551,29 @@ fn location_selector_failure(
         reason_kind: reason_kind.to_string(),
         reason: reason.into(),
         candidate_files_truncated: false,
+        hint,
     })
+}
+
+fn usage_failure_hint(reason_kind: &str, candidate_files_truncated: bool) -> Option<String> {
+    if candidate_files_truncated {
+        return Some(
+            "The candidate file set exceeded the per-query cap; re-call scan_usages with narrower `paths` to reduce the scan scope."
+                .to_string(),
+        );
+    }
+
+    match reason_kind {
+        "unsafe_inference" => Some(
+            "Re-call scan_usages with a location-anchored `targets` selector for the definition site, e.g. `targets: [{\"path\":\"...\",\"line\":...,\"column\":...}]`."
+                .to_string(),
+        ),
+        "unsupported_target_language"
+        | "missing_analyzer_capability"
+        | "unsupported_target_shape"
+        | "no_graph_seed" => None,
+        _ => None,
+    }
 }
 
 fn declaration_start_column(unit: &CodeUnit, range: Range) -> Option<usize> {
@@ -2369,10 +2611,10 @@ fn resolve_scan_usages_target(
             );
         }
         ResolvedFileInput::NotFound(path) => {
-            return ScanUsageTargetResolution::NotFound(format!(
+            return ScanUsageTargetResolution::NotFound(file_not_found_input(format!(
                 "{} ({path} does not resolve to a workspace file)",
                 scan_usages_target_label(&target)
-            ));
+            )));
         }
     };
 
@@ -2482,10 +2724,10 @@ fn resolve_scan_usages_target(
         .collect();
 
     if matching_units.is_empty() {
-        return ScanUsageTargetResolution::NotFound(format!(
+        return ScanUsageTargetResolution::NotFound(renderable_not_found_input(format!(
             "{} (no declaration at location)",
             scan_usages_target_label(&target)
-        ));
+        )));
     }
 
     let narrowest_span = matching_units
@@ -2688,7 +2930,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 continue;
             }
             CodeUnitResolution::NotFound => {
-                not_found.push(symbol);
+                not_found.push(symbol_not_found_input(symbol));
                 continue;
             }
         };
@@ -2702,7 +2944,7 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     .filter(|unit| rel_path_string(unit.source()) == anchor)
                     .collect();
                 if narrowed.is_empty() {
-                    not_found.push(symbol);
+                    not_found.push(anchor_not_found_input(symbol.clone(), anchor, lookup));
                     continue;
                 }
                 narrowed
@@ -2838,15 +3080,17 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
             }
             FuzzyResult::Failure { fq_name, reason } => {
                 let diagnostic = query.graph_failure.as_ref();
+                let reason_kind = diagnostic
+                    .map(|diagnostic| diagnostic.reason_kind.clone())
+                    .unwrap_or_default();
                 failures.push(UsageFailureInfo {
                     symbol,
                     fq_name,
                     strategy: diagnostic
                         .map(|diagnostic| diagnostic.strategy.clone())
                         .unwrap_or_default(),
-                    reason_kind: diagnostic
-                        .map(|diagnostic| diagnostic.reason_kind.clone())
-                        .unwrap_or_default(),
+                    hint: usage_failure_hint(&reason_kind, truncated),
+                    reason_kind,
                     reason,
                     candidate_files_truncated: truncated,
                 });
@@ -3466,7 +3710,7 @@ fn ranges_overlap(range: &Range, hit: &UsageHit) -> bool {
 
 fn render_scan_usages_with_budget(
     states: Vec<SymbolUsageRenderState>,
-    not_found: &[String],
+    not_found: &[NotFoundInput],
     failures: &[UsageFailureInfo],
     ambiguous: &[AmbiguousUsageSymbol],
     too_many_callsites: &[TooManyCallsitesInfo],
@@ -3504,7 +3748,7 @@ fn render_scan_usages_with_budget(
 
 fn build_scan_usages_summary(
     usages: &[SymbolUsages],
-    not_found: &[String],
+    not_found: &[NotFoundInput],
     failures: &[UsageFailureInfo],
     ambiguous: &[AmbiguousUsageSymbol],
     too_many_callsites: &[TooManyCallsitesInfo],
@@ -3551,7 +3795,14 @@ fn build_scan_usages_summary(
 
     let mut warnings = Vec::new();
     if !not_found.is_empty() {
-        warnings.push(format!("not_found: {}", not_found.join(", ")));
+        warnings.push(format!(
+            "not_found: {}",
+            not_found
+                .iter()
+                .map(|item| item.input.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     if !ambiguous.is_empty() {
         warnings.push(format!(
@@ -4668,7 +4919,7 @@ fn source_blocks_for_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) ->
                     text,
                     presentation: None,
                     note: Some(
-                        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body, or use get_summaries for structured summaries"
+                        "file target: showing a flat outline of top-level symbols, not the full source; pass a symbol name for its full body (for JS/TS module-scoped symbols, use the full relative path selector such as src/plugin/relativeTime/index.js#default), or use get_summaries for structured summaries"
                             .to_string(),
                     ),
                 });
@@ -5493,7 +5744,14 @@ def gamma():
         );
 
         assert!(result.summaries.is_empty());
-        assert_eq!(vec!["src"], result.not_found);
+        assert_eq!(
+            vec!["src"],
+            result
+                .not_found
+                .iter()
+                .map(|item| item.input.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     fn rel_paths(files: &[ProjectFile]) -> Vec<String> {

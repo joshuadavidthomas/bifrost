@@ -1,6 +1,12 @@
 # ExecPlans
 
-When writing complex features or significant refactors, use an ExecPlan (as described in .agent/PLANS.md) from design to implementation.
+When writing complex features or significant refactors, use an ExecPlan (as described in `.agent/PLANS.md`) from design to implementation.
+
+Store ExecPlans under `.agents/plans/`. Keep `.agent/PLANS.md` as the canonical instructions for how ExecPlans are written; do not place individual ExecPlans beside it.
+
+Store LLM-facing or agent-facing design notes under `.agents/docs/`. These are internal working documents for agent context, publication runbooks, parity notes, and similar material that is not meant to be rendered as public product documentation.
+
+Reserve `docs/` for future human-readable documentation intended for publication. Do not put ExecPlans, agent runbooks, or LLM-only context there.
 
 # Git / version control
 
@@ -67,6 +73,9 @@ Backwards compatibility is not yet a concern. Clean up APIs instead when our req
 
 # Implementation details
 
+- Bifrost builds and tests on Windows as well as Unix-like targets. Keep file and path handling OS-agnostic: use
+  `Path`/`PathBuf`, temp/project roots that are absolute on the current platform, and explicit slash normalization only
+  at API/rendering boundaries where a stable workspace-relative string is required.
 - Prefer stack-safe iterative traversal over recursive Rust calls for analyzer tree/graph walks, especially during
   workspace initialization, parser declaration collection, usage analysis, and other paths that may touch many files or
   deeply nested ASTs. Use an explicit stack/queue or shared traversal helper unless the recursion depth is provably

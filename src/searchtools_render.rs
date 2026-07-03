@@ -1,7 +1,7 @@
 use crate::model_context;
 use crate::path_utils::AmbiguousPathInput;
 use crate::searchtools::{
-    AmbiguousSymbol, MostRelevantFilesResult, SearchSymbolHit, SearchSymbolsFile,
+    AmbiguousSymbol, MostRelevantFilesResult, NotFoundInput, SearchSymbolHit, SearchSymbolsFile,
     SearchSymbolsResult, SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement,
     SummaryResult, SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
     SymbolSourcesResult,
@@ -84,7 +84,10 @@ impl RenderText for SearchSymbolsResult {
             .map(|file| file.render_text(options))
             .collect();
         if blocks.is_empty() {
-            return "No matching symbols found.".to_string();
+            return match self.note.as_deref() {
+                Some(note) => format!("No matching symbols found.\n\nNote: {note}"),
+                None => "No matching symbols found.".to_string(),
+            };
         }
         let mut lines = vec![
             "# Symbol search results".to_string(),
@@ -101,6 +104,9 @@ impl RenderText for SearchSymbolsResult {
                     .to_string(),
             );
         }
+        if let Some(note) = self.note.as_deref() {
+            lines.push(format!("- Note: {note}"));
+        }
         lines.push(String::new());
         lines.push(blocks.join("\n\n"));
         lines.join("\n")
@@ -115,7 +121,10 @@ impl RenderText for SymbolLocationsResult {
             .map(|location| location.render_text(options))
             .collect();
         if !self.not_found.is_empty() {
-            lines.push(format!("Not found: {}", self.not_found.join(", ")));
+            lines.push(format!(
+                "Not found: {}",
+                render_not_found_inline(&self.not_found)
+            ));
         }
         if lines.is_empty() {
             "No matching symbols found.".to_string()
@@ -154,7 +163,10 @@ impl RenderText for SummaryResult {
             .map(|summary| summary.render_text(options))
             .collect();
         if !self.not_found.is_empty() {
-            blocks.push(format!("Not found: {}", self.not_found.join(", ")));
+            blocks.push(format!(
+                "Not found: {}",
+                render_not_found_inline(&self.not_found)
+            ));
         }
         blocks.extend(self.ambiguous.iter().map(render_ambiguous_symbol));
         if !self.ambiguous_paths.is_empty() {
@@ -196,7 +208,10 @@ impl RenderText for SkimFilesResult {
     fn render_text(&self, _options: RenderOptions) -> String {
         let blocks: Vec<String> = self.files.iter().map(render_skim_file).collect();
         if blocks.is_empty() {
-            return "No matching files found.".to_string();
+            return match self.note.as_deref() {
+                Some(note) => format!("No matching files found.\n\nNote: {note}"),
+                None => "No matching files found.".to_string(),
+            };
         }
         let mut text = blocks.join("\n\n");
         if self.truncated {
@@ -205,6 +220,10 @@ impl RenderText for SkimFilesResult {
                 self.files.len(),
                 self.total_files
             ));
+        }
+        if let Some(note) = self.note.as_deref() {
+            text.push_str("\n\nNote: ");
+            text.push_str(note);
         }
         if !self.ambiguous_paths.is_empty() {
             text.push_str("\n\n");
@@ -226,7 +245,10 @@ impl RenderText for MostRelevantFilesResult {
 
         let mut lines = self.files.clone();
         if !self.not_found.is_empty() {
-            lines.push(format!("Not found: {}", self.not_found.join(", ")));
+            lines.push(format!(
+                "Not found: {}",
+                render_not_found_inline(&self.not_found)
+            ));
         }
         if !self.duplicates.is_empty() {
             lines.push(format!("Duplicate seeds: {}", self.duplicates.join(", ")));
@@ -319,7 +341,15 @@ fn render_summary_block(block: &SummaryBlock, options: RenderOptions) -> String 
 }
 
 fn render_ambiguous_symbol(symbol: &AmbiguousSymbol) -> String {
-    format!("Ambiguous {}: {}", symbol.target, symbol.matches.join(", "))
+    let mut lines = vec![format!(
+        "Ambiguous {}: {}",
+        symbol.target,
+        symbol.matches.join(", ")
+    )];
+    if let Some(note) = &symbol.note {
+        lines.push(format!("Note: {note}"));
+    }
+    lines.join("\n")
 }
 
 fn render_ambiguous_paths(paths: &[AmbiguousPathInput]) -> String {
@@ -475,12 +505,28 @@ fn render_inline_list<'a>(items: impl Iterator<Item = &'a str>) -> String {
     }
 }
 
-fn render_not_found(items: &[String]) -> String {
+fn render_not_found_inline(items: &[NotFoundInput]) -> String {
+    items
+        .iter()
+        .map(render_not_found_item)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_not_found_item(item: &NotFoundInput) -> String {
+    let input = escape_markdown_inline_code(&item.input);
+    match &item.note {
+        Some(note) => format!("{input}: {note}"),
+        None => input,
+    }
+}
+
+fn render_not_found(items: &[NotFoundInput]) -> String {
     let mut lines = vec!["## Not found".to_string(), String::new()];
     lines.extend(
         items
             .iter()
-            .map(|item| format!("- {}", escape_markdown_inline_code(item))),
+            .map(|item| format!("- {}", render_not_found_item(item))),
     );
     lines.join("\n")
 }
@@ -489,14 +535,15 @@ fn render_ambiguous_symbols_table(symbols: &[AmbiguousSymbol]) -> String {
     let mut lines = vec![
         "## Ambiguous symbols".to_string(),
         String::new(),
-        "| Target | Matches |".to_string(),
-        "| --- | --- |".to_string(),
+        "| Target | Matches | Note |".to_string(),
+        "| --- | --- | --- |".to_string(),
     ];
     lines.extend(symbols.iter().map(|symbol| {
         format!(
-            "| {} | {} |",
+            "| {} | {} | {} |",
             escape_markdown_table_cell(&symbol.target),
-            escape_markdown_table_cell(&symbol.matches.join(", "))
+            escape_markdown_table_cell(&symbol.matches.join(", ")),
+            escape_markdown_table_cell(symbol.note.as_deref().unwrap_or(""))
         )
     }));
     lines.join("\n")
@@ -563,6 +610,10 @@ mod tests {
                 modules: Vec::new(),
                 macros: Vec::new(),
             }],
+            note: Some(
+                "Showing 1 of 3 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."
+                    .to_string(),
+            ),
         };
 
         let text = result.render_text(RenderOptions::default());
@@ -571,6 +622,10 @@ mod tests {
         assert!(text.contains("- Patterns: `Foo`"), "{text}");
         assert!(text.contains("- Files: 1 of 3"), "{text}");
         assert!(text.contains("- Truncated: yes;"), "{text}");
+        assert!(
+            text.contains("- Note: Showing 1 of 3 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."),
+            "{text}"
+        );
         assert!(text.contains("ranked by symbol relevance"), "{text}");
         assert!(text.contains("## src/foo.rs (42 lines)"), "{text}");
         assert!(
@@ -599,10 +654,20 @@ mod tests {
                 presentation: None,
                 note: None,
             }],
-            not_found: vec!["Missing".to_string()],
+            not_found: vec![NotFoundInput {
+                input: "Missing".to_string(),
+                note: Some(
+                    "no symbol matched; try search_symbols with a substring or regex pattern"
+                        .to_string(),
+                ),
+            }],
             ambiguous: vec![AmbiguousSymbol {
                 target: "Foo".to_string(),
                 matches: vec!["crate::foo::Foo".to_string(), "other::Foo".to_string()],
+                note: Some(
+                    "Ambiguous; re-call with one selector from `matches` (e.g. crate::foo::Foo)."
+                        .to_string(),
+                ),
             }],
             ambiguous_paths: vec![AmbiguousPathInput {
                 input: "Foo.java".to_string(),
@@ -616,16 +681,19 @@ mod tests {
         assert!(text.contains("- Location: src/foo.rs:12..14"), "{text}");
         assert!(text.contains("```text\n12: fn bar() {"), "{text}");
         assert!(text.contains("13:     println!(\"hi\");"), "{text}");
-        assert!(text.contains("## Not found\n\n- `Missing`"), "{text}");
+        assert!(
+            text.contains("## Not found\n\n- `Missing`: no symbol matched; try search_symbols with a substring or regex pattern"),
+            "{text}"
+        );
         assert!(text.contains("Ambiguous paths:"), "{text}");
         assert!(
             text.contains("- Foo.java -> app/Foo.java, lib/Foo.java"),
             "{text}"
         );
         assert!(text.contains("## Ambiguous symbols"), "{text}");
-        assert!(text.contains("| Target | Matches |"), "{text}");
+        assert!(text.contains("| Target | Matches | Note |"), "{text}");
         assert!(
-            text.contains("| Foo | crate::foo::Foo, other::Foo |"),
+            text.contains("| Foo | crate::foo::Foo, other::Foo | Ambiguous; re-call with one selector from `matches` (e.g. crate::foo::Foo). |"),
             "{text}"
         );
     }

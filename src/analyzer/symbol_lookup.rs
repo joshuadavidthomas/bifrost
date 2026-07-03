@@ -25,15 +25,6 @@ pub(crate) fn resolve_codeunit_exact(analyzer: &dyn IAnalyzer, input: &str) -> V
     analyzer.definitions(trimmed).cloned().collect()
 }
 
-pub(crate) fn resolve_typeish_codeunit_fuzzy(
-    analyzer: &dyn IAnalyzer,
-    input: &str,
-) -> CodeUnitResolution {
-    resolve_codeunit_fuzzy_with(analyzer, input, |code_unit| {
-        code_unit.is_class() || code_unit.is_module()
-    })
-}
-
 fn resolve_codeunit_fuzzy_with(
     analyzer: &dyn IAnalyzer,
     input: &str,
@@ -93,18 +84,6 @@ fn resolve_codeunit_fuzzy_with(
             &mut full_matches,
             &mut suffix_matches,
         );
-        if candidate.is_class() || candidate.is_module() {
-            for member in analyzer.get_members_in_class(candidate) {
-                collect_fuzzy_matches(
-                    analyzer,
-                    &member,
-                    include,
-                    query_paths,
-                    &mut full_matches,
-                    &mut suffix_matches,
-                );
-            }
-        }
     }
 
     resolution_from_matches(analyzer, full_matches, include)

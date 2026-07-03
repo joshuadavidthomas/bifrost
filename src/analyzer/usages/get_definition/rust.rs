@@ -37,10 +37,31 @@ pub(super) fn resolve_rust(
         && let Some(self_type) = rust_enclosing_impl_type_fqn(analyzer, support, file, source, node)
     {
         let candidates = match reference.split_once("::") {
-            Some((_, name)) => rust_member_candidates(
-                support.fqn(&format!("{self_type}.{name}")),
-                RustMemberKind::Function,
-            ),
+            Some((_, name)) => {
+                let mut candidates = rust_member_candidates(
+                    support.fqn(&format!("{self_type}.{name}")),
+                    RustMemberKind::Function,
+                );
+                if candidates.is_empty() {
+                    // The enclosing impl's type may get the associated item from an
+                    // implemented trait; the owner fqn is already resolved, so this
+                    // enters the shared resolver past its scoped-path step.
+                    let refs = rust.reference_context_of(file);
+                    candidates =
+                        match crate::analyzer::usages::rust_graph::resolve_trait_associated_item(
+                            rust, support, &refs, file, &self_type, name,
+                        ) {
+                            ReceiverAnalysisOutcome::Precise(resolved) => {
+                                rust_member_candidates(resolved, RustMemberKind::Function)
+                            }
+                            ReceiverAnalysisOutcome::Ambiguous(_)
+                            | ReceiverAnalysisOutcome::Unknown
+                            | ReceiverAnalysisOutcome::Unsupported { .. }
+                            | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+                        };
+                }
+                candidates
+            }
             None => support.fqn(&self_type),
         };
         if !candidates.is_empty() {
@@ -52,9 +73,15 @@ pub(super) fn resolve_rust(
     {
         let resolved = rust_focused_scoped_segment_candidates(rust, support, file, site)
             .unwrap_or_else(|| {
-                refs.resolve_scoped(path, name)
-                    .map(|fqn| support.fqn(&fqn))
-                    .unwrap_or_default()
+                match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
+                    rust, support, &refs, file, path, name,
+                ) {
+                    ReceiverAnalysisOutcome::Precise(candidates) => candidates,
+                    ReceiverAnalysisOutcome::Ambiguous(_)
+                    | ReceiverAnalysisOutcome::Unknown
+                    | ReceiverAnalysisOutcome::Unsupported { .. }
+                    | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+                }
             });
         (resolved, true)
     } else {

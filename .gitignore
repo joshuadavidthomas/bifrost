@@ -1,9 +1,14 @@
 /target
+/docs/dist
+/docs/.astro
+/docs/node_modules
 /benchmark/.cache/
 /benchmark/benchmark-output/
 __pycache__/
 .codex
 .claude/
+.amp/
+.agents/skills/
 .bifrost/
 bifrost_searchtools/*.so
 

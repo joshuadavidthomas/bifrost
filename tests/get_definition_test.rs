@@ -112,6 +112,197 @@ end
 }
 
 #[test]
+fn ruby_get_definition_resolves_attr_reader_and_alias_method_calls() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "lib/shop/product.rb",
+            r#"
+class Product
+  attr_reader :name
+  alias_method :label, :name
+
+  def self.featured
+    new("featured")
+  end
+
+  def initialize(name)
+    @name = name
+  end
+
+  def summary
+    label
+  end
+end
+"#,
+        )
+        .file(
+            "app/catalog.rb",
+            r#"
+require "lib/shop/product"
+
+product = Product.featured
+product.name
+product.label
+"#,
+        )
+        .build();
+
+    let name_line = "product.name";
+    let name_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/catalog.rb","line":5,"column":{}}}]}}"#,
+            column_of(name_line, "name")
+        ),
+    );
+    assert_eq!(
+        name_value["results"][0]["status"], "resolved",
+        "{name_value}"
+    );
+    assert_eq!(
+        name_value["results"][0]["definitions"][0]["fqn"], "Product.name",
+        "{name_value}"
+    );
+    assert_eq!(
+        name_value["results"][0]["definitions"][0]["kind"], "function",
+        "{name_value}"
+    );
+
+    let label_line = "product.label";
+    let label_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/catalog.rb","line":6,"column":{}}}]}}"#,
+            column_of(label_line, "label")
+        ),
+    );
+    assert_eq!(
+        label_value["results"][0]["status"], "resolved",
+        "{label_value}"
+    );
+    assert_eq!(
+        label_value["results"][0]["definitions"][0]["fqn"], "Product.label",
+        "{label_value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_resolves_singleton_attr_reader_and_alias_method_calls() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"
+class Product
+  class << self
+    attr_reader :version
+    alias_method :label, :version
+  end
+end
+
+Product.version
+Product.label
+Product.new.version
+"#,
+        )
+        .build();
+
+    let version_line = "Product.version";
+    let version_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":9,"column":{}}}]}}"#,
+            column_of(version_line, "version")
+        ),
+    );
+    assert_eq!(
+        version_value["results"][0]["status"], "resolved",
+        "{version_value}"
+    );
+    assert_eq!(
+        version_value["results"][0]["definitions"][0]["fqn"], "Product.version",
+        "{version_value}"
+    );
+
+    let label_line = "Product.label";
+    let label_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":10,"column":{}}}]}}"#,
+            column_of(label_line, "label")
+        ),
+    );
+    assert_eq!(
+        label_value["results"][0]["status"], "resolved",
+        "{label_value}"
+    );
+    assert_eq!(
+        label_value["results"][0]["definitions"][0]["fqn"], "Product.label",
+        "{label_value}"
+    );
+
+    let instance_line = "Product.new.version";
+    let instance_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":11,"column":{}}}]}}"#,
+            column_of(instance_line, "version")
+        ),
+    );
+    assert_eq!(
+        instance_value["results"][0]["status"], "no_definition",
+        "{instance_value}"
+    );
+}
+
+#[test]
+fn ruby_get_definition_does_not_index_dynamic_attr_or_alias_names() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app.rb",
+            r#"
+class Product
+  ATTR_NAME = :name
+  alias_name = :label
+
+  attr_reader ATTR_NAME
+  alias_method alias_name, :name
+end
+
+product = Product.new
+product.ATTR_NAME
+product.alias_name
+"#,
+        )
+        .build();
+
+    let attr_line = "product.ATTR_NAME";
+    let attr_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":11,"column":{}}}]}}"#,
+            column_of(attr_line, "ATTR_NAME")
+        ),
+    );
+    assert_eq!(
+        attr_value["results"][0]["status"], "no_definition",
+        "{attr_value}"
+    );
+
+    let alias_line = "product.alias_name";
+    let alias_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":12,"column":{}}}]}}"#,
+            column_of(alias_line, "alias_name")
+        ),
+    );
+    assert_eq!(
+        alias_value["results"][0]["status"], "no_definition",
+        "{alias_value}"
+    );
+}
+
+#[test]
 fn ruby_get_definition_resolves_top_level_bare_method_call() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(
@@ -2282,6 +2473,116 @@ namespace App {
         .as_array()
         .expect("definitions array");
     assert_eq!(definitions.len(), 2, "{value}");
+}
+
+#[test]
+fn csharp_type_lookup_preserves_same_fqn_generic_arity_candidates() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Models/Box.cs",
+            "namespace Models { public class Box {} }\n",
+        )
+        .file(
+            "Models/GenericBox.cs",
+            "namespace Models { public class Box<T> {} }\n",
+        )
+        .file(
+            "App/UseBox.cs",
+            r#"
+using Models;
+
+namespace App {
+    public class UseBox {
+        public void Render(Box<int> input) {
+            input.ToString();
+        }
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "            input.ToString();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"App/UseBox.cs","line":7,"column":{}}}]}}"#,
+            column_of(line, "input")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let definitions = result["types"][0]["definitions"]
+        .as_array()
+        .expect("definitions array");
+    assert_eq!(definitions.len(), 2, "{value}");
+}
+
+#[test]
+fn csharp_type_lookup_preserves_partial_declaration_locations() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Handlers.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord
+{
+    public string Name { get; set; }
+}
+"#,
+        )
+        .file(
+            "src/Consumers.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord
+{
+    public string Label()
+    {
+        return Name;
+    }
+}
+
+public sealed class Consumer
+{
+    public string Render(EventRecord record)
+    {
+        return record.Name;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return record.Name;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Consumers.cs","line":15,"column":{}}}]}}"#,
+            column_of(line, "record")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Demo.EventRecord", "{value}");
+    let definitions = result["types"][0]["definitions"]
+        .as_array()
+        .expect("definitions array");
+    assert_eq!(definitions.len(), 2, "{value}");
+    assert!(
+        definitions
+            .iter()
+            .any(|definition| definition["path"] == "src/Handlers.cs"),
+        "{value}"
+    );
+    assert!(
+        definitions
+            .iter()
+            .any(|definition| definition["path"] == "src/Consumers.cs"),
+        "{value}"
+    );
 }
 
 #[test]
@@ -9150,6 +9451,68 @@ fn csharp_instance_member_receiver_resolves_from_enclosing_property_type() {
 }
 
 #[test]
+fn csharp_partial_property_receiver_resolves_to_declaration() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Handlers.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord
+{
+    public string Name { get; set; }
+
+    public EventRecord(string name)
+    {
+        Name = name;
+    }
+}
+"#,
+        )
+        .file(
+            "src/Consumers.cs",
+            r#"namespace Demo;
+
+public partial class EventRecord
+{
+    public string Label()
+    {
+        return Name;
+    }
+}
+
+public sealed class Consumer
+{
+    public string Render(EventRecord record)
+    {
+        return record.Name;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        return record.Name;";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Consumers.cs","line":15,"column":{}}}]}}"#,
+            column_of(line, "Name")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.EventRecord.Name",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "src/Handlers.cs",
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_var_initialized_from_instance_member_seeds_receiver_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
@@ -11613,6 +11976,87 @@ object App:
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "app.ConsoleRenderer$.default",
+        "{value}"
+    );
+
+    let render_start = app_source.find("render(\"ok\")").expect("render token");
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/App.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            render_start,
+            render_start + "render".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.ConsoleRenderer.render",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_imported_factory_return_type_uses_factory_scope() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "api/Renderer.scala",
+            r#"
+package api
+
+class Renderer {
+  def render(value: String): String = value
+}
+"#,
+        )
+        .file(
+            "app/Renderer.scala",
+            r#"
+package app
+
+class Renderer {
+  def render(value: String): String = value.trim
+}
+
+object Factory {
+  def default: Renderer = new Renderer
+}
+"#,
+        )
+        .file(
+            "app/App.scala",
+            r#"
+package app
+
+object App:
+  import Factory.{default => renderer}
+  val direct = renderer.render("ok")
+"#,
+        )
+        .build();
+
+    let app_source = r#"
+package app
+
+object App:
+  import Factory.{default => renderer}
+  val direct = renderer.render("ok")
+"#;
+    let render_start = app_source.find("render(\"ok\")").expect("render token");
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/App.scala","start_byte":{},"end_byte":{}}}]}}"#,
+            render_start,
+            render_start + "render".len()
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Renderer.render",
         "{value}"
     );
 }
