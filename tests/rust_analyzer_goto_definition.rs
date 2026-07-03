@@ -30,13 +30,37 @@ fn split_caret(source: &str) -> (String, u64, u64) {
 }
 
 fn definition_lines(name: &str, source_with_caret: &str) -> (TempDir, Vec<u64>) {
+    definition_lines_in_project(&[(name, source_with_caret)], name, name)
+}
+
+fn definition_lines_in_project(
+    files: &[(&str, &str)],
+    caret_file: &str,
+    target_file: &str,
+) -> (TempDir, Vec<u64>) {
+    let source_with_caret = files
+        .iter()
+        .find(|(name, _)| *name == caret_file)
+        .map(|(_, source)| *source)
+        .expect("caret file must exist");
     let (source, line, character) = split_caret(source_with_caret);
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().canonicalize().expect("canon temp");
-    let file: PathBuf = root.join(name);
-    std::fs::write(&file, source).expect("write fixture");
+    for (name, contents) in files {
+        let file = root.join(name);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).expect("create fixture parent");
+        }
+        let contents = if *name == caret_file {
+            source.as_str()
+        } else {
+            contents
+        };
+        std::fs::write(file, contents).expect("write fixture");
+    }
 
     let mut server = LspServer::start(&root);
+    let file: PathBuf = root.join(caret_file);
     let response = server.text_document_position_response(
         "textDocument/definition",
         &uri_for(&file),
@@ -45,7 +69,7 @@ fn definition_lines(name: &str, source_with_caret: &str) -> (TempDir, Vec<u64>) 
     );
     server.shutdown();
 
-    let file_uri = uri_for(&file);
+    let file_uri = uri_for(&root.join(target_file));
     let lines = match &response["result"] {
         Value::Array(items) => items
             .iter()
@@ -58,61 +82,40 @@ fn definition_lines(name: &str, source_with_caret: &str) -> (TempDir, Vec<u64>) 
     (temp, lines)
 }
 
-fn definition_lines_in_files(
-    files: &[(&str, &str)],
-    query_name: &str,
-    target_name: &str,
-) -> (TempDir, Vec<u64>) {
-    let temp = TempDir::new().expect("tempdir");
-    let root = temp.path().canonicalize().expect("canon temp");
-    let mut query_position = None;
-    for (name, source) in files {
-        let file = root.join(name);
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent).expect("mkdir fixture parent");
-        }
-        let source = if *name == query_name {
-            let (source, line, character) = split_caret(source);
-            query_position = Some((line, character));
-            source
-        } else {
-            source.to_string()
-        };
-        std::fs::write(&file, source).expect("write fixture");
-    }
-
-    let (line, character) = query_position.expect("query fixture must contain <caret>");
-    let query_file = root.join(query_name);
-    let target_file = root.join(target_name);
-    let mut server = LspServer::start(&root);
-    let response = server.text_document_position_response(
-        "textDocument/definition",
-        &uri_for(&query_file),
-        line,
-        character,
-    );
-    server.shutdown();
-
-    let target_uri = uri_for(&target_file);
-    let lines = match &response["result"] {
-        Value::Array(items) => items
-            .iter()
-            .filter(|loc| loc["uri"].as_str() == Some(target_uri.as_str()))
-            .filter_map(|loc| loc["range"]["start"]["line"].as_u64())
-            .collect(),
-        Value::Object(loc) if loc["uri"].as_str() == Some(target_uri.as_str()) => {
-            loc["range"]["start"]["line"].as_u64().into_iter().collect()
-        }
-        _ => Vec::new(),
-    };
-    (temp, lines)
-}
-
 fn assert_resolves_to_line(name: &str, source_with_caret: &str, expected: u64) {
     let (_t, lines) = definition_lines(name, source_with_caret);
     assert!(
         lines.contains(&expected),
         "expected {name} to resolve to line {expected}, got {lines:?}"
+    );
+}
+
+fn assert_project_resolves_to_line(
+    files: &[(&str, &str)],
+    caret_file: &str,
+    target_file: &str,
+    expected: u64,
+) {
+    let (_t, lines) = definition_lines_in_project(files, caret_file, target_file);
+    assert!(
+        lines.contains(&expected),
+        "expected {caret_file} to resolve to {target_file}:{expected}, got {lines:?}"
+    );
+}
+
+fn assert_project_resolves_to_nothing(files: &[(&str, &str)], caret_file: &str) {
+    let (_t, lines) = definition_lines_in_project(files, caret_file, caret_file);
+    assert!(
+        lines.is_empty(),
+        "expected {caret_file} to resolve to nothing, got {lines:?}"
+    );
+}
+
+fn assert_resolves_to_nothing(name: &str, source_with_caret: &str) {
+    let (_t, lines) = definition_lines(name, source_with_caret);
+    assert!(
+        lines.is_empty(),
+        "expected {name} to resolve to nothing, got {lines:?}"
     );
 }
 
@@ -172,43 +175,95 @@ fn ra_goto_def_for_ufcs_trait_methods_through_self() {
     );
 }
 
-// #433: if multiple in-scope implemented traits declare the same associated
-// method, `Foo::frobnicate()` is ambiguous and returns no definition.
 #[test]
-fn ra_goto_def_ufcs_trait_method_ambiguous_traits() {
-    let (_t, lines) = definition_lines(
+fn rust_ufcs_trait_method_ambiguity_resolves_to_nothing() {
+    assert_resolves_to_nothing(
         "ambiguous.rs",
-        "struct Foo;\ntrait A {\n    fn frobnicate();\n}\ntrait B {\n    fn frobnicate();\n}\nimpl A for Foo {}\nimpl B for Foo {}\n\nfn bar() {\n    Foo::frobnicate<caret>();\n}\n",
+        "struct Foo;\ntrait One {\n    fn frobnicate();\n}\ntrait Two {\n    fn frobnicate();\n}\nimpl One for Foo {}\nimpl Two for Foo {}\n\nfn bar() {\n    Foo::frobnicate<caret>();\n}\n",
     );
-    assert!(lines.is_empty(), "expected no definitions, got {lines:?}");
+}
+
+#[test]
+fn rust_ufcs_trait_method_resolves_through_module_qualified_implementer() {
+    assert_project_resolves_to_line(
+        &[
+            (
+                "src/service.rs",
+                "pub struct Foo;\npub trait Trait {\n    fn frobnicate();\n}\nimpl Trait for Foo {}\n",
+            ),
+            (
+                "src/main.rs",
+                "mod service;\nuse service::Trait;\n\nfn bar() {\n    service::Foo::frobnicate<caret>();\n}\n",
+            ),
+        ],
+        "src/main.rs",
+        "src/service.rs",
+        2,
+    );
+}
+
+#[test]
+fn rust_ufcs_trait_method_requires_visible_trait() {
+    assert_project_resolves_to_nothing(
+        &[
+            (
+                "src/service.rs",
+                "pub struct Foo;\npub trait Trait {\n    fn frobnicate();\n}\nimpl Trait for Foo {}\n",
+            ),
+            (
+                "src/main.rs",
+                "mod service;\n\nfn bar() {\n    service::Foo::frobnicate<caret>();\n}\n",
+            ),
+        ],
+        "src/main.rs",
+    );
+}
+
+// #433: a glob import (`use service::*;`) makes the trait visible at the call
+// site even though glob bindings never land in the file's named-import maps.
+// Glob visibility resolves through the module's export index, so the fixture
+// needs a real crate shape (`Cargo.toml` + a `pub mod` chain from the root).
+#[test]
+fn rust_ufcs_trait_method_resolves_through_glob_imported_trait() {
+    assert_project_resolves_to_line(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "src/service.rs",
+                "pub struct Foo;\npub trait Trait {\n    fn frobnicate();\n}\nimpl Trait for Foo {}\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod service;\nuse service::*;\n\nfn bar() {\n    service::Foo::frobnicate<caret>();\n}\n",
+            ),
+        ],
+        "src/lib.rs",
+        "src/service.rs",
+        2,
+    );
 }
 
 // #433: cross-file `Worker::frobnicate()` resolves through an imported trait
 // implemented for `Worker`.
 #[test]
 fn ra_goto_def_ufcs_trait_method_cross_file() {
-    let (_t, lines) = definition_lines_in_files(
+    assert_project_resolves_to_line(
         &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
-            ),
-            ("src/lib.rs", "pub mod contracts;\npub mod worker;\n"),
             (
                 "src/contracts.rs",
                 "pub trait Runnable {\n    fn frobnicate();\n}\n",
             ),
             (
-                "src/worker.rs",
-                "use crate::contracts::Runnable;\npub struct Worker;\nimpl Runnable for Worker {}\nfn bar() {\n    Worker::frobnicate<caret>();\n}\n",
+                "src/main.rs",
+                "mod contracts;\nuse contracts::Runnable;\npub struct Worker;\nimpl Runnable for Worker {}\nfn bar() {\n    Worker::frobnicate<caret>();\n}\n",
             ),
         ],
-        "src/worker.rs",
+        "src/main.rs",
         "src/contracts.rs",
-    );
-    assert!(
-        lines.contains(&1),
-        "expected cross-file trait method to resolve to line 1, got {lines:?}"
+        1,
     );
 }
 
@@ -216,28 +271,31 @@ fn ra_goto_def_ufcs_trait_method_cross_file() {
 // candidates to the imported trait.
 #[test]
 fn ra_goto_def_ufcs_trait_method_scope_filtered() {
-    let (_t, lines) = definition_lines_in_files(
+    assert_project_resolves_to_line(
         &[
-            (
-                "Cargo.toml",
-                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
-            ),
-            ("src/lib.rs", "pub mod contracts;\npub mod worker;\n"),
             (
                 "src/contracts.rs",
                 "pub trait Runnable {\n    fn frobnicate();\n}\npub trait Hidden {\n    fn frobnicate();\n}\n",
             ),
             (
-                "src/worker.rs",
-                "use crate::contracts::Runnable;\npub struct Worker;\nimpl Runnable for Worker {}\nimpl crate::contracts::Hidden for Worker {}\nfn bar() {\n    Worker::frobnicate<caret>();\n}\n",
+                "src/main.rs",
+                "mod contracts;\nuse contracts::Runnable;\npub struct Worker;\nimpl Runnable for Worker {}\nimpl contracts::Hidden for Worker {}\nfn bar() {\n    Worker::frobnicate<caret>();\n}\n",
             ),
         ],
-        "src/worker.rs",
+        "src/main.rs",
         "src/contracts.rs",
+        1,
     );
-    assert!(
-        lines.contains(&1),
-        "expected scope-filtered trait method to resolve to line 1, got {lines:?}"
+}
+
+// #433: `Self::assoc()` inside an inherent impl resolves through a trait the
+// enclosing type implements (line 2 is the trait method signature).
+#[test]
+fn rust_self_assoc_fn_resolves_through_implemented_trait() {
+    assert_resolves_to_line(
+        "sa.rs",
+        "struct Foo;\ntrait Trait {\n    fn frobnicate();\n}\nimpl Trait for Foo {}\nimpl Foo {\n    fn call() {\n        Self::frobnicate<caret>();\n    }\n}\n",
+        2,
     );
 }
 

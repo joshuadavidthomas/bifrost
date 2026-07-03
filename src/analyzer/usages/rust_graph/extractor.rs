@@ -1,12 +1,18 @@
 use crate::analyzer::usages::common::{TreeWalkAction, same_node, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::UsageHit;
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::usages::rust_graph::hits::{
     member_hit_enclosing, push_member_hit, push_self_receiver_member_hit, record_hit,
     record_import_hit, record_module_qualified_hits,
 };
-use crate::analyzer::usages::rust_graph::resolver::is_trait_owner;
-use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer};
+use crate::analyzer::usages::rust_graph::resolver::{
+    is_trait_owner, resolve_scoped_associated_item,
+};
+use crate::analyzer::{
+    CodeUnit, DefinitionLookupIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer,
+    RustReferenceContext,
+};
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
@@ -372,6 +378,7 @@ pub(super) fn scan_files_for_member_target(
     let hits = Mutex::new(BTreeSet::new());
     let constructor_returns = self_like_constructor_returns(rust, &owner);
     let self_like_constructors = self_like_constructor_seeds(rust, &owner, &constructor_returns);
+    let support = analyzer.definition_lookup_index();
 
     files.par_iter().for_each(|file| {
         let owned_source: Option<Arc<String>>;
@@ -420,14 +427,18 @@ pub(super) fn scan_files_for_member_target(
             &visible_bare_constructors,
         );
         let static_owner_names = owner_local_names;
-        if receiver_names.is_empty() && static_owner_names.is_empty() {
+        let has_static_trait_call = trait_owner && source.contains(&format!("::{}", member_name));
+        if receiver_names.is_empty() && static_owner_names.is_empty() && !has_static_trait_call {
             return;
         }
+        let refs = rust.reference_context_of(file);
 
         let mut local_hits = BTreeSet::new();
         let mut ctx = MemberScanCtx {
             analyzer,
             rust,
+            support,
+            refs: &refs,
             file,
             source,
             line_starts: &line_starts,
@@ -437,7 +448,6 @@ pub(super) fn scan_files_for_member_target(
             receiver_names: &receiver_names,
             receiver_type_names: &receiver_type_names,
             static_owner_names: &static_owner_names,
-            trait_owner,
             hits: &mut local_hits,
         };
         scan_member_node(tree.root_node(), &mut ctx);
@@ -454,6 +464,8 @@ pub(super) fn scan_files_for_member_target(
 struct MemberScanCtx<'a> {
     analyzer: &'a dyn IAnalyzer,
     rust: &'a RustAnalyzer,
+    support: &'a DefinitionLookupIndex,
+    refs: &'a RustReferenceContext,
     file: &'a ProjectFile,
     source: &'a str,
     line_starts: &'a [usize],
@@ -463,7 +475,6 @@ struct MemberScanCtx<'a> {
     receiver_names: &'a Vec<String>,
     receiver_type_names: &'a HashSet<String>,
     static_owner_names: &'a HashSet<String>,
-    trait_owner: bool,
     hits: &'a mut BTreeSet<UsageHit>,
 }
 
@@ -789,8 +800,9 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some(owner_name) = simple_node_text(path, ctx.source) else {
         return;
     };
-    let static_owner_match = ctx.static_owner_names.contains(&owner_name);
-    if !static_owner_match && !static_trait_assoc_member_matches_owner(&owner_name, ctx) {
+    if !ctx.static_owner_names.contains(&owner_name)
+        && !scoped_static_member_matches_target(&owner_name, ctx)
+    {
         return;
     }
 
@@ -811,18 +823,23 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     );
 }
 
-fn static_trait_assoc_member_matches_owner(owner_name: &str, ctx: &MemberScanCtx<'_>) -> bool {
-    if !ctx.trait_owner {
-        return false;
+fn scoped_static_member_matches_target(owner_name: &str, ctx: &MemberScanCtx<'_>) -> bool {
+    match resolve_scoped_associated_item(
+        ctx.rust,
+        ctx.support,
+        ctx.refs,
+        ctx.file,
+        owner_name,
+        ctx.member_name,
+    ) {
+        ReceiverAnalysisOutcome::Precise(candidates) => candidates.into_iter().any(|candidate| {
+            candidate.fq_name() == format!("{}.{}", ctx.owner.fq_name(), ctx.member_name)
+        }),
+        ReceiverAnalysisOutcome::Ambiguous(_)
+        | ReceiverAnalysisOutcome::Unknown
+        | ReceiverAnalysisOutcome::Unsupported { .. }
+        | ReceiverAnalysisOutcome::ExceededBudget { .. } => false,
     }
-    let refs = ctx.rust.reference_context_of(ctx.file);
-    let Some(type_fqn) = refs.resolve_path(owner_name) else {
-        return false;
-    };
-    let candidates = ctx
-        .rust
-        .trait_assoc_member_candidates(ctx.file, &type_fqn, ctx.member_name);
-    matches!(candidates.as_slice(), [candidate] if candidate.fq_name() == format!("{}.{}", ctx.owner.fq_name(), ctx.member_name))
 }
 
 fn self_like_constructor_returns(
