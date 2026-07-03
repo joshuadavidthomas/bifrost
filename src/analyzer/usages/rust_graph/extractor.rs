@@ -437,6 +437,7 @@ pub(super) fn scan_files_for_member_target(
             receiver_names: &receiver_names,
             receiver_type_names: &receiver_type_names,
             static_owner_names: &static_owner_names,
+            trait_owner,
             hits: &mut local_hits,
         };
         scan_member_node(tree.root_node(), &mut ctx);
@@ -462,6 +463,7 @@ struct MemberScanCtx<'a> {
     receiver_names: &'a Vec<String>,
     receiver_type_names: &'a HashSet<String>,
     static_owner_names: &'a HashSet<String>,
+    trait_owner: bool,
     hits: &'a mut BTreeSet<UsageHit>,
 }
 
@@ -787,7 +789,8 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some(owner_name) = simple_node_text(path, ctx.source) else {
         return;
     };
-    if !ctx.static_owner_names.contains(&owner_name) {
+    let static_owner_match = ctx.static_owner_names.contains(&owner_name);
+    if !static_owner_match && !static_trait_assoc_member_matches_owner(&owner_name, ctx) {
         return;
     }
 
@@ -806,6 +809,20 @@ fn record_static_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
         enclosing,
         ctx.hits,
     );
+}
+
+fn static_trait_assoc_member_matches_owner(owner_name: &str, ctx: &MemberScanCtx<'_>) -> bool {
+    if !ctx.trait_owner {
+        return false;
+    }
+    let refs = ctx.rust.reference_context_of(ctx.file);
+    let Some(type_fqn) = refs.resolve_path(owner_name) else {
+        return false;
+    };
+    let candidates = ctx
+        .rust
+        .trait_assoc_member_candidates(ctx.file, &type_fqn, ctx.member_name);
+    matches!(candidates.as_slice(), [candidate] if candidate.fq_name() == format!("{}.{}", ctx.owner.fq_name(), ctx.member_name))
 }
 
 fn self_like_constructor_returns(

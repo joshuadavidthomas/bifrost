@@ -2842,6 +2842,70 @@ fn rust_graph_hits(analyzer: &RustAnalyzer, fq_name: &str) -> Vec<brokk_bifrost:
 }
 
 #[test]
+fn rust_graph_strategy_finds_unique_trait_associated_function_candidate() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub trait Trait {
+    fn frobnicate();
+}
+
+pub struct Foo;
+
+impl Trait for Foo {}
+
+fn bar() {
+    Foo::frobnicate();
+}
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "Trait.frobnicate");
+    assert_eq!(
+        1,
+        hits.len(),
+        "expected the Foo::frobnicate() call to hit Trait.frobnicate: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("Foo::frobnicate()")),
+        "hit should be the static associated call site: {hits:?}"
+    );
+}
+
+#[test]
+fn rust_graph_strategy_ignores_ambiguous_trait_associated_function_candidates() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub trait Trait {
+    fn frobnicate();
+}
+
+pub trait OtherTrait {
+    fn frobnicate();
+}
+
+pub struct Foo;
+
+impl Trait for Foo {}
+impl OtherTrait for Foo {}
+
+fn bar() {
+    Foo::frobnicate();
+}
+"#,
+    )]);
+
+    let trait_hits = rust_graph_hits(&analyzer, "Trait.frobnicate");
+    let other_hits = rust_graph_hits(&analyzer, "OtherTrait.frobnicate");
+    assert!(
+        trait_hits.is_empty() && other_hits.is_empty(),
+        "ambiguous trait candidates must not emit partial hits: Trait={trait_hits:?}, OtherTrait={other_hits:?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_finds_reexported_free_function_call() {
     let (project, analyzer) = build_233_reexport_project();
     let hits = rust_graph_hits(&analyzer, "service.build_service");
