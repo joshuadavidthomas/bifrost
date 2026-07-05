@@ -211,6 +211,50 @@ fn analyze_commit_reads_from_bare_repo_without_worktree() {
 }
 
 #[test]
+fn analyze_commit_from_python_service_does_not_build_root_workspace_cache() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+    git(root, &["init"]);
+    git(root, &["config", "user.email", "tester@example.com"]);
+    git(root, &["config", "user.name", "Tester"]);
+
+    fs::write(
+        root.join("lib.go"),
+        "package sample\nfunc A() int { return 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("untouched.go"),
+        "package sample\nfunc Untouched() int { return 1 }\n",
+    )
+    .unwrap();
+    commit(root, "base");
+    fs::write(
+        root.join("lib.go"),
+        "package sample\nfunc A() int { return 2 }\n",
+    )
+    .unwrap();
+    let head = commit(root, "change");
+
+    let service = SearchToolsService::new_for_python(root.to_path_buf()).expect("service");
+    let result: Value = serde_json::from_str(
+        &service
+            .call_tool_json(
+                "analyze_commit",
+                &serde_json::json!({"revision": head}).to_string(),
+            )
+            .expect("analyze_commit"),
+    )
+    .expect("json");
+
+    assert_eq!(result["commit"]["hash"].as_str().unwrap(), head);
+    assert!(
+        !root.join(".bifrost").join("analyzer.db").exists(),
+        "analyze_commit should not force the root workspace analyzer/cache"
+    );
+}
+
+#[test]
 fn analyze_commit_reports_renamed_file_touches_on_exact_image_paths() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path();

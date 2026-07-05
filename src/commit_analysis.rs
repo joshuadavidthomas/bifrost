@@ -2,8 +2,8 @@ use crate::analyzer::{AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, Languag
 use crate::searchtools::{
     UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
 };
-use crate::{FilesystemProject, WorkspaceAnalyzer};
-use git2::{Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository, Tree};
+use crate::{FileSetProject, WorkspaceAnalyzer};
+use git2::{Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -177,7 +177,14 @@ pub fn analyze_commit(
     analyzer: &dyn IAnalyzer,
     params: AnalyzeCommitParams,
 ) -> Result<CommitAnalysisResult, String> {
-    let repo = Repository::open(analyzer.project().root())
+    analyze_commit_at_root(analyzer.project().root(), params)
+}
+
+pub fn analyze_commit_at_root(
+    root: &Path,
+    params: AnalyzeCommitParams,
+) -> Result<CommitAnalysisResult, String> {
+    let repo = Repository::open(root)
         .map_err(|err| format!("not a git repository at project root: {err}"))?;
     let object = repo
         .revparse_single(params.revision.trim())
@@ -210,11 +217,25 @@ pub fn analyze_commit(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let parent_paths: Vec<String> = file_changes
+        .iter()
+        .filter_map(|change| change.old_path.as_ref().or(change.path.as_ref()))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let commit_paths: Vec<String> = file_changes
+        .iter()
+        .filter_map(|change| change.path.as_ref())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
-    let parent_tree = MaterializedRevision::new(&repo, parent_oid)?;
-    let commit_tree = MaterializedRevision::new(&repo, commit_oid)?;
-    let parent_analyzer = build_analyzer(parent_tree.path())?;
-    let commit_analyzer = build_analyzer(commit_tree.path())?;
+    let parent_tree = MaterializedRevision::new(&repo, parent_oid, &parent_paths)?;
+    let commit_tree = MaterializedRevision::new(&repo, commit_oid, &commit_paths)?;
+    let parent_analyzer = build_analyzer(parent_tree.path(), parent_tree.files())?;
+    let commit_analyzer = build_analyzer(commit_tree.path(), commit_tree.files())?;
 
     let before = symbol_index(parent_analyzer.analyzer(), params.include_tests);
     let after = symbol_index(commit_analyzer.analyzer(), params.include_tests);
@@ -456,17 +477,22 @@ fn diff_metadata(
 
 struct MaterializedRevision {
     temp: RevisionTempDir,
+    files: Vec<PathBuf>,
 }
 
 impl MaterializedRevision {
-    fn new(repo: &Repository, oid: Oid) -> Result<Self, String> {
+    fn new(repo: &Repository, oid: Oid, paths: &[String]) -> Result<Self, String> {
         let temp = RevisionTempDir::new(oid)?;
-        export_commit_tree(repo, oid, temp.path())?;
-        Ok(Self { temp })
+        let files = export_commit_files(repo, oid, temp.path(), paths)?;
+        Ok(Self { temp, files })
     }
 
     fn path(&self) -> &Path {
         self.temp.path()
+    }
+
+    fn files(&self) -> &[PathBuf] {
+        &self.files
     }
 }
 
@@ -511,55 +537,52 @@ impl Drop for RevisionTempDir {
     }
 }
 
-fn export_commit_tree(repo: &Repository, oid: Oid, root: &Path) -> Result<(), String> {
+fn export_commit_files(
+    repo: &Repository,
+    oid: Oid,
+    root: &Path,
+    paths: &[String],
+) -> Result<Vec<PathBuf>, String> {
     let tree = repo
         .find_commit(oid)
         .and_then(|commit| commit.tree())
         .map_err(|err| format!("unable to read tree for {oid}: {err}"))?;
-    export_tree(repo, &tree, root)
-}
-
-fn export_tree(repo: &Repository, root_tree: &Tree<'_>, root: &Path) -> Result<(), String> {
-    let mut stack = vec![(root_tree.clone(), root.to_path_buf())];
-    while let Some((tree, directory)) = stack.pop() {
-        fs::create_dir_all(&directory)
-            .map_err(|err| format!("unable to create {}: {err}", directory.display()))?;
-
-        for entry in &tree {
-            let name = entry
-                .name()
-                .ok_or_else(|| "tree entry name is not valid UTF-8".to_string())?;
-            let rel = safe_tree_entry_component(name)?;
-            let path = directory.join(rel);
-
-            match entry.kind() {
-                Some(ObjectType::Tree) => {
-                    let subtree = entry
-                        .to_object(repo)
-                        .and_then(|object| object.peel_to_tree())
-                        .map_err(|err| format!("unable to read subtree `{name}`: {err}"))?;
-                    stack.push((subtree, path));
-                }
-                Some(ObjectType::Blob) if is_regular_file_mode(entry.filemode()) => {
-                    let blob = repo
-                        .find_blob(entry.id())
-                        .map_err(|err| format!("unable to read blob `{name}`: {err}"))?;
-                    fs::write(&path, blob.content())
-                        .map_err(|err| format!("unable to write {}: {err}", path.display()))?;
-                }
-                _ => {}
-            }
+    let mut exported = Vec::new();
+    for raw_path in paths {
+        let rel = safe_tree_entry_path(raw_path)?;
+        let Ok(entry) = tree.get_path(&rel) else {
+            continue;
+        };
+        if entry.kind() != Some(ObjectType::Blob) || !is_regular_file_mode(entry.filemode()) {
+            continue;
         }
+        let blob = repo
+            .find_blob(entry.id())
+            .map_err(|err| format!("unable to read blob `{}`: {err}", rel.display()))?;
+        let path = root.join(&rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("unable to create {}: {err}", parent.display()))?;
+        }
+        fs::write(&path, blob.content())
+            .map_err(|err| format!("unable to write {}: {err}", path.display()))?;
+        exported.push(rel);
     }
-    Ok(())
+    Ok(exported)
 }
 
-fn safe_tree_entry_component(name: &str) -> Result<&Path, String> {
+fn safe_tree_entry_path(name: &str) -> Result<PathBuf, String> {
     let path = Path::new(name);
-    let mut components = path.components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(_)), None) => Ok(path),
-        _ => Err(format!("unsafe tree entry name `{name}`")),
+    if path.as_os_str().is_empty() {
+        return Err("empty tree entry path".to_string());
+    }
+    if path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+    {
+        Ok(path.to_path_buf())
+    } else {
+        Err(format!("unsafe tree entry path `{name}`"))
     }
 }
 
@@ -569,11 +592,11 @@ fn is_regular_file_mode(mode: i32) -> bool {
         || mode == i32::from(FileMode::BlobExecutable)
 }
 
-fn build_analyzer(root: &Path) -> Result<WorkspaceAnalyzer, String> {
-    let project = Arc::new(
-        FilesystemProject::new(root.to_path_buf())
-            .map_err(|err| format!("unable to open materialized project: {err}"))?,
-    );
+fn build_analyzer(root: &Path, files: &[PathBuf]) -> Result<WorkspaceAnalyzer, String> {
+    let project = Arc::new(FileSetProject::new(
+        root.to_path_buf(),
+        files.iter().cloned(),
+    ));
     Ok(WorkspaceAnalyzer::build(project, AnalyzerConfig::default()))
 }
 

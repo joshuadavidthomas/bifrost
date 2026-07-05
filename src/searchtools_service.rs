@@ -10,7 +10,7 @@ use crate::{
         report_long_method_and_god_object_smells, report_secret_like_code,
         report_structural_clone_smells, report_test_assertion_smells,
     },
-    commit_analysis::{AnalyzeCommitParams, analyze_commit},
+    commit_analysis::{AnalyzeCommitParams, analyze_commit, analyze_commit_at_root},
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
     },
@@ -129,6 +129,7 @@ enum UpdateStrategy {
 }
 
 pub struct SearchToolsService {
+    root: RwLock<PathBuf>,
     session: RwLock<Option<WorkspaceSession>>,
     /// When constructed via `new_deferred`, the initial workspace build (file
     /// discovery + parse) runs on a background thread and lands here.
@@ -140,6 +141,7 @@ pub struct SearchToolsService {
     /// error) so every access after the first surfaces it instead of hanging.
     build_error: Mutex<Option<String>>,
     update_strategy: UpdateStrategy,
+    semantic_indexing: bool,
 }
 
 struct WorkspaceSession {
@@ -225,7 +227,7 @@ impl SearchToolsService {
     }
 
     pub fn new_for_python(root: PathBuf) -> Result<Self, String> {
-        Self::new_with_strategy(
+        Self::new_lazy_with_strategy(
             root,
             UpdateStrategy::WatchFiles,
             semantic_indexing_enabled(),
@@ -248,13 +250,16 @@ impl SearchToolsService {
     /// already-selected project. One-shot CLI subset workspaces use this to
     /// avoid whole-root watchers and analyzer DB reconciliation.
     pub fn new_manual_for_project(project: Arc<dyn Project>) -> Result<Self, String> {
+        let root = project.root().to_path_buf();
         let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
         let session = assemble_session(project, workspace, UpdateStrategy::Manual, false);
         Ok(Self {
+            root: RwLock::new(root),
             session: RwLock::new(Some(session)),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy: UpdateStrategy::Manual,
+            semantic_indexing: false,
         })
     }
 
@@ -327,6 +332,18 @@ impl SearchToolsService {
         }
         if name == "semantic_search_status" {
             return self.handle_semantic_search_status(arguments);
+        }
+        if name == "analyze_commit" {
+            let params =
+                serde_json::from_value::<AnalyzeCommitParams>(arguments).map_err(|err| {
+                    SearchToolsServiceError::invalid_params(format!(
+                        "Invalid tool arguments: {err}"
+                    ))
+                })?;
+            let root = self.service_root()?;
+            return Self::structured_only(
+                analyze_commit_at_root(&root, params).map_err(SearchToolsServiceError::internal)?,
+            );
         }
 
         let arguments = self.normalize_arguments_for_current_workspace(name, arguments)?;
@@ -534,18 +551,9 @@ impl SearchToolsService {
     }
 
     pub fn active_workspace_root(&self) -> PathBuf {
-        // Blocks on the deferred build so the real root is returned rather than
-        // a default; this runs on the tool-call path, which waits for readiness
-        // anyway.
-        let _ = self.ensure_ready();
-        self.session
+        self.root
             .read()
-            .ok()
-            .and_then(|guard| {
-                guard
-                    .as_ref()
-                    .map(|session| session.snapshot.analyzer().project().root().to_path_buf())
-            })
+            .map(|root| root.clone())
             .unwrap_or_default()
     }
 
@@ -563,12 +571,39 @@ impl SearchToolsService {
         semantic_indexing: bool,
     ) -> Result<Self, String> {
         let (project, workspace) = build_workspace(root)?;
+        let root = project.root().to_path_buf();
         let session = assemble_session(project, workspace, update_strategy, semantic_indexing);
         Ok(Self {
+            root: RwLock::new(root),
             session: RwLock::new(Some(session)),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             update_strategy,
+            semantic_indexing,
+        })
+    }
+
+    fn new_lazy_with_strategy(
+        root: PathBuf,
+        update_strategy: UpdateStrategy,
+        semantic_indexing: bool,
+    ) -> Result<Self, String> {
+        let canonical = root
+            .canonicalize()
+            .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
+        if !canonical.is_dir() {
+            return Err(format!(
+                "project root is not a directory: {}",
+                canonical.display()
+            ));
+        }
+        Ok(Self {
+            root: RwLock::new(canonical),
+            session: RwLock::new(None),
+            pending_build: Mutex::new(None),
+            build_error: Mutex::new(None),
+            update_strategy,
+            semantic_indexing,
         })
     }
 
@@ -601,28 +636,33 @@ impl SearchToolsService {
         }
         let handle = std::thread::Builder::new()
             .name("bifrost-index-build".to_string())
-            .spawn(move || -> Result<WorkspaceSession, String> {
-                let project: Arc<dyn Project> = Arc::new(
-                    FilesystemProject::new(canonical)
-                        .map_err(|err| format!("Failed to initialize project root: {err}"))?,
-                );
-                let workspace = WorkspaceAnalyzer::build_persisted(
-                    Arc::clone(&project),
-                    AnalyzerConfig::default(),
-                );
-                Ok(assemble_session(
-                    project,
-                    workspace,
-                    update_strategy,
-                    semantic_indexing,
-                ))
+            .spawn({
+                let canonical = canonical.clone();
+                move || -> Result<WorkspaceSession, String> {
+                    let project: Arc<dyn Project> = Arc::new(
+                        FilesystemProject::new(canonical)
+                            .map_err(|err| format!("Failed to initialize project root: {err}"))?,
+                    );
+                    let workspace = WorkspaceAnalyzer::build_persisted(
+                        Arc::clone(&project),
+                        AnalyzerConfig::default(),
+                    );
+                    Ok(assemble_session(
+                        project,
+                        workspace,
+                        update_strategy,
+                        semantic_indexing,
+                    ))
+                }
             })
             .map_err(|err| format!("Failed to spawn index build thread: {err}"))?;
         Ok(Self {
+            root: RwLock::new(canonical),
             session: RwLock::new(None),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
             update_strategy,
+            semantic_indexing,
         })
     }
 
@@ -663,6 +703,27 @@ impl SearchToolsService {
             .clone()
         {
             return Err(SearchToolsServiceError::internal(err));
+        }
+        if self
+            .session
+            .read()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .is_none()
+        {
+            let (project, workspace) =
+                build_workspace(self.service_root()?).map_err(SearchToolsServiceError::internal)?;
+            let session = assemble_session(
+                project,
+                workspace,
+                self.update_strategy,
+                self.semantic_indexing,
+            );
+            let mut guard = self.session.write().map_err(|_| {
+                SearchToolsServiceError::internal("SearchToolsService lock poisoned")
+            })?;
+            if guard.is_none() {
+                *guard = Some(session);
+            }
         }
         Ok(())
     }
@@ -809,6 +870,11 @@ impl SearchToolsService {
         );
         drop(guard);
         old_session.close_semantic();
+        *self
+            .root
+            .write()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))? =
+            resolved.clone();
 
         active_workspace_result(&resolved)
     }
@@ -1072,6 +1138,13 @@ impl SearchToolsService {
         self.ensure_ready()?;
         self.session
             .read()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
+    }
+
+    fn service_root(&self) -> Result<PathBuf, SearchToolsServiceError> {
+        self.root
+            .read()
+            .map(|root| root.clone())
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
     }
 
