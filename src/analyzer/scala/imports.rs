@@ -1,8 +1,10 @@
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, ProjectFile,
+    build_reverse_import_index,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
+use std::sync::Arc;
 
 use super::ScalaAnalyzer;
 use super::declarations::last_segment;
@@ -14,63 +16,109 @@ impl ScalaAnalyzer {
         };
         if info.is_wildcard {
             return self
-                .inner
-                .all_declarations()
-                .filter(|unit| unit.package_name() == path && is_scala_importable_top_level(unit))
-                .cloned()
-                .collect();
+                .importable_declarations_by_package()
+                .get(&path)
+                .map(|units| units.iter().cloned().collect())
+                .unwrap_or_default();
         }
         self.inner.definitions(&path).cloned().collect()
+    }
+
+    fn importable_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>> {
+        self.importable_declarations_by_package.get_or_init(|| {
+            let mut declarations: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+            for unit in self.inner.all_declarations() {
+                if is_scala_importable_top_level(unit) {
+                    declarations
+                        .entry(unit.package_name().to_string())
+                        .or_default()
+                        .push(unit.clone());
+                }
+            }
+            declarations
+                .into_iter()
+                .map(|(package, units)| (package, Arc::new(units)))
+                .collect()
+        })
+    }
+
+    fn same_package_reference_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        self.same_package_reference_index.get_or_init(|| {
+            let mut files_by_package: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+            for file in self.inner.all_files() {
+                if file_language(file) != Language::Scala {
+                    continue;
+                }
+                if let Some(package) = self.inner.package_name_of(file) {
+                    files_by_package
+                        .entry(package.to_string())
+                        .or_default()
+                        .push(file.clone());
+                }
+            }
+
+            let mut references_by_target: HashMap<ProjectFile, HashSet<ProjectFile>> =
+                HashMap::default();
+            for files in files_by_package.values() {
+                for target in files {
+                    let references = references_by_target.entry(target.clone()).or_default();
+                    for candidate in files {
+                        if candidate != target {
+                            references.insert(candidate.clone());
+                        }
+                    }
+                }
+            }
+
+            references_by_target
+                .into_iter()
+                .map(|(target, files)| (target, Arc::new(files)))
+                .collect()
+        })
     }
 }
 
 impl ImportAnalysisProvider for ScalaAnalyzer {
     fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+        if let Some(cached) = self.imported_code_units.get(file) {
+            return (*cached).clone();
+        }
+        if file_language(file) != Language::Scala {
+            return HashSet::default();
+        }
         let mut imported = HashSet::default();
         for info in self.inner.import_info_of(file) {
             for code_unit in self.resolve_import_info(info) {
                 imported.insert(code_unit);
             }
         }
+        self.imported_code_units
+            .insert(file.clone(), Arc::new(imported.clone()));
         imported
     }
 
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {
-        let mut result = HashSet::default();
+        if let Some(cached) = self.referencing_files.get(file) {
+            return (*cached).clone();
+        }
         if file_language(file) != Language::Scala {
-            return result;
+            return HashSet::default();
         }
-        let Some(target_package) = self.inner.package_name_of(file) else {
-            return result;
-        };
-        let target_names: HashSet<String> = self
-            .inner
-            .top_level_declarations(file)
-            .filter(|unit| is_scala_importable_top_level(unit))
-            .map(scala_importable_name)
-            .collect();
 
-        for candidate in self.inner.all_files() {
-            if candidate == file {
-                continue;
-            }
-            if self.inner.package_name_of(candidate).unwrap_or("") == target_package
-                && self
-                    .inner
-                    .type_identifiers_of(candidate)
-                    .is_some_and(|identifiers| {
-                        identifiers
-                            .iter()
-                            .any(|identifier| target_names.contains(identifier))
-                    })
-            {
-                result.insert(candidate.clone());
-                continue;
-            }
-            if self.could_import_file(candidate, self.import_info_of(candidate), file) {
-                result.insert(candidate.clone());
-            }
+        let reverse_index = self.reverse_import_index.get_or_init(|| {
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
+        });
+        let mut result = reverse_index
+            .get(file)
+            .map(|files| (**files).clone())
+            .unwrap_or_default();
+        if let Some(files) = self.same_package_reference_index().get(file) {
+            result.extend(files.iter().cloned());
         }
+
+        self.referencing_files
+            .insert(file.clone(), Arc::new(result.clone()));
         result
     }
 
