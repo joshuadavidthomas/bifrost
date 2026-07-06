@@ -1,4 +1,5 @@
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::cpp_graph::{
     CppTargetKind, CppVisibilityIndex, cpp_call_arity, cpp_constructor_type_node,
     cpp_first_type_child, cpp_function_return_type_text, cpp_is_declaration_name,
@@ -327,18 +328,13 @@ impl<'a> DefinitionBatchContext<'a> {
         analyzer: &dyn IAnalyzer,
     ) -> Option<Arc<GoProjectGraph>> {
         if self.go_graph.is_none() {
-            let graph = analyzer
-                .project()
-                .analyzable_files(Language::Go)
-                .ok()
-                .and_then(|files| {
-                    let files: Vec<ProjectFile> = files.into_iter().collect();
-                    if files.is_empty() {
-                        return None;
-                    }
-                    let cache = preparse_go_files(&files);
-                    build_workspace_go_graph(go, &files, Some(&cache)).map(Arc::new)
-                });
+            let files = analyzed_files_for_language(analyzer, Language::Go);
+            let graph = if files.is_empty() {
+                None
+            } else {
+                let cache = preparse_go_files(&files);
+                build_workspace_go_graph(go, &files, Some(&cache)).map(Arc::new)
+            };
             self.go_graph = Some(graph);
         }
         self.go_graph.as_ref().and_then(Clone::clone)

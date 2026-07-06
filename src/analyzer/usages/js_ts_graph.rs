@@ -41,6 +41,7 @@ mod resolver;
 pub(in crate::analyzer::usages) use receiver_analysis::JsTsReceiverFactProvider;
 pub(crate) use resolver::{JsTsUsageIndex, build_jsts_usage_index};
 
+use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
 use crate::analyzer::usages::js_ts_graph::resolver::{is_static_member, target_language};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
@@ -203,13 +204,7 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let has_jsts = [Language::TypeScript, Language::JavaScript]
             .iter()
-            .any(|language| {
-                analyzer
-                    .project()
-                    .analyzable_files(*language)
-                    .map(|set| set.into_iter().next().is_some())
-                    .unwrap_or(false)
-            });
+            .any(|language| !analyzed_files_for_language(analyzer, *language).is_empty());
         has_jsts.then_some(Self)
     }
 
@@ -228,12 +223,7 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
             std::collections::BTreeMap::new();
 
         for language in [Language::TypeScript, Language::JavaScript] {
-            let has_files = analyzer
-                .project()
-                .analyzable_files(language)
-                .map(|set| set.into_iter().next().is_some())
-                .unwrap_or(false);
-            if !has_files {
+            if analyzed_files_for_language(analyzer, language).is_empty() {
                 continue;
             }
             let result = inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
@@ -274,12 +264,7 @@ where
     let mut any = false;
 
     for language in [Language::TypeScript, Language::JavaScript] {
-        let has_files = analyzer
-            .project()
-            .analyzable_files(language)
-            .map(|set| set.into_iter().next().is_some())
-            .unwrap_or(false);
-        if !has_files {
+        if analyzed_files_for_language(analyzer, language).is_empty() {
             continue;
         }
         any = true;

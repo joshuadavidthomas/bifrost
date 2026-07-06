@@ -12,8 +12,9 @@ impl ImportAnalysisProvider for CppAnalyzer {
         }
 
         let mut resolved = HashSet::default();
+        let include_targets = self.include_target_index();
         for path in quoted_include_paths(self.inner.import_statements(file)) {
-            for target in resolve_include_targets(self.inner.project(), file, &path) {
+            for target in resolve_include_targets_with_index(file, &path, include_targets) {
                 resolved.extend(self.inner.top_level_declarations(&target).cloned());
             }
         }
@@ -84,50 +85,142 @@ impl ImportAnalysisProvider for CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    pub(crate) fn include_target_index(&self) -> &IncludeTargetIndex {
+        self.include_target_index.get_or_init(|| {
+            let files: Vec<_> = self.inner.all_files().cloned().collect();
+            IncludeTargetIndex::build(files.iter())
+        })
+    }
+
     fn reverse_include_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
         self.reverse_include_index.get_or_init(|| {
             let files: Vec<_> = self.inner.all_files().cloned().collect();
-            let mut by_rel_path: HashMap<PathBuf, Vec<ProjectFile>> = HashMap::default();
-            let mut by_file_name: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-            for file in &files {
-                by_rel_path
-                    .entry(file.rel_path().to_path_buf())
-                    .or_default()
-                    .push(file.clone());
-                if let Some(file_name) =
-                    file.rel_path().file_name().and_then(|value| value.to_str())
-                {
-                    by_file_name
-                        .entry(file_name.to_string())
-                        .or_default()
-                        .push(file.clone());
-                }
-            }
+            let include_targets = self.include_target_index();
 
             build_reverse_file_index(&files, |candidate| {
                 let mut matched_targets = HashSet::default();
                 let mut resolved_targets = Vec::new();
                 for include in quoted_include_paths(self.inner.import_statements(candidate)) {
-                    if let Some(path_targets) = by_rel_path.get(Path::new(&include)) {
-                        for target in path_targets {
-                            if matched_targets.insert(target.clone()) {
-                                resolved_targets.push(target.clone());
-                            }
-                        }
-                    }
-                    for suffix in string_suffixes(&include) {
-                        if let Some(name_targets) = by_file_name.get(suffix) {
-                            for target in name_targets {
-                                if matched_targets.insert(target.clone()) {
-                                    resolved_targets.push(target.clone());
-                                }
-                            }
+                    for target in include_targets.resolve_indexed(&include) {
+                        if matched_targets.insert(target.clone()) {
+                            resolved_targets.push(target);
                         }
                     }
                 }
                 resolved_targets
             })
         })
+    }
+}
+
+pub(crate) struct IncludeTargetIndex {
+    by_rel_path: HashMap<PathBuf, Vec<ProjectFile>>,
+    by_file_name: HashMap<String, Vec<ProjectFile>>,
+}
+
+impl IncludeTargetIndex {
+    pub(crate) fn build<'a>(files: impl IntoIterator<Item = &'a ProjectFile>) -> Self {
+        let mut by_rel_path: HashMap<PathBuf, Vec<ProjectFile>> = HashMap::default();
+        let mut by_file_name: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+        for file in files {
+            by_rel_path
+                .entry(file.rel_path().to_path_buf())
+                .or_default()
+                .push(file.clone());
+            if let Some(file_name) = file.rel_path().file_name().and_then(|value| value.to_str()) {
+                by_file_name
+                    .entry(file_name.to_string())
+                    .or_default()
+                    .push(file.clone());
+            }
+        }
+        Self {
+            by_rel_path,
+            by_file_name,
+        }
+    }
+
+    fn resolve_indexed(&self, include: &str) -> Vec<ProjectFile> {
+        let include_path = Path::new(include);
+        let mut matched = HashSet::default();
+        let mut resolved = Vec::new();
+        if let Some(targets) = self.by_rel_path.get(include_path) {
+            for target in targets {
+                if matched.insert(target.clone()) {
+                    resolved.push(target.clone());
+                }
+            }
+        }
+        for suffix in string_suffixes(include) {
+            if let Some(targets) = self.by_file_name.get(suffix) {
+                for target in targets {
+                    if matched.insert(target.clone()) {
+                        resolved.push(target.clone());
+                    }
+                }
+            }
+        }
+        resolved
+    }
+
+    fn resolve_direct(&self, source_file: &ProjectFile, include: &str) -> Vec<ProjectFile> {
+        let include_path = Path::new(include);
+        let mut matched = HashSet::default();
+        let mut resolved = Vec::new();
+        if include_path.is_absolute() {
+            if let Ok(rel_path) = include_path.strip_prefix(source_file.root()) {
+                self.extend_rel_path(rel_path, &mut matched, &mut resolved);
+            }
+            return resolved;
+        }
+
+        let source_relative = ProjectFile::new(
+            source_file.root().to_path_buf(),
+            source_file.parent().join(include_path),
+        );
+        self.extend_rel_path(source_relative.rel_path(), &mut matched, &mut resolved);
+
+        let project_relative =
+            ProjectFile::new(source_file.root().to_path_buf(), include_path.to_path_buf());
+        self.extend_rel_path(project_relative.rel_path(), &mut matched, &mut resolved);
+        resolved
+    }
+
+    fn extend_rel_path(
+        &self,
+        rel_path: &Path,
+        matched: &mut HashSet<ProjectFile>,
+        out: &mut Vec<ProjectFile>,
+    ) {
+        if let Some(targets) = self.by_rel_path.get(rel_path) {
+            for target in targets {
+                if matched.insert(target.clone()) {
+                    out.push(target.clone());
+                }
+            }
+        }
+    }
+
+    fn resolve_unique_fallback(&self, include: &str) -> Vec<ProjectFile> {
+        let include_path = Path::new(include);
+        let matches: Vec<_> = self
+            .resolve_indexed(include)
+            .into_iter()
+            .filter(|file| {
+                if include_path.components().count() > 1 {
+                    file.rel_path().ends_with(include_path)
+                } else {
+                    file.rel_path()
+                        .file_name()
+                        .is_some_and(|name| name == include_path)
+                }
+            })
+            .collect();
+        if matches.len() == 1 {
+            matches
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -184,36 +277,19 @@ pub(crate) fn resolve_include_targets(
     candidates
 }
 
-pub(crate) fn resolve_include_targets_with_unique_fallback(
-    project: &dyn Project,
+pub(crate) fn resolve_include_targets_with_index(
     source_file: &ProjectFile,
     include: &str,
+    include_targets: &IncludeTargetIndex,
 ) -> Vec<ProjectFile> {
-    let mut candidates = resolve_include_targets(project, source_file, include);
+    let mut candidates = include_targets.resolve_direct(source_file, include);
     if !candidates.is_empty() {
         return candidates;
     }
-    let include_path = Path::new(include);
-    if include_path.is_absolute() {
+    if Path::new(include).is_absolute() {
         return candidates;
     }
-    if let Ok(files) = project.all_files() {
-        let matches: Vec<_> = files
-            .into_iter()
-            .filter(|file| {
-                if include_path.components().count() > 1 {
-                    file.rel_path().ends_with(include_path)
-                } else {
-                    file.rel_path()
-                        .file_name()
-                        .is_some_and(|name| name == include_path)
-                }
-            })
-            .collect();
-        if matches.len() == 1 {
-            candidates.extend(matches);
-        }
-    }
+    candidates.extend(include_targets.resolve_unique_fallback(include));
     candidates
 }
 
@@ -287,4 +363,34 @@ fn strip_slash_prefix<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     }
     path.strip_prefix(root)
         .and_then(|rest| rest.strip_prefix('/'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_file(root: &Path, rel: &str) -> ProjectFile {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().expect("test file has parent")).unwrap();
+        fs::write(&path, "").unwrap();
+        ProjectFile::new(root.to_path_buf(), rel)
+    }
+
+    #[test]
+    fn indexed_include_resolution_uses_unique_suffix_fallback() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = write_file(&root, "src/lib.c");
+        let target = write_file(&root, "include/git2/sys/credential.h");
+        let duplicate = write_file(&root, "vendor/credential.h");
+        let index = IncludeTargetIndex::build([&source, &target, &duplicate]);
+
+        let resolved = resolve_include_targets_with_index(&source, "git2/sys/credential.h", &index);
+        assert_eq!(resolved, vec![target]);
+
+        let ambiguous = resolve_include_targets_with_index(&source, "credential.h", &index);
+        assert!(ambiguous.is_empty());
+    }
 }

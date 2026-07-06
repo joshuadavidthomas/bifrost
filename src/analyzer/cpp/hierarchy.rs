@@ -3,6 +3,7 @@ use crate::analyzer::build_direct_descendant_index;
 
 impl CppAnalyzer {
     fn build_direct_ancestor_index(&self) -> HashMap<String, Arc<Vec<CodeUnit>>> {
+        let include_targets = self.include_target_index();
         let mut visible_by_file = HashMap::default();
         let mut index = HashMap::default();
 
@@ -10,7 +11,8 @@ impl CppAnalyzer {
             if self.is_type_alias(code_unit) {
                 continue;
             }
-            let visible = self.visible_type_units(code_unit.source(), &mut visible_by_file);
+            let visible =
+                self.visible_type_units(code_unit.source(), include_targets, &mut visible_by_file);
             let mut ancestors = Vec::new();
             for raw in self.inner.raw_supertypes_of(code_unit) {
                 if let Some(ancestor) = self.resolve_base_type(code_unit, raw, &visible)
@@ -30,6 +32,7 @@ impl CppAnalyzer {
     fn visible_type_units(
         &self,
         file: &ProjectFile,
+        include_targets: &IncludeTargetIndex,
         cache: &mut HashMap<ProjectFile, Arc<Vec<CodeUnit>>>,
     ) -> Arc<Vec<CodeUnit>> {
         if let Some(cached) = cache.get(file) {
@@ -38,7 +41,7 @@ impl CppAnalyzer {
 
         let mut visited = HashSet::default();
         let mut declarations = Vec::new();
-        self.collect_visible_type_units(file, &mut visited, &mut declarations);
+        self.collect_visible_type_units(file, include_targets, &mut visited, &mut declarations);
         declarations.sort();
         declarations.dedup();
 
@@ -50,6 +53,7 @@ impl CppAnalyzer {
     fn collect_visible_type_units(
         &self,
         file: &ProjectFile,
+        include_targets: &IncludeTargetIndex,
         visited: &mut HashSet<ProjectFile>,
         out: &mut Vec<CodeUnit>,
     ) {
@@ -64,10 +68,8 @@ impl CppAnalyzer {
         );
 
         for include in include_paths(self.inner.import_statements(file)) {
-            for target in
-                resolve_include_targets_with_unique_fallback(self.project(), file, &include)
-            {
-                self.collect_visible_type_units(&target, visited, out);
+            for target in resolve_include_targets_with_index(file, &include, include_targets) {
+                self.collect_visible_type_units(&target, include_targets, visited, out);
             }
         }
     }

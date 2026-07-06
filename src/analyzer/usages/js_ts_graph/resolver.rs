@@ -1,5 +1,5 @@
 use crate::analyzer::js_ts::syntax::compute_import_binder;
-use crate::analyzer::usages::common::language_for_target_filtered;
+use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target_filtered};
 use crate::analyzer::usages::js_ts_graph::extractor::compute_export_index;
 use crate::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportBinding, ImportKind,
@@ -483,11 +483,7 @@ fn export_names_for_file(
 }
 
 pub(super) fn collect_jsts_files(analyzer: &dyn IAnalyzer, language: Language) -> Vec<ProjectFile> {
-    let mut result: Vec<ProjectFile> = analyzer
-        .project()
-        .analyzable_files(language)
-        .map(|set| set.into_iter().collect())
-        .unwrap_or_default();
+    let mut result = analyzed_files_for_language(analyzer, language);
     result.sort();
     result.dedup();
     result

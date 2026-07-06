@@ -1,4 +1,6 @@
-use crate::analyzer::usages::common::{language_for_file, language_for_target};
+use crate::analyzer::usages::common::{
+    analyzed_files_for_language, language_for_file, language_for_target,
+};
 use crate::analyzer::usages::traits::CandidateFileProvider;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashSet, set_with_capacity};
@@ -63,16 +65,14 @@ impl CandidateFileProvider for ImportGraphCandidateProvider {
                 continue;
             }
 
-            if let Ok(files) = analyzer.project().analyzable_files(language) {
-                for file in files {
-                    let file_parent: PathBuf = file
-                        .rel_path()
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_default();
-                    if file_parent == parent_dir {
-                        candidates.insert(file);
-                    }
+            for file in analyzed_files_for_language(analyzer, language) {
+                let file_parent: PathBuf = file
+                    .rel_path()
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default();
+                if file_parent == parent_dir {
+                    candidates.insert(file);
                 }
             }
         }
@@ -102,9 +102,7 @@ fn add_scala_candidates_for_java_type(
         return;
     }
 
-    let Ok(files) = analyzer.project().analyzable_files(Language::Scala) else {
-        return;
-    };
+    let files = analyzed_files_for_language(analyzer, Language::Scala);
     if files.is_empty() {
         return;
     }
@@ -155,16 +153,12 @@ impl CandidateFileProvider for TextSearchCandidateProvider {
             return HashSet::default();
         }
 
-        let files = match analyzer.project().analyzable_files(language) {
-            Ok(files) => files,
-            Err(_) => return HashSet::default(),
-        };
+        let files = analyzed_files_for_language(analyzer, language);
         if files.is_empty() {
             return HashSet::default();
         }
 
         let matches: Mutex<HashSet<ProjectFile>> = Mutex::new(HashSet::default());
-        let files: Vec<ProjectFile> = files.into_iter().collect();
 
         files.par_iter().for_each(|file| {
             if file.is_binary().unwrap_or(true) {

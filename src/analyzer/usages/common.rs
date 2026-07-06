@@ -1,6 +1,6 @@
 use crate::analyzer::common as analyzer_common;
 use crate::analyzer::usages::model::UsageHit;
-use crate::analyzer::{CodeUnit, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use std::collections::BTreeSet;
 use tree_sitter::Node;
 
@@ -27,6 +27,19 @@ pub(super) fn language_for_target_filtered(
 
 pub(super) fn language_for_file(file: &ProjectFile) -> Language {
     analyzer_common::language_for_file(file)
+}
+
+pub(crate) fn analyzed_files_for_language(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+) -> Vec<ProjectFile> {
+    let mut files: Vec<ProjectFile> = analyzer
+        .analyzed_files()
+        .filter(|file| language_for_file(file) == language)
+        .cloned()
+        .collect();
+    files.sort();
+    files
 }
 
 /// Whether `left` and `right` are the same syntax node, by tree-sitter node

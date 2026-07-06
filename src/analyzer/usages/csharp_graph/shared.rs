@@ -1,7 +1,7 @@
 use super::extractor::{ScanState, scan_file};
 use super::inverted;
 use super::resolver::{TargetKind, TargetSpec};
-use crate::analyzer::usages::common::language_for_file;
+use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -96,12 +96,7 @@ pub(crate) struct CSharpEdgeResolver<'a> {
 impl<'a> UsageEdgeResolver<'a> for CSharpEdgeResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
-        let files: Vec<ProjectFile> = analyzer
-            .project()
-            .analyzable_files(Language::CSharp)
-            .ok()?
-            .into_iter()
-            .collect();
+        let files = analyzed_files_for_language(analyzer, Language::CSharp);
         Some(Self { csharp, files })
     }
 

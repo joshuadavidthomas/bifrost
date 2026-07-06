@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::resolve_include_targets_with_index;
 use crate::analyzer::usages::cpp_call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_type_name, cpp_parameter_type_text,
     cpp_type_text_pointer_depth, normalize_cpp_type_name,
@@ -2560,10 +2561,15 @@ fn cpp_unresolved_include_boundary(
     if !reference.contains("::") && !reference.chars().next().is_some_and(char::is_uppercase) {
         return false;
     }
+    let include_targets =
+        resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.include_target_index());
     analyzer.import_statements(file).iter().any(|import| {
-        cpp_include_paths(std::slice::from_ref(import))
-            .iter()
-            .any(|include| resolve_include_targets(analyzer.project(), file, include).is_empty())
+        cpp_include_paths(std::slice::from_ref(import)).iter().any(
+            |include| match include_targets {
+                Some(index) => resolve_include_targets_with_index(file, include, index).is_empty(),
+                None => resolve_include_targets(analyzer.project(), file, include).is_empty(),
+            },
+        )
     })
 }
 

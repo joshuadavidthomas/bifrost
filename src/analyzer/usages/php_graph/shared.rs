@@ -2,7 +2,7 @@ use super::extractor::scan_file;
 use super::hits::push_override_declaration_hit;
 use super::inverted;
 use super::resolver::{PhpHierarchyIndex, TargetKind, TargetSpec};
-use crate::analyzer::usages::common::language_for_file;
+use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -82,12 +82,7 @@ pub(crate) struct PhpEdgeResolver<'a> {
 impl<'a> UsageEdgeResolver<'a> for PhpEdgeResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let php = resolve_analyzer::<PhpAnalyzer>(analyzer)?;
-        let files: Vec<ProjectFile> = analyzer
-            .project()
-            .analyzable_files(Language::Php)
-            .ok()?
-            .into_iter()
-            .collect();
+        let files = analyzed_files_for_language(analyzer, Language::Php);
         Some(Self { php, files })
     }
 

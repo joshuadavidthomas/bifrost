@@ -4,7 +4,7 @@ mod inverted;
 mod reference;
 mod resolver;
 
-use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
 use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
 use crate::analyzer::usages::go_graph::resolver::{
     GoEdgeIndex, TargetSpec, build_go_edge_index, build_go_graph,
@@ -89,12 +89,7 @@ pub(crate) struct GoEdgeResolver<'a> {
 impl<'a> UsageEdgeResolver<'a> for GoEdgeResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let go = resolve_analyzer::<GoAnalyzer>(analyzer)?;
-        let files: Vec<ProjectFile> = analyzer
-            .project()
-            .analyzable_files(Language::Go)
-            .ok()?
-            .into_iter()
-            .collect();
+        let files = analyzed_files_for_language(analyzer, Language::Go);
         if files.is_empty() {
             return None;
         }

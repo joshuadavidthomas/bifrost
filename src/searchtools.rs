@@ -4139,7 +4139,7 @@ fn render_clustered_usage_file_groups(hits: &[UsageHitRow]) -> Vec<UsageFileGrou
         .map(|(path, enclosing_groups)| {
             let mut rendered_hits = Vec::new();
             for (enclosing, mut group) in enclosing_groups {
-                group.sort_by(|left, right| left.line.cmp(&right.line));
+                group.sort_by_key(|hit| hit.line);
                 if group.len() > 2 {
                     let first = group.first().expect("non-empty group");
                     let last = group.last().expect("non-empty group");

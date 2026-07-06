@@ -2,7 +2,7 @@ use crate::analyzer::usages::candidates::{
     FallbackCandidateProvider, ImportGraphCandidateProvider, TextSearchCandidateProvider,
     default_provider,
 };
-use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
 use crate::analyzer::usages::cpp_graph::CppUsageGraphStrategy;
 use crate::analyzer::usages::csharp_graph::CSharpUsageGraphStrategy;
 use crate::analyzer::usages::go_graph::GoUsageGraphStrategy;
@@ -211,10 +211,7 @@ fn add_php_composer_candidates(
     if !php.target_has_composer_autoload_visibility(target) {
         return;
     }
-    let Ok(files) = analyzer.project().analyzable_files(Language::Php) else {
-        return;
-    };
-    candidates.extend(files);
+    candidates.extend(analyzed_files_for_language(analyzer, Language::Php));
 }
 
 fn add_php_import_alias_candidates(
@@ -240,10 +237,7 @@ fn add_php_import_alias_candidates(
                 .map(|unit| unit.source().clone()),
         );
     }
-    let Ok(files) = analyzer.project().analyzable_files(Language::Php) else {
-        return;
-    };
-    for file in files {
+    for file in analyzed_files_for_language(analyzer, Language::Php) {
         let aliases = php.use_aliases_by_kind_of(&file);
         if aliases
             .type_aliases

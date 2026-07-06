@@ -5,9 +5,9 @@ use crate::analyzer::usages::cpp_call_match::{
 use crate::analyzer::usages::cpp_graph::extractor::ScanCtx;
 use crate::analyzer::usages::local_inference::LocalInferenceEngine;
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, ProjectFile, cpp_include_paths,
-    cpp_node_text as node_text, normalize_cpp_whitespace,
-    resolve_include_targets_with_unique_fallback,
+    CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, IncludeTargetIndex, ProjectFile,
+    cpp_include_paths, cpp_node_text as node_text, normalize_cpp_whitespace,
+    resolve_include_targets_with_index,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -181,8 +181,9 @@ impl VisibilityIndex {
         roots: &HashSet<ProjectFile>,
     ) -> Self {
         let mut files = HashSet::default();
+        let include_targets = cpp.include_target_index();
         for file in roots {
-            collect_include_closure(cpp, analyzer, file, &mut files);
+            collect_include_closure(analyzer, include_targets, file, &mut files);
         }
         let declarations_by_file: HashMap<ProjectFile, BTreeSet<CodeUnit>> = files
             .iter()
@@ -193,8 +194,8 @@ impl VisibilityIndex {
             let mut visited = HashSet::default();
             let mut visible = HashSet::default();
             collect_visible_declarations(
-                cpp,
                 analyzer,
+                include_targets,
                 &declarations_by_file,
                 file,
                 &mut visited,
@@ -736,8 +737,8 @@ fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 pub(super) fn collect_include_closure(
-    cpp: &CppAnalyzer,
     analyzer: &dyn IAnalyzer,
+    include_targets: &IncludeTargetIndex,
     file: &ProjectFile,
     out: &mut HashSet<ProjectFile>,
 ) {
@@ -747,9 +748,7 @@ pub(super) fn collect_include_closure(
             continue;
         }
         for include in cpp_include_paths(analyzer.import_statements(&file)) {
-            for target in
-                resolve_include_targets_with_unique_fallback(cpp.project(), &file, &include)
-            {
+            for target in resolve_include_targets_with_index(&file, &include, include_targets) {
                 stack.push(target);
             }
         }
@@ -757,8 +756,8 @@ pub(super) fn collect_include_closure(
 }
 
 pub(super) fn collect_visible_declarations(
-    cpp: &CppAnalyzer,
     analyzer: &dyn IAnalyzer,
+    include_targets: &IncludeTargetIndex,
     declarations_by_file: &HashMap<ProjectFile, BTreeSet<CodeUnit>>,
     file: &ProjectFile,
     visited: &mut HashSet<ProjectFile>,
@@ -773,9 +772,7 @@ pub(super) fn collect_visible_declarations(
             out.extend(declarations.iter().cloned());
         }
         for include in cpp_include_paths(analyzer.import_statements(&file)) {
-            for target in
-                resolve_include_targets_with_unique_fallback(cpp.project(), &file, &include)
-            {
+            for target in resolve_include_targets_with_index(&file, &include, include_targets) {
                 stack.push(target);
             }
         }
