@@ -2,7 +2,7 @@ use crate::analyzer::{
     CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
     build_reverse_import_index,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use std::sync::Arc;
 use tree_sitter::Node;
 
@@ -52,15 +52,6 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         if target_namespaces.is_empty() {
             return HashSet::default();
         }
-        let target_identifiers: HashSet<String> = target_classes
-            .iter()
-            .map(|unit| unit.identifier().to_string())
-            .collect();
-        let target_fq_names: HashSet<String> = target_classes
-            .iter()
-            .flat_map(|unit| [unit.fq_name(), unit.fq_name().replace('$', ".")])
-            .collect();
-
         let reverse_index = self.memo_caches.reverse_import_index.get_or_init(|| {
             let files: Vec<_> = self.inner.all_files().cloned().collect();
             build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
@@ -70,31 +61,8 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
             .map(|files| (**files).clone())
             .unwrap_or_default();
 
-        for candidate in self.inner.all_files() {
-            if candidate == file || result.contains(candidate) {
-                continue;
-            }
-            let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
-                continue;
-            };
-            let candidate_namespace = self.namespace_of_file(candidate);
-            let same_namespace = target_namespaces
-                .iter()
-                .any(|namespace| namespace == &candidate_namespace);
-            if same_namespace
-                && identifiers
-                    .iter()
-                    .any(|name| target_identifiers.contains(name))
-            {
-                result.insert(candidate.clone());
-                continue;
-            }
-            if identifiers
-                .iter()
-                .any(|name| target_fq_names.contains(name))
-            {
-                result.insert(candidate.clone());
-            }
+        if let Some(files) = self.implicit_reference_index().get(file) {
+            result.extend(files.iter().cloned());
         }
 
         self.memo_caches
@@ -136,6 +104,77 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
                     .filter(|unit| unit.kind() == CodeUnitType::Class)
                     .any(|unit| candidates.contains(&unit))
             })
+    }
+}
+
+impl CSharpAnalyzer {
+    fn implicit_reference_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        self.memo_caches.implicit_reference_index.get_or_init(|| {
+            let mut by_namespace_and_name: HashMap<(String, String), Vec<ProjectFile>> =
+                HashMap::default();
+            let mut by_fq_name: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+            for target in self.inner.all_files() {
+                for unit in self
+                    .inner
+                    .top_level_declarations(target)
+                    .filter(|unit| unit.kind() == CodeUnitType::Class)
+                {
+                    by_namespace_and_name
+                        .entry((
+                            unit.package_name().to_string(),
+                            unit.identifier().to_string(),
+                        ))
+                        .or_default()
+                        .push(target.clone());
+                    by_fq_name
+                        .entry(unit.fq_name())
+                        .or_default()
+                        .push(target.clone());
+                    by_fq_name
+                        .entry(unit.fq_name().replace('$', "."))
+                        .or_default()
+                        .push(target.clone());
+                }
+            }
+
+            let mut references_by_target: HashMap<ProjectFile, HashSet<ProjectFile>> =
+                HashMap::default();
+            for candidate in self.inner.all_files() {
+                let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
+                    continue;
+                };
+                let candidate_namespace = self.namespace_of_file(candidate);
+                for identifier in identifiers {
+                    if let Some(targets) = by_namespace_and_name
+                        .get(&(candidate_namespace.clone(), identifier.clone()))
+                    {
+                        for target in targets {
+                            if target != candidate {
+                                references_by_target
+                                    .entry(target.clone())
+                                    .or_default()
+                                    .insert(candidate.clone());
+                            }
+                        }
+                    }
+                    if let Some(targets) = by_fq_name.get(identifier) {
+                        for target in targets {
+                            if target != candidate {
+                                references_by_target
+                                    .entry(target.clone())
+                                    .or_default()
+                                    .insert(candidate.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            references_by_target
+                .into_iter()
+                .map(|(target, files)| (target, Arc::new(files)))
+                .collect()
+        })
     }
 }
 
