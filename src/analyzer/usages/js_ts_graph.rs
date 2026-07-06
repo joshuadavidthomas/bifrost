@@ -45,7 +45,9 @@ use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
 use crate::analyzer::usages::js_ts_graph::resolver::{is_static_member, target_language};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::usages::traits::{
+    UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
+};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
     resolve_analyzer,
@@ -108,7 +110,7 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let Some(target) = overloads.first() else {
@@ -163,13 +165,13 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 );
             }
         } else {
+            let candidate_files = scan_scope.candidate_files();
             let importers = index.importers_of_seeds(&seeds);
-            let scan_files: HashSet<ProjectFile> = candidate_files
-                .iter()
-                .cloned()
-                .chain(importers)
-                .chain(std::iter::once(target.source().clone()))
-                .collect();
+            let mut scan_files: HashSet<ProjectFile> = candidate_files.iter().cloned().collect();
+            scan_files.extend(importers.into_iter().filter(|file| scan_scope.allows(file)));
+            if scan_scope.allows(target.source()) {
+                scan_files.insert(target.source().clone());
+            }
 
             scan_files_for_seeds(analyzer, index, &scan_files, target, &seeds, language)
         };
@@ -335,7 +337,7 @@ impl JsTsExportUsageGraphStrategy {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let Some(resolver) = JsTsQueryResolver::try_new(analyzer) else {
@@ -348,7 +350,7 @@ impl JsTsExportUsageGraphStrategy {
                 "JsTsExportUsageGraphStrategy",
             );
         };
-        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
     }
 }
 
@@ -375,7 +377,8 @@ impl UsageAnalyzer for JsTsExportUsageGraphStrategy {
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> FuzzyResult {
-        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+        let scan_scope = UsageScanScope::new(candidate_files, false);
+        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
             .into_fuzzy_result()
     }
 }

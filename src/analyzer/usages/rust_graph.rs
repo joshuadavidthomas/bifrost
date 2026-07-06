@@ -15,7 +15,9 @@ use crate::analyzer::usages::rust_graph::resolver::{
     infer_graph_seeds, is_graph_visible_member_target, is_member_target,
     supports_same_file_local_scan, unresolved_external_frontier_specifiers,
 };
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::usages::traits::{
+    UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -58,7 +60,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let Some(target) = overloads.first() else {
@@ -67,6 +69,12 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
         let rust = self.rust;
 
         let hits = if supports_same_file_local_scan(rust, target) {
+            if scan_scope.is_authoritative() && !scan_scope.allows(target.source()) {
+                return GraphUsageOutcome::Resolved(FuzzyResult::success(
+                    target.clone(),
+                    BTreeSet::new(),
+                ));
+            }
             let scan_files: HashSet<ProjectFile> = [target.source().clone()].into_iter().collect();
             let graph = build_rust_graph_for_files(scan_files.clone());
             scan_files_for_target(analyzer, rust, &graph, scan_files, target, None)
@@ -100,7 +108,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                         BTreeSet::new(),
                     ));
                 }
-                let scan_files = effective_scan_files(rust, candidate_files, target, &seeds);
+                let scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
                 let graph = build_rust_graph_for_files(scan_files.clone());
                 scan_files_for_member_target(analyzer, &graph, rust, scan_files, target, &seeds)
             }
@@ -113,7 +121,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                     "RustExportUsageGraphStrategy",
                 );
             }
-            let scan_files = effective_scan_files(rust, candidate_files, target, &seeds);
+            let scan_files = effective_scan_files(rust, scan_scope, target, &seeds);
             let graph = build_rust_graph_for_files(scan_files.clone());
             scan_files_for_target(analyzer, rust, &graph, scan_files, target, Some(&seeds))
         };
@@ -208,7 +216,7 @@ impl RustExportUsageGraphStrategy {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         if overloads.is_empty() {
@@ -234,7 +242,7 @@ impl RustExportUsageGraphStrategy {
             );
         };
 
-        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
     }
 }
 
@@ -246,7 +254,8 @@ impl UsageAnalyzer for RustExportUsageGraphStrategy {
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> FuzzyResult {
-        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+        let scan_scope = UsageScanScope::new(candidate_files, false);
+        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
             .into_fuzzy_result()
     }
 }

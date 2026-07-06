@@ -11,7 +11,9 @@ use crate::analyzer::usages::java_graph::resolver::{TargetKind, TargetSpec};
 use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::usages::traits::{
+    UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 
@@ -78,7 +80,7 @@ impl JavaUsageGraphStrategy {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         if overloads.is_empty() {
@@ -104,7 +106,7 @@ impl JavaUsageGraphStrategy {
             );
         };
 
-        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
     }
 }
 
@@ -116,7 +118,8 @@ impl UsageAnalyzer for JavaUsageGraphStrategy {
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> FuzzyResult {
-        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+        let scan_scope = UsageScanScope::new(candidate_files, false);
+        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
             .into_fuzzy_result()
     }
 }

@@ -15,7 +15,7 @@ use crate::analyzer::usages::python_graph::PythonExportUsageGraphStrategy;
 use crate::analyzer::usages::ruby_graph::RubyUsageGraphStrategy;
 use crate::analyzer::usages::rust_graph::RustExportUsageGraphStrategy;
 use crate::analyzer::usages::scala_graph::ScalaUsageGraphStrategy;
-use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer};
+use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -55,6 +55,7 @@ pub struct CandidateFilesSample {
 pub struct UsageFinder {
     fallback_candidate_provider: DefaultCandidateProvider,
     file_filter: Option<FileFilter>,
+    authoritative_scope: bool,
 }
 
 impl UsageFinder {
@@ -62,6 +63,7 @@ impl UsageFinder {
         Self {
             fallback_candidate_provider: default_provider(),
             file_filter: None,
+            authoritative_scope: false,
         }
     }
 
@@ -70,6 +72,11 @@ impl UsageFinder {
         F: Fn(&ProjectFile) -> bool + Send + Sync + 'static,
     {
         self.file_filter = Some(Box::new(filter));
+        self
+    }
+
+    pub fn with_authoritative_scope(mut self, authoritative: bool) -> Self {
+        self.authoritative_scope = authoritative;
         self
     }
 
@@ -130,11 +137,12 @@ impl UsageFinder {
             .map(|all_candidates| candidate_files_sample(all_candidates, &candidates));
 
         let mut graph_failure = None;
+        let scan_scope = UsageScanScope::new(&candidates, self.authoritative_scope);
         let result = match graph_find_usages(
             language_for_target(target),
             analyzer,
             overloads,
-            &candidates,
+            &scan_scope,
             max_usages,
         ) {
             GraphUsageOutcome::Resolved(result) => result,
@@ -346,16 +354,10 @@ macro_rules! impl_graph_usage_analyzer {
                 &self,
                 analyzer: &dyn IAnalyzer,
                 overloads: &[CodeUnit],
-                candidate_files: &HashSet<ProjectFile>,
+                scan_scope: &UsageScanScope<'_>,
                 max_usages: usize,
             ) -> GraphUsageOutcome {
-                <$strategy>::find_graph_usages(
-                    self,
-                    analyzer,
-                    overloads,
-                    candidate_files,
-                    max_usages,
-                )
+                <$strategy>::find_graph_usages(self, analyzer, overloads, scan_scope, max_usages)
             }
         }
     };
@@ -376,17 +378,17 @@ fn graph_strategy_find_usages(
     strategy: &dyn GraphUsageAnalyzer,
     analyzer: &dyn IAnalyzer,
     overloads: &[CodeUnit],
-    candidates: &HashSet<ProjectFile>,
+    scan_scope: &UsageScanScope<'_>,
     max_usages: usize,
 ) -> GraphUsageOutcome {
-    strategy.find_graph_usages(analyzer, overloads, candidates, max_usages)
+    strategy.find_graph_usages(analyzer, overloads, scan_scope, max_usages)
 }
 
 fn graph_find_usages(
     language: Language,
     analyzer: &dyn IAnalyzer,
     overloads: &[CodeUnit],
-    candidates: &HashSet<ProjectFile>,
+    scan_scope: &UsageScanScope<'_>,
     max_usages: usize,
 ) -> GraphUsageOutcome {
     match language {
@@ -394,70 +396,70 @@ fn graph_find_usages(
             &JsTsExportUsageGraphStrategy::new(),
             analyzer,
             overloads,
-            candidates,
+            scan_scope,
             max_usages,
         ),
         Language::Python => graph_strategy_find_usages(
             &PythonExportUsageGraphStrategy::new(),
             analyzer,
             overloads,
-            candidates,
+            scan_scope,
             max_usages,
         ),
         Language::Php => graph_strategy_find_usages(
             &PhpUsageGraphStrategy::new(),
             analyzer,
             overloads,
-            candidates,
+            scan_scope,
             max_usages,
         ),
         Language::Rust => graph_strategy_find_usages(
             &RustExportUsageGraphStrategy::new(),
             analyzer,
             overloads,
-            candidates,
+            scan_scope,
             max_usages,
         ),
         Language::Java => graph_strategy_find_usages(
             &JavaUsageGraphStrategy::new(),
             analyzer,
             overloads,
-            candidates,
+            scan_scope,
             max_usages,
         ),
         Language::CSharp => graph_strategy_find_usages(
             &CSharpUsageGraphStrategy::new(),
             analyzer,
             overloads,
-            candidates,
+            scan_scope,
             max_usages,
         ),
         Language::Cpp => graph_strategy_find_usages(
             &CppUsageGraphStrategy::new(),
             analyzer,
             overloads,
-            candidates,
+            scan_scope,
             max_usages,
         ),
         Language::Go => graph_strategy_find_usages(
             &GoUsageGraphStrategy::new(),
             analyzer,
             overloads,
-            candidates,
+            scan_scope,
             max_usages,
         ),
         Language::Scala => graph_strategy_find_usages(
             &ScalaUsageGraphStrategy::new(),
             analyzer,
             overloads,
-            candidates,
+            scan_scope,
             max_usages,
         ),
         Language::Ruby => graph_strategy_find_usages(
             &RubyUsageGraphStrategy::new(),
             analyzer,
             overloads,
-            candidates,
+            scan_scope,
             max_usages,
         ),
         Language::None => GraphUsageOutcome::terminal_failure(

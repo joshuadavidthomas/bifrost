@@ -15,7 +15,9 @@ pub(in crate::analyzer::usages) use crate::analyzer::usages::go_graph::resolver:
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::usages::traits::{
+    UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
+};
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 pub(in crate::analyzer::usages) use reference::resolve_go_reference;
@@ -59,12 +61,13 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
+        let candidate_files = scan_scope.candidate_files();
         let graph = build_go_graph(self.go, candidate_files, target.source(), None);
         resolve_with_graph(
             analyzer,
@@ -72,6 +75,7 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
             &graph,
             overloads,
             candidate_files,
+            scan_scope,
             max_usages,
         )
     }
@@ -131,7 +135,7 @@ impl GoUsageGraphStrategy {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         if overloads.is_empty() {
@@ -157,7 +161,7 @@ impl GoUsageGraphStrategy {
             );
         };
 
-        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
     }
 }
 
@@ -170,6 +174,7 @@ fn resolve_with_graph(
     graph: &GoProjectGraph,
     overloads: &[CodeUnit],
     candidate_files: &HashSet<ProjectFile>,
+    scan_scope: &UsageScanScope<'_>,
     max_usages: usize,
 ) -> GraphUsageOutcome {
     let target = &overloads[0];
@@ -182,7 +187,10 @@ fn resolve_with_graph(
         );
     }
 
-    let scan_files = graph.scan_files(candidate_files, target, &target_spec);
+    let mut scan_files = graph.scan_files(candidate_files, target, &target_spec);
+    if scan_scope.is_authoritative() {
+        scan_files.retain(|file| scan_scope.allows(file));
+    }
     let hits = scan_files_for_target(analyzer, graph, scan_files, &target_spec);
     let hits: BTreeSet<_> = hits
         .into_iter()
@@ -208,7 +216,8 @@ impl UsageAnalyzer for GoUsageGraphStrategy {
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> FuzzyResult {
-        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+        let scan_scope = UsageScanScope::new(candidate_files, false);
+        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
             .into_fuzzy_result()
     }
 }

@@ -9,6 +9,7 @@ use crate::analyzer::usages::rust_graph::hits::{
 use crate::analyzer::usages::rust_graph::resolver::{
     is_trait_owner, resolve_scoped_associated_item,
 };
+use crate::analyzer::usages::traits::UsageScanScope;
 use crate::analyzer::{
     CodeUnit, DefinitionLookupIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer,
     RustReferenceContext,
@@ -60,16 +61,21 @@ fn parse_rust_graph_file(file: &ProjectFile) -> Option<(ProjectFile, ParsedFile)
 
 pub(super) fn effective_scan_files(
     analyzer: &RustAnalyzer,
-    candidate_files: &HashSet<ProjectFile>,
+    scan_scope: &UsageScanScope<'_>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
 ) -> HashSet<ProjectFile> {
+    let candidate_files = scan_scope.candidate_files();
     let analyzed = analyzer.get_analyzed_files();
     let filtered_candidates: HashSet<_> = candidate_files
         .iter()
         .filter(|file| analyzed.contains(*file))
         .cloned()
         .collect();
+
+    if scan_scope.is_authoritative() {
+        return filtered_candidates;
+    }
 
     if !candidate_files.is_empty() && filtered_candidates.is_empty() {
         return [target.source().clone()].into_iter().collect();

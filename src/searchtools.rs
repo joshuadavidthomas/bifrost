@@ -2412,7 +2412,7 @@ fn scoped_usage_finder(
     } else if let Some(path_filter) = path_filter.clone() {
         finder = finder.with_file_filter(move |file| path_filter.matches(file));
     }
-    finder
+    finder.with_authoritative_scope(path_filter.is_some())
 }
 
 /// Split a definition selector into an optional file anchor and the name to

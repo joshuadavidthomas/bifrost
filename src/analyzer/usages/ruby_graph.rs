@@ -16,7 +16,7 @@ use crate::analyzer::usages::common::{
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::UsageAnalyzer;
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageScanScope};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, Range, RubyAnalyzer, resolve_analyzer,
 };
@@ -46,7 +46,7 @@ impl RubyUsageGraphStrategy {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let Some(target) = overloads.first() else {
@@ -75,9 +75,15 @@ impl RubyUsageGraphStrategy {
         };
 
         let semantic = RubySemanticIndex::build(analyzer, ruby, &spec);
-        let mut scan_files = candidate_files.clone();
-        scan_files.insert(target.source().clone());
-        scan_files.extend(ruby.zeitwerk_reference_files_for_identifier(&spec.member_name));
+        let mut scan_files = scan_scope.candidate_files().clone();
+        if scan_scope.allows(target.source()) {
+            scan_files.insert(target.source().clone());
+        }
+        scan_files.extend(
+            ruby.zeitwerk_reference_files_for_identifier(&spec.member_name)
+                .into_iter()
+                .filter(|file| scan_scope.allows(file)),
+        );
 
         let mut hits = BTreeSet::new();
         let mut saw_unproven_match = false;
@@ -141,7 +147,8 @@ impl UsageAnalyzer for RubyUsageGraphStrategy {
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> FuzzyResult {
-        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+        let scan_scope = UsageScanScope::new(candidate_files, false);
+        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
             .into_fuzzy_result()
     }
 }

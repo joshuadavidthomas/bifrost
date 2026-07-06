@@ -2737,6 +2737,155 @@ fn scan_usages_paths_scope_returns_all_in_scope_callers() {
 }
 
 #[test]
+fn scan_usages_paths_scope_blocks_js_ts_importer_expansion() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("lib.ts", "export function helper() { return 1; }\n")
+        .file(
+            "scoped.ts",
+            "import { helper } from './lib';\nexport const value = 1;\n",
+        )
+        .file(
+            "out_of_scope.ts",
+            "import { helper } from './lib';\nexport const value = helper();\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["helper"],"include_tests":true,"paths":["scoped.ts"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(1, array_len(&value, "usages"), "payload: {value}");
+    assert_eq!(0, value["usages"][0]["total_hits"].as_u64().unwrap());
+    assert!(value["usages"][0]["files"].is_null(), "payload: {value}");
+}
+
+#[test]
+fn scan_usages_paths_scope_blocks_csharp_target_source_leakage() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Service.cs",
+            "namespace App; public class Service { public void Run() {} public void Call() { this.Run(); } }\n",
+        )
+        .file(
+            "Scoped.cs",
+            "namespace App; public class Scoped { public void Other() {} }\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["App.Service.Run"],"include_tests":true,"paths":["Scoped.cs"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(1, array_len(&value, "usages"), "payload: {value}");
+    assert_eq!(0, value["usages"][0]["total_hits"].as_u64().unwrap());
+}
+
+#[test]
+fn scan_usages_paths_scope_blocks_jvm_php_scala_target_source_leakage() {
+    let java_project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "Service.java",
+            "public class Service { public void run() {} public void call() { run(); } }\n",
+        )
+        .file("Scoped.java", "public class Scoped {}\n")
+        .build();
+    let java_service =
+        SearchToolsService::new_without_semantic_index(java_project.root().to_path_buf()).unwrap();
+    let java_payload = java_service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Service.run"],"include_tests":true,"paths":["Scoped.java"]}"#,
+        )
+        .unwrap();
+    let java_value: Value = serde_json::from_str(&java_payload).unwrap();
+    assert_eq!(
+        0,
+        java_value["usages"][0]["total_hits"].as_u64().unwrap(),
+        "payload: {java_value}"
+    );
+
+    let php_project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "Service.php",
+            "<?php\nclass Service { public function run() {} public function call() { $this->run(); } }\n",
+        )
+        .file("Scoped.php", "<?php\nclass Scoped {}\n")
+        .build();
+    let php_service =
+        SearchToolsService::new_without_semantic_index(php_project.root().to_path_buf()).unwrap();
+    let php_payload = php_service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Service.run"],"include_tests":true,"paths":["Scoped.php"]}"#,
+        )
+        .unwrap();
+    let php_value: Value = serde_json::from_str(&php_payload).unwrap();
+    assert_eq!(
+        0,
+        php_value["usages"][0]["total_hits"].as_u64().unwrap(),
+        "payload: {php_value}"
+    );
+
+    let scala_project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "Service.scala",
+            "class Service { def run(): Unit = {}; def call(): Unit = run() }\n",
+        )
+        .file("Scoped.scala", "class Scoped {}\n")
+        .build();
+    let scala_service =
+        SearchToolsService::new_without_semantic_index(scala_project.root().to_path_buf()).unwrap();
+    let scala_payload = scala_service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Service.run"],"include_tests":true,"paths":["Scoped.scala"]}"#,
+        )
+        .unwrap();
+    let scala_value: Value = serde_json::from_str(&scala_payload).unwrap();
+    assert_eq!(
+        0,
+        scala_value["usages"][0]["total_hits"].as_u64().unwrap(),
+        "payload: {scala_value}"
+    );
+}
+
+#[test]
+fn scan_usages_paths_scope_blocks_rust_empty_scope_fallback() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("lib.rs", "pub fn target() {}\n")
+        .file(
+            "caller.rs",
+            "use crate::target;\npub fn call() { target(); }\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["target"],"include_tests":true,"paths":["missing.rs"]}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(1, array_len(&value, "usages"), "payload: {value}");
+    assert_eq!(0, value["usages"][0]["total_hits"].as_u64().unwrap());
+}
+
+#[test]
 fn scan_usages_paths_scope_does_not_truncate_broad_glob_candidates_before_scanning() {
     let mut project = InlineTestProject::with_language(Language::Java).file(
         "Greeter.java",

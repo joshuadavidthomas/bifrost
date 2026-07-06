@@ -9,7 +9,9 @@ use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::python_graph::extractor::{build_python_graph, scan_files_for_seeds};
 use crate::analyzer::usages::python_graph::resolver::infer_export_names;
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::usages::traits::{
+    UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
+};
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_analyzer,
 };
@@ -52,13 +54,14 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let py = self.py;
+        let candidate_files = scan_scope.candidate_files();
 
         let graph = build_python_graph(py, candidate_files, target.source());
         let seed_names = infer_export_names(py, target);
@@ -82,7 +85,10 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
             );
         }
 
-        let scan_files = graph.scan_files(candidate_files, target.source());
+        let mut scan_files = graph.scan_files(candidate_files, target.source());
+        if scan_scope.is_authoritative() {
+            scan_files.retain(|file| scan_scope.allows(file));
+        }
 
         let hits = scan_files_for_seeds(analyzer, py, &graph, &scan_files, target, &seeds);
         let hits: BTreeSet<UsageHit> = hits
@@ -145,7 +151,7 @@ impl PythonExportUsageGraphStrategy {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         if overloads.is_empty() {
@@ -171,7 +177,7 @@ impl PythonExportUsageGraphStrategy {
             );
         };
 
-        resolver.find_usages(analyzer, overloads, candidate_files, max_usages)
+        resolver.find_usages(analyzer, overloads, scan_scope, max_usages)
     }
 }
 
@@ -183,7 +189,8 @@ impl UsageAnalyzer for PythonExportUsageGraphStrategy {
         candidate_files: &HashSet<ProjectFile>,
         max_usages: usize,
     ) -> FuzzyResult {
-        self.find_graph_usages(analyzer, overloads, candidate_files, max_usages)
+        let scan_scope = UsageScanScope::new(candidate_files, false);
+        self.find_graph_usages(analyzer, overloads, &scan_scope, max_usages)
             .into_fuzzy_result()
     }
 }

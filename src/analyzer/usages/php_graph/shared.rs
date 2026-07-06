@@ -6,7 +6,7 @@ use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver};
+use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -26,7 +26,7 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome {
         let Some(target) = overloads.first() else {
@@ -40,12 +40,15 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
             );
         };
 
-        let files: HashSet<ProjectFile> = candidate_files
+        let candidate_files = scan_scope.candidate_files();
+        let mut files: HashSet<ProjectFile> = candidate_files
             .iter()
             .filter(|file| language_for_file(file) == Language::Php)
             .cloned()
-            .chain(std::iter::once(target.source().clone()))
             .collect();
+        if scan_scope.allows(target.source()) {
+            files.insert(target.source().clone());
+        }
 
         let hierarchy = matches!(spec.kind, TargetKind::Method | TargetKind::Field)
             .then(|| PhpHierarchyIndex::for_target_owner(self.php, &spec, &files));

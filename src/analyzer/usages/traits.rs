@@ -4,6 +4,38 @@ use crate::analyzer::usages::outcome::GraphUsageOutcome;
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::HashSet;
 
+/// Files a usage query is allowed to scan.
+///
+/// A non-authoritative scope is a candidate hint: strategies may add importers,
+/// definition files, or other structured files. An authoritative scope is a hard
+/// boundary from a caller-supplied `paths` filter: any internally-added files
+/// must already be present in `candidate_files`.
+pub(crate) struct UsageScanScope<'a> {
+    candidate_files: &'a HashSet<ProjectFile>,
+    authoritative: bool,
+}
+
+impl<'a> UsageScanScope<'a> {
+    pub(crate) fn new(candidate_files: &'a HashSet<ProjectFile>, authoritative: bool) -> Self {
+        Self {
+            candidate_files,
+            authoritative,
+        }
+    }
+
+    pub(crate) fn candidate_files(&self) -> &'a HashSet<ProjectFile> {
+        self.candidate_files
+    }
+
+    pub(crate) fn is_authoritative(&self) -> bool {
+        self.authoritative
+    }
+
+    pub(crate) fn allows(&self, file: &ProjectFile) -> bool {
+        !self.authoritative || self.candidate_files.contains(file)
+    }
+}
+
 /// Strategy for resolving usages of one or more overloads within a candidate file set.
 pub trait UsageAnalyzer: Send + Sync {
     fn find_usages(
@@ -21,7 +53,7 @@ pub(crate) trait GraphUsageAnalyzer: UsageAnalyzer {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome;
 }
@@ -40,7 +72,7 @@ pub(crate) trait UsageQueryResolver<'a>: Sized {
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
-        candidate_files: &HashSet<ProjectFile>,
+        scan_scope: &UsageScanScope<'_>,
         max_usages: usize,
     ) -> GraphUsageOutcome;
 }
