@@ -86,6 +86,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
                 short_name: target.short_name().to_string(),
                 total_callsites: external_hit_count,
                 limit: max_usages,
+                sample_hits: hits,
             });
         }
 

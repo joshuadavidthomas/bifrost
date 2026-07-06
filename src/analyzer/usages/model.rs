@@ -234,6 +234,7 @@ pub enum FuzzyResult {
         short_name: String,
         total_callsites: usize,
         limit: usize,
+        sample_hits: BTreeSet<UsageHit>,
     },
 }
 
@@ -313,6 +314,7 @@ impl FuzzyResult {
                 short_name,
                 total_callsites,
                 limit,
+                ..
             } => Err(format!(
                 "Too many call sites for symbol: {short_name} ({total_callsites}, limit {limit})"
             )),
@@ -594,6 +596,7 @@ mod tests {
             short_name: "bar".to_string(),
             total_callsites: 2000,
             limit: 1000,
+            sample_hits: BTreeSet::new(),
         };
         let err = result.into_either().unwrap_err();
         assert!(err.contains("2000"));

@@ -75,6 +75,7 @@ impl<'a> UsageQueryResolver<'a> for ScalaQueryResolver<'a> {
                     short_name: target.short_name().to_string(),
                     total_callsites: hits.len(),
                     limit: max_usages,
+                    sample_hits: hits,
                 });
             }
             if limit_exceeded {

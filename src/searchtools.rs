@@ -3155,7 +3155,18 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 short_name,
                 total_callsites,
                 limit,
+                sample_hits,
             } => {
+                let filtered =
+                    filter_and_dedupe_hits(analyzer, &overloads, sample_hits.into_iter().collect());
+                render_states.push(SymbolUsageRenderState::partial_summary(
+                    symbol.clone(),
+                    total_callsites,
+                    truncated,
+                    filtered.definition_sites_excluded,
+                    filtered.hits,
+                    Some(too_many_callsites_summary_note(limit)),
+                ));
                 too_many_callsites.push(TooManyCallsitesInfo {
                     symbol,
                     short_name,
@@ -3694,6 +3705,28 @@ impl SymbolUsageRenderState {
             top_enclosing_limit: SCAN_USAGES_TOP_ENCLOSING_LIMIT,
         }
     }
+
+    fn partial_summary(
+        symbol: String,
+        total_hits: usize,
+        candidate_files_truncated: bool,
+        definition_sites_excluded: usize,
+        hits: Vec<UsageHitRow>,
+        base_note: Option<String>,
+    ) -> Self {
+        let mut state = Self::new(
+            symbol,
+            candidate_files_truncated,
+            definition_sites_excluded,
+            hits,
+            base_note,
+        );
+        state.total_hits = total_hits;
+        state.rendering = UsageRendering::Summary;
+        state.file_limit = (state.summary_files.len() > SCAN_USAGES_SUMMARY_FILE_LIMIT)
+            .then_some(SCAN_USAGES_SUMMARY_FILE_LIMIT);
+        state
+    }
 }
 
 fn filter_and_dedupe_hits(
@@ -3810,11 +3843,7 @@ fn build_scan_usages_summary(
     ambiguous: &[AmbiguousUsageSymbol],
     too_many_callsites: &[TooManyCallsitesInfo],
 ) -> ScanUsagesSummary {
-    let requested_symbols = usages.len()
-        + not_found.len()
-        + failures.len()
-        + ambiguous.len()
-        + too_many_callsites.len();
+    let requested_symbols = usages.len() + not_found.len() + failures.len() + ambiguous.len();
     let total_hits = usages.iter().map(|usage| usage.total_hits).sum();
     let partial = usages
         .iter()
@@ -4241,6 +4270,12 @@ fn some_if_nonzero(value: usize) -> Option<usize> {
 fn too_many_callsites_note(limit: usize) -> String {
     format!(
         "Stopped after the {limit}-callsite cap for this high-fanout symbol. Re-call with narrower `paths` or a more specific declaration; exhaustive output is intentionally suppressed for this query."
+    )
+}
+
+fn too_many_callsites_summary_note(limit: usize) -> String {
+    format!(
+        "Callsite cap exceeded for this high-fanout symbol (limit {limit}); this is an incomplete summary of observed hits before stopping. Re-call with `paths` from the files list for line-level detail."
     )
 }
 

@@ -1426,6 +1426,7 @@ public class Consumer {
             short_name,
             total_callsites,
             limit,
+            ..
         } => {
             assert_eq!("Target.run", short_name);
             assert_eq!(1, limit);

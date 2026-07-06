@@ -132,6 +132,7 @@ impl RubyUsageGraphStrategy {
                 short_name: spec.target.short_name().to_string(),
                 total_callsites: hits.len(),
                 limit: max_usages,
+                sample_hits: hits,
             });
         }
 

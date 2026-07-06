@@ -101,6 +101,7 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
                 short_name: target.short_name().to_string(),
                 total_callsites: hits.len(),
                 limit: max_usages,
+                sample_hits: hits,
             });
         }
 

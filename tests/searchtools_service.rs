@@ -3106,6 +3106,98 @@ fn scan_usages_demotes_large_result_to_summary_within_budget() {
 }
 
 #[test]
+fn scan_usages_too_many_callsites_returns_incomplete_summary_with_observed_files() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("Target.java"),
+        "public class Target {\n    public void hit() {}\n}\n",
+    )
+    .unwrap();
+    for idx in 0..1001 {
+        fs::write(
+            temp.path().join(format!("Caller{idx}.java")),
+            format!(
+                "public class Caller{idx} {{\n    public void run() {{ new Target().hit(); }}\n}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let service =
+        SearchToolsService::new_without_semantic_index(temp.path().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["Target.hit"],"paths":["Caller*.java"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(
+        1,
+        value["summary"]["requested_symbols"].as_u64().unwrap(),
+        "payload: {value}"
+    );
+    assert_eq!(
+        1,
+        value["summary"]["resolved_symbols"].as_u64().unwrap(),
+        "payload: {value}"
+    );
+    assert_eq!(true, value["summary"]["partial"], "payload: {value}");
+    assert_eq!(
+        1001,
+        value["summary"]["total_hits"].as_u64().unwrap(),
+        "payload: {value}"
+    );
+
+    let too_many = value["too_many_callsites"].as_array().unwrap();
+    assert_eq!(1, too_many.len(), "payload: {value}");
+    assert_eq!(
+        1001,
+        too_many[0]["total_callsites"].as_u64().unwrap(),
+        "payload: {value}"
+    );
+    assert_eq!(
+        1000,
+        too_many[0]["limit"].as_u64().unwrap(),
+        "payload: {value}"
+    );
+
+    let usages = value["usages"].as_array().unwrap();
+    assert_eq!(1, usages.len(), "payload: {value}");
+    let usage = &usages[0];
+    assert_eq!("summary", usage["rendering"], "payload: {value}");
+    assert_eq!(
+        1001,
+        usage["total_hits"].as_u64().unwrap(),
+        "payload: {value}"
+    );
+    assert!(
+        usage["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("incomplete summary")
+                && note.contains("`paths` from the files list")),
+        "payload: {value}"
+    );
+    assert!(
+        usage["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty()
+                && files
+                    .iter()
+                    .all(|file| file["path"].as_str().unwrap().starts_with("Caller")
+                        && file["hit_count"].as_u64() == Some(1))),
+        "payload: {value}"
+    );
+    assert!(
+        usage["files_truncated"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_resolved_symbol_with_no_hits_is_emitted_with_zero_total() {
     // method7 lives on A.AInner.AInnerInner and has no callers in the fixture.
     let service = SearchToolsService::new_without_semantic_index(fixture_root()).unwrap();
