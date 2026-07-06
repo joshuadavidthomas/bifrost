@@ -27,34 +27,8 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             .get(file)
             .map(|files| (**files).clone())
             .unwrap_or_default();
-
-        let target_identifiers: HashSet<String> = self
-            .inner
-            .top_level_declarations(file)
-            .filter(|code_unit| code_unit.is_class() || code_unit.is_module())
-            .map(|code_unit| code_unit.identifier().to_string())
-            .collect();
-
-        let target_package = self.inner.package_name_of(file).unwrap_or("");
-        for candidate in self.inner.all_files() {
-            if candidate == file || result.contains(candidate) {
-                continue;
-            }
-            if self.inner.package_name_of(candidate).unwrap_or("") != target_package {
-                continue;
-            }
-
-            if self
-                .inner
-                .type_identifiers_of(candidate)
-                .is_some_and(|candidate_identifiers| {
-                    candidate_identifiers
-                        .iter()
-                        .any(|identifier| target_identifiers.contains(identifier))
-                })
-            {
-                result.insert(candidate.clone());
-            }
+        if let Some(files) = self.same_package_reference_index().get(file) {
+            result.extend(files.iter().cloned());
         }
 
         self.memo_caches
@@ -204,6 +178,58 @@ impl ImportAnalysisProvider for JavaAnalyzer {
 impl TestDetectionProvider for JavaAnalyzer {}
 
 impl JavaAnalyzer {
+    fn same_package_reference_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        self.memo_caches
+            .same_package_reference_index
+            .get_or_init(|| {
+                let mut targets_by_package_and_name: HashMap<(String, String), Vec<ProjectFile>> =
+                    HashMap::default();
+                for file in self.inner.all_files() {
+                    let package = self.inner.package_name_of(file).unwrap_or("").to_string();
+                    for declaration in self.inner.top_level_declarations(file) {
+                        if declaration.is_class() || declaration.is_module() {
+                            targets_by_package_and_name
+                                .entry((package.clone(), declaration.identifier().to_string()))
+                                .or_default()
+                                .push(file.clone());
+                        }
+                    }
+                }
+
+                let mut references_by_target: HashMap<ProjectFile, HashSet<ProjectFile>> =
+                    HashMap::default();
+                for candidate in self.inner.all_files() {
+                    let package = self
+                        .inner
+                        .package_name_of(candidate)
+                        .unwrap_or("")
+                        .to_string();
+                    let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
+                        continue;
+                    };
+                    for identifier in identifiers {
+                        if let Some(targets) =
+                            targets_by_package_and_name.get(&(package.clone(), identifier.clone()))
+                        {
+                            for target in targets {
+                                if target != candidate {
+                                    references_by_target
+                                        .entry(target.clone())
+                                        .or_default()
+                                        .insert(candidate.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                references_by_target
+                    .into_iter()
+                    .map(|(target, files)| (target, Arc::new(files)))
+                    .collect()
+            })
+    }
+
     pub fn could_import_file_without_source(
         &self,
         imports: &[ImportInfo],
