@@ -9,8 +9,9 @@ use crate::analyzer::usages::cpp_graph::{
 use crate::analyzer::usages::csharp_graph::{
     csharp_argument_count, csharp_first_type_child, csharp_is_declaration_name,
     csharp_is_extension_method, csharp_is_type_reference_node, csharp_member_declared_type_fq_name,
-    csharp_method_return_type_fq_name, csharp_node_text, csharp_reference_type_text,
-    csharp_signature_arity, member_access_name as csharp_member_access_name,
+    csharp_method_return_type_fq_name, csharp_node_text, csharp_object_initializer_for_label,
+    csharp_reference_type_text, csharp_signature_arity,
+    member_access_name as csharp_member_access_name,
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
@@ -55,9 +56,10 @@ use crate::analyzer::usages::ruby_graph::{
     symbol_or_string_value as ruby_symbol_or_string_value,
 };
 use crate::analyzer::usages::scala_graph::{
-    ScalaNameResolver, ScalaProjectTypes, package_name_of as scala_package_name_of,
-    scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_import_path,
-    scala_literal_type_name, scala_node_text,
+    ScalaNameResolver, ScalaProjectTypes, import_candidate_owner_fq_names,
+    package_name_of as scala_package_name_of, scala_builtin_type_name,
+    scala_extension_receiver_matches_resolved, scala_import_path, scala_literal_type_name,
+    scala_node_text,
 };
 use crate::analyzer::{
     AliasResolver, CSharpAnalyzer, CodeUnit, CppAnalyzer, DefinitionLookupIndex, GoAnalyzer,
