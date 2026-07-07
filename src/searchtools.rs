@@ -593,6 +593,9 @@ pub struct ScanUsagesSymbolSummary {
     pub symbol: String,
     pub resolution: ScanUsageResolution,
     pub total_hits: usize,
+    pub unproven_hits: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub verified_absent: bool,
     pub rendering: UsageRendering,
     pub files_returned: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -632,6 +635,9 @@ pub struct SymbolUsages {
     pub symbol: String,
     pub resolution: ScanUsageResolution,
     pub total_hits: usize,
+    pub unproven_hits: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub verified_absent: bool,
     pub rendering: UsageRendering,
     /// True when the candidate file set exceeded the analyzer's per-query cap
     /// and an arbitrary subset was scanned. Results are partial when set.
@@ -647,6 +653,8 @@ pub struct SymbolUsages {
     pub top_enclosing: Vec<UsageEnclosingCount>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub files: Vec<UsageFileGroup>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unproven_files: Vec<UsageFileGroup>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3041,13 +3049,23 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                 });
 
         match query.result {
-            FuzzyResult::Success { hits_by_overload } => {
+            FuzzyResult::Success {
+                hits_by_overload,
+                unproven_by_overload,
+                unproven_total_by_overload,
+            } => {
                 let hits: Vec<UsageHit> = hits_by_overload
                     .into_values()
                     .flat_map(BTreeSet::into_iter)
                     .collect();
                 let filtered = filter_and_dedupe_hits(analyzer, &overloads, hits);
-                if truncated && filtered.hits.is_empty() {
+                let unproven_total = unproven_total_by_overload.values().sum();
+                let unproven_hits: Vec<UsageHit> = unproven_by_overload
+                    .into_values()
+                    .flat_map(BTreeSet::into_iter)
+                    .collect();
+                let filtered_unproven = filter_and_dedupe_hits(analyzer, &overloads, unproven_hits);
+                if truncated && filtered.hits.is_empty() && filtered_unproven.hits.is_empty() {
                     failures.push(truncated_zero_hit_failure(
                         symbol,
                         &overloads,
@@ -3061,6 +3079,8 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     truncated,
                     filtered.definition_sites_excluded,
                     filtered.hits,
+                    unproven_total,
+                    filtered_unproven.hits,
                     None,
                 ));
             }
@@ -3086,6 +3106,8 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                         truncated,
                         filtered.definition_sites_excluded,
                         filtered.hits,
+                        0,
+                        Vec::new(),
                         None,
                     ));
                     continue;
@@ -3168,6 +3190,8 @@ pub fn scan_usages(analyzer: &dyn IAnalyzer, params: ScanUsagesParams) -> ScanUs
                     truncated,
                     filtered.definition_sites_excluded,
                     filtered.hits,
+                    0,
+                    Vec::new(),
                     Some(too_many_callsites_summary_note(limit)),
                 ));
                 too_many_callsites.push(TooManyCallsitesInfo {
@@ -3647,9 +3671,11 @@ struct SummaryFileCount {
 struct SymbolUsageRenderState {
     symbol: String,
     total_hits: usize,
+    unproven_hits: usize,
     candidate_files_truncated: bool,
     definition_sites_excluded: usize,
     hits: Vec<UsageHitRow>,
+    unproven_rows: Vec<UsageHitRow>,
     summary_files: Vec<SummaryFileCount>,
     top_enclosing: Vec<UsageEnclosingCount>,
     base_note: Option<String>,
@@ -3664,6 +3690,8 @@ impl SymbolUsageRenderState {
         candidate_files_truncated: bool,
         definition_sites_excluded: usize,
         hits: Vec<UsageHitRow>,
+        unproven_hits: usize,
+        unproven_rows: Vec<UsageHitRow>,
         base_note: Option<String>,
     ) -> Self {
         let total_hits = hits.len();
@@ -3709,9 +3737,11 @@ impl SymbolUsageRenderState {
         Self {
             symbol,
             total_hits,
+            unproven_hits,
             candidate_files_truncated,
             definition_sites_excluded,
             hits,
+            unproven_rows,
             summary_files,
             top_enclosing,
             base_note,
@@ -3721,12 +3751,15 @@ impl SymbolUsageRenderState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn partial_summary(
         symbol: String,
         total_hits: usize,
         candidate_files_truncated: bool,
         definition_sites_excluded: usize,
         hits: Vec<UsageHitRow>,
+        unproven_hits: usize,
+        unproven_rows: Vec<UsageHitRow>,
         base_note: Option<String>,
     ) -> Self {
         let mut state = Self::new(
@@ -3734,6 +3767,8 @@ impl SymbolUsageRenderState {
             candidate_files_truncated,
             definition_sites_excluded,
             hits,
+            unproven_hits,
+            unproven_rows,
             base_note,
         );
         state.total_hits = total_hits;
@@ -3875,6 +3910,8 @@ fn build_scan_usages_summary(
             symbol: usage.symbol.clone(),
             resolution: usage.resolution,
             total_hits: usage.total_hits,
+            unproven_hits: usage.unproven_hits,
+            verified_absent: usage.verified_absent,
             rendering: usage.rendering,
             files_returned: usage.files.len(),
             files_truncated: usage.files_truncated,
@@ -4074,11 +4111,21 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
     if files_truncated.is_some() {
         notes.push("Summary file list truncated to fit the response budget.".to_string());
     }
+    if state.unproven_hits > 0 {
+        notes.push(
+            "Unproven usages matched structurally, but receiver/type proof was incomplete."
+                .to_string(),
+        );
+    }
+    let verified_absent =
+        !state.candidate_files_truncated && state.total_hits == 0 && state.unproven_hits == 0;
 
     SymbolUsages {
         symbol: state.symbol.clone(),
         resolution: ScanUsageResolution::Resolved,
         total_hits: state.total_hits,
+        unproven_hits: state.unproven_hits,
+        verified_absent,
         rendering: state.rendering,
         candidate_files_truncated: state.candidate_files_truncated,
         definition_sites_excluded: some_if_nonzero(state.definition_sites_excluded),
@@ -4090,6 +4137,7 @@ fn render_symbol_usages(state: &SymbolUsageRenderState) -> SymbolUsages {
         },
         top_enclosing,
         files,
+        unproven_files: render_usage_file_groups(&state.unproven_rows, true),
     }
 }
 

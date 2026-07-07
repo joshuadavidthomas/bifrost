@@ -64,7 +64,7 @@ export function build(): BaseClass {
 }
 
 #[test]
-fn usage_finder_reports_fallback_safe_graph_failure_without_regex() {
+fn usage_finder_reports_csharp_unproven_sites_without_regex_failure() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "Domain/Target.cs",
@@ -72,8 +72,19 @@ fn usage_finder_reports_fallback_safe_graph_failure_without_regex() {
 namespace Domain {
     public class Target {
         public void Run() {}
-        public void Execute() {
-            Run();
+    }
+}
+"#,
+        )
+        .file(
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void Execute(dynamic value) {
+            value.Run();
         }
     }
 }
@@ -84,18 +95,28 @@ namespace Domain {
     let target = definition(&analyzer, |unit| unit.fq_name() == "Domain.Target.Run");
 
     let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
-    let diagnostic = query
-        .graph_failure
-        .as_ref()
-        .expect("graph failure diagnostic");
-    assert_eq!("CSharpUsageGraphStrategy", diagnostic.strategy);
-    assert_eq!("unsafe_inference", diagnostic.reason_kind);
-
     assert!(
-        matches!(query.result, FuzzyResult::Failure { .. }),
-        "fallback-safe graph failure should surface as a failure, got {:?}",
-        query.result
+        query.graph_failure.is_none(),
+        "unproven C# sites should not surface as a graph failure: {:?}",
+        query.graph_failure
     );
+
+    match query.result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&target)
+                    .is_none_or(|hits| hits.is_empty()),
+                "dynamic receiver must not be a proven hit"
+            );
+            assert_eq!(Some(&1), unproven_total_by_overload.get(&target));
+        }
+        other => panic!("expected success with unproven C# site, got {other:#?}"),
+    }
 }
 
 #[test]

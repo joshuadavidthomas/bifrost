@@ -136,6 +136,29 @@ pub(super) fn push_member_hit(
     );
 }
 
+pub(super) fn push_unproven_member_hit(
+    file: &ProjectFile,
+    source: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+    enclosing: CodeUnit,
+    hits: &mut BTreeSet<UsageHit>,
+) {
+    let start_line = find_line_index_for_offset(line_starts, start);
+    hits.insert(
+        usage_hit(
+            file,
+            start_line,
+            start,
+            end,
+            enclosing,
+            trimmed_snippet_around_range(source, line_starts, start, end, SNIPPET_CONTEXT_LINES),
+        )
+        .into_unproven(),
+    );
+}
+
 pub(super) fn push_self_receiver_member_hit(
     file: &ProjectFile,
     source: &str,

@@ -589,6 +589,72 @@ func Read(album model.Album) string {
 }
 
 #[test]
+fn go_graph_strategy_reports_unproven_selector_when_receiver_type_is_unknown() {
+    let (project, analyzer) = go_analyzer_with_files(&[
+        (
+            "model/service.go",
+            r#"
+package model
+
+type Service struct{}
+
+func (s Service) Run() {}
+"#,
+        ),
+        (
+            "core/caller.go",
+            r#"
+package core
+
+func Call(value any) {
+    value.Run()
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let method = definition(&analyzer, "example.com/app/model.Service.Run");
+    let result = GoUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&method),
+        &candidates,
+        1000,
+    );
+
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            unproven_total_by_overload,
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&method)
+                    .is_none_or(|hits| hits.is_empty()),
+                "unknown receiver must not be a proven hit: {hits_by_overload:#?}"
+            );
+            assert_eq!(
+                Some(&1),
+                unproven_total_by_overload.get(&method),
+                "unknown receiver selector should be counted as unproven"
+            );
+            let unproven = unproven_by_overload
+                .get(&method)
+                .expect("capped unproven sites");
+            assert!(
+                unproven.iter().any(|hit| {
+                    hit.file == project.file("core/caller.go")
+                        && hit.snippet.contains("value.Run()")
+                }),
+                "expected value.Run() to render as unproven: {unproven:#?}"
+            );
+        }
+        other => panic!("expected success with unproven selector, got {other:#?}"),
+    }
+}
+
+#[test]
 fn go_graph_strategy_finds_promoted_go_embedded_member_usages() {
     let (_project, analyzer) = go_analyzer_with_files(&[(
         "example/audit.go",

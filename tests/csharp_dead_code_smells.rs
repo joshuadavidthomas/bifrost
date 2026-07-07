@@ -412,11 +412,15 @@ namespace App {
     );
 
     assert!(
-        report.contains("CSharpUsageGraphStrategy: no proven structured hits"),
-        "{report}"
+        report.contains("could not be proven or disproven"),
+        "the zero-arg overload's cross-overload call must stay inconclusive: {report}"
     );
     assert!(!report.contains("one workspace inbound edge"), "{report}");
     assert!(!report.contains("no non-self usages found"), "{report}");
+    assert!(
+        report.contains("only usage: Service.cs:5"),
+        "the (int) overload's same-class call is proven and counted: {report}"
+    );
 }
 
 #[test]
@@ -646,4 +650,56 @@ namespace App {
 
     assert!(report.contains("App.Worker.Main"), "{report}");
     assert!(report.contains("no non-self usages found"), "{report}");
+}
+
+#[test]
+fn csharp_unproven_usage_evidence_is_inconclusive_not_dead() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            r#"
+namespace Domain {
+    class Target {
+        void Run() {}
+        void Run(int value) {}
+    }
+}
+"#,
+        ),
+        (
+            "Domain/Consumer.cs",
+            r#"
+namespace Domain {
+    class Consumer {
+        public void Execute(dynamic value) {
+            value.Run();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+    let run = member_function_with_signature(&analyzer, "Domain.Target", "Run", "()");
+
+    let report = report(
+        &analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: vec!["Domain/Target.cs".to_string()],
+            fq_names: vec![run.fq_name()],
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        report.contains("could not be proven or disproven"),
+        "unproven usage evidence should surface as inconclusive: {report}"
+    );
+    assert!(
+        !report.contains("Domain/Target.cs:5-5"),
+        "the zero-arg overload (line 5) matched by the dynamic call must not be reported dead: {report}"
+    );
+    assert!(
+        report.contains("Domain/Target.cs:6-6"),
+        "the (int) overload is provably unreachable by the zero-arg dynamic call and stays a finding: {report}"
+    );
 }

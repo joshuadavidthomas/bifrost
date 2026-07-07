@@ -205,7 +205,9 @@ fn drive(tracker: RequestTracker) {
         1000,
     );
     let hits = match result {
-        FuzzyResult::Success { hits_by_overload } => hits_by_overload
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload
             .into_values()
             .flat_map(BTreeSet::into_iter)
             .collect::<BTreeSet<_>>(),
@@ -257,7 +259,9 @@ pub fn render(field: StorageField) {
         1000,
     );
     let hits = match result {
-        FuzzyResult::Success { hits_by_overload } => hits_by_overload
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload
             .into_values()
             .flat_map(BTreeSet::into_iter)
             .collect::<BTreeSet<_>>(),

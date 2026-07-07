@@ -1,5 +1,5 @@
 use crate::analyzer::csharp_normalize_full_name;
-use crate::analyzer::usages::csharp_graph::hits::push_hit;
+use crate::analyzer::usages::csharp_graph::hits::{push_hit, push_unproven_hit};
 use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, argument_count, binding_scope_node, enclosing_declared_type,
     expression_resolves_to_type, first_type_child, is_type_reference_node,
@@ -19,7 +19,7 @@ use tree_sitter::{Node, Parser};
 pub(super) struct ScanState<'a> {
     pub(super) max_usages: usize,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) saw_unproven_match: &'a mut bool,
+    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub(super) limit_exceeded: &'a mut bool,
 }
 
@@ -63,7 +63,7 @@ pub(super) fn scan_file(
         line_starts: &line_starts,
         spec,
         hits: state.hits,
-        saw_unproven_match: state.saw_unproven_match,
+        unproven_hits: state.unproven_hits,
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
         enclosing_cache: HashMap::default(),
@@ -79,7 +79,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
-    pub(super) saw_unproven_match: &'a mut bool,
+    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
     pub(super) enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
@@ -183,12 +183,12 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     let Some(receiver_node) = member_access_receiver(node) else {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(name_node, ctx);
         return;
     };
     let receiver = node_text(receiver_node, ctx.source);
     if receiver.is_empty() {
-        *ctx.saw_unproven_match = true;
+        push_unproven_hit(name_node, ctx);
         return;
     }
 
@@ -220,7 +220,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 }
             }
             SymbolResolution::Ambiguous | SymbolResolution::Unknown => {
-                *ctx.saw_unproven_match = true;
+                push_unproven_hit(name_node, ctx);
             }
         }
         return;
@@ -234,10 +234,10 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             push_hit(name_node, ctx);
         }
         SymbolResolution::Ambiguous => {
-            *ctx.saw_unproven_match = true;
+            push_unproven_hit(name_node, ctx);
         }
         SymbolResolution::Unknown => {
-            *ctx.saw_unproven_match = true;
+            push_unproven_hit(name_node, ctx);
         }
         SymbolResolution::Precise(_) => {}
     }
@@ -318,7 +318,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             if unqualified_method_call_resolves_to_owner(node, ctx) {
                 push_hit(node, ctx);
             } else {
-                *ctx.saw_unproven_match = true;
+                push_unproven_hit(node, ctx);
             }
         }
         TargetKind::Field if !is_type_reference_node(node) => {
@@ -342,7 +342,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 }
                 LabelOwnerResolution::KnownOther => return,
                 LabelOwnerResolution::Unknown => {
-                    *ctx.saw_unproven_match = true;
+                    push_unproven_hit(node, ctx);
                     return;
                 }
                 LabelOwnerResolution::NotLabel => {}
@@ -364,7 +364,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             ) {
                 push_hit(node, ctx);
             } else {
-                *ctx.saw_unproven_match = true;
+                push_unproven_hit(node, ctx);
             }
         }
         _ => {}

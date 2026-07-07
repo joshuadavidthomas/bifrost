@@ -49,7 +49,9 @@ fn js_graph_strategy_finds_in_file_references() {
     );
 
     let hits: BTreeSet<_> = match result {
-        FuzzyResult::Success { hits_by_overload } => hits_by_overload
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload
             .into_values()
             .flat_map(BTreeSet::into_iter)
             .collect(),
@@ -88,7 +90,9 @@ fn ts_graph_strategy_finds_in_file_references() {
     );
 
     let hits: BTreeSet<_> = match result {
-        FuzzyResult::Success { hits_by_overload } => hits_by_overload
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload
             .into_values()
             .flat_map(BTreeSet::into_iter)
             .collect(),
@@ -443,7 +447,9 @@ fn find_js_target(
 // belong to find-references, not to usage/call-graph counts, so they are filtered here.
 fn flatten_hits(result: FuzzyResult) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
     match result {
-        FuzzyResult::Success { hits_by_overload } => hits_by_overload
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload
             .into_values()
             .flat_map(BTreeSet::into_iter)
             .filter(|hit| {

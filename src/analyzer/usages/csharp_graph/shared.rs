@@ -1,6 +1,6 @@
 use super::extractor::{ScanState, scan_file};
 use super::inverted;
-use super::resolver::{TargetKind, TargetSpec};
+use super::resolver::TargetSpec;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
@@ -52,12 +52,12 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
         }
 
         let mut hits: BTreeSet<UsageHit> = BTreeSet::new();
-        let mut saw_unproven_match = false;
+        let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut limit_exceeded = false;
         let mut state = ScanState {
             max_usages,
             hits: &mut hits,
-            saw_unproven_match: &mut saw_unproven_match,
+            unproven_hits: &mut unproven_hits,
             limit_exceeded: &mut limit_exceeded,
         };
         for file in files {
@@ -65,14 +65,6 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
             if *state.limit_exceeded {
                 break;
             }
-        }
-
-        if hits.is_empty() && saw_unproven_match && spec.kind != TargetKind::Type {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsafeInference("no proven structured hits"),
-                "CSharpUsageGraphStrategy",
-            );
         }
 
         if limit_exceeded || hits.len() > max_usages {
@@ -84,7 +76,11 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
             });
         }
 
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+            target.clone(),
+            hits,
+            unproven_hits,
+        ))
     }
 }
 

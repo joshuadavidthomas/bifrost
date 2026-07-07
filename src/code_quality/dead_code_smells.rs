@@ -631,11 +631,25 @@ fn analyze_candidate(
     }
 
     let hits = match query.result {
-        FuzzyResult::Success { hits_by_overload } => hits_by_overload
-            .into_values()
-            .flat_map(BTreeSet::into_iter)
-            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
-            .collect::<Vec<_>>(),
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            let unproven_total: usize = unproven_total_by_overload.values().sum();
+            if unproven_total > 0 {
+                skipped.push(format!(
+                    "`{}`: {unproven_total} structurally matching usage site(s) could not be proven or disproven; evidence is inconclusive",
+                    candidate.fq_name()
+                ));
+                return None;
+            }
+            hits_by_overload
+                .into_values()
+                .flat_map(BTreeSet::into_iter)
+                .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+                .collect::<Vec<_>>()
+        }
         FuzzyResult::Ambiguous { .. } => {
             skipped.push(format!(
                 "`{}`: usage analysis was ambiguous; evidence is inconclusive",

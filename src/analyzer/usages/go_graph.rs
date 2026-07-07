@@ -187,8 +187,14 @@ fn resolve_with_graph(
     if scan_scope.is_authoritative() {
         scan_files.retain(|file| scan_scope.allows(file));
     }
-    let hits = scan_files_for_target(analyzer, graph, scan_files, &target_spec);
-    let hits: BTreeSet<_> = hits
+    let scan_result = scan_files_for_target(analyzer, graph, scan_files, &target_spec);
+    let hits: BTreeSet<_> = scan_result
+        .hits
+        .into_iter()
+        .filter(|hit| &hit.enclosing != target)
+        .collect();
+    let unproven_hits: BTreeSet<_> = scan_result
+        .unproven_hits
         .into_iter()
         .filter(|hit| &hit.enclosing != target)
         .collect();
@@ -202,7 +208,11 @@ fn resolve_with_graph(
         });
     }
 
-    GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+    GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+        target.clone(),
+        hits,
+        unproven_hits,
+    ))
 }
 
 impl UsageAnalyzer for GoUsageGraphStrategy {

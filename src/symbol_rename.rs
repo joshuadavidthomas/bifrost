@@ -134,7 +134,9 @@ pub(crate) fn rename_symbol(
         });
     }
     let hits = match query.result {
-        FuzzyResult::Success { hits_by_overload } => hits_by_overload
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload
             .into_values()
             .flat_map(|hits| hits.into_iter())
             .filter(|hit| hit.kind.included_in(UsageHitSurface::LspReferences))

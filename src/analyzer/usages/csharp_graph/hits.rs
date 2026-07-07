@@ -30,6 +30,29 @@ pub(super) fn push_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+pub(super) fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let start = node.start_byte();
+    let end = node.end_byte();
+    let line_idx = find_line_index_for_offset(ctx.line_starts, start);
+    let Some(enclosing) = enclosing_code_unit(node, ctx) else {
+        return;
+    };
+    if enclosing == ctx.spec.target {
+        return;
+    }
+    ctx.unproven_hits.insert(
+        usage_hit(
+            ctx.file,
+            line_idx,
+            start,
+            end,
+            enclosing,
+            snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
+        )
+        .into_unproven(),
+    );
+}
+
 fn enclosing_code_unit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Option<CodeUnit> {
     let key = (node.start_byte(), node.end_byte());
     if let Some(cached) = ctx.enclosing_cache.get(&key) {

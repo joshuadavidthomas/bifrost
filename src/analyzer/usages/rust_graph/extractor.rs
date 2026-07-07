@@ -3,8 +3,8 @@ use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInfere
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::usages::rust_graph::hits::{
-    member_hit_enclosing, push_member_hit, push_self_receiver_member_hit, record_hit,
-    record_import_hit, record_module_qualified_hits,
+    member_hit_enclosing, push_member_hit, push_self_receiver_member_hit, push_unproven_member_hit,
+    record_hit, record_import_hit, record_module_qualified_hits,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
     is_trait_owner, resolve_scoped_associated_item,
@@ -375,13 +375,14 @@ pub(super) fn scan_files_for_member_target(
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
-) -> BTreeSet<UsageHit> {
+) -> RustMemberScanResult {
     let Some(owner) = rust.parent_of(target) else {
-        return BTreeSet::new();
+        return RustMemberScanResult::default();
     };
     let member_name = target.identifier().to_string();
     let parser_language = tree_sitter_rust::LANGUAGE.into();
     let hits = Mutex::new(BTreeSet::new());
+    let unproven_hits = Mutex::new(BTreeSet::new());
     let constructor_returns = self_like_constructor_returns(rust, &owner);
     let self_like_constructors = self_like_constructor_seeds(rust, &owner, &constructor_returns);
     let support = analyzer.definition_lookup_index();
@@ -421,7 +422,10 @@ pub(super) fn scan_files_for_member_target(
         } else {
             owner_local_names.clone()
         };
-        if owner_local_names.is_empty() && receiver_type_names.is_empty() {
+        if owner_local_names.is_empty()
+            && receiver_type_names.is_empty()
+            && !source.contains(&member_name)
+        {
             return;
         }
         let visible_bare_constructors =
@@ -440,6 +444,7 @@ pub(super) fn scan_files_for_member_target(
         let refs = rust.reference_context_of(file);
 
         let mut local_hits = BTreeSet::new();
+        let mut local_unproven_hits = BTreeSet::new();
         let mut ctx = MemberScanCtx {
             analyzer,
             rust,
@@ -456,6 +461,7 @@ pub(super) fn scan_files_for_member_target(
             receiver_type_names: &receiver_type_names,
             static_owner_names: &static_owner_names,
             hits: &mut local_hits,
+            unproven_hits: &mut local_unproven_hits,
         };
         scan_member_node(tree.root_node(), &mut ctx);
 
@@ -463,9 +469,26 @@ pub(super) fn scan_files_for_member_target(
             let mut sink = hits.lock().expect("poisoned Rust member collector");
             sink.extend(local_hits);
         }
+        if !local_unproven_hits.is_empty() {
+            let mut sink = unproven_hits
+                .lock()
+                .expect("poisoned Rust member unproven collector");
+            sink.extend(local_unproven_hits);
+        }
     });
 
-    hits.into_inner().expect("poisoned Rust member collector")
+    RustMemberScanResult {
+        hits: hits.into_inner().expect("poisoned Rust member collector"),
+        unproven_hits: unproven_hits
+            .into_inner()
+            .expect("poisoned Rust member unproven collector"),
+    }
+}
+
+#[derive(Default)]
+pub(super) struct RustMemberScanResult {
+    pub(super) hits: BTreeSet<UsageHit>,
+    pub(super) unproven_hits: BTreeSet<UsageHit>,
 }
 
 struct MemberScanCtx<'a> {
@@ -484,6 +507,7 @@ struct MemberScanCtx<'a> {
     receiver_type_names: &'a HashSet<String>,
     static_owner_names: &'a HashSet<String>,
     hits: &'a mut BTreeSet<UsageHit>,
+    unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
 fn scan_member_node(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
@@ -528,6 +552,19 @@ fn record_instance_member_hit(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     };
     let receiver_name = simple_node_text(receiver, ctx.source);
     if !receiver_matches_owner(receiver, receiver_name.as_deref(), &enclosing, ctx) {
+        if receiver_name.as_ref().is_some_and(|receiver_name| {
+            !receiver_name_explicitly_mismatched(receiver_name, &enclosing, ctx)
+        }) {
+            push_unproven_member_hit(
+                ctx.file,
+                ctx.source,
+                ctx.line_starts,
+                start,
+                end,
+                enclosing,
+                ctx.unproven_hits,
+            );
+        }
         return;
     }
 
@@ -600,6 +637,19 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
             continue;
         };
         if !receiver_matches_owner(*receiver, receiver_name.as_deref(), &enclosing, ctx) {
+            if receiver_name.as_ref().is_some_and(|receiver_name| {
+                !receiver_name_explicitly_mismatched(receiver_name, &enclosing, ctx)
+            }) {
+                push_unproven_member_hit(
+                    ctx.file,
+                    ctx.source,
+                    ctx.line_starts,
+                    start,
+                    end,
+                    enclosing,
+                    ctx.unproven_hits,
+                );
+            }
             continue;
         }
         if let Some(receiver_name) = receiver_name.as_ref() {
@@ -629,6 +679,24 @@ fn record_token_tree_instance_member_hits(node: Node<'_>, ctx: &mut MemberScanCt
             ctx.hits,
         );
     }
+}
+
+fn receiver_name_explicitly_mismatched(
+    receiver_name: &str,
+    enclosing: &CodeUnit,
+    ctx: &MemberScanCtx<'_>,
+) -> bool {
+    ctx.analyzer
+        .get_source(enclosing, false)
+        .map(|enclosing_source| {
+            receiver_explicitly_mismatched(
+                ctx.source,
+                &enclosing_source,
+                ctx.receiver_type_names,
+                receiver_name,
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// A struct literal `S { field: value }` (or shorthand `S { field }`) references

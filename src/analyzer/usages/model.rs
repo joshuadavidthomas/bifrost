@@ -31,6 +31,13 @@ pub enum UsageHitKind {
     OverrideDeclaration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum UsageProof {
+    #[default]
+    Proven,
+    Unproven,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UsageHitSurface {
     /// Agent/search/relevance/call-graph surfaces that should count only external
@@ -60,6 +67,7 @@ pub struct UsageHit {
     pub confidence: f64,
     pub snippet: String,
     pub kind: UsageHitKind,
+    pub proof: UsageProof,
 }
 
 impl UsageHit {
@@ -81,6 +89,7 @@ impl UsageHit {
             confidence,
             snippet: snippet.into(),
             kind: UsageHitKind::Reference,
+            proof: UsageProof::Proven,
         }
     }
 
@@ -102,6 +111,11 @@ impl UsageHit {
         self
     }
 
+    pub fn into_unproven(mut self) -> Self {
+        self.proof = UsageProof::Unproven;
+        self
+    }
+
     pub fn with_confidence(&self, confidence: f64) -> Self {
         Self {
             file: self.file.clone(),
@@ -112,6 +126,7 @@ impl UsageHit {
             confidence,
             snippet: self.snippet.clone(),
             kind: self.kind,
+            proof: self.proof,
         }
     }
 }
@@ -220,6 +235,8 @@ pub enum FuzzyResult {
     /// Resolution succeeded — possibly with zero hits.
     Success {
         hits_by_overload: HashMap<CodeUnit, BTreeSet<UsageHit>>,
+        unproven_by_overload: HashMap<CodeUnit, BTreeSet<UsageHit>>,
+        unproven_total_by_overload: HashMap<CodeUnit, usize>,
     },
     /// The analyzer/LLM could not produce a result for this query.
     Failure { fq_name: String, reason: String },
@@ -239,17 +256,42 @@ pub enum FuzzyResult {
 }
 
 impl FuzzyResult {
+    pub const MAX_UNPROVEN_HITS_PER_SYMBOL: usize = 20;
+
     pub fn success(target: CodeUnit, hits: BTreeSet<UsageHit>) -> Self {
+        Self::success_with_unproven(target, hits, BTreeSet::new())
+    }
+
+    pub fn success_with_unproven(
+        target: CodeUnit,
+        hits: BTreeSet<UsageHit>,
+        unproven: BTreeSet<UsageHit>,
+    ) -> Self {
         let mut map = HashMap::default();
-        map.insert(target, hits);
+        map.insert(target.clone(), hits);
+        let mut unproven_map = HashMap::default();
+        let mut unproven_total_map = HashMap::default();
+        let unproven_total = unproven.len();
+        if unproven_total > 0 {
+            let capped = unproven
+                .into_iter()
+                .take(Self::MAX_UNPROVEN_HITS_PER_SYMBOL)
+                .collect();
+            unproven_map.insert(target.clone(), capped);
+            unproven_total_map.insert(target, unproven_total);
+        }
         FuzzyResult::Success {
             hits_by_overload: map,
+            unproven_by_overload: unproven_map,
+            unproven_total_by_overload: unproven_total_map,
         }
     }
 
     pub fn empty_success() -> Self {
         FuzzyResult::Success {
             hits_by_overload: HashMap::default(),
+            unproven_by_overload: HashMap::default(),
+            unproven_total_by_overload: HashMap::default(),
         }
     }
 
@@ -291,7 +333,9 @@ impl FuzzyResult {
 
     fn all_hits_unfiltered(&self) -> BTreeSet<UsageHit> {
         match self {
-            FuzzyResult::Success { hits_by_overload }
+            FuzzyResult::Success {
+                hits_by_overload, ..
+            }
             | FuzzyResult::Ambiguous {
                 hits_by_overload, ..
             } => hits_by_overload
@@ -318,7 +362,9 @@ impl FuzzyResult {
             } => Err(format!(
                 "Too many call sites for symbol: {short_name} ({total_callsites}, limit {limit})"
             )),
-            FuzzyResult::Success { hits_by_overload } => Ok(hits_by_overload
+            FuzzyResult::Success {
+                hits_by_overload, ..
+            } => Ok(hits_by_overload
                 .into_values()
                 .flat_map(BTreeSet::into_iter)
                 .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))

@@ -1,5 +1,5 @@
 use crate::analyzer::usages::common::same_node;
-use crate::analyzer::usages::go_graph::hits::record_hit;
+use crate::analyzer::usages::go_graph::hits::{record_hit, record_unproven_hit};
 use crate::analyzer::usages::go_graph::reference::go_is_top_level_decl;
 use crate::analyzer::usages::go_graph::resolver::{
     GoProjectGraph, ScanBindings, TargetSpec, TypeRef, node_text,
@@ -21,8 +21,9 @@ pub(super) fn scan_files_for_target(
     graph: &GoProjectGraph,
     files: HashSet<ProjectFile>,
     spec: &TargetSpec,
-) -> BTreeSet<UsageHit> {
+) -> GoScanResult {
     let hits = Mutex::new(BTreeSet::new());
+    let unproven_hits = Mutex::new(BTreeSet::new());
     let files: Vec<_> = files.into_iter().collect();
 
     files.par_iter().for_each(|file| {
@@ -42,6 +43,7 @@ pub(super) fn scan_files_for_target(
         }
         let scan_bindings = ScanBindings::new(graph, file, spec);
         let mut local_hits = BTreeSet::new();
+        let mut local_unproven_hits = BTreeSet::new();
         let mut ctx = ScanCtx {
             file,
             source,
@@ -50,6 +52,7 @@ pub(super) fn scan_files_for_target(
             spec,
             bindings: scan_bindings,
             hits: &mut local_hits,
+            unproven_hits: &mut local_unproven_hits,
         };
         let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
         scan_node(parsed.tree.root_node(), &mut ctx, &mut locals);
@@ -58,9 +61,25 @@ pub(super) fn scan_files_for_target(
             let mut sink = hits.lock().expect("poisoned Go graph collector");
             sink.extend(local_hits);
         }
+        if !local_unproven_hits.is_empty() {
+            let mut sink = unproven_hits
+                .lock()
+                .expect("poisoned Go graph unproven collector");
+            sink.extend(local_unproven_hits);
+        }
     });
 
-    hits.into_inner().expect("poisoned Go graph collector")
+    GoScanResult {
+        hits: hits.into_inner().expect("poisoned Go graph collector"),
+        unproven_hits: unproven_hits
+            .into_inner()
+            .expect("poisoned Go graph unproven collector"),
+    }
+}
+
+pub(super) struct GoScanResult {
+    pub(super) hits: BTreeSet<UsageHit>,
+    pub(super) unproven_hits: BTreeSet<UsageHit>,
 }
 
 pub(super) struct ScanCtx<'a> {
@@ -71,6 +90,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) spec: &'a TargetSpec,
     bindings: ScanBindings,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
+    pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceEngine<String>) {
@@ -490,6 +510,10 @@ fn scan_selector_like(
             || composite_literal_receiver_matches_owner(qualifier_node, ctx)
         {
             record_hit(field_node, ctx);
+        } else if !ctx.bindings.namespace_names.contains(&qualifier)
+            || locals.is_shadowed(&qualifier)
+        {
+            record_unproven_hit(field_node, ctx);
         }
         return;
     }

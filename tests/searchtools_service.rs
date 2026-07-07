@@ -2605,7 +2605,7 @@ fn scan_usages_reports_unknown_symbol_as_not_found() {
 }
 
 #[test]
-fn scan_usages_reports_graph_failure_reason_without_regex_fallback() {
+fn scan_usages_reports_unproven_sites_instead_of_unsafe_inference_failure() {
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join("Domain")).unwrap();
     fs::write(
@@ -2614,8 +2614,18 @@ fn scan_usages_reports_graph_failure_reason_without_regex_fallback() {
 namespace Domain {
     public class Target {
         public void Run() {}
-        public void Execute() {
-            Run();
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("Domain").join("Consumer.cs"),
+        r#"
+namespace Domain {
+    public class Consumer {
+        public void Execute(dynamic value) {
+            value.Run();
         }
     }
 }
@@ -2632,18 +2642,22 @@ namespace Domain {
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
 
-    assert_eq!(0, array_len(&value, "usages"));
+    assert_eq!(0, array_len(&value, "failures"), "payload: {value}");
     assert_eq!(0, array_len(&value, "not_found"));
-    let failures = value["failures"].as_array().unwrap();
-    assert_eq!(1, failures.len(), "payload: {value}");
-    assert_eq!("Domain.Target.Run", failures[0]["symbol"]);
-    assert_eq!("CSharpUsageGraphStrategy", failures[0]["strategy"]);
-    assert_eq!("unsafe_inference", failures[0]["reason_kind"]);
+    let usages = value["usages"].as_array().unwrap();
+    assert_eq!(1, usages.len(), "payload: {value}");
+    assert_eq!("Domain.Target.Run", usages[0]["symbol"]);
+    assert_eq!(0, usages[0]["total_hits"], "payload: {value}");
+    assert_eq!(1, usages[0]["unproven_hits"], "payload: {value}");
     assert!(
-        failures[0]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("CSharpUsageGraphStrategy")),
-        "payload: {value}"
+        usages[0]["unproven_files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty()),
+        "unproven sites must be rendered: {value}"
+    );
+    assert!(
+        usages[0].get("verified_absent").is_none(),
+        "unproven evidence must block the verified-absent claim: {value}"
     );
 }
 

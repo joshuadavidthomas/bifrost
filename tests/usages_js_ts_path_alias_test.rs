@@ -25,7 +25,9 @@ fn ts_target(analyzer: &TypescriptAnalyzer, source: &ProjectFile, name: &str) ->
 
 fn flatten_hits(result: FuzzyResult) -> BTreeSet<UsageHit> {
     match result {
-        FuzzyResult::Success { hits_by_overload } => hits_by_overload
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload
             .into_values()
             .flat_map(BTreeSet::into_iter)
             .collect(),

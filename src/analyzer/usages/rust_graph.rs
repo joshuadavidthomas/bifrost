@@ -74,7 +74,7 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
         let canonical_target = canonical_usage_target(rust, target);
         let target = &canonical_target;
 
-        let hits = if supports_same_file_local_scan(rust, target) {
+        let (hits, unproven_hits) = if supports_same_file_local_scan(rust, target) {
             if scan_scope.is_authoritative() && !scan_scope.allows(target.source()) {
                 return GraphUsageOutcome::Resolved(FuzzyResult::success(
                     target.clone(),
@@ -83,7 +83,10 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             }
             let scan_files: HashSet<ProjectFile> = [target.source().clone()].into_iter().collect();
             let graph = build_rust_graph_for_files(scan_files.clone());
-            scan_files_for_target(analyzer, rust, &graph, scan_files, target, None)
+            (
+                scan_files_for_target(analyzer, rust, &graph, scan_files, target, None),
+                BTreeSet::new(),
+            )
         } else if is_member_target(rust, target) {
             let seed_result = infer_graph_seeds(rust, target);
             let seeds = seed_result.seeds;
@@ -109,7 +112,15 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             let graph = build_rust_graph_for_files(scan_files.clone());
             let scan_target = trait_member_for_impl_member(rust, target);
             let scan_target = scan_target.as_ref().unwrap_or(target);
-            scan_files_for_member_target(analyzer, &graph, rust, scan_files, scan_target, &seeds)
+            let result = scan_files_for_member_target(
+                analyzer,
+                &graph,
+                rust,
+                scan_files,
+                scan_target,
+                &seeds,
+            );
+            (result.hits, result.unproven_hits)
         } else {
             let seed_result = infer_graph_seeds(rust, target);
             let seeds = seed_result.seeds;
@@ -125,10 +136,17 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
                 scan_files.extend(local_impl_target_importer_files(rust, target));
             }
             let graph = build_rust_graph_for_files(scan_files.clone());
-            scan_files_for_target(analyzer, rust, &graph, scan_files, target, Some(&seeds))
+            (
+                scan_files_for_target(analyzer, rust, &graph, scan_files, target, Some(&seeds)),
+                BTreeSet::new(),
+            )
         };
 
         let hits: BTreeSet<_> = hits
+            .into_iter()
+            .filter(|hit| &hit.enclosing != target)
+            .collect();
+        let unproven_hits: BTreeSet<_> = unproven_hits
             .into_iter()
             .filter(|hit| &hit.enclosing != target)
             .collect();
@@ -146,7 +164,11 @@ impl<'a> UsageQueryResolver<'a> for RustQueryResolver<'a> {
             });
         }
 
-        GraphUsageOutcome::Resolved(FuzzyResult::success(target.clone(), hits))
+        GraphUsageOutcome::Resolved(FuzzyResult::success_with_unproven(
+            target.clone(),
+            hits,
+            unproven_hits,
+        ))
     }
 }
 

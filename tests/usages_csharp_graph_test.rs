@@ -913,10 +913,26 @@ namespace App {
         1000,
     );
 
-    assert!(
-        matches!(result, FuzzyResult::Failure { .. }),
-        "a receiver declared in another method must not prove this member hit"
-    );
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&run)
+                    .is_none_or(|hits| hits.is_empty()),
+                "a receiver declared in another method must not prove this member hit"
+            );
+            assert_eq!(
+                Some(&1),
+                unproven_total_by_overload.get(&run),
+                "method-scoped unknown receiver should be reported as unproven"
+            );
+        }
+        other => panic!("expected success with unproven receiver site, got {other:#?}"),
+    }
 }
 
 #[test]
@@ -996,10 +1012,26 @@ namespace App {
         1000,
     );
 
-    assert!(
-        matches!(result, FuzzyResult::Failure { .. }),
-        "locals declared after a member access must not prove receiver type"
-    );
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&run)
+                    .is_none_or(|hits| hits.is_empty()),
+                "locals declared after a member access must not prove receiver type"
+            );
+            assert_eq!(
+                Some(&1),
+                unproven_total_by_overload.get(&run),
+                "forward local declaration gap should be reported as unproven"
+            );
+        }
+        other => panic!("expected success with unproven forward-local site, got {other:#?}"),
+    }
 }
 
 #[test]
@@ -1262,10 +1294,26 @@ namespace App {
         1000,
     );
 
-    assert!(
-        matches!(result, FuzzyResult::Failure { .. }),
-        "using static member forms are deferred and should fall back when there are no proven hits"
-    );
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } => {
+            assert!(
+                hits_by_overload
+                    .get(&configure)
+                    .is_none_or(|hits| hits.is_empty()),
+                "using static member forms are deferred and should not be proven"
+            );
+            assert_eq!(
+                Some(&1),
+                unproven_total_by_overload.get(&configure),
+                "deferred using static member form should be reported as unproven"
+            );
+        }
+        other => panic!("expected success with unproven using-static site, got {other:#?}"),
+    }
 }
 
 #[test]
@@ -2145,5 +2193,168 @@ namespace NzbDrone.Core
     assert!(
         result["summary"]["total_hits"].as_u64().unwrap_or_default() > 0,
         "definition-site target selector should recover primitive extension usage: {result}"
+    );
+}
+
+#[test]
+fn csharp_scan_usages_dynamic_extension_receiver_returns_unproven_without_failure() {
+    let (project, _analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/NzbDrone.Common/Extensions/NumberExtensions.cs",
+            r#"
+namespace NzbDrone.Common.Extensions
+{
+    public static class NumberExtensions
+    {
+        public static string SizeSuffix(this long bytes)
+        {
+            return bytes.ToString();
+        }
+    }
+}
+"#,
+        ),
+        (
+            "src/NzbDrone.Core/Consumer.cs",
+            r#"
+using NzbDrone.Common.Extensions;
+
+namespace NzbDrone.Core
+{
+    public class Consumer
+    {
+        public string Render(dynamic size)
+        {
+            return size.SizeSuffix();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let result = call_search_tool_json(
+        project.root(),
+        "scan_usages",
+        &json!({
+            "targets": [{
+                "path": "src/NzbDrone.Common/Extensions/NumberExtensions.cs",
+                "line": 6
+            }]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        0,
+        result["failures"].as_array().map_or(0, Vec::len),
+        "{result}"
+    );
+    assert_eq!(0, result["usages"][0]["total_hits"], "{result}");
+    assert_eq!(1, result["usages"][0]["unproven_hits"], "{result}");
+    assert!(
+        result["usages"][0]["verified_absent"].is_null(),
+        "unproven sites must prevent verified_absent: {result}"
+    );
+    assert!(
+        result["usages"][0]["unproven_files"][0]["hits"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("size.SizeSuffix()")),
+        "dynamic extension call should render in unproven_files: {result}"
+    );
+}
+
+#[test]
+fn csharp_scan_usages_complete_zero_reports_verified_absent() {
+    let (project, _analyzer) = csharp_analyzer_with_files(&[(
+        "Service.cs",
+        r#"
+namespace App
+{
+    public class Service
+    {
+        public void Run() {}
+    }
+}
+"#,
+    )]);
+
+    let result = call_search_tool_json(
+        project.root(),
+        "scan_usages",
+        &json!({
+            "symbols": ["App.Service.Run"],
+            "include_tests": true
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        1,
+        result["usages"].as_array().map_or(0, Vec::len),
+        "{result}"
+    );
+    assert_eq!(0, result["usages"][0]["total_hits"], "{result}");
+    assert_eq!(0, result["usages"][0]["unproven_hits"], "{result}");
+    assert_eq!(true, result["usages"][0]["verified_absent"], "{result}");
+    assert_eq!(
+        true, result["summary"]["symbols"][0]["verified_absent"],
+        "{result}"
+    );
+}
+
+#[test]
+fn csharp_scan_usages_truncated_scan_does_not_report_verified_absent() {
+    let mut builder = InlineTestProject::with_language(Language::CSharp).file(
+        "Service.cs",
+        r#"
+namespace App
+{
+    public class Service
+    {
+        public void Target() {}
+    }
+}
+"#,
+    );
+    for idx in 0..1005 {
+        builder = builder.file(
+            format!("Decoy{idx:04}.cs"),
+            format!(
+                "namespace Noise {{ public class Decoy{idx:04} {{ public void Call(dynamic value) {{ value.Target(); }} }} }}\n"
+            ),
+        );
+    }
+    let project = builder.build();
+
+    let result = call_search_tool_json(
+        project.root(),
+        "scan_usages",
+        &json!({
+            "symbols": ["App.Service.Target"],
+            "include_tests": true
+        })
+        .to_string(),
+    );
+
+    assert_eq!(true, result["summary"]["partial"], "{result}");
+    if let Some(usages) = result["usages"].as_array()
+        && let Some(usage) = usages.first()
+    {
+        assert_eq!(true, usage["candidate_files_truncated"], "{result}");
+        assert!(
+            usage["verified_absent"].is_null(),
+            "truncated scans must not claim verified_absent: {result}"
+        );
+        return;
+    }
+    assert_eq!(
+        1,
+        result["failures"].as_array().map_or(0, Vec::len),
+        "{result}"
+    );
+    assert!(
+        result["failures"][0]["candidate_files_truncated"].as_bool() == Some(true),
+        "truncated zero-hit failure should carry truncation evidence: {result}"
     );
 }

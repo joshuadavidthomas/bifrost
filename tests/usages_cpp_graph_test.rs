@@ -2695,7 +2695,10 @@ int pick() { return DefaultPrefix; }
     // The reference resolves to `other::DefaultPrefix`, so it must not be a proven hit
     // for `example::DefaultPrefix`. Ambiguity surfaces conservatively as a structured
     // fallback; either way the invariant is no false-positive hit.
-    if let FuzzyResult::Success { hits_by_overload } = &result {
+    if let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = &result
+    {
         assert!(
             hits_by_overload.values().all(|hits| hits.is_empty()),
             "bare DefaultPrefix in namespace other must not be attributed to example: {result:?}",

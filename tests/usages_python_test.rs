@@ -72,7 +72,9 @@ fn empty_overloads_yields_empty_success() {
     let finder = UsageFinder::new();
     let result = finder.find_usages_default(&analyzer, &[]);
     match result {
-        FuzzyResult::Success { hits_by_overload } => {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => {
             assert!(hits_by_overload.is_empty());
         }
         other => panic!("expected empty Success, got {other:?}"),
