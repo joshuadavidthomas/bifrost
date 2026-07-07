@@ -203,8 +203,10 @@ pub(crate) struct FileState {
 struct AnalyzerState {
     files: HashMap<ProjectFile, FileState>,
     definitions: HashMap<String, Vec<CodeUnit>>,
-    definition_lookup_index: DefinitionLookupIndex,
-    usage_facts_index: UsageFactsIndex,
+    // Arc so per-query views (e.g. Scala's ProjectTypes) can hold an owned
+    // handle without cloning the workspace-sized maps.
+    definition_lookup_index: Arc<DefinitionLookupIndex>,
+    usage_facts_index: Arc<UsageFactsIndex>,
     // Child lists are canonicalized once while building immutable analyzer
     // state. `direct_children` intentionally exposes this deduped, source-
     // ordered contract; callers only reorder when they need a presentation-
@@ -1082,8 +1084,8 @@ where
         AnalyzerState {
             files,
             definitions,
-            definition_lookup_index,
-            usage_facts_index,
+            definition_lookup_index: Arc::new(definition_lookup_index),
+            usage_facts_index: Arc::new(usage_facts_index),
             children,
             module_children,
             ranges,
@@ -1321,6 +1323,19 @@ where
             .map(|range| range.start_byte)
             .min()
             .unwrap_or(usize::MAX)
+    }
+
+    /// Owned handle to the workspace definition index. A refcount bump, not a
+    /// map clone; used by per-query views that must outlive a borrow of the
+    /// analyzer (e.g. Scala's `ProjectTypes` behind `Arc` caches).
+    pub(crate) fn definition_lookup_index_shared(&self) -> Arc<DefinitionLookupIndex> {
+        Arc::clone(&self.state.definition_lookup_index)
+    }
+
+    /// Owned handle to the derived callable-facts index; see
+    /// [`Self::definition_lookup_index_shared`].
+    pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
+        Arc::clone(&self.state.usage_facts_index)
     }
 }
 

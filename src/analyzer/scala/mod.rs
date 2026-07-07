@@ -160,6 +160,18 @@ impl ScalaAnalyzer {
         Self::new_with_config_storage(project, config, storage, None)
     }
 
+    /// Owned handles to the workspace indexes (refcount bumps, not map
+    /// clones), for per-query views held behind `Arc` caches.
+    pub(crate) fn definition_lookup_index_shared(
+        &self,
+    ) -> Arc<crate::analyzer::DefinitionLookupIndex> {
+        self.inner.definition_lookup_index_shared()
+    }
+
+    pub(crate) fn usage_facts_index_shared(&self) -> Arc<UsageFactsIndex> {
+        self.inner.usage_facts_index_shared()
+    }
+
     pub(crate) fn new_with_config_storage_and_progress(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,

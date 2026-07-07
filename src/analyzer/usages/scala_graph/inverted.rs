@@ -37,13 +37,14 @@ use crate::analyzer::{
     IAnalyzer, ImportAnalysisProvider, ProjectFile, ScalaAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
+use std::sync::Arc;
 use tree_sitter::Node;
 
 /// Every class/object/trait/enum the project declares, indexed for the per-file
 /// name->fqn rebuild. Built once and shared across all files' scans.
 pub(crate) struct ProjectTypes {
-    index: DefinitionLookupIndex,
-    facts: UsageFactsIndex,
+    index: Arc<DefinitionLookupIndex>,
+    facts: Arc<UsageFactsIndex>,
     extension_methods_by_name: HashMap<String, Vec<ExtensionMethod>>,
 }
 
@@ -75,8 +76,8 @@ impl ProjectTypes {
             }
         }
         Self {
-            index: scala.definition_lookup_index().clone(),
-            facts: scala.usage_facts_index().clone(),
+            index: scala.definition_lookup_index_shared(),
+            facts: scala.usage_facts_index_shared(),
             extension_methods_by_name,
         }
     }
