@@ -16,7 +16,7 @@ Observable outcomes: existing Ruby suites keep passing; a new `tests/ruby_dead_c
 - [x] (2026-07-07T14:33Z) Milestone 1: mechanically split `src/analyzer/usages/ruby_graph.rs` into facade plus `ruby_graph/{resolver,extractor,hits,syntax}.rs`; behavior-only validation passed with zero test edits.
 - [x] (2026-07-07T14:33Z) Milestone 2: hoisted ancestor and mixin lookup maps into lazy `RubyAnalyzer` semantic facts; `RubySemanticIndex::build*` is now a per-query view and performs no `all_declarations()` scan.
 - [x] (2026-07-07T14:33Z) Milestone 3: recorded Ruby method dispatch mode in analyzer parse state, rewired method lookup to consult `RubyAnalyzer::method_dispatch_mode`, and deleted the usage-layer `is_singleton_method_declaration` re-parse helper.
-- [ ] Milestone 4: Ruby inverted-edge path (`build_ruby_usage_edges` + `RubyEdgeResolver`), wired into dead-code analysis, with tests.
+- [x] (2026-07-07T20:10Z) Milestone 4: added Ruby's inverted-edge path (`build_ruby_usage_edges` + `RubyEdgeResolver`), wired Ruby into `usage_graph` and dead-code bulk analysis, and added Ruby usage-graph/dead-code suites.
 
 ## Surprises & Discoveries
 
@@ -32,6 +32,10 @@ Observable outcomes: existing Ruby suites keep passing; a new `tests/ruby_dead_c
   Evidence: `src/analyzer/ruby/declarations.rs` now calls `set_ruby_method_dispatch_mode` from both `visit_method` and `add_member_function`; `rg is_singleton_method_declaration src/analyzer/usages/ruby_graph src/analyzer/ruby` returns no matches.
 - Observation: The old usage-layer `module_function` walker only looked at statements before the method node, but Ruby's named form is commonly written after the method it exports.
   Evidence: the new internal test `analyzer::ruby::tests::dispatch_mode_tests::classifies_named_module_function_method` covers `def normalize ...; module_function :normalize` and passes.
+- Observation: The new edge builder could reuse `RubySemanticIndex::build_for_lookup`, `ruby_receiver_type`, `ruby_seed_assignment`, factory-return inference, and `RubyAnalyzer::method_dispatch_mode` without changing the query-path scanner, but the query scanner itself remains target-specific and is not a reusable no-target edge walker.
+  Evidence: `src/analyzer/usages/ruby_graph/inverted.rs` builds a fresh target-free `RubySemanticIndex` inside each parsed-file closure and calls the shared receiver helpers directly; `RubyFileScan` still owns `RubyTargetSpec`, hit sets, and unsafe-inference bookkeeping.
+- Observation: `usage_graph` had a Ruby node label but no Ruby ecosystem, so adding only the edge builder would still have left Ruby nodes under `unknown` while Ruby edges were impossible to merge cleanly.
+  Evidence: before Milestone 4, `Ecosystem::of(Language::Ruby)` returned `Unknown` in `src/searchtools.rs`; the implementation adds `Ecosystem::Ruby`, a `usage_graph::resolve_ruby` pass, and wire label `ruby`.
 
 ## Decision Log
 
@@ -59,16 +63,31 @@ Observable outcomes: existing Ruby suites keep passing; a new `tests/ruby_dead_c
 - Decision: The invocation-context-keyed factory-return cache (`FactoryInferenceKey` = method + invocation owner) stays exactly as designed.
   Rationale: Ruby self-returning factories genuinely need the calling owner, not just the method FQN; this was the reason Ruby could not adopt the shared single-key `callable_return_type` map (unified plan, Decision Log).
   Date/Author: 2026-07-07 / Claude
+- Decision: Milestone 4 uses a dedicated target-free Ruby inverted scanner instead of reshaping `RubyFileScan` into a shared query/edge walker.
+  Rationale: `RubyFileScan` is built around one `RubyTargetSpec`, target hit recording, and unsafe-inference diagnostics. A separate scanner can still reuse the proven semantic pieces (`RubySemanticIndex::build_for_lookup`, receiver typing, local assignment seeding, factory-return inference, dispatch-mode filtering) while keeping this milestone scoped and avoiding speculative edges.
+  Date/Author: 2026-07-07 / Codex
+- Decision: Ruby edge coverage is the conservative proven subset: constant references, class/module receiver method calls, `Klass.new` to `Klass.initialize`, bare/self lexical receiver calls, locally typed receivers, and factory-return-typed receivers. Dynamic `send`/`public_send`, `alias_method`, and Ruby field edges remain on the per-target query path for now.
+  Rationale: The subset covers the Milestone 4 dead-code and `usage_graph` requirements without inventing new inference. Edges are recorded only when method resolution returns exactly one candidate; ambiguous candidate sets, unknown receivers, and same-name guesses record nothing.
+  Date/Author: 2026-07-07 / Codex
+- Decision: Add a dedicated Ruby ecosystem to `usage_graph`.
+  Rationale: Ruby now has an edge builder, so its nodes and edges need the same language identity as the other package-scoped ecosystems. Keeping Ruby under `Unknown` would make the output misleading and would prevent a clean per-language node-membership set.
+  Date/Author: 2026-07-07 / Codex
 
 ## Outcomes & Retrospective
 
-Milestones 1 through 3 are complete and Milestone 4 was not started. The facade `src/analyzer/usages/ruby_graph.rs` is 160 lines and delegates to `ruby_graph/extractor.rs`, `ruby_graph/hits.rs`, `ruby_graph/resolver.rs`, and `ruby_graph/syntax.rs`. `RubySemanticIndex` no longer builds workspace-invariant ancestor/mixin maps per query; it borrows the analyzer-owned `RubySemanticFacts` and keeps only target/factory-return state per lookup. Method lookup mode now comes from `RubyAnalyzer::method_dispatch_mode`, backed by dispatch metadata recorded during declaration collection and persisted through analyzer state; the usage-layer `is_singleton_method_declaration` re-parse helper is gone.
+Milestones 1 through 4 are complete. The facade `src/analyzer/usages/ruby_graph.rs` delegates to `ruby_graph/extractor.rs`, `ruby_graph/hits.rs`, `ruby_graph/resolver.rs`, `ruby_graph/syntax.rs`, and the new edge modules `ruby_graph/inverted.rs` and `ruby_graph/shared.rs`. `RubySemanticIndex` no longer builds workspace-invariant ancestor/mixin maps per query; it borrows the analyzer-owned `RubySemanticFacts` and keeps only target/factory-return state per lookup. Method lookup mode now comes from `RubyAnalyzer::method_dispatch_mode`, backed by dispatch metadata recorded during declaration collection and persisted through analyzer state; the usage-layer `is_singleton_method_declaration` re-parse helper is gone.
 
 Validation on 2026-07-07T14:33Z: `cargo fmt` passed; `BIFROST_SEMANTIC_INDEX=off cargo test -p brokk-bifrost analyzer::ruby::tests::dispatch_mode_tests --lib` passed 5 tests; `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_ruby_test --test ruby_lsp_goto_definition --test ruby_lsp_find_references --test ruby_analyzer_test --test ruby_type_hierarchy_test --test ruby_import_test --test get_definition_test` passed 455 tests; `cargo clippy --all-targets --all-features -- -D warnings` passed cleanly.
 
-Milestone 4 remains the next and only remaining plan milestone: no `build_ruby_usage_edges`, `RubyEdgeResolver`, dead-code dispatch arm, or Ruby dead-code tests were added in this run.
+Milestone 4 adds `build_ruby_usage_edges`, `RubyEdgeResolver`, `src/analyzer/usages/ruby_graph/inverted.rs`, Ruby `usage_graph` dispatch, Ruby dead-code bulk dispatch, `tests/ruby_dead_code_smells.rs`, and `tests/usage_graph_ruby_test.rs`. The edge builder uses the shared inverted-edge engine and records only unique proven resolutions. Ruby dead-code analysis no longer falls back to one-symbol scans for ordinary function/class candidates, and `usage_graph` now emits Ruby nodes under the `ruby` ecosystem with Ruby caller-to-callee edges.
+
+Validation on 2026-07-07T20:10Z: `cargo fmt` passed; `BIFROST_SEMANTIC_INDEX=off cargo test --test ruby_dead_code_smells --test usage_graph_ruby_test` passed 9 tests; `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_ruby_test --test ruby_lsp_goto_definition --test ruby_lsp_find_references --test ruby_analyzer_test --test ruby_type_hierarchy_test --test ruby_import_test --test get_definition_test --test cross_language_self_usages --test ruby_dead_code_smells --test usage_graph_ruby_test` passed 473 tests; `cargo clippy --all-targets --all-features -- -D warnings` passed cleanly.
+
+The main limitation deliberately left for review is coverage breadth: dynamic dispatch (`send`, `__send__`, `public_send`), `alias_method`, and field edges were not added to the inverted edge path. They remain supported where previously supported by the target-specific query path, but Milestone 4 chose conservative no-edge behavior for those shapes rather than broadening inference under whole-workspace dead-code analysis.
 
 Plan revision note, 2026-07-07T14:33Z: updated Progress, Surprises & Discoveries, Decision Log, and Outcomes after executing Milestones 1 through 3. The updates record the lazy analyzer-owned semantic facts cache, persisted dispatch-mode analyzer metadata, validation evidence, and the explicit Milestone 4 boundary.
+
+Plan revision note, 2026-07-07T20:10Z: updated Progress, Surprises & Discoveries, Decision Log, and Outcomes after executing Milestone 4. The updates record the conservative Ruby edge coverage, `usage_graph` ecosystem wiring, validation evidence, and final limitations for review.
 
 ## Context and Orientation
 
@@ -125,6 +144,14 @@ Work from `/mnt/optane/bifrost-shared-usage-index`. After each milestone:
     cargo clippy --all-targets --all-features -- -D warnings
 
 plus the milestone-specific new suites named above. Clippy must be completely clean.
+
+Final Milestone 4 validation was run from `/mnt/optane/bifrost-shared-usage-index`:
+
+    cargo fmt
+    BIFROST_SEMANTIC_INDEX=off cargo test --test usages_ruby_test --test ruby_lsp_goto_definition --test ruby_lsp_find_references --test ruby_analyzer_test --test ruby_type_hierarchy_test --test ruby_import_test --test get_definition_test --test cross_language_self_usages --test ruby_dead_code_smells --test usage_graph_ruby_test
+    cargo clippy --all-targets --all-features -- -D warnings
+
+The combined test command passed 473 tests. Clippy completed with no warnings.
 
 ## Validation and Acceptance
 

@@ -7,7 +7,9 @@
 
 mod extractor;
 mod hits;
+mod inverted;
 mod resolver;
+mod shared;
 mod syntax;
 
 pub(crate) use extractor::{
@@ -22,9 +24,10 @@ pub(crate) use syntax::{
 
 use crate::analyzer::ruby::parse_ruby_tree;
 use crate::analyzer::usages::common::language_for_target;
+use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageAnalyzer, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageAnalyzer, UsageEdgeResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RubyAnalyzer, resolve_analyzer};
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
@@ -32,8 +35,18 @@ use std::collections::BTreeSet;
 
 use self::extractor::{RubyFileScan, language_for_file};
 use self::resolver::{RubyTargetKind, RubyTargetSpec};
+use self::shared::RubyEdgeResolver;
 
 const STRATEGY: &str = "RubyUsageGraphStrategy";
+
+pub fn build_ruby_usage_edges(
+    analyzer: &dyn IAnalyzer,
+    nodes: &HashSet<String>,
+    keep_file: impl Fn(&ProjectFile) -> bool + Sync,
+) -> Option<UsageEdges> {
+    let resolver = RubyEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
 
 #[derive(Default)]
 pub struct RubyUsageGraphStrategy;
