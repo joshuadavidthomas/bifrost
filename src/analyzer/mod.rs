@@ -61,8 +61,8 @@ pub use model::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
     DeclarationInfo, DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo,
     Language, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata,
-    ParseError, ParseErrorKind, ProjectFile, Range, SignatureMetadata, TestAssertionSmell,
-    TestAssertionWeights, metrics_from_declarations,
+    ParseError, ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
@@ -79,6 +79,7 @@ pub use project::{
 };
 pub use python::PythonAnalyzer;
 pub use ruby::RubyAnalyzer;
+pub(crate) use ruby::RubySemanticFacts;
 pub use rust::{RustAnalyzer, RustReferenceContext};
 pub use scala::ScalaAnalyzer;
 pub(crate) use scala::scala_parenthesized_arity;

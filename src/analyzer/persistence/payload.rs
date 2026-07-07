@@ -10,7 +10,10 @@
 //! re-attached on hydrate using the row key from the storage layer.
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::{CodeUnit, CodeUnitType, ImportInfo, ProjectFile, Range, SignatureMetadata};
+use crate::analyzer::{
+    CodeUnit, CodeUnitType, ImportInfo, ProjectFile, Range, RubyMethodDispatchMode,
+    SignatureMetadata,
+};
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -18,7 +21,7 @@ use std::io;
 /// Bincode envelope version. Bumped when the wire format changes in a way
 /// that cannot be deserialized by older readers; persisted rows tagged with
 /// an unknown version are treated as dirty and re-analyzed.
-pub(crate) const PAYLOAD_VERSION: u32 = 3;
+pub(crate) const PAYLOAD_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct PersistedCodeUnit {
@@ -67,6 +70,7 @@ struct PersistedFileState {
     type_identifiers: Vec<String>,
     signatures: Vec<(PersistedCodeUnit, Vec<String>)>,
     signature_metadata: Vec<(PersistedCodeUnit, Vec<SignatureMetadata>)>,
+    ruby_method_dispatch_modes: Vec<(PersistedCodeUnit, RubyMethodDispatchMode)>,
     ranges: Vec<(PersistedCodeUnit, Vec<Range>)>,
     children: Vec<(PersistedCodeUnit, Vec<PersistedCodeUnit>)>,
     type_aliases: Vec<PersistedCodeUnit>,
@@ -111,6 +115,11 @@ impl PersistedFileState {
                 .signature_metadata
                 .iter()
                 .map(|(unit, metadata)| (PersistedCodeUnit::from_code_unit(unit), metadata.clone()))
+                .collect(),
+            ruby_method_dispatch_modes: state
+                .ruby_method_dispatch_modes
+                .iter()
+                .map(|(unit, mode)| (PersistedCodeUnit::from_code_unit(unit), *mode))
                 .collect(),
             ranges: state
                 .ranges
@@ -175,6 +184,12 @@ impl PersistedFileState {
             signature_metadata.insert(unit.into_code_unit(source), metadata);
         }
 
+        let mut ruby_method_dispatch_modes =
+            map_with_capacity(self.ruby_method_dispatch_modes.len());
+        for (unit, mode) in self.ruby_method_dispatch_modes {
+            ruby_method_dispatch_modes.insert(unit.into_code_unit(source), mode);
+        }
+
         let mut ranges = map_with_capacity(self.ranges.len());
         for (unit, file_ranges) in self.ranges {
             ranges.insert(unit.into_code_unit(source), file_ranges);
@@ -207,6 +222,7 @@ impl PersistedFileState {
             type_identifiers,
             signatures,
             signature_metadata,
+            ruby_method_dispatch_modes,
             ranges,
             children,
             type_aliases,

@@ -13,9 +13,9 @@ Observable outcomes: existing Ruby suites keep passing; a new `tests/ruby_dead_c
 ## Progress
 
 - [x] (2026-07-07) Plan drafted from a survey of `ruby_graph.rs` and the Ruby analyzer.
-- [ ] Milestone 1: mechanical split of `ruby_graph.rs` into `ruby_graph/` modules; no behavior change.
-- [ ] Milestone 2: hoist ancestor/mixin maps out of the per-query `RubySemanticIndex` build into analyzer-cached state.
-- [ ] Milestone 3: record method dispatch mode at declaration-collection time; delete the per-candidate re-parse.
+- [x] (2026-07-07T14:33Z) Milestone 1: mechanically split `src/analyzer/usages/ruby_graph.rs` into facade plus `ruby_graph/{resolver,extractor,hits,syntax}.rs`; behavior-only validation passed with zero test edits.
+- [x] (2026-07-07T14:33Z) Milestone 2: hoisted ancestor and mixin lookup maps into lazy `RubyAnalyzer` semantic facts; `RubySemanticIndex::build*` is now a per-query view and performs no `all_declarations()` scan.
+- [x] (2026-07-07T14:33Z) Milestone 3: recorded Ruby method dispatch mode in analyzer parse state, rewired method lookup to consult `RubyAnalyzer::method_dispatch_mode`, and deleted the usage-layer `is_singleton_method_declaration` re-parse helper.
 - [ ] Milestone 4: Ruby inverted-edge path (`build_ruby_usage_edges` + `RubyEdgeResolver`), wired into dead-code analysis, with tests.
 
 ## Surprises & Discoveries
@@ -26,6 +26,12 @@ Observable outcomes: existing Ruby suites keep passing; a new `tests/ruby_dead_c
   Evidence: the only uses of `target` in the built struct are `target_matches_constant` and factory inference; `ancestors` and the three mixin maps are pure workspace facts.
 - Observation: Ruby is absent from the per-language edge dispatch in `src/code_quality/dead_code_smells.rs` (arms exist for Rust :778, Python :862, Java :896, Scala :920, Go :943, C# :966, C++ :992, PHP :1016, JS/TS :1164) and `ruby_graph.rs` implements no `UsageEdgeResolver`, unlike every other `*_graph` module.
   Evidence: `grep -l UsageEdgeResolver src/analyzer/usages/*.rs` lists every language facade except `ruby_graph.rs`; there is no `ruby_dead_code_smells.rs` test suite while eight sibling suites exist.
+- Observation: The Milestone 2 query-invariance diagnosis was correct. The moved maps are now built only in `RubyAnalyzer::semantic_facts`, and `RubySemanticIndex::build_with_target` only stores `analyzer`, `ruby`, a borrow of `ruby.semantic_facts()`, the optional target, and the per-query factory-return cache.
+  Evidence: `rg -n "all_declarations\\(" src/analyzer/usages/ruby_graph src/analyzer/ruby/mod.rs` shows no usage-layer `all_declarations()` call; the only new scan is `src/analyzer/ruby/mod.rs:168` inside `RubySemanticFacts::build`.
+- Observation: The Milestone 3 collector diagnosis was correct. The collector already had the singleton-context parent walk; after this work it persists the dispatch classification for methods through `ParsedFile::set_ruby_method_dispatch_mode` instead of discarding the fact.
+  Evidence: `src/analyzer/ruby/declarations.rs` now calls `set_ruby_method_dispatch_mode` from both `visit_method` and `add_member_function`; `rg is_singleton_method_declaration src/analyzer/usages/ruby_graph src/analyzer/ruby` returns no matches.
+- Observation: The old usage-layer `module_function` walker only looked at statements before the method node, but Ruby's named form is commonly written after the method it exports.
+  Evidence: the new internal test `analyzer::ruby::tests::dispatch_mode_tests::classifies_named_module_function_method` covers `def normalize ...; module_function :normalize` and passes.
 
 ## Decision Log
 
@@ -35,9 +41,18 @@ Observable outcomes: existing Ruby suites keep passing; a new `tests/ruby_dead_c
 - Decision: Cache ancestor/mixin maps in the Ruby analyzer's state lifecycle rather than memoizing inside the usages layer.
   Rationale: They are workspace facts derived from declarations and `mixin_relations`; analyzer state is rebuilt wholesale on re-analysis, so caching there gets invalidation for free — the same reasoning that put `DefinitionLookupIndex` and `UsageFactsIndex` on the analyzer (see the unified plan's Decision Log). A usages-side memo would be a second cache with its own staleness story.
   Date/Author: 2026-07-07 / Claude
+- Decision: Build `RubySemanticFacts` lazily with an `Arc<OnceLock<RubySemanticFacts>>` owned by `RubyAnalyzer`.
+  Rationale: Ancestor and mixin maps are only needed by Ruby usage/get-definition paths, so eager construction would add cost to analyzer users that never ask for those paths. Placing the `OnceLock` on `RubyAnalyzer` still ties invalidation to `update` and `update_all`, because those constructors allocate fresh analyzer cache state.
+  Date/Author: 2026-07-07 / Codex
 - Decision: Record method dispatch mode at declaration-collection time (Milestone 3) instead of caching the re-parse result.
   Rationale: The collector already walks the exact node structure needed; persisting the fact at the source follows the repo's root-cause philosophy, and it deletes the per-candidate `read_source` + `parse_ruby_tree` entirely instead of amortizing it.
   Date/Author: 2026-07-07 / Claude
+- Decision: Store Ruby method dispatch modes in the generic parsed/analyzer state and persisted payload, keyed by `CodeUnit`.
+  Rationale: This makes the classification a declaration-collection fact, not a Ruby usage side cache. The payload version was bumped from 3 to 4 so storage-backed analyzers do not hydrate rows missing the dispatch map.
+  Date/Author: 2026-07-07 / Codex
+- Decision: Treat `RubyMethodDispatchMode::ModuleFunction` as matching both instance and singleton lookup modes.
+  Rationale: Ruby's `module_function` copies the method to the module's singleton side while leaving a private instance method, which is the behavioral contract Milestone 3 requires. `ruby_method_lookup_mode_matches` now encodes that directly from analyzer state.
+  Date/Author: 2026-07-07 / Codex
 - Decision: The edge path (Milestone 4) records only resolutions the query path already treats as proven; unresolved or unproven-receiver calls produce no edge.
   Rationale: `ruby_graph.rs`'s module doc states the policy: Ruby is dynamic, so hits are emitted only when parser and analyzer facts prove the target. Edges must follow the same conservatism — a wrong edge poisons dead-code analysis. This mirrors how the query path surfaces `UnsafeInference` instead of guessing.
   Date/Author: 2026-07-07 / Claude
@@ -47,7 +62,13 @@ Observable outcomes: existing Ruby suites keep passing; a new `tests/ruby_dead_c
 
 ## Outcomes & Retrospective
 
-(To be filled in as milestones complete.)
+Milestones 1 through 3 are complete and Milestone 4 was not started. The facade `src/analyzer/usages/ruby_graph.rs` is 160 lines and delegates to `ruby_graph/extractor.rs`, `ruby_graph/hits.rs`, `ruby_graph/resolver.rs`, and `ruby_graph/syntax.rs`. `RubySemanticIndex` no longer builds workspace-invariant ancestor/mixin maps per query; it borrows the analyzer-owned `RubySemanticFacts` and keeps only target/factory-return state per lookup. Method lookup mode now comes from `RubyAnalyzer::method_dispatch_mode`, backed by dispatch metadata recorded during declaration collection and persisted through analyzer state; the usage-layer `is_singleton_method_declaration` re-parse helper is gone.
+
+Validation on 2026-07-07T14:33Z: `cargo fmt` passed; `BIFROST_SEMANTIC_INDEX=off cargo test -p brokk-bifrost analyzer::ruby::tests::dispatch_mode_tests --lib` passed 5 tests; `BIFROST_SEMANTIC_INDEX=off cargo test --test usages_ruby_test --test ruby_lsp_goto_definition --test ruby_lsp_find_references --test ruby_analyzer_test --test ruby_type_hierarchy_test --test ruby_import_test --test get_definition_test` passed 455 tests; `cargo clippy --all-targets --all-features -- -D warnings` passed cleanly.
+
+Milestone 4 remains the next and only remaining plan milestone: no `build_ruby_usage_edges`, `RubyEdgeResolver`, dead-code dispatch arm, or Ruby dead-code tests were added in this run.
+
+Plan revision note, 2026-07-07T14:33Z: updated Progress, Surprises & Discoveries, Decision Log, and Outcomes after executing Milestones 1 through 3. The updates record the lazy analyzer-owned semantic facts cache, persisted dispatch-mode analyzer metadata, validation evidence, and the explicit Milestone 4 boundary.
 
 ## Context and Orientation
 

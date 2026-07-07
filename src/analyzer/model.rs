@@ -25,6 +25,13 @@ pub enum Language {
     Ruby,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RubyMethodDispatchMode {
+    Instance,
+    Singleton,
+    ModuleFunction,
+}
+
 impl Language {
     pub fn config_label(self) -> &'static str {
         match self {
