@@ -2302,6 +2302,69 @@ end
 }
 
 #[test]
+fn scan_usages_target_recall_does_not_repeat_targets_hint() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file(
+            "app/user.rb",
+            r#"
+class User
+  def save
+  end
+end
+
+class App
+  def run(obj)
+    obj.save
+    send(:save)
+  end
+end
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let first_payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"symbols":["User.save"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let first: Value = serde_json::from_str(&first_payload).unwrap();
+    assert_scan_usages_failure(
+        &first,
+        "User.save",
+        "RubyUsageGraphStrategy",
+        "unsafe_inference",
+    );
+    let first_hint = first["failures"][0]["hint"].as_str().unwrap();
+    assert!(
+        first_hint.contains("`targets` selector"),
+        "payload: {first}"
+    );
+
+    let recalled_payload = service
+        .call_tool_json(
+            "scan_usages",
+            r#"{"targets":[{"path":"app/user.rb","line":3}],"include_tests":true}"#,
+        )
+        .unwrap();
+    let recalled: Value = serde_json::from_str(&recalled_payload).unwrap();
+    assert_scan_usages_failure(
+        &recalled,
+        "User.save",
+        "RubyUsageGraphStrategy",
+        "unsafe_inference",
+    );
+    let recalled_hint = recalled["failures"][0]["hint"].as_str().unwrap();
+    assert_ne!(first_hint, recalled_hint, "payload: {recalled}");
+    assert!(
+        !recalled_hint.contains("targets"),
+        "anchored re-call must not suggest another targets re-call: {recalled}"
+    );
+}
+
+#[test]
 fn scan_usages_accepts_location_target_without_symbols() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -2437,7 +2500,7 @@ function run() {
     );
     assert_scan_usages_failure_hint(
         &method,
-        "No export seed was resolved for this symbol. Use search_symbols or get_symbol_sources to choose an exported declaration, or re-call scan_usages with a location-anchored `targets` selector for the definition site.",
+        "No export seed was resolved for this selected definition. Use search_symbols or get_symbol_sources to choose an exported declaration, or narrow `paths` to likely callers.",
     );
 }
 
