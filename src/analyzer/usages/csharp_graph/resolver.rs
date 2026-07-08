@@ -912,7 +912,7 @@ fn receiver_type_fq_names(
     }
 }
 
-fn class_field_receiver_type(
+pub(in crate::analyzer::usages) fn class_field_receiver_type(
     receiver_node: Node<'_>,
     receiver: &str,
     csharp: &CSharpAnalyzer,

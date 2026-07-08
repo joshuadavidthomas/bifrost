@@ -322,6 +322,57 @@ object Utility {
 }
 
 #[test]
+fn scala_graph_counts_static_qualifier_references_for_object_targets() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "pkg/Utility.scala",
+            r#"
+package pkg
+
+object Utility {
+  val value: Int = 7
+  def build(): String = "ok"
+}
+
+class Other {
+  def touch(): Unit = ()
+}
+"#,
+        ),
+        (
+            "app/Consumer.scala",
+            r#"
+package app
+
+import pkg.{Other, Utility}
+
+class Consumer {
+  def run(): Unit = {
+    Utility.build()
+    val value = Utility.value
+    val Utility = new Other()
+    Utility.touch()
+  }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "pkg.Utility$");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = hits(ScalaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_contains(&hits, "Utility.build()");
+    assert_hit_contains(&hits, "Utility.value");
+    assert_no_hit_contains(&hits, "Utility.touch()");
+}
+
+#[test]
 fn scala_graph_handles_wildcard_member_imports_and_ignores_unrelated_same_names() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

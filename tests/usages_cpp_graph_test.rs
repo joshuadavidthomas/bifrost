@@ -1563,6 +1563,46 @@ void call(ns::Target& obj, ns::Target* ptr, ns::Other& other) {
 }
 
 #[test]
+fn cpp_graph_counts_static_qualifier_references_for_class_targets() {
+    let (_project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "target.h",
+            r#"
+namespace ns {
+struct Target {
+    static const int VALUE = 7;
+    static Target build();
+};
+struct Other {
+    void touch();
+};
+}
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"
+#include "target.h"
+
+void call() {
+    ns::Target::build();
+    int value = ns::Target::VALUE;
+    ns::Other Target;
+    Target.touch();
+}
+"#,
+        ),
+    ]);
+
+    let target = class_definition(&analyzer, "Target");
+    let hits = usage_hits(&analyzer, &target);
+
+    assert_hit_contains(&hits, "consumer.cpp", "ns::Target::build()");
+    assert_hit_contains(&hits, "consumer.cpp", "ns::Target::VALUE");
+    assert_no_hit_contains(&hits, "Target.touch()");
+}
+
+#[test]
 fn cpp_graph_v2_handles_static_fields_globals_and_scoped_enums() {
     let (_project, analyzer) = cpp_analyzer_with_files(&[
         (

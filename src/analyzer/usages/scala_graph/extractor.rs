@@ -10,9 +10,9 @@ use crate::analyzer::usages::scala_graph::resolver::{
 };
 use crate::analyzer::usages::scala_graph::syntax::{
     call_arity_for_reference, has_ancestor_kind, has_member_qualifier, is_assignment_lhs,
-    is_constructor_like_reference, is_identifier_node, is_owner_qualified_this,
-    is_type_like_reference, member_qualifier, member_qualifier_node, node_text,
-    parenthesized_arity,
+    is_constructor_like_reference, is_field_expression_value, is_identifier_node,
+    is_owner_qualified_this, is_type_like_reference, member_qualifier, member_qualifier_node,
+    node_text, parenthesized_arity,
 };
 use crate::analyzer::{
     CodeUnit, IAnalyzer, ProjectFile, Range, ScalaAnalyzer, TypeHierarchyProvider,
@@ -534,7 +534,9 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     let proven = match ctx.spec.kind {
         TargetKind::Type => {
-            ctx.visibility.type_names.contains(text) && is_type_like_reference(node, ctx.source)
+            ctx.visibility.type_names.contains(text)
+                && (is_type_like_reference(node, ctx.source) || is_field_expression_value(node))
+                && !type_reference_is_locally_bound(text, ctx)
         }
         TargetKind::Constructor => {
             ctx.visibility.type_names.contains(text)
@@ -555,6 +557,10 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn assignment_lhs_is_target_member_write(proven: bool, text: &str, ctx: &ScanCtx<'_>) -> bool {
     proven && ctx.spec.kind == TargetKind::Field && text == ctx.spec.member_name
+}
+
+fn type_reference_is_locally_bound(text: &str, ctx: &ScanCtx<'_>) -> bool {
+    !ctx.bindings.resolve_symbol(text).is_unknown() || ctx.bindings.is_shadowed(text)
 }
 
 fn seed_value_binding_identifier(node: Node<'_>, text: &str, ctx: &mut ScanCtx<'_>) -> bool {

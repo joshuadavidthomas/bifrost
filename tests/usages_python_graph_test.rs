@@ -226,10 +226,13 @@ fn reexported_class_alias_receiver_resolves_member_usages() {
     let analyzer = PythonAnalyzer::from_project(project.project().clone());
     let candidates = analyzer.get_analyzed_files().into_iter().collect();
 
-    for (fqn, snippet) in [
-        ("shop.models.User", "Account.guest()"),
-        ("shop.models.User.guest", "Account.guest()"),
-        ("shop.models.User.format_name", "Account.format_name"),
+    for (fqn, snippets) in [
+        (
+            "shop.models.User",
+            vec!["Account.guest()", "Account.format_name"],
+        ),
+        ("shop.models.User.guest", vec!["Account.guest()"]),
+        ("shop.models.User.format_name", vec!["Account.format_name"]),
     ] {
         let target = definition(&analyzer, fqn);
         let result = PythonExportUsageGraphStrategy::new().find_usages(
@@ -241,11 +244,82 @@ fn reexported_class_alias_receiver_resolves_member_usages() {
         let hits = result
             .into_either()
             .unwrap_or_else(|_| panic!("graph should resolve usages for {fqn}"));
-        assert_eq!(hits.len(), 1, "{fqn}: {hits:#?}");
-        let hit = hits.iter().next().expect("one hit");
-        assert_eq!(hit.file, project.file("tests/test_models.py"), "{fqn}");
-        assert!(hit.snippet.contains(snippet), "{fqn}: {hit:#?}");
+        assert_eq!(hits.len(), snippets.len(), "{fqn}: {hits:#?}");
+        assert!(
+            hits.iter()
+                .all(|hit| hit.file == project.file("tests/test_models.py")),
+            "{fqn}: {hits:#?}"
+        );
+        for snippet in snippets {
+            assert!(
+                hits.iter().any(|hit| hit.snippet.contains(snippet)),
+                "{fqn}: expected {snippet:?}, got {hits:#?}"
+            );
+        }
     }
+}
+
+#[test]
+fn python_graph_counts_static_qualifier_references_for_class_targets() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+class Target:
+    LIMIT = 7
+
+    @staticmethod
+    def static_helper():
+        return Target.LIMIT
+
+class Other:
+    def touch(self):
+        pass
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import Target, Other
+
+def run():
+    Target.static_helper()
+    value = Target.LIMIT
+
+def shadowed():
+    Target = Other()
+    Target.touch()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.Target");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve class-target static qualifiers");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("Target.static_helper()")),
+        "expected staticmethod qualifier hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.snippet.contains("Target.LIMIT")),
+        "expected class attribute qualifier hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("Target.touch()")),
+        "local variable receiver must not count as class usage: {hits:#?}"
+    );
 }
 
 #[test]

@@ -52,6 +52,12 @@ pub(crate) fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
         })
 }
 
+pub(crate) fn is_field_expression_value(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
+    })
+}
+
 pub(crate) fn is_constructor_like_reference(node: Node<'_>, source: &str) -> bool {
     let prefix = source[..node.start_byte()].trim_end();
     prefix.ends_with("new")

@@ -1,8 +1,8 @@
 use crate::analyzer::csharp_normalize_full_name;
 use crate::analyzer::usages::csharp_graph::hits::{push_hit, push_unproven_hit};
 use crate::analyzer::usages::csharp_graph::resolver::{
-    TargetKind, TargetSpec, argument_count, binding_scope_node, enclosing_declared_type,
-    expression_resolves_to_type, first_type_child, is_type_reference_node,
+    TargetKind, TargetSpec, argument_count, binding_scope_node, class_field_receiver_type,
+    enclosing_declared_type, expression_resolves_to_type, first_type_child, is_type_reference_node,
     member_name_is_locally_bound, node_text, normalize_type_text, object_initializer_for_label,
     receiver_targets_owner, reference_type_text, resolves_to_target, resolves_to_target_at,
     same_node, seed_visible_bindings_at, type_identity_matches,
@@ -113,10 +113,11 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if !matches!(node.kind(), "identifier" | "type")
-        || is_declaration_name(node)
-        || !is_type_reference_node(node)
-    {
+    if !matches!(node.kind(), "identifier" | "type") || is_declaration_name(node) {
+        return;
+    }
+    if !is_type_reference_node(node) {
+        scan_static_type_qualifier(node, ctx);
         return;
     }
     let raw_name = normalize_type_text(node_text(node, ctx.source));
@@ -132,6 +133,50 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if type_reference_resolves_to_target(node, ctx, &reference) {
         push_hit(node, ctx);
     }
+}
+
+fn scan_static_type_qualifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() != "identifier" || !is_member_access_expression_receiver(node) {
+        return;
+    }
+    let raw_name = normalize_type_text(node_text(node, ctx.source));
+    if raw_name != ctx.spec.member_name
+        && !ctx
+            .csharp
+            .using_aliases_of(ctx.file)
+            .contains_key(&raw_name)
+    {
+        return;
+    }
+
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    seed_visible_bindings_at(
+        binding_scope_node(node),
+        node,
+        ctx.csharp,
+        ctx.file,
+        ctx.source,
+        &mut bindings,
+    );
+    if !bindings.resolve_symbol(&raw_name).is_unknown()
+        || !class_field_receiver_type(node, &raw_name, ctx.csharp, ctx.file, ctx.source)
+            .is_unknown()
+    {
+        return;
+    }
+
+    if type_reference_resolves_to_target(node, ctx, &raw_name) {
+        push_hit(node, ctx);
+    } else {
+        push_unproven_hit(node, ctx);
+    }
+}
+
+fn is_member_access_expression_receiver(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "member_access_expression"
+            && member_access_receiver(parent).is_some_and(|receiver| same_node(receiver, node))
+    })
 }
 
 fn type_reference_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>, reference: &str) -> bool {

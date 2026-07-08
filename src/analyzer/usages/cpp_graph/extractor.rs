@@ -290,9 +290,89 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .resolves_to_type(ctx.file, text, &ctx.spec.target)
     {
         push_hit(hit_node, ctx);
+    } else if let Some(scope) = static_qualifier_type_scope(node, ctx) {
+        push_hit(scope, ctx);
     } else if !ctx.visibility.is_visible(ctx.file, &ctx.spec.target) {
-        push_unproven_hit(hit_node, ctx);
+        if let Some(scope) = static_qualifier_name_scope(node, ctx) {
+            push_unproven_hit(scope, ctx);
+        } else {
+            push_unproven_hit(hit_node, ctx);
+        }
     }
+}
+
+fn static_qualifier_type_scope<'tree>(node: Node<'tree>, ctx: &ScanCtx<'_>) -> Option<Node<'tree>> {
+    if node.kind() != "qualified_identifier" {
+        return None;
+    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() != "qualified_identifier" {
+            continue;
+        }
+        if let Some(scope) = current.child_by_field_name("scope") {
+            let text = qualified_scope_text(scope, ctx.source);
+            if ctx
+                .visibility
+                .resolves_to_type(ctx.file, &text, &ctx.spec.target)
+            {
+                return Some(scope);
+            }
+        }
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == "qualified_identifier" {
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+fn static_qualifier_name_scope<'tree>(node: Node<'tree>, ctx: &ScanCtx<'_>) -> Option<Node<'tree>> {
+    if node.kind() != "qualified_identifier" {
+        return None;
+    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() != "qualified_identifier" {
+            continue;
+        }
+        if let Some(scope) = current.child_by_field_name("scope") {
+            let text = qualified_scope_text(scope, ctx.source);
+            if name_mentions(&text, &ctx.spec.member_name) {
+                return Some(scope);
+            }
+        }
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == "qualified_identifier" {
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+fn qualified_scope_text(scope: Node<'_>, source: &str) -> String {
+    let mut parts = vec![node_text(scope, source).to_string()];
+    let mut current = scope.parent();
+    while let Some(qualified) = current {
+        let Some(parent) = qualified.parent() else {
+            break;
+        };
+        if parent.kind() != "qualified_identifier"
+            || parent.child_by_field_name("name") != Some(qualified)
+        {
+            break;
+        }
+        if let Some(outer_scope) = parent.child_by_field_name("scope") {
+            parts.push(node_text(outer_scope, source).to_string());
+        }
+        current = Some(parent);
+    }
+    parts.reverse();
+    parts.join("::")
 }
 
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

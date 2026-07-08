@@ -198,6 +198,61 @@ fn java_import_hits_are_editor_visible_but_external_usage_free() {
 }
 
 #[test]
+fn java_graph_counts_static_qualifier_references_for_class_targets() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "com/example/Target.java",
+            r#"
+package com.example;
+
+public class Target {
+    public static final int VALUE = 7;
+    public static Target build() { return new Target(); }
+}
+"#,
+        ),
+        (
+            "com/example/Other.java",
+            r#"
+package com.example;
+
+public class Other {
+    public void touch() {}
+}
+"#,
+        ),
+        (
+            "com/example/Consumer.java",
+            r#"
+package com.example;
+
+public class Consumer {
+    void run() {
+        Target.build();
+        int value = Target.VALUE;
+        Other Target = new Other();
+        Target.touch();
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "com.example.Target");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    ));
+
+    assert_hit_contains(&hits, "Target.build()");
+    assert_hit_contains(&hits, "Target.VALUE");
+    assert_no_hit_contains(&hits, "Target.touch()");
+}
+
+#[test]
 fn java_graph_strategy_finds_method_constructor_field_and_type_usages() {
     let (project, analyzer) = java_analyzer_with_files(&[
         (

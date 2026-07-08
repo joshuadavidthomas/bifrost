@@ -238,7 +238,6 @@ pub(super) fn scan_files_for_seeds(
             source: source_str,
             line_starts: &line_starts,
             analyzer,
-            target,
             target_short: &target_short,
             target_member: target_member.as_deref(),
             target_owner: target_owner.clone(),
@@ -287,7 +286,6 @@ pub(super) struct ScanCtx<'a> {
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) analyzer: &'a dyn IAnalyzer,
-    target: &'a CodeUnit,
     target_short: &'a str,
     target_member: Option<&'a str>,
     target_owner: Option<CodeUnit>,
@@ -489,21 +487,6 @@ impl ScanCtx<'_> {
             .into_iter()
             .any(|ancestor| ancestor == *target_owner)
     }
-
-    fn target_class_method_named(&self, attribute: &str) -> bool {
-        if !self.target.is_class() {
-            return false;
-        }
-        let owner_fqn = self.target.fq_name();
-        self.analyzer
-            .definition_lookup_index()
-            .members_for_owner_name(&owner_fqn, &owner_fqn, attribute)
-            .into_iter()
-            .any(|unit| {
-                unit.is_function()
-                    && python_callable_has_decorator(self.analyzer, unit, "classmethod")
-            })
-    }
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -608,7 +591,6 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if ctx.target_member.is_none()
         && object.kind() == "identifier"
         && ctx.binds_target(object_text, node)
-        && ctx.target_class_method_named(attribute_text)
         && !ctx.edges.iter().any(|edge| {
             matches!(edge.kind, ImportEdgeKind::Namespace) && edge.local_name == object_text
         })
@@ -859,54 +841,6 @@ fn callable_return_type_name(analyzer: &dyn IAnalyzer, callable: &CodeUnit) -> O
     let tree = parser.parse(source.as_str(), None)?;
     let function = first_function_definition(tree.root_node())?;
     factory_return_type(function, &source)
-}
-
-fn python_callable_has_decorator(
-    analyzer: &dyn IAnalyzer,
-    callable: &CodeUnit,
-    decorator_name: &str,
-) -> bool {
-    let Some(source) = analyzer.get_source(callable, false) else {
-        return false;
-    };
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .is_err()
-    {
-        return false;
-    }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
-        return false;
-    };
-    let Some(function) = first_function_definition(tree.root_node()) else {
-        return false;
-    };
-    let Some(parent) = function.parent() else {
-        return false;
-    };
-    if parent.kind() != "decorated_definition" {
-        return false;
-    }
-    let mut cursor = parent.walk();
-    parent
-        .named_children(&mut cursor)
-        .filter(|child| child.kind() == "decorator")
-        .any(|decorator| decorator_contains_identifier(decorator, &source, decorator_name))
-}
-
-fn decorator_contains_identifier(node: Node<'_>, source: &str, identifier: &str) -> bool {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "identifier" && slice(node, source) == identifier {
-            return true;
-        }
-        let mut cursor = node.walk();
-        let mut children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
-        children.reverse();
-        stack.extend(children);
-    }
-    false
 }
 
 fn first_function_definition(root: Node<'_>) -> Option<Node<'_>> {

@@ -14,16 +14,22 @@ Languages that already handle this correctly and must not regress: JS/TS (`src/a
 
 ## Progress
 
-- [ ] Milestone 1: failing tests pinning the contract in C#, Java, C++, Scala, Python; passing tests confirming JS/TS, Rust, PHP, Ruby already conform.
-- [ ] Milestone 2: C# fix (reference implementation of the shape).
-- [ ] Milestone 3: Java and C++ fixes.
-- [ ] Milestone 4: Scala and Python fixes.
-- [ ] Milestone 5: end-to-end verification against the Radarr worktree; update `.agents/docs/scan-usages-hardab80-inconsistent-results.md` with the issue-543 verdicts; close-out.
+- [x] Milestone 1: failing tests pinning the contract in C#, Java, C++, Scala, Python; passing tests confirming JS/TS, Rust, PHP, Ruby already conform.
+- [x] Milestone 2: C# fix (reference implementation of the shape).
+- [x] Milestone 3: Java and C++ fixes.
+- [x] Milestone 4: Scala and Python fixes.
+- [x] (2026-07-08 18:20Z) Milestone 5: end-to-end verification against the Radarr worktree; update `.agents/docs/scan-usages-hardab80-inconsistent-results.md` with the issue-543 verdicts; close-out.
 
 ## Surprises & Discoveries
 
 - Observation: of the four "inconsistent results" cases in issue #543, three were benchmark-extraction artifacts (calls recorded against mutated or mid-edit working trees, or with a `paths` filter the extraction's dedup key dropped) and one was already fixed by the issue-528 proof-tier work. The only genuine engine defect found is the static-qualifier blind spot this plan fixes, which is a silent undercount, not an inconsistency.
   Evidence: five repeated runs of `scan_usages` for `NzbDrone.Core.Organizer.FileNameBuilder.TitleRegex` at the pristine sha return 4/4/4/4/4 hits deterministically; the class-level query returns 7/7/7 but never any of the ~11 static-access production sites.
+- Observation: the cited root causes are still present in the current code, although line numbers have moved since commit `26ddbbc`.
+  Evidence: C# still gated class-target references through `is_type_reference_node`; Java still restricted class-target references to type-node kinds; C++ still resolved the whole `qualified_identifier`; Scala still required `is_type_like_reference`; Python still required `target_class_method_named`.
+- Observation: C++ tree-sitter can associate `ns::Target::build` as an outer qualified node whose `scope` is the namespace and whose nested `name` contains the type/member path, so resolving only the immediate `scope` is insufficient for namespaced static qualifiers.
+  Evidence: the first C++ implementation resolved `scope` chains only and the new `cpp_graph_counts_static_qualifier_references_for_class_targets` test still returned no hits; walking nested `qualified_identifier` nodes and reconstructing prefixes from AST `scope`/`name` fields made the test pass.
+- Observation: Python assignment shadows are function-wide, so a positive `Target.static_helper()` before `Target = Other()` in the same function is not a valid imported-class reference in Python.
+  Evidence: `binds_target` correctly rejected that test shape; splitting the positive static qualifier and the local-shadow negative into separate functions produced the intended coverage.
 
 ## Decision Log
 
@@ -33,10 +39,16 @@ Languages that already handle this correctly and must not regress: JS/TS (`src/a
 - Decision: report a resolved qualifier as a proven hit, an unresolvable-but-plausible qualifier as an unproven hit, and a qualifier that resolves to something else (a local variable, a different type) as no hit.
   Rationale: this is the established proof-tier idiom from the issue-528 work; see the idiom citations in Context and Orientation. Silently dropping plausible references is exactly the bug class this repository's design philosophy forbids.
   Date/Author: 2026-07-08 / Claude.
+- Decision: remove Python's blanket `target_class_method_named` gate rather than preserving a narrower classmethod-only guard.
+  Rationale: `git log -S target_class_method_named` shows commit `f32f737` added the gate for usagebench receiver parity, explicitly counting class aliases for classmethod receivers while excluding staticmethod calls as class usages. The current contract intentionally changes that exclusion; `ctx.binds_target` remains the import-aware, shadow-aware resolver, and the existing namespace-import exclusion remains in place.
+  Date/Author: 2026-07-08 / Codex implementation session.
+- Decision: for Java `TargetKind::Type`, local variables and parameters seed only shadows, not receiver type bindings.
+  Rationale: the scanner seeds the target class name into the binding engine so static qualifiers can be recognized, but a local variable named like the target must still block class-target hits even when its declared type is the target. Type-target scans do not need instance receiver inference, so treating locals/parameters as shadows keeps the qualifier proof tier precise.
+  Date/Author: 2026-07-08 / Codex implementation session.
 
 ## Outcomes & Retrospective
 
-(To be written at completion.)
+Milestones 1 through 4 are complete. Class-target static qualifier hits are now covered and implemented for C#, Java, C++, Scala, and Python, with PHP and Rust pinning tests confirming their existing behavior. Validation completed with the targeted seven usage graph test files, the broader per-language `usage_graph_*` / `usages_*` regression targets named for the touched languages, `cargo fmt`, and `cargo clippy --all-targets --all-features -- -D warnings`. Milestone 5 completed separately: against the pristine Radarr worktree at `187dd79b9c9d`, the class-target query for `NzbDrone.Core.Organizer.FileNameBuilder` grew from 7 test-only hits to 22 hits including every enumerated production static-access site (IsoLanguages.cs:102, FileNameValidation.cs:46/63, UsenetClientBase.cs:43, TorrentClientBase.cs:199, Pneumatic.cs:48/74, UsenetBlackhole.cs:42, TorrentBlackhole.cs:53/72, ScanWatchFolder.cs:56/97), all proven (`unproven_hits: 0`), byte-identical across repeated runs; the field-level `TitleRegex` query is unchanged at exactly 4 hits. The issue-543 verdicts were appended to `.agents/docs/scan-usages-hardab80-inconsistent-results.md`. Lesson learned: the four language strategies with this bug all shared the same root pattern — an AST-shape allow-list added for precision that encoded "type reference" too narrowly — while the incidentally-correct languages scan every identifier and let resolution decide. Future precision gates on reference kinds should be paired with a cross-language contract test at introduction time.
 
 ## Context and Orientation
 

@@ -280,6 +280,62 @@ namespace Other {
 }
 
 #[test]
+fn csharp_graph_counts_static_qualifier_references_for_class_targets() {
+    let (_project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Domain/Target.cs",
+            r#"
+namespace Domain {
+    public class Target {
+        public const int Value = 7;
+        public static Target Build() => new Target();
+    }
+
+    public class Other {
+        public void Touch() {}
+    }
+}
+"#,
+        ),
+        (
+            "App/Consumer.cs",
+            r#"
+using Domain;
+
+namespace App {
+    public class Consumer {
+        public void Run() {
+            Target.Build();
+            var value = Target.Value;
+            var Target = new Other();
+            Target.Touch();
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = type_definition(&analyzer, "Domain.Target");
+    let hits = graph_hits(&analyzer, &target);
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("Target.Build()")),
+        "expected static method qualifier hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.snippet.contains("Target.Value")),
+        "expected static constant qualifier hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter()
+            .all(|hit| !hit.snippet.contains("Target.Touch()")),
+        "local variable receiver must not count as class usage: {hits:#?}"
+    );
+}
+
+#[test]
 fn csharp_graph_resolves_nested_partial_type_references_in_sibling_file() {
     let project = csharp_nested_partial_cacheinfo_project().build();
     let analyzer = CSharpAnalyzer::from_project(project.project().clone());

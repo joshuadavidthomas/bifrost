@@ -5,7 +5,9 @@ use crate::analyzer::usages::java_graph::resolver::{
     is_declaration_name, is_ignored_type_context, java_method_signatures_match, node_text,
     receiver_matches_target, resolve_type_from_node, same_owner_context, seed_class_binding,
 };
-use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
+use crate::analyzer::usages::local_inference::{
+    LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
+};
 use crate::analyzer::usages::model::UsageHit;
 use crate::analyzer::{IAnalyzer, JavaAnalyzer, ProjectFile};
 use crate::hash::HashMap;
@@ -186,7 +188,9 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             resolved_type = infer_type_from_value(value, ctx);
         }
 
-        if let Some(resolved) = resolved_type.as_ref()
+        if ctx.spec.kind == TargetKind::Type {
+            ctx.bindings.declare_shadow(binding_name.to_string());
+        } else if let Some(resolved) = resolved_type.as_ref()
             && ctx
                 .spec
                 .receiver_owner_fq_names
@@ -211,7 +215,9 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let resolved = node
         .child_by_field_name("type")
         .and_then(|type_node| resolve_type_from_node(type_node, ctx));
-    if let Some(resolved) = resolved
+    if ctx.spec.kind == TargetKind::Type {
+        ctx.bindings.declare_shadow(binding_name.to_string());
+    } else if let Some(resolved) = resolved
         && ctx
             .spec
             .receiver_owner_fq_names
@@ -234,6 +240,9 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if maybe_record_static_qualifier_type_hit(node, ctx) {
+        return;
+    }
     if !matches!(
         node.kind(),
         "type_identifier" | "scoped_type_identifier" | "generic_type"
@@ -256,6 +265,44 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     hits::push_hit(node, ctx);
+}
+
+fn maybe_record_static_qualifier_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
+    if node.kind() != "identifier" || !is_member_access_object(node) {
+        return false;
+    }
+    let text = node_text(node, ctx.source);
+    if text != ctx.spec.member_name {
+        return false;
+    }
+    match ctx.bindings.resolve_symbol(text) {
+        SymbolResolution::Precise(targets)
+            if targets
+                .iter()
+                .any(|target| target == &ctx.spec.target.fq_name()) =>
+        {
+            hits::push_hit(node, ctx);
+            true
+        }
+        SymbolResolution::Unknown if ctx.bindings.is_shadowed(text) => true,
+        SymbolResolution::Unknown => {
+            if resolve_type_from_node(node, ctx).is_some_and(|resolved| resolved == ctx.spec.target)
+            {
+                hits::push_hit(node, ctx);
+            } else {
+                hits::push_unproven_hit(node, ctx);
+            }
+            true
+        }
+        SymbolResolution::Ambiguous | SymbolResolution::Precise(_) => true,
+    }
+}
+
+fn is_member_access_object(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "method_invocation" | "field_access")
+            && parent.child_by_field_name("object") == Some(node)
+    })
 }
 
 fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

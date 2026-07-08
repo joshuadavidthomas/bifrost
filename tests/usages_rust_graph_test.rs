@@ -1334,6 +1334,46 @@ fn run() {
 }
 
 #[test]
+fn rust_graph_counts_static_qualifier_references_for_struct_targets() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "src/service.rs",
+            r#"
+pub struct Foo;
+impl Foo {
+    pub const CONST: usize = 1;
+    pub fn assoc_fn() -> Foo { Foo }
+}
+"#,
+        ),
+        (
+            "src/main.rs",
+            r#"
+use crate::service::Foo;
+
+fn run() {
+    let _ = Foo::assoc_fn();
+    let _ = Foo::CONST;
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "service.Foo");
+    let hits = rust_graph_hits(&analyzer, &target.fq_name());
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("Foo::assoc_fn()")),
+        "expected associated function qualifier hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.snippet.contains("Foo::CONST")),
+        "expected associated const qualifier hit: {hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_strategy_resolves_ufcs_trait_method_through_implementer() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (

@@ -630,6 +630,48 @@ function consume(): void {
 }
 
 #[test]
+fn php_graph_counts_static_qualifier_references_for_class_targets() {
+    let (_project, analyzer) = php_analyzer_with_files(&[
+        (
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"src/"}}}"#,
+        ),
+        (
+            "src/Target.php",
+            r#"<?php
+namespace App;
+class Target {
+    public const VALUE = 1;
+    public static function make(): Target { return new Target(); }
+}
+"#,
+        ),
+        (
+            "src/Consumer.php",
+            r#"<?php
+namespace App;
+function consume(): void {
+    Target::make();
+    echo Target::VALUE;
+}
+"#,
+        ),
+    ]);
+
+    let hits = graph_hits(&analyzer, "App.Target");
+
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("Target::make()")),
+        "expected static method qualifier class hit: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.snippet.contains("Target::VALUE")),
+        "expected static constant qualifier class hit: {hits:#?}"
+    );
+}
+
+#[test]
 fn php_graph_finds_aliased_static_method_and_property_usages() {
     let (_project, analyzer) = php_analyzer_with_files(&[
         (
