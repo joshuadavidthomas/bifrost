@@ -6,17 +6,37 @@ pub(super) fn infer_export_names(analyzer: &PythonAnalyzer, target: &CodeUnit) -
     if (target.is_function() || target.is_field())
         && let Some(owner_name) = owner_name(target)
     {
-        let owner_exports = infer_export_names_for_local(analyzer, target.source(), &owner_name);
+        let owner_exports =
+            infer_export_names_for_local(analyzer, target, target.source(), &owner_name);
         if !owner_exports.is_empty() {
             return owner_exports;
         }
     }
 
-    infer_export_names_for_local(analyzer, target.source(), target.identifier())
+    infer_export_names_for_local(analyzer, target, target.source(), target.identifier())
+}
+
+pub(super) fn infer_usage_seeds(
+    analyzer: &PythonAnalyzer,
+    target: &CodeUnit,
+    seed_names: BTreeSet<String>,
+) -> BTreeSet<(ProjectFile, String)> {
+    let mut seeds = BTreeSet::new();
+    for seed_name in &seed_names {
+        seeds.extend(analyzer.usage_seeds(target.source(), seed_name));
+    }
+    if seeds.is_empty()
+        && seed_names.contains(target.identifier())
+        && is_module_level_target_identifier(analyzer, target, target.source(), target.identifier())
+    {
+        seeds.insert((target.source().clone(), target.identifier().to_string()));
+    }
+    seeds
 }
 
 fn infer_export_names_for_local(
     analyzer: &PythonAnalyzer,
+    target: &CodeUnit,
     file: &ProjectFile,
     local_name: &str,
 ) -> BTreeSet<String> {
@@ -31,7 +51,25 @@ fn infer_export_names_for_local(
             export_names.insert(export_name);
         }
     }
+    if export_names.is_empty()
+        && is_module_level_target_identifier(analyzer, target, file, local_name)
+    {
+        export_names.insert(local_name.to_string());
+    }
     export_names
+}
+
+fn is_module_level_target_identifier(
+    analyzer: &PythonAnalyzer,
+    target: &CodeUnit,
+    file: &ProjectFile,
+    local_name: &str,
+) -> bool {
+    target.source() == file
+        && target.identifier() == local_name
+        && analyzer
+            .parent_of(target)
+            .is_some_and(|parent| parent.is_module() && parent.source() == file)
 }
 
 fn owner_name(target: &CodeUnit) -> Option<String> {

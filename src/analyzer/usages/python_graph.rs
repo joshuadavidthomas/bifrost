@@ -8,7 +8,7 @@ use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::python_graph::extractor::{build_python_graph, scan_files_for_seeds};
-use crate::analyzer::usages::python_graph::resolver::infer_export_names;
+use crate::analyzer::usages::python_graph::resolver::{infer_export_names, infer_usage_seeds};
 use crate::analyzer::usages::traits::{
     UsageAnalyzer, UsageEdgeResolver, UsageQueryResolver, UsageScanScope,
 };
@@ -73,10 +73,7 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
             );
         }
 
-        let mut seeds = BTreeSet::new();
-        for seed_name in seed_names {
-            seeds.extend(py.usage_seeds(target.source(), &seed_name));
-        }
+        let seeds = infer_usage_seeds(py, target, seed_names);
         if seeds.is_empty() {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),

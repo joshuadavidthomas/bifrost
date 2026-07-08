@@ -138,6 +138,78 @@ def run():
 }
 
 #[test]
+fn private_module_function_resolves_same_file_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+def _helper():
+    return "ok"
+
+def run():
+    return _helper()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service._helper");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve private same-file function usage");
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one hit");
+    assert_eq!(hit.file, project.file("service.py"));
+    assert!(hit.snippet.contains("_helper()"), "{hit:#?}");
+}
+
+#[test]
+fn private_module_function_resolves_explicit_import_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            r#"
+def _helper():
+    return "ok"
+"#,
+        )
+        .file(
+            "consumer.py",
+            r#"
+from service import _helper
+
+def run():
+    return _helper()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service._helper");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let result = PythonExportUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&target),
+        &candidates,
+        1000,
+    );
+    let hits = result
+        .into_either()
+        .expect("graph should resolve private explicitly imported function usage");
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one hit");
+    assert_eq!(hit.file, project.file("consumer.py"));
+    assert!(hit.snippet.contains("_helper()"), "{hit:#?}");
+}
+
+#[test]
 fn reexported_class_alias_receiver_resolves_member_usages() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
