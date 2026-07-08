@@ -52,10 +52,24 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
         if target_namespaces.is_empty() {
             return HashSet::default();
         }
-        let reverse_index = self.memo_caches.reverse_import_index.get_or_init(|| {
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
-        });
+        let reverse_index = self.memo_caches.reverse_import_index.get_or_build(
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    true,
+                )
+            },
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    false,
+                )
+            },
+        );
         let mut result = reverse_index
             .get(file)
             .map(|files| (**files).clone())
@@ -108,37 +122,48 @@ impl ImportAnalysisProvider for CSharpAnalyzer {
 }
 
 impl CSharpAnalyzer {
-    fn implicit_reference_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        self.memo_caches.implicit_reference_index.get_or_init(|| {
-            let mut by_namespace_and_name: HashMap<(String, String), Vec<ProjectFile>> =
-                HashMap::default();
-            let mut by_fq_name: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-            for target in self.inner.all_files() {
-                for unit in self
-                    .inner
-                    .top_level_declarations(target)
-                    .filter(|unit| unit.kind() == CodeUnitType::Class)
-                {
-                    by_namespace_and_name
-                        .entry((
-                            unit.package_name().to_string(),
-                            unit.identifier().to_string(),
-                        ))
-                        .or_default()
-                        .push(target.clone());
-                    by_fq_name
-                        .entry(unit.fq_name())
-                        .or_default()
-                        .push(target.clone());
-                    by_fq_name
-                        .entry(unit.fq_name().replace('$', "."))
-                        .or_default()
-                        .push(target.clone());
-                }
-            }
+    fn implicit_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+        self.memo_caches.implicit_reference_index.get_or_build(
+            || self.compute_implicit_reference_index(true),
+            || self.compute_implicit_reference_index(false),
+        )
+    }
 
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            build_reverse_file_index(&files, |candidate| {
+    fn compute_implicit_reference_index(
+        &self,
+        parallel: bool,
+    ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        let mut by_namespace_and_name: HashMap<(String, String), Vec<ProjectFile>> =
+            HashMap::default();
+        let mut by_fq_name: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+        for target in self.inner.all_files() {
+            for unit in self
+                .inner
+                .top_level_declarations(target)
+                .filter(|unit| unit.kind() == CodeUnitType::Class)
+            {
+                by_namespace_and_name
+                    .entry((
+                        unit.package_name().to_string(),
+                        unit.identifier().to_string(),
+                    ))
+                    .or_default()
+                    .push(target.clone());
+                by_fq_name
+                    .entry(unit.fq_name())
+                    .or_default()
+                    .push(target.clone());
+                by_fq_name
+                    .entry(unit.fq_name().replace('$', "."))
+                    .or_default()
+                    .push(target.clone());
+            }
+        }
+
+        let files: Vec<_> = self.inner.all_files().cloned().collect();
+        build_reverse_file_index(
+            &files,
+            |candidate| {
                 let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
                     return Vec::new();
                 };
@@ -155,8 +180,9 @@ impl CSharpAnalyzer {
                     }
                 }
                 resolved_targets
-            })
-        })
+            },
+            parallel,
+        )
     }
 }
 

@@ -13,9 +13,10 @@ mod usage_index;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language,
+    PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
+    TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -40,7 +41,7 @@ pub struct RustAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
-    reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     usage_index: Arc<OnceLock<RustUsageIndex>>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
     #[allow(dead_code)]
@@ -60,7 +61,7 @@ impl RustAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
-            reverse_import_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -112,7 +113,7 @@ impl RustAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
-            reverse_import_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -236,7 +237,7 @@ impl IAnalyzer for RustAnalyzer {
                 self.memo_budget / 8,
                 weight_reference_context,
             ),
-            reverse_import_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -253,7 +254,7 @@ impl IAnalyzer for RustAnalyzer {
                 self.memo_budget / 8,
                 weight_reference_context,
             ),
-            reverse_import_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),

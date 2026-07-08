@@ -15,10 +15,10 @@ use crate::analyzer::js_ts::cache::{
 };
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
-    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, Project,
-    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
-    build_direct_descendant_index,
+    AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider, Language,
+    PoolSafeMemo, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    UsageFactsIndex, build_direct_descendant_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -119,9 +119,10 @@ pub struct ScalaAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
-    reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     importable_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
-    same_package_reference_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    same_package_reference_index:
+        Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
     /// Analyzer-cached Scala usage/type-resolution support, built once per
     /// analyzer generation and reset on `update`/`update_all`.
@@ -149,9 +150,9 @@ impl ScalaAnalyzer {
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
-            reverse_import_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             importable_declarations_by_package: Arc::new(OnceLock::new()),
-            same_package_reference_index: Arc::new(OnceLock::new()),
+            same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
             project_types: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),

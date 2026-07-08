@@ -19,10 +19,24 @@ impl ImportAnalysisProvider for JavaAnalyzer {
             return (*cached).clone();
         }
 
-        let reverse_index = self.memo_caches.reverse_import_index.get_or_init(|| {
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
-        });
+        let reverse_index = self.memo_caches.reverse_import_index.get_or_build(
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    true,
+                )
+            },
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    false,
+                )
+            },
+        );
         let mut result = reverse_index
             .get(file)
             .map(|files| (**files).clone())
@@ -178,45 +192,55 @@ impl ImportAnalysisProvider for JavaAnalyzer {
 impl TestDetectionProvider for JavaAnalyzer {}
 
 impl JavaAnalyzer {
-    fn same_package_reference_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        self.memo_caches
-            .same_package_reference_index
-            .get_or_init(|| {
-                let mut targets_by_package_and_name: HashMap<(String, String), Vec<ProjectFile>> =
-                    HashMap::default();
-                for file in self.inner.all_files() {
-                    let package = self.inner.package_name_of(file).unwrap_or("").to_string();
-                    for declaration in self.inner.top_level_declarations(file) {
-                        if declaration.is_class() || declaration.is_module() {
-                            targets_by_package_and_name
-                                .entry((package.clone(), declaration.identifier().to_string()))
-                                .or_default()
-                                .push(file.clone());
-                        }
+    fn same_package_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+        self.memo_caches.same_package_reference_index.get_or_build(
+            || self.compute_same_package_reference_index(true),
+            || self.compute_same_package_reference_index(false),
+        )
+    }
+
+    fn compute_same_package_reference_index(
+        &self,
+        parallel: bool,
+    ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        let mut targets_by_package_and_name: HashMap<(String, String), Vec<ProjectFile>> =
+            HashMap::default();
+        for file in self.inner.all_files() {
+            let package = self.inner.package_name_of(file).unwrap_or("").to_string();
+            for declaration in self.inner.top_level_declarations(file) {
+                if declaration.is_class() || declaration.is_module() {
+                    targets_by_package_and_name
+                        .entry((package.clone(), declaration.identifier().to_string()))
+                        .or_default()
+                        .push(file.clone());
+                }
+            }
+        }
+
+        let files: Vec<_> = self.inner.all_files().cloned().collect();
+        build_reverse_file_index(
+            &files,
+            |candidate| {
+                let package = self
+                    .inner
+                    .package_name_of(candidate)
+                    .unwrap_or("")
+                    .to_string();
+                let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
+                    return Vec::new();
+                };
+                let mut targets = Vec::new();
+                for identifier in identifiers {
+                    if let Some(matching_targets) =
+                        targets_by_package_and_name.get(&(package.clone(), identifier.clone()))
+                    {
+                        targets.extend(matching_targets.iter().cloned());
                     }
                 }
-
-                let files: Vec<_> = self.inner.all_files().cloned().collect();
-                build_reverse_file_index(&files, |candidate| {
-                    let package = self
-                        .inner
-                        .package_name_of(candidate)
-                        .unwrap_or("")
-                        .to_string();
-                    let Some(identifiers) = self.inner.type_identifiers_of(candidate) else {
-                        return Vec::new();
-                    };
-                    let mut targets = Vec::new();
-                    for identifier in identifiers {
-                        if let Some(matching_targets) =
-                            targets_by_package_and_name.get(&(package.clone(), identifier.clone()))
-                        {
-                            targets.extend(matching_targets.iter().cloned());
-                        }
-                    }
-                    targets
-                })
-            })
+                targets
+            },
+            parallel,
+        )
     }
 
     pub fn could_import_file_without_source(

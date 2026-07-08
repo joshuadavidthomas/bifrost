@@ -38,26 +38,29 @@ pub(crate) struct JsTsUsageIndex {
 pub(crate) fn build_jsts_usage_index(
     analyzer: &dyn IAnalyzer,
     language: Language,
+    parallel: bool,
 ) -> JsTsUsageIndex {
     let files = collect_jsts_files(analyzer, language);
     if tree_sitter_language_for(language).is_none() {
         return JsTsUsageIndex::default();
     }
 
-    let per_file: Vec<(ProjectFile, ExportIndex, ImportBinder)> = files
-        .par_iter()
-        .filter_map(|file| {
-            let source = file.read_to_string().ok()?;
-            let mut parser = Parser::new();
-            let file_language = js_ts_tree_sitter_language_for_file(file, language)?;
-            parser.set_language(&file_language).ok()?;
-            let tree = parser.parse(source.as_str(), None)?;
-            let exports = compute_export_index(&source, &tree);
-            let binder = compute_import_binder(&source, &tree);
-            // `tree`/`source` drop here — only the per-file indices outlive the parse.
-            Some((file.clone(), exports, binder))
-        })
-        .collect();
+    let compute_file = |file: &ProjectFile| {
+        let source = file.read_to_string().ok()?;
+        let mut parser = Parser::new();
+        let file_language = js_ts_tree_sitter_language_for_file(file, language)?;
+        parser.set_language(&file_language).ok()?;
+        let tree = parser.parse(source.as_str(), None)?;
+        let exports = compute_export_index(&source, &tree);
+        let binder = compute_import_binder(&source, &tree);
+        // `tree`/`source` drop here — only the per-file indices outlive the parse.
+        Some((file.clone(), exports, binder))
+    };
+    let per_file: Vec<(ProjectFile, ExportIndex, ImportBinder)> = if parallel {
+        files.par_iter().filter_map(compute_file).collect()
+    } else {
+        files.iter().filter_map(compute_file).collect()
+    };
 
     let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = map_with_capacity(per_file.len());
     let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = map_with_capacity(per_file.len());

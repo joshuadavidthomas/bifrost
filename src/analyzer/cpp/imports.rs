@@ -92,12 +92,23 @@ impl CppAnalyzer {
         })
     }
 
-    fn reverse_include_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        self.reverse_include_index.get_or_init(|| {
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            let include_targets = self.include_target_index();
+    fn reverse_include_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+        self.reverse_include_index.get_or_build(
+            || self.compute_reverse_include_index(true),
+            || self.compute_reverse_include_index(false),
+        )
+    }
 
-            build_reverse_file_index(&files, |candidate| {
+    fn compute_reverse_include_index(
+        &self,
+        parallel: bool,
+    ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        let files: Vec<_> = self.inner.all_files().cloned().collect();
+        let include_targets = self.include_target_index();
+
+        build_reverse_file_index(
+            &files,
+            |candidate| {
                 let mut matched_targets = HashSet::default();
                 let mut resolved_targets = Vec::new();
                 for include in quoted_include_paths(self.inner.import_statements(candidate)) {
@@ -108,8 +119,9 @@ impl CppAnalyzer {
                     }
                 }
                 resolved_targets
-            })
-        })
+            },
+            parallel,
+        )
     }
 }
 

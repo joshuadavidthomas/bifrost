@@ -5,9 +5,9 @@ use crate::analyzer::clone_detection::{
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, Language, Project, ProjectFile, SemanticDiagnostic, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeAliasProvider, TypeHierarchyProvider, build_reverse_import_index,
+    ImportInfo, Language, PoolSafeMemo, Project, ProjectFile, SemanticDiagnostic,
+    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -182,10 +182,10 @@ pub struct TypescriptAnalyzer {
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>>,
-    reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     /// Analyzer-cached JS/TS usage-resolution maps, built once per analyzer and reused
     /// across `scan_usages`/`usage_graph` queries. Reset on `update`/`update_all`.
-    jsts_usage_index: Arc<OnceLock<JsTsUsageIndex>>,
+    jsts_usage_index: Arc<PoolSafeMemo<JsTsUsageIndex>>,
     /// Shared tsconfig path-alias resolver (parsed configs cached) so the import/reference
     /// graph resolves `@/`-style aliases the same way the scan_usages graph does.
     alias_resolver: Arc<AliasResolver>,
@@ -208,17 +208,19 @@ impl TypescriptAnalyzer {
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(OnceLock::new()),
-            jsts_usage_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            jsts_usage_index: Arc::new(PoolSafeMemo::new()),
             alias_resolver,
         }
     }
 
     /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
     /// language. Built once and reused until `update`/`update_all` resets the cell.
-    pub(crate) fn jsts_usage_index(&self) -> &JsTsUsageIndex {
-        self.jsts_usage_index
-            .get_or_init(|| build_jsts_usage_index(self, Language::TypeScript))
+    pub(crate) fn jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
+        self.jsts_usage_index.get_or_build(
+            || build_jsts_usage_index(self, Language::TypeScript, true),
+            || build_jsts_usage_index(self, Language::TypeScript, false),
+        )
     }
 
     pub fn new_with_config_and_storage(
@@ -270,8 +272,8 @@ impl TypescriptAnalyzer {
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(OnceLock::new()),
-            jsts_usage_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            jsts_usage_index: Arc::new(PoolSafeMemo::new()),
             alias_resolver,
         }
     }
@@ -387,10 +389,24 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
             return (*cached).clone();
         }
 
-        let reverse_index = self.reverse_import_index.get_or_init(|| {
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
-        });
+        let reverse_index = self.reverse_import_index.get_or_build(
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    true,
+                )
+            },
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    false,
+                )
+            },
+        );
         let referencing = reverse_index
             .get(file)
             .map(|files| (**files).clone())
@@ -459,7 +475,7 @@ impl TypeHierarchyProvider for TypescriptAnalyzer {
 
         let ancestors = resolve_direct_ancestors(
             self,
-            self.jsts_usage_index(),
+            self.jsts_usage_index().as_ref(),
             Language::TypeScript,
             &self.alias_resolver,
             code_unit,
@@ -577,8 +593,8 @@ impl IAnalyzer for TypescriptAnalyzer {
                 weight_code_unit_set_by_unit,
             ),
             direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(OnceLock::new()),
-            jsts_usage_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            jsts_usage_index: Arc::new(PoolSafeMemo::new()),
             alias_resolver,
         }
     }
@@ -600,8 +616,8 @@ impl IAnalyzer for TypescriptAnalyzer {
                 weight_code_unit_set_by_unit,
             ),
             direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(OnceLock::new()),
-            jsts_usage_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            jsts_usage_index: Arc::new(PoolSafeMemo::new()),
             alias_resolver,
         }
     }

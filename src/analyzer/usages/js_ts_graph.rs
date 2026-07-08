@@ -55,6 +55,7 @@ use crate::analyzer::{
 };
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub(in crate::analyzer::usages) use crate::analyzer::js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::analyzer::usages::inverted_edges::CallSite;
@@ -85,7 +86,7 @@ where
 pub(in crate::analyzer::usages) fn cached_jsts_index(
     analyzer: &dyn IAnalyzer,
     language: Language,
-) -> Option<&JsTsUsageIndex> {
+) -> Option<Arc<JsTsUsageIndex>> {
     match language {
         Language::TypeScript => {
             Some(resolve_analyzer::<TypescriptAnalyzer>(analyzer)?.jsts_usage_index())
@@ -154,7 +155,7 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
 
             scan_files_for_seeds(
                 analyzer,
-                index,
+                index.as_ref(),
                 &scan_files,
                 target,
                 &BTreeSet::new(),
@@ -169,7 +170,14 @@ impl<'a> UsageQueryResolver<'a> for JsTsQueryResolver {
                 scan_files.insert(target.source().clone());
             }
 
-            scan_files_for_seeds(analyzer, index, &scan_files, target, &seeds, language)
+            scan_files_for_seeds(
+                analyzer,
+                index.as_ref(),
+                &scan_files,
+                target,
+                &seeds,
+                language,
+            )
         };
         let (hits, unproven_hits): (BTreeSet<UsageHit>, BTreeSet<UsageHit>) = scan_hits
             .into_iter()
@@ -289,7 +297,7 @@ where
         };
         let result = inverted::build_jsts_scoped_edges(
             analyzer,
-            index,
+            index.as_ref(),
             language,
             &language_nodes,
             keep_file,

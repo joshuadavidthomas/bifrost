@@ -35,10 +35,24 @@ impl ImportAnalysisProvider for RustAnalyzer {
             return (*cached).clone();
         }
 
-        let reverse_index = self.reverse_import_index.get_or_init(|| {
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
-        });
+        let reverse_index = self.reverse_import_index.get_or_build(
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    true,
+                )
+            },
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    false,
+                )
+            },
+        );
         let referencing = reverse_index
             .get(file)
             .map(|files| (**files).clone())

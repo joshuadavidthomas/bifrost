@@ -26,7 +26,7 @@ use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorde
 use crate::analyzer::usages::js_ts_graph::{JsTsUsageIndex, build_jsts_usage_index};
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, BuildProgress, CodeUnit, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, Language, LanguageAdapter, ParameterMetadata, Project, ProjectFile,
+    ImportInfo, Language, LanguageAdapter, ParameterMetadata, PoolSafeMemo, Project, ProjectFile,
     SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
 };
@@ -160,7 +160,6 @@ pub struct JavascriptAnalyzer {
     alias_resolver: Arc<AliasResolver>,
 }
 
-#[derive(Clone)]
 struct JsMemoCaches {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
@@ -168,10 +167,10 @@ struct JsMemoCaches {
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>,
-    reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
+    reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     /// Analyzer-cached JS/TS usage-resolution maps, built once and reused across queries.
     /// Reset (with the rest of this bucket) on `update`/`update_all`.
-    jsts_usage_index: OnceLock<JsTsUsageIndex>,
+    jsts_usage_index: PoolSafeMemo<JsTsUsageIndex>,
 }
 
 impl JsMemoCaches {
@@ -186,8 +185,8 @@ impl JsMemoCaches {
                 weight_code_unit_set_by_unit,
             ),
             direct_descendant_index: OnceLock::new(),
-            reverse_import_index: OnceLock::new(),
-            jsts_usage_index: OnceLock::new(),
+            reverse_import_index: PoolSafeMemo::new(),
+            jsts_usage_index: PoolSafeMemo::new(),
         }
     }
 }
@@ -199,10 +198,11 @@ impl JavascriptAnalyzer {
 
     /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
     /// language. Built once and reused until `update`/`update_all` rebuilds the cache bucket.
-    pub(crate) fn jsts_usage_index(&self) -> &JsTsUsageIndex {
-        self.memo_caches
-            .jsts_usage_index
-            .get_or_init(|| build_jsts_usage_index(self, Language::JavaScript))
+    pub(crate) fn jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
+        self.memo_caches.jsts_usage_index.get_or_build(
+            || build_jsts_usage_index(self, Language::JavaScript, true),
+            || build_jsts_usage_index(self, Language::JavaScript, false),
+        )
     }
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
@@ -359,10 +359,24 @@ impl ImportAnalysisProvider for JavascriptAnalyzer {
             return (*cached).clone();
         }
 
-        let reverse_index = self.memo_caches.reverse_import_index.get_or_init(|| {
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
-        });
+        let reverse_index = self.memo_caches.reverse_import_index.get_or_build(
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    true,
+                )
+            },
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    false,
+                )
+            },
+        );
         let referencing = reverse_index
             .get(file)
             .map(|files| (**files).clone())
@@ -425,7 +439,7 @@ impl TypeHierarchyProvider for JavascriptAnalyzer {
 
         let ancestors = resolve_direct_ancestors(
             self,
-            self.jsts_usage_index(),
+            self.jsts_usage_index().as_ref(),
             Language::JavaScript,
             &self.alias_resolver,
             code_unit,

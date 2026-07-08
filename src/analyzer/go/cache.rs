@@ -1,5 +1,5 @@
 use super::hierarchy::GoHierarchyIndex;
-use crate::analyzer::{CodeUnit, ProjectFile};
+use crate::analyzer::{CodeUnit, PoolSafeMemo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::mem::size_of;
@@ -12,7 +12,8 @@ pub(super) struct GoMemoCaches {
     budget_bytes: u64,
     pub(super) imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     pub(super) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    pub(super) reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    pub(super) reverse_import_index:
+        Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     pub(super) hierarchy_index: Arc<OnceLock<GoHierarchyIndex>>,
     pub(super) package_clause_names: Arc<OnceLock<HashMap<ProjectFile, String>>>,
     pub(super) package_files: Arc<OnceLock<HashMap<String, Arc<Vec<ProjectFile>>>>>,
@@ -26,7 +27,7 @@ impl GoMemoCaches {
             budget_bytes,
             imported_code_units: build_weighted_cache(budget_bytes / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
-            reverse_import_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             package_clause_names: Arc::new(OnceLock::new()),
             package_files: Arc::new(OnceLock::new()),

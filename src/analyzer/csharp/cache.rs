@@ -1,4 +1,4 @@
-use crate::analyzer::{CodeUnit, ProjectFile};
+use crate::analyzer::{CodeUnit, PoolSafeMemo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::mem::size_of;
@@ -15,8 +15,9 @@ pub(super) struct CSharpMemoCaches {
     pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     pub(super) direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     pub(super) direct_descendant_index: OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>,
-    pub(super) reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
-    pub(super) implicit_reference_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
+    pub(super) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
+    pub(super) implicit_reference_index:
+        PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) global_using_namespaces: OnceLock<HashSet<String>>,
     pub(super) global_using_aliases: OnceLock<HashMap<String, String>>,
 }
@@ -38,8 +39,8 @@ impl CSharpMemoCaches {
                 weight_hierarchy_code_unit_set,
             ),
             direct_descendant_index: OnceLock::new(),
-            reverse_import_index: OnceLock::new(),
-            implicit_reference_index: OnceLock::new(),
+            reverse_import_index: PoolSafeMemo::new(),
+            implicit_reference_index: PoolSafeMemo::new(),
             global_using_namespaces: OnceLock::new(),
             global_using_aliases: OnceLock::new(),
         }

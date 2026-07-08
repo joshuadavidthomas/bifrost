@@ -42,23 +42,34 @@ impl ScalaAnalyzer {
         })
     }
 
-    fn same_package_reference_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        self.same_package_reference_index.get_or_init(|| {
-            let mut files_by_package: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-            for file in self.inner.all_files() {
-                if file_language(file) != Language::Scala {
-                    continue;
-                }
-                if let Some(package) = self.inner.package_name_of(file) {
-                    files_by_package
-                        .entry(package.to_string())
-                        .or_default()
-                        .push(file.clone());
-                }
-            }
+    fn same_package_reference_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+        self.same_package_reference_index.get_or_build(
+            || self.compute_same_package_reference_index(true),
+            || self.compute_same_package_reference_index(false),
+        )
+    }
 
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            build_reverse_file_index(&files, |candidate| {
+    fn compute_same_package_reference_index(
+        &self,
+        parallel: bool,
+    ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        let mut files_by_package: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+        for file in self.inner.all_files() {
+            if file_language(file) != Language::Scala {
+                continue;
+            }
+            if let Some(package) = self.inner.package_name_of(file) {
+                files_by_package
+                    .entry(package.to_string())
+                    .or_default()
+                    .push(file.clone());
+            }
+        }
+
+        let files: Vec<_> = self.inner.all_files().cloned().collect();
+        build_reverse_file_index(
+            &files,
+            |candidate| {
                 if file_language(candidate) != Language::Scala {
                     return Vec::new();
                 }
@@ -66,8 +77,9 @@ impl ScalaAnalyzer {
                     return Vec::new();
                 };
                 files_by_package.get(package).cloned().unwrap_or_default()
-            })
-        })
+            },
+            parallel,
+        )
     }
 }
 
@@ -98,10 +110,24 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
             return HashSet::default();
         }
 
-        let reverse_index = self.reverse_import_index.get_or_init(|| {
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            build_reverse_import_index(&files, |candidate| self.imported_code_units_of(candidate))
-        });
+        let reverse_index = self.reverse_import_index.get_or_build(
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    true,
+                )
+            },
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_import_index(
+                    &files,
+                    |candidate| self.imported_code_units_of(candidate),
+                    false,
+                )
+            },
+        );
         let mut result = reverse_index
             .get(file)
             .map(|files| (**files).clone())

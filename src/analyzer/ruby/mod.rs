@@ -11,7 +11,7 @@ use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CodeUnit, CodeUnitType, IAnalyzer, ImportAnalysisProvider,
-    Language, Project, ProjectFile, RubyMethodDispatchMode, SignatureMetadata,
+    Language, PoolSafeMemo, Project, ProjectFile, RubyMethodDispatchMode, SignatureMetadata,
     TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
@@ -41,7 +41,7 @@ pub struct RubyAnalyzer {
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
-    reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     autoload_constant_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
     zeitwerk_project: Arc<OnceLock<bool>>,
     zeitwerk_autoload_files: Arc<OnceLock<HashSet<ProjectFile>>>,
@@ -119,7 +119,7 @@ impl RubyAnalyzer {
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             autoload_constant_files: Arc::new(OnceLock::new()),
             zeitwerk_project: Arc::new(OnceLock::new()),
             zeitwerk_autoload_files: Arc::new(OnceLock::new()),

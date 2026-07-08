@@ -14,7 +14,7 @@ use crate::analyzer::js_ts::{
 };
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType,
-    IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, Project, ProjectFile,
+    IAnalyzer, ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project, ProjectFile,
     SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
 };
@@ -42,7 +42,7 @@ pub struct CppAnalyzer {
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
-    reverse_include_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_ancestor_index: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
 }
@@ -109,7 +109,7 @@ impl CppAnalyzer {
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             include_target_index: Arc::new(OnceLock::new()),
-            reverse_include_index: Arc::new(OnceLock::new()),
+            reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_ancestor_index: Arc::new(OnceLock::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
         }
@@ -130,7 +130,7 @@ impl CppAnalyzer {
                 weight_code_unit_set_by_unit,
             ),
             include_target_index: Arc::new(OnceLock::new()),
-            reverse_include_index: Arc::new(OnceLock::new()),
+            reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_ancestor_index: Arc::new(OnceLock::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
         }

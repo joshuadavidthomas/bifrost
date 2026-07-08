@@ -18,6 +18,7 @@ mod model;
 mod multi_analyzer;
 pub mod persistence;
 mod php;
+mod pool_memo;
 mod project;
 mod python;
 mod ruby;
@@ -78,6 +79,7 @@ pub(crate) use php::{
     PhpFileContext, php_signature_return_type_text, resolve_php_constant, resolve_php_function,
     resolve_php_type,
 };
+pub(crate) use pool_memo::PoolSafeMemo;
 pub use project::{
     DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject, MultiRootProject, OverlayProject,
     Project, TestProject, collect_workspace_files,

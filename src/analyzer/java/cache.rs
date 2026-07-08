@@ -1,9 +1,9 @@
 use super::*;
+use crate::analyzer::PoolSafeMemo;
 use moka::sync::Cache;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
-#[derive(Clone)]
 pub(super) struct JavaMemoCaches {
     budget_bytes: u64,
     pub(super) resolved_imports: Cache<ProjectFile, Arc<HashMap<String, CodeUnit>>>,
@@ -12,9 +12,9 @@ pub(super) struct JavaMemoCaches {
     pub(super) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     pub(super) direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     pub(super) direct_descendant_index: OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>,
-    pub(super) reverse_import_index: OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
+    pub(super) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) same_package_reference_index:
-        OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
+        PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
 }
 
 impl JavaMemoCaches {
@@ -27,8 +27,8 @@ impl JavaMemoCaches {
             direct_ancestors: Self::build_cache(budget_bytes / 8, weight_code_unit_vec),
             direct_descendants: Self::build_cache(budget_bytes / 8, weight_code_unit_set),
             direct_descendant_index: OnceLock::new(),
-            reverse_import_index: OnceLock::new(),
-            same_package_reference_index: OnceLock::new(),
+            reverse_import_index: PoolSafeMemo::new(),
+            same_package_reference_index: PoolSafeMemo::new(),
         }
     }
 

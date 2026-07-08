@@ -286,11 +286,17 @@ impl RubyAnalyzer {
 
     pub(super) fn build_reverse_import_index(
         &self,
-    ) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        self.reverse_import_index.get_or_init(|| {
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            build_reverse_file_index(&files, |file| self.required_files(file))
-        })
+    ) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+        self.reverse_import_index.get_or_build(
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_file_index(&files, |file| self.required_files(file), true)
+            },
+            || {
+                let files: Vec<_> = self.inner.all_files().cloned().collect();
+                build_reverse_file_index(&files, |file| self.required_files(file), false)
+            },
+        )
     }
 
     fn transitive_referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile> {

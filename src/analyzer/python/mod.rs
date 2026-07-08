@@ -17,9 +17,9 @@ use crate::analyzer::usages::{
 };
 use crate::analyzer::{
     AnalyzerConfig, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit, CodeUnitType,
-    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
+    IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile,
+    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, build_reverse_import_index,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -54,7 +54,7 @@ pub struct PythonAnalyzer {
     direct_descendants: Cache<CodeUnit, Arc<HashSet<CodeUnit>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<String, Arc<HashSet<CodeUnit>>>>>,
     module_code_units: Arc<HashMap<String, CodeUnit>>,
-    reverse_import_index: Arc<OnceLock<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     usage_index: Arc<OnceLock<PythonUsageIndex>>,
 }
 
@@ -121,7 +121,7 @@ impl PythonAnalyzer {
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             direct_descendants: build_weighted_cache(memo_budget / 8, weight_code_unit_set_by_unit),
             direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
         }
     }
@@ -360,23 +360,31 @@ impl PythonAnalyzer {
         binder
     }
 
-    fn build_reverse_import_index(&self) -> &HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
-        self.reverse_import_index.get_or_init(|| {
-            let _scope = profiling::scope("PythonAnalyzer::build_reverse_import_index");
-            let files: Vec<_> = self.inner.all_files().cloned().collect();
-            let reverse =
-                build_reverse_import_index(&files, |file| self.imported_code_units_of(file));
+    fn build_reverse_import_index(&self) -> Arc<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>> {
+        self.reverse_import_index.get_or_build(
+            || self.compute_reverse_import_index(true),
+            || self.compute_reverse_import_index(false),
+        )
+    }
 
-            if profiling::enabled() {
-                profiling::note(format!(
-                    "PythonAnalyzer::build_reverse_import_index files={} indexed_targets={}",
-                    files.len(),
-                    reverse.len()
-                ));
-            }
+    fn compute_reverse_import_index(
+        &self,
+        parallel: bool,
+    ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        let _scope = profiling::scope("PythonAnalyzer::build_reverse_import_index");
+        let files: Vec<_> = self.inner.all_files().cloned().collect();
+        let reverse =
+            build_reverse_import_index(&files, |file| self.imported_code_units_of(file), parallel);
 
-            reverse
-        })
+        if profiling::enabled() {
+            profiling::note(format!(
+                "PythonAnalyzer::build_reverse_import_index files={} indexed_targets={}",
+                files.len(),
+                reverse.len()
+            ));
+        }
+
+        reverse
     }
 
     fn public_declarations_in_module(&self, module_fq: &str) -> Vec<CodeUnit> {
@@ -591,7 +599,7 @@ impl IAnalyzer for PythonAnalyzer {
                 weight_code_unit_set_by_unit,
             ),
             direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
         }
     }
@@ -610,7 +618,7 @@ impl IAnalyzer for PythonAnalyzer {
                 weight_code_unit_set_by_unit,
             ),
             direct_descendant_index: Arc::new(OnceLock::new()),
-            reverse_import_index: Arc::new(OnceLock::new()),
+            reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
         }
     }

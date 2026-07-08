@@ -41,36 +41,44 @@ pub trait ImportAnalysisProvider: CapabilityProvider {
 pub(crate) fn build_reverse_import_index<F>(
     files: &[ProjectFile],
     resolve_imported: F,
+    parallel: bool,
 ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>
 where
     F: Fn(&ProjectFile) -> HashSet<CodeUnit> + Sync,
 {
-    build_reverse_file_index(files, |file| {
-        resolve_imported(file)
-            .into_iter()
-            .map(|code_unit| code_unit.source().clone())
-            .collect::<Vec<_>>()
-    })
+    build_reverse_file_index(
+        files,
+        |file| {
+            resolve_imported(file)
+                .into_iter()
+                .map(|code_unit| code_unit.source().clone())
+                .collect::<Vec<_>>()
+        },
+        parallel,
+    )
 }
 
 pub(crate) fn build_reverse_file_index<F, I>(
     files: &[ProjectFile],
     resolve_targets: F,
+    parallel: bool,
 ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>
 where
     F: Fn(&ProjectFile) -> I + Sync,
     I: IntoIterator<Item = ProjectFile>,
 {
-    let edges: Vec<_> = files
-        .par_iter()
-        .flat_map(|file| {
-            let source = file.clone();
-            resolve_targets(file)
-                .into_iter()
-                .filter_map(move |target| (target != source).then(|| (target, source.clone())))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let collect_edges = |file: &ProjectFile| {
+        let source = file.clone();
+        resolve_targets(file)
+            .into_iter()
+            .filter_map(move |target| (target != source).then(|| (target, source.clone())))
+            .collect::<Vec<_>>()
+    };
+    let edges: Vec<_> = if parallel {
+        files.par_iter().flat_map(collect_edges).collect()
+    } else {
+        files.iter().flat_map(collect_edges).collect()
+    };
 
     let mut reverse: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
     for (target, source) in edges {
