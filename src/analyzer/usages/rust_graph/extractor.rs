@@ -14,6 +14,7 @@ use crate::analyzer::{
     CodeUnit, DefinitionLookupIndex, IAnalyzer, ImportAnalysisProvider, ProjectFile, RustAnalyzer,
     RustReferenceContext,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
@@ -32,12 +33,22 @@ pub(crate) struct RustProjectGraph {
 
 pub(super) fn build_rust_graph_for_files(
     files: impl IntoIterator<Item = ProjectFile>,
+    cancellation: Option<&CancellationToken>,
 ) -> RustProjectGraph {
     let parsed: HashMap<ProjectFile, ParsedFile> = files
         .into_iter()
         .collect::<Vec<_>>()
         .par_iter()
-        .filter_map(parse_rust_graph_file)
+        .filter_map(|file| {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return None;
+            }
+            let parsed = parse_rust_graph_file(file);
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return None;
+            }
+            parsed
+        })
         .collect();
 
     RustProjectGraph { parsed }
@@ -87,7 +98,13 @@ pub(super) fn effective_scan_files(
 
     let seed_names: HashSet<&str> = seeds.iter().map(|(_, name)| name.as_str()).collect();
     let textual_candidates = analyzed.into_iter().filter(|file| {
+        if scan_scope.is_cancelled() {
+            return false;
+        }
         file.read_to_string().ok().is_some_and(|source| {
+            if scan_scope.is_cancelled() {
+                return false;
+            }
             source.contains(target.identifier())
                 || seed_names
                     .iter()
@@ -111,6 +128,7 @@ pub(super) fn scan_files_for_target(
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: Option<&BTreeSet<(ProjectFile, String)>>,
+    cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
     let target_short = target.identifier().to_string();
     let target_fqn = target.fq_name();
@@ -119,6 +137,9 @@ pub(super) fn scan_files_for_target(
     let files_vec: Vec<_> = files.into_iter().collect();
 
     files_vec.par_iter().for_each(|file| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let owned_source: Option<Arc<String>>;
         let owned_tree: Option<Tree>;
         let (source, tree) = if let Some(parsed) = graph.parsed.get(file) {
@@ -141,6 +162,9 @@ pub(super) fn scan_files_for_target(
                 owned_tree.as_ref().expect("owned tree"),
             )
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
 
         let line_starts = compute_line_starts(source);
         let (mut direct_names, namespace_names) = match seeds {
@@ -375,6 +399,7 @@ pub(super) fn scan_files_for_member_target(
     files: HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
+    cancellation: Option<&CancellationToken>,
 ) -> RustMemberScanResult {
     let Some(owner) = rust.parent_of(target) else {
         return RustMemberScanResult::default();
@@ -388,6 +413,9 @@ pub(super) fn scan_files_for_member_target(
     let support = analyzer.definition_lookup_index();
 
     files.par_iter().for_each(|file| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let owned_source: Option<Arc<String>>;
         let owned_tree: Option<Tree>;
         let (source, tree) = if let Some(parsed) = graph.parsed.get(file) {
@@ -410,6 +438,9 @@ pub(super) fn scan_files_for_member_target(
                 owned_tree.as_ref().expect("owned tree"),
             )
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let line_starts = compute_line_starts(source);
         let owner_local_names: HashSet<String> = if file == target.source() {
             [owner.identifier().to_string()].into_iter().collect()
@@ -1684,4 +1715,25 @@ fn simple_pattern_name(node: Node<'_>, source: &str) -> Option<String> {
 fn simple_node_text(node: Node<'_>, source: &str) -> Option<String> {
     let text = source.get(node.start_byte()..node.end_byte())?.trim();
     (!text.is_empty()).then(|| text.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_cancelled_graph_build_skips_file_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn target() {}\n").unwrap();
+        let file = ProjectFile::new(root, "lib.rs");
+
+        let live = build_rust_graph_for_files([file.clone()], None);
+        assert!(live.parsed.contains_key(&file));
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let cancelled = build_rust_graph_for_files([file], Some(&cancellation));
+        assert!(cancelled.parsed.is_empty());
+    }
 }

@@ -69,7 +69,16 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let candidate_files = scan_scope.candidate_files();
-        let graph = build_go_graph(self.go, candidate_files, target.source(), None);
+        let graph = build_go_graph(
+            self.go,
+            candidate_files,
+            target.source(),
+            None,
+            scan_scope.cancellation(),
+        );
+        if scan_scope.is_cancelled() {
+            return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+        }
         resolve_with_graph(
             analyzer,
             self.go,
@@ -187,7 +196,13 @@ fn resolve_with_graph(
     if scan_scope.is_authoritative() {
         scan_files.retain(|file| scan_scope.allows(file));
     }
-    let scan_result = scan_files_for_target(analyzer, graph, scan_files, &target_spec);
+    let scan_result = scan_files_for_target(
+        analyzer,
+        graph,
+        scan_files,
+        &target_spec,
+        scan_scope.cancellation(),
+    );
     let hits: BTreeSet<_> = scan_result
         .hits
         .into_iter()

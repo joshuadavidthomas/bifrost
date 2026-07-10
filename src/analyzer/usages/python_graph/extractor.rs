@@ -11,6 +11,7 @@ use crate::analyzer::usages::python_graph::resolver::{
     resolve_receiver_type, target_owner_code_unit, top_level_identifier,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, PythonAnalyzer, Range};
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::compute_line_starts;
 use rayon::prelude::*;
@@ -59,6 +60,7 @@ impl<'a> PythonGraphAdapter<'a> {
         &self,
         candidate_files: &HashSet<ProjectFile>,
         target_file: &ProjectFile,
+        cancellation: Option<&CancellationToken>,
     ) -> PythonProjectGraph {
         let parser_language = tree_sitter_python::LANGUAGE.into();
         let mut scoped_files: HashSet<ProjectFile> = candidate_files.iter().cloned().collect();
@@ -68,6 +70,9 @@ impl<'a> PythonGraphAdapter<'a> {
         let mut parsed: HashMap<ProjectFile, ParsedFile> = HashMap::default();
 
         while let Some(file) = frontier.pop_front() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
             if parsed.contains_key(&file) {
                 continue;
             }
@@ -75,6 +80,9 @@ impl<'a> PythonGraphAdapter<'a> {
             let Ok(source) = file.read_to_string() else {
                 continue;
             };
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
             if source.is_empty() {
                 continue;
             }
@@ -86,6 +94,9 @@ impl<'a> PythonGraphAdapter<'a> {
             let Some(tree) = parser.parse(source.as_str(), None) else {
                 continue;
             };
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
 
             let exports = self.analyzer.export_index_of(&file);
             let binder = self.analyzer.import_binder_of(&file);
@@ -158,8 +169,9 @@ pub(super) fn build_python_graph(
     analyzer: &PythonAnalyzer,
     candidate_files: &HashSet<ProjectFile>,
     target_file: &ProjectFile,
+    cancellation: Option<&CancellationToken>,
 ) -> PythonProjectGraph {
-    PythonGraphAdapter::new(analyzer).build_graph(candidate_files, target_file)
+    PythonGraphAdapter::new(analyzer).build_graph(candidate_files, target_file, cancellation)
 }
 
 pub(super) fn scan_files_for_seeds(
@@ -169,6 +181,7 @@ pub(super) fn scan_files_for_seeds(
     files: &HashSet<ProjectFile>,
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
+    cancellation: Option<&CancellationToken>,
 ) -> ScanResult {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
     let unproven_collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
@@ -191,6 +204,9 @@ pub(super) fn scan_files_for_seeds(
     let parser_language = tree_sitter_python::LANGUAGE.into();
 
     files_vec.par_iter().for_each(|file| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         let owned_source: Option<Arc<String>>;
         let owned_tree: Option<Tree>;
         let (source_str, tree_ref) = if let Some(parsed) = graph.parsed.get(*file) {
@@ -216,6 +232,9 @@ pub(super) fn scan_files_for_seeds(
                 owned_tree.as_ref().unwrap(),
             )
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
 
         let edges = py.usage_matching_edges(file, seeds);
         let local_conflicts = collect_top_level_conflicts(tree_ref.root_node(), source_str);
@@ -1318,4 +1337,29 @@ fn returned_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
         _ => None,
     }?;
     normalized_receiver_type(&raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{FileSetProject, Project};
+    use std::path::PathBuf;
+
+    #[test]
+    fn pre_cancelled_graph_build_skips_python_file_parsing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("target.py"), "def target():\n    pass\n").unwrap();
+        let file = ProjectFile::new(root.clone(), PathBuf::from("target.py"));
+        let project: Arc<dyn Project> =
+            Arc::new(FileSetProject::new(root, [PathBuf::from("target.py")]));
+        let analyzer = PythonAnalyzer::new(project);
+        let files = [file.clone()].into_iter().collect();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let graph = build_python_graph(&analyzer, &files, &file, Some(&cancellation));
+
+        assert!(graph.parsed.is_empty());
+    }
 }

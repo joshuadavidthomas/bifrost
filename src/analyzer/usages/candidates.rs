@@ -2,7 +2,8 @@ use crate::analyzer::usages::common::{
     analyzed_files_for_language, language_for_file, language_for_target,
 };
 use crate::analyzer::usages::traits::CandidateFileProvider;
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile};
+use crate::cancellation::CancellationToken;
 use crate::hash::{HashSet, set_with_capacity};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -32,71 +33,141 @@ impl Default for ImportGraphCandidateProvider {
 
 impl CandidateFileProvider for ImportGraphCandidateProvider {
     fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile> {
-        let mut candidates: HashSet<ProjectFile> = set_with_capacity(16);
+        find_import_graph_candidates(target, analyzer, None)
+    }
+}
 
-        // (1) Polymorphic expansion: target + descendants of its parent type.
-        let mut all_targets: HashSet<CodeUnit> = set_with_capacity(4);
-        all_targets.insert(target.clone());
+fn find_import_graph_candidates(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    cancellation: Option<&CancellationToken>,
+) -> HashSet<ProjectFile> {
+    let mut candidates: HashSet<ProjectFile> = set_with_capacity(16);
 
-        if let Some(provider) = analyzer.type_hierarchy_provider()
-            && target.is_function()
-            && let Some(parent) = analyzer.parent_of(target)
-        {
-            for descendant in provider.get_descendants(&parent) {
-                all_targets.insert(descendant);
+    // (1) Polymorphic expansion: target + descendants of its parent type.
+    let mut all_targets: HashSet<CodeUnit> = set_with_capacity(4);
+    all_targets.insert(target.clone());
+
+    if let Some(provider) = analyzer.type_hierarchy_provider()
+        && target.is_function()
+        && let Some(parent) = analyzer.parent_of(target)
+    {
+        for descendant in provider.get_descendants(&parent) {
+            if is_cancelled(cancellation) {
+                return candidates;
             }
+            all_targets.insert(descendant);
+        }
+    }
+
+    // (2) Defining files + directory siblings.
+    let source_files: BTreeSet<ProjectFile> =
+        all_targets.iter().map(|cu| cu.source().clone()).collect();
+
+    for source_file in &source_files {
+        if is_cancelled(cancellation) {
+            return candidates;
+        }
+        candidates.insert(source_file.clone());
+
+        let parent_dir: PathBuf = source_file
+            .rel_path()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let language = language_for_file(source_file);
+
+        if language == Language::None {
+            continue;
         }
 
-        // (2) Defining files + directory siblings.
-        let source_files: BTreeSet<ProjectFile> =
-            all_targets.iter().map(|cu| cu.source().clone()).collect();
-
-        for source_file in &source_files {
-            candidates.insert(source_file.clone());
-
-            let parent_dir: PathBuf = source_file
+        for file in analyzed_files_for_language(analyzer, language) {
+            if is_cancelled(cancellation) {
+                return candidates;
+            }
+            let file_parent: PathBuf = file
                 .rel_path()
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_default();
-            let language = language_for_file(source_file);
-
-            if language == Language::None {
-                continue;
-            }
-
-            for file in analyzed_files_for_language(analyzer, language) {
-                let file_parent: PathBuf = file
-                    .rel_path()
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_default();
-                if file_parent == parent_dir {
-                    candidates.insert(file);
-                }
+            if file_parent == parent_dir {
+                candidates.insert(file);
             }
         }
+    }
 
-        // (3) Direct importers — only if the analyzer exposes import analysis.
-        if let Some(import_provider) = analyzer.import_analysis_provider() {
+    // (3) Direct importers — only if the analyzer exposes import analysis.
+    if let Some(import_provider) = analyzer.import_analysis_provider() {
+        if let Some(cancellation) = cancellation {
+            let importers = find_direct_importers_with_cancellation(
+                analyzer.analyzed_files(),
+                import_provider,
+                &source_files,
+                cancellation,
+            );
+            candidates.extend(importers);
+        } else {
             let snapshot: Vec<ProjectFile> = candidates.iter().cloned().collect();
             for source_file in snapshot {
-                for importer in import_provider.referencing_files_of(&source_file) {
-                    candidates.insert(importer);
+                if is_cancelled(cancellation) {
+                    return candidates;
                 }
+                candidates.extend(import_provider.referencing_files_of(&source_file));
             }
         }
-
-        add_scala_candidates_for_java_type(target, analyzer, &mut candidates);
-
-        candidates
     }
+
+    add_scala_candidates_for_java_type(target, analyzer, &mut candidates, cancellation);
+
+    candidates
+}
+
+fn find_direct_importers_with_cancellation(
+    files: impl IntoIterator<Item = ProjectFile>,
+    import_provider: &dyn ImportAnalysisProvider,
+    source_files: &BTreeSet<ProjectFile>,
+    cancellation: &CancellationToken,
+) -> HashSet<ProjectFile> {
+    let mut files: Vec<_> = files.into_iter().collect();
+    files.sort();
+    let mut importers = HashSet::default();
+    for candidate in files {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if source_files.contains(&candidate) {
+            continue;
+        }
+        let imports = import_provider.import_info_of(&candidate);
+        let could_import_target = source_files
+            .iter()
+            .any(|target| import_provider.could_import_file(&candidate, imports, target));
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if could_import_target {
+            importers.insert(candidate);
+            continue;
+        }
+        let imported = import_provider.imported_code_units_of(&candidate);
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if imported
+            .iter()
+            .any(|unit| source_files.contains(unit.source()))
+        {
+            importers.insert(candidate);
+        }
+    }
+    importers
 }
 
 fn add_scala_candidates_for_java_type(
     target: &CodeUnit,
     analyzer: &dyn IAnalyzer,
     candidates: &mut HashSet<ProjectFile>,
+    cancellation: Option<&CancellationToken>,
 ) {
     if language_for_target(target) != Language::Java || !target.is_class() {
         return;
@@ -110,6 +181,9 @@ fn add_scala_candidates_for_java_type(
     let target_name = target.identifier();
     let target_fq_name = target.fq_name();
     for file in files {
+        if is_cancelled(cancellation) {
+            return;
+        }
         if file.is_binary().unwrap_or(true) {
             continue;
         }
@@ -142,40 +216,54 @@ impl Default for TextSearchCandidateProvider {
 
 impl CandidateFileProvider for TextSearchCandidateProvider {
     fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile> {
-        let identifier = target.identifier();
-        if identifier.trim().is_empty() {
-            return HashSet::default();
-        }
-
-        let language = language_for_target(target);
-
-        if language == Language::None {
-            return HashSet::default();
-        }
-
-        let files = analyzed_files_for_language(analyzer, language);
-        if files.is_empty() {
-            return HashSet::default();
-        }
-
-        let matches: Mutex<HashSet<ProjectFile>> = Mutex::new(HashSet::default());
-
-        files.par_iter().for_each(|file| {
-            if file.is_binary().unwrap_or(true) {
-                return;
-            }
-            let Ok(content) = file.read_to_string() else {
-                return;
-            };
-            if content.contains(identifier)
-                && let Ok(mut sink) = matches.lock()
-            {
-                sink.insert(file.clone());
-            }
-        });
-
-        matches.into_inner().expect("candidate match set poisoned")
+        find_text_candidates(target, analyzer, None)
     }
+}
+
+fn find_text_candidates(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    cancellation: Option<&CancellationToken>,
+) -> HashSet<ProjectFile> {
+    let identifier = target.identifier();
+    if identifier.trim().is_empty() {
+        return HashSet::default();
+    }
+
+    let language = language_for_target(target);
+
+    if language == Language::None {
+        return HashSet::default();
+    }
+
+    let files = analyzed_files_for_language(analyzer, language);
+    if files.is_empty() {
+        return HashSet::default();
+    }
+
+    let matches: Mutex<HashSet<ProjectFile>> = Mutex::new(HashSet::default());
+
+    files.par_iter().for_each(|file| {
+        if is_cancelled(cancellation) {
+            return;
+        }
+        if file.is_binary().unwrap_or(true) {
+            return;
+        }
+        let Ok(content) = file.read_to_string() else {
+            return;
+        };
+        if is_cancelled(cancellation) {
+            return;
+        }
+        if content.contains(identifier)
+            && let Ok(mut sink) = matches.lock()
+        {
+            sink.insert(file.clone());
+        }
+    });
+
+    matches.into_inner().expect("candidate match set poisoned")
 }
 
 /// Candidate provider for path-scoped `scan_usages` queries (called with `paths`).
@@ -241,15 +329,34 @@ where
     T: CandidateFileProvider,
 {
     fn find_candidates(&self, target: &CodeUnit, analyzer: &dyn IAnalyzer) -> HashSet<ProjectFile> {
-        let mut candidates = self.graph.find_candidates(target, analyzer);
-        if candidates.is_empty() && !analyzer.is_empty() {
-            return self.text.find_candidates(target, analyzer);
-        }
-        if should_union_text_candidates(target) {
-            candidates.extend(self.text.find_candidates(target, analyzer));
-        }
-        candidates
+        apply_fallback_policy(
+            target,
+            analyzer,
+            || self.graph.find_candidates(target, analyzer),
+            || self.text.find_candidates(target, analyzer),
+            || false,
+        )
     }
+}
+
+fn apply_fallback_policy(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    mut find_graph: impl FnMut() -> HashSet<ProjectFile>,
+    mut find_text: impl FnMut() -> HashSet<ProjectFile>,
+    is_cancelled: impl Fn() -> bool,
+) -> HashSet<ProjectFile> {
+    let mut candidates = find_graph();
+    if is_cancelled() {
+        return candidates;
+    }
+    if candidates.is_empty() && !analyzer.is_empty() {
+        return find_text();
+    }
+    if should_union_text_candidates(target) {
+        candidates.extend(find_text());
+    }
+    candidates
 }
 
 fn should_union_text_candidates(target: &CodeUnit) -> bool {
@@ -266,4 +373,75 @@ pub fn default_provider()
         ImportGraphCandidateProvider::new(),
         TextSearchCandidateProvider::new(),
     )
+}
+
+pub(crate) fn find_default_candidates_with_cancellation(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+    cancellation: &CancellationToken,
+) -> HashSet<ProjectFile> {
+    apply_fallback_policy(
+        target,
+        analyzer,
+        || find_import_graph_candidates(target, analyzer, Some(cancellation)),
+        || find_text_candidates(target, analyzer, Some(cancellation)),
+        || cancellation.is_cancelled(),
+    )
+}
+
+fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
+    cancellation.is_some_and(CancellationToken::is_cancelled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::{CodeUnitType, ImportInfo};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CancellingImportProvider {
+        cancellation: CancellationToken,
+        calls: Arc<AtomicUsize>,
+        imported: CodeUnit,
+    }
+
+    impl ImportAnalysisProvider for CancellingImportProvider {
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.cancellation.cancel();
+            [self.imported.clone()].into_iter().collect()
+        }
+
+        fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
+            panic!("cancellable discovery must not build the global reverse index");
+        }
+
+        fn import_info_of<'a>(&'a self, _file: &ProjectFile) -> &'a [ImportInfo] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn cancellable_importer_scan_stops_after_current_file_without_recording_partial_work() {
+        let root = std::env::temp_dir();
+        let target_file = ProjectFile::new(root.clone(), "Target.java");
+        let importer = ProjectFile::new(root, "Importer.java");
+        let cancellation = CancellationToken::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = CancellingImportProvider {
+            cancellation: cancellation.clone(),
+            calls: Arc::clone(&calls),
+            imported: CodeUnit::new(target_file.clone(), CodeUnitType::Class, "pkg", "Target"),
+        };
+
+        let importers = find_direct_importers_with_cancellation(
+            [importer],
+            &provider,
+            &[target_file].into_iter().collect(),
+            &cancellation,
+        );
+
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(importers.is_empty());
+    }
 }

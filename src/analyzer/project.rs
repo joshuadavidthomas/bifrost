@@ -547,7 +547,7 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
 /// writing to disk.
 pub struct OverlayProject {
     delegate: Arc<dyn Project>,
-    overlays: Arc<RwLock<HashMap<PathBuf, String>>>,
+    overlays: Arc<RwLock<HashMap<PathBuf, Arc<str>>>>,
     max_overlay_bytes: usize,
     /// Last instant we emitted a rejection log for a given path. Kept on a
     /// separate throttle helper so the per-keystroke read path doesn't
@@ -574,6 +574,23 @@ impl OverlayProject {
         }
     }
 
+    /// Capture an independent read view of the current overlays.
+    ///
+    /// Subsequent editor changes mutate the live project's map without changing this
+    /// snapshot, allowing background requests to use one coherent source generation.
+    pub(crate) fn snapshot(&self) -> Self {
+        let overlays = self.overlays.read().expect("overlay lock poisoned").clone();
+        Self {
+            delegate: Arc::clone(&self.delegate),
+            overlays: Arc::new(RwLock::new(overlays)),
+            max_overlay_bytes: self.max_overlay_bytes,
+            last_rejection_log: ThrottledLog::new(
+                OVERLAY_REJECTION_LOG_THROTTLE,
+                OVERLAY_REJECTION_LOG_MAX_ENTRIES,
+            ),
+        }
+    }
+
     /// Replace (or insert) the overlay for `abs_path`. Returns `true` when
     /// the overlay was stored and `false` when it was rejected because
     /// `content` exceeded the configured per-overlay byte cap; in the reject
@@ -593,7 +610,7 @@ impl OverlayProject {
         self.overlays
             .write()
             .expect("overlay lock poisoned")
-            .insert(abs_path, content);
+            .insert(abs_path, Arc::from(content));
         true
     }
 
@@ -686,7 +703,7 @@ impl Project for OverlayProject {
             .expect("overlay lock poisoned")
             .get(&file.abs_path())
         {
-            return Ok(text.clone());
+            return Ok(text.to_string());
         }
         self.delegate.read_source(file)
     }
@@ -810,6 +827,30 @@ mod tests {
 
         // Clearing a missing overlay returns false.
         assert!(!overlay.clear(&file.abs_path()));
+    }
+
+    #[test]
+    fn overlay_project_snapshot_isolated_from_later_edits() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = write_file(&root, "lib.rs", "fn disk() {}\n");
+        let delegate: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = OverlayProject::new(delegate);
+        assert!(overlay.set(file.abs_path(), "fn first() {}\n".to_string()));
+
+        let snapshot = overlay.snapshot();
+        {
+            let live = overlay.overlays.read().expect("overlay lock poisoned");
+            let frozen = snapshot.overlays.read().expect("overlay lock poisoned");
+            assert!(Arc::ptr_eq(
+                live.get(&file.abs_path()).unwrap(),
+                frozen.get(&file.abs_path()).unwrap(),
+            ));
+        }
+        assert!(overlay.set(file.abs_path(), "fn second() {}\n".to_string()));
+
+        assert_eq!(snapshot.read_source(&file).unwrap(), "fn first() {}\n");
+        assert_eq!(overlay.read_source(&file).unwrap(), "fn second() {}\n");
     }
 
     #[test]
