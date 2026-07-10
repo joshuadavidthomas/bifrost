@@ -1,6 +1,8 @@
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{ProjectFile, TestAssertionSmell, TestAssertionWeights};
 use regex::Regex;
 use std::sync::LazyLock;
+use tree_sitter::Node;
 
 static CSHARP_TEST_METHOD_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -235,13 +237,61 @@ fn compact_csharp_excerpt(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub(super) fn csharp_contains_tests(source: &str) -> bool {
-    static TEST_ATTR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let regex = TEST_ATTR_RE.get_or_init(|| {
-        regex::Regex::new(
-            r"\[(?:[A-Za-z_][A-Za-z0-9_.]*\.)?(?:Test|Fact|Theory)(?:Attribute)?(?:\s*\(|\s*\])",
-        )
-        .expect("valid csharp test regex")
+pub(super) fn csharp_contains_tests(root: Node<'_>, source: &str) -> bool {
+    let mut found = false;
+    walk_named_tree_preorder(root, true, |node| {
+        found |= node.kind() == "attribute" && csharp_test_attribute(node, source);
+        if found {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        }
     });
-    regex.is_match(source)
+    found
+}
+
+fn csharp_test_attribute(node: Node<'_>, source: &str) -> bool {
+    let Some(name) = node
+        .child_by_field_name("name")
+        .or_else(|| node.named_child(0))
+    else {
+        return false;
+    };
+    let Some(final_name) = final_identifier_text(name, source) else {
+        return false;
+    };
+    csharp_test_attribute_name(final_name)
+}
+
+fn csharp_test_attribute_name(name: &str) -> bool {
+    let final_name = name.strip_suffix("Attribute").unwrap_or(name);
+    matches!(
+        final_name,
+        "Test" | "Fact" | "Theory" | "TestMethod" | "TestCase"
+    )
+}
+
+fn final_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let mut last = None;
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "identifier" {
+            let text = node_text(current, source).trim();
+            if !text.is_empty() {
+                last = Some(text);
+            }
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    last
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or_default()
 }

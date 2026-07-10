@@ -28,6 +28,7 @@ pub(crate) mod semantic_diagnostics;
 mod source_content;
 pub mod structural;
 pub(crate) mod symbol_lookup;
+pub(crate) mod test_paths;
 pub(crate) mod tree_sitter_analyzer;
 pub(crate) mod type_relations;
 mod typescript;

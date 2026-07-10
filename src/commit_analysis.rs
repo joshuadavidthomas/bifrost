@@ -1,3 +1,4 @@
+use crate::analyzer::test_paths;
 use crate::analyzer::{AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile};
 use crate::searchtools::{
     UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
@@ -413,7 +414,10 @@ fn diff_metadata(
             path: new_path,
             status: delta_status(delta.status()).to_string(),
             loc_changed: 0,
-            is_test: is_test_like_path(&display_path),
+            is_test: test_paths::is_test_like_path(
+                &display_path,
+                path_language(Path::new(&display_path)),
+            ),
             is_parseable: is_parseable_path(&display_path),
         });
     }
@@ -610,7 +614,8 @@ fn symbol_snapshot_map(
             continue;
         }
         let path = rel_path(unit.source());
-        let is_test = analyzer.contains_tests(unit.source()) || is_test_like_path(&path);
+        let is_test = analyzer.contains_tests(unit.source())
+            || test_paths::is_test_like_path(&path, path_language(unit.source().rel_path()));
         if is_test && !include_tests {
             continue;
         }
@@ -887,30 +892,21 @@ fn is_parseable_path(path: &str) -> bool {
 }
 
 fn language_for_path(path: &Path) -> String {
+    let language = path_language(path);
+    if language == Language::None {
+        "unknown".to_string()
+    } else {
+        format!("{language:?}").to_lowercase()
+    }
+}
+
+fn path_language(path: &Path) -> Language {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(Language::from_extension)
-        .filter(|language| *language != Language::None)
-        .map(|language| format!("{language:?}").to_lowercase())
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or(Language::None)
 }
 
 fn kind_name(kind: CodeUnitType) -> &'static str {
     kind.display_lowercase()
-}
-
-fn is_test_like_path(path: &str) -> bool {
-    let path = path.replace('\\', "/").to_ascii_lowercase();
-    path.split('/')
-        .any(|segment| matches!(segment, "test" | "tests" | "__tests__" | "spec" | "specs"))
-        || PathBuf::from(&path)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|stem| {
-                stem.ends_with("_test")
-                    || stem.ends_with("test")
-                    || stem.ends_with("_spec")
-                    || stem.ends_with("spec")
-            })
-            .unwrap_or(false)
 }

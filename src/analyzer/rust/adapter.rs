@@ -70,10 +70,10 @@ impl LanguageAdapter for RustAdapter {
         &self,
         _file: &ProjectFile,
         source: &str,
-        _tree: &Tree,
+        tree: &Tree,
         _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     ) -> bool {
-        rust_source_contains_tests(source)
+        rust_source_contains_tests(tree.root_node(), source)
     }
 
     fn parse_file(

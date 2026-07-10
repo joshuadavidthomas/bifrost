@@ -204,6 +204,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
             "contains_tests",
+            "classify_test_files",
         ];
         #[cfg(feature = "nlp")]
         let expected = vec![
@@ -247,6 +248,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
             "contains_tests",
+            "classify_test_files",
         ];
         expected
     });
@@ -943,6 +945,113 @@ fn bifrost_cli_toolset_exposes_contains_tests() {
     assert_eq!(
         structured["unresolved"],
         json!(["Missing.java"]),
+        "{response}"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+#[test]
+fn bifrost_cli_toolset_exposes_classify_test_files() {
+    let fixture_root = TempDir::new().expect("temp dir");
+    fs::create_dir_all(fixture_root.path().join("src/test/java")).expect("test dir");
+    fs::create_dir_all(fixture_root.path().join("src/main/java")).expect("main dir");
+    fs::write(
+        fixture_root.path().join("SampleTest.java"),
+        r#"
+        import org.junit.jupiter.api.Test;
+
+        public class SampleTest {
+            @Test
+            void works() {}
+        }
+        "#,
+    )
+    .expect("write test file");
+    fs::write(
+        fixture_root.path().join("src/test/java/Helper.java"),
+        r#"
+        public class Helper {
+            String value() { return "ok"; }
+        }
+        "#,
+    )
+    .expect("write helper file");
+    fs::write(
+        fixture_root.path().join("src/main/java/Production.java"),
+        r#"
+        public class Production {
+            void works() {}
+        }
+        "#,
+    )
+    .expect("write production file");
+
+    let mut child = spawn_server(fixture_root.path(), "cli", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let list_tools = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    );
+    let tools = list_tools["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    assert!(
+        tool_names(tools).contains(&"classify_test_files"),
+        "cli toolset should advertise classify_test_files: {list_tools}"
+    );
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "classify_test_files",
+                "arguments": {
+                    "file_paths": [
+                        "SampleTest.java",
+                        "src/test/java/Helper.java",
+                        "src/main/java/Production.java",
+                        "Missing.java"
+                    ]
+                }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"],
+        json!({
+            "classifications": {
+                "SampleTest.java": {
+                    "kind": "test",
+                    "contains_test_code": true
+                },
+                "src/main/java/Production.java": {
+                    "kind": "production",
+                    "contains_test_code": false
+                },
+                "src/test/java/Helper.java": {
+                    "kind": "test_support",
+                    "contains_test_code": false
+                }
+            },
+            "unresolved": ["Missing.java"]
+        }),
         "{response}"
     );
 

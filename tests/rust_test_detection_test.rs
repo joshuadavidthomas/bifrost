@@ -91,3 +91,20 @@ fn test_false_positive_function_name() {
         "false_positive.rs",
     )));
 }
+
+#[test]
+fn test_string_literal_test_attribute_does_not_trigger_detection() {
+    let project = rust_project(&[(
+        "string_literal.rs",
+        r##"
+        pub fn marker() -> &'static str {
+            "#[test]"
+        }
+        "##,
+    )]);
+    let analyzer = RustAnalyzer::from_project(project.clone());
+    assert!(!analyzer.contains_tests(&ProjectFile::new(
+        project.root().to_path_buf(),
+        "string_literal.rs",
+    )));
+}

@@ -1,9 +1,67 @@
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{ProjectFile, TestAssertionSmell, TestAssertionWeights};
 use regex::Regex;
 use std::sync::LazyLock;
+use tree_sitter::Node;
 
-pub(super) fn rust_source_contains_tests(source: &str) -> bool {
-    source.contains("#[cfg(test)]") || source.contains("#[test]")
+pub(super) fn rust_source_contains_tests(root: Node<'_>, source: &str) -> bool {
+    let mut found = false;
+    walk_named_tree_preorder(root, true, |node| {
+        found |= node.kind() == "attribute_item" && rust_test_attribute(node, source);
+        if found {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        }
+    });
+    found
+}
+
+fn rust_test_attribute(node: Node<'_>, source: &str) -> bool {
+    let text = compact_attribute_text(node_text(node, source));
+    matches!(text.as_str(), "#[test]" | "#[tokio::test]" | "#[rstest]")
+        || text
+            .strip_prefix("#[cfg(")
+            .and_then(|body| body.strip_suffix(")]"))
+            .is_some_and(cfg_body_has_positive_test_token)
+}
+
+fn cfg_body_has_positive_test_token(body: &str) -> bool {
+    if body.contains("not(test)") {
+        return false;
+    }
+
+    let mut token = String::new();
+    let mut in_string = false;
+    for ch in body.chars() {
+        if ch == '"' {
+            in_string = !in_string;
+            token.clear();
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            token.push(ch);
+            continue;
+        }
+        if token == "test" {
+            return true;
+        }
+        token.clear();
+    }
+    token == "test"
+}
+
+fn compact_attribute_text(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or_default()
 }
 
 static RUST_TEST_FN_RE: LazyLock<Regex> = LazyLock::new(|| {

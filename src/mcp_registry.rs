@@ -334,6 +334,7 @@ mod tests {
                 "report_dead_code_and_unused_abstraction_smells",
                 "report_secret_like_code",
                 "contains_tests",
+                "classify_test_files",
             ]
             .into_iter()
             .map(str::to_string),

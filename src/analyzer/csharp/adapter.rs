@@ -61,10 +61,10 @@ impl LanguageAdapter for CSharpAdapter {
         &self,
         _file: &ProjectFile,
         source: &str,
-        _tree: &Tree,
+        tree: &Tree,
         _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     ) -> bool {
-        csharp_contains_tests(source)
+        csharp_contains_tests(tree.root_node(), source)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

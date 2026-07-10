@@ -76,10 +76,10 @@ impl LanguageAdapter for ScalaAdapter {
         &self,
         _file: &ProjectFile,
         source: &str,
-        _tree: &Tree,
+        tree: &Tree,
         _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     ) -> bool {
-        scala_contains_tests(source)
+        scala_contains_tests(tree.root_node(), source)
     }
 
     fn parse_file(

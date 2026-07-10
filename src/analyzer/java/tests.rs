@@ -1,5 +1,6 @@
 use super::exceptions::named_child_by_kind;
 use super::*;
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::path_utils::rel_path_string;
 use tree_sitter::Node;
 
@@ -119,42 +120,99 @@ fn compact_whitespace_for_excerpt(text: &str) -> String {
     out
 }
 
-pub(super) fn java_source_contains_tests(source: &str) -> bool {
-    source.contains("@Test")
-        || source.contains(".Test")
-        || source.contains("@ParameterizedTest")
-        || source.contains("@RepeatedTest")
-        || source.contains("@Rule")
-        || source.contains("@ClassRule")
-        || source.contains("@Ignore")
-        || (source.contains("TestCase")
-            && (contains_ignoring_whitespace(source, "extendsTestCase")
-                || contains_ignoring_whitespace(source, "extendsjunit.framework.TestCase")))
+pub(super) fn java_source_contains_tests(root: Node<'_>, source: &str) -> bool {
+    let mut found = false;
+    walk_named_tree_preorder(root, true, |node| {
+        found |= match node.kind() {
+            "marker_annotation" | "annotation" => java_test_annotation(node, source),
+            "class_declaration" => java_extends_testcase(node, source),
+            _ => false,
+        };
+        if found {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        }
+    });
+    found
 }
 
-fn contains_ignoring_whitespace(source: &str, needle: &str) -> bool {
-    let mut needle_chars = needle.chars();
-    let Some(first) = needle_chars.next() else {
-        return true;
+fn java_test_annotation(node: Node<'_>, source: &str) -> bool {
+    let Some(name) = node
+        .child_by_field_name("name")
+        .or_else(|| first_named_descendant(node, &["identifier", "scoped_identifier"]))
+    else {
+        return false;
     };
+    let Some(final_name) = final_identifier_text(name, source) else {
+        return false;
+    };
+    matches!(
+        final_name,
+        "Test"
+            | "ParameterizedTest"
+            | "RepeatedTest"
+            | "TestFactory"
+            | "TestTemplate"
+            | "Rule"
+            | "ClassRule"
+            | "Ignore"
+            | "Disabled"
+            | "Nested"
+            | "BeforeEach"
+            | "AfterEach"
+            | "BeforeAll"
+            | "AfterAll"
+    )
+}
 
-    for (start, ch) in source.char_indices() {
-        if ch.is_whitespace() || ch != first {
-            continue;
+fn java_extends_testcase(node: Node<'_>, source: &str) -> bool {
+    let Some(superclass) = node.child_by_field_name("superclass") else {
+        return false;
+    };
+    let text = compact_no_whitespace(node_text(superclass, source));
+    matches!(
+        text.as_str(),
+        "TestCase"
+            | "junit.framework.TestCase"
+            | "extendsTestCase"
+            | "extendsjunit.framework.TestCase"
+    )
+}
+
+fn first_named_descendant<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if kinds.contains(&current.kind()) {
+            return Some(current);
         }
-
-        let mut chars = source[start + ch.len_utf8()..]
-            .chars()
-            .filter(|ch| !ch.is_whitespace());
-        if needle_chars
-            .clone()
-            .all(|expected| chars.next() == Some(expected))
-        {
-            return true;
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
         }
     }
+    None
+}
 
-    false
+fn final_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let mut last = None;
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "identifier" | "type_identifier") {
+            last = Some(node_text(current, source).trim());
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    last.filter(|text| !text.is_empty())
+}
+
+fn compact_no_whitespace(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 pub(super) fn detect_test_assertion_smells_java(

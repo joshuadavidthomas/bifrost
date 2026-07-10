@@ -90,10 +90,10 @@ impl LanguageAdapter for JavaAdapter {
         &self,
         _file: &ProjectFile,
         source: &str,
-        _tree: &Tree,
+        tree: &Tree,
         _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     ) -> bool {
-        java_source_contains_tests(source)
+        java_source_contains_tests(tree.root_node(), source)
     }
 
     fn parse_file(

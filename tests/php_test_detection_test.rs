@@ -17,7 +17,9 @@ fn test_name_based_detection() {
         "Test.php",
         r#"
         <?php
-        function testFoo() { }
+        class FooTest {
+            public function helper() { }
+        }
         "#,
     )]);
     let analyzer = PhpAnalyzer::from_project(project.clone()).update_all();
@@ -63,8 +65,7 @@ fn test_name_based_detection_is_case_insensitive() {
         "CaseInsensitive.php",
         r#"
         <?php
-        function TestFoo() { }
-        function TESTBar() { }
+        class FooTestCase { }
         "#,
     )]);
     let analyzer = PhpAnalyzer::from_project(project.clone()).update_all();
@@ -80,7 +81,8 @@ fn test_context_manager_equivalent_detection() {
         "Integration.php",
         r#"
         <?php
-        function testFoo() { }
+        class IntegrationTest extends \PHPUnit\Framework\TestCase {
+        }
         "#,
     )]);
     let analyzer = PhpAnalyzer::from_project(project.clone()).update_all();
@@ -124,7 +126,7 @@ fn test_boundary_matches() {
         "Boundary.php",
         r#"
         <?php
-        class TestSuffix {
+        class SuffixTest {
             public function testingSetup() { }
             public function atest() { }
         }
@@ -134,5 +136,23 @@ fn test_boundary_matches() {
     assert!(analyzer.contains_tests(&ProjectFile::new(
         project.root().to_path_buf(),
         "Boundary.php",
+    )));
+}
+
+#[test]
+fn test_contest_class_does_not_trigger_detection() {
+    let project = inline_project(&[(
+        "Contest.php",
+        r#"
+        <?php
+        class Contest {
+            public function latest() { }
+        }
+        "#,
+    )]);
+    let analyzer = PhpAnalyzer::from_project(project.clone()).update_all();
+    assert!(!analyzer.contains_tests(&ProjectFile::new(
+        project.root().to_path_buf(),
+        "Contest.php",
     )));
 }

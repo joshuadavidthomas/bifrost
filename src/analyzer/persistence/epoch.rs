@@ -281,7 +281,7 @@ lang_epoch!(
     Java,
     "java",
     "treesitter/java/",
-    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07"
+    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07"
 );
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
@@ -321,25 +321,25 @@ lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07"
 );
 lang_epoch!(
     Php,
     "php",
     "treesitter/php/",
-    "synthetic-file-scope-code-units-2026-07"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07"
 );
 lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07"
 );
 lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07"
 );
 lang_epoch!(
     Ruby,

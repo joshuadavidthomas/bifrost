@@ -1,6 +1,8 @@
+use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::analyzer::{ProjectFile, TestAssertionSmell, TestAssertionWeights};
 use regex::Regex;
 use std::sync::LazyLock;
+use tree_sitter::Node;
 
 static SCALA_TEST_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?s)"(?P<name>[^"]+)"\s+should\s+"[^"]+"\s+in\s*\{(?P<body>.*?)\n\}"#)
@@ -400,10 +402,69 @@ fn oversized_scala_literal(
     })
 }
 
-pub(super) fn scala_contains_tests(source: &str) -> bool {
-    source.contains("@Test")
-        || source.contains("@org.junit.Test")
-        || source.contains("test(\"")
-        || source.contains("test (\"")
-        || (source.contains(" should ") && source.contains(" in {"))
+pub(super) fn scala_contains_tests(root: Node<'_>, source: &str) -> bool {
+    let mut found = false;
+    walk_named_tree_preorder(root, true, |node| {
+        found |= match node.kind() {
+            "annotation" => scala_test_annotation(node, source),
+            "call_expression" | "generic_function" => scala_test_call(node, source),
+            "infix_expression" => scala_test_infix(node, source),
+            _ => false,
+        };
+        if found {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        }
+    });
+    found
+}
+
+fn scala_test_annotation(node: Node<'_>, source: &str) -> bool {
+    final_identifier_text(node, source).is_some_and(|name| name == "Test")
+}
+
+fn scala_test_call(node: Node<'_>, source: &str) -> bool {
+    let Some(function) = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))
+    else {
+        return false;
+    };
+    final_identifier_text(function, source)
+        .is_some_and(|name| matches!(name, "test" | "it" | "property"))
+}
+
+fn scala_test_infix(node: Node<'_>, source: &str) -> bool {
+    let text = node_text(node, source);
+    text.contains(" should ") && text.contains(" in ")
+}
+
+fn final_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let mut last = None;
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(
+            current.kind(),
+            "identifier" | "type_identifier" | "stable_identifier"
+        ) && current.child_count() == 0
+        {
+            let text = node_text(current, source).trim();
+            if !text.is_empty() {
+                last = Some(text);
+            }
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    last
+}
+
+fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
+    source
+        .get(node.start_byte()..node.end_byte())
+        .unwrap_or_default()
 }

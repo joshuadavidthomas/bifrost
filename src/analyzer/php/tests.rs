@@ -1,4 +1,5 @@
 use crate::analyzer::{ProjectFile, TestAssertionSmell, TestAssertionWeights};
+use crate::hash::HashSet;
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -217,10 +218,19 @@ pub(super) fn php_contains_tests(
     source: &str,
     parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
 ) -> bool {
+    let test_classes = php_test_classes(parsed);
+    if !test_classes.is_empty() {
+        return true;
+    }
+
     if parsed.declarations.iter().any(|code_unit| {
-        let lower = code_unit.identifier().to_ascii_lowercase();
-        (code_unit.is_class() && lower.contains("test"))
-            || (code_unit.is_function() && lower.starts_with("test"))
+        code_unit.is_function()
+            && code_unit
+                .identifier()
+                .to_ascii_lowercase()
+                .starts_with("test")
+            && php_function_parent_class(code_unit.short_name())
+                .is_some_and(|class_name| test_classes.contains(class_name))
     }) {
         return true;
     }
@@ -232,4 +242,39 @@ pub(super) fn php_contains_tests(
         .unwrap()
     });
     DOCBLOCK_TEST_RE.is_match(source)
+}
+
+fn php_test_classes(parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile) -> HashSet<String> {
+    let mut classes = HashSet::default();
+    for code_unit in parsed
+        .declarations
+        .iter()
+        .filter(|code_unit| code_unit.is_class())
+    {
+        let name = code_unit.identifier();
+        if php_test_class_name(name)
+            || parsed
+                .raw_supertypes
+                .get(code_unit)
+                .is_some_and(|parents| parents.iter().any(|parent| php_extends_testcase(parent)))
+        {
+            classes.insert(code_unit.short_name().to_string());
+        }
+    }
+    classes
+}
+
+fn php_test_class_name(name: &str) -> bool {
+    name.ends_with("Test") || name.ends_with("TestCase")
+}
+
+fn php_extends_testcase(parent: &str) -> bool {
+    parent
+        .rsplit(['\\', '.'])
+        .next()
+        .is_some_and(|name| name == "TestCase")
+}
+
+fn php_function_parent_class(short_name: &str) -> Option<&str> {
+    short_name.rsplit_once('.').map(|(parent, _)| parent)
 }

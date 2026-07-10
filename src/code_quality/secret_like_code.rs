@@ -2,7 +2,8 @@
 //! secret scanner and the brokk-core MCP wrapper to bifrost.
 
 use super::{ReportLines, sanitize_table_cell};
-use crate::analyzer::IAnalyzer;
+use crate::analyzer::test_paths;
+use crate::analyzer::{IAnalyzer, Language};
 use crate::path_utils::normalize_pattern;
 use git2::{FileMode, ObjectType, Oid, Repository, Sort, TreeWalkMode, TreeWalkResult};
 use regex::Regex;
@@ -435,7 +436,7 @@ fn scan_default_ref(
             format!("{root}{}", entry.name().unwrap_or_default())
         };
         if let Some(project_path) = to_project_relative_path(ctx, &git_path) {
-            if looks_like_test_path(&project_path) {
+            if test_paths::is_test_like_path(&project_path, language_for_path(&project_path)) {
                 return TreeWalkResult::Ok;
             }
             let result =
@@ -497,7 +498,7 @@ fn scan_history(
             let Some(project_path) = to_project_relative_path(ctx, &git_path) else {
                 return TreeWalkResult::Ok;
             };
-            if looks_like_test_path(&project_path) {
+            if test_paths::is_test_like_path(&project_path, language_for_path(&project_path)) {
                 return TreeWalkResult::Ok;
             }
             let oid = entry.id();
@@ -773,24 +774,12 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-fn looks_like_test_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_lowercase();
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_lowercase();
-    normalized.contains("/test/")
-        || normalized.contains("/tests/")
-        || normalized.contains("/src/test/")
-        || file_name.starts_with("test_")
-        || file_name.ends_with("_test.py")
-        || file_name.ends_with("test.java")
-        || file_name.ends_with("tests.java")
-        || file_name.ends_with(".test.js")
-        || file_name.ends_with(".spec.js")
-        || file_name.ends_with(".test.ts")
-        || file_name.ends_with(".spec.ts")
+fn language_for_path(path: &str) -> Language {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(Language::from_extension)
+        .unwrap_or(Language::None)
 }
 
 fn is_regular_file_mode(mode: i32) -> bool {

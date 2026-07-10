@@ -81,3 +81,24 @@ fn ignores_non_test_file() {
         "Application.java",
     )));
 }
+
+#[test]
+fn ignores_testonly_annotation_and_import() {
+    let project = java_project(&[(
+        "Production.java",
+        r#"
+        import org.jetbrains.annotations.TestOnly;
+
+        public class Production {
+            @TestOnly
+            public void forTests() {}
+        }
+        "#,
+    )]);
+    let analyzer = JavaAnalyzer::from_project(project.clone());
+
+    assert!(!analyzer.contains_tests(&ProjectFile::new(
+        project.root().to_path_buf(),
+        "Production.java",
+    )));
+}

@@ -3410,10 +3410,12 @@ fn scan_usages_emits_one_entry_for_blank_symbols() {
 
 #[test]
 fn scan_usages_excludes_test_files_when_include_tests_is_false() {
-    // Two callers of `Greeter.hello`: one in production code, one in a JUnit test
-    // file. With include_tests=false, the test caller must be filtered before the
-    // regex scan so that test hits do not eat into DEFAULT_MAX_USAGES and do not
-    // appear in the result. With include_tests=true, both callers must show up.
+    // Three callers of `Greeter.hello`: one in production code, one in a JUnit
+    // test file, and one helper under a test root with no runnable test marker.
+    // With include_tests=false, both test-surface callers must be filtered
+    // before the regex scan so that test hits do not eat into DEFAULT_MAX_USAGES
+    // and do not appear in the result. With include_tests=true, all callers must
+    // show up.
     let temp = TempDir::new().unwrap();
     fs::write(
         temp.path().join("Greeter.java"),
@@ -3428,6 +3430,12 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
     fs::write(
         temp.path().join("GreeterTest.java"),
         "import org.junit.Test;\npublic class GreeterTest {\n    @Test\n    public void greets() { new Greeter().hello(); }\n}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(temp.path().join("src/test/java")).unwrap();
+    fs::write(
+        temp.path().join("src/test/java/GreeterFixture.java"),
+        "public class GreeterFixture {\n    public String call() { return new Greeter().hello(); }\n}\n",
     )
     .unwrap();
 
@@ -3455,6 +3463,10 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
         !paths.contains(&"GreeterTest.java"),
         "GreeterTest.java must be filtered when include_tests=false: {value}"
     );
+    assert!(
+        !paths.contains(&"src/test/java/GreeterFixture.java"),
+        "GreeterFixture.java must be filtered when include_tests=false: {value}"
+    );
 
     let with_tests = service
         .call_tool_json(
@@ -3475,6 +3487,10 @@ fn scan_usages_excludes_test_files_when_include_tests_is_false() {
     assert!(
         paths.contains(&"GreeterTest.java"),
         "GreeterTest.java missing with include_tests=true: {value}"
+    );
+    assert!(
+        paths.contains(&"src/test/java/GreeterFixture.java"),
+        "GreeterFixture.java missing with include_tests=true: {value}"
     );
 }
 

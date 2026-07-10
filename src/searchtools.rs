@@ -9,6 +9,7 @@ use crate::analyzer::symbol_lookup::{
     CodeUnitResolution, resolve_codeunit_exact, resolve_codeunit_fuzzy,
     resolve_enclosing_codeunits, strip_trailing_call_suffix,
 };
+use crate::analyzer::test_paths;
 use crate::analyzer::usages::get_definition::{
     SCALA_UNSUPPORTED_CALL_TARGET_SHAPE, SCALA_UNSUPPORTED_RECEIVER,
 };
@@ -2852,7 +2853,12 @@ fn excluded_test_files(
     let set: HashSet<ProjectFile> = analyzer
         .analyzed_files()
         .into_iter()
-        .filter(|file| analyzer.contains_tests(file))
+        .filter(|file| {
+            matches!(
+                classify_resolved_test_file(analyzer, file).kind,
+                TestFileKind::Test | TestFileKind::TestSupport
+            )
+        })
         .collect();
     Some(Arc::new(set))
 }
@@ -5708,10 +5714,10 @@ pub struct ContainsTestsResult {
     pub unresolved: Vec<String>,
 }
 
-/// Classify whether each given file contains test code, via the per-language
-/// analyzers' `contains_tests`. Exposed so consumers that must treat the test
-/// surface specially (e.g. hermetic acceptance that resets test files to a
-/// reference state) can do so without re-implementing path heuristics.
+/// Return the semantic test-code predicate for each resolved file. This is
+/// path-independent and does not identify the full test surface: fixtures and
+/// helpers under test roots can return `false`. Use `classify_test_files` when
+/// callers need file-level test-surface identification.
 pub fn contains_tests(
     analyzer: &dyn IAnalyzer,
     params: ContainsTestsParams,
@@ -5734,29 +5740,87 @@ pub fn contains_tests(
     }
 }
 
-fn is_test_candidate(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> bool {
-    analyzer.contains_tests(file) || is_test_like_path(file)
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClassifyTestFilesParams {
+    pub file_paths: Vec<String>,
 }
 
-fn is_test_like_path(file: &ProjectFile) -> bool {
-    let path = rel_path_string(file).to_ascii_lowercase();
-    if path
-        .split('/')
-        .any(|segment| matches!(segment, "test" | "tests" | "__tests__" | "spec" | "specs"))
-    {
-        return true;
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestFileKind {
+    Test,
+    TestSupport,
+    Production,
+    Ambiguous,
+}
 
-    let stem = file
-        .rel_path()
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(|stem| stem.to_ascii_lowercase())
-        .unwrap_or_default();
-    stem.ends_with("_test")
-        || stem.ends_with("test")
-        || stem.ends_with("_spec")
-        || stem.ends_with("spec")
+#[derive(Debug, Clone, Serialize)]
+pub struct TestFileClassification {
+    pub kind: TestFileKind,
+    /// Semantic runnable-test detection for the same file, reported so callers
+    /// can separate file-level test surface from files that contain test code.
+    pub contains_test_code: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassifyTestFilesResult {
+    pub classifications: BTreeMap<String, TestFileClassification>,
+    pub unresolved: Vec<String>,
+}
+
+pub fn classify_test_files(
+    analyzer: &dyn IAnalyzer,
+    params: ClassifyTestFilesParams,
+) -> ClassifyTestFilesResult {
+    let project = analyzer.project();
+    let resolver = WorkspaceFileResolver::new(project);
+    let mut classifications = BTreeMap::new();
+    let mut unresolved = Vec::new();
+    for input in params.file_paths.iter() {
+        match resolver.resolve_literal(input.trim()) {
+            ResolvedFileInput::File(file) if file.exists() => {
+                classifications.insert(
+                    rel_path_string(&file),
+                    classify_resolved_test_file(analyzer, &file),
+                );
+            }
+            _ => unresolved.push(input.clone()),
+        }
+    }
+    ClassifyTestFilesResult {
+        classifications,
+        unresolved,
+    }
+}
+
+fn classify_resolved_test_file(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+) -> TestFileClassification {
+    let path = rel_path_string(file);
+    let language = language_for_file(file);
+    let path_verdict = test_paths::path_test_verdict(&path);
+    let contains_test_code = analyzer.contains_tests(file);
+    let test_like = path_verdict == test_paths::PathTestVerdict::TestRoot
+        || test_paths::has_test_filename_convention(&path, language);
+    let kind = if test_like && contains_test_code {
+        TestFileKind::Test
+    } else if test_like {
+        TestFileKind::TestSupport
+    } else if path_verdict == test_paths::PathTestVerdict::ProductionRoot {
+        TestFileKind::Production
+    } else {
+        TestFileKind::Ambiguous
+    };
+    TestFileClassification {
+        kind,
+        contains_test_code,
+    }
+}
+
+fn is_test_candidate(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> bool {
+    analyzer.contains_tests(file)
+        || test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
 }
 
 fn is_generated_like_path(file: &ProjectFile) -> bool {
