@@ -6966,6 +6966,43 @@ export function run() {
 }
 
 #[test]
+fn typescript_workspace_module_external_reexport_reports_boundary() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/core.ts",
+            r#"
+import { exec } from "./vendor-core.js";
+
+export class ProcessPromise {
+  run() {
+    return exec({});
+  }
+}
+"#,
+        )
+        .file("src/vendor-core.ts", "export { exec } from 'zurk/spawn';\n")
+        .build();
+
+    let line = "    return exec({});";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/core.ts","line":6,"column":{}}}]}}"#,
+            column_of(line, "exec")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(message.contains("src/vendor-core.ts"), "{value}");
+    assert!(message.contains("zurk/spawn"), "{value}");
+    assert!(message.contains("outside the indexed workspace"), "{value}");
+}
+
+#[test]
 fn go_import_selector_resolves_to_definition() {
     let project = InlineTestProject::with_language(Language::Go)
         .file("go.mod", "module example.com/app\n")

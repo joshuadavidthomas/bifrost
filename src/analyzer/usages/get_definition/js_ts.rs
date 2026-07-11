@@ -471,6 +471,14 @@ fn resolve_js_ts_module_binding(
         value_position,
     );
     if candidates.is_empty() {
+        if let Some((reexport_file, external_module)) = cached_jsts_index(analyzer, language, None)
+            .and_then(|index| index.unresolved_reexport_boundary(&files, exported_name))
+        {
+            return boundary(format!(
+                "`{exported_name}` is re-exported by `{}` from `{external_module}`, which is outside the indexed workspace",
+                rel_path_string(&reexport_file)
+            ));
+        }
         return no_definition(
             "no_indexed_definition",
             format!("`{exported_name}` is not indexed in `{module}`"),

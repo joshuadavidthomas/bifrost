@@ -190,6 +190,77 @@ impl JsTsUsageIndex {
         resolved
     }
 
+    /// Follow workspace re-export edges until an exported name reaches a module
+    /// specifier that cannot be resolved inside the index. This distinguishes an
+    /// external re-export boundary from a workspace module that simply does not
+    /// export the requested name.
+    pub(crate) fn unresolved_reexport_boundary(
+        &self,
+        module_files: &[ProjectFile],
+        exported_name: &str,
+    ) -> Option<(ProjectFile, String)> {
+        let mut visited = HashSet::default();
+        let mut frontier: VecDeque<(ProjectFile, String)> = module_files
+            .iter()
+            .cloned()
+            .map(|file| (file, exported_name.to_string()))
+            .collect();
+
+        while let Some((file, name)) = frontier.pop_front() {
+            if !visited.insert((file.clone(), name.clone())) {
+                continue;
+            }
+
+            if let Some(targets) = self
+                .direct_reexport_edges
+                .get(&(file.clone(), name.clone()))
+            {
+                frontier.extend(targets.iter().cloned());
+                continue;
+            }
+
+            if let Some(entry) = self
+                .exports_by_file
+                .get(&file)
+                .and_then(|exports| exports.exports_by_name.get(&name))
+            {
+                match entry {
+                    ExportEntry::ReexportedNamed {
+                        module_specifier, ..
+                    } => return Some((file, module_specifier.clone())),
+                    // Local/default entries can involve resolved CommonJS module
+                    // objects whose edge shape intentionally differs. Without a
+                    // recorded direct named re-export, they are not evidence of
+                    // an external boundary.
+                    ExportEntry::Local { .. } | ExportEntry::Default { .. } => {}
+                }
+                continue;
+            }
+
+            if name == "default" {
+                continue;
+            }
+            if let Some(target_files) = self.direct_star_reexports.get(&file) {
+                frontier.extend(
+                    target_files
+                        .iter()
+                        .cloned()
+                        .map(|target_file| (target_file, name.clone())),
+                );
+                continue;
+            }
+            if let Some(star) = self
+                .exports_by_file
+                .get(&file)
+                .and_then(|exports| exports.reexport_stars.first())
+            {
+                return Some((file, star.module_specifier.clone()));
+            }
+        }
+
+        None
+    }
+
     pub(crate) fn import_binding(
         &self,
         importer: &ProjectFile,
