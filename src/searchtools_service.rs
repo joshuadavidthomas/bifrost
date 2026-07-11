@@ -34,6 +34,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -157,6 +158,39 @@ struct WorkspaceSession {
     semantic: Option<Arc<SemanticIndexer>>,
 }
 
+/// Owns one workspace snapshot and its request-scoped analyzer memoization.
+///
+/// Returning this from `snapshot_for_query` makes the cleanup obligation part
+/// of the type, including for direct callers such as the code-query REPL.
+struct WorkspaceQueryScope {
+    snapshot: Arc<WorkspaceAnalyzer>,
+}
+
+impl WorkspaceQueryScope {
+    fn new(snapshot: Arc<WorkspaceAnalyzer>) -> Self {
+        snapshot.begin_query();
+        Self { snapshot }
+    }
+
+    fn arc(&self) -> &Arc<WorkspaceAnalyzer> {
+        &self.snapshot
+    }
+}
+
+impl Deref for WorkspaceQueryScope {
+    type Target = WorkspaceAnalyzer;
+
+    fn deref(&self) -> &Self::Target {
+        self.snapshot.as_ref()
+    }
+}
+
+impl Drop for WorkspaceQueryScope {
+    fn drop(&mut self) {
+        self.snapshot.end_query();
+    }
+}
+
 enum ObservedSource {
     Present(String),
     Missing,
@@ -271,12 +305,13 @@ impl SearchToolsService {
         Self::new_transient_with_strategy(root, UpdateStrategy::Manual, false)
     }
 
-    /// Construct a manual, non-persistent, non-semantic service over an
-    /// already-selected project. One-shot CLI subset workspaces use this to
-    /// avoid whole-root watchers and analyzer DB reconciliation.
+    /// Construct a manual, non-semantic service over an already-selected
+    /// project. One-shot CLI subset workspaces use this to avoid whole-root
+    /// watchers while still sharing the analyzer blob cache for git roots.
     pub fn new_manual_for_project(project: Arc<dyn Project>) -> Result<Self, String> {
         let root = project.root().to_path_buf();
-        let workspace = WorkspaceAnalyzer::build(Arc::clone(&project), AnalyzerConfig::default());
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
         let session = assemble_session(project, workspace, UpdateStrategy::Manual, false);
         Ok(Self {
             root: RwLock::new(root),
@@ -1061,14 +1096,14 @@ impl SearchToolsService {
         active_workspace_result(session.snapshot.analyzer().project().root())
     }
 
-    fn snapshot_for_query(&self) -> Result<Arc<WorkspaceAnalyzer>, SearchToolsServiceError> {
+    fn snapshot_for_query(&self) -> Result<WorkspaceQueryScope, SearchToolsServiceError> {
         let mut guard = self.write_session()?;
         let session = guard.as_mut().ok_or_else(Self::closed_error)?;
         match self.update_strategy {
             UpdateStrategy::WatchFiles => Self::apply_watcher_delta(session),
             UpdateStrategy::Manual => {}
         }
-        Ok(Arc::clone(&session.snapshot))
+        Ok(WorkspaceQueryScope::new(Arc::clone(&session.snapshot)))
     }
 
     fn handle_get_symbol_sources(
@@ -1098,24 +1133,21 @@ impl SearchToolsService {
                 let analyzer = session.snapshot.analyzer();
                 let stale_files = observed_sources
                     .iter()
-                    .filter_map(|(file, observed)| {
-                        let indexed = analyzer.indexed_source(file);
-                        match (indexed, observed) {
-                            (Some(indexed), ObservedSource::Present(current))
-                                if indexed == current =>
-                            {
-                                None
-                            }
-                            (None, ObservedSource::Missing) => None,
-                            _ => Some(file.clone()),
+                    .filter_map(|(file, observed)| match observed {
+                        ObservedSource::Present(current)
+                            if analyzer.indexed_source_matches(file, current) =>
+                        {
+                            None
                         }
+                        ObservedSource::Missing => Some(file.clone()),
+                        _ => Some(file.clone()),
                     })
                     .collect();
                 Self::apply_changed_files(session, stale_files);
                 Arc::clone(&session.snapshot)
             };
 
-            if !Arc::ptr_eq(&initial_snapshot, &final_snapshot) {
+            if !Arc::ptr_eq(initial_snapshot.arc(), &final_snapshot) {
                 result = get_symbol_sources(final_snapshot.analyzer(), params);
             }
         }
