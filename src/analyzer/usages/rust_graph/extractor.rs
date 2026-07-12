@@ -199,6 +199,7 @@ pub(super) fn scan_files_for_target(
             support,
             target,
             target_fqn: &target_fqn,
+            target_is_class: target.is_class(),
             target_is_module: target.is_module(),
             target_short: &target_short,
             direct_names: &direct_names,
@@ -236,6 +237,7 @@ pub(super) struct ScanCtx<'a> {
     support: &'a DefinitionLookupIndex,
     target: &'a CodeUnit,
     pub(super) target_fqn: &'a str,
+    pub(super) target_is_class: bool,
     pub(super) target_is_module: bool,
     pub(super) target_short: &'a str,
     direct_names: &'a HashSet<String>,
@@ -268,7 +270,10 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .unwrap_or_default();
             if text == "Self" && self_reference_matches_target(node, ctx) {
                 record_self_reference_hit(node, ctx);
-            } else if ctx.matches_identifier(text) && !is_shadowed_identifier(text, node, ctx) {
+            } else if (!ctx.target_is_class || !identifier_is_scoped_path_part(node))
+                && ctx.matches_identifier(text)
+                && !is_shadowed_identifier(text, node, ctx)
+            {
                 record_hit(node, ctx);
             }
         }
@@ -282,6 +287,15 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     for child in node.named_children(&mut cursor) {
         scan_node(child, ctx);
     }
+}
+
+fn identifier_is_scoped_path_part(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        )
+    })
 }
 
 fn self_member_receiver(node: Node<'_>) -> bool {

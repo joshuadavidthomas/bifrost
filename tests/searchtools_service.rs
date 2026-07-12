@@ -4377,6 +4377,79 @@ pub fn consume() {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_exact_fully_qualified_rust_type_owners() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+pub mod core;
+pub mod flags;
+pub mod messenger;
+pub mod tracing_bridge;
+pub mod unrelated;
+
+pub fn consume() {
+    crate::tracing_bridge::OpenTelemetryTracingBridge::new();
+    crate::messenger::emit::VisibilityLevels::default();
+    let _ = crate::core::api::AnalysisLogLevel::Error;
+    crate::flags::OutputFormat::from();
+
+    crate::unrelated::tracing_bridge::OpenTelemetryTracingBridge::new();
+    crate::unrelated::messenger::emit::VisibilityLevels::default();
+    let _ = crate::unrelated::core::api::AnalysisLogLevel::Error;
+    crate::unrelated::flags::OutputFormat::from();
+}
+"#,
+        )
+        .file(
+            "tracing_bridge.rs",
+            "pub struct OpenTelemetryTracingBridge;\n",
+        )
+        .file(
+            "messenger.rs",
+            "pub mod emit { pub struct VisibilityLevels; }\n",
+        )
+        .file(
+            "core.rs",
+            "pub mod api { pub enum AnalysisLogLevel { Error } }\n",
+        )
+        .file("flags.rs", "pub struct OutputFormat;\n")
+        .file(
+            "unrelated.rs",
+            r#"
+pub mod tracing_bridge { pub struct OpenTelemetryTracingBridge; }
+pub mod messenger { pub mod emit { pub struct VisibilityLevels; } }
+pub mod core { pub mod api { pub enum AnalysisLogLevel { Error } } }
+pub mod flags { pub struct OutputFormat; }
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["tracing_bridge.OpenTelemetryTracingBridge","messenger.emit.VisibilityLevels","core.api.AnalysisLogLevel","flags.OutputFormat"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(4, resolved_scan_count(&value), "payload: {value}");
+    for usage in results(&value) {
+        assert_eq!(1, usage["total_hits"].as_u64().unwrap(), "payload: {value}");
+        let files = usage["files"].as_array().unwrap();
+        assert_eq!(1, files.len(), "payload: {value}");
+        assert_eq!("lib.rs", files[0]["path"], "payload: {value}");
+        assert_eq!(
+            1,
+            files[0]["hits"].as_array().unwrap().len(),
+            "payload: {value}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_paths_scope_does_not_truncate_broad_glob_candidates_before_scanning() {
     let mut project = InlineTestProject::with_language(Language::Java).file(
         "Greeter.java",

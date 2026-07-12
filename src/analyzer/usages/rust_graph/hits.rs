@@ -22,8 +22,8 @@ fn record_module_qualified_hits_in(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.target_is_module {
-        record_scoped_module_segment_hit(node, ctx);
+    if ctx.target_is_module || ctx.target_is_class {
+        record_scoped_target_segment_hit(node, ctx);
         return;
     }
 
@@ -58,7 +58,7 @@ fn record_scoped_identifier_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn record_scoped_module_segment_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn record_scoped_target_segment_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if has_ancestor_kind(node, "use_declaration") {
         return;
     }
@@ -77,21 +77,33 @@ fn record_scoped_module_segment_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             .map(str::to_string)
             .or_else(|| ctx.rust.resolve_module_package(ctx.file, path_text));
         if resolved_root.as_deref() == Some(ctx.target_fqn) {
-            record_module_segment(path, ctx);
+            record_target_segment(path, ctx);
         }
     }
-    let resolved = ctx.refs.resolve_scoped(path_text, name_text).or_else(|| {
-        ctx.rust
-            .resolve_module_package(ctx.file, node_text(node, ctx.source))
-    });
-    if resolved.as_deref() != Some(ctx.target_fqn) {
+    if !scoped_node_resolves_to_target(node, path_text, name_text, ctx) {
         return;
     }
 
-    record_module_segment(name, ctx);
+    record_target_segment(name, ctx);
 }
 
-fn record_module_segment(segment: Node<'_>, ctx: &mut ScanCtx<'_>) {
+fn scoped_node_resolves_to_target(
+    node: Node<'_>,
+    path_text: &str,
+    name_text: &str,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    ctx.refs
+        .resolve_scoped(path_text, name_text)
+        .or_else(|| {
+            ctx.rust
+                .resolve_module_package(ctx.file, node_text(node, ctx.source))
+        })
+        .as_deref()
+        == Some(ctx.target_fqn)
+}
+
+fn record_target_segment(segment: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let start = segment.start_byte();
     let end = segment.end_byte();
     if let Some(enclosing) =

@@ -29,6 +29,7 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 20:00Z) Found and symbols-tested Scala blocker #651 before the cold Scala corpus run: inverse usage now preserves every overload CodeUnit and enforces the usage cap across their merged hit set.
 - [x] (2026-07-12 20:35Z) Pushed and closed #651, then removed Rust/C++ cross-language scoped-owner leakage in #654 with mixed-language symbols regressions.
 - [x] (2026-07-12 21:05Z) Implemented and symbols-tested #652: named Rust module segments in runtime/type paths now resolve through the structured reference context, while import-only sites and unrelated same-name modules remain excluded.
+- [x] (2026-07-12 21:30Z) Implemented and symbols-tested #653 by generalizing the exact scoped-prefix walk from modules to class/type owners; all four corpus shapes and same-name fully qualified negatives are covered through `scan_usages_by_reference`.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
