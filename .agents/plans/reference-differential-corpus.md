@@ -56,6 +56,7 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 10:00Z) Stopped the Go run after three hours when GDB proved it had never reached the differential: persisted symbols startup was eagerly rebuilding `DefinitionLookupIndex` through `all_declarations` and reparsing Go content qualifiers. Corrected #675 to Python per-query reuse and filed the distinct warm-start blocker as #677.
 - [x] (2026-07-12 20:38Z) Resumed after release `0.7.6`, migrated the Azure PowerShell cache with the required external write access, and found the remaining C# forward amplification: extension visibility performed a generic SQLite parent-definition query for every exact identifier candidate. Replaced it with the persisted member namespace and per-file structural parent map; the fixed warm 1,000-site/100-target smoke completed in 232.1 seconds with a valid record.
 - [x] (2026-07-12 20:50Z) Pushed C# parent lookup fix `b842208a` and completed the full Azure PowerShell N=1 record in 425.0 seconds: 3,269 forward-resolved sites, 598 consistent, 40 unproven, 1,339 missing, and 8,023 inconclusive. Initial triage shows 1,304 class/type targets; exact production rerun confirms the dominant fully qualified partial/interface type boundary, but no correctness issue is filed until a reduced authoritative-scope regression pins the resolver gap.
+- [x] (2026-07-12 21:11Z) Pinned the first C# correctness boundary with a three-file authoritative-scope regression, filed #698, recognized tree-sitter C#'s `returns` field, and emitted qualified-type hits on their containing AST node. The exact Azure bytes `5677..5693` changed from missing to consistent in 146.7 seconds; focused tests, affected all-feature clippy, and the complete `nlp,python` test gate pass.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -101,6 +102,9 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Observation: Package version alone is insufficient resume identity during a fix campaign.
   Evidence: Analyzer fixes can land without changing `CARGO_PKG_VERSION`; a report produced before the fix would otherwise suppress the required rerun. Repository records and completion keys therefore include the Bifrost source HEAD as well as the target repository HEAD and configuration fingerprint.
+
+- Observation: C# fully qualified method-return sites exposed a focus-range asymmetry rather than a partial-declaration or authoritative-scope failure.
+  Evidence: The reduced #698 query received both partial interface declarations and only the consumer candidate, yet initially emitted only the terminal parameter-type identifier. The grammar names method return types `returns`, and the differential had focused `ADDomainServices` inside the qualified return. Recognizing that field and emitting the containing qualified type produced a covering `5642..5712` hit for exact site `5677..5693`.
 
 ## Decision Log
 
@@ -246,3 +250,5 @@ Revision note (2026-07-12): Recorded the all-language preflight and made resume 
 Revision note (2026-07-12): Corrected the #643 diagnosis after debugger capture identified self-initializer binding recursion as the stack overflow, and recorded the exact low-stack/RSS validation of the SQLite and traversal fixes.
 
 Revision note (2026-07-12): Recorded the first complete Rust differential triage and the #644/#645 root fixes, including the macro-token field gap found by exact-site validation.
+
+Revision note (2026-07-12): Recorded #698 and its exact Azure production proof, separating C# qualified-type focus/range semantics from partial target grouping and authoritative candidate routing.

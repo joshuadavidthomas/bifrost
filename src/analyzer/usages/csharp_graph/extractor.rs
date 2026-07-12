@@ -4,8 +4,8 @@ use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, argument_count, binding_scope_node, class_field_receiver_type,
     enclosing_declared_type, expression_resolves_to_type, first_type_child, is_type_reference_node,
     member_name_is_locally_bound, node_text, normalize_type_text, object_initializer_for_label,
-    receiver_targets_owner, reference_type_text, resolves_to_target, resolves_to_target_at,
-    same_node, seed_visible_bindings_at, type_identity_matches,
+    receiver_targets_owner, reference_type_node, reference_type_text, resolves_to_target,
+    resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
     unqualified_member_resolves_to_owner,
 };
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
@@ -129,9 +129,10 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    let reference = reference_type_text(node, ctx.source);
+    let reference_node = reference_type_node(node);
+    let reference = reference_type_text(reference_node, ctx.source);
     if type_reference_resolves_to_target(node, ctx, &reference) {
-        push_hit(node, ctx);
+        push_hit(reference_node, ctx);
     }
 }
 

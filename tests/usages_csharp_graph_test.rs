@@ -1,9 +1,12 @@
 mod common;
 
-use brokk_bifrost::usages::{CSharpUsageGraphStrategy, FuzzyResult, UsageAnalyzer, UsageFinder};
+use brokk_bifrost::usages::{
+    CSharpUsageGraphStrategy, ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder,
+};
 use brokk_bifrost::{CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language};
 use common::{InlineTestProject, call_search_tool_json, csharp_nested_partial_cacheinfo_project};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 fn csharp_analyzer_with_files(
     files: &[(&str, &str)],
@@ -443,6 +446,84 @@ namespace App {
     assert!(
         hits.iter()
             .any(|hit| hit.file == project.file("App/FqnConsumer.cs"))
+    );
+}
+
+#[test]
+fn usage_finder_csharp_finds_fully_qualified_partial_type_in_authoritative_file_scope() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Models/IReplicaSet.First.cs",
+            r#"
+namespace Microsoft.Azure.PowerShell.Cmdlets.ADDomainServices.Models {
+    public partial interface IReplicaSet {
+        string Name { get; }
+    }
+}
+"#,
+        ),
+        (
+            "Models/IReplicaSet.Second.cs",
+            r#"
+namespace Microsoft.Azure.PowerShell.Cmdlets.ADDomainServices.Models {
+    public partial interface IReplicaSet {
+        string Location { get; }
+    }
+}
+"#,
+        ),
+        (
+            "Generated/ReplicaSet.TypeConverter.cs",
+            r#"
+namespace Microsoft.Azure.PowerShell.Cmdlets.ADDomainServices.Models {
+    public sealed class ReplicaSetTypeConverter {
+        private Microsoft.Azure.PowerShell.Cmdlets.ADDomainServices.Models.IReplicaSet Convert(
+            Microsoft.Azure.PowerShell.Cmdlets.ADDomainServices.Models.IReplicaSet value) => value;
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target_fq_name = "Microsoft.Azure.PowerShell.Cmdlets.ADDomainServices.Models.IReplicaSet";
+    let targets: Vec<_> = analyzer
+        .get_all_declarations()
+        .iter()
+        .filter(|unit| unit.kind() == CodeUnitType::Class && unit.fq_name() == target_fq_name)
+        .cloned()
+        .collect();
+    assert_eq!(
+        targets.len(),
+        2,
+        "expected both partial interface declarations"
+    );
+
+    let consumer = project.file("Generated/ReplicaSet.TypeConverter.cs");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(&analyzer, &targets, Some(&provider), 1, 1000);
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect(),
+        "the explicit authoritative scope should contain only the consumer"
+    );
+    let hits = query
+        .result
+        .into_either()
+        .expect("partial interface usage query should resolve");
+
+    let source = consumer.read_to_string().expect("consumer source");
+    let qualified_return = source
+        .find("Microsoft.Azure.PowerShell.Cmdlets.ADDomainServices.Models.IReplicaSet Convert")
+        .expect("fully-qualified return type");
+    let segment_start = qualified_return + "Microsoft.Azure.PowerShell.Cmdlets.".len();
+    let segment_end = segment_start + "ADDomainServices".len();
+    assert!(
+        hits.iter()
+            .any(|hit| hit.start_offset <= segment_start && segment_end <= hit.end_offset),
+        "the full qualified type usage should cover its nonterminal namespace segment {segment_start}..{segment_end}: {hits:#?}"
     );
 }
 

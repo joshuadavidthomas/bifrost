@@ -17,7 +17,8 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - [x] (2026-07-12 20:38Z) Routed C# parent lookup through the per-file structural child map and used the member's persisted namespace directly for extension visibility; all 35 focused definition tests and affected all-feature clippy targets pass.
 - [x] (2026-07-12 20:38Z) Completed the warm 1,000-site/100-target Azure PowerShell smoke in 232.1 seconds: 336 resolved sites, 41 consistent, 3 unproven, 82 missing, and 874 inconclusive; peak RSS was 6,972,940 KiB.
 - [x] (2026-07-12 20:50Z) Committed and pushed parent-lookup fix `b842208a`, then completed the full 10,000-site/1,000-target C# run in 425.0 seconds (7:07 wall) at 6,969,144 KiB peak RSS; the canonical record contains 598 consistent, 40 unproven, 1,339 missing, and 8,023 inconclusive sites.
-- [ ] Triage the 1,339 missing sites from exact production reruns; the first confirmed boundary is fully qualified partial/interface type references under authoritative one-file scope.
+- [x] (2026-07-12 21:11Z) Reduced the first correctness boundary under an authoritative one-file scope, filed #698, fixed C# method-return recognition and qualified-type usage ranges, passed 59 focused tests, affected all-feature clippy, and the complete `nlp,python` test gate, then changed the exact Azure site from missing to consistent in 146.7 seconds.
+- [ ] Triage the remaining C# missing sites from exact production reruns after the #698 checkpoint lands.
 
 ## Surprises & Discoveries
 
@@ -29,6 +30,8 @@ C# definition lookup currently scans every workspace declaration whenever a memb
   Evidence: The sandboxed smoke reached about 8.1 GiB RSS, but GDB showed `build_persisted -> reconcile_file_states -> write_parsed_blob`. The explicitly unsandboxed run committed schema-v10 rows and later entered `run_reference_differential`.
 - Observation: After writable cache population reached the forward batch, extension visibility still queried generic FQN-derived parents once per exact identifier candidate.
   Evidence: The writable 1,000-site/100-target run was stopped after 17m44s at 10,112,644 KiB peak RSS. GDB captured `csharp_extension_method_candidates -> parent_of -> definitions -> declaration_candidate_rows_by_short_name -> SQLite`. Each member already carries its declaring namespace in `CodeUnit::package_name`, and the parsed per-file `children` map carries its exact structural owner.
+- Observation: The dominant partial-interface report was not caused by partial target grouping or authoritative candidate handling.
+  Evidence: The reduced three-file query reached the consumer and produced a terminal `IReplicaSet` hit, but the production focus was the nonterminal `ADDomainServices` segment in a method return type. Tree-sitter C# calls that field `returns`, while `is_type_reference_node` recognized only `type` and `return_type`; after recognizing `returns`, the inverse hit still needed the containing `qualified_name` range to cover the forward-focused segment.
 
 ## Decision Log
 
@@ -38,10 +41,13 @@ C# definition lookup currently scans every workspace declaration whenever a memb
 - Decision: Add a test-only observable counter at the shared all-declaration SQL boundary.
   Rationale: Behavioral tests alone cannot prevent a future implementation from restoring the same asymptotic scan while returning correct answers.
   Date/Author: 2026-07-12 / Codex
+- Decision: Emit C# type-reference hits on the existing AST-derived containing type node rather than the terminal identifier leaf.
+  Rationale: Forward lookup interprets any structured segment of a qualified type through the whole type identity. Using the same qualified/generic/nullable/array node climb for inverse range emission makes those focus positions round-trip without source scanning or a second parser.
+  Date/Author: 2026-07-12 / Codex
 
 ## Outcomes & Retrospective
 
-The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes in 425.0 seconds instead of remaining indefinitely in forward resolution. Its 1,339 actionable sites are a correctness-triage backlog: 1,304 target classes/types, 33 functions, and two fields. An exact rerun of `ReplicaSet.TypeConverter.cs` bytes `5677..5693` reproduced the dominant fully qualified partial-interface type miss in 155.9 seconds. No correctness issue has been filed yet because the reduced authoritative-scope regression and root resolver boundary still need to be pinned.
+The exact identifier index, direct namespace visibility check, and structural C# parent lookup are implemented and pushed through `b842208a`. The full Azure PowerShell N=1 run now completes in 425.0 seconds instead of remaining indefinitely in forward resolution. Its initial 1,339 actionable sites comprised 1,304 target classes/types, 33 functions, and two fields. The first dominant correctness boundary is pinned by #698: C# method returns use the grammar field `returns`, and proven qualified-type references must emit the containing type range rather than only the terminal identifier. The reduced authoritative-scope regression passes, and exact bytes `5677..5693` now classify consistent.
 
 ## Context and Orientation
 
@@ -71,6 +77,8 @@ The schema-v10 migration and query measurements must run outside the Codex files
 
 The full committed-HEAD result is the final line of `.agents/docs/reference-differential/n1.jsonl`, pinned to `b842208a23fa7b620848c96da0db05d617bb848d`. The representative exact type result is `/tmp/csharp-exact-type-replica.jsonl`. The record is marked `bifrost_dirty=true` solely because the shared worktree retains unrelated user/untracked artifacts; the release binary and reported HEAD are pinned to the pushed commit.
 
+The fixed #698 exact result is `/tmp/csharp-exact-type-replica-698-fixed.jsonl`. It completed in 146.7 seconds with one forward-resolved site, one consistent classification, zero missing classifications, and an inverse hit covering bytes `5642..5712` around the requested `5677..5693` focus.
+
 `cargo clippy --all-targets --all-features -- -D warnings` reached an unrelated uncommitted `tests/rust_analyzer_goto_definition.rs` edit and failed on its line 65 `needless_borrow`. That file was left untouched. `cargo clippy --lib --all-features -- -D warnings` and `cargo clippy --test get_definition_test --all-features -- -D warnings` both pass for this change.
 
 ## Interfaces and Dependencies
@@ -78,3 +86,5 @@ The full committed-HEAD result is the final line of `.agents/docs/reference-diff
 The analyzer cache schema stores `CodeUnit::identifier()` in `code_units.identifier` and indexes `(lang, identifier)` for declaration rows. `CSharpAnalyzer::declaration_candidates_by_identifier` exposes the exact structured candidate set to C# definition lookup. No text search or source mini-parser is involved.
 
 Revision note (2026-07-12): Created from the Azure PowerShell production profile before implementation.
+
+Revision note (2026-07-12): Recorded the reduced #698 correctness boundary and exact production validation so the next session can continue C# triage from proven current behavior rather than the pre-fix missing report.

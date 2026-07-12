@@ -835,19 +835,22 @@ pub(super) fn normalize_type_text(reference: &str) -> String {
         .to_string()
 }
 
-pub(in crate::analyzer::usages) fn reference_type_text(node: Node<'_>, source: &str) -> String {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
+pub(in crate::analyzer::usages) fn reference_type_node(mut node: Node<'_>) -> Node<'_> {
+    while let Some(parent) = node.parent() {
         if matches!(
             parent.kind(),
             "qualified_name" | "generic_name" | "nullable_type" | "array_type"
         ) {
-            current = parent;
+            node = parent;
             continue;
         }
         break;
     }
-    normalize_type_text(node_text(current, source))
+    node
+}
+
+pub(in crate::analyzer::usages) fn reference_type_text(node: Node<'_>, source: &str) -> String {
+    normalize_type_text(node_text(reference_type_node(node), source))
 }
 
 pub(in crate::analyzer::usages) fn binding_scope_node(mut node: Node<'_>) -> Node<'_> {
@@ -982,6 +985,9 @@ pub(in crate::analyzer::usages) fn is_type_reference_node(mut node: Node<'_>) ->
             .is_some_and(|type_node| same_node(type_node, node))
             || parent
                 .child_by_field_name("return_type")
+                .is_some_and(|type_node| same_node(type_node, node))
+            || parent
+                .child_by_field_name("returns")
                 .is_some_and(|type_node| same_node(type_node, node))
         {
             return true;
