@@ -29,7 +29,18 @@ fn init_git_repo(root: &Path) -> Repository {
 
 fn commit_all(repo: &Repository, message: &str) {
     let mut index = repo.index().unwrap();
-    index.add_all(["*"], IndexAddOption::DEFAULT, None).unwrap();
+    // Persisted analyzers keep their SQLite database under `.brokk`. A later
+    // fixture commit must not race those live database files into the Git
+    // index; only the workspace sources are part of the test repository.
+    let mut skip_analyzer_cache =
+        |path: &Path, _matched_pathspec: &[u8]| i32::from(path.starts_with(Path::new(".brokk")));
+    index
+        .add_all(
+            ["*"],
+            IndexAddOption::DEFAULT,
+            Some(&mut skip_analyzer_cache),
+        )
+        .unwrap();
     index.write().unwrap();
     let tree_oid = index.write_tree().unwrap();
     let tree = repo.find_tree(tree_oid).unwrap();

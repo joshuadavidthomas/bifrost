@@ -18,7 +18,8 @@ Bifrost currently resolves editor definition and hover requests only when the ta
 - [x] (2026-07-12 19:40Z) Added all-language, shadowing, callable-form, declaration-site, hover, tool-contract, and overlay regressions; the focused suites pass.
 - [x] (2026-07-12 21:30Z) Ran focused definition, hover, click-around, issue-reproduction, search-tool, and overlay suites; all pass.
 - [x] (2026-07-12 22:10Z) Ran `cargo fmt`, warning-free all-target/all-feature clippy, the complete `nlp,python` Rust suite, and 38 Python tests; all pass.
-- [ ] Push the completed branch and open the pull request linked to issue #699.
+- [x] (2026-07-12 22:20Z) Pushed the completed branch and opened pull request #702 linked to issue #699.
+- [x] (2026-07-12 23:05Z) Merged the current `master` base after Linux CI exposed a persistence-fixture race, excluded the live `.brokk` cache from fixture commits, and reran the affected, definition, parameter, formatting, and clippy gates successfully.
 
 ## Surprises & Discoveries
 
@@ -46,6 +47,9 @@ Bifrost currently resolves editor definition and hover requests only when the ta
 - Observation: The worktree's default target directory exhausted `/tmp` during the full all-feature build, and sharing the original checkout's target directory reused stale test artifacts.
   Evidence: the final gates use the isolated `CARGO_TARGET_DIR=/home/jonathan/Projects/bifrost/target/issue699`; the complete run exits successfully without touching the original dirty checkout.
 
+- Observation: Both Linux CI targets failed in `csharp_package_existence_ignores_stale_complete_blobs` because its second broad fixture commit could sweep the live persisted-analyzer SQLite files under `.brokk` into the Git index. macOS, Windows, and local runs happened not to hit the race.
+  Evidence: both failed logs reported libgit2 `failed to read file into stream` from `commit_all`; filtering `.brokk` in that helper makes all eight persistence tests pass on the merged base while the parameter and 427-case definition suites remain green.
+
 ## Decision Log
 
 - Decision: Resolve parameters from the current parsed source on every query instead of persisting them.
@@ -62,6 +66,10 @@ Bifrost currently resolves editor definition and hover requests only when the ta
 
 - Decision: Keep indexed candidates' existing JSON `fqn`, add a truthful `name`, and omit `fqn` for lexical candidates.
   Rationale: A parameter has no honest workspace FQN. The tool response should state that directly rather than fabricate an identifier.
+  Date/Author: 2026-07-12 / Codex
+
+- Decision: Exclude `.brokk` through the persistence test's Git-index callback rather than retrying CI or adding timing workarounds.
+  Rationale: Analyzer cache files are not fixture source, and a live SQLite database must never be captured by the test repository's broad source commit.
   Date/Author: 2026-07-12 / Codex
 
 ## Outcomes & Retrospective
@@ -127,3 +135,5 @@ Define a lexical result with identifier, `DeclarationKind`, exact name `Range`, 
 Use only existing tree-sitter grammars and analyzer helpers. Do not add dependencies, SQL tables, migrations, regex fallbacks, or hand-written source parsers.
 
 Revision note (2026-07-12): Marked implementation and validation complete, recorded the precedence regressions found by the full suite and the isolated-target recovery, and replaced the provisional outcome with final evidence before delivery.
+
+Revision note (2026-07-12, CI follow-up): Recorded the Linux persistence-fixture race found after PR creation, the structured exclusion of `.brokk` from fixture commits, and successful validation on the current merged base.
