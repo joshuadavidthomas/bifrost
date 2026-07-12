@@ -5562,6 +5562,71 @@ fn rust_nonterminal_scoped_focus_does_not_retry_terminal_or_flat_names() {
 }
 
 #[test]
+fn rust_focused_prefix_candidates_stay_within_rust() {
+    let rust_source = r#"struct IndexedOwner;
+impl IndexedOwner {
+    fn new() -> Self { Self }
+}
+
+fn demo() {
+    let _external = String::new();
+    let _indexed = IndexedOwner::new();
+}
+"#;
+    let cpp_source = r#"struct String {};
+String make_string() { return String{}; }
+"#;
+    let project = InlineTestProject::new()
+        .file("lib.rs", rust_source)
+        .file("foreign.cpp", cpp_source)
+        .build();
+
+    let cpp_use = cpp_source.find("String make_string").unwrap();
+    let value = lookup(
+        project.root(),
+        &location_reference("foreign.cpp", cpp_source, cpp_use),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "String", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "foreign.cpp", "{value}");
+
+    let string_use = rust_source.find("String::new()").unwrap();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", rust_source, string_use),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(result["definitions"][0].is_null(), "{value}");
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "demo",
+                "context": "let _external = String::new();",
+                "target": "String"
+            }]
+        })
+        .to_string(),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(result["definitions"][0].is_null(), "{value}");
+
+    let indexed_use = rust_source.find("IndexedOwner::new()").unwrap();
+    let value = lookup(
+        project.root(),
+        &location_reference("lib.rs", rust_source, indexed_use),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "IndexedOwner", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "lib.rs", "{value}");
+}
+
+#[test]
 fn line_column_uses_character_columns_not_byte_offsets() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

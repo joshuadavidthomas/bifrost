@@ -614,7 +614,11 @@ fn rust_focused_scoped_prefix_outcome(
 
     let resolved_fqn = rust_scoped_prefix_fqn(rust, file, refs, prefix, source);
     if let Some(fqn) = resolved_fqn.as_deref() {
-        let candidates = support.fqn(fqn);
+        let candidates: Vec<_> = support
+            .fqn(fqn)
+            .into_iter()
+            .filter(|candidate| language_for_file(candidate.source()) == Language::Rust)
+            .collect();
         if !candidates.is_empty() {
             return Some(candidates_outcome(candidates));
         }
