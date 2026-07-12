@@ -1,7 +1,7 @@
 use crate::analyzer::usages::scala_graph::syntax::{parenthesized_arity, scala_import_path};
 use crate::analyzer::{
-    CodeUnit, DefinitionLookupIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo, ProjectFile,
-    ScalaAnalyzer, TypeHierarchyProvider,
+    CallableArity, CodeUnit, DefinitionLookupIndex, IAnalyzer, ImportAnalysisProvider, ImportInfo,
+    ProjectFile, ScalaAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -27,6 +27,7 @@ pub(super) struct TargetSpec {
     family_owner_fq_names: HashSet<String>,
     receiver_owner_fq_names: HashSet<String>,
     pub(super) arity: Option<usize>,
+    pub(super) callable_arity: Option<CallableArity>,
     pub(super) is_extension_method: bool,
     pub(super) unapplied_reference_is_unambiguous: bool,
 }
@@ -53,6 +54,7 @@ impl TargetSpec {
                 )]),
                 owner_name: Some(owner_name),
                 arity: None,
+                callable_arity: None,
                 is_extension_method: false,
                 unapplied_reference_is_unambiguous: false,
             });
@@ -77,6 +79,11 @@ impl TargetSpec {
             .signature()
             .map(str::to_string)
             .or_else(|| scala.signatures(target).into_iter().next());
+        let callable_arity = scala
+            .signature_metadata(target)
+            .into_iter()
+            .find_map(|metadata| metadata.callable_arity())
+            .or_else(|| arity.map(CallableArity::exact));
         let is_extension_method = signature
             .as_deref()
             .is_some_and(|signature| signature.starts_with("extension "));
@@ -123,6 +130,7 @@ impl TargetSpec {
             family_owner_fq_names,
             receiver_owner_fq_names,
             arity,
+            callable_arity,
             is_extension_method,
             unapplied_reference_is_unambiguous,
         })
@@ -564,6 +572,21 @@ pub(in crate::analyzer::usages) fn method_signature_arity(
             .into_iter()
             .find_map(|signature| signature_arity(&signature))
     })
+}
+
+pub(in crate::analyzer::usages) fn method_call_arity_applies(
+    scala: &ScalaAnalyzer,
+    unit: &CodeUnit,
+    call_arity: usize,
+) -> bool {
+    let callable_arity = scala
+        .signature_metadata(unit)
+        .into_iter()
+        .find_map(|metadata| metadata.callable_arity());
+    callable_arity.map_or_else(
+        || method_signature_arity(scala, unit).is_some_and(|arity| arity == call_arity),
+        |arity| arity.accepts(call_arity),
+    )
 }
 
 fn owner_of(scala: &ScalaAnalyzer, target: &CodeUnit) -> Option<CodeUnit> {

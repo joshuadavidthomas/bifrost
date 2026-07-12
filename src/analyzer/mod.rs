@@ -71,12 +71,12 @@ pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
 pub(crate) use model::SemanticDiagnostic;
 pub use model::{
-    CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
-    DeclarationInfo, DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo,
-    Language, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata,
-    ParseError, ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
-    SignatureMetadata, SummaryFileProjection, TestAssertionSmell, TestAssertionWeights,
-    metrics_from_declarations,
+    CallableArity, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType,
+    CommentDensityStats, DeclarationInfo, DeclarationKind, ExceptionHandlingSmell,
+    ExceptionSmellWeights, ImportInfo, Language, MaintainabilitySizeSmell,
+    MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError, ParseErrorKind, ProjectFile,
+    Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, SummaryFileProjection,
+    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};

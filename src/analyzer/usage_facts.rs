@@ -1,9 +1,10 @@
-use crate::analyzer::{CodeUnit, DefinitionLookupIndex, IAnalyzer, LanguageAdapter};
+use crate::analyzer::{CallableArity, CodeUnit, DefinitionLookupIndex, IAnalyzer, LanguageAdapter};
 use crate::hash::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CallableFacts {
     pub(crate) arity: Option<usize>,
+    pub(crate) callable_arity: Option<CallableArity>,
     pub(crate) return_type_fqn: Option<String>,
     pub(crate) is_function: bool,
 }
@@ -114,6 +115,9 @@ impl UsageFactsIndex {
                 arity: signature
                     .as_deref()
                     .and_then(|signature| extract.arity_of(signature, metadata.as_ref())),
+                callable_arity: metadata
+                    .as_ref()
+                    .and_then(crate::analyzer::SignatureMetadata::callable_arity),
                 return_type_fqn,
                 is_function: unit.is_function(),
             };

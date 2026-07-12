@@ -2687,6 +2687,55 @@ class UnrelatedChild extends UnrelatedBase {
 }
 
 #[test]
+fn scan_usages_by_reference_accepts_scala_default_and_repeated_arity() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Api.scala",
+            r#"
+package app
+
+class Base {
+  def doTest(text: String, result: String, settings: String = "default"): Unit = ()
+  def collect(head: String, rest: String*): Unit = ()
+}
+class Child extends Base {
+  doTest("text", "result")
+  doTest()
+  doTest("one", "two", "three", "four")
+  collect("one")
+  collect("one", "two", "three")
+}
+object SbtScalaSdkData {
+  def apply(version: Option[String], language: String = "Scala", jars: Int = 0, docs: Int = 0, sources: Int = 0): String = "sdk"
+}
+object Use {
+  val sdk = SbtScalaSdkData(Some("3.3"))
+  val missing = SbtScalaSdkData()
+  val excessive = SbtScalaSdkData(Some("3.3"), "Scala", 1, 2, 3, 4)
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (symbol, expected_hits) in [
+        ("app.Base.doTest", 1),
+        ("app.Base.collect", 2),
+        ("app.SbtScalaSdkData.apply", 1),
+    ] {
+        let args = serde_json::json!({"symbols": [symbol], "include_tests": true}).to_string();
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args)
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let usage = only_result(&value);
+        assert_eq!(usage["status"], "found", "{value}");
+        assert_eq!(usage["total_hits"], expected_hits, "{value}");
+    }
+}
+
+#[test]
 fn scan_usages_by_reference_finds_scala_companion_apply_and_infix_calls() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -2834,6 +2883,52 @@ object Use {
             "expected {expected:?}: {value}"
         );
     }
+}
+
+#[test]
+fn scan_usages_by_reference_resolves_scala_call_initializer_receiver() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Console.scala",
+            r#"
+package app
+
+class Editor
+class ScalaLanguageConsole { def textSent(value: String): Unit = () }
+class OtherConsole { def textSent(value: String): Unit = () }
+object ScalaConsoleInfo { def getConsole(editor: Editor): ScalaLanguageConsole = new ScalaLanguageConsole }
+object OtherInfo { def getConsole(editor: Editor): OtherConsole = new OtherConsole }
+
+object Action {
+  def run(editor: Editor): Unit = {
+    val console = ScalaConsoleInfo.getConsole(editor)
+    console.textSent("expected")
+    val decoy = OtherInfo.getConsole(editor)
+    decoy.textSent("other")
+  }
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["app.ScalaLanguageConsole.textSent"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+
+    assert_eq!(usage["status"], "found", "{value}");
+    assert_eq!(usage["total_hits"], 1, "{value}");
+    assert!(
+        usage["files"][0]["hits"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("console.textSent(\"expected\")")),
+        "{value}"
+    );
 }
 
 #[test]

@@ -6,9 +6,9 @@ use crate::analyzer::usages::scala_graph::hits::{
     add_hit, add_import_hit, add_override_declaration_hit,
 };
 use crate::analyzer::usages::scala_graph::resolver::{
-    TargetKind, TargetSpec, Visibility, method_signature_arity, package_name_of,
-    scala_builtin_type_name, scala_extension_receiver_matches_resolved, scala_literal_type_name,
-    scala_normalized_fq_name, scala_resolve_declared_type,
+    TargetKind, TargetSpec, Visibility, method_call_arity_applies, method_signature_arity,
+    package_name_of, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
+    scala_literal_type_name, scala_normalized_fq_name, scala_resolve_declared_type,
 };
 use crate::analyzer::usages::scala_graph::syntax::{
     call_arity_for_reference, has_ancestor_kind, has_member_qualifier, infix_receiver_for_operator,
@@ -440,16 +440,59 @@ fn seed_value_definition(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let type_name = node
         .child_by_field_name("type")
         .map(|type_node| node_text(type_node, ctx.source).trim());
-    let value_name = node
-        .child_by_field_name("value")
-        .and_then(|value_node| constructor_type_name(node_text(value_node, ctx.source)));
-    if type_name.is_none() && value_name.is_none() {
+    let value = node.child_by_field_name("value");
+    let value_name =
+        value.and_then(|value_node| constructor_type_name(node_text(value_node, ctx.source)));
+    let resolved_value_owner = value.and_then(|value| call_initializer_return_owner(value, ctx));
+    if type_name.is_none() && value_name.is_none() && resolved_value_owner.is_none() {
         seed_value_definition_from_text(node_text(node, ctx.source), ctx);
         return;
     }
     for name in pattern_names(pattern, ctx.source) {
-        seed_or_shadow_typed_symbol(name, type_name, value_name, ctx);
+        if let Some(owner) = resolved_value_owner.as_deref() {
+            ctx.bindings
+                .seed_symbol(name.to_string(), owner.to_string());
+        } else {
+            seed_or_shadow_typed_symbol(name, type_name, value_name, ctx);
+        }
     }
+}
+
+fn call_initializer_return_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    let (owner_node, member_node) = match function.kind() {
+        "field_expression" => (
+            function.child_by_field_name("value")?,
+            function.child_by_field_name("field")?,
+        ),
+        _ => return None,
+    };
+    if !matches!(owner_node.kind(), "identifier" | "type_identifier") {
+        return None;
+    }
+    let owner_name = node_text(owner_node, ctx.source).trim();
+    let member_name = node_text(member_node, ctx.source).trim();
+    if owner_name.is_empty() || member_name.is_empty() {
+        return None;
+    }
+    let owner = scala_resolve_declared_type(ctx.scala, ctx.file, ctx.file_package, owner_name)?;
+    let member_fqn = format!("{owner}.{member_name}");
+    let call_arity = call_arity_for_reference(member_node);
+    let has_applicable_member = ctx.scala.definitions(&member_fqn).any(|unit| {
+        unit.is_function()
+            && call_arity.is_none_or(|arity| method_call_arity_applies(ctx.scala, &unit, arity))
+    });
+    has_applicable_member
+        .then(|| {
+            ctx.scala
+                .usage_facts_index_shared()
+                .callable_return_type(&member_fqn)
+                .map(str::to_string)
+        })
+        .flatten()
 }
 
 fn seed_value_definition_from_text(text: &str, ctx: &mut ScanCtx<'_>) {
@@ -630,6 +673,12 @@ fn type_reference_is_locally_bound(text: &str, ctx: &ScanCtx<'_>) -> bool {
 
 fn seed_value_binding_identifier(node: Node<'_>, text: &str, ctx: &mut ScanCtx<'_>) -> bool {
     if is_direct_owner_field_declaration_identifier(node, ctx) {
+        return true;
+    }
+    if node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "val_definition" | "var_definition")
+            && parent.child_by_field_name("pattern") == Some(node)
+    }) {
         return true;
     }
     let before = ctx.source[..node.start_byte()].trim_end();
@@ -878,9 +927,7 @@ fn receiver_member_applies(unit: &CodeUnit, call_arity: Option<usize>, ctx: &Sca
         return false;
     }
     match call_arity {
-        Some(call_arity) => {
-            method_signature_arity(ctx.scala, unit).is_some_and(|arity| arity == call_arity)
-        }
+        Some(call_arity) => method_call_arity_applies(ctx.scala, unit, call_arity),
         None => method_signature_arity(ctx.scala, unit).is_none_or(|arity| arity == 0),
     }
 }
@@ -950,12 +997,17 @@ fn member_call_arity_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     if ctx.spec.kind != TargetKind::Method {
         return true;
     }
-    let Some(target_arity) = ctx.spec.arity else {
-        return true;
-    };
     match call_arity_for_reference(node) {
-        Some(call_arity) => call_arity == target_arity,
-        None => target_arity == 0 || ctx.spec.unapplied_reference_is_unambiguous,
+        Some(call_arity) => ctx
+            .spec
+            .callable_arity
+            .is_none_or(|arity| arity.accepts(call_arity)),
+        None => {
+            ctx.spec
+                .callable_arity
+                .is_none_or(|arity| arity.total() == 0)
+                || ctx.spec.unapplied_reference_is_unambiguous
+        }
     }
 }
 

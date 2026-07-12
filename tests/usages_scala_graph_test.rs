@@ -177,6 +177,91 @@ class BinaryChild extends BinaryBase {
 }
 
 #[test]
+fn scala_callable_arity_accepts_defaults_and_repeated_parameters() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "app/Api.scala",
+            r#"
+package app
+
+class Base {
+  def doTest(text: String, result: String, settings: String = "default"): Unit = ()
+  def collect(head: String, rest: String*): Unit = ()
+}
+
+class Child extends Base {
+  doTest("text", "result")
+  doTest()
+  doTest("one", "two", "three", "four")
+  collect("one")
+  collect("one", "two", "three")
+}
+
+object SbtScalaSdkData {
+  def apply(version: Option[String], language: String = "Scala", jars: Int = 0, docs: Int = 0, sources: Int = 0): String = "sdk"
+}
+
+object Use {
+  val sdk = SbtScalaSdkData(Some("3.3"))
+  val missing = SbtScalaSdkData()
+  val excessive = SbtScalaSdkData(Some("3.3"), "Scala", 1, 2, 3, 4)
+}
+"#,
+        ),
+        (
+            "other/Api.scala",
+            r#"
+package other
+
+class Base {
+  def doTest(text: String, result: String): Unit = ()
+  def collect(head: String, rest: String*): Unit = ()
+}
+class Child extends Base {
+  doTest("other", "result")
+  collect("other")
+}
+object SbtScalaSdkData {
+  def apply(version: Option[String], language: String = "Other"): String = "sdk"
+}
+object Use { val sdk = SbtScalaSdkData(Some("other")) }
+"#,
+        ),
+    ]);
+
+    for (target, expected_hits) in [
+        ("app.Base.doTest", vec!["doTest(\"text\", \"result\")"]),
+        (
+            "app.Base.collect",
+            vec!["collect(\"one\")", "collect(\"one\", \"two\", \"three\")"],
+        ),
+        (
+            "app.SbtScalaSdkData$.apply",
+            vec!["SbtScalaSdkData(Some(\"3.3\"))"],
+        ),
+    ] {
+        let target = definition(&analyzer, target);
+        let hits =
+            hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+        for expected in expected_hits {
+            assert_hit_contains(&hits, expected);
+        }
+        assert_no_hit_contains(&hits, "doTest()");
+        assert_no_hit_contains(&hits, "doTest(\"one\", \"two\", \"three\", \"four\")");
+        assert_no_hit_contains(&hits, "SbtScalaSdkData()");
+        assert_no_hit_contains(
+            &hits,
+            "SbtScalaSdkData(Some(\"3.3\"), \"Scala\", 1, 2, 3, 4)",
+        );
+        assert!(
+            hits.iter()
+                .all(|hit| hit.file.rel_path() != "other/Api.scala"),
+            "unrelated callable owner leaked for {target:?}: {hits:#?}"
+        );
+    }
+}
+
+#[test]
 fn scala_companion_apply_and_infix_usages_preserve_exact_targets() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (
@@ -401,6 +486,42 @@ object Use {
             "unrelated same-name owner leaked for {target:?}: {hits:#?}"
         );
     }
+}
+
+#[test]
+fn scala_qualified_call_initializer_seeds_local_receiver_type() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Console.scala",
+        r#"
+package app
+
+class Editor
+class ScalaLanguageConsole { def textSent(value: String): Unit = () }
+class OtherConsole { def textSent(value: String): Unit = () }
+
+object ScalaConsoleInfo {
+  def getConsole(editor: Editor): ScalaLanguageConsole = new ScalaLanguageConsole
+}
+object OtherInfo {
+  def getConsole(editor: Editor): OtherConsole = new OtherConsole
+}
+
+object Action {
+  def run(editor: Editor): Unit = {
+    val console = ScalaConsoleInfo.getConsole(editor)
+    console.textSent("expected")
+    val decoy = OtherInfo.getConsole(editor)
+    decoy.textSent("other")
+  }
+}
+"#,
+    )]);
+    let target = definition(&analyzer, "app.ScalaLanguageConsole.textSent");
+    let hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+
+    assert_hit_contains(&hits, "console.textSent(\"expected\")");
+    assert_no_hit_contains(&hits, "decoy.textSent");
 }
 
 #[test]

@@ -55,9 +55,12 @@ impl LanguageAdapter for ScalaAdapter {
     fn callable_arity(
         &self,
         signature: &str,
-        _metadata: Option<&SignatureMetadata>,
+        metadata: Option<&SignatureMetadata>,
     ) -> Option<usize> {
-        scala_member_signature_arity(signature)
+        metadata
+            .and_then(SignatureMetadata::callable_arity)
+            .map(|arity| arity.total())
+            .or_else(|| scala_member_signature_arity(signature))
     }
 
     fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {

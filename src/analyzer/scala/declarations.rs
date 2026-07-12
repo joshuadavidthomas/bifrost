@@ -1,4 +1,6 @@
-use crate::analyzer::{CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata};
+use crate::analyzer::{
+    CallableArity, CodeUnit, CodeUnitType, ParameterMetadata, ProjectFile, SignatureMetadata,
+};
 use tree_sitter::{Node, Tree};
 
 use super::imports::parse_scala_import_infos;
@@ -717,7 +719,47 @@ fn scala_signature_metadata_for_parameter_nodes(
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters)
+    let mut metadata = SignatureMetadata::new(signature, parameters);
+    if let Some(arity) = scala_callable_arity(parameter_nodes.first().copied()) {
+        metadata = metadata.with_callable_arity(arity);
+    }
+    metadata
+}
+
+fn scala_callable_arity(parameters: Option<Node<'_>>) -> Option<CallableArity> {
+    let Some(parameters) = parameters else {
+        return Some(CallableArity::exact(0));
+    };
+    let mut total = 0usize;
+    let mut required = 0usize;
+    let mut repeated = false;
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if !matches!(parameter.kind(), "parameter" | "class_parameter") {
+            continue;
+        }
+        total += 1;
+        let is_repeated = parameter
+            .child_by_field_name("type")
+            .is_some_and(contains_repeated_parameter_type);
+        repeated |= is_repeated;
+        if parameter.child_by_field_name("default_value").is_none() && !is_repeated {
+            required += 1;
+        }
+    }
+    Some(CallableArity::new(required, total, repeated))
+}
+
+fn contains_repeated_parameter_type(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "repeated_parameter_type" {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
 }
 
 fn scala_parameter_label_nodes<'tree>(parameter_nodes: &[Node<'tree>]) -> Vec<Node<'tree>> {

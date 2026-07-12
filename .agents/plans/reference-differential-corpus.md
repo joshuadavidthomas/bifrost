@@ -44,6 +44,7 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-13 04:55Z) Implemented and symbols-tested #661 by extending Scala hierarchy proof to class fields and resolving named-argument labels through their structured invocation owners; the remaining selection/stable/type roles are pinned with exact-owner regressions.
 - [x] (2026-07-13 05:05Z) Implemented and symbols-tested #658 with one exact associated-item resolver across normal and macro token-tree paths, preserving call/value roles, requested identity, import exclusion, and multi-segment owners.
 - [x] (2026-07-13 05:20Z) Reopened #659 after its exact corpus site remained missing, then added structured concrete-receiver-to-trait-impl dispatch proof while leaving generic and trait-object receivers unproven.
+- [x] (2026-07-13 06:20Z) Reopened #661-#663 after synthetic symbols regressions passed but their exact Scala corpus sites remained missing; generalized callable matching to persisted required/total/repeated arity and propagated structured qualified-call return types into local receiver bindings. Exact public-symbol probes now pass for inherited default arguments, companion `apply` defaults, and call-result member dispatch.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.

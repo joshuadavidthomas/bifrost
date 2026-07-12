@@ -220,6 +220,9 @@ impl ProjectTypes {
                         self.facts
                             .fact_for_declaration(method)
                             .and_then(|facts| facts.arity),
+                        self.facts
+                            .fact_for_declaration(method)
+                            .and_then(|facts| facts.callable_arity),
                         call_arity,
                     )
             })
@@ -268,6 +271,9 @@ impl ProjectTypes {
                         self.facts
                             .fact_for_declaration(method)
                             .and_then(|facts| facts.arity),
+                        self.facts
+                            .fact_for_declaration(method)
+                            .and_then(|facts| facts.callable_arity),
                         call_arity,
                     )
             })
@@ -639,13 +645,16 @@ fn method_arities_compatible(method: Option<usize>, ancestor: Option<usize>) -> 
     method.is_none() || ancestor.is_none() || method == ancestor
 }
 
-fn method_call_arity_matches(method_arity: Option<usize>, call_arity: Option<usize>) -> bool {
-    let Some(method_arity) = method_arity else {
-        return call_arity.is_none();
-    };
+fn method_call_arity_matches(
+    method_arity: Option<usize>,
+    callable_arity: Option<crate::analyzer::CallableArity>,
+    call_arity: Option<usize>,
+) -> bool {
     match call_arity {
-        Some(call_arity) => call_arity == method_arity,
-        None => method_arity == 0,
+        Some(call_arity) => callable_arity
+            .map(|arity| arity.accepts(call_arity))
+            .unwrap_or_else(|| method_arity.is_some_and(|arity| arity == call_arity)),
+        None => method_arity.is_none_or(|arity| arity == 0),
     }
 }
 

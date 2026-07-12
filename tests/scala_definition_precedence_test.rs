@@ -137,3 +137,42 @@ fn scala_term_namespace_resolves_explicitly_imported_stable_object() {
         "{value}"
     );
 }
+
+#[test]
+fn scala_location_definition_accepts_inherited_default_argument_call() {
+    let source = r#"package app
+
+class Base {
+  def doTest(text: String, result: String, settings: String = "default"): Unit = ()
+}
+class Child extends Base {
+  doTest("text", "result")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Api.scala", source)
+        .build();
+    let start = source.rfind("doTest").expect("inherited call");
+    let prefix = &source[..start];
+    let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix, |(_, current)| current)
+        .chars()
+        .count()
+        + 1;
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({
+            "references": [{"path": "app/Api.scala", "line": line, "column": column}]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "app.Base.doTest",
+        "{value}"
+    );
+}

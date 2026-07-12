@@ -1,6 +1,6 @@
 use super::*;
-use crate::analyzer::usages::scala_graph::method_signature_arity;
 use crate::analyzer::usages::scala_graph::syntax::call_arity_for_reference;
+use crate::analyzer::usages::scala_graph::{method_call_arity_applies, method_signature_arity};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 
 pub(crate) enum ScalaTypeLookupResolution {
@@ -946,9 +946,7 @@ fn scala_member_unit_applies(
         return false;
     }
     match call_arity {
-        Some(call_arity) => {
-            method_signature_arity(scala, unit).is_some_and(|arity| arity == call_arity)
-        }
+        Some(call_arity) => method_call_arity_applies(scala, unit, call_arity),
         None => method_signature_arity(scala, unit).is_none_or(|arity| arity == 0),
     }
 }

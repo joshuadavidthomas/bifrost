@@ -188,6 +188,35 @@ pub struct ParameterMetadata {
     end_byte: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CallableArity {
+    required: usize,
+    total: usize,
+    repeated: bool,
+}
+
+impl CallableArity {
+    pub fn new(required: usize, total: usize, repeated: bool) -> Self {
+        Self {
+            required,
+            total,
+            repeated,
+        }
+    }
+
+    pub fn exact(arity: usize) -> Self {
+        Self::new(arity, arity, false)
+    }
+
+    pub fn accepts(self, arity: usize) -> bool {
+        arity >= self.required && (self.repeated || arity <= self.total)
+    }
+
+    pub fn total(self) -> usize {
+        self.total
+    }
+}
+
 impl ParameterMetadata {
     pub fn new(label: impl Into<String>, start_byte: usize, end_byte: usize) -> Self {
         Self {
@@ -218,6 +247,8 @@ pub struct SignatureMetadata {
     return_type_text: Option<String>,
     #[serde(default)]
     declaration_only: bool,
+    #[serde(default)]
+    callable_arity: Option<CallableArity>,
 }
 
 impl SignatureMetadata {
@@ -227,6 +258,7 @@ impl SignatureMetadata {
             parameters,
             return_type_text: None,
             declaration_only: false,
+            callable_arity: None,
         }
     }
 
@@ -263,6 +295,7 @@ impl SignatureMetadata {
             parameters,
             return_type_text: None,
             declaration_only: false,
+            callable_arity: None,
         }
     }
 
@@ -276,6 +309,11 @@ impl SignatureMetadata {
 
     pub fn with_declaration_only(mut self, declaration_only: bool) -> Self {
         self.declaration_only = declaration_only;
+        self
+    }
+
+    pub fn with_callable_arity(mut self, callable_arity: CallableArity) -> Self {
+        self.callable_arity = Some(callable_arity);
         self
     }
 
@@ -293,6 +331,10 @@ impl SignatureMetadata {
 
     pub fn is_declaration_only(&self) -> bool {
         self.declaration_only
+    }
+
+    pub fn callable_arity(&self) -> Option<CallableArity> {
+        self.callable_arity
     }
 }
 

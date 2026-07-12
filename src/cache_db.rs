@@ -17,7 +17,7 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 pub const LATEST_SCHEMA_VERSION: i64 = 1;
 const PRE_RELEASE_UNIFIED_SCHEMA_VERSION: i64 = 6;
 const LATEST_SEMANTIC_SCHEMA_VERSION: i64 = 1;
-const LATEST_ANALYZER_SCHEMA_VERSION: i64 = 7;
+const LATEST_ANALYZER_SCHEMA_VERSION: i64 = 8;
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
 
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
@@ -808,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_namespace_rebuild_preserves_semantic_tables() {
+    fn callable_metadata_upgrade_rebuilds_analyzer_and_preserves_semantic_tables() {
         let mut conn = Connection::open_in_memory().unwrap();
         configure_connection(&mut conn).unwrap();
         migrate(&mut conn).unwrap();
@@ -823,8 +823,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "UPDATE cache_state SET analyzer_schema_version = 0 WHERE id = 1",
-            [],
+            "UPDATE cache_state SET analyzer_schema_version = ?1 WHERE id = 1",
+            [LATEST_ANALYZER_SCHEMA_VERSION - 1],
         )
         .unwrap();
 
@@ -836,8 +836,10 @@ mod tests {
         let analyzer_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .unwrap();
+        let (_, analyzer_version) = namespace_schema_versions(&conn).unwrap();
         assert_eq!(semantic_count, 1);
         assert_eq!(analyzer_count, 0);
+        assert_eq!(analyzer_version, LATEST_ANALYZER_SCHEMA_VERSION);
     }
 
     #[test]
