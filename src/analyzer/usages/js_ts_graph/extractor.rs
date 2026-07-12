@@ -31,6 +31,8 @@ use std::sync::Mutex;
 use tree_sitter::{Node, Parser, Tree};
 
 const TARGET_BINDING: &str = "__target__";
+const TARGET_VALUE_BINDING: &str = "__target_value__";
+const TARGET_OBJECT_BINDING: &str = "__target_object__";
 
 pub(super) fn scan_files_for_seeds(
     analyzer: &dyn IAnalyzer,
@@ -191,16 +193,16 @@ pub(super) struct ScanCtx<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalBinding {
     Other,
+    KnownUnrelated,
     TargetReceiver,
 }
 
 impl ScanCtx<'_> {
     fn binds_target(&self, ident: &str) -> bool {
         let local_resolution = self.binding_engine.resolve_symbol(ident);
-        if local_resolution
-            .as_precise()
-            .is_some_and(|targets| targets.contains(TARGET_BINDING))
-        {
+        if local_resolution.as_precise().is_some_and(|targets| {
+            targets.contains(TARGET_BINDING) || targets.contains(TARGET_VALUE_BINDING)
+        }) {
             return true;
         }
         if self.binding_engine.is_shadowed(ident) {
@@ -217,6 +219,20 @@ impl ScanCtx<'_> {
         // worth reporting (covers `BaseClass.foo()` and `extends BaseClass` written in
         // the same file).
         self.target_self_file && ident == self.target_short
+    }
+
+    fn binds_target_value(&self, ident: &str) -> bool {
+        self.binding_engine
+            .resolve_symbol(ident)
+            .as_precise()
+            .is_some_and(|targets| targets.contains(TARGET_VALUE_BINDING))
+    }
+
+    fn binds_target_object(&self, ident: &str) -> bool {
+        self.binding_engine
+            .resolve_symbol(ident)
+            .as_precise()
+            .is_some_and(|targets| targets.contains(TARGET_OBJECT_BINDING))
     }
 }
 
@@ -357,18 +373,42 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
+    let Some(value_node) = node.child_by_field_name("value") else {
+        register_pattern_bindings(name_node, ctx);
+        return;
+    };
+
+    if name_node.kind() == "object_pattern" {
+        register_pattern_bindings(name_node, ctx);
+        if expression_carries_target_object(value_node, ctx) {
+            seed_target_destructuring_bindings(name_node, ctx);
+        }
+        return;
+    }
+
     let lhs = slice(name_node, ctx.source);
     if lhs.is_empty() {
         return;
     }
-
-    if !is_target_declaration_binding(name_node, lhs, ctx) {
-        ctx.binding_engine.declare_shadow(lhs.to_string());
-    }
-
-    let Some(value_node) = node.child_by_field_name("value") else {
+    if is_target_declaration_binding(name_node, lhs, ctx) {
+        if ctx.target_member.is_some_and(|member| member == lhs) {
+            ctx.binding_engine
+                .seed_symbol(lhs.to_string(), TARGET_VALUE_BINDING);
+        }
         return;
-    };
+    }
+    ctx.binding_engine.declare_shadow(lhs.to_string());
+
+    if expression_carries_target_object(value_node, ctx) {
+        ctx.binding_engine
+            .seed_symbol(lhs.to_string(), TARGET_OBJECT_BINDING);
+        return;
+    }
+    if expression_resolves_to_target_value(value_node, ctx) {
+        ctx.binding_engine
+            .seed_symbol(lhs.to_string(), TARGET_VALUE_BINDING);
+        return;
+    }
     let rhs = match value_node.kind() {
         "identifier" | "type_identifier" => slice(value_node, ctx.source),
         _ => return,
@@ -377,6 +417,69 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     ctx.binding_engine.alias_symbol(lhs.to_string(), rhs);
+}
+
+fn seed_target_destructuring_bindings(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some(target_member) = ctx.target_member else {
+        return;
+    };
+    let mut cursor = pattern.walk();
+    for property in pattern.named_children(&mut cursor) {
+        let (key, local) = match property.kind() {
+            "shorthand_property_identifier_pattern" => {
+                let name = slice(property, ctx.source);
+                (name, name)
+            }
+            "pair_pattern" => {
+                let Some(key_node) = property.child_by_field_name("key") else {
+                    continue;
+                };
+                let Some(value_node) = property.child_by_field_name("value") else {
+                    continue;
+                };
+                (slice(key_node, ctx.source), slice(value_node, ctx.source))
+            }
+            _ => continue,
+        };
+        if key == target_member && !local.is_empty() {
+            ctx.binding_engine
+                .seed_symbol(local.to_string(), TARGET_VALUE_BINDING);
+            let key_node = property.child_by_field_name("key").unwrap_or(property);
+            record_hit(key_node, ctx);
+        }
+    }
+}
+
+fn expression_carries_target_object(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    match node.kind() {
+        "this" => this_receiver_matches_target(node, ctx),
+        "identifier" | "type_identifier" => {
+            let text = slice(node, ctx.source);
+            ctx.binds_target_object(text)
+        }
+        "call_expression" => node
+            .child_by_field_name("function")
+            .and_then(|callee| simple_identifier_text(callee, ctx.source))
+            .is_some_and(|callee| ctx.binds_target(callee)),
+        _ => false,
+    }
+}
+
+fn expression_resolves_to_target_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    if let Some(text) = simple_identifier_text(node, ctx.source) {
+        return ctx.binds_target_value(text);
+    }
+    if node.kind() != "member_expression" {
+        return false;
+    }
+    let (Some(object), Some(property), Some(target_member)) = (
+        node.child_by_field_name("object"),
+        node.child_by_field_name("property"),
+        ctx.target_member,
+    ) else {
+        return false;
+    };
+    slice(property, ctx.source) == target_member && expression_carries_target_object(object, ctx)
 }
 
 fn target_seed_identifier(target: &CodeUnit, target_owner: Option<&CodeUnit>) -> String {
@@ -396,7 +499,9 @@ fn target_seed_identifier(target: &CodeUnit, target_owner: Option<&CodeUnit>) ->
 }
 
 fn is_target_declaration_binding(name_node: Node<'_>, lhs: &str, ctx: &ScanCtx<'_>) -> bool {
-    if !ctx.target_self_file || lhs != ctx.target_short {
+    if !ctx.target_self_file
+        || (lhs != ctx.target_short && ctx.target_member.is_none_or(|member| lhs != member))
+    {
         return false;
     }
     let range = Range {
@@ -616,6 +721,21 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         && ctx.binds_target(object_text)
     {
         record_hit(object, ctx);
+        return;
+    }
+
+    if simple_identifier_text(object, ctx.source).is_some() && ctx.binds_target_value(object_text) {
+        record_hit(object, ctx);
+        return;
+    }
+
+    if object.kind() != "this"
+        && ctx
+            .target_member
+            .is_some_and(|member| member == property_text)
+        && expression_carries_target_object(object, ctx)
+    {
+        record_hit(property, ctx);
         return;
     }
 
@@ -841,9 +961,12 @@ fn member_object_match_status(
             .rev()
             .find_map(|scope| scope.get(name))
             .copied()
-    }) && binding == LocalBinding::TargetReceiver
-    {
-        return ReceiverMatchStatus::Proven;
+    }) {
+        return match binding {
+            LocalBinding::TargetReceiver => ReceiverMatchStatus::Proven,
+            LocalBinding::KnownUnrelated => ReceiverMatchStatus::NoMatch,
+            LocalBinding::Other => receiver_fact_match_status(node, ctx),
+        };
     }
 
     receiver_fact_match_status(node, ctx)
@@ -941,6 +1064,15 @@ fn infer_receiver_binding(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<LocalBind
         || has_target_type_annotation(node, ctx)
     {
         return Some(LocalBinding::TargetReceiver);
+    }
+    let name = node.child_by_field_name("name")?;
+    if name.kind() == "identifier"
+        && value.kind() == "object"
+        && ctx
+            .target_owner
+            .is_none_or(|owner| slice(name, ctx.source) != owner.identifier())
+    {
+        return Some(LocalBinding::KnownUnrelated);
     }
 
     simple_identifier_text(value, ctx.source).map(|ident| {

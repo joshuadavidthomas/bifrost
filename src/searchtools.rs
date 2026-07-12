@@ -3310,25 +3310,49 @@ fn path_match_sample(matches: &[String]) -> String {
     }
 }
 
-/// The selector a caller re-queries to choose exactly this definition. Module-
-/// scoped ecosystems (JS/TS) share bare fqns across files, so the selector is
-/// file-anchored to stay unique; elsewhere the fqn already is.
+/// The preferred selector for one definition. Module-scoped ecosystems (JS/TS)
+/// are always file-anchored. [`distinct_definitions`] also anchors other
+/// ecosystems when the same FQN spans multiple language/file domains.
 fn definition_selector(unit: &CodeUnit) -> String {
     if Ecosystem::of(language_for_target(unit)).is_module_scoped() {
-        format!("{}#{}", rel_path_string(unit.source()), unit.fq_name())
+        file_anchored_definition_selector(unit)
     } else {
         unit.fq_name()
     }
 }
 
+fn file_anchored_definition_selector(unit: &CodeUnit) -> String {
+    format!("{}#{}", rel_path_string(unit.source()), unit.fq_name())
+}
+
 /// Partition resolved overloads into distinct selectable definitions, preserving
-/// first-seen order. Overloads of one symbol share a selector and scan together;
-/// module-scoped same-name definitions in different files get one selector each,
-/// so the caller can choose between them rather than scan a conflation.
+/// first-seen order. Overloads of one symbol share a selector and scan together.
+/// An FQN present in multiple language/file domains is file-anchored in every
+/// domain so each ambiguity candidate can be re-queried without looping.
 fn distinct_definitions(overloads: Vec<CodeUnit>) -> Vec<(String, Vec<CodeUnit>)> {
+    let mut domains_by_fqn: HashMap<String, HashSet<(Language, Option<String>)>> =
+        HashMap::default();
+    for unit in &overloads {
+        let language = language_for_target(unit);
+        let module_path = Ecosystem::of(language)
+            .is_module_scoped()
+            .then(|| rel_path_string(unit.source()));
+        domains_by_fqn
+            .entry(unit.fq_name())
+            .or_default()
+            .insert((language, module_path));
+    }
+
     let mut groups: Vec<(String, Vec<CodeUnit>)> = Vec::new();
     for unit in overloads {
-        let selector = definition_selector(&unit);
+        let selector = if domains_by_fqn
+            .get(&unit.fq_name())
+            .is_some_and(|domains| domains.len() > 1)
+        {
+            file_anchored_definition_selector(&unit)
+        } else {
+            definition_selector(&unit)
+        };
         match groups
             .iter_mut()
             .find(|(existing, _)| *existing == selector)
@@ -3352,7 +3376,10 @@ fn prefer_exact_lookup_matches(overloads: Vec<CodeUnit>, lookup: &str) -> Vec<Co
 }
 
 fn code_unit_match_names(matches: &[CodeUnit]) -> Vec<String> {
-    dedupe_preserving_order(matches.iter().map(definition_selector).collect())
+    distinct_definitions(matches.to_vec())
+        .into_iter()
+        .map(|(selector, _)| selector)
+        .collect()
 }
 
 fn ambiguous_usage_symbol_from_groups(
@@ -5924,17 +5951,6 @@ fn serialized_char_count<T: Serialize>(value: &T) -> usize {
     serde_json::to_string(value)
         .map(|text| text.chars().count())
         .unwrap_or(0)
-}
-
-fn dedupe_preserving_order(values: Vec<String>) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut deduped = Vec::new();
-    for value in values {
-        if seen.insert(value.clone()) {
-            deduped.push(value);
-        }
-    }
-    deduped
 }
 
 fn some_if_nonzero(value: usize) -> Option<usize> {

@@ -4077,6 +4077,105 @@ exports.measure = function() {
 }
 
 #[test]
+fn scan_usages_by_reference_preserves_javascript_property_alias_provenance() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "context.js",
+            r#"function setupSessions() {
+  const contextGroup = makeContextGroup();
+  return { contextGroup };
+}
+function useContext() {
+  const { contextGroup } = setupSessions();
+  contextGroup.createContext();
+  const result = setupSessions();
+  const alias = result.contextGroup;
+  alias.createContext();
+  const unrelated = { contextGroup: makeContextGroup() };
+  unrelated.contextGroup.createContext();
+  function shadow(contextGroup) { contextGroup.createContext(); }
+}
+"#,
+        )
+        .file(
+            "holder.js",
+            r#"class Holder {
+  constructor() { this.ret = makeValue(); }
+  use() {
+    const { ret } = this;
+    ret.run();
+    const alias = ret;
+    alias.run();
+    const unrelated = { ret: makeValue() };
+    unrelated.ret.run();
+    function shadow(ret) { ret.run(); }
+  }
+}
+"#,
+        )
+        .file(
+            "proxy.js",
+            r#"function createProxyServer() {
+  const proxy = makeProxy();
+  return { proxy };
+}
+function start() {
+  const returned = createProxyServer();
+  const { proxy } = returned;
+  proxy.listen();
+  const unrelated = { proxy: makeProxy() };
+  unrelated.proxy.listen();
+}
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    for (symbol, path, expected_lines, rejected_lines) in [
+        (
+            "setupSessions.contextGroup",
+            "context.js",
+            vec![6, 7, 9, 10],
+            vec![12, 13],
+        ),
+        ("Holder.ret", "holder.js", vec![4, 5, 7], vec![9, 10]),
+        ("createProxyServer.proxy", "proxy.js", vec![7, 8], vec![10]),
+    ] {
+        let args = serde_json::json!({
+            "symbols": [symbol],
+            "include_tests": true,
+            "paths": [path],
+        });
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args.to_string())
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let result = only_result(&value);
+        assert_eq!(result["status"], "found", "payload: {value}");
+        assert_eq!(result["unproven_hits"], 0, "payload: {value}");
+        let lines: BTreeSet<u64> = result["files"][0]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hit| hit["line"].as_u64())
+            .collect();
+        for expected in expected_lines {
+            assert!(
+                lines.contains(&expected),
+                "missing line {expected}: {value}"
+            );
+        }
+        for rejected in rejected_lines {
+            assert!(
+                !lines.contains(&rejected),
+                "unexpected line {rejected}: {value}"
+            );
+        }
+    }
+}
+
+#[test]
 fn scan_usages_location_target_uses_column_on_same_line_declarations() {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file(
@@ -4208,6 +4307,58 @@ fn scan_usages_by_reference_ambiguity_uses_symbolic_candidates_only() {
         !ambiguous["message"].as_str().unwrap().contains("location"),
         "payload: {value}"
     );
+}
+
+#[test]
+fn scan_usages_by_reference_ambiguous_candidates_round_trip_across_languages() {
+    let project = InlineTestProject::new()
+        .file(
+            "api.php",
+            "<?php\nfunction get_string($value) { return $value; }\nget_string('php');\n",
+        )
+        .file(
+            "api.js",
+            "export function get_string(value) { return value; }\nget_string('js');\n",
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["get_string"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let ambiguous = only_result(&value);
+    assert_eq!(ambiguous["status"], "ambiguous", "payload: {value}");
+    let candidates = ambiguous["candidate_targets"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2, "payload: {value}");
+
+    let selectors: std::collections::BTreeSet<_> = candidates
+        .iter()
+        .map(|candidate| candidate.as_str().unwrap())
+        .collect();
+    assert_eq!(selectors.len(), candidates.len(), "payload: {value}");
+    for selector in selectors {
+        assert!(
+            selector.contains('#'),
+            "selector must be unique: {selector}"
+        );
+        assert_ne!(selector, "get_string");
+        let args = serde_json::json!({
+            "symbols": [selector],
+            "include_tests": true,
+        });
+        let retry_payload = service
+            .call_tool_json("scan_usages_by_reference", &args.to_string())
+            .unwrap();
+        let retry: Value = serde_json::from_str(&retry_payload).unwrap();
+        let result = only_result(&retry);
+        assert_eq!(result["status"], "found", "payload: {retry}");
+        assert_eq!(result["total_hits"], 1, "payload: {retry}");
+    }
 }
 
 #[test]
