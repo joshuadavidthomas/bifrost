@@ -878,6 +878,40 @@ fn commonjs_nested_member_matches(
 }
 
 fn handle_jsx_element(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if let Some(target_member) = ctx.target_member {
+        let mut cursor = node.walk();
+        let matching_attributes = node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "jsx_attribute")
+            .filter_map(|attribute| attribute.named_child(0))
+            .filter(|name| slice(*name, ctx.source) == target_member)
+            .collect::<Vec<_>>();
+        if !matching_attributes.is_empty() {
+            let provider = JsTsReceiverFactProvider::new(
+                ctx.analyzer,
+                ctx.analyzer.definition_lookup_index(),
+                ctx.language,
+                ctx.file,
+                ctx.source,
+                ctx.root,
+                ctx.imports.clone(),
+            );
+            for name in matching_attributes {
+                if provider
+                    .resolve_jsx_attribute_targets(name, ReceiverAnalysisBudget::default())
+                    .is_some_and(|targets| {
+                        targets.iter().any(|target| {
+                            target.source() == ctx.target.source()
+                                && target.fq_name() == ctx.target.fq_name()
+                        })
+                    })
+                {
+                    record_hit(name, ctx);
+                }
+            }
+        }
+    }
+
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };

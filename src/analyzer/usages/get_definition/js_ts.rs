@@ -107,6 +107,30 @@ pub(super) fn resolve_js_ts(
     let value_position = jsts_reference_is_value_position(tree, site);
     let imports = compute_jsts_import_binder(source, tree);
     let aliases = AliasResolver::new(analyzer.project().root().to_path_buf());
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
+
+    if let Some(targets) = focused.and_then(|node| {
+        JsTsReceiverFactProvider::new(
+            analyzer,
+            support,
+            language,
+            file,
+            source,
+            tree.root_node(),
+            imports.clone(),
+        )
+        .resolve_jsx_attribute_targets(node, ReceiverAnalysisBudget::default())
+    }) {
+        return if targets.is_empty() {
+            no_definition(
+                "unresolved_jsx_attribute_owner",
+                format!("the JSX component's `{reference}` prop owner could not be proven"),
+            )
+        } else {
+            js_ts_candidates_outcome(analyzer, targets)
+        };
+    }
 
     if language == Language::TypeScript {
         let contextual_members = ts_contextual_object_literal_key_candidates(
@@ -117,8 +141,6 @@ pub(super) fn resolve_js_ts(
         }
     }
 
-    let focused =
-        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
     if focused
         .is_some_and(|node| is_declaration_identifier(node) || is_explicit_object_literal_key(node))
     {

@@ -40,6 +40,77 @@ fn location_reference(path: &str, source: &str, start: usize) -> String {
 }
 
 #[test]
+fn typescript_jsx_attribute_resolves_local_component_props_owner_exactly() {
+    let source = r#"
+interface LocalProps { label: string }
+interface OtherProps { label: string }
+function Local(_props: LocalProps) { return null }
+function Other(_props: OtherProps) { return null }
+export function View() {
+  return <><Local label="local" /><Other label="other" /><External label="external" /></>
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("view.tsx", source)
+        .build();
+
+    for (marker, expected) in [
+        ("label=\"local\"", "LocalProps.label"),
+        ("label=\"other\"", "OtherProps.label"),
+    ] {
+        let start = source.find(marker).expect("attribute marker");
+        let value = lookup(
+            project.root(),
+            &location_reference("view.tsx", source, start),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected,
+            "{value}"
+        );
+    }
+
+    let external = source
+        .find("label=\"external\"")
+        .expect("external attribute");
+    let value = lookup(
+        project.root(),
+        &location_reference("view.tsx", source, external),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn typescript_jsx_attribute_resolves_imported_component_props_owner() {
+    let source = r#"
+import { Child } from './child'
+export function View() { return <Child title="hello" /> }
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "child.tsx",
+            "export interface ChildProps { title: string }\nexport const Child: React.FC<ChildProps> = (_props) => null\n",
+        )
+        .file("view.tsx", source)
+        .build();
+    let start = source.find("title=\"hello\"").expect("attribute");
+    let value = lookup(
+        project.root(),
+        &location_reference("view.tsx", source, start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "ChildProps.title",
+        "{value}"
+    );
+    assert_eq!(
+        value["results"][0]["definitions"][0]["path"], "child.tsx",
+        "{value}"
+    );
+}
+
+#[test]
 fn ruby_get_definition_resolves_constant_reference_to_class() {
     let project = InlineTestProject::with_language(Language::Ruby)
         .file(

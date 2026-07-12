@@ -5213,6 +5213,53 @@ pub fn consume(same: usize, only: usize, wanted: Wanted, decoy: Decoy) {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_exact_typescript_jsx_props() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "child.tsx",
+            r#"
+export interface ChildProps { title: string }
+export interface OtherProps { title: string }
+export function Child(_props: ChildProps) { return null }
+export function Other(_props: OtherProps) { return null }
+"#,
+        )
+        .file(
+            "view.tsx",
+            r#"
+import { Child, Other } from './child'
+export function ViewOne() { return <Child title="one" /> }
+export function ViewTwo() { return <Child title="two" /> }
+export function OtherView() { return <Other title="other" /> }
+export function ExternalView() { return <External title="external" /> }
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["ChildProps.title"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+
+    assert_eq!(1, resolved_scan_count(&value), "payload: {value}");
+    let usage = only_result(&value);
+    assert_eq!(2, usage["total_hits"].as_u64().unwrap(), "payload: {value}");
+    let files = usage["files"].as_array().unwrap();
+    assert_eq!(1, files.len(), "payload: {value}");
+    assert_eq!("view.tsx", files[0]["path"], "payload: {value}");
+    assert_eq!(
+        2,
+        files[0]["hits"].as_array().unwrap().len(),
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_by_reference_proves_structured_rust_instance_receivers() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

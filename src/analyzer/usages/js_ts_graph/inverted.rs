@@ -1041,6 +1041,7 @@ fn scoped_namespace_member_class(
 }
 
 fn handle_jsx(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferenceEngine<String>) {
+    record_jsx_attributes(node, ctx);
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
@@ -1055,11 +1056,33 @@ fn handle_jsx(node: Node<'_>, ctx: &mut TsScan<'_, '_>, locals: &LocalInferenceE
     }
 }
 
+fn record_jsx_attributes(node: Node<'_>, ctx: &mut TsScan<'_, '_>) {
+    let mut cursor = node.walk();
+    for attribute in node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "jsx_attribute")
+    {
+        let Some(name) = attribute.named_child(0) else {
+            continue;
+        };
+        let Some(targets) = ctx
+            .receiver_provider
+            .resolve_jsx_attribute_targets(name, ReceiverAnalysisBudget::default())
+        else {
+            continue;
+        };
+        for target in targets {
+            ctx.record(target.fq_name(), name);
+        }
+    }
+}
+
 fn handle_scoped_jsx(
     node: Node<'_>,
     ctx: &mut ScopedTsScan<'_, '_>,
     locals: &LocalInferenceEngine<String>,
 ) {
+    record_scoped_jsx_attributes(node, ctx);
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
@@ -1071,5 +1094,29 @@ fn handle_scoped_jsx(
     }
     if let Some(callee) = ctx.bare_callee(leaf_text) {
         ctx.record(callee, rightmost);
+    }
+}
+
+fn record_scoped_jsx_attributes(node: Node<'_>, ctx: &mut ScopedTsScan<'_, '_>) {
+    let mut cursor = node.walk();
+    for attribute in node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "jsx_attribute")
+    {
+        let Some(name) = attribute.named_child(0) else {
+            continue;
+        };
+        let Some(targets) = ctx
+            .receiver_provider
+            .resolve_jsx_attribute_targets(name, ReceiverAnalysisBudget::default())
+        else {
+            continue;
+        };
+        for target in targets {
+            ctx.record(
+                UsageNodeKey::new(target.source().clone(), target.fq_name()),
+                name,
+            );
+        }
     }
 }

@@ -480,6 +480,50 @@ fn flatten_unproven_hits(result: FuzzyResult) -> BTreeSet<brokk_bifrost::usages:
 }
 
 #[test]
+fn ts_jsx_attributes_use_exact_imported_component_props_owner() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "child.tsx",
+            r#"
+export interface ChildProps { title: string }
+export interface OtherProps { title: string }
+export function Child(_props: ChildProps) { return null }
+export function Other(_props: OtherProps) { return null }
+"#,
+        )
+        .file(
+            "view.tsx",
+            r#"
+import { Child, Other } from './child'
+export function ViewOne() { return <Child title="one" /> }
+export function ViewTwo() { return <Child title="two" /> }
+export function OtherView() { return <Other title="other" /> }
+export function ExternalView() { return <External title="external" /> }
+"#,
+        )
+        .build()
+    });
+    let target = find_ts_target(&analyzer, &project.file("child.tsx"), |unit| {
+        unit.fq_name() == "ChildProps.title"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert_eq!(
+        2,
+        hits.len(),
+        "expected only Child.title attributes: {hits:?}"
+    );
+    let enclosings = hits
+        .iter()
+        .map(|hit| hit.enclosing.short_name())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(BTreeSet::from(["ViewOne", "ViewTwo"]), enclosings);
+}
+
+#[test]
 fn js_seedless_factory_returned_unexported_class_method_is_proven() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(

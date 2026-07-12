@@ -40,6 +40,7 @@ pub(crate) struct JsTsReceiverFactProvider<'tree, 'a> {
     class_declarations_by_name: HashMap<String, Vec<Node<'tree>>>,
     member_target_cache:
         RefCell<HashMap<ReceiverAnalysisCacheKey, ReceiverAnalysisOutcome<CodeUnit>>>,
+    jsx_props_owner_cache: RefCell<HashMap<(ProjectFile, String), Vec<CodeUnit>>>,
 }
 
 impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
@@ -67,6 +68,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             function_declarations_by_name,
             class_declarations_by_name,
             member_target_cache: RefCell::new(HashMap::default()),
+            jsx_props_owner_cache: RefCell::new(HashMap::default()),
         }
     }
 
@@ -149,6 +151,106 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         targets.dedup();
         targets.truncate(budget.max_targets.saturating_add(1));
         targets
+    }
+
+    /// Resolves a JSX attribute name through the element's component declaration to
+    /// the exact field on its props type. `None` means `node` is not an attribute
+    /// name; `Some([])` is a recognized attribute whose owner cannot be proven.
+    pub(crate) fn resolve_jsx_attribute_targets(
+        &self,
+        node: Node<'tree>,
+        budget: ReceiverAnalysisBudget,
+    ) -> Option<Vec<CodeUnit>> {
+        let (attribute_name, element_name) = jsx_attribute_site(node)?;
+        if self.language != Language::TypeScript {
+            return Some(Vec::new());
+        }
+        let attribute = slice(attribute_name, self.source);
+        let Some(component) = simple_identifier_text(element_name, self.source)
+            .filter(|name| name.starts_with(|ch: char| ch.is_ascii_uppercase()))
+        else {
+            return Some(Vec::new());
+        };
+
+        let components = self.jsx_component_candidates(component);
+        let mut targets = components
+            .iter()
+            .flat_map(|component| self.jsx_component_prop_owners(component))
+            .flat_map(|owner| self.member_targets(&owner, attribute))
+            .collect::<Vec<_>>();
+        sort_units(&mut targets);
+        targets.dedup();
+        targets.truncate(budget.max_targets.saturating_add(1));
+        Some(targets)
+    }
+
+    fn jsx_component_candidates(&self, name: &str) -> Vec<CodeUnit> {
+        let mut candidates = if let Some(binding) = self.imports.bindings.get(name) {
+            let exported_name = match binding.kind {
+                ImportKind::Named => binding.imported_name.as_deref().unwrap_or(name),
+                ImportKind::Default => "default",
+                ImportKind::Namespace | ImportKind::CommonJsRequire | ImportKind::Glob => {
+                    return Vec::new();
+                }
+            };
+            resolve_js_ts_module_binding_candidates(
+                self.analyzer,
+                self.support,
+                self.language,
+                self.file,
+                &binding.module_specifier,
+                exported_name,
+                Some(&self.aliases),
+                true,
+            )
+        } else {
+            self.support
+                .file_identifier(self.file, name)
+                .into_iter()
+                .filter(|unit| unit.source() == self.file)
+                .collect()
+        };
+        candidates.retain(|unit| unit.is_function() || unit.is_field() || unit.is_class());
+        sort_units(&mut candidates);
+        candidates.dedup();
+        candidates
+    }
+
+    fn jsx_component_prop_owners(&self, component: &CodeUnit) -> Vec<CodeUnit> {
+        let cache_key = (component.source().clone(), component.fq_name());
+        if let Some(cached) = self.jsx_props_owner_cache.borrow().get(&cache_key) {
+            return cached.clone();
+        }
+        let Ok(source) = component.source().read_to_string() else {
+            return Vec::new();
+        };
+        let Some(tree) = parse_js_ts_tree(component.source(), &source, Language::TypeScript) else {
+            return Vec::new();
+        };
+        let imports = compute_jsts_import_binder(&source, &tree);
+        let aliases = AliasResolver::new(self.analyzer.project().root().to_path_buf());
+        let mut owners = nodes_for_code_unit(self.analyzer, component, tree.root_node())
+            .into_iter()
+            .filter_map(|node| jsx_component_props_type(node, component.identifier(), &source))
+            .flat_map(|type_node| {
+                ts_resolve_type_text_to_property_owners(
+                    self.analyzer,
+                    self.support,
+                    component.source(),
+                    &source,
+                    &imports,
+                    &aliases,
+                    ts_type_annotation_text(type_node, &source).as_str(),
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        sort_units(&mut owners);
+        owners.dedup();
+        self.jsx_props_owner_cache
+            .borrow_mut()
+            .insert(cache_key, owners.clone());
+        owners
     }
 
     fn resolve_expression(
@@ -763,6 +865,170 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+fn jsx_attribute_site(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {
+    let attribute = if node.kind() == "jsx_attribute" {
+        node
+    } else {
+        node.parent()
+            .filter(|parent| parent.kind() == "jsx_attribute")?
+    };
+    let attribute_name = attribute.named_child(0)?;
+    if attribute_name.id() != node.id() && node.kind() != "jsx_attribute" {
+        return None;
+    }
+    if attribute_name.kind() != "property_identifier" {
+        return None;
+    }
+    let element = attribute.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "jsx_opening_element" | "jsx_self_closing_element"
+        )
+    })?;
+    Some((attribute_name, element.child_by_field_name("name")?))
+}
+
+fn jsx_component_props_type<'tree>(
+    node: Node<'tree>,
+    component_name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let declaration = enclosing_component_declaration(node, component_name, source)?;
+    match declaration.kind() {
+        "function_declaration" | "function_expression" | "arrow_function" => {
+            function_first_parameter_type(declaration)
+        }
+        "variable_declarator" => declaration
+            .child_by_field_name("value")
+            .filter(|value| matches!(value.kind(), "function_expression" | "arrow_function"))
+            .and_then(function_first_parameter_type)
+            .or_else(|| {
+                declaration
+                    .child_by_field_name("type")
+                    .and_then(|node| function_component_wrapper_argument(node, source))
+            }),
+        "class_declaration" | "abstract_class_declaration" => {
+            class_component_props_argument(declaration, source)
+        }
+        _ => None,
+    }
+}
+
+fn enclosing_component_declaration<'tree>(
+    node: Node<'tree>,
+    component_name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![node];
+    while let Some(candidate) = stack.pop() {
+        if component_declaration_has_name(candidate, component_name, source) {
+            return Some(candidate);
+        }
+        for index in (0..candidate.named_child_count()).rev() {
+            if let Some(child) = candidate.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if component_declaration_has_name(candidate, component_name, source) {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn component_declaration_has_name(node: Node<'_>, component_name: &str, source: &str) -> bool {
+    matches!(
+        node.kind(),
+        "function_declaration"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "variable_declarator"
+    ) && node
+        .child_by_field_name("name")
+        .is_some_and(|name| node_text_matches(name, source, component_name))
+}
+
+fn function_first_parameter_type(function: Node<'_>) -> Option<Node<'_>> {
+    let parameters = function.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .next()
+        .and_then(|parameter| parameter.child_by_field_name("type"))
+}
+
+fn function_component_wrapper_argument<'tree>(
+    type_annotation: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![type_annotation];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "generic_type" {
+            let Some(terminal) = node
+                .child_by_field_name("name")
+                .and_then(|name| type_reference_terminal(name, source))
+            else {
+                continue;
+            };
+            if matches!(terminal, "FC" | "FunctionComponent" | "ComponentType") {
+                return node
+                    .child_by_field_name("type_arguments")
+                    .and_then(|arguments| arguments.named_child(0));
+            }
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    None
+}
+
+fn class_component_props_argument<'tree>(class: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let mut cursor = class.walk();
+    let heritage = class
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "class_heritage")?;
+    let mut cursor = heritage.walk();
+    for extends in heritage
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "extends_clause")
+    {
+        let value = extends.child_by_field_name("value")?;
+        let terminal = type_reference_terminal(value, source)?;
+        if matches!(terminal, "Component" | "PureComponent") {
+            return extends
+                .child_by_field_name("type_arguments")
+                .and_then(|arguments| arguments.named_child(0));
+        }
+    }
+    None
+}
+
+fn type_reference_terminal<'a>(mut node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    loop {
+        if let Some(name) = node.child_by_field_name("name")
+            && name.id() != node.id()
+        {
+            node = name;
+            continue;
+        }
+        return match node.kind() {
+            "identifier" | "type_identifier" | "property_identifier" => {
+                let text = slice(node, source);
+                (!text.is_empty()).then_some(text)
+            }
+            _ => None,
+        };
     }
 }
 
