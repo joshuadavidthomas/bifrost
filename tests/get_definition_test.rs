@@ -3638,6 +3638,177 @@ pub fn run() {
 }
 
 #[test]
+fn rust_prelude_some_does_not_resolve_sibling_module_type() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+mod custom {
+    pub struct Some(pub u8);
+}
+
+fn demo(value: Option<u8>) {
+    if let Some(inner) = value {
+        let _ = inner;
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "    if let Some(inner) = value {";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":7,"column":{}}}]}}"#,
+            column_of(line, "Some")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn rust_type_namespace_does_not_resolve_same_file_enum_variant() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+enum Binding {
+    String(&'static str),
+}
+
+fn demo(value: Option<String>) {
+    let _ = value;
+}
+"#,
+        )
+        .build();
+
+    let line = "fn demo(value: Option<String>) {";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":6,"column":{}}}]}}"#,
+            column_of(line, "String")
+        ),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn rust_same_module_custom_constructor_still_resolves() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+struct Some(u8);
+
+fn demo() -> Some {
+    Some(1)
+}
+"#,
+        )
+        .build();
+
+    let value = lookup_reference(
+        project.root(),
+        &json!({
+            "references": [{
+                "symbol": "demo",
+                "context": "Some(1)",
+                "target": "Some"
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Some", "{value}");
+}
+
+#[test]
+fn rust_explicit_unresolved_import_does_not_fall_back_to_variant() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "lib.rs",
+            r#"
+use missing_crate::Pattern;
+
+enum Position {
+    Pattern,
+}
+
+fn demo(_: Pattern) {}
+"#,
+        )
+        .build();
+
+    let line = "fn demo(_: Pattern) {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"lib.rs","line":8,"column":{}}}]}}"#,
+            column_of(line, "Pattern")
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "{value}"
+    );
+}
+
+#[test]
+fn rust_workspace_import_beats_same_file_value_namespace() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"matcher\", \"core\"]\nresolver = \"2\"\n",
+        )
+        .file(
+            "matcher/Cargo.toml",
+            "[package]\nname = \"matcher\"\nversion = \"0.1.0\"\n",
+        )
+        .file("matcher/src/lib.rs", "pub struct Pattern;\n")
+        .file(
+            "core/Cargo.toml",
+            "[package]\nname = \"core\"\nversion = \"0.1.0\"\n[dependencies]\nmatcher = { path = \"../matcher\" }\n",
+        )
+        .file(
+            "core/src/lib.rs",
+            r#"
+use matcher::Pattern;
+
+enum Position {
+    Pattern,
+}
+
+fn demo(_: Pattern) {}
+"#,
+        )
+        .build();
+
+    let line = "fn demo(_: Pattern) {}";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"core/src/lib.rs","line":8,"column":{}}}]}}"#,
+            column_of(line, "Pattern")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["path"], "matcher/src/lib.rs",
+        "{value}"
+    );
+}
+
+#[test]
 fn rust_struct_field_access_resolves_from_parameters_and_result_locals() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(

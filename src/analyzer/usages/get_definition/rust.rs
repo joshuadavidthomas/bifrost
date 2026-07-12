@@ -1,7 +1,7 @@
 use super::*;
 use crate::analyzer::RustReferenceContext;
 use crate::analyzer::rust::lexical_scope;
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
 pub(super) fn resolve_rust(
     analyzer: &dyn IAnalyzer,
@@ -168,24 +168,52 @@ pub(super) fn resolve_rust(
         ) {
             return candidates_outcome(vec![unit]);
         }
-        let mut resolved = refs
-            .resolve_bare(reference)
-            .map(|fqn| support.fqn(fqn))
-            .unwrap_or_default();
-        if resolved.is_empty() {
-            let imported = rust_imported_export_candidates(
+        let resolved = if let Some(tree) = tree
+            && let Some(role) = rust_bare_reference_role(tree, site)
+        {
+            if role == RustBareReferenceRole::Type
+                && lexical_scope::local_item_name_shadowed_in_tree(
+                    tree.root_node(),
+                    source,
+                    reference,
+                    site.focus_start_byte,
+                )
+            {
+                return no_definition(
+                    "local_binding",
+                    format!("`{reference}` is a local Rust item, which is not indexed"),
+                );
+            }
+            match rust_visible_import_resolution(
                 rust,
                 support,
                 file,
+                source,
+                site.focus_start_byte,
                 reference,
-                Some(site.range.start_byte),
-            );
-            resolved = if imported.is_empty() {
-                support.file_identifier(file, reference)
-            } else {
-                imported
-            };
-        }
+                role,
+            ) {
+                RustVisibleImportResolution::Resolved(candidates) => candidates,
+                RustVisibleImportResolution::GlobResolved(candidates) => {
+                    let local = rust_current_module_candidates(
+                        analyzer, rust, support, file, tree, site, reference, role, &refs,
+                    );
+                    if local.is_empty() { candidates } else { local }
+                }
+                RustVisibleImportResolution::BoundButUnindexed => {
+                    return boundary(format!(
+                        "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
+                    ));
+                }
+                RustVisibleImportResolution::Unbound => rust_current_module_candidates(
+                    analyzer, rust, support, file, tree, site, reference, role, &refs,
+                ),
+            }
+        } else {
+            refs.resolve_bare(reference)
+                .map(|fqn| support.fqn(fqn))
+                .unwrap_or_default()
+        };
         (resolved, false)
     };
     if !candidates.is_empty() {
@@ -206,6 +234,178 @@ pub(super) fn resolve_rust(
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed Rust definition"),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustBareReferenceRole {
+    Type,
+    // Rust struct and enum constructors occupy the value namespace too.
+    Value,
+}
+
+enum RustVisibleImportResolution {
+    Resolved(Vec<CodeUnit>),
+    GlobResolved(Vec<CodeUnit>),
+    BoundButUnindexed,
+    Unbound,
+}
+
+fn rust_bare_reference_role(
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+) -> Option<RustBareReferenceRole> {
+    let node =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    match node.kind() {
+        "type_identifier" => Some(RustBareReferenceRole::Type),
+        "identifier" => Some(RustBareReferenceRole::Value),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_visible_import_resolution(
+    rust: &RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    source: &str,
+    reference_byte: usize,
+    reference: &str,
+    role: RustBareReferenceRole,
+) -> RustVisibleImportResolution {
+    let binder = lexical_scope::visible_import_binder_at(source, reference_byte);
+    let explicitly_bound = rust_binder_has_external_binding(&binder, reference);
+    let mut expected_fqns = HashSet::default();
+    if explicitly_bound {
+        for (local_name, binding) in &binder.bindings {
+            if local_name != reference || binding.kind != ImportKind::Named {
+                continue;
+            }
+            let imported = binding.imported_name.as_deref().unwrap_or(reference);
+            if let Some(package) = rust.resolve_module_package(file, &binding.module_specifier) {
+                expected_fqns.insert(format!("{package}.{imported}"));
+            }
+        }
+    }
+    let targets = rust.resolve_imported_export_from_binder(file, &binder, reference);
+    let mut candidates = Vec::new();
+    for (target_file, target_name) in targets {
+        candidates.extend(
+            support
+                .file_identifier(&target_file, &target_name)
+                .into_iter()
+                .filter(|candidate| rust_role_accepts_imported(rust, role, candidate)),
+        );
+    }
+    if explicitly_bound && !expected_fqns.is_empty() {
+        let exact: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| expected_fqns.contains(&candidate.fq_name()))
+            .cloned()
+            .collect();
+        if !exact.is_empty() {
+            candidates = exact;
+        }
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    if !candidates.is_empty() {
+        if explicitly_bound {
+            RustVisibleImportResolution::Resolved(candidates)
+        } else {
+            RustVisibleImportResolution::GlobResolved(candidates)
+        }
+    } else if explicitly_bound {
+        RustVisibleImportResolution::BoundButUnindexed
+    } else {
+        RustVisibleImportResolution::Unbound
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_current_module_candidates(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &DefinitionLookupIndex,
+    file: &ProjectFile,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    reference: &str,
+    role: RustBareReferenceRole,
+    refs: &RustReferenceContext,
+) -> Vec<CodeUnit> {
+    let range = Range {
+        start_byte: site.focus_start_byte,
+        end_byte: site.focus_end_byte,
+        start_line: 0,
+        end_line: 0,
+    };
+    let mut enclosing = Vec::new();
+    let mut current = analyzer.enclosing_code_unit(file, &range);
+    while let Some(unit) = current {
+        enclosing.push(unit.clone());
+        current = analyzer.parent_of(&unit);
+    }
+    let package = enclosing
+        .first()
+        .map(CodeUnit::package_name)
+        .unwrap_or_else(|| refs.package_name());
+    let reference_module =
+        lexical_scope::enclosing_mod_item_range_at(tree.root_node(), site.focus_start_byte);
+    let mut candidates: Vec<_> = support
+        .file_identifier(file, reference)
+        .into_iter()
+        .filter(|candidate| candidate.package_name() == package)
+        .filter(|candidate| rust_role_accepts_current_module(analyzer, rust, role, candidate))
+        .filter(|candidate| {
+            analyzer
+                .ranges(candidate)
+                .first()
+                .map(|range| {
+                    lexical_scope::enclosing_mod_item_range_at(tree.root_node(), range.start_byte)
+                        == reference_module
+                })
+                .unwrap_or(reference_module.is_none())
+        })
+        .filter(|candidate| {
+            analyzer.parent_of(candidate).is_none_or(|parent| {
+                parent.is_module() || enclosing.iter().any(|scope| scope == &parent)
+            })
+        })
+        .collect();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
+fn rust_role_accepts_imported(
+    rust: &RustAnalyzer,
+    role: RustBareReferenceRole,
+    candidate: &CodeUnit,
+) -> bool {
+    match role {
+        RustBareReferenceRole::Type => candidate.is_class() || rust.is_type_alias(candidate),
+        RustBareReferenceRole::Value => !candidate.is_module(),
+    }
+}
+
+fn rust_role_accepts_current_module(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    role: RustBareReferenceRole,
+    candidate: &CodeUnit,
+) -> bool {
+    match role {
+        RustBareReferenceRole::Type => candidate.is_class() || rust.is_type_alias(candidate),
+        RustBareReferenceRole::Value => {
+            candidate.is_class()
+                || candidate.is_function()
+                || (candidate.is_field()
+                    && analyzer
+                        .parent_of(candidate)
+                        .is_none_or(|parent| !parent.is_class()))
+        }
+    }
 }
 
 fn rust_impl_associated_type_declaration_outcome(

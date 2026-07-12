@@ -219,6 +219,47 @@ pub(crate) fn name_shadowed_in_tree(
     bindings.contains(name)
 }
 
+pub(crate) fn local_item_name_shadowed_in_tree(
+    root: Node<'_>,
+    source: &str,
+    name: &str,
+    reference_byte: usize,
+) -> bool {
+    let Some(scope) = enclosing_function_or_closure(root, reference_byte) else {
+        return false;
+    };
+    let Some(body) = scope.child_by_field_name("body") else {
+        return false;
+    };
+    let mut items = HashSet::default();
+    collect_visible_local_items(body, source, reference_byte, &mut items);
+    items.contains(name)
+}
+
+fn collect_visible_local_items(
+    mut scope: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+    out: &mut HashSet<String>,
+) {
+    loop {
+        let mut cursor = scope.walk();
+        for node in scope.named_children(&mut cursor) {
+            if matches!(
+                node.kind(),
+                "struct_item" | "enum_item" | "trait_item" | "type_item" | "function_item"
+            ) {
+                collect_local_item_name(node, source, out);
+            }
+        }
+        let Some(child_scope) = child_lexical_scope_containing_reference(scope, reference_byte)
+        else {
+            return;
+        };
+        scope = child_scope;
+    }
+}
+
 /// Whether `node` is the identifier being introduced by a Rust binding pattern.
 /// Type/variant owners in structured patterns are deliberately excluded.
 pub(crate) fn is_pattern_binding_identifier(node: Node<'_>) -> bool {

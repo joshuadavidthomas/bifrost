@@ -22,6 +22,8 @@ Bifrost currently learns about false-negative reference resolution after agents 
 - [x] (2026-07-12 15:10Z) Pushed `03646ad1`, closed #644/#645, and reran the complete Rust N=1 repository from the fixing HEAD. Missing sites fell from 961 to 628; the record is commit-pinned but reports dirty because unrelated untracked agent/cache artifacts exist in both worktrees.
 - [x] (2026-07-12 16:05Z) Triaged all 628 post-fix Rust disagreements. Filed #646/#647 for the dominant cross-file type and `self`/`Self` inverse gaps, and #648/#649/#650 for independently reproduced forward scoped-focus, namespace/prelude, and let-condition defects.
 - [x] (2026-07-12 16:30Z) Implemented and behavior-tested #646/#647: nested workspace file modules now retain structured module identity, and Rust class usage emits exact editor-only owner-alias hits with CodeUnit identity checks.
+- [x] (2026-07-12 17:25Z) Pushed and closed #646/#647, then fixed, pushed, and closed #648 through the `get_definitions_by_location` symbols surface; no LSP-only acceptance work was retained.
+- [x] (2026-07-12 18:20Z) Implemented and symbols-tested #649 with AST namespace roles, tri-state visible imports, exact lexical-module fallback, and a cached Cargo path-dependency route index shared by forward and inverse Rust resolution.
 - [ ] Run N=1 for c, cpp, csharp, go, java, js, php, py, rust, scala, and ts.
 - [ ] Triage every reported inverse disagreement; create GitHub tickets only for genuine analyzer defects.
 - [ ] Fix, test, push, and close every genuine ticket found by the N=1 campaign.
@@ -96,6 +98,14 @@ Bifrost currently learns about false-negative reference resolution after agents 
 
 - Decision: Key resumable records by Bifrost source HEAD in addition to target HEAD and run configuration.
   Rationale: Every landed analyzer fix must invalidate earlier evidence automatically even when the package version and corpus checkout are unchanged.
+  Date/Author: 2026-07-12 / Codex
+
+- Decision: Treat the symbols MCP toolset as the production acceptance surface for corpus findings; LSP coverage is incidental and must not expand campaign scope.
+  Rationale: The campaign exists to improve `get_definitions_by_location`, `get_definitions_by_reference`, usage scanning, symbol sources, and related symbols tools. Their shared resolver may also improve LSP behavior, but LSP-only discrepancies are outside this campaign.
+  Date/Author: 2026-07-12 / Codex
+
+- Decision: Resolve indexed Rust path dependencies through one cached Cargo route index shared by forward module lookup and the inverse usage index.
+  Rationale: Per-reference manifest parsing would be a hot-path regression, while a forward-only filesystem fallback would recreate definition/usage disagreement. The compact route index parses indexed manifests once, preserves importer-scoped aliases and library names, and refuses to guess registry dependencies from coincidental workspace names.
   Date/Author: 2026-07-12 / Codex
 
 ## Outcomes & Retrospective

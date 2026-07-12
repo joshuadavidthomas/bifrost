@@ -14,8 +14,10 @@ use crate::analyzer::usages::{ExportEntry, ExportIndex, ImportBinder, ImportKind
 use crate::analyzer::{IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use super::RustAnalyzer;
+use super::cargo_routes::RustCargoRouteIndex;
 use super::declarations::rust_package_name;
 use super::graph_support::rust_module_files_from_path;
 use super::imports::{resolve_rust_module_path_with_crate, rust_crate_root_package};
@@ -54,15 +56,17 @@ struct RustModuleFiles {
     files: Vec<ProjectFile>,
     by_package: HashMap<String, Vec<usize>>,
     inline_by_name: HashMap<String, Vec<(usize, bool)>>,
+    cargo_routes: Arc<RustCargoRouteIndex>,
 }
 
 impl RustModuleFiles {
     /// Compact routing projection over the same file/declaration pass already
     /// required for export and import indices. It retains file IDs and module
     /// names only, never persisted rows, file states, declarations, or source.
-    fn new(files: &[ProjectFile]) -> Self {
+    fn new(files: &[ProjectFile], cargo_routes: Arc<RustCargoRouteIndex>) -> Self {
         let mut routing = Self {
             files: files.to_vec(),
+            cargo_routes,
             ..Self::default()
         };
         for (file_id, file) in files.iter().enumerate() {
@@ -94,8 +98,12 @@ impl RustModuleFiles {
     fn resolve(&self, importing_file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
         let package = rust_package_name(importing_file);
         let crate_package = rust_crate_root_package(importing_file);
-        let Some(resolved_module) =
-            resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
+        let Some(resolved_module) = self
+            .cargo_routes
+            .resolve_module_package(importing_file, module_specifier)
+            .or_else(|| {
+                resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
+            })
         else {
             return rust_module_files_from_path(importing_file, module_specifier);
         };
@@ -132,7 +140,7 @@ impl RustUsageIndex {
         let files: Vec<ProjectFile> = analyzer.get_analyzed_files().into_iter().collect();
         let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
         let mut binders_by_file: HashMap<ProjectFile, ImportBinder> = HashMap::default();
-        let mut module_files = RustModuleFiles::new(&files);
+        let mut module_files = RustModuleFiles::new(&files, analyzer.cargo_routes());
         for (file_id, file) in files.iter().enumerate() {
             let declarations = analyzer.declarations(file);
             exports_by_file.insert(
@@ -605,6 +613,7 @@ mod tests {
                     files: files.clone(),
                     by_package,
                     inline_by_name: HashMap::default(),
+                    cargo_routes: Arc::new(RustCargoRouteIndex::default()),
                 },
                 ..RustUsageIndex::default()
             },
@@ -652,6 +661,7 @@ mod tests {
             inline_by_name: [("service".to_string(), vec![(1, true)])]
                 .into_iter()
                 .collect(),
+            cargo_routes: Arc::new(RustCargoRouteIndex::default()),
         };
 
         assert_eq!(snapshot.files.len(), 2);

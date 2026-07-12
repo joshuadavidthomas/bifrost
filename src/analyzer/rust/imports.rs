@@ -399,6 +399,16 @@ pub(super) fn resolve_rust_import_fq_name(
     resolve_rust_module_path_with_crate(package, &crate_package, path)
 }
 
+pub(super) fn rust_external_module_route(path: &str) -> Option<(&str, Option<String>)> {
+    let mut segments = path.split("::").filter(|segment| !segment.is_empty());
+    let root = segments.next()?;
+    if matches!(root, "crate" | "self" | "super") {
+        return None;
+    }
+    let nested = segments.collect::<Vec<_>>().join(".");
+    Some((root, (!nested.is_empty()).then_some(nested)))
+}
+
 pub(super) fn rust_crate_root_package(file: &ProjectFile) -> String {
     let rel = file.rel_path();
     let mut components: Vec<_> = rel

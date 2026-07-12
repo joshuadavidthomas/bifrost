@@ -36,6 +36,10 @@ pub struct RustReferenceContext {
 }
 
 impl RustReferenceContext {
+    pub(crate) fn package_name(&self) -> &str {
+        &self.package
+    }
+
     /// The callee fqn a bare `name` refers to: a named import, a same-file item,
     /// or a free function imported via `use path::func;` (the binder classifies
     /// the latter as a namespace whose resolved value is the function's own fqn).
@@ -296,6 +300,12 @@ impl RustAnalyzer {
         importing_file: &ProjectFile,
         module_specifier: &str,
     ) -> Option<String> {
+        if let Some(package) = self
+            .cargo_routes()
+            .resolve_module_package(importing_file, module_specifier)
+        {
+            return Some(package);
+        }
         let package = rust_package_name(importing_file);
         let crate_package = rust_crate_root_package(importing_file);
         resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
@@ -428,8 +438,12 @@ impl RustAnalyzer {
     ) -> Vec<ProjectFile> {
         let package = rust_package_name(importing_file);
         let crate_package = rust_crate_root_package(importing_file);
-        let Some(resolved_module) =
-            resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
+        let Some(resolved_module) = self
+            .cargo_routes()
+            .resolve_module_package(importing_file, module_specifier)
+            .or_else(|| {
+                resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
+            })
         else {
             return rust_module_files_from_path(importing_file, module_specifier);
         };

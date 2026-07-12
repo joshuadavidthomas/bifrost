@@ -1,5 +1,6 @@
 mod adapter;
 mod cache;
+mod cargo_routes;
 mod declarations;
 mod diagnostics;
 mod graph_support;
@@ -27,6 +28,7 @@ use tree_sitter::Parser;
 use super::js_ts::build_weighted_cache;
 pub(crate) use adapter::RustAdapter;
 use cache::{weight_code_unit_set, weight_project_file_set, weight_reference_context};
+use cargo_routes::RustCargoRouteIndex;
 use declarations::collect_rust_type_identifiers;
 use tests::detect_rust_test_assertion_smells;
 
@@ -42,6 +44,7 @@ pub struct RustAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    cargo_routes: Arc<OnceLock<Arc<RustCargoRouteIndex>>>,
     usage_index: Arc<OnceLock<RustUsageIndex>>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
     #[allow(dead_code)]
@@ -52,7 +55,17 @@ impl RustAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.cargo_routes = Arc::new(OnceLock::new());
         clone
+    }
+
+    fn cargo_routes(&self) -> Arc<RustCargoRouteIndex> {
+        self.cargo_routes
+            .get_or_init(|| {
+                let files: Vec<_> = self.get_analyzed_files().into_iter().collect();
+                Arc::new(RustCargoRouteIndex::build(&files))
+            })
+            .clone()
     }
 
     pub fn new(project: Arc<dyn Project>) -> Self {
@@ -68,6 +81,7 @@ impl RustAnalyzer {
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            cargo_routes: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -95,6 +109,7 @@ impl RustAnalyzer {
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            cargo_routes: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -229,6 +244,7 @@ impl IAnalyzer for RustAnalyzer {
                 weight_reference_context,
             ),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            cargo_routes: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -246,6 +262,7 @@ impl IAnalyzer for RustAnalyzer {
                 weight_reference_context,
             ),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            cargo_routes: Arc::new(OnceLock::new()),
             usage_index: Arc::new(OnceLock::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
