@@ -33,7 +33,7 @@ pub(super) fn go_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source.get(node.start_byte()..node.end_byte()).unwrap_or("")
 }
 
-pub(super) fn determine_go_package_name(root: Node<'_>, source: &str) -> String {
+pub(crate) fn determine_go_package_name(root: Node<'_>, source: &str) -> String {
     let mut cursor = root.walk();
     for child in root.named_children(&mut cursor) {
         if child.kind() != "package_clause" {

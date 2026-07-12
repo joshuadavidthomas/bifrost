@@ -9,11 +9,126 @@
 //! is present) so that `CodeUnit::fq_name()` is unique per declaration.
 
 use crate::analyzer::{Project, ProjectFile};
+use crate::hash::HashMap;
 use std::path::{Path, PathBuf};
 
 pub(crate) struct GoModuleRoot {
     pub import_path: String,
     pub workspace_dir: PathBuf,
+}
+
+pub(crate) struct GoWorkspacePathIndex {
+    module_roots: Vec<GoModuleRoot>,
+    representative_by_directory: HashMap<PathBuf, ProjectFile>,
+}
+
+impl GoWorkspacePathIndex {
+    pub(crate) fn build(project: &dyn Project) -> Self {
+        let files = project.all_files().unwrap_or_default();
+        let mut module_roots = Vec::new();
+        let mut representative_by_directory: HashMap<PathBuf, ProjectFile> = HashMap::default();
+        for file in files {
+            if file
+                .rel_path()
+                .file_name()
+                .is_some_and(|name| name == "go.mod")
+            {
+                if let Ok(contents) = project.read_source(&file)
+                    && let Some(import_path) = go_module_path_from_source(&contents)
+                {
+                    module_roots.push(GoModuleRoot {
+                        import_path,
+                        workspace_dir: file.parent(),
+                    });
+                }
+            } else if file
+                .rel_path()
+                .extension()
+                .is_some_and(|extension| extension == "go")
+            {
+                representative_by_directory
+                    .entry(file.parent())
+                    .and_modify(|representative| {
+                        if is_go_test_file(representative) && !is_go_test_file(&file) {
+                            *representative = file.clone();
+                        }
+                    })
+                    .or_insert(file);
+            }
+        }
+        module_roots.sort_by(|left, right| {
+            right
+                .import_path
+                .len()
+                .cmp(&left.import_path.len())
+                .then_with(|| left.workspace_dir.cmp(&right.workspace_dir))
+        });
+        Self {
+            module_roots,
+            representative_by_directory,
+        }
+    }
+
+    pub(crate) fn import_files(
+        &self,
+        source_file: &ProjectFile,
+        import_path: &str,
+    ) -> Vec<ProjectFile> {
+        let import_path = import_path.trim().trim_matches('/');
+        if import_path.is_empty() {
+            return Vec::new();
+        }
+        let mut directories = Vec::new();
+        if let Some(relative) = import_path.strip_prefix("./") {
+            directories.push(source_file.parent().join(relative));
+        } else {
+            let mut cursor = Some(source_file.parent());
+            while let Some(directory) = cursor {
+                directories.push(directory.join("vendor").join(import_path));
+                cursor = directory.parent().map(Path::to_path_buf);
+            }
+            for module in &self.module_roots {
+                if let Some(relative) = module_relative_import(&module.import_path, import_path) {
+                    directories.push(module.workspace_dir.join(relative));
+                }
+            }
+            directories.push(PathBuf::from(import_path));
+        }
+        directories.sort();
+        directories.dedup();
+
+        directories
+            .into_iter()
+            .filter_map(|directory| self.representative_by_directory.get(&directory).cloned())
+            .collect()
+    }
+
+    pub(crate) fn package_prefix_exists(&self, prefix: &str) -> bool {
+        self.module_roots.iter().any(|module| {
+            module_relative_import(&module.import_path, prefix).is_some_and(|relative| {
+                self.representative_by_directory
+                    .contains_key(&module.workspace_dir.join(relative))
+            })
+        }) || self
+            .representative_by_directory
+            .contains_key(Path::new(prefix))
+    }
+}
+
+fn is_go_test_file(file: &ProjectFile) -> bool {
+    file.rel_path()
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().ends_with("_test.go"))
+}
+
+fn module_relative_import<'a>(module: &str, import_path: &'a str) -> Option<&'a str> {
+    if import_path == module {
+        Some("")
+    } else {
+        import_path
+            .strip_prefix(module)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+    }
 }
 
 pub(crate) fn go_module_roots(project: &dyn Project) -> Vec<GoModuleRoot> {

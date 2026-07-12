@@ -12,9 +12,10 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 - [x] (2026-07-13) Isolated the raw Go package-clause persistence fix.
 - [x] (2026-07-13) Add content-dependent parsed-state qualifier storage and remove Go source parsing from row hydration.
 - [x] (2026-07-13) Prototyped and rejected lazy Arc-backed index shards because they merely defer full SQLite materialization until a graph query.
-- [ ] Replace symbols resolver access to `DefinitionLookupIndex` with owned, query-shaped analyzer operations backed by indexed SQL candidate reads.
-- [ ] Add startup counters and warm-open, blob-reuse, single-language, and multi-language public parity regressions.
-- [ ] Run focused/full tests, formatting, and all-feature clippy.
+- [x] (2026-07-13) Add a lazy batch support boundary and migrate Go forward definition resolution to an owned, query-shaped provider backed by exact SQL definitions and bounded file hydration.
+- [ ] Migrate remaining symbols resolvers from `DefinitionLookupIndex` to owned, query-shaped analyzer operations backed by indexed SQL candidate reads.
+- [x] (2026-07-13) Add index-build/full-scan counters plus warm multi-language, blob-reuse, sibling-module, and bounded-hydration regressions for the Go vertical slice.
+- [x] (2026-07-13) Pass formatting, all-target/all-feature clippy, focused Go/persistence tests, and the complete `nlp,python` suite.
 - [ ] Measure cold build, warm open, peak RSS, and targeted query latency on `aws__aws-sdk-go-v2` and record the evidence.
 
 ## Surprises & Discoveries
@@ -30,6 +31,18 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 
 - Observation: Graph-heavy definition and usage resolution still accepts `&DefinitionLookupIndex` broadly and therefore materializes a language's full persisted definition index when that support object is first requested.
   Evidence: `DefinitionBatchContext::new` and the usage graph resolvers retain a `DefinitionLookupIndex`; replacing that contract with bounded store-backed lookup operations is a larger follow-up than removing eager workspace construction.
+
+- Observation: Go forward definition lookup can avoid the full index using only exact FQN, same-file identifier, direct-owner-child, and workspace-package existence queries. Exact FQNs already use indexed SQLite reads; owner children hydrate only files containing an exact owner; package existence is checked by import-path/module-root inversion and a bounded target-directory inventory.
+  Evidence: `AnalyzerGoDefinitionProvider` in `src/analyzer/usages/get_definition/go.rs` implements those operations without calling `definition_lookup_index` or `all_declarations`.
+
+- Observation: `DefinitionBatchContext` itself was an eager trigger even for resolvers that did not need the support index.
+  Evidence: Its constructor called `analyzer.definition_lookup_index()` before reading the request language. It now stores a `OnceLock` fallback initialized only by non-migrated language dispatch.
+
+- Observation: The existing Go workspace graph preparsed every analyzed Go file on the first batch lookup, even though forward resolution only needs the current file's tree and its bounded import namespace.
+  Evidence: The forward path now calls `definition_import_namespaces(file)` and `resolve_go_reference_with_namespaces` with the already parsed request tree; the obsolete whole-workspace preparse entrypoints were removed while usage scanning retains its candidate-scoped graph.
+
+- Observation: Exact SQL lookup still called the nonpersisted path-synthetic union, which enumerated every live path even for adapters such as Go that never synthesize path-derived modules.
+  Evidence: `LanguageAdapter::has_path_synthetic_module_units` now defaults false and only JavaScript, TypeScript, and Python opt in, allowing other adapters to return an empty union before taking a live snapshot.
 
 - Observation: Go intentionally stores empty `code_units.content_qualifier` and `blob_meta.content_package`, then `GoAdapter::hydrate_content_qualifier` reads and parses the entire source file for every resolved candidate row.
   Evidence: `src/analyzer/go/adapter.rs` returns `String::new()` from both storage hooks and constructs a tree-sitter parser in the hydration hook.
@@ -47,6 +60,10 @@ Opening a warm persisted workspace must finish without reconstructing every decl
   Rationale: Exact FQN, normalized FQN, identifier, owner/member, file/identifier, type/package, and package-prefix operations can fetch bounded candidates using the persisted short-name and identifier indexes, hydrate only live matches, and merge dirty state. Multi-language lookup can fan out those owned queries without constructing a combined workspace index.
   Date/Author: 2026-07-13 / Codex
 
+- Decision: Make the legacy batch definition index a lazy fallback, and route Go through a language-specific provider first.
+  Rationale: This establishes a complete vertical slice without forcing a cross-language resolver rewrite in one checkpoint. Independent index-build and full-declaration-scan counters prevent the lazy fallback from silently regressing Go.
+  Date/Author: 2026-07-13 / Codex
+
 - Decision: Keep exact symbols lookup on the existing bounded `definitions` SQL path and test that it does not initialize the composite definition index.
   Rationale: Deferring the full index is only useful if common symbols requests do not immediately force it. This establishes that boundary without claiming that graph-heavy usage analysis is store-backed yet.
   Date/Author: 2026-07-13 / Codex
@@ -61,7 +78,7 @@ Opening a warm persisted workspace must finish without reconstructing every decl
 
 ## Outcomes & Retrospective
 
-Implementation and measured evidence are pending.
+The first Go forward-definition vertical slice is implemented. A warm persisted multi-language public `get_definitions_by_location` regression resolves an imported package member whose import-path tail differs from its declared package name, with zero warm-build parse events, zero delegate/composite definition-index builds, and zero full declaration scans. A sibling-module regression proves the workspace path index is built once and package-clause metadata is read without full file-state hydration. Remaining language migrations and real-corpus measurements are pending.
 
 ## Context and Orientation
 
@@ -110,7 +127,7 @@ All tests and benchmark commands are repeatable. The Go epoch bump invalidates o
 
 ## Artifacts and Notes
 
-The isolated Go qualifier checkpoint passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, the 710-test `cargo test --features nlp,python --lib` suite, all three `go_analyzer_parity` tests, the store side-table round trip, and the identical-blob/two-live-path regression. Benchmark transcripts and final query-provider test counts remain pending.
+The integrated Go query-provider checkpoint passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, the complete `cargo test --features nlp,python` suite, all 35 focused Go definition tests, all 16 canonical-FQN tests, all six persistence tests, and the identical-blob/two-live-path store regression. Benchmark transcripts remain pending.
 
 ## Interfaces and Dependencies
 

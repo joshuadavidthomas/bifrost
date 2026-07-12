@@ -1,5 +1,4 @@
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::cpp_graph::{
     CppTargetKind, CppVisibilityIndex, cpp_call_arity, cpp_constructor_type_node,
     cpp_first_type_child, cpp_function_return_type_text, cpp_is_declaration_name,
@@ -15,10 +14,10 @@ use crate::analyzer::usages::csharp_graph::{
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
 use crate::analyzer::usages::go_graph::{
-    GoIndexedMemberLookup, GoProjectGraph, build_workspace_go_graph, default_go_import_local_name,
+    GoIndexedMemberLookup, GoReferenceResolution, default_go_import_local_name,
     extract_go_import_path, go_embedded_field_unit_type_text, go_simple_type_name,
-    go_type_name_parts, go_unique_indexed_member_candidate_at_nearest_depth, preparse_go_files,
-    resolve_go_reference,
+    go_type_name_parts, go_unique_indexed_member_candidate_at_nearest_depth,
+    resolve_go_reference_with_namespaces,
 };
 use crate::analyzer::usages::inverted_edges::{ClassRangeIndex, first_precise};
 use crate::analyzer::usages::java_graph::java_signature_arity;
@@ -75,7 +74,7 @@ pub(crate) use rust::{
     RustTypeLookupCache, rust_expression_type_definition_fqn_cached, rust_is_type_definition,
     rust_resolve_type_node_fqn,
 };
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
 
 mod call_sites;
@@ -267,26 +266,31 @@ pub(crate) fn resolve_call_reference_definition_with_source(
 }
 
 struct DefinitionBatchContext<'a> {
-    support: &'a DefinitionLookupIndex,
+    analyzer: &'a dyn IAnalyzer,
+    support: OnceLock<&'a DefinitionLookupIndex>,
     sources: HashMap<ProjectFile, Result<Arc<String>, String>>,
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
     scala_project_types: Option<Arc<ScalaProjectTypes>>,
-    go_graph: Option<Option<Arc<GoProjectGraph>>>,
 }
 
 impl<'a> DefinitionBatchContext<'a> {
     fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         Self {
-            support: analyzer.definition_lookup_index(),
+            analyzer,
+            support: OnceLock::new(),
             sources: HashMap::default(),
             trees: HashMap::default(),
             line_starts: HashMap::default(),
             cpp_visibility: HashMap::default(),
             scala_project_types: None,
-            go_graph: None,
         }
+    }
+
+    fn support(&self) -> &'a DefinitionLookupIndex {
+        self.support
+            .get_or_init(|| self.analyzer.definition_lookup_index())
     }
 
     fn source(&mut self, file: &ProjectFile) -> Result<Arc<String>, String> {
@@ -334,24 +338,6 @@ impl<'a> DefinitionBatchContext<'a> {
         self.scala_project_types
             .get_or_insert_with(|| scala.project_types())
             .clone()
-    }
-
-    fn go_graph(
-        &mut self,
-        go: &crate::analyzer::GoAnalyzer,
-        analyzer: &dyn IAnalyzer,
-    ) -> Option<Arc<GoProjectGraph>> {
-        if self.go_graph.is_none() {
-            let files = analyzed_files_for_language(analyzer, Language::Go);
-            let graph = if files.is_empty() {
-                None
-            } else {
-                let cache = preparse_go_files(&files);
-                build_workspace_go_graph(go, &files, Some(&cache)).map(Arc::new)
-            };
-            self.go_graph = Some(graph);
-        }
-        self.go_graph.as_ref().and_then(Clone::clone)
     }
 }
 
@@ -405,7 +391,7 @@ fn resolve_one(
     let resolved = match language {
         Language::Rust => rust::resolve_rust(
             analyzer,
-            context.support,
+            context.support(),
             &request.file,
             &source,
             tree.as_ref(),
@@ -413,7 +399,7 @@ fn resolve_one(
         ),
         Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts(
             analyzer,
-            context.support,
+            context.support(),
             &request.file,
             language,
             &source,
@@ -422,19 +408,36 @@ fn resolve_one(
         ),
         Language::Go => {
             let go = resolve_analyzer::<GoAnalyzer>(analyzer);
-            let go_graph = go.and_then(|go| context.go_graph(go, analyzer));
-            go::resolve_go(
-                analyzer,
-                context.support,
-                &request.file,
-                &source,
-                &site,
-                go_graph.as_deref(),
-            )
+            let resolution = go.and_then(|go| {
+                let tree = tree.as_ref()?;
+                let file_package =
+                    go.canonical_package_name_from_tree(&request.file, &source, tree.root_node());
+                let (aliases, dot_imports) = go.definition_import_namespaces(&request.file);
+                Some(resolve_go_reference_with_namespaces(
+                    tree.root_node(),
+                    &source,
+                    &file_package,
+                    aliases,
+                    dot_imports,
+                    &site,
+                ))
+            });
+            if let Some(go_analyzer) = go {
+                go::resolve_go(
+                    analyzer,
+                    &go::AnalyzerGoDefinitionProvider::new(go_analyzer),
+                    &request.file,
+                    &source,
+                    &site,
+                    resolution,
+                )
+            } else {
+                no_definition("go_analyzer_unavailable", "Go analyzer is unavailable")
+            }
         }
         Language::Java => java::resolve_java(
             analyzer,
-            context.support,
+            context.support(),
             &request.file,
             &source,
             tree.as_ref(),
@@ -442,7 +445,7 @@ fn resolve_one(
         ),
         Language::Php => php::resolve_php(
             analyzer,
-            context.support,
+            context.support(),
             &request.file,
             &source,
             tree.as_ref(),
@@ -450,7 +453,7 @@ fn resolve_one(
         ),
         Language::Python => python::resolve_python(
             analyzer,
-            context.support,
+            context.support(),
             &request.file,
             &source,
             tree.as_ref(),
@@ -458,7 +461,7 @@ fn resolve_one(
         ),
         Language::CSharp => csharp::resolve_csharp(
             analyzer,
-            context.support,
+            context.support(),
             &request.file,
             &source,
             tree.as_ref(),
@@ -482,7 +485,7 @@ fn resolve_one(
         ),
         Language::Ruby => ruby::resolve_ruby(
             analyzer,
-            context.support,
+            context.support(),
             &request.file,
             &source,
             tree.as_ref(),

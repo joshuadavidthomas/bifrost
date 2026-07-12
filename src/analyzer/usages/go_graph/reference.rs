@@ -1,8 +1,6 @@
 use super::extractor::{declared_names, is_definition_identifier, parameter_names, selector_parts};
-use super::resolver::GoProjectGraph;
 use crate::analyzer::usages::get_definition::ResolvedReferenceSite;
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::{GoAnalyzer, ProjectFile};
 use crate::hash::HashMap;
 use tree_sitter::Node;
 
@@ -12,27 +10,7 @@ pub(in crate::analyzer::usages) struct GoReferenceResolution {
     pub shadowed: bool,
 }
 
-pub(in crate::analyzer::usages) fn resolve_go_reference(
-    graph: &GoProjectGraph,
-    go: &GoAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    site: &ResolvedReferenceSite,
-) -> Option<GoReferenceResolution> {
-    let parsed = graph.parsed_file(file)?;
-    let file_pkg = graph.package_name_of(file)?;
-    let (alias_packages, dot_packages) = graph.namespace_packages(go, file);
-    Some(resolve_with_namespaces(
-        parsed.tree.root_node(),
-        source,
-        &file_pkg,
-        alias_packages,
-        dot_packages,
-        site,
-    ))
-}
-
-fn resolve_with_namespaces(
+pub(in crate::analyzer::usages) fn resolve_go_reference_with_namespaces(
     root: Node<'_>,
     source: &str,
     file_pkg: &str,

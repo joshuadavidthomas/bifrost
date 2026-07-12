@@ -102,6 +102,10 @@ impl LanguageAdapter for PythonAdapter {
         module_code_unit(file, &python_module_name(file))
     }
 
+    fn has_path_synthetic_module_units(&self) -> bool {
+        true
+    }
+
     fn contains_tests(
         &self,
         _file: &ProjectFile,

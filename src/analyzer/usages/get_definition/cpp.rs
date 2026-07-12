@@ -20,7 +20,7 @@ pub(super) fn resolve_cpp(
         return no_definition("cpp_parse_failed", "C++ source could not be parsed");
     };
     let visibility = context.cpp_visibility(cpp, analyzer, file);
-    let support = context.support;
+    let support = context.support();
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {

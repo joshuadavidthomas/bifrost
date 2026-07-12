@@ -1,6 +1,91 @@
 use super::*;
 use tree_sitter::Tree;
 
+pub(crate) trait GoDefinitionProvider {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
+    fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit>;
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool;
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        !self.fqn(fqn).is_empty()
+    }
+}
+
+impl GoDefinitionProvider for DefinitionLookupIndex {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        DefinitionLookupIndex::fqn(self, fqn)
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        DefinitionLookupIndex::file_identifier(self, file, identifier)
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        DefinitionLookupIndex::fqn_direct_children(self, fqn)
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        DefinitionLookupIndex::fqn_prefix_exists(self, prefix)
+    }
+}
+
+pub(super) struct AnalyzerGoDefinitionProvider<'a> {
+    analyzer: &'a GoAnalyzer,
+}
+
+impl<'a> AnalyzerGoDefinitionProvider<'a> {
+    pub(super) fn new(analyzer: &'a GoAnalyzer) -> Self {
+        Self { analyzer }
+    }
+}
+
+impl GoDefinitionProvider for AnalyzerGoDefinitionProvider<'_> {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut units: Vec<_> = self.analyzer.definitions(fqn).collect();
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        self.analyzer
+            .declarations(file)
+            .into_iter()
+            .filter(|unit| unit.identifier() == identifier)
+            .collect()
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut children = Vec::new();
+        for owner in self.fqn(fqn) {
+            children.extend(self.analyzer.direct_children(&owner));
+        }
+        sort_units(&mut children);
+        children.dedup();
+        children
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.analyzer
+            .workspace_path_index()
+            .package_prefix_exists(prefix)
+    }
+}
+
+fn go_fqn_candidates(
+    support: &dyn GoDefinitionProvider,
+    fqns: impl IntoIterator<Item = String>,
+) -> Vec<CodeUnit> {
+    let mut candidates = Vec::new();
+    for fqn in fqns {
+        candidates.extend(support.fqn(&fqn));
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
 pub(super) fn parse_go_tree(source: &str) -> Option<Tree> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
@@ -9,20 +94,18 @@ pub(super) fn parse_go_tree(source: &str) -> Option<Tree> {
 
 pub(super) fn resolve_go(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     site: &ResolvedReferenceSite,
-    graph: Option<&GoProjectGraph>,
+    resolution: Option<GoReferenceResolution>,
 ) -> DefinitionLookupOutcome {
     let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
         return no_definition("go_analyzer_unavailable", "Go analyzer is unavailable");
     };
     let reference = site.text.as_str();
-    if let Some(resolution) =
-        graph.and_then(|graph| resolve_go_reference(graph, go, file, source, site))
-    {
-        let candidates = support.fqn_candidates(resolution.fqn_candidates);
+    if let Some(resolution) = resolution {
+        let candidates = go_fqn_candidates(support, resolution.fqn_candidates);
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
@@ -94,7 +177,7 @@ pub(super) fn resolve_go(
         {
             return outcome;
         }
-        let candidates = support.fqn_candidates([format!("{package}.{qualifier}.{name}")]);
+        let candidates = go_fqn_candidates(support, [format!("{package}.{qualifier}.{name}")]);
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
@@ -138,7 +221,7 @@ pub(crate) struct GoTypeLookupResolution {
 
 pub(crate) fn go_type_lookup_resolution(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -173,12 +256,10 @@ pub(crate) fn go_type_lookup_resolution(
 }
 
 fn go_package_name(file: &ProjectFile, source: &str) -> String {
-    let declared = source
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("package "))
-        .and_then(|rest| rest.split_whitespace().next())
-        .unwrap_or("");
-    crate::analyzer::go::packages::canonical_go_package_name(file, declared)
+    let declared = parse_go_tree(source)
+        .map(|tree| crate::analyzer::go::determine_go_package_name(tree.root_node(), source))
+        .unwrap_or_default();
+    crate::analyzer::go::packages::canonical_go_package_name(file, &declared)
 }
 
 fn go_import_paths(
@@ -209,12 +290,12 @@ fn go_import_paths(
     imports
 }
 
-fn go_import_path_is_workspace(support: &DefinitionLookupIndex, import_path: &str) -> bool {
+fn go_import_path_is_workspace(support: &dyn GoDefinitionProvider, import_path: &str) -> bool {
     support.fqn_prefix_exists(import_path)
 }
 
 fn go_package_member_candidates(
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     package: &str,
     name: &str,
 ) -> Vec<CodeUnit> {
@@ -229,7 +310,7 @@ fn go_package_member_candidates(
 }
 
 fn go_package_selector_chain_outcome(
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     package: &str,
     site: &ResolvedReferenceSite,
 ) -> Option<DefinitionLookupOutcome> {
@@ -245,7 +326,7 @@ fn go_package_selector_chain_outcome(
 
 fn go_external_dot_import_path(
     go: &crate::analyzer::GoAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
 ) -> Option<String> {
     go.import_info_of(file).into_iter().find_map(|import| {
@@ -258,7 +339,7 @@ fn go_external_dot_import_path(
 
 fn resolve_go_local_selector_chain(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     site: &ResolvedReferenceSite,
@@ -373,7 +454,7 @@ fn go_partial_selector_chain_outcome(
 
 fn go_binding_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -386,7 +467,7 @@ fn go_binding_type_fqn(
 
 fn go_receiver_binding_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -412,7 +493,7 @@ fn go_receiver_binding_type_fqn(
 /// statement node we walk through, so those bindings are covered too.
 fn go_local_binding_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -596,7 +677,7 @@ fn go_type_text_from_composite_value(value: &str) -> Option<&str> {
 
 fn go_value_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -616,7 +697,7 @@ fn go_value_type_fqn(
 
 fn go_value_type_text(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -645,7 +726,7 @@ fn go_value_type_text(
 
 fn go_identifier_value_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -667,7 +748,7 @@ fn go_identifier_value_type_fqn(
 
 fn go_selector_value_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -695,7 +776,7 @@ fn go_selector_value_type_fqn(
 
 fn go_expression_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -756,7 +837,7 @@ fn go_type_lookup_expression(mut node: Node<'_>) -> Node<'_> {
 }
 
 fn go_interface_method_owner_type_fqn(
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     mut node: Node<'_>,
@@ -792,7 +873,7 @@ fn go_interface_method_owner_type_fqn(
 
 fn go_range_binding_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -810,7 +891,7 @@ fn go_range_binding_type_fqn(
 
 fn go_expression_type_text(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -848,7 +929,7 @@ fn go_expression_type_text(
 
 fn go_selector_expression_type_text(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -873,7 +954,7 @@ fn go_selector_expression_type_text(
 
 fn go_index_expression_type_text(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -894,7 +975,7 @@ fn go_index_expression_type_text(
 
 fn go_call_expression_return_type_text(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -951,7 +1032,7 @@ fn go_call_expression_return_type_text(
 
 fn go_call_expression_return_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -1029,7 +1110,7 @@ fn go_callable_return_type_text(
 
 fn go_callable_return_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     candidates: Vec<CodeUnit>,
 ) -> Option<String> {
     candidates.into_iter().find_map(|candidate| {
@@ -1112,7 +1193,7 @@ fn go_type_text_from_fqn(fqn: &str) -> Option<&str> {
 
 fn go_resolve_type_text_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     type_text: &str,
@@ -1164,7 +1245,7 @@ fn go_parameter_declaration_type_for_name<'tree>(
 
 fn go_indexed_field_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     field: &str,
 ) -> Option<String> {
@@ -1174,7 +1255,7 @@ fn go_indexed_field_type_fqn(
 
 fn go_indexed_field_type(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     field: &str,
 ) -> Option<(ProjectFile, String)> {
@@ -1189,7 +1270,7 @@ fn go_indexed_field_type(
 
 fn go_indexed_field_lookup(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     field: &str,
 ) -> GoIndexedMemberLookup<CodeUnit> {
@@ -1200,7 +1281,7 @@ fn go_indexed_field_lookup(
 
 fn go_embedded_field_types(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
 ) -> Vec<String> {
     support
@@ -1236,7 +1317,7 @@ fn go_field_unit_type_text(
 
 fn go_resolve_go_field_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     owner_fqn: &str,
     field_file: &ProjectFile,
     type_text: &str,
@@ -1251,7 +1332,7 @@ fn go_resolve_go_field_type_fqn(
 
 fn go_resolve_qualified_type_from_file(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     type_text: &str,
 ) -> Option<String> {
@@ -1266,7 +1347,7 @@ fn go_resolve_qualified_type_from_file(
 
 fn go_resolve_type_fqn(
     analyzer: &dyn IAnalyzer,
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     file: &ProjectFile,
     source: &str,
     type_node: Node<'_>,
@@ -1278,7 +1359,7 @@ fn go_resolve_type_fqn(
 }
 
 fn go_resolve_type_name_in_package(
-    support: &DefinitionLookupIndex,
+    support: &dyn GoDefinitionProvider,
     package: &str,
     type_text: &str,
 ) -> Option<String> {

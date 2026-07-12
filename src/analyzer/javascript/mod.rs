@@ -98,6 +98,10 @@ impl LanguageAdapter for JavascriptAdapter {
         Some(module_code_unit(file))
     }
 
+    fn has_path_synthetic_module_units(&self) -> bool {
+        true
+    }
+
     fn path_synthetic_module_requires_imports(&self) -> bool {
         true
     }

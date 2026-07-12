@@ -12,7 +12,10 @@ use crate::hash::HashSet;
 use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 /// Resolve a concrete analyzer of type `T` out of a `&dyn IAnalyzer`, whether it is
 /// that analyzer directly or a [`MultiAnalyzer`] holding it as a per-language delegate.
@@ -192,21 +195,16 @@ fn is_js_ts_config_file(file: &ProjectFile) -> bool {
 #[derive(Clone, Default)]
 pub struct MultiAnalyzer {
     delegates: BTreeMap<Language, AnalyzerDelegate>,
-    definition_lookup_index: Arc<DefinitionLookupIndex>,
+    definition_lookup_index: Arc<OnceLock<DefinitionLookupIndex>>,
+    definition_lookup_index_build_count: Arc<AtomicUsize>,
 }
 
 impl MultiAnalyzer {
     pub fn new(delegates: BTreeMap<Language, AnalyzerDelegate>) -> Self {
-        let definition_lookup_index = Arc::new(DefinitionLookupIndex::from_declarations(
-            delegates
-                .values()
-                .flat_map(|delegate| delegate.analyzer().all_declarations()),
-            str::to_string,
-            |unit| unit.identifier().to_string(),
-        ));
         Self {
             delegates,
-            definition_lookup_index,
+            definition_lookup_index: Arc::new(OnceLock::new()),
+            definition_lookup_index_build_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -230,7 +228,8 @@ impl MultiAnalyzer {
                     (*language, delegate.clone_with_project(Arc::clone(&project)))
                 })
                 .collect(),
-            definition_lookup_index: Arc::clone(&self.definition_lookup_index),
+            definition_lookup_index: Arc::new(OnceLock::new()),
+            definition_lookup_index_build_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -465,7 +464,56 @@ impl IAnalyzer for MultiAnalyzer {
     }
 
     fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
-        self.definition_lookup_index.as_ref()
+        self.definition_lookup_index.get_or_init(|| {
+            self.definition_lookup_index_build_count
+                .fetch_add(1, Ordering::Relaxed);
+            DefinitionLookupIndex::from_declarations(
+                self.delegates
+                    .values()
+                    .flat_map(|delegate| delegate.analyzer().all_declarations()),
+                str::to_string,
+                |unit| unit.identifier().to_string(),
+            )
+        })
+    }
+
+    fn reset_definition_lookup_index_build_count_for_test(&self) {
+        self.definition_lookup_index_build_count
+            .store(0, Ordering::Relaxed);
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .reset_definition_lookup_index_build_count_for_test();
+        }
+    }
+
+    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        self.definition_lookup_index_build_count
+            .load(Ordering::Relaxed)
+            + self
+                .delegates
+                .values()
+                .map(|delegate| {
+                    delegate
+                        .analyzer()
+                        .definition_lookup_index_build_count_for_test()
+                })
+                .sum::<usize>()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .reset_full_declaration_scan_count_for_test();
+        }
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| delegate.analyzer().full_declaration_scan_count_for_test())
+            .sum()
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -804,6 +852,7 @@ impl IAnalyzer for MultiAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::FileSetProject;
 
     fn project_file(rel_path: &str) -> ProjectFile {
         let root = if cfg!(windows) {
@@ -822,5 +871,30 @@ mod tests {
         )));
         assert!(!is_js_ts_config_file(&project_file("package.json")));
         assert!(!is_js_ts_config_file(&project_file("src/app.ts")));
+    }
+
+    #[test]
+    fn project_clone_has_an_independent_lazy_definition_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
+            root,
+            std::iter::empty::<std::path::PathBuf>(),
+        ));
+        let analyzer = MultiAnalyzer::new(BTreeMap::new());
+        let snapshot = analyzer.clone_with_project(project);
+
+        assert!(!Arc::ptr_eq(
+            &analyzer.definition_lookup_index,
+            &snapshot.definition_lookup_index
+        ));
+        assert!(!Arc::ptr_eq(
+            &analyzer.definition_lookup_index_build_count,
+            &snapshot.definition_lookup_index_build_count
+        ));
+
+        snapshot.definition_lookup_index();
+        assert_eq!(snapshot.definition_lookup_index_build_count_for_test(), 1);
+        assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
     }
 }

@@ -53,6 +53,13 @@ fn python_project(root: &Path) -> Arc<dyn Project> {
     ))
 }
 
+fn go_python_project(root: &Path) -> Arc<dyn Project> {
+    Arc::new(TestProject::with_languages(
+        root.canonicalize().unwrap(),
+        BTreeSet::from([Language::Go, Language::Python]),
+    ))
+}
+
 fn parsed_file_count(events: &[BuildProgressEvent]) -> usize {
     events
         .iter()
@@ -66,6 +73,58 @@ fn declaration_names(analyzer: &dyn IAnalyzer) -> BTreeSet<String> {
         .all_declarations()
         .map(|unit| unit.fq_name())
         .collect()
+}
+
+#[test]
+fn warm_multilanguage_go_definition_query_does_not_build_full_definition_index() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_file(root, "go.mod", "module example.com/app\n");
+    write_file(
+        root,
+        "main.go",
+        "package main\n\nimport \"example.com/app/generated/client\"\n\nfunc Run() { api.Helper() }\n",
+    );
+    write_file(
+        root,
+        "generated/client/client.go",
+        "package api\n\nfunc Helper() {}\n",
+    );
+    write_file(root, "other.py", "def unrelated():\n    return 1\n");
+    let repo = init_git_repo(root);
+    commit_all(&repo, "init");
+    let project = go_python_project(root);
+
+    let _cold = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default());
+    let warm_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let warm =
+        WorkspaceAnalyzer::build_persisted_with_progress(project, AnalyzerConfig::default(), {
+            let events = Arc::clone(&warm_events);
+            move |event| events.lock().unwrap().push(event)
+        });
+    let analyzer = warm.analyzer();
+    assert_eq!(parsed_file_count(&warm_events.lock().unwrap()), 0);
+    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+
+    let result = brokk_bifrost::searchtools::get_definitions_by_location(
+        analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "main.go".to_string(),
+                line: Some(5),
+                column: Some(18),
+            }],
+        },
+    );
+
+    assert_eq!(result.results[0].status, "resolved");
+    assert_eq!(
+        result.results[0].definitions[0].fqn,
+        "example.com/app/generated/client.Helper"
+    );
+    assert_eq!(analyzer.definition_lookup_index_build_count_for_test(), 0);
+    assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
 }
 
 #[test]

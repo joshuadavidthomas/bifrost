@@ -8,7 +8,8 @@ mod common;
 use brokk_bifrost::{
     GoAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
     searchtools::{
-        ScanUsagesByReferenceParams, ScanUsagesStatus, SearchSymbolsParams, SymbolLookupParams,
+        DefinitionReferenceQuery, GetDefinitionParams, ScanUsagesByReferenceParams,
+        ScanUsagesStatus, SearchSymbolsParams, SymbolLookupParams, get_definitions_by_location,
         get_symbol_locations, get_symbol_sources, scan_usages_by_reference, search_symbols,
     },
 };
@@ -341,6 +342,53 @@ fn imports_resolve_to_the_exact_canonical_package() {
             .iter()
             .any(|cu| cu.package_name() == "example.com/repo/b/list"),
         "import of a/list must not pull in the same-named b/list: {resolved:#?}"
+    );
+}
+
+#[test]
+fn definition_lookup_resolves_sibling_module_package_clause_without_workspace_hydration() {
+    let project = InlineTestProject::with_language(Language::Go)
+        .file("app/go.mod", "module example.com/app\n")
+        .file(
+            "app/main.go",
+            "package main\nimport \"example.com/application\"\nfunc Run() { views.Draw() }\n",
+        )
+        // This path would be selected by an unbounded `example.com/app`
+        // prefix match for the `example.com/application` import.
+        .file("app/lication/wrong.go", "package wrong\nfunc Draw() {}\n")
+        .file("application/go.mod", "module example.com/application\n")
+        .file("application/render.go", "package views\nfunc Draw() {}\n")
+        .build();
+    let analyzer = GoAnalyzer::from_project(project.project().clone());
+    analyzer.reset_full_hydration_count_for_test();
+
+    for _ in 0..2 {
+        let result = get_definitions_by_location(
+            &analyzer,
+            GetDefinitionParams {
+                references: vec![DefinitionReferenceQuery {
+                    path: "app/main.go".to_string(),
+                    line: Some(3),
+                    column: Some(20),
+                }],
+            },
+        );
+        assert_eq!(result.results[0].status, "resolved", "{result:#?}");
+        assert_eq!(
+            result.results[0].definitions[0].fqn, "example.com/application.Draw",
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].definitions[0].path, "application/render.go",
+            "{result:#?}"
+        );
+    }
+
+    assert_eq!(analyzer.workspace_path_index_build_count_for_test(), 1);
+    assert_eq!(
+        analyzer.full_hydration_count_for_test(),
+        0,
+        "definition lookup should read package metadata without hydrating file states"
     );
 }
 

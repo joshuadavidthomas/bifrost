@@ -18,10 +18,11 @@ use crate::analyzer::{
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub(crate) use adapter::GoAdapter;
 use cache::GoMemoCaches;
-use declarations::determine_go_package_name;
+pub(crate) use declarations::determine_go_package_name;
 use tests::detect_go_test_assertion_smells;
 use tree_sitter::Node;
 
@@ -90,6 +91,16 @@ impl GoAnalyzer {
         determine_go_package_name(tree.root_node(), source)
     }
 
+    pub(crate) fn canonical_package_name_from_tree(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        root: tree_sitter::Node<'_>,
+    ) -> String {
+        let declared = determine_go_package_name(root, source);
+        packages::canonical_go_package_name(file, &declared)
+    }
+
     #[doc(hidden)]
     pub fn reset_full_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
@@ -103,6 +114,35 @@ impl GoAnalyzer {
     #[doc(hidden)]
     pub fn bulk_hydration_count_for_test(&self) -> usize {
         self.inner.bulk_hydration_count_for_test()
+    }
+
+    #[doc(hidden)]
+    pub fn reset_definition_lookup_index_build_count_for_test(&self) {
+        self.inner
+            .reset_definition_lookup_index_build_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        self.inner.definition_lookup_index_build_count_for_test()
+    }
+
+    pub(crate) fn package_clause_of(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.content_qualifier_of(file)
+    }
+
+    pub(crate) fn workspace_path_index(&self) -> &packages::GoWorkspacePathIndex {
+        self.memo_caches.workspace_path_index.get_or_init(|| {
+            self.memo_caches
+                .workspace_path_index_build_count
+                .fetch_add(1, Ordering::Relaxed);
+            packages::GoWorkspacePathIndex::build(self.project())
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn workspace_path_index_build_count_for_test(&self) -> usize {
+        self.memo_caches.workspace_path_index_build_count()
     }
 
     pub(crate) fn package_clause_names(&self) -> &crate::hash::HashMap<ProjectFile, String> {
@@ -236,6 +276,23 @@ impl IAnalyzer for GoAnalyzer {
 
     fn definition_lookup_index(&self) -> &crate::analyzer::DefinitionLookupIndex {
         self.inner.definition_lookup_index()
+    }
+
+    fn reset_definition_lookup_index_build_count_for_test(&self) {
+        self.inner
+            .reset_definition_lookup_index_build_count_for_test();
+    }
+
+    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        self.inner.definition_lookup_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner.reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner.full_declaration_scan_count_for_test()
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {

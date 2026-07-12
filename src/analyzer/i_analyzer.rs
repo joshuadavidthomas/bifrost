@@ -97,6 +97,18 @@ pub trait IAnalyzer: Send + Sync + Any {
         static EMPTY: OnceLock<DefinitionLookupIndex> = OnceLock::new();
         EMPTY.get_or_init(DefinitionLookupIndex::default)
     }
+    #[doc(hidden)]
+    fn reset_definition_lookup_index_build_count_for_test(&self) {}
+    #[doc(hidden)]
+    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        0
+    }
+    #[doc(hidden)]
+    fn reset_full_declaration_scan_count_for_test(&self) {}
+    #[doc(hidden)]
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        0
+    }
     fn usage_facts_index(&self) -> &UsageFactsIndex {
         static EMPTY: OnceLock<UsageFactsIndex> = OnceLock::new();
         EMPTY.get_or_init(UsageFactsIndex::default)

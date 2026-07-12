@@ -51,7 +51,7 @@ pub(super) fn resolve_scala(
     let Some(tree) = tree else {
         return no_definition("scala_parse_failed", "Scala source could not be parsed");
     };
-    let support = context.support;
+    let support = context.support();
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {
@@ -141,7 +141,7 @@ pub(super) fn resolve_scala(
             if let Some(imported_member) = scala_wildcard_imported_member_outcome(ctx, text, None) {
                 return imported_member;
             }
-            if scala_import_boundary_for_name(scala, context.support, file, text) {
+            if scala_import_boundary_for_name(scala, context.support(), file, text) {
                 return boundary(format!(
                     "`{text}` appears to cross a Scala import boundary not indexed in this workspace"
                 ));

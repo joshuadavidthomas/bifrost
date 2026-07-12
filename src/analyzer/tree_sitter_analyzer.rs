@@ -211,6 +211,9 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn path_synthetic_module_unit(&self, _file: &ProjectFile) -> Option<CodeUnit> {
         None
     }
+    fn has_path_synthetic_module_units(&self) -> bool {
+        false
+    }
     fn path_synthetic_module_requires_imports(&self) -> bool {
         false
     }
@@ -383,6 +386,22 @@ impl AnalyzerRuntimeState {
             .lock()
             .expect("dirty file-state mutex poisoned")
             .clone()
+    }
+
+    fn dirty_content_qualifier(&self, key: &FileStateCacheKey) -> Option<String> {
+        self.dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned")
+            .get(key)
+            .map(|dirty| dirty.state.content_qualifier.clone())
+    }
+
+    fn dirty_imports(&self, key: &FileStateCacheKey) -> Option<Vec<ImportInfo>> {
+        self.dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned")
+            .get(key)
+            .map(|dirty| dirty.state.imports.clone())
     }
 }
 
@@ -746,6 +765,7 @@ pub struct TreeSitterAnalyzer<A> {
     full_hydration_count: Arc<AtomicUsize>,
     bulk_hydration_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
+    definition_lookup_index_build_count: Arc<AtomicUsize>,
     _state: PhantomData<A>,
 }
 
@@ -767,6 +787,9 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             full_hydration_count: Arc::clone(&self.full_hydration_count),
             bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
+            definition_lookup_index_build_count: Arc::clone(
+                &self.definition_lookup_index_build_count,
+            ),
             _state: PhantomData,
         }
     }
@@ -907,6 +930,7 @@ where
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
+            definition_lookup_index_build_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
         }
     }
@@ -966,6 +990,7 @@ where
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
+            definition_lookup_index_build_count: Arc::new(AtomicUsize::new(0)),
             _state: PhantomData,
         }
     }
@@ -1954,6 +1979,9 @@ where
         &self,
         mut keep: impl FnMut(&CodeUnit) -> bool,
     ) -> Option<Vec<CodeUnit>> {
+        if !self.adapter.has_path_synthetic_module_units() {
+            return Some(Vec::new());
+        }
         let snapshot = self.live_snapshot();
         let mut candidates = Vec::new();
         let mut candidate_files = Vec::new();
@@ -2137,6 +2165,18 @@ where
     #[doc(hidden)]
     pub fn full_declaration_scan_count_for_test(&self) -> usize {
         self.full_declaration_scan_count.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_definition_lookup_index_build_count_for_test(&self) {
+        self.definition_lookup_index_build_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        self.definition_lookup_index_build_count
+            .load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]
@@ -2523,6 +2563,28 @@ where
             .map(|state| state.package_name.clone())
     }
 
+    pub(crate) fn content_qualifier_of(&self, file: &ProjectFile) -> Option<String> {
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(content_qualifier) = self.state.dirty_content_qualifier(&key) {
+            return Some(content_qualifier);
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.store_context
+            .store
+            .content_package(oid, &storage_key)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                self.source_snapshot_file_state(file)
+                    .map(|state| state.content_qualifier.clone())
+            })
+            .or_else(|| {
+                self.fetch_file_state(file)
+                    .map(|state| state.content_qualifier.clone())
+            })
+    }
+
     pub(crate) fn ruby_method_dispatch_mode(
         &self,
         code_unit: &CodeUnit,
@@ -2532,8 +2594,27 @@ where
     }
 
     pub(crate) fn import_info_of(&self, file: &ProjectFile) -> Vec<ImportInfo> {
-        self.fetch_file_state(file)
-            .map(|state| state.imports.clone())
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return Vec::new();
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(imports) = self.state.dirty_imports(&key) {
+            return imports;
+        }
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        self.store_context
+            .store
+            .hydrate_import_infos_by_key(&[(file.clone(), oid, storage_key)], self.adapter.as_ref())
+            .ok()
+            .and_then(|mut imports| imports.remove(file))
+            .or_else(|| {
+                self.source_snapshot_file_state(file)
+                    .map(|state| state.imports.clone())
+            })
+            .or_else(|| {
+                self.fetch_file_state(file)
+                    .map(|state| state.imports.clone())
+            })
             .unwrap_or_default()
     }
 
@@ -2999,8 +3080,27 @@ where
     }
 
     fn definition_lookup_index(&self) -> &DefinitionLookupIndex {
-        self.definition_lookup_index
-            .get_or_init(|| self.sql_definition_lookup_index().unwrap_or_default())
+        self.definition_lookup_index.get_or_init(|| {
+            self.definition_lookup_index_build_count
+                .fetch_add(1, Ordering::Relaxed);
+            self.sql_definition_lookup_index().unwrap_or_default()
+        })
+    }
+
+    fn reset_definition_lookup_index_build_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_definition_lookup_index_build_count_for_test(self);
+    }
+
+    fn definition_lookup_index_build_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::definition_lookup_index_build_count_for_test(self)
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_full_declaration_scan_count_for_test(self);
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::full_declaration_scan_count_for_test(self)
     }
 
     fn usage_facts_index(&self) -> &UsageFactsIndex {

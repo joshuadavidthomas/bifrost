@@ -524,6 +524,11 @@ impl AnalyzerStore {
         Ok(out)
     }
 
+    pub(crate) fn content_package(&self, oid: Oid, lang: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        Ok(read_content_packages_bulk(&conn, lang, &[oid.to_string()])?.remove(&oid.to_string()))
+    }
+
     pub fn declaration_candidate_rows_by_short_name(
         &self,
         lang: &str,

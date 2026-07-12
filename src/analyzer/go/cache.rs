@@ -1,9 +1,12 @@
-use super::hierarchy::GoHierarchyIndex;
+use super::{hierarchy::GoHierarchyIndex, packages::GoWorkspacePathIndex};
 use crate::analyzer::{CodeUnit, PoolSafeMemo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::mem::size_of;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use crate::analyzer::js_ts::build_weighted_cache;
 
@@ -16,6 +19,8 @@ pub(super) struct GoMemoCaches {
         Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     pub(super) hierarchy_index: Arc<OnceLock<GoHierarchyIndex>>,
     pub(super) package_clause_names: Arc<OnceLock<HashMap<ProjectFile, String>>>,
+    pub(super) workspace_path_index: Arc<OnceLock<GoWorkspacePathIndex>>,
+    pub(super) workspace_path_index_build_count: Arc<AtomicUsize>,
     pub(super) package_files: Arc<OnceLock<HashMap<String, Arc<Vec<ProjectFile>>>>>,
     pub(super) dir_parent_files: Arc<OnceLock<HashMap<String, Arc<Vec<ProjectFile>>>>>,
     pub(super) dir_parent_suffix_files: Arc<OnceLock<HashMap<String, Arc<Vec<ProjectFile>>>>>,
@@ -30,6 +35,8 @@ impl GoMemoCaches {
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             package_clause_names: Arc::new(OnceLock::new()),
+            workspace_path_index: Arc::new(OnceLock::new()),
+            workspace_path_index_build_count: Arc::new(AtomicUsize::new(0)),
             package_files: Arc::new(OnceLock::new()),
             dir_parent_files: Arc::new(OnceLock::new()),
             dir_parent_suffix_files: Arc::new(OnceLock::new()),
@@ -38,6 +45,11 @@ impl GoMemoCaches {
 
     pub(super) fn budget_bytes(&self) -> u64 {
         self.budget_bytes
+    }
+
+    pub(super) fn workspace_path_index_build_count(&self) -> usize {
+        self.workspace_path_index_build_count
+            .load(Ordering::Relaxed)
     }
 }
 

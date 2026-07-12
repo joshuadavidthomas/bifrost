@@ -100,6 +100,57 @@ impl ImportAnalysisProvider for GoAnalyzer {
 }
 
 impl GoAnalyzer {
+    /// Resolve only `file`'s namespace from persisted import and package facts.
+    /// This deliberately avoids the whole-workspace package graph used by bulk
+    /// usage analysis.
+    pub(crate) fn definition_import_namespaces(
+        &self,
+        file: &ProjectFile,
+    ) -> (HashMap<String, Vec<String>>, Vec<String>) {
+        let mut by_alias: HashMap<String, Vec<String>> = HashMap::default();
+        let mut dot_imports = Vec::new();
+        for import in self.inner.import_info_of(file) {
+            let alias = import.alias.as_deref();
+            if alias == Some("_") {
+                continue;
+            }
+            let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+                continue;
+            };
+            match alias {
+                Some(".") => dot_imports.push(path),
+                Some(explicit) => by_alias.entry(explicit.to_string()).or_default().push(path),
+                None => {
+                    let local = self
+                        .workspace_package_clause(file, &path)
+                        .or(import.identifier)
+                        .unwrap_or_else(|| default_import_local_name(&path));
+                    by_alias.entry(local).or_default().push(path);
+                }
+            }
+        }
+        for packages in by_alias.values_mut() {
+            packages.sort();
+            packages.dedup();
+        }
+        dot_imports.sort();
+        dot_imports.dedup();
+        (by_alias, dot_imports)
+    }
+
+    fn workspace_package_clause(
+        &self,
+        source_file: &ProjectFile,
+        import_path: &str,
+    ) -> Option<String> {
+        self.workspace_path_index()
+            .import_files(source_file, import_path)
+            .into_iter()
+            .filter(|file| self.is_analyzed(file))
+            .find_map(|file| self.package_clause_of(&file))
+            .filter(|package| !package.is_empty())
+    }
+
     /// Canonical package identity (import path) of a file, taken from any of
     /// its declarations. `None` for files with no top-level declarations.
     pub(super) fn go_package_of(&self, file: &ProjectFile) -> Option<String> {
@@ -208,6 +259,10 @@ impl GoAnalyzer {
                 .collect()
         })
     }
+}
+
+fn default_import_local_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 /// Legacy directory-suffix import match, used only as a fallback when no

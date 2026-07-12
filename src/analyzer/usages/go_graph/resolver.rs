@@ -31,18 +31,6 @@ pub(crate) struct ParsedFile {
     package_name: String,
 }
 
-/// Workspace-wide cache of parsed Go files, keyed by file.
-///
-/// `usage_graph` resolves callers for every symbol in the workspace, and each
-/// per-symbol query rebuilds a [`GoProjectGraph`] over an overlapping set of
-/// candidate files. Parsing the same file once per symbol that touches it is the
-/// dominant cost on real repos (re-parsing the same files thousands of times).
-/// Pre-parsing every file once and sharing the trees behind `Arc` collapses that
-/// to a single parse per file while leaving the per-query graph construction
-/// (import binders, module resolution) scoped to the candidate set, so there is
-/// no quadratic blow-up in import resolution.
-pub(crate) type ParsedFileCache = HashMap<ProjectFile, Arc<ParsedFile>>;
-
 pub(crate) struct GoProjectGraph {
     pub(super) parsed: HashMap<ProjectFile, Arc<ParsedFile>>,
     /// Go-owned re-export + importer index, built from the analyzer's
@@ -52,10 +40,6 @@ pub(crate) struct GoProjectGraph {
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
     importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
-    /// Retained so the inverted whole-workspace edge builder can resolve a file's
-    /// imports to package names without rescanning every parsed file.
-    dir_index: ParentDirIndex,
-    module_path: Option<String>,
     edge_index: GoEdgeIndex,
 }
 
@@ -71,28 +55,6 @@ impl GoProjectGraph {
         self.parsed
             .get(file)
             .map(|parsed| canonical_go_package_name(file, &parsed.package_name))
-    }
-
-    /// Resolve `file`'s imports to the workspace package names they bind, so the
-    /// inverted scan can turn a `pkg.Symbol` reference into a candidate node fqn.
-    /// Returns `(alias -> package names, dot-imported package names)`. External
-    /// (non-workspace) imports resolve to nothing and are simply absent.
-    pub(super) fn namespace_packages(
-        &self,
-        analyzer: &GoAnalyzer,
-        file: &ProjectFile,
-    ) -> (HashMap<String, Vec<String>>, Vec<String>) {
-        namespace_packages_from(
-            analyzer,
-            file,
-            &self.dir_index,
-            self.module_path.as_deref(),
-            |target| {
-                self.parsed
-                    .get(target)
-                    .map(|parsed| parsed.package_name.clone())
-            },
-        )
     }
 
     pub(super) fn scan_files(
@@ -748,21 +710,10 @@ fn parse_go_file(file: &ProjectFile) -> Option<ParsedFile> {
     })
 }
 
-/// Parse every Go file in `files` once, in parallel, into a shared cache that
-/// per-symbol [`build_go_graph`] calls can reuse instead of re-parsing.
-pub(crate) fn preparse_go_files(files: &[ProjectFile]) -> ParsedFileCache {
-    files
-        .par_iter()
-        .filter(|file| language_for_file(file) == Language::Go)
-        .filter_map(|file| Some((file.clone(), Arc::new(parse_go_file(file)?))))
-        .collect()
-}
-
 pub(super) fn build_go_graph(
     analyzer: &GoAnalyzer,
     candidate_files: &HashSet<ProjectFile>,
     target_file: &ProjectFile,
-    cache: Option<&ParsedFileCache>,
     cancellation: Option<&CancellationToken>,
 ) -> GoProjectGraph {
     let mut parsed: HashMap<ProjectFile, Arc<ParsedFile>> = HashMap::default();
@@ -785,12 +736,9 @@ pub(super) fn build_go_graph(
         if module_path.is_none() {
             module_path = read_go_module_path(file.root());
         }
-        let parsed_file = match cache.and_then(|cache| cache.get(&file).cloned()) {
-            Some(parsed_file) => parsed_file,
-            None => match parse_go_file(&file) {
-                Some(parsed_file) => Arc::new(parsed_file),
-                None => continue,
-            },
+        let parsed_file = match parse_go_file(&file) {
+            Some(parsed_file) => Arc::new(parsed_file),
+            None => continue,
         };
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             break;
@@ -836,32 +784,8 @@ pub(super) fn build_go_graph(
         reexport_edges,
         star_reexports,
         importer_reverse,
-        dir_index,
-        module_path,
         edge_index,
     }
-}
-
-/// Build the whole-workspace Go usage graph once (parse + binders + importer
-/// graph) so a bulk caller (`usage_graph`) can share it across every per-symbol
-/// query instead of rebuilding the import graph for each symbol's candidate set —
-/// the rebuild is quadratic in candidate count and the dominant cost at scale.
-pub(crate) fn build_workspace_go_graph(
-    analyzer: &GoAnalyzer,
-    files: &[ProjectFile],
-    cache: Option<&ParsedFileCache>,
-) -> Option<GoProjectGraph> {
-    let target_file = files
-        .iter()
-        .find(|file| language_for_file(file) == Language::Go)?;
-    let all_files: HashSet<ProjectFile> = files.iter().cloned().collect();
-    Some(build_go_graph(
-        analyzer,
-        &all_files,
-        target_file,
-        cache,
-        None,
-    ))
 }
 
 fn export_index_of(analyzer: &GoAnalyzer, file: &ProjectFile) -> ExportIndex {

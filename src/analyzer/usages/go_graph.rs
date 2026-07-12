@@ -7,10 +7,7 @@ mod resolver;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_target};
 use crate::analyzer::usages::go_graph::extractor::scan_files_for_target;
 use crate::analyzer::usages::go_graph::resolver::{
-    GoEdgeIndex, TargetSpec, build_go_edge_index, build_go_graph,
-};
-pub(in crate::analyzer::usages) use crate::analyzer::usages::go_graph::resolver::{
-    GoProjectGraph, build_workspace_go_graph, preparse_go_files,
+    GoEdgeIndex, GoProjectGraph, TargetSpec, build_go_edge_index, build_go_graph,
 };
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::model::FuzzyResult;
@@ -20,7 +17,9 @@ use crate::analyzer::usages::traits::{
 };
 use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
-pub(in crate::analyzer::usages) use reference::resolve_go_reference;
+pub(in crate::analyzer::usages) use reference::{
+    GoReferenceResolution, resolve_go_reference_with_namespaces,
+};
 use std::collections::BTreeSet;
 
 pub(in crate::analyzer::usages) use resolver::extract_go_import_path;
@@ -73,7 +72,6 @@ impl<'a> UsageQueryResolver<'a> for GoQueryResolver<'a> {
             self.go,
             candidate_files,
             target.source(),
-            None,
             scan_scope.cancellation(),
         );
         if scan_scope.is_cancelled() {
