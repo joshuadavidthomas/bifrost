@@ -8,7 +8,12 @@ In a nutshell:
 1. Bifrost parses unbuilt or partially broken repositories, including mixed-language workspaces.
 1. Bifrost is designed for concurrency, with snapshot isolation and fast incremental updates when code changes underneath.
 1. Bifrost is fast and lazy; it avoids optional work such as import analysis unless a request needs it.
+1. Bifrost is built to be git- and worktree- aware; its index is content-based and won't need to reindex code it's seen before on any branch.
 1. Bifrost can be used through MCP, LSP, the command line, Python, or Rust.
+
+## Language Coverage
+
+Bifrost includes analyzers for C, C++, C#, Go, Java, JavaScript, PHP, Python, Ruby, Rust, Scala, and TypeScript.
 
 ## Documentation
 
@@ -38,11 +43,6 @@ npm run dev
 GitHub Pages publication is handled by `.github/workflows/docs.yml`. Release tag
 builds publish both the latest docs site and a versioned snapshot under
 `versions/<tag>/`.
-
-## Language Coverage
-
-Bifrost includes analyzers for Java, JavaScript, TypeScript, Rust, Go, Python,
-C, C++, C#, PHP, Scala, and Ruby.
 
 ## Contributing
 
