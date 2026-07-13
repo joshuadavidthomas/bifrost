@@ -112,6 +112,111 @@ public sealed class HiddenCommand : BaseCommand {
 }
 
 #[test]
+fn inverted_graph_resolves_inherited_members_at_the_nearest_declaring_type() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "Demo.cs",
+            r#"
+namespace Demo;
+
+public class Base {
+    protected void Report(int value) {}
+}
+
+public class Intermediate : Base {}
+
+public sealed class Consumer : Intermediate {
+    public void RunQualified() {
+        this.Report(1);
+    }
+
+    public void RunUnqualified() {
+        Report(2);
+    }
+
+    public void RunParameter(System.Action<int> Report) {
+        Report(4);
+    }
+
+    public void RunLocal() {
+        void Report(int value) {}
+        Report(5);
+    }
+}
+
+public sealed class HiddenConsumer : Intermediate {
+    private void Report(int value) {}
+
+    public void Run() {
+        this.Report(3);
+    }
+}
+
+public class Box {
+    protected void Read() {}
+}
+
+public class Box<T> {
+    protected void Read() {}
+}
+
+public sealed class GenericConsumer : Box<int> {
+    public void Run() {
+        this.Read();
+    }
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(&value, "Demo.Consumer.RunQualified", "Demo.Base.Report"),
+        "qualified inherited call should edge to the declaring base member: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "Demo.Consumer.RunUnqualified", "Demo.Base.Report"),
+        "unqualified inherited call should edge to the declaring base member: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Demo.Consumer.RunParameter", "Demo.Base.Report"),
+        "delegate parameter must shadow the inherited member: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Demo.Consumer.RunLocal", "Demo.Base.Report"),
+        "local function must shadow the inherited member: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(
+            &value,
+            "Demo.HiddenConsumer.Run",
+            "Demo.HiddenConsumer.Report"
+        ),
+        "nearer member should receive the hidden call edge: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Demo.HiddenConsumer.Run", "Demo.Base.Report"),
+        "nearer declaration must hide the base member: {}",
+        value["edges"]
+    );
+    assert!(
+        has_edge(&value, "Demo.GenericConsumer.Run", "Demo.Box`1.Read"),
+        "generic inherited call should retain the exact metadata-arity owner: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "Demo.GenericConsumer.Run", "Demo.Box.Read"),
+        "generic inherited call must not normalize to the nongeneric owner: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn receiver_typing_is_type_based_not_name_based() {
     let value = usage_graph();
 

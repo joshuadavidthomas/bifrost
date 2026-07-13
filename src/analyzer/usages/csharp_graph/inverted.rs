@@ -23,17 +23,18 @@ use super::extractor::{
 };
 use super::resolver::{
     UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name, first_type_child,
-    is_type_reference_node, method_unit_return_type_fq_name, node_text, reference_type_text,
-    resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner, signature_arity,
-    unqualified_method_group_has_local_binding, unqualified_method_group_has_structured_shadow,
+    is_type_reference_node, method_unit_return_type_fq_name, nearest_member_candidates_for_owner,
+    node_text, reference_type_text, resolve_type_fq_name_at,
+    resolve_unqualified_method_group_for_owner, signature_arity,
+    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
 };
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, EdgeCollector, UsageEdges, build_edges, first_precise, parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{
-    CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_type_names,
-    csharp_normalize_full_name,
+    CSharpAnalyzer, CallableArity, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_type_names,
+    csharp_callable_arity, csharp_normalize_full_name,
 };
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::Node;
@@ -58,6 +59,7 @@ where
                 source: parsed.source.as_str(),
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 method_group_cache: HashMap::default(),
+                member_cache: HashMap::default(),
                 collector,
             };
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -73,7 +75,13 @@ struct CsScan<'a, 'b> {
     source: &'a str,
     class_ranges: ClassRangeIndex,
     method_group_cache: HashMap<(String, String), UnqualifiedMethodGroupResolution>,
+    member_cache: HashMap<(String, String), Vec<CachedMember>>,
     collector: &'a mut EdgeCollector<'b>,
+}
+
+struct CachedMember {
+    fqn: String,
+    callable_arity: Option<CallableArity>,
 }
 
 impl CsScan<'_, '_> {
@@ -107,6 +115,54 @@ impl CsScan<'_, '_> {
     fn record_unproven_callee(&mut self, callee: String, node: Node<'_>) {
         self.collector
             .record_unproven(callee, node.start_byte(), node.end_byte());
+    }
+
+    fn record_nearest_member(
+        &mut self,
+        owner_fqn: &str,
+        name: &str,
+        node: Node<'_>,
+        call_arity: Option<usize>,
+    ) {
+        let key = (owner_fqn.to_string(), name.to_string());
+        if !self.member_cache.contains_key(&key) {
+            let candidates = class_unit_for_fq_name(self.csharp, owner_fqn)
+                .map(|owner| {
+                    nearest_member_candidates_for_owner(self.analyzer, self.csharp, &owner, name)
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(|candidate| CachedMember {
+                    fqn: candidate.fq_name(),
+                    callable_arity: candidate
+                        .is_function()
+                        .then(|| csharp_callable_arity(self.analyzer, &candidate)),
+                })
+                .collect();
+            self.member_cache.insert(key.clone(), candidates);
+        }
+        let candidates = self
+            .member_cache
+            .get(&key)
+            .expect("member cache entry was inserted");
+        if candidates.is_empty() {
+            self.record(format!("{owner_fqn}.{name}"), node);
+            return;
+        }
+        let callees = candidates
+            .iter()
+            .filter(|candidate| {
+                !call_arity.is_some_and(|arity| {
+                    candidate
+                        .callable_arity
+                        .is_some_and(|callable| !callable.accepts(arity))
+                })
+            })
+            .map(|candidate| candidate.fqn.clone())
+            .collect::<Vec<_>>();
+        for callee in callees {
+            self.record(callee, node);
+        }
     }
 }
 
@@ -169,8 +225,17 @@ fn record_reference(
                 // An unqualified `Member(..)` call attributes to the enclosing class.
                 if is_unqualified_invocation_target(node) {
                     let name = node_text(node, ctx.source);
-                    if let Some(owner) = ctx.enclosing_class(node.start_byte()) {
-                        ctx.record(format!("{owner}.{name}"), node);
+                    if unqualified_member_has_local_binding(node, ctx.source, bindings)
+                        || unqualified_member_has_structured_shadow(node, ctx.source)
+                    {
+                        return;
+                    }
+                    if let Some(owner) = ctx.enclosing_class(node.start_byte()).map(str::to_string)
+                    {
+                        let arity = node
+                            .parent()
+                            .map(|invocation| argument_count(invocation, ctx.source));
+                        ctx.record_nearest_member(&owner, name, node, arity);
                     }
                 } else if is_unqualified_method_group_argument(node, ctx.source) {
                     let Some(owner_fqn) = ctx
@@ -181,7 +246,7 @@ fn record_reference(
                         return;
                     };
                     let name = node_text(node, ctx.source).to_string();
-                    if unqualified_method_group_has_local_binding(node, ctx.source, bindings) {
+                    if unqualified_member_has_local_binding(node, ctx.source, bindings) {
                         return;
                     }
                     let key = (owner_fqn.clone(), name.clone());
@@ -201,7 +266,7 @@ fn record_reference(
                         resolution
                     };
                     if matches!(&resolution, UnqualifiedMethodGroupResolution::NoMember)
-                        || unqualified_method_group_has_structured_shadow(node, ctx.source)
+                        || unqualified_member_has_structured_shadow(node, ctx.source)
                     {
                         return;
                     }
@@ -241,7 +306,12 @@ fn record_reference(
                 return;
             }
             if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
-                ctx.record(format!("{owner}.{name}"), name_node);
+                let call_arity = node.parent().and_then(|parent| {
+                    (parent.kind() == "invocation_expression"
+                        && parent.child_by_field_name("function") == Some(node))
+                    .then(|| argument_count(parent, ctx.source))
+                });
+                ctx.record_nearest_member(&owner, name, name_node, call_arity);
             } else {
                 ctx.record_unproven(name, name_node);
             }
@@ -431,14 +501,14 @@ fn invocation_return_type_fqn(
         "identifier" => {
             let name = node_text(function, ctx.source);
             let owner_fqn = ctx.enclosing_class(invocation.start_byte())?;
-            let owner = class_unit_for_fqn(ctx, owner_fqn)?;
+            let owner = class_unit_for_fq_name(ctx.csharp, owner_fqn)?;
             method_return_type_for_call(ctx, &owner, name, argument_count(invocation, ctx.source))
         }
         "member_access_expression" => {
             let receiver = member_access_receiver(function)?;
             let name = member_access_name(function)?;
             let owner_fqn = receiver_type_fqn(receiver, ctx, bindings)?;
-            let owner = class_unit_for_fqn(ctx, &owner_fqn)?;
+            let owner = class_unit_for_fq_name(ctx.csharp, &owner_fqn)?;
             method_return_type_for_call(
                 ctx,
                 &owner,
@@ -508,24 +578,4 @@ fn csharp_method_return_types_for_owner(
         );
     }
     returns
-}
-
-fn class_unit_for_fqn(ctx: &CsScan<'_, '_>, fqn: &str) -> Option<CodeUnit> {
-    let normalized = csharp_normalize_full_name(fqn);
-    let mut candidates = ctx
-        .csharp
-        .definition_lookup_index()
-        .by_fqn(fqn)
-        .iter()
-        .chain(
-            ctx.csharp
-                .definition_lookup_index()
-                .by_normalized_fqn(&normalized)
-                .iter(),
-        )
-        .filter(|unit| unit.is_class())
-        .cloned()
-        .collect::<Vec<_>>();
-    ctx.csharp.sort_dedup_type_candidates(&mut candidates);
-    (candidates.len() == 1).then(|| candidates.remove(0))
 }

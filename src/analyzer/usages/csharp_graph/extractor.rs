@@ -4,12 +4,12 @@ use crate::analyzer::usages::csharp_graph::resolver::{
     TargetKind, TargetSpec, UnqualifiedMethodGroupResolution, argument_count, binding_scope_node,
     class_field_receiver_type, class_unit_for_fq_name, enclosing_declared_type,
     expression_resolves_to_type, first_type_child, is_type_reference_node,
-    member_name_is_locally_bound, node_text, normalize_type_text, object_initializer_for_label,
-    receiver_targets_owner, reference_type_node, reference_type_text,
-    resolve_unqualified_method_group_for_owner, resolves_to_target, resolves_to_target_at,
-    same_node, seed_visible_bindings_at, type_identity_matches,
-    unqualified_member_resolves_to_owner, unqualified_method_group_has_local_binding,
-    unqualified_method_group_has_structured_shadow,
+    member_name_is_locally_bound, nearest_member_candidates_for_owner, node_text,
+    normalize_type_text, object_initializer_for_label, receiver_targets_owner, reference_type_node,
+    reference_type_text, resolve_unqualified_method_group_for_owner, resolves_to_target,
+    resolves_to_target_at, same_node, seed_visible_bindings_at, type_identity_matches,
+    unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
+    unqualified_member_resolves_to_owner,
 };
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::local_inference::SymbolResolution;
@@ -75,6 +75,7 @@ pub(super) fn scan_file(
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
         enclosing_cache: HashMap::default(),
+        nearest_member_target_cache: HashMap::default(),
         class_ranges: ClassRangeIndex::build(csharp, file),
     };
     scan_node(tree.root_node(), &mut ctx);
@@ -92,7 +93,15 @@ pub(super) struct ScanCtx<'a> {
     pub(super) max_usages: usize,
     pub(super) limit_exceeded: &'a mut bool,
     pub(super) enclosing_cache: HashMap<(usize, usize), Option<CodeUnit>>,
+    nearest_member_target_cache: HashMap<String, TargetMemberResolution>,
     pub(super) class_ranges: ClassRangeIndex,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetMemberResolution {
+    MatchesTarget,
+    KnownOther,
+    NotFound,
 }
 
 fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -339,9 +348,10 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     match receiver_targets_owner(receiver_node, ctx.csharp, ctx.file, ctx.source, &bindings) {
         SymbolResolution::Precise(targets)
-            if targets
-                .iter()
-                .any(|target| target == &ctx.spec.owner.fq_name()) =>
+            if targets.iter().any(|target| {
+                receiver_fqn_target_member_resolution(target, ctx)
+                    == TargetMemberResolution::MatchesTarget
+            }) =>
         {
             push_hit(name_node, ctx);
         }
@@ -427,10 +437,10 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 .parent()
                 .is_some_and(|parent| parent.kind() == "invocation_expression") =>
         {
-            if unqualified_method_call_resolves_to_owner(node, ctx) {
-                push_hit(node, ctx);
-            } else {
-                push_unproven_hit(node, ctx);
+            match unqualified_method_call_resolution(node, ctx) {
+                TargetMemberResolution::MatchesTarget => push_hit(node, ctx),
+                TargetMemberResolution::KnownOther => {}
+                TargetMemberResolution::NotFound => push_unproven_hit(node, ctx),
             }
         }
         TargetKind::Method if is_unqualified_method_group_argument(node, ctx.source) => {
@@ -443,8 +453,8 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 ctx.source,
                 &mut bindings,
             );
-            if unqualified_method_group_has_local_binding(node, ctx.source, &bindings)
-                || unqualified_method_group_has_structured_shadow(node, ctx.source)
+            if unqualified_member_has_local_binding(node, ctx.source, &bindings)
+                || unqualified_member_has_structured_shadow(node, ctx.source)
             {
                 return;
             }
@@ -566,22 +576,74 @@ fn transparent_expression_parent(current: Node<'_>, parent: Node<'_>) -> bool {
         && parent.child_by_field_name("value") == Some(current))
 }
 
-fn unqualified_method_call_resolves_to_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+fn unqualified_method_call_resolution(
+    node: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+) -> TargetMemberResolution {
     let Some(invocation) = node.parent() else {
-        return false;
+        return TargetMemberResolution::NotFound;
     };
     if invocation.kind() != "invocation_expression" {
-        return false;
+        return TargetMemberResolution::NotFound;
     }
     if ctx
         .spec
         .callable_arity
         .is_some_and(|arity| !arity.accepts(argument_count(invocation, ctx.source)))
     {
-        return false;
+        // A signature-specific target is incompatible, but FQN-grouped callers
+        // still need conservative cross-overload evidence rather than a proof of
+        // absence for the sibling declaration.
+        return TargetMemberResolution::NotFound;
+    }
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    seed_visible_bindings_at(
+        binding_scope_node(node),
+        node,
+        ctx.csharp,
+        ctx.file,
+        ctx.source,
+        &mut bindings,
+    );
+    if unqualified_member_has_local_binding(node, ctx.source, &bindings)
+        || unqualified_member_has_structured_shadow(node, ctx.source)
+    {
+        return TargetMemberResolution::KnownOther;
     }
     enclosing_declared_type(node, ctx.csharp, ctx.file, ctx.source)
-        .is_some_and(|enclosing| enclosing == ctx.spec.owner)
+        .map(|enclosing| receiver_fqn_target_member_resolution(&enclosing.fq_name(), ctx))
+        .unwrap_or(TargetMemberResolution::NotFound)
+}
+
+fn receiver_fqn_target_member_resolution(
+    receiver_fqn: &str,
+    ctx: &mut ScanCtx<'_>,
+) -> TargetMemberResolution {
+    if let Some(resolution) = ctx.nearest_member_target_cache.get(receiver_fqn) {
+        return *resolution;
+    }
+    let resolution = class_unit_for_fq_name(ctx.csharp, receiver_fqn)
+        .map(|receiver_owner| {
+            nearest_member_candidates_for_owner(
+                ctx.analyzer,
+                ctx.csharp,
+                &receiver_owner,
+                &ctx.spec.member_name,
+            )
+        })
+        .map(|candidates| {
+            if candidates.contains(&ctx.spec.target) {
+                TargetMemberResolution::MatchesTarget
+            } else if candidates.is_empty() {
+                TargetMemberResolution::NotFound
+            } else {
+                TargetMemberResolution::KnownOther
+            }
+        })
+        .unwrap_or(TargetMemberResolution::NotFound);
+    ctx.nearest_member_target_cache
+        .insert(receiver_fqn.to_string(), resolution);
+    resolution
 }
 
 enum LabelOwnerResolution {

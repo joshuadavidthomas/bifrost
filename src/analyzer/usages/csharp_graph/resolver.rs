@@ -425,14 +425,21 @@ pub(super) fn class_unit_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Opti
 
 fn type_declarations_for_fq_name(csharp: &CSharpAnalyzer, fqn: &str) -> Vec<CodeUnit> {
     let index = csharp.definition_lookup_index();
-    let normalized = csharp_normalize_full_name(fqn);
     let mut candidates = index
         .by_fqn(fqn)
         .iter()
-        .chain(index.by_normalized_fqn(&normalized).iter())
         .filter(|unit| unit.is_class())
         .cloned()
         .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates.extend(
+            index
+                .by_normalized_fqn(&csharp_normalize_full_name(fqn))
+                .iter()
+                .filter(|unit| unit.is_class())
+                .cloned(),
+        );
+    }
     csharp.sort_dedup_type_candidates(&mut candidates);
     candidates
 }
@@ -1012,7 +1019,56 @@ pub(super) enum UnqualifiedMethodGroupResolution {
     NoMember,
 }
 
-pub(super) fn unqualified_method_group_has_local_binding(
+pub(super) fn nearest_member_candidates_for_owner(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    owner: &CodeUnit,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let hierarchy = analyzer.type_hierarchy_provider();
+    let mut seen = HashSet::default();
+    let mut level = csharp.partial_type_parts(owner);
+    if level.is_empty() {
+        level.push(owner.clone());
+    }
+    while !level.is_empty() {
+        let mut members = Vec::new();
+        let mut current_level = Vec::new();
+        for current in level {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            members.extend(
+                csharp
+                    .member_candidates_for_owner(&current.fq_name(), name)
+                    .into_iter()
+                    .filter(|candidate| candidate.identifier() == name),
+            );
+            current_level.push(current);
+        }
+        members.sort();
+        members.dedup();
+        if !members.is_empty() {
+            return members;
+        }
+        let mut next_level = Vec::new();
+        if let Some(hierarchy) = hierarchy {
+            for current in current_level {
+                for ancestor in hierarchy.get_direct_ancestors(&current) {
+                    let mut parts = csharp.partial_type_parts(&ancestor);
+                    if parts.is_empty() {
+                        parts.push(ancestor);
+                    }
+                    next_level.extend(parts);
+                }
+            }
+        }
+        level = next_level;
+    }
+    Vec::new()
+}
+
+pub(super) fn unqualified_member_has_local_binding(
     node: Node<'_>,
     source: &str,
     bindings: &LocalInferenceEngine<String>,
@@ -1020,7 +1076,7 @@ pub(super) fn unqualified_method_group_has_local_binding(
     member_name_is_locally_bound(node_text(node, source), bindings)
 }
 
-pub(super) fn unqualified_method_group_has_structured_shadow(node: Node<'_>, source: &str) -> bool {
+pub(super) fn unqualified_member_has_structured_shadow(node: Node<'_>, source: &str) -> bool {
     let name = node_text(node, source);
     local_function_name_is_in_scope(node, source, name)
         || structured_local_name_is_in_scope(node, source, name)
@@ -1032,62 +1088,31 @@ pub(super) fn resolve_unqualified_method_group_for_owner(
     owner: &CodeUnit,
     name: &str,
 ) -> UnqualifiedMethodGroupResolution {
-    let hierarchy = analyzer.type_hierarchy_provider();
-    let mut seen = HashSet::default();
-    let mut level = csharp.partial_type_parts(owner);
-    if level.is_empty() {
-        level.push(owner.clone());
+    let members = nearest_member_candidates_for_owner(analyzer, csharp, owner, name);
+    if members.is_empty() {
+        return UnqualifiedMethodGroupResolution::NoMember;
     }
-    while !level.is_empty() {
-        let mut members = Vec::new();
-        let mut candidates = Vec::new();
-        let mut next_level = Vec::new();
-        for current in level {
-            if !seen.insert(current.clone()) {
-                continue;
-            }
-            let current_members = csharp
-                .member_candidates_for_owner(&current.fq_name(), name)
-                .into_iter()
-                .filter(|candidate| candidate.identifier() == name)
-                .collect::<Vec<_>>();
-            candidates.extend(
-                current_members
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.is_function()
-                            && candidate.identifier() != csharp_source_identifier(&current)
+    let mut candidates = members
+        .iter()
+        .filter(|candidate| {
+            candidate.is_function()
+                && analyzer
+                    .parent_of(candidate)
+                    .is_some_and(|declaring_owner| {
+                        candidate.identifier() != csharp_source_identifier(&declaring_owner)
                     })
-                    .cloned(),
-            );
-            members.extend(current_members);
-            if let Some(hierarchy) = hierarchy {
-                for ancestor in hierarchy.get_direct_ancestors(&current) {
-                    let mut parts = csharp.partial_type_parts(&ancestor);
-                    if parts.is_empty() {
-                        parts.push(ancestor);
-                    }
-                    next_level.extend(parts);
-                }
-            }
-        }
-        members.sort();
-        members.dedup();
-        if members.is_empty() {
-            level = next_level;
-            continue;
-        }
-        candidates.sort();
-        candidates.dedup();
-        if candidates.len() != members.len() {
-            return UnqualifiedMethodGroupResolution::NoMember;
-        }
-        if candidates.len() == 1 {
-            return UnqualifiedMethodGroupResolution::Unique(candidates.remove(0));
-        }
-        return UnqualifiedMethodGroupResolution::Ambiguous(candidates);
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    if candidates.len() != members.len() {
+        return UnqualifiedMethodGroupResolution::NoMember;
     }
-    UnqualifiedMethodGroupResolution::NoMember
+    if candidates.len() == 1 {
+        return UnqualifiedMethodGroupResolution::Unique(candidates.remove(0));
+    }
+    UnqualifiedMethodGroupResolution::Ambiguous(candidates)
 }
 
 fn local_function_name_is_in_scope(node: Node<'_>, source: &str, name: &str) -> bool {

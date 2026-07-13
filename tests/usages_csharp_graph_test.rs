@@ -2186,7 +2186,13 @@ namespace App {
     let ordinary_body_hits = graph_hits(&analyzer, &ordinary_body);
     assert_eq!(1, ordinary_body_hits.len(), "{ordinary_body_hits:#?}");
     let generic_body_hits = graph_hits(&analyzer, &generic_body);
-    assert_eq!(1, generic_body_hits.len(), "{generic_body_hits:#?}");
+    assert_eq!(2, generic_body_hits.len(), "{generic_body_hits:#?}");
+    assert!(
+        generic_body_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("public T Read() => Body")),
+        "the sibling partial self-read should retain the exact generic owner identity: {generic_body_hits:#?}"
+    );
 }
 
 #[test]
@@ -2927,6 +2933,152 @@ namespace Demo {
     assert!(
         hits.iter()
             .any(|hit| hit.snippet.contains("Accept(onDefault)"))
+    );
+}
+
+#[test]
+fn usage_finder_csharp_finds_inherited_member_access_on_precise_receiver() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "Demo/Base.cs",
+            r#"
+namespace Demo {
+    public class Base {
+        protected void Report(int value) {}
+    }
+}
+"#,
+        ),
+        (
+            "Demo/Intermediate.cs",
+            "namespace Demo { public class Intermediate : Base {} }\n",
+        ),
+        (
+            "Demo/PartialIntermediate.Part1.cs",
+            "namespace Demo { public partial class PartialIntermediate {} }\n",
+        ),
+        (
+            "Demo/PartialIntermediate.Part2.cs",
+            "namespace Demo { public partial class PartialIntermediate : Base {} }\n",
+        ),
+        (
+            "Demo/Consumer.cs",
+            r#"
+namespace Demo {
+    public sealed class Consumer : Intermediate {
+        public void RunQualified() {
+            this.Report(1);
+        }
+
+        public void RunUnqualified() {
+            Report(2);
+        }
+
+        public void RunParameter(System.Action<int> Report) {
+            Report(5);
+        }
+
+        public void RunLocal() {
+            void Report(int value) {}
+            Report(6);
+        }
+    }
+}
+"#,
+        ),
+        (
+            "Demo/HiddenConsumer.cs",
+            r#"
+namespace Demo {
+    public sealed class HiddenConsumer : Intermediate {
+        private void Report(int value) {}
+
+        public void Run() {
+            this.Report(3);
+        }
+    }
+}
+"#,
+        ),
+        (
+            "Demo/PartialConsumer.cs",
+            r#"
+namespace Demo {
+    public sealed class PartialConsumer : PartialIntermediate {
+        public void Run() {
+            this.Report(4);
+        }
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = member_function_with_arity(&analyzer, "Demo.Base", "Report", 1);
+    let consumer = project.file("Demo/Consumer.cs");
+    let source = consumer.read_to_string().expect("consumer source");
+    let use_start = source.find("Report(1)").expect("inherited member call");
+    let forward = definition_lookup(
+        project.root(),
+        "Demo/Consumer.cs",
+        use_start,
+        use_start + "Report".len(),
+    );
+    assert_eq!(forward["results"][0]["status"], "resolved", "{forward}");
+    assert_eq!(
+        forward["results"][0]["definitions"][0]["fqn"], "Demo.Base.Report",
+        "{forward}"
+    );
+
+    let hidden_consumer = project.file("Demo/HiddenConsumer.cs");
+    let partial_consumer = project.file("Demo/PartialConsumer.cs");
+    let provider = ExplicitCandidateProvider::new(Arc::new(
+        [consumer.clone(), hidden_consumer, partial_consumer]
+            .into_iter()
+            .collect(),
+    ));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            3,
+            1000,
+        );
+    match &query.result {
+        FuzzyResult::Success {
+            unproven_total_by_overload,
+            ..
+        } => assert!(
+            unproven_total_by_overload
+                .get(&target)
+                .is_none_or(|count| *count == 0),
+            "proven parameter and local-function shadows must not be emitted as unproven target hits: {:#?}",
+            query.result
+        ),
+        other => panic!("expected inherited member query success, got {other:#?}"),
+    }
+    let hits = query
+        .result
+        .into_either()
+        .expect("inherited member query should resolve");
+    assert_eq!(3, hits.len(), "{hits:#?}");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= use_start
+                && use_start + "Report".len() <= hit.end_offset
+        }),
+        "inverse lookup should find the inherited member on the precise derived receiver: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.snippet.contains("Report(2)")),
+        "inverse lookup should find the inherited unqualified call: {hits:#?}"
+    );
+    assert!(
+        hits.iter().any(|hit| hit.snippet.contains("Report(4)")),
+        "inverse lookup should follow inheritance declared on a sibling partial type: {hits:#?}"
     );
 }
 
