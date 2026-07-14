@@ -32,6 +32,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) bindings: LocalInferenceEngine<CppScanBinding>,
+    local_shadows: LocalInferenceEngine<()>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub(super) raw_match_count: &'a mut usize,
@@ -81,6 +82,7 @@ pub(super) fn scan_file(
         line_starts: &line_starts,
         spec,
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
+        local_shadows: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         hits: state.hits,
         unproven_hits: state.unproven_hits,
         raw_match_count: state.raw_match_count,
@@ -106,6 +108,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     );
     if enters_scope {
         ctx.bindings.enter_scope();
+        ctx.local_shadows.enter_scope();
     }
 
     seed_declarations(node, ctx);
@@ -121,6 +124,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     if enters_scope {
         ctx.bindings.exit_scope();
+        ctx.local_shadows.exit_scope();
     }
 }
 
@@ -164,6 +168,9 @@ fn seed_variable_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         let Some(name) = extract_variable_name(declarator, ctx.source) else {
             continue;
         };
+        if node.kind() == "declaration" && has_function_scope_ancestor(node) {
+            ctx.local_shadows.declare_shadow(name.clone());
+        }
         let value = child.child_by_field_name("value");
         seed_binding_from_type_or_value(&name, type_text.as_deref(), value, ctx);
     }
@@ -176,11 +183,25 @@ fn seed_typed_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(name) = extract_variable_name(declarator, ctx.source) else {
         return;
     };
+    if has_function_scope_ancestor(node) {
+        ctx.local_shadows.declare_shadow(name.clone());
+    }
     let type_text = node
         .child_by_field_name("type")
         .or_else(|| first_type_child(node))
         .map(|node| node_text(node, ctx.source).to_string());
     seed_binding_from_type_or_value(&name, type_text.as_deref(), None, ctx);
+}
+
+fn has_function_scope_ancestor(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "function_definition" | "lambda_expression") {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 fn seed_binding_from_type_or_value(
@@ -909,7 +930,7 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     ) || !name_matches_terminal(node_text(node, ctx.source), &ctx.spec.member_name)
         || is_declaration_name(node)
         || is_member_field_declaration_context(node, ctx)
-        || has_ancestor_kind(node, "field_expression")
+        || is_field_expression_member_descendant(node)
         || is_nested_in_qualified_identifier(node)
     {
         return;
@@ -923,8 +944,27 @@ fn maybe_record_global_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+fn is_field_expression_member_descendant(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "field_expression" {
+            let receiver = parent
+                .child_by_field_name("argument")
+                .or_else(|| parent.child_by_field_name("object"))
+                .or_else(|| parent.named_child(0));
+            if receiver != Some(node) {
+                return true;
+            }
+        }
+        node = parent;
+    }
+    false
+}
+
 fn global_field_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let text = node_text(node, ctx.source);
+    if !text.contains("::") && ctx.local_shadows.is_shadowed(text) {
+        return false;
+    }
     if text.contains("::") {
         return ctx.visibility.contains_named_symbol(
             ctx.file,
@@ -949,7 +989,9 @@ fn global_field_resolves_to_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 fn bare_global_field_uniquely_resolves_to_target(text: &str, ctx: &ScanCtx<'_>) -> bool {
     let mut matched_target = false;
     for unit in ctx.visibility.visible_identifier_candidates(ctx.file, text) {
-        if !unit.is_field() || !name_matches_terminal(unit.identifier(), &ctx.spec.member_name) {
+        if !has_persisted_global_field_identity(unit)
+            || !name_matches_terminal(unit.identifier(), &ctx.spec.member_name)
+        {
             continue;
         }
         if !name_matches_terminal(cpp_name_for(unit).as_str(), text) {
@@ -964,8 +1006,19 @@ fn bare_global_field_uniquely_resolves_to_target(text: &str, ctx: &ScanCtx<'_>) 
     matched_target
 }
 
+fn has_persisted_global_field_identity(unit: &CodeUnit) -> bool {
+    // C++ type members persist their owner in `short_name` (`Owner.member`), while namespace
+    // identity lives in `package_name`; global and namespace-scoped fields therefore have a
+    // terminal-only short name. Keep this hot lookup projection-only instead of asking the
+    // analyzer for every same-named candidate's parent.
+    unit.is_field() && !unit.short_name().contains('.')
+}
+
 fn global_field_is_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
     let text = node_text(node, ctx.source);
+    if !text.contains("::") && ctx.local_shadows.is_shadowed(text) {
+        return true;
+    }
     if text.contains("::") {
         return ctx.visibility.resolve_known_non_target(
             ctx.file,
@@ -982,7 +1035,7 @@ fn global_field_is_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .visibility
             .visible_identifier_candidates(ctx.file, &ctx.spec.member_name)
             .any(|unit| {
-                unit.is_field()
+                has_persisted_global_field_identity(unit)
                     && unit.identifier() == ctx.spec.member_name
                     && cpp_namespace_for(unit).as_deref() == Some(namespace.as_str())
             })

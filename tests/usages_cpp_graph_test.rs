@@ -1,8 +1,11 @@
 mod common;
 
-use brokk_bifrost::usages::{CppUsageGraphStrategy, FuzzyResult, UsageAnalyzer, UsageFinder};
+use brokk_bifrost::usages::{
+    CppUsageGraphStrategy, ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder,
+};
 use brokk_bifrost::{CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, ProjectFile};
 use common::InlineTestProject;
+use std::sync::Arc;
 
 fn cpp_analyzer_with_files(
     files: &[(&str, &str)],
@@ -1055,6 +1058,161 @@ void call() {
         .into_either()
         .expect("enum value success");
     assert_eq!(1, enum_hits.len());
+}
+
+#[test]
+fn authoritative_cpp_usage_finds_global_receiver_of_member_access() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "boot.h",
+            r#"struct Boot {
+    int cluster_size;
+    Boot* next;
+};
+extern struct Boot bs;
+extern struct Boot* bs_ptr;
+"#,
+        ),
+        (
+            "consumer.cpp",
+            r#"#include "boot.h"
+
+struct Other { Boot bs; };
+
+int read_cluster_size() {
+    return bs.cluster_size
+        + bs.next->cluster_size
+        + bs.next->next->cluster_size;
+}
+
+int read_other_cluster_size(Other& other) {
+    return other.bs.cluster_size;
+}
+
+int read_shadowed_cluster_size() {
+    Boot bs{};
+    return bs.cluster_size;
+}
+
+int read_after_local_type() {
+    struct Local { Boot bs; };
+    return bs.cluster_size;
+}
+
+int read_pointer_cluster_size() {
+    return bs_ptr->cluster_size;
+}
+"#,
+        ),
+    ]);
+
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.identifier() == "bs"
+            && unit.source().rel_path().to_string_lossy() == "boot.h"
+    });
+    let pointer_target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.identifier() == "bs_ptr"
+            && unit.source().rel_path().to_string_lossy() == "boot.h"
+    });
+    let consumer = project.file("consumer.cpp");
+    let source = consumer.read_to_string().expect("consumer source");
+    let receiver_starts = source
+        .match_indices("bs.")
+        .map(|(start, _)| start)
+        .collect::<Vec<_>>();
+    assert_eq!(6, receiver_starts.len(), "test fixture receiver count");
+    let global_receiver_starts = [
+        receiver_starts[0],
+        receiver_starts[1],
+        receiver_starts[2],
+        receiver_starts[5],
+    ];
+    let non_global_receiver_starts = [receiver_starts[3], receiver_starts[4]];
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative C++ usage success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("global target should have a proven-hit bucket");
+    assert_eq!(
+        global_receiver_starts.len(),
+        hits.len(),
+        "only global receiver-chain occurrences should be proven: {hits:#?}"
+    );
+    for receiver_start in &global_receiver_starts {
+        let receiver_end = receiver_start + "bs".len();
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= *receiver_start
+                    && receiver_end <= hit.end_offset
+            }),
+            "authoritative inverse lookup should prove global receiver at {receiver_start}: {hits:#?}"
+        );
+    }
+    for receiver_start in &non_global_receiver_starts {
+        assert!(
+            hits.iter().all(|hit| {
+                !(hit.start_offset <= *receiver_start
+                    && receiver_start + "bs".len() <= hit.end_offset)
+            }),
+            "member and shadowed receivers must not be attributed to global `bs`: {hits:#?}"
+        );
+    }
+
+    let pointer_start = source
+        .find("bs_ptr->cluster_size")
+        .expect("direct global pointer receiver");
+    let pointer_end = pointer_start + "bs_ptr".len();
+    let pointer_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&pointer_target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = pointer_query.result
+    else {
+        panic!(
+            "expected authoritative C++ pointer usage success, got {:#?}",
+            pointer_query.result
+        );
+    };
+    let pointer_hits = hits_by_overload
+        .get(&pointer_target)
+        .expect("global pointer target should have a proven-hit bucket");
+    assert!(
+        pointer_hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= pointer_start
+                && pointer_end <= hit.end_offset
+        }),
+        "authoritative inverse lookup should prove direct global pointer receiver: {pointer_hits:#?}"
+    );
 }
 
 #[test]

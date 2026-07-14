@@ -1282,6 +1282,15 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
             && parent
                 .child_by_field_name("declarator")
                 .is_some_and(|declarator| node_contains(declarator, node))
+        || matches!(
+            parent.kind(),
+            "declaration"
+                | "field_declaration"
+                | "parameter_declaration"
+                | "optional_parameter_declaration"
+        ) && parent
+            .child_by_field_name("declarator")
+            .is_some_and(|declarator| node_contains(declarator, node))
 }
 
 pub(super) fn out_of_line_member_definition_owner<'tree>(
