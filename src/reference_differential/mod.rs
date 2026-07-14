@@ -184,6 +184,7 @@ struct SampledSite {
     priority: [u8; 32],
     file: ProjectFile,
     range: Range,
+    csharp_nameof_argument: bool,
 }
 
 impl Ord for SampledSite {
@@ -495,6 +496,17 @@ fn collect_sampled_sites(
             {
                 continue;
             }
+            let csharp_nameof_argument = language == Language::CSharp
+                && root
+                    .descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        csharp_is_nameof_argument(
+                            node,
+                            range.start_byte,
+                            range.end_byte,
+                            context.content(),
+                        )
+                    });
             let priority = site_priority(config.seed, &path, &range);
             push_bounded(
                 &mut heap,
@@ -502,6 +514,7 @@ fn collect_sampled_sites(
                     priority,
                     file: file.clone(),
                     range,
+                    csharp_nameof_argument,
                 },
                 config.max_sites,
             );
@@ -561,6 +574,12 @@ fn forward_resolve_sites(
         );
         for (site, outcome) in sites.into_iter().zip(outcomes) {
             summary.forward.increment(outcome.status);
+            let csharp_nameof_member = outcome.status == DefinitionLookupStatus::Resolved
+                && site.csharp_nameof_argument
+                && !outcome.definitions.is_empty()
+                && outcome.definitions.iter().all(|target| {
+                    matches!(target.kind(), CodeUnitType::Field | CodeUnitType::Function)
+                });
             let reference = outcome.reference.as_ref();
             let text = reference
                 .map(|reference| reference.text.clone())
@@ -592,9 +611,17 @@ fn forward_resolve_sites(
                 ),
                 forward_status: outcome.status.as_str().to_string(),
                 targets: stable_targets,
-                classification: ReferenceClassification::Inconclusive,
-                note: (outcome.status != DefinitionLookupStatus::Resolved)
-                    .then(|| format!("forward lookup returned {}", outcome.status.as_str())),
+                classification: if csharp_nameof_member {
+                    ReferenceClassification::EditorOnly
+                } else {
+                    ReferenceClassification::Inconclusive
+                },
+                note: if csharp_nameof_member {
+                    Some("C# nameof member navigation is excluded from runtime usage".to_string())
+                } else {
+                    (outcome.status != DefinitionLookupStatus::Resolved)
+                        .then(|| format!("forward lookup returned {}", outcome.status.as_str()))
+                },
                 inverse_hit: None,
                 diagnostics,
             });
@@ -605,6 +632,8 @@ fn forward_resolve_sites(
                 if targets.is_empty() {
                     records[record_index].note =
                         Some("resolved forward lookup returned no targets".to_string());
+                } else if csharp_nameof_member {
+                    continue;
                 } else if analyzer
                     .enclosing_code_unit(&file, &site.range)
                     .is_some_and(|enclosing| targets.contains(&enclosing))
@@ -621,6 +650,50 @@ fn forward_resolve_sites(
         }
     }
     (records, resolved)
+}
+
+fn csharp_is_nameof_argument(
+    node: tree_sitter::Node<'_>,
+    start_byte: usize,
+    end_byte: usize,
+    source: &str,
+) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent()
+        && parent.start_byte() == start_byte
+        && parent.end_byte() == end_byte
+    {
+        current = parent;
+    }
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "argument" | "argument_list" => current = parent,
+            "invocation_expression" => {
+                return parent
+                    .child_by_field_name("function")
+                    .or_else(|| parent.named_child(0))
+                    .and_then(|function| source.get(function.start_byte()..function.end_byte()))
+                    == Some("nameof");
+            }
+            "member_access_expression" if parent.child_by_field_name("name") == Some(current) => {
+                current = parent;
+            }
+            _ if csharp_transparent_nameof_parent(current, parent) => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn csharp_transparent_nameof_parent(
+    current: tree_sitter::Node<'_>,
+    parent: tree_sitter::Node<'_>,
+) -> bool {
+    matches!(
+        parent.kind(),
+        "parenthesized_expression" | "checked_expression"
+    ) || (parent.kind() == "cast_expression"
+        && parent.child_by_field_name("value") == Some(current))
 }
 
 fn resolved_groups(resolved: Vec<ResolvedSite>) -> Vec<ResolvedGroup> {
@@ -1225,6 +1298,130 @@ mod tests {
             withheld[0].note.as_deref(),
             Some("forward-resolved site is absent from the complete inverse result")
         );
+    }
+
+    #[test]
+    fn csharp_nameof_members_are_editor_only_while_runtime_members_still_round_trip() {
+        let fixture = RoundTripFixture {
+            corpus_language: "csharp",
+            analyzer_language: Language::CSharp,
+            file_name: "NameOf.cs",
+            source: r#"namespace Example;
+public sealed class Model {
+    private string member = "";
+    private void Perform() { }
+    public string BareMemberName() => nameof(member);
+    public string QualifiedMemberName() => nameof(this.member);
+    public string MethodName() => nameof(Perform);
+    public string ReadMember() => member;
+}
+"#,
+            call_line: "",
+        };
+
+        let report = audit_fixture(&fixture);
+        let nameof_members = report
+            .sites
+            .iter()
+            .filter(|site| {
+                site.source_evidence.contains("nameof(")
+                    && site
+                        .targets
+                        .iter()
+                        .any(|target| matches!(target.kind.as_str(), "field" | "function"))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(nameof_members.len(), 3, "{:#?}", report.sites);
+        for site in nameof_members {
+            assert_eq!(
+                site.classification,
+                ReferenceClassification::EditorOnly,
+                "{site:#?}"
+            );
+            assert_eq!(
+                site.note.as_deref(),
+                Some("C# nameof member navigation is excluded from runtime usage")
+            );
+            assert!(site.inverse_hit.is_none(), "{site:#?}");
+        }
+
+        let runtime_member = report
+            .sites
+            .iter()
+            .find(|site| {
+                site.source_evidence.contains("ReadMember() => member")
+                    && site.targets.iter().any(|target| target.kind == "field")
+            })
+            .expect("sampled runtime member reference");
+        assert_eq!(
+            runtime_member.classification,
+            ReferenceClassification::Consistent,
+            "runtime member references must still require inverse proof: {runtime_member:#?}"
+        );
+        assert_eq!(report.summary.classifications.editor_only, 3);
+        assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
+        assert!(!report.has_actionable_findings(), "{report:#?}");
+    }
+
+    #[test]
+    fn csharp_nested_call_classifies_only_nameof_operand_as_editor_only() {
+        let source = r#"namespace Example;
+public sealed class EventListener {
+    public void AssertObjectIsValid(string name, object value) { }
+}
+public sealed class Model {
+    private object member = new();
+    public void Validate(EventListener eventListener) {
+        eventListener.AssertObjectIsValid(nameof(member), member);
+    }
+}
+"#;
+        let fixture = RoundTripFixture {
+            corpus_language: "csharp",
+            analyzer_language: Language::CSharp,
+            file_name: "NestedNameOf.cs",
+            source,
+            call_line: "",
+        };
+
+        let report = audit_fixture(&fixture);
+        let call = "eventListener.AssertObjectIsValid(nameof(member), member);";
+        let call_start = source.find(call).expect("production-shaped outer call");
+        let nameof_start =
+            call_start + call.find("nameof(member)").expect("nameof operand") + "nameof(".len();
+        let runtime_start = call_start + call.rfind("member").expect("runtime operand");
+
+        let nameof_site = report
+            .sites
+            .iter()
+            .find(|site| site.start_byte == nameof_start)
+            .expect("sampled nameof member");
+        assert_eq!(
+            nameof_site.classification,
+            ReferenceClassification::EditorOnly,
+            "the nearest invocation is nameof, not the outer call: {nameof_site:#?}"
+        );
+        assert!(
+            nameof_site
+                .targets
+                .iter()
+                .any(|target| target.fq_name == "Example.Model.member")
+        );
+
+        let runtime_site = report
+            .sites
+            .iter()
+            .find(|site| site.start_byte == runtime_start)
+            .expect("sampled runtime member");
+        assert_eq!(
+            runtime_site.classification,
+            ReferenceClassification::Consistent,
+            "the second outer-call argument remains a runtime usage: {runtime_site:#?}"
+        );
+        assert!(runtime_site.inverse_hit.is_some(), "{runtime_site:#?}");
+        assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
+        assert!(!report.has_actionable_findings(), "{report:#?}");
     }
 
     #[test]
