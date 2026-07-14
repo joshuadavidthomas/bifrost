@@ -1752,6 +1752,88 @@ CanonicalArray array_value;
 }
 
 #[test]
+fn authoritative_cpp_usage_recovers_macro_decorated_function_return_type() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("routerstatus.h", "struct routerstatus_t { int value; };\n"),
+        (
+            "consumer.cpp",
+            r#"#include "routerstatus.h"
+#define STATIC static
+
+STATIC const routerstatus_t *
+choose(void) { return 0; }
+"#,
+        ),
+    ]);
+
+    let target = class_definition(&analyzer, "routerstatus_t");
+    let consumer = project.file("consumer.cpp");
+    let source = consumer.read_to_string().expect("consumer source");
+    let token = "routerstatus_t";
+    let token_start = source.find(token).expect("return type token");
+    let line_start = source[..token_start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let line = source[..token_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let column = source[line_start..token_start].chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.cpp".to_string(),
+                line: Some(line),
+                column: Some(column),
+            }],
+        },
+    );
+    let forward_result = &forward.results[0];
+    assert_eq!("resolved", forward_result.status, "{forward_result:#?}");
+    assert!(
+        forward_result
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("routerstatus_t")),
+        "forward lookup should resolve the exact recovered return type: {forward_result:#?}"
+    );
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!(
+            "expected authoritative macro-return-type success, got {:#?}",
+            query.result
+        );
+    };
+    let hits = hits_by_overload
+        .get(&target)
+        .expect("routerstatus_t should have a proven-hit bucket");
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == consumer
+                && hit.start_offset <= token_start
+                && token_start + token.len() <= hit.end_offset
+        }),
+        "macro-recovered return type should be proven: {hits:#?}"
+    );
+}
+
+#[test]
 fn authoritative_cpp_usage_rejects_ambiguous_and_cyclic_typedef_type_references() {
     let (project, analyzer) = cpp_analyzer_with_files(&[
         (

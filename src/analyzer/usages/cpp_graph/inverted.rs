@@ -25,7 +25,8 @@
 use super::resolver::{
     TargetKind, VisibilityIndex, constructor_style_local_declaration, extract_variable_name,
     first_type_child, infer_cpp_initializer_type, is_declaration_name, is_declarator_node,
-    normalize_type_text, out_of_line_member_definition_owner, type_owner_of,
+    normalize_type_text, out_of_line_member_definition_owner, recovered_macro_function_return_type,
+    type_owner_of,
 };
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::{
@@ -141,6 +142,11 @@ fn record_reference(
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
     match node.kind() {
+        "namespace_identifier" if recovered_macro_function_return_type(node).is_some() => {
+            if let Some(unit) = ctx.resolve_type(node_text(node, ctx.source)) {
+                ctx.record(unit.fq_name(), node);
+            }
+        }
         // A type reference (`Foo x`, base class, `new Foo()`'s type child) resolves
         // to the class. `new Foo()` reaches its type via this case (its type child
         // is itself one of these nodes), so there is no separate construction case.

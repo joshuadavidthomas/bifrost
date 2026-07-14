@@ -1525,6 +1525,42 @@ pub(in crate::analyzer::usages) fn is_declarator_node(node: Node<'_>) -> bool {
     )
 }
 
+pub(super) fn recovered_macro_function_return_type(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "namespace_identifier" {
+        return None;
+    }
+    let qualified = node.parent()?;
+    if qualified.kind() != "qualified_identifier"
+        || qualified.child_by_field_name("scope") != Some(node)
+    {
+        return None;
+    }
+    let mut cursor = qualified.walk();
+    if !qualified
+        .children(&mut cursor)
+        .any(|child| child.kind() == "::" && child.is_missing())
+    {
+        return None;
+    }
+    let function = qualified.parent()?;
+    if function.kind() != "function_definition"
+        || function.child_by_field_name("declarator") != Some(qualified)
+    {
+        return None;
+    }
+
+    let mut declarator = qualified.child_by_field_name("name")?;
+    loop {
+        match declarator.kind() {
+            "function_declarator" => return Some(node),
+            "pointer_declarator" | "pointer_type_declarator" | "reference_declarator" => {
+                declarator = declarator.child_by_field_name("declarator")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
 pub(in crate::analyzer::usages) fn first_type_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).find(|child| {

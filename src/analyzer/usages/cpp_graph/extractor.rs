@@ -302,13 +302,16 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if !matches!(
-        node.kind(),
-        "type_identifier" | "qualified_identifier" | "scoped_type_identifier" | "template_type"
-    ) {
+    let recovered_return_type = recovered_macro_function_return_type(node).is_some();
+    if !recovered_return_type
+        && !matches!(
+            node.kind(),
+            "type_identifier" | "qualified_identifier" | "scoped_type_identifier" | "template_type"
+        )
+    {
         return;
     }
-    if is_declaration_name(node) {
+    if !recovered_return_type && is_declaration_name(node) {
         if let Some((scope, owner)) =
             out_of_line_member_definition_owner(ctx.visibility, ctx.file, ctx.source, node)
             && same_visible_symbol(&owner, &ctx.spec.target)
