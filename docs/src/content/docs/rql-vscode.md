@@ -23,7 +23,7 @@ to open its file and highlight the source range; selecting a file result opens
 the file at its first line. Pipeline wrappers such as `enclosing-decl` and
 `file-of` therefore remain navigable from the same view.
 
-![An RQL query in VS Code, grouped query results in Explorer, and the selected Rust match.](/images/rql-vscode-query-results.png)
+![An RQL query in VS Code, grouped query results in Explorer, and the selected Rust match.](../../assets/rql-vscode-query-results.png)
 
 ## Query Scope
 
