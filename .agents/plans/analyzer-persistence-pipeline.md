@@ -14,9 +14,9 @@ After this work, changing an epoch will make old rows invisible immediately with
 - [x] (2026-07-14) Measured the current database and write cardinality: 10.314 GiB main DB, 6.510 GiB WAL, 6.737 GiB freelist, and about 18.1 million logical rows for 49,233 completed C++ blobs.
 - [x] (2026-07-14) Added deterministic failing contracts for generation visibility, parse/write overlap, and bounded transaction count; retain failure-isolation coverage for the writer implementation.
 - [x] (2026-07-14) Filed and assigned #772 for epoch invalidation and #773 for the persistence pipeline.
-- [ ] Implement generation-aware epoch visibility and incremental reclamation.
+- [x] (2026-07-14) Implemented #772 monotonic generation visibility, captured-token reads and writes, transactional migration, and bounded best-effort reclamation.
 - [x] (2026-07-14) Implemented #773 parallel preparation, an eight-item bounded result channel, deterministic parse/persist overlap, and one adaptive batching writer.
-- [ ] Validate unit, integration, clippy, crash/retry, and forced-refresh behavior.
+- [ ] Validate forced-refresh production behavior; unit, integration, migration, race, failure-isolation, formatting, and all-target/all-feature clippy gates are complete.
 - [ ] Record pushed commits, close the assigned issues, and update the reference-differential campaign plan.
 
 ## Surprises & Discoveries
@@ -44,6 +44,12 @@ After this work, changing an epoch will make old rows invisible immediately with
 
 - Observation: A clock-based linger is not a valid batching boundary on a contended machine.
   Evidence: Root and independent review rejected an initial 2 ms receive timeout because interarrival gaps could silently restore one transaction per blob. The accepted pipeline uses an explicit `AllStarted` producer marker, adaptive caps, and deterministic production-path transaction-count tests instead.
+
+- Observation: An epoch string cannot serve as publication identity, and checking only the current generation at write time is insufficient.
+  Evidence: The accepted #772 design allocates a fresh monotonic token even for A to B to A, returns the complete storage-key token map from one immediate cutover transaction, and validates that captured map inside every read snapshot and mutation transaction. Stale prepared results remain authoritative in memory but are terminal and are never retried forever.
+
+- Observation: Minimal generation tagging keeps migration metadata-only but makes same-OID replacement part of the mutation budget.
+  Evidence: Generation is stored on root blobs and path-symbol rows while satellite tables retain their existing keys. A B-generation write therefore deletes an old A root for the same OID; adaptive batching now counts both cascaded old rows and new rows, isolates one oversized replacement for progress, and reports the combined mutation cost.
 
 ## Decision Log
 
@@ -77,7 +83,7 @@ After this work, changing an epoch will make old rows invisible immediately with
 
 ## Outcomes & Retrospective
 
-The work is not complete because #772 generation-aware epoch visibility and the forced production refresh remain. Issue #773 is implemented and reviewed: parsing and CPU-heavy SQLite-row preparation run on Rayon workers, prepared results stream through a bounded channel, and one writer commits adaptive batches. A real 257-file analyzer build commits 257 blobs in five transactions, a latch proves persistence begins before a slow parser is released, and rollback isolation leaves only the irreducible bad blob dirty. Root rejected and Oldskool replaced an initial clock-based batching policy before this checkpoint.
+Implementation is complete for both #772 and #773; the forced production refresh remains. Parsing and CPU-heavy SQLite-row preparation run on Rayon workers, prepared results stream through a bounded channel, and one writer commits adaptive batches. Epoch cutover atomically publishes fresh monotonic generation tokens without deleting old rows, and analyzers remain bound to the complete captured token map for all reads and writes. Bounded best-effort reclamation and generation-qualified GC remove stale rows later without changing the outcome of already committed mutations. Root and independent review rejected and repaired clock-based batching, oversized buffering, partial token maps, stale lazy-index poisoning, retryable stale dirty states, mixed WAL snapshots, uncounted old-row deletion cost, and cleanup failures reported as primary failures.
 
 ## Context and Orientation
 
@@ -183,6 +189,19 @@ The accepted #773 validation before its checkpoint is:
     broad library gate: 802 passed, 3 ignored; three sandbox-blocked process tests pass outside the sandbox
     affected all-feature clippy, formatting, and diff check: pass
 
+The accepted #772 validation before its checkpoint is:
+
+    store generation and persistence tests: 38 passed
+    tree_sitter analyzer tests: 24 passed
+    populated v3 to v4 analyzer and semantic migration: pass
+    A to B to A non-revival and two-connection publisher serialization: pass
+    stale register, prepared, legacy, path, dirty, and lazy-index behavior: pass
+    same-OID hydration read snapshot consistency: pass
+    strict multi-key TS and TSX captured-token completeness: pass
+    logical-row reclamation and oversized replacement accounting: pass
+    full all-feature library: 814 passed, 3 ignored; four sandbox process failures pass unrestricted
+    isolated all-target and all-feature clippy, formatting, and diff check: pass
+
 ## Interfaces and Dependencies
 
 Use existing Rust standard-library synchronization and channel facilities unless the repository already depends on a bounded-channel crate that clearly fits. Do not introduce an async runtime. Keep SQLite access in `AnalyzerStore` and use `rusqlite` transactions.
@@ -223,3 +242,5 @@ Revision note (2026-07-14): Created this ExecPlan from live RMerl profiling afte
 Revision note (2026-07-14): Recorded the failing reductions and assigned issue boundaries: #772 for constant-time logical epoch cutover and #773 for the bounded streaming persistence pipeline.
 
 Revision note (2026-07-14): Recorded the reviewed #773 implementation, the rejection of clock-based batching and oversized buffering, deterministic production-path overlap and five-transaction proofs, failure isolation, bounded-flow telemetry, rich persistence parity, and broad validation. #772 and the forced production refresh remain open.
+
+Revision note (2026-07-14): Recorded the reviewed #772 implementation: metadata-only generation migration, atomic monotonic multi-key publication, captured-token snapshots and mutations, terminal stale handling, generation-safe GC, bounded reclamation and replacement accounting, concurrency/migration tests, and full validation. Only the forced production refresh remains.

@@ -15,16 +15,19 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
 #[cfg(test)]
-const CURRENT_MIGRATION_VERSION: i64 = 3;
+const CURRENT_MIGRATION_VERSION: i64 = 4;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
 const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
 const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
 const FORWARD_FACTS_SQL: &str = include_str!("../migrations/cache/0003-forward-facts.sql");
+const ANALYZER_GENERATIONS_SQL: &str =
+    include_str!("../migrations/cache/0004-analyzer-generations.sql");
 static CACHE_MIGRATIONS: Lazy<Migrations<'static>> = Lazy::new(|| {
     Migrations::new(vec![
         M::up(CURRENT_BASELINE_SQL),
         M::up(PATH_SYMBOL_UNITS_SQL),
         M::up(FORWARD_FACTS_SQL),
+        M::up(ANALYZER_GENERATIONS_SQL),
     ])
 });
 static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
@@ -42,6 +45,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply path symbol migration");
     conn.execute_batch(FORWARD_FACTS_SQL)
         .expect("apply forward facts migration");
+    conn.execute_batch(ANALYZER_GENERATIONS_SQL)
+        .expect("apply analyzer generations migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -426,6 +431,7 @@ mod tests {
             M::up(CURRENT_BASELINE_SQL),
             M::up(PATH_SYMBOL_UNITS_SQL),
             M::up(FORWARD_FACTS_SQL),
+            M::up(ANALYZER_GENERATIONS_SQL),
             M::up(sql),
         ])
     }
@@ -481,6 +487,71 @@ mod tests {
         );
         assert_eq!(semantic_count, 1);
         assert_eq!(analyzer_count, 0);
+    }
+
+    #[test]
+    fn generation_migration_preserves_populated_v3_rows_as_visible_generation_zero() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        configure_connection(&mut conn).unwrap();
+        Migrations::new(vec![
+            M::up(CURRENT_BASELINE_SQL),
+            M::up(PATH_SYMBOL_UNITS_SQL),
+            M::up(FORWARD_FACTS_SQL),
+        ])
+        .to_latest(&mut conn)
+        .unwrap();
+        let semantic_oid = "1111111111111111111111111111111111111111";
+        let analyzer_oid = "2222222222222222222222222222222222222222";
+        conn.execute(
+            "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
+            [semantic_oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            [analyzer_oid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO path_symbol_units(
+               lang, rel_path, blob_oid, kind, package_name, short_name,
+               exact_fqn, normalized_fqn
+             ) VALUES('rust', 'src/lib.rs', ?1, 0, 'src', 'lib', 'src.lib', 'src.lib')",
+            [analyzer_oid],
+        )
+        .unwrap();
+
+        CACHE_MIGRATIONS.to_latest(&mut conn).unwrap();
+
+        assert_eq!(cache_migration_version(&conn).unwrap(), 4);
+        assert_eq!(
+            conn.query_row("SELECT generation FROM blobs", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT generation FROM path_symbol_units", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM semantic_blobs", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        assert!(current_schema_is_valid(&conn).unwrap());
     }
 
     #[test]
@@ -608,7 +679,7 @@ mod tests {
         let analyzer_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 4);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 5);
         assert_eq!(analyzer_count, 1);
         assert!(table_exists(&conn, "migration_probe").unwrap());
     }
@@ -657,7 +728,7 @@ mod tests {
         writer.rollback().unwrap();
         migrations.to_latest(&mut conn).unwrap();
 
-        assert_eq!(cache_migration_version(&conn).unwrap(), 4);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 5);
         assert!(table_exists(&conn, "migration_probe").unwrap());
     }
 
@@ -669,7 +740,7 @@ mod tests {
             ["2222222222222222222222222222222222222222"],
         )
         .unwrap();
-        conn.execute_batch("PRAGMA user_version = 4;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 5;").unwrap();
 
         let err = migrate(&mut conn).unwrap_err();
 
@@ -680,7 +751,7 @@ mod tests {
             err.contains("DatabaseTooFarAhead"),
             "unexpected error: {err}"
         );
-        assert_eq!(cache_migration_version(&conn).unwrap(), 4);
+        assert_eq!(cache_migration_version(&conn).unwrap(), 5);
         assert_eq!(analyzer_count, 1);
     }
 

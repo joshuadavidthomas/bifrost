@@ -2,7 +2,8 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
 use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::store::{
-    AnalyzerStore, PathSymbolRow, PersistBatchLimits, PersistBatchStats, PreparedParsedBlob,
+    AnalyzerStore, GenerationId, PathSymbolRow, PersistBatchLimits, PersistBatchStats,
+    PreparedParsedBlob, StoreError,
 };
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo,
@@ -57,6 +58,7 @@ pub(crate) struct AnalyzerStoreContext {
     pub(crate) gc: Arc<crate::analyzer::store::gc::AnalyzerGcCoordinator>,
     pub(crate) liveness: Option<Arc<Liveness>>,
     pub(crate) live_paths: Arc<LivePathMap>,
+    pub(crate) generations: Arc<HashMap<String, GenerationId>>,
 }
 
 pub(crate) fn default_store_context(project: &dyn Project) -> AnalyzerStoreContext {
@@ -88,6 +90,7 @@ fn store_context(project: &dyn Project, persisted: bool) -> AnalyzerStoreContext
         gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
         liveness,
         live_paths: Arc::new(LivePathMap::default()),
+        generations: Arc::new(HashMap::default()),
     }
 }
 
@@ -369,8 +372,10 @@ pub(crate) struct ImportFileFacts {
 #[derive(Debug, Clone)]
 struct DirtyFileState {
     state: Arc<FileState>,
+    generation: GenerationId,
     attempts: usize,
     next_retry_at: Instant,
+    terminal_stale: bool,
     _last_error: String,
 }
 
@@ -480,7 +485,7 @@ impl PreparedInFlight {
     }
 }
 
-type PreparedPersistenceOutcome = Option<(Arc<FileState>, Option<String>)>;
+type PreparedPersistenceOutcome = Option<(Arc<FileState>, Option<StoreError>)>;
 type PreparedOutcomeHandler<'a> = dyn FnMut(ProjectFile, PreparedPersistenceOutcome) + 'a;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -944,7 +949,9 @@ pub struct TreeSitterAnalyzer<A> {
     source_snapshot_file_states: Arc<Mutex<FileStateCache>>,
     summary_file_projections: Arc<Mutex<SummaryFileProjectionCache>>,
     global_usage_definition_index: Arc<OnceLock<Arc<GlobalUsageDefinitionIndex>>>,
+    global_usage_definition_fallback: Arc<GlobalUsageDefinitionIndex>,
     usage_facts_index: Arc<OnceLock<Arc<UsageFactsIndex>>>,
+    usage_facts_fallback: Arc<UsageFactsIndex>,
     full_hydration_count: Arc<AtomicUsize>,
     bulk_hydration_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
@@ -967,7 +974,9 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             source_snapshot_file_states: Arc::clone(&self.source_snapshot_file_states),
             summary_file_projections: Arc::clone(&self.summary_file_projections),
             global_usage_definition_index: Arc::clone(&self.global_usage_definition_index),
+            global_usage_definition_fallback: Arc::clone(&self.global_usage_definition_fallback),
             usage_facts_index: Arc::clone(&self.usage_facts_index),
+            usage_facts_fallback: Arc::clone(&self.usage_facts_fallback),
             full_hydration_count: Arc::clone(&self.full_hydration_count),
             bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
@@ -1070,14 +1079,24 @@ where
         store_context: Option<AnalyzerStoreContext>,
     ) -> Self {
         let adapter = Arc::new(adapter);
-        let store_context =
+        let mut store_context =
             store_context.unwrap_or_else(|| default_store_context(project.as_ref()));
-        for (storage_key, parser_language) in adapter.storage_language_keys() {
-            let _ = store_context.store.ensure_language_epoch_value(
-                &storage_key,
-                crate::analyzer::store::epoch::epoch_for(adapter.language(), &parser_language),
-            );
-        }
+        let epochs = adapter
+            .storage_language_keys()
+            .into_iter()
+            .map(|(storage_key, parser_language)| {
+                (
+                    storage_key,
+                    crate::analyzer::store::epoch::epoch_for(adapter.language(), &parser_language)
+                        .to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let generations = store_context
+            .store
+            .ensure_language_epoch_values(&epochs)
+            .unwrap_or_else(|error| panic!("failed to publish analyzer epochs: {error}"));
+        store_context.generations = Arc::new(generations);
         let state = {
             let _scope = profiling::scope(format!(
                 "TreeSitterAnalyzer::{:?}::new_with_config",
@@ -1112,7 +1131,9 @@ where
                 SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
             ))),
             global_usage_definition_index: Arc::new(OnceLock::new()),
+            global_usage_definition_fallback: Arc::new(GlobalUsageDefinitionIndex::default()),
             usage_facts_index: Arc::new(OnceLock::new()),
+            usage_facts_fallback: Arc::new(UsageFactsIndex::default()),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
@@ -1173,7 +1194,9 @@ where
                 SUMMARY_FILE_PROJECTION_CACHE_CAPACITY,
             ))),
             global_usage_definition_index: Arc::new(OnceLock::new()),
+            global_usage_definition_fallback: Arc::new(GlobalUsageDefinitionIndex::default()),
             usage_facts_index: Arc::new(OnceLock::new()),
+            usage_facts_fallback: Arc::new(UsageFactsIndex::default()),
             full_hydration_count: Arc::new(AtomicUsize::new(0)),
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
@@ -1332,7 +1355,7 @@ where
         adapter: &A,
         project: &dyn Project,
         config: &AnalyzerConfig,
-        targets: Vec<(ProjectFile, Oid, String)>,
+        targets: Vec<(ProjectFile, Oid, String, GenerationId)>,
         progress: Option<BuildProgress>,
         store_context: &AnalyzerStoreContext,
         mut on_outcome: impl FnMut(ProjectFile, PreparedPersistenceOutcome),
@@ -1367,7 +1390,7 @@ where
                 pool.install(|| {
                     targets.into_par_iter().for_each_init(
                         || Self::build_parser(language.clone()),
-                        |parser, (file, oid, storage_key)| {
+                        |parser, (file, oid, storage_key, generation)| {
                             let current_started = started.fetch_add(1, Ordering::SeqCst) + 1;
                             if current_started == total {
                                 producer_tx
@@ -1387,6 +1410,7 @@ where
                                         match AnalyzerStore::prepare_parsed_blob(
                                             oid,
                                             &storage_key,
+                                            generation,
                                             adapter,
                                             Arc::clone(&state),
                                         ) {
@@ -1585,7 +1609,7 @@ where
                                 None,
                             ));
                         }
-                        on_outcome(file, Some((state, Some(error))));
+                        on_outcome(file, Some((state, Some(StoreError::new(error)))));
                     }
                     Ok(PreparedAnalysis::Unparseable(file)) => {
                         persist_completed = persist_completed.saturating_add(1);
@@ -1834,7 +1858,7 @@ where
             for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
                 if store_context
                     .store
-                    .sync_path_symbol_units(&lang, &rows)
+                    .sync_path_symbol_units(&lang, store_context.generations[&lang], &rows)
                     .is_ok()
                 {
                     persisted = true;
@@ -1870,6 +1894,10 @@ where
             .into_iter()
             .map(|(lang, _)| lang)
             .collect::<Vec<_>>();
+        let generations = storage_languages
+            .iter()
+            .map(|lang| (lang.clone(), store_context.generations[lang]))
+            .collect();
         let snapshot = store_context.live_paths.snapshot();
         for file in files {
             dirty.remove(file);
@@ -1883,7 +1911,12 @@ where
             for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
                 if store_context
                     .store
-                    .replace_path_symbol_unit(&storage_languages, &rel_path, replacement_ref)
+                    .replace_path_symbol_unit(
+                        &storage_languages,
+                        &generations,
+                        &rel_path,
+                        replacement_ref,
+                    )
                     .is_ok()
                 {
                     persisted = true;
@@ -1925,7 +1958,10 @@ where
                     .collect();
                 let missing = store_context
                     .store
-                    .missing_parsed_blob_keys(&all_blob_keys)
+                    .missing_parsed_blob_keys_at_generations(
+                        &all_blob_keys,
+                        store_context.generations.as_ref(),
+                    )
                     .unwrap_or(all_blob_keys);
                 let missing_blob_keys: HashSet<(Oid, String)> = missing.iter().cloned().collect();
 
@@ -1954,7 +1990,14 @@ where
                         representative_by_blob_key
                             .get(&(*oid, storage_key.clone()))
                             .cloned()
-                            .map(|file| (file, *oid, storage_key.clone()))
+                            .map(|file| {
+                                (
+                                    file,
+                                    *oid,
+                                    storage_key.clone(),
+                                    store_context.generations[storage_key],
+                                )
+                            })
                     })
                     .collect();
                 let mut failed_blob_keys = HashSet::default();
@@ -1976,12 +2019,15 @@ where
                                 let key = Self::transient_cache_key(oid, &file);
                                 match error {
                                     Some(error) => {
+                                        let terminal_stale = error.is_stale_generation();
                                         dirty_file_states.insert(
                                             key.clone(),
                                             Self::dirty_file_state(
                                                 Arc::clone(&state),
+                                                store_context.generations[&storage_key],
                                                 STORE_WRITE_IMMEDIATE_RETRIES + 1,
-                                                error,
+                                                error.to_string(),
+                                                terminal_stale,
                                             ),
                                         );
                                     }
@@ -2018,7 +2064,11 @@ where
                     }
                     if !store_context
                         .store
-                        .contains_parsed_blob(oid, &storage_key)
+                        .contains_parsed_blob_at_generation(
+                            oid,
+                            &storage_key,
+                            store_context.generations[&storage_key],
+                        )
                         .unwrap_or(false)
                     {
                         hydrate_misses.push(file.clone());
@@ -2034,6 +2084,7 @@ where
                     let mut seed_key = None;
                     if let Some(oid) = file_oids.get(&file).copied() {
                         let storage_key = adapter.storage_language_key_for_file(&file);
+                        let generation = store_context.generations[&storage_key];
                         Self::persist_or_mark_dirty(
                             &mut dirty_file_states,
                             store_context,
@@ -2041,6 +2092,7 @@ where
                             &file,
                             oid,
                             &storage_key,
+                            generation,
                             &state,
                         );
                         seed_key = Some(Self::transient_cache_key(oid, &file));
@@ -2065,6 +2117,7 @@ where
                         && let Ok(oid) = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                     {
                         let storage_key = adapter.storage_language_key_for_file(&file);
+                        let generation = store_context.generations[&storage_key];
                         Self::persist_or_mark_dirty(
                             &mut dirty_file_states,
                             store_context,
@@ -2072,6 +2125,7 @@ where
                             &file,
                             oid,
                             &storage_key,
+                            generation,
                             &state,
                         );
                         Some(Self::transient_cache_key(oid, &file))
@@ -2135,13 +2189,17 @@ where
 
     fn dirty_file_state(
         state: Arc<FileState>,
+        generation: GenerationId,
         attempts: usize,
         last_error: String,
+        terminal_stale: bool,
     ) -> DirtyFileState {
         DirtyFileState {
             state,
+            generation,
             attempts,
             next_retry_at: Instant::now() + Self::dirty_retry_delay(attempts),
+            terminal_stale,
             _last_error: last_error,
         }
     }
@@ -2151,26 +2209,35 @@ where
         adapter: &A,
         oid: Oid,
         storage_key: &str,
+        generation: GenerationId,
         state: &FileState,
-    ) -> std::result::Result<usize, String> {
-        let mut last_error = String::new();
+    ) -> std::result::Result<usize, StoreError> {
+        let mut last_error = None;
         for attempt in 1..=STORE_WRITE_IMMEDIATE_RETRIES + 1 {
-            match store_context
-                .store
-                .write_parsed_blob(oid, storage_key, adapter, state)
-            {
+            match store_context.store.write_parsed_blob_at_generation(
+                oid,
+                storage_key,
+                generation,
+                adapter,
+                state,
+            ) {
                 Ok(()) => return Ok(attempt),
                 Err(err) => {
-                    last_error = err.to_string();
+                    let stale = err.is_stale_generation();
+                    last_error = Some(err);
+                    if stale {
+                        break;
+                    }
                     if attempt <= STORE_WRITE_IMMEDIATE_RETRIES {
                         std::thread::sleep(Duration::from_millis(10 * attempt as u64));
                     }
                 }
             }
         }
-        Err(last_error)
+        Err(last_error.expect("failed store write must retain its error"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn persist_or_mark_dirty(
         dirty_file_states: &mut HashMap<FileStateCacheKey, DirtyFileState>,
         store_context: &AnalyzerStoreContext,
@@ -2178,21 +2245,31 @@ where
         file: &ProjectFile,
         oid: Oid,
         storage_key: &str,
+        generation: GenerationId,
         state: &FileState,
     ) {
         let key = Self::transient_cache_key(oid, file);
-        match Self::write_parsed_blob_with_retries(store_context, adapter, oid, storage_key, state)
-        {
+        match Self::write_parsed_blob_with_retries(
+            store_context,
+            adapter,
+            oid,
+            storage_key,
+            generation,
+            state,
+        ) {
             Ok(_) => {
                 dirty_file_states.remove(&key);
             }
             Err(err) => {
+                let terminal_stale = err.is_stale_generation();
                 dirty_file_states.insert(
                     key,
                     Self::dirty_file_state(
                         Arc::new(state.clone()),
+                        generation,
                         STORE_WRITE_IMMEDIATE_RETRIES + 1,
-                        err,
+                        err.to_string(),
+                        terminal_stale,
                     ),
                 );
             }
@@ -2212,22 +2289,23 @@ where
         key: &FileStateCacheKey,
         storage_key: &str,
     ) -> Option<Arc<FileState>> {
-        let state = {
+        let (state, generation) = {
             let dirty_file_states = self
                 .state
                 .dirty_file_states
                 .lock()
                 .expect("dirty file-state mutex poisoned");
             let dirty = dirty_file_states.get(key)?;
-            if Instant::now() < dirty.next_retry_at {
+            if dirty.terminal_stale || Instant::now() < dirty.next_retry_at {
                 return Some(Arc::clone(&dirty.state));
             }
-            Arc::clone(&dirty.state)
+            (Arc::clone(&dirty.state), dirty.generation)
         };
 
-        match self.store_context.store.write_parsed_blob(
+        match self.store_context.store.write_parsed_blob_at_generation(
             key.oid,
             storage_key,
+            generation,
             self.adapter.as_ref(),
             &state,
         ) {
@@ -2250,6 +2328,9 @@ where
                     .lock()
                     .expect("dirty file-state mutex poisoned");
                 if let Some(dirty) = dirty_file_states.get_mut(key) {
+                    if err.is_stale_generation() {
+                        dirty.terminal_stale = true;
+                    }
                     dirty.attempts = dirty.attempts.saturating_add(1);
                     dirty.next_retry_at = Instant::now() + Self::dirty_retry_delay(dirty.attempts);
                     dirty._last_error = err.to_string();
@@ -2304,7 +2385,14 @@ where
         let mut state = match self
             .store_context
             .store
-            .hydrate_file_state_with_source(oid, &storage_key, self.adapter.as_ref(), file, &source)
+            .hydrate_file_state_with_source(
+                oid,
+                &storage_key,
+                self.store_context.generations[&storage_key],
+                self.adapter.as_ref(),
+                file,
+                &source,
+            )
             .ok()
             .flatten()
         {
@@ -2378,7 +2466,12 @@ where
         let mut states = self
             .store_context
             .store
-            .hydrate_file_states_by_key(&entries, self.adapter.as_ref(), &source_by_file)
+            .hydrate_file_states_by_key(
+                &entries,
+                self.store_context.generations.as_ref(),
+                self.adapter.as_ref(),
+                &source_by_file,
+            )
             .unwrap_or_default();
         self.bulk_hydration_count
             .fetch_add(states.len(), Ordering::Relaxed);
@@ -2451,7 +2544,11 @@ where
         let mut facts: HashMap<ProjectFile, ImportFileFacts> = self
             .store_context
             .store
-            .hydrate_import_facts_by_key(&entries, self.adapter.as_ref())
+            .hydrate_import_facts_by_key(
+                &entries,
+                self.store_context.generations.as_ref(),
+                self.adapter.as_ref(),
+            )
             .unwrap_or_default()
             .into_iter()
             .map(|(file, facts)| {
@@ -2560,15 +2657,17 @@ where
         oid: Oid,
         source: String,
     ) -> Option<FileState> {
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        let generation = self.store_context.generations[&storage_key];
         let mut parser = Self::build_parser(self.adapter.parser_language());
         let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
-        let storage_key = self.adapter.storage_language_key_for_file(file);
         let key = Self::transient_cache_key(oid, file);
         match Self::write_parsed_blob_with_retries(
             &self.store_context,
             self.adapter.as_ref(),
             oid,
             &storage_key,
+            generation,
             &state,
         ) {
             Ok(_) => {
@@ -2579,6 +2678,7 @@ where
                     .remove(&key);
             }
             Err(err) => {
+                let terminal_stale = err.is_stale_generation();
                 self.state
                     .dirty_file_states
                     .lock()
@@ -2587,8 +2687,10 @@ where
                         key,
                         Self::dirty_file_state(
                             Arc::new(state.clone()),
+                            generation,
                             STORE_WRITE_IMMEDIATE_RETRIES + 1,
-                            err,
+                            err.to_string(),
+                            terminal_stale,
                         ),
                     );
             }
@@ -2637,7 +2739,7 @@ where
         let present = self
             .store_context
             .store
-            .parsed_blob_keys(&keys)
+            .parsed_blob_keys_at_generations(&keys, self.store_context.generations.as_ref())
             .unwrap_or_default();
         for (project_file, oid, storage_key) in persisted_candidates {
             if present.contains(&(oid, storage_key)) {
@@ -2671,6 +2773,7 @@ where
             .store
             .path_symbol_rows_by_fqn_for_langs(
                 &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
                 fq_name,
                 normalized,
             )
@@ -2731,10 +2834,18 @@ where
 
     fn sql_nonpersisted_workspace_declarations_vec_matching(
         &self,
-        mut keep: impl FnMut(&CodeUnit) -> bool,
+        keep: impl FnMut(&CodeUnit) -> bool,
     ) -> Option<Vec<CodeUnit>> {
+        self.try_sql_nonpersisted_workspace_declarations_vec_matching(keep)
+            .ok()
+    }
+
+    fn try_sql_nonpersisted_workspace_declarations_vec_matching(
+        &self,
+        mut keep: impl FnMut(&CodeUnit) -> bool,
+    ) -> std::result::Result<Vec<CodeUnit>, StoreError> {
         if !self.adapter.has_path_synthetic_module_units() {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
         self.workspace_path_scan_count
             .fetch_add(1, Ordering::Relaxed);
@@ -2786,8 +2897,10 @@ where
             let import_oids = self
                 .store_context
                 .store
-                .blobs_with_structured_imports_by_keys(&blob_keys)
-                .ok()?;
+                .blobs_with_structured_imports_by_keys(
+                    &blob_keys,
+                    self.store_context.generations.as_ref(),
+                )?;
             candidates.retain(|(file, oid, _)| {
                 let project_file = self
                     .rebase_live_file_to_project_root(file)
@@ -2807,7 +2920,7 @@ where
             .collect();
         declarations.sort();
         declarations.dedup();
-        Some(declarations)
+        Ok(declarations)
     }
 
     fn dirty_file_states_for_queries(&self) -> Vec<FileState> {
@@ -2855,7 +2968,9 @@ where
         out
     }
 
-    fn sql_global_usage_definition_index(&self) -> Option<GlobalUsageDefinitionIndex> {
+    fn sql_global_usage_definition_index(
+        &self,
+    ) -> std::result::Result<GlobalUsageDefinitionIndex, StoreError> {
         let _scope = profiling::scope("TreeSitterAnalyzer::sql_global_usage_definition_index");
         if profiling::enabled() {
             profiling::note(format!("language={:?}", self.adapter.language()));
@@ -2894,8 +3009,10 @@ where
             let rows = self
                 .store_context
                 .store
-                .definition_lookup_candidate_rows_by_keys(&blob_keys)
-                .ok()?;
+                .definition_lookup_candidate_rows_by_keys(
+                    &blob_keys,
+                    self.store_context.generations.as_ref(),
+                )?;
             if profiling::enabled() {
                 profiling::note(format!("persisted_rows={}", rows.len()));
             }
@@ -2913,7 +3030,9 @@ where
         let nonpersisted_units = {
             let _scope =
                 profiling::scope("global_usage_definition_index::collect_nonpersisted_units");
-            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| !unit.is_file_scope())?
+            self.try_sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                !unit.is_file_scope()
+            })?
         };
         if profiling::enabled() {
             profiling::note(format!(
@@ -2926,7 +3045,7 @@ where
         units.extend(dirty_units);
         units.extend(nonpersisted_units);
         let _scope = profiling::scope("global_usage_definition_index::build");
-        Some(GlobalUsageDefinitionIndex::from_declarations(
+        Ok(GlobalUsageDefinitionIndex::from_declarations(
             units.iter(),
             |fqn| self.adapter.normalize_full_name(fqn),
             |unit| self.adapter.simple_type_name(unit),
@@ -3038,6 +3157,7 @@ where
                     .store
                     .declaration_rows_by_package_prefix_page(
                         &lang,
+                        self.store_context.generations[&lang],
                         prefix,
                         after.as_ref().map(|(qualifier, oid, unit_key)| {
                             (qualifier.as_str(), *oid, *unit_key)
@@ -3077,11 +3197,13 @@ where
         };
         let mut parser = Self::build_parser(self.adapter.parser_language());
         let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
+        let storage_key = self.adapter.storage_language_key_for_file(file);
         self.store_context
             .store
-            .write_parsed_blob(
+            .write_parsed_blob_at_generation(
                 oid,
-                &self.adapter.storage_language_key_for_file(file),
+                &storage_key,
+                self.store_context.generations[&storage_key],
                 self.adapter.as_ref(),
                 &state,
             )
@@ -3099,7 +3221,10 @@ where
         let rows = self
             .store_context
             .store
-            .declaration_candidate_rows_for_langs(&self.storage_language_keys_for_queries())
+            .declaration_candidate_rows_for_langs(
+                &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
+            )
             .ok()?;
         let mut units = self.resolve_candidate_rows(rows);
         units.extend(self.dirty_units_matching(false, |_| true));
@@ -3118,6 +3243,7 @@ where
             .store
             .declaration_candidate_rows_with_primary_ranges_for_langs(
                 &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
             )
             .ok()?;
         let resolver = QueryResolver::from_snapshot(
@@ -3212,12 +3338,17 @@ where
                         .store
                         .definition_lookup_candidate_rows_by_short_name_for_langs(
                             &langs,
+                            self.store_context.generations.as_ref(),
                             &short_name,
                         )
                 } else {
                     self.store_context
                         .store
-                        .declaration_candidate_rows_by_short_name_for_langs(&langs, &short_name)
+                        .declaration_candidate_rows_by_short_name_for_langs(
+                            &langs,
+                            self.store_context.generations.as_ref(),
+                            &short_name,
+                        )
                 };
                 rows.extend(candidates.ok()?);
             }
@@ -3273,7 +3404,11 @@ where
             rows.extend(
                 self.store_context
                     .store
-                    .declaration_candidate_rows_by_short_name_for_langs(&langs, short_name)
+                    .declaration_candidate_rows_by_short_name_for_langs(
+                        &langs,
+                        self.store_context.generations.as_ref(),
+                        short_name,
+                    )
                     .ok()?,
             );
         }
@@ -3299,7 +3434,11 @@ where
         let rows = self
             .store_context
             .store
-            .declaration_candidate_rows_by_identifier_for_langs(&langs, identifier)
+            .declaration_candidate_rows_by_identifier_for_langs(
+                &langs,
+                self.store_context.generations.as_ref(),
+                identifier,
+            )
             .unwrap_or_default();
         let mut matches: BTreeSet<_> = self
             .resolve_candidate_rows(rows)
@@ -3337,6 +3476,7 @@ where
             .store
             .declaration_candidate_rows_by_lookup_key_for_langs(
                 &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
                 key,
                 &lookup,
             )
@@ -3374,6 +3514,7 @@ where
             .store
             .declaration_member_rows_for_owner_for_langs(
                 &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
                 owner_fqn,
                 false,
                 name,
@@ -3402,6 +3543,7 @@ where
             .store
             .declaration_member_rows_for_owner_for_langs(
                 &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
                 &normalized_owner,
                 true,
                 name,
@@ -3437,6 +3579,7 @@ where
             .store
             .declaration_rows_by_package_for_langs(
                 &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
                 package,
             )
             .unwrap_or_default();
@@ -3477,13 +3620,18 @@ where
                 .store
                 .declaration_candidate_rows_by_literal_substring_for_langs(
                     &storage_languages,
+                    self.store_context.generations.as_ref(),
                     &pattern,
                 )
                 .ok()?
         } else {
             self.store_context
                 .store
-                .declaration_candidate_rows_by_pattern_for_langs(&storage_languages, &pattern)
+                .declaration_candidate_rows_by_pattern_for_langs(
+                    &storage_languages,
+                    self.store_context.generations.as_ref(),
+                    &pattern,
+                )
                 .ok()?
         };
         let mut out: BTreeSet<_> = self
@@ -3534,6 +3682,7 @@ where
             .store
             .search_candidate_rows_by_pattern_for_langs(
                 &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
                 &pattern,
             )
             .ok()?;
@@ -3607,7 +3756,11 @@ where
         let storage_key = self.adapter.storage_language_key_for_file(file);
         self.store_context
             .store
-            .content_package(oid, &storage_key)
+            .content_package(
+                oid,
+                &storage_key,
+                self.store_context.generations[&storage_key],
+            )
             .ok()
             .flatten()
             .or_else(|| {
@@ -3639,7 +3792,11 @@ where
         let storage_key = self.adapter.storage_language_key_for_file(file);
         self.store_context
             .store
-            .hydrate_import_infos_by_key(&[(file.clone(), oid, storage_key)], self.adapter.as_ref())
+            .hydrate_import_infos_by_key(
+                &[(file.clone(), oid, storage_key)],
+                self.store_context.generations.as_ref(),
+                self.adapter.as_ref(),
+            )
             .ok()
             .and_then(|mut imports| imports.remove(file))
             .or_else(|| {
@@ -3701,7 +3858,10 @@ where
         let rows = self
             .store_context
             .store
-            .declaration_candidate_rows_for_langs(&self.storage_language_keys_for_queries())
+            .declaration_candidate_rows_for_langs(
+                &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
+            )
             .unwrap_or_default()
             .into_iter()
             .filter(|row| row.kind == CodeUnitType::Class && row.flags.is_top_level);
@@ -3866,41 +4026,78 @@ where
     }
 
     fn global_usage_definition_index_handle(&self) -> &Arc<GlobalUsageDefinitionIndex> {
-        self.global_usage_definition_index.get_or_init(|| {
-            let _scope =
-                profiling::scope("TreeSitterAnalyzer::global_usage_definition_index_build");
-            let build_count = self
-                .global_usage_definition_index_build_count
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-            if profiling::enabled() {
-                profiling::note(format!(
-                    "language={:?} build_count={build_count}",
-                    self.adapter.language()
-                ));
-            }
-            Arc::new(self.sql_global_usage_definition_index().unwrap_or_default())
-        })
+        self.try_global_usage_definition_index_handle()
+            .unwrap_or(&self.global_usage_definition_fallback)
+    }
+
+    fn try_global_usage_definition_index_handle(
+        &self,
+    ) -> std::result::Result<&Arc<GlobalUsageDefinitionIndex>, StoreError> {
+        if let Some(index) = self.global_usage_definition_index.get() {
+            return Ok(index);
+        }
+        let _scope = profiling::scope("TreeSitterAnalyzer::global_usage_definition_index_build");
+        let build_count = self
+            .global_usage_definition_index_build_count
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if profiling::enabled() {
+            profiling::note(format!(
+                "language={:?} build_count={build_count}",
+                self.adapter.language()
+            ));
+        }
+        let built = Arc::new(self.sql_global_usage_definition_index()?);
+        let _ = self.global_usage_definition_index.set(built);
+        Ok(self
+            .global_usage_definition_index
+            .get()
+            .expect("successful definition index build initializes OnceLock"))
     }
 
     fn usage_facts_index_handle(&self) -> &Arc<UsageFactsIndex> {
-        self.usage_facts_index
-            .get_or_init(|| Arc::new(self.build_usage_facts_index()))
+        self.try_usage_facts_index_handle()
+            .unwrap_or(&self.usage_facts_fallback)
     }
 
-    fn build_usage_facts_index(&self) -> UsageFactsIndex {
-        let declarations = self.sql_all_declarations_vec().unwrap_or_default();
+    fn try_usage_facts_index_handle(
+        &self,
+    ) -> std::result::Result<&Arc<UsageFactsIndex>, StoreError> {
+        if let Some(index) = self.usage_facts_index.get() {
+            return Ok(index);
+        }
+        let built = Arc::new(self.build_usage_facts_index()?);
+        let _ = self.usage_facts_index.set(built);
+        Ok(self
+            .usage_facts_index
+            .get()
+            .expect("successful usage facts build initializes OnceLock"))
+    }
+
+    fn build_usage_facts_index(&self) -> std::result::Result<UsageFactsIndex, StoreError> {
+        self.full_declaration_scan_count
+            .fetch_add(1, Ordering::Relaxed);
+        let storage_languages = self.storage_language_keys_for_queries();
+        let (declaration_rows, rows) = self
+            .store_context
+            .store
+            .declaration_and_usage_fact_rows_for_langs(
+                &storage_languages,
+                self.store_context.generations.as_ref(),
+            )?;
+        let mut declarations = self.resolve_candidate_rows(declaration_rows);
+        declarations.extend(self.dirty_units_matching(false, |_| true));
+        declarations
+            .extend(self.try_sql_nonpersisted_workspace_declarations_vec_matching(|_| true)?);
+        declarations.retain(|unit| !unit.is_file_scope());
+        declarations.sort();
+        declarations.dedup();
         let resolver = QueryResolver::from_snapshot(
             self.adapter.as_ref(),
             self.project.root(),
             self.live_snapshot(),
         );
         let mut facts_by_declaration = HashMap::default();
-        let rows = self
-            .store_context
-            .store
-            .usage_fact_rows_for_langs(&self.storage_language_keys_for_queries())
-            .unwrap_or_default();
         for (unit, row) in resolver.resolve_rows_with_payload(
             rows.into_iter()
                 .map(|row| (row.candidate, (row.signature, row.signature_metadata))),
@@ -3926,8 +4123,8 @@ where
                 );
             }
         }
-        UsageFactsIndex::build_from_declarations(
-            self.global_usage_definition_index(),
+        Ok(UsageFactsIndex::build_from_declarations(
+            self.try_global_usage_definition_index_handle()?.as_ref(),
             declarations.iter(),
             |unit| {
                 facts_by_declaration
@@ -3941,7 +4138,7 @@ where
                     .and_then(|(_, metadata)| metadata.clone())
             },
             self.adapter.as_ref(),
-        )
+        ))
     }
 }
 
@@ -4000,7 +4197,13 @@ where
         let projection = self
             .store_context
             .store
-            .summary_file_projection(oid, &storage_key, self.adapter.as_ref(), file)
+            .summary_file_projection(
+                oid,
+                &storage_key,
+                self.store_context.generations[&storage_key],
+                self.adapter.as_ref(),
+                file,
+            )
             .ok()
             .flatten()?;
         let projection = Arc::new(projection);
@@ -4037,7 +4240,11 @@ where
                 || self
                     .store_context
                     .store
-                    .contains_parsed_blob(oid, &storage_key)
+                    .contains_parsed_blob_at_generation(
+                        oid,
+                        &storage_key,
+                        self.store_context.generations[&storage_key],
+                    )
                     .unwrap_or(false)
         }
     }
@@ -5151,8 +5358,10 @@ mod tests {
             key,
             TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
                 Arc::new(parsed),
+                GenerationId::BOOTSTRAP,
                 32,
                 "forced test persistence failure".to_string(),
+                false,
             ),
         );
 
@@ -5164,6 +5373,10 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             live_paths,
+            generations: Arc::new(HashMap::from_iter([(
+                "python".to_string(),
+                GenerationId::BOOTSTRAP,
+            )])),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -5202,6 +5415,76 @@ mod tests {
     }
 
     #[test]
+    fn terminal_stale_dirty_state_remains_authoritative_without_retrying() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = "class Dirty:\n    pass\n";
+        std::fs::write(root.join("dirty.py"), source).unwrap();
+        let file = ProjectFile::new(root.clone(), "dirty.py");
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let mut parser = TreeSitterAnalyzer::<PythonAdapter>::build_parser(
+            analyzer.adapter.parser_language_for_file(&file),
+        );
+        let parsed = TreeSitterAnalyzer::<PythonAdapter>::analyze_source(
+            &mut parser,
+            analyzer.adapter.as_ref(),
+            &file,
+            source.to_string(),
+        )
+        .unwrap();
+        let key = TreeSitterAnalyzer::<PythonAdapter>::transient_cache_key(oid, &file);
+        let generation = analyzer.store_context.generations["python"];
+        analyzer
+            .store_context
+            .store
+            .ensure_language_epoch_value("python", "cutover-after-failure")
+            .unwrap();
+        analyzer.state.dirty_file_states.lock().unwrap().insert(
+            key.clone(),
+            TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
+                Arc::new(parsed),
+                generation,
+                STORE_WRITE_IMMEDIATE_RETRIES + 1,
+                "stale generation".to_string(),
+                true,
+            ),
+        );
+        let starts = analyzer
+            .store_context
+            .store
+            .parsed_blob_transaction_starts_for_test();
+
+        let state = analyzer.retry_dirty_file_state(&key, "python").unwrap();
+
+        assert!(
+            state
+                .declarations
+                .iter()
+                .any(|unit| unit.short_name() == "Dirty")
+        );
+        assert_eq!(
+            analyzer
+                .store_context
+                .store
+                .parsed_blob_transaction_starts_for_test(),
+            starts,
+            "terminal stale state must not schedule another obsolete write"
+        );
+        assert!(
+            analyzer
+                .state
+                .dirty_file_states
+                .lock()
+                .unwrap()
+                .get(&key)
+                .unwrap()
+                .terminal_stale
+        );
+    }
+
+    #[test]
     fn dirty_path_projection_is_authoritative_for_exact_module_lookup() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -5224,6 +5507,10 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             live_paths,
+            generations: Arc::new(HashMap::from_iter([(
+                "python".to_string(),
+                GenerationId::BOOTSTRAP,
+            )])),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -5280,8 +5567,10 @@ mod tests {
             key,
             TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
                 Arc::new(parsed),
+                GenerationId::BOOTSTRAP,
                 32,
                 "forced test persistence failure".to_string(),
+                false,
             ),
         );
 
@@ -5293,6 +5582,10 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             live_paths,
+            generations: Arc::new(HashMap::from_iter([(
+                "python".to_string(),
+                GenerationId::BOOTSTRAP,
+            )])),
         };
         let config = AnalyzerConfig::default();
         let analyzer = TreeSitterAnalyzer::from_state(
@@ -5513,6 +5806,36 @@ mod tests {
         );
         assert_eq!(analyzer.full_hydration_count_for_test(), 0);
         assert_eq!(analyzer.bulk_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn stale_lazy_index_builds_return_fallback_without_poisoning_once_locks() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::write(root.join("Model.java"), "class Model {}\n").unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
+        analyzer
+            .store_context
+            .store
+            .ensure_language_epoch_value("java", "cutover-before-lazy-read")
+            .unwrap();
+
+        assert!(analyzer.global_usage_definition_index.get().is_none());
+        assert!(analyzer.usage_facts_index.get().is_none());
+        let definitions = analyzer.global_usage_definition_index_shared();
+        let facts = analyzer.usage_facts_index_shared();
+
+        assert!(definitions.fqn("Model").is_empty());
+        assert!(facts.facts("Model").is_empty());
+        assert!(
+            analyzer.global_usage_definition_index.get().is_none(),
+            "stale read must not permanently cache an incomplete definition index"
+        );
+        assert!(
+            analyzer.usage_facts_index.get().is_none(),
+            "stale read must not permanently cache incomplete usage facts"
+        );
     }
 
     #[test]

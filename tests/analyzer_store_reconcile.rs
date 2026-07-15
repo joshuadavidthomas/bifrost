@@ -143,7 +143,12 @@ fn persisted_build_triggers_analyzer_store_gc() {
     assert!(store.contains_blob(reachable_oid, "python").unwrap());
     assert!(store.contains_blob(dirty_oid, "python").unwrap());
 
-    store.register_blobs(&[bogus_oid], "python").unwrap();
+    let python_generation = store
+        .ensure_language_epoch(Language::Python, &tree_sitter_python::LANGUAGE.into())
+        .unwrap();
+    store
+        .register_blobs(&[bogus_oid], "python", python_generation)
+        .unwrap();
     assert!(store.contains_blob(bogus_oid, "python").unwrap());
 
     let _guard = brokk_bifrost::analyzer::store::gc::set_min_interval_secs_for_test(0);

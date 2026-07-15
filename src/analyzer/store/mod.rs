@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use git2::Oid;
 use growable_bloom_filter::GrowableBloom;
-use rusqlite::{Connection, OptionalExtension, ToSql, Transaction, params, params_from_iter};
+use rusqlite::{
+    Connection, OptionalExtension, ToSql, Transaction, TransactionBehavior, params,
+    params_from_iter,
+};
 use sha2::{Digest, Sha256};
 use tree_sitter::Language as TsLanguage;
 
@@ -26,23 +29,41 @@ use crate::hash::{HashMap, HashSet, set_with_capacity};
 use crate::text_utils::compute_line_starts;
 
 const PREPARED_WRITE_IMMEDIATE_RETRIES: usize = 2;
+const STALE_GENERATION_RECLAIM_ROWS: usize = 10_000;
 
 pub fn analyzer_db_path(workspace_root: &Path) -> PathBuf {
     gitblob::cache_db_path(workspace_root)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoreError(String);
+pub struct StoreError {
+    message: String,
+    stale_generation: bool,
+}
 
 impl StoreError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            stale_generation: false,
+        }
+    }
+
+    fn stale_generation(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            stale_generation: true,
+        }
+    }
+
+    pub(crate) fn is_stale_generation(&self) -> bool {
+        self.stale_generation
     }
 }
 
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -71,10 +92,27 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 // A completed parse is published atomically with its rows. Hot candidate
 // queries rely on this marker; full count validation remains on hydration and
 // explicit presence checks to quarantine externally corrupted cache rows.
-const PARSED_BLOB_COMPLETE_CONDITION: &str = "meta.is_complete = 1";
+const PARSED_BLOB_COMPLETE_CONDITION: &str = "
+meta.is_complete = 1
+AND EXISTS (
+  SELECT 1
+  FROM blobs AS active_blob
+  LEFT JOIN analysis_epochs AS active_epoch ON active_epoch.lang = active_blob.lang
+  WHERE active_blob.blob_oid = meta.blob_oid
+    AND active_blob.lang = meta.lang
+    AND active_blob.generation = COALESCE(active_epoch.generation, 0)
+)";
 
 const PARSED_BLOB_INTEGRITY_CONDITION: &str = "
 meta.is_complete = 1
+AND EXISTS (
+  SELECT 1
+  FROM blobs AS active_blob
+  LEFT JOIN analysis_epochs AS active_epoch ON active_epoch.lang = active_blob.lang
+  WHERE active_blob.blob_oid = meta.blob_oid
+    AND active_blob.lang = meta.lang
+    AND active_blob.generation = COALESCE(active_epoch.generation, 0)
+)
 AND
 meta.stored_unit_count = (
   SELECT COUNT(*) FROM code_units AS units
@@ -126,6 +164,13 @@ pub struct AnalyzerStore {
     db_path: Option<PathBuf>,
     #[cfg(test)]
     parsed_blob_transaction_starts: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GenerationId(i64);
+
+impl GenerationId {
+    pub(crate) const BOOTSTRAP: Self = Self(0);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +271,7 @@ fn path_symbol_fingerprint(rows: &[PathSymbolRow]) -> String {
 fn insert_path_symbol_row(
     statement: &mut rusqlite::Statement<'_>,
     lang: &str,
+    generation: GenerationId,
     row: &PathSymbolRow,
 ) -> rusqlite::Result<usize> {
     statement.execute(params![
@@ -237,6 +283,7 @@ fn insert_path_symbol_row(
         row.short_name,
         row.exact_fqn,
         row.normalized_fqn,
+        generation.0,
     ])
 }
 
@@ -257,14 +304,21 @@ pub struct UsageFactRow {
 }
 
 impl AnalyzerStore {
-    pub(crate) fn sync_path_symbol_units(&self, lang: &str, rows: &[PathSymbolRow]) -> Result<()> {
+    pub(crate) fn sync_path_symbol_units(
+        &self,
+        lang: &str,
+        generation: GenerationId,
+        rows: &[PathSymbolRow],
+    ) -> Result<()> {
         let fingerprint = path_symbol_fingerprint(rows);
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
         let existing_fingerprint = tx
             .query_row(
-                "SELECT fingerprint FROM path_symbol_snapshots WHERE lang = ?1",
-                params![lang],
+                "SELECT fingerprint FROM path_symbol_snapshots
+                 WHERE lang = ?1 AND generation = ?2",
+                params![lang, generation.0],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -276,9 +330,11 @@ impl AnalyzerStore {
             let mut stmt = tx.prepare(
                 "SELECT rel_path, blob_oid, kind, package_name, short_name,
                         exact_fqn, normalized_fqn
-                 FROM path_symbol_units WHERE lang = ?1",
+                 FROM path_symbol_units WHERE lang = ?1 AND generation = ?2",
             )?;
-            let mapped = stmt.query_map(params![lang], |row| decode_path_symbol_row(row, 0))?;
+            let mapped = stmt.query_map(params![lang, generation.0], |row| {
+                decode_path_symbol_row(row, 0)
+            })?;
             mapped
                 .map(|row| row.map(|row| (row.rel_path.clone(), row)))
                 .collect::<std::result::Result<HashMap<_, _>, _>>()?
@@ -301,83 +357,106 @@ impl AnalyzerStore {
         let mut insert = tx.prepare(
             "INSERT OR REPLACE INTO path_symbol_units(
                lang, rel_path, blob_oid, kind, package_name, short_name,
-               exact_fqn, normalized_fqn
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+               exact_fqn, normalized_fqn, generation
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
         for (rel_path, row) in &wanted {
             if existing.get(rel_path) == Some(row) {
                 continue;
             }
-            insert_path_symbol_row(&mut insert, lang, row)?;
+            insert_path_symbol_row(&mut insert, lang, generation, row)?;
         }
         drop(insert);
         tx.execute(
-            "INSERT INTO path_symbol_snapshots(lang, fingerprint) VALUES(?1, ?2)
-             ON CONFLICT(lang) DO UPDATE SET fingerprint = excluded.fingerprint",
-            params![lang, fingerprint],
+            "INSERT INTO path_symbol_snapshots(lang, fingerprint, generation) VALUES(?1, ?2, ?3)
+             ON CONFLICT(lang) DO UPDATE SET
+               fingerprint = excluded.fingerprint,
+               generation = excluded.generation",
+            params![lang, fingerprint, generation.0],
         )?;
         tx.commit()?;
+        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
         Ok(())
     }
 
     pub(crate) fn path_symbol_rows_by_fqn_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
         exact_fqn: &str,
         normalized_fqn: &str,
     ) -> Result<Vec<(String, PathSymbolRow)>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let mut out = Vec::new();
-        let sql = "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
+        let sql = format!(
+            "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
                     exact_fqn, normalized_fqn
              FROM path_symbol_units AS units
              WHERE lang = ?1 AND (exact_fqn = ?2 OR normalized_fqn = ?3)
+               AND units.generation = COALESCE(
+                 (SELECT generation FROM analysis_epochs WHERE lang = units.lang), 0
+               )
                AND (
                  lang NOT IN ('javascript', 'typescript:ts', 'typescript:tsx')
                  OR EXISTS(
                    SELECT 1 FROM import_details AS imports
+                   JOIN blob_meta AS meta
+                     ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
                    WHERE imports.blob_oid = units.blob_oid AND imports.lang = units.lang
+                     AND {PARSED_BLOB_COMPLETE_CONDITION}
                  )
                )
-             ORDER BY rel_path, exact_fqn";
+             ORDER BY rel_path, exact_fqn"
+        );
         for lang in langs {
-            let mut stmt = conn.prepare(sql)?;
+            let mut stmt = tx.prepare(&sql)?;
             let mapped = stmt.query_map(params![lang, exact_fqn, normalized_fqn], |row| {
                 Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
             })?;
             out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
         }
+        tx.commit()?;
         Ok(out)
     }
 
     pub(crate) fn replace_path_symbol_unit(
         &self,
         storage_langs: &[String],
+        generations: &HashMap<String, GenerationId>,
         rel_path: &str,
         replacement: Option<(&str, &PathSymbolRow)>,
     ) -> Result<()> {
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let tx = conn.transaction()?;
         for lang in storage_langs {
+            let generation = generations.get(lang).copied().ok_or_else(|| {
+                StoreError::new(format!("missing captured generation for {lang}"))
+            })?;
+            require_current_generation(&tx, lang, generation)?;
             tx.execute(
-                "DELETE FROM path_symbol_units WHERE lang = ?1 AND rel_path = ?2",
-                params![lang, rel_path],
+                "DELETE FROM path_symbol_units
+                 WHERE lang = ?1 AND rel_path = ?2 AND generation = ?3",
+                params![lang, rel_path, generation.0],
             )?;
             tx.execute(
-                "DELETE FROM path_symbol_snapshots WHERE lang = ?1",
-                params![lang],
+                "DELETE FROM path_symbol_snapshots WHERE lang = ?1 AND generation = ?2",
+                params![lang, generation.0],
             )?;
         }
         if let Some((lang, row)) = replacement {
+            let generation = generations[lang];
             let mut insert = tx.prepare(
                 "INSERT INTO path_symbol_units(
                    lang, rel_path, blob_oid, kind, package_name, short_name,
-                   exact_fqn, normalized_fqn
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                   exact_fqn, normalized_fqn, generation
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
-            insert_path_symbol_row(&mut insert, lang, row)?;
+            insert_path_symbol_row(&mut insert, lang, generation, row)?;
         }
         tx.commit()?;
+        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
         Ok(())
     }
 
@@ -419,20 +498,28 @@ impl AnalyzerStore {
         self.db_path.is_none()
     }
 
-    pub fn register_blobs(&self, oids: &[Oid], lang: &str) -> Result<()> {
+    pub fn register_blobs(&self, oids: &[Oid], lang: &str, generation: GenerationId) -> Result<()> {
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
         {
-            let mut stmt =
-                tx.prepare("INSERT OR IGNORE INTO blobs(blob_oid, lang) VALUES(?1, ?2)")?;
+            let mut remove_stale = tx.prepare(
+                "DELETE FROM blobs
+                 WHERE blob_oid = ?1 AND lang = ?2 AND generation <> ?3",
+            )?;
+            let mut insert = tx.prepare(
+                "INSERT OR IGNORE INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)",
+            )?;
             let mut seen = HashSet::default();
             for oid in oids {
                 if seen.insert(*oid) {
-                    stmt.execute(params![oid.to_string(), lang])?;
+                    remove_stale.execute(params![oid.to_string(), lang, generation.0])?;
+                    insert.execute(params![oid.to_string(), lang, generation.0])?;
                 }
             }
         }
         tx.commit()?;
+        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
         Ok(())
     }
 
@@ -440,20 +527,39 @@ impl AnalyzerStore {
         &self,
         language: Language,
         ts_language: &TsLanguage,
-    ) -> Result<()> {
+    ) -> Result<GenerationId> {
         let epoch = epoch::epoch_for(language, ts_language);
         self.ensure_language_epoch_value(language.config_label(), epoch)
     }
 
-    pub fn ensure_language_epoch_value(&self, lang: &str, analysis_epoch: &str) -> Result<()> {
+    pub fn ensure_language_epoch_value(
+        &self,
+        lang: &str,
+        analysis_epoch: &str,
+    ) -> Result<GenerationId> {
+        let entries = [(lang.to_string(), analysis_epoch.to_string())];
+        Ok(self.ensure_language_epoch_values(&entries)?[lang])
+    }
+
+    pub(crate) fn ensure_language_epoch_values(
+        &self,
+        entries: &[(String, String)],
+    ) -> Result<HashMap<String, GenerationId>> {
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        ensure_language_epoch_tx(&mut conn, lang, analysis_epoch)
+        ensure_language_epochs_tx(&mut conn, entries)
     }
 
     pub fn missing_blobs(&self, oids: &[Oid], lang: &str) -> Result<Vec<Oid>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let mut stmt =
-            conn.prepare("SELECT 1 FROM blobs WHERE blob_oid = ?1 AND lang = ?2 LIMIT 1")?;
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT 1 FROM blobs
+             WHERE blob_oid = ?1 AND lang = ?2
+               AND generation = COALESCE(
+                 (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
+               )
+             LIMIT 1",
+        )?;
         let mut out = Vec::new();
         let mut seen = HashSet::default();
         for oid in oids {
@@ -468,13 +574,22 @@ impl AnalyzerStore {
                 out.push(*oid);
             }
         }
+        drop(stmt);
+        tx.commit()?;
         Ok(out)
     }
 
     pub fn missing_blob_keys(&self, entries: &[(Oid, String)]) -> Result<Vec<(Oid, String)>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let mut stmt =
-            conn.prepare("SELECT 1 FROM blobs WHERE blob_oid = ?1 AND lang = ?2 LIMIT 1")?;
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT 1 FROM blobs
+             WHERE blob_oid = ?1 AND lang = ?2
+               AND generation = COALESCE(
+                 (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
+               )
+             LIMIT 1",
+        )?;
         let mut out = Vec::new();
         let mut seen = HashSet::default();
         for (oid, lang) in entries {
@@ -489,6 +604,8 @@ impl AnalyzerStore {
                 out.push((*oid, lang.clone()));
             }
         }
+        drop(stmt);
+        tx.commit()?;
         Ok(out)
     }
 
@@ -507,53 +624,44 @@ impl AnalyzerStore {
         Ok(out)
     }
 
+    pub(crate) fn missing_parsed_blob_keys_at_generations(
+        &self,
+        entries: &[(Oid, String)],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<Vec<(Oid, String)>> {
+        let present = self.parsed_blob_keys_at_generations(entries, generations)?;
+        let mut seen = HashSet::default();
+        Ok(entries
+            .iter()
+            .filter(|entry| seen.insert((*entry).clone()) && !present.contains(*entry))
+            .cloned()
+            .collect())
+    }
+
     /// Return the complete parsed keys from `entries` using chunked set queries.
     /// This reads blob metadata only; it does not hydrate file state or source.
     pub fn parsed_blob_keys(&self, entries: &[(Oid, String)]) -> Result<HashSet<(Oid, String)>> {
-        const KEYS_PER_QUERY: usize = 400;
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        let present = parsed_blob_keys_conn(&tx, entries)?;
+        tx.commit()?;
+        Ok(present)
+    }
 
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let mut unique = Vec::with_capacity(entries.len());
-        let mut seen = HashSet::default();
-        for entry in entries {
-            if seen.insert(entry.clone()) {
-                unique.push(entry.clone());
-            }
-        }
-        let mut present = set_with_capacity(unique.len());
-        for chunk in unique.chunks(KEYS_PER_QUERY) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let values = std::iter::repeat_n("(?, ?)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
-                "WITH requested(blob_oid, lang) AS (VALUES {values})
-                 SELECT requested.blob_oid, requested.lang
-                 FROM requested
-                 JOIN blob_meta AS meta
-                   ON meta.blob_oid = requested.blob_oid
-                  AND meta.lang = requested.lang
-                 WHERE {PARSED_BLOB_INTEGRITY_CONDITION}"
-            );
-            let parameters = chunk
-                .iter()
-                .flat_map(|(oid, lang)| [oid.to_string(), lang.clone()])
-                .collect::<Vec<_>>();
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(parameters), |row| {
-                let oid: String = row.get(0)?;
-                let lang: String = row.get(1)?;
-                Ok((oid, lang))
-            })?;
-            for row in rows {
-                let (oid, lang) = row?;
-                if let Ok(oid) = Oid::from_str(&oid) {
-                    present.insert((oid, lang));
-                }
-            }
-        }
+    pub(crate) fn parsed_blob_keys_at_generations(
+        &self,
+        entries: &[(Oid, String)],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<HashSet<(Oid, String)>> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(
+            &tx,
+            generations,
+            entries.iter().map(|(_, lang)| lang.as_str()),
+        )?;
+        let present = parsed_blob_keys_conn(&tx, entries)?;
+        tx.commit()?;
         Ok(present)
     }
 
@@ -561,7 +669,12 @@ impl AnalyzerStore {
         let conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let exists = conn
             .query_row(
-                "SELECT 1 FROM blobs WHERE blob_oid = ?1 AND lang = ?2 LIMIT 1",
+                "SELECT 1 FROM blobs
+                 WHERE blob_oid = ?1 AND lang = ?2
+                   AND generation = COALESCE(
+                     (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
+                   )
+                 LIMIT 1",
                 params![oid.to_string(), lang],
                 |_| Ok(()),
             )
@@ -572,23 +685,40 @@ impl AnalyzerStore {
 
     pub fn contains_parsed_blob(&self, oid: Oid, lang: &str) -> Result<bool> {
         let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let sql = format!(
-            "SELECT 1 FROM blob_meta AS meta
-             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
-               AND {PARSED_BLOB_INTEGRITY_CONDITION}
-             LIMIT 1"
-        );
-        let exists = conn
-            .query_row(&sql, params![oid.to_string(), lang], |_| Ok(()))
-            .optional()?
-            .is_some();
-        Ok(exists)
+        contains_parsed_blob_conn(&conn, oid, lang)
     }
 
-    pub fn write_parsed_blob<A: LanguageAdapter>(
+    pub(crate) fn contains_parsed_blob_at_generation(
         &self,
         oid: Oid,
         lang: &str,
+        generation: GenerationId,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let exists = contains_parsed_blob_conn(&tx, oid, lang)?;
+        tx.commit()?;
+        Ok(exists)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn write_parsed_blob<A: LanguageAdapter>(
+        &self,
+        oid: Oid,
+        lang: &str,
+        adapter: &A,
+        state: &FileState,
+    ) -> Result<()> {
+        let generation = self.current_generation(lang)?;
+        self.write_parsed_blob_at_generation(oid, lang, generation, adapter, state)
+    }
+
+    pub(crate) fn write_parsed_blob_at_generation<A: LanguageAdapter>(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
         adapter: &A,
         state: &FileState,
     ) -> Result<()> {
@@ -597,8 +727,10 @@ impl AnalyzerStore {
             .fetch_add(1, Ordering::SeqCst);
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let tx = conn.transaction()?;
-        write_parsed_blob_tx(&tx, oid, lang, adapter, state)?;
+        require_current_generation(&tx, lang, generation)?;
+        write_parsed_blob_tx(&tx, oid, lang, generation, adapter, state)?;
         tx.commit()?;
+        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
         Ok(())
     }
 
@@ -610,18 +742,26 @@ impl AnalyzerStore {
     pub(crate) fn prepare_parsed_blob<A: LanguageAdapter>(
         oid: Oid,
         lang: &str,
+        generation: GenerationId,
         adapter: &A,
         state: Arc<FileState>,
     ) -> Result<PreparedParsedBlob> {
-        prepare_parsed_blob(oid, lang, adapter, state)
+        prepare_parsed_blob(oid, lang, generation, adapter, state)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_generation(&self, lang: &str) -> Result<GenerationId> {
+        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        current_generation_conn(&conn, lang)
     }
 
     pub(crate) fn persist_prepared_blobs(
         &self,
-        prepared: Vec<PreparedParsedBlob>,
+        mut prepared: Vec<PreparedParsedBlob>,
         limits: PersistBatchLimits,
     ) -> (Vec<PersistBlobOutcome>, PersistBatchStats) {
         let limits = limits.normalized();
+        self.include_replacement_costs(&mut prepared);
         let mut outcomes = Vec::with_capacity(prepared.len());
         let mut stats = PersistBatchStats::default();
         let mut batch = Vec::new();
@@ -633,54 +773,80 @@ impl AnalyzerStore {
             if !seen.insert((blob.oid(), blob.lang().to_string())) {
                 outcomes.push(PersistBlobOutcome {
                     prepared: blob,
-                    error: Some("duplicate prepared blob key in one persistence call".to_string()),
+                    error: Some(StoreError::new(
+                        "duplicate prepared blob key in one persistence call",
+                    )),
                 });
                 stats.failed_blobs = stats.failed_blobs.saturating_add(1);
                 continue;
             }
             let exceeds = !batch.is_empty()
                 && (batch.len() >= limits.max_blobs
-                    || batch_rows.saturating_add(blob.logical_rows()) > limits.max_rows
-                    || batch_bytes.saturating_add(blob.payload_bytes()) > limits.max_payload_bytes);
+                    || batch_rows.saturating_add(blob.mutation_logical_rows()) > limits.max_rows
+                    || batch_bytes.saturating_add(blob.mutation_payload_bytes())
+                        > limits.max_payload_bytes);
             if exceeds {
-                let (batch_outcomes, batch_stats) = self.persist_prepared_chunk(batch);
+                let (batch_outcomes, batch_stats) = self.persist_prepared_chunk(batch, limits);
                 outcomes.extend(batch_outcomes);
                 stats.merge(batch_stats);
                 batch = Vec::new();
                 batch_rows = 0;
                 batch_bytes = 0;
             }
-            batch_rows = batch_rows.saturating_add(blob.logical_rows());
-            batch_bytes = batch_bytes.saturating_add(blob.payload_bytes());
+            batch_rows = batch_rows.saturating_add(blob.mutation_logical_rows());
+            batch_bytes = batch_bytes.saturating_add(blob.mutation_payload_bytes());
             batch.push(blob);
         }
         if !batch.is_empty() {
-            let (batch_outcomes, batch_stats) = self.persist_prepared_chunk(batch);
+            let (batch_outcomes, batch_stats) = self.persist_prepared_chunk(batch, limits);
             outcomes.extend(batch_outcomes);
             stats.merge(batch_stats);
         }
         (outcomes, stats)
     }
 
+    fn include_replacement_costs(&self, prepared: &mut [PreparedParsedBlob]) {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let Ok(tx) = conn.transaction() else {
+            return;
+        };
+        for blob in prepared {
+            let replaced =
+                persisted_blob_mutation_cost_conn(&tx, blob.oid_text.as_str(), blob.lang())
+                    .unwrap_or_default();
+            blob.include_replaced_cost(replaced);
+        }
+        let _ = tx.commit();
+    }
+
     fn persist_prepared_chunk(
         &self,
         mut prepared: Vec<PreparedParsedBlob>,
+        limits: PersistBatchLimits,
     ) -> (Vec<PersistBlobOutcome>, PersistBatchStats) {
         let batch_blobs = prepared.len();
-        let batch_rows = saturating_sum(prepared.iter().map(PreparedParsedBlob::logical_rows));
-        let batch_bytes = saturating_sum(prepared.iter().map(PreparedParsedBlob::payload_bytes));
-        let result = self.try_persist_prepared_chunk(&prepared);
+        let batch_rows = saturating_sum(
+            prepared
+                .iter()
+                .map(PreparedParsedBlob::mutation_logical_rows),
+        );
+        let batch_bytes = saturating_sum(
+            prepared
+                .iter()
+                .map(PreparedParsedBlob::mutation_payload_bytes),
+        );
+        let result = self.try_persist_prepared_chunk(&prepared, limits);
 
         match result {
-            Ok(()) => {
+            Ok(actual_cost) => {
                 let stats = PersistBatchStats {
                     transactions: 1,
                     committed_blobs: batch_blobs,
-                    logical_rows: batch_rows,
-                    payload_bytes: batch_bytes,
+                    logical_rows: actual_cost.logical_rows,
+                    payload_bytes: actual_cost.payload_bytes,
                     peak_batch_blobs: batch_blobs,
-                    peak_batch_rows: batch_rows,
-                    peak_batch_payload_bytes: batch_bytes,
+                    peak_batch_rows: actual_cost.logical_rows,
+                    peak_batch_payload_bytes: actual_cost.payload_bytes,
                     ..PersistBatchStats::default()
                 };
                 let outcomes = prepared
@@ -692,12 +858,32 @@ impl AnalyzerStore {
                     .collect();
                 (outcomes, stats)
             }
+            Err(error) if error.is_stale_generation() => {
+                let outcomes = prepared
+                    .into_iter()
+                    .map(|prepared| PersistBlobOutcome {
+                        prepared,
+                        error: Some(error.clone()),
+                    })
+                    .collect();
+                (
+                    outcomes,
+                    PersistBatchStats {
+                        failed_transaction_attempts: 1,
+                        failed_blobs: batch_blobs,
+                        peak_batch_blobs: batch_blobs,
+                        peak_batch_rows: batch_rows,
+                        peak_batch_payload_bytes: batch_bytes,
+                        ..PersistBatchStats::default()
+                    },
+                )
+            }
             Err(mut error) if prepared.len() == 1 => {
                 let mut failed_attempts = 1;
                 for retry in 1..=PREPARED_WRITE_IMMEDIATE_RETRIES {
                     std::thread::sleep(Duration::from_millis(10 * retry as u64));
-                    match self.try_persist_prepared_chunk(&prepared) {
-                        Ok(()) => {
+                    match self.try_persist_prepared_chunk(&prepared, limits) {
+                        Ok(actual_cost) => {
                             return (
                                 vec![PersistBlobOutcome {
                                     prepared: prepared.pop().expect("single retried prepared blob"),
@@ -707,17 +893,21 @@ impl AnalyzerStore {
                                     transactions: 1,
                                     failed_transaction_attempts: failed_attempts,
                                     committed_blobs: 1,
-                                    logical_rows: batch_rows,
-                                    payload_bytes: batch_bytes,
+                                    logical_rows: actual_cost.logical_rows,
+                                    payload_bytes: actual_cost.payload_bytes,
                                     peak_batch_blobs: batch_blobs,
-                                    peak_batch_rows: batch_rows,
-                                    peak_batch_payload_bytes: batch_bytes,
+                                    peak_batch_rows: actual_cost.logical_rows,
+                                    peak_batch_payload_bytes: actual_cost.payload_bytes,
                                     ..PersistBatchStats::default()
                                 },
                             );
                         }
                         Err(retry_error) => {
                             failed_attempts = failed_attempts.saturating_add(1);
+                            if retry_error.is_stale_generation() {
+                                error = retry_error;
+                                break;
+                            }
                             error = retry_error;
                         }
                     }
@@ -725,7 +915,7 @@ impl AnalyzerStore {
                 (
                     vec![PersistBlobOutcome {
                         prepared: prepared.pop().expect("single failed prepared blob"),
-                        error: Some(error.to_string()),
+                        error: Some(error),
                     }],
                     PersistBatchStats {
                         failed_transaction_attempts: failed_attempts,
@@ -739,8 +929,8 @@ impl AnalyzerStore {
             }
             Err(_) => {
                 let right = prepared.split_off(prepared.len() / 2);
-                let (mut left_outcomes, mut stats) = self.persist_prepared_chunk(prepared);
-                let (right_outcomes, right_stats) = self.persist_prepared_chunk(right);
+                let (mut left_outcomes, mut stats) = self.persist_prepared_chunk(prepared, limits);
+                let (right_outcomes, right_stats) = self.persist_prepared_chunk(right, limits);
                 left_outcomes.extend(right_outcomes);
                 stats.failed_transaction_attempts =
                     stats.failed_transaction_attempts.saturating_add(1);
@@ -753,20 +943,52 @@ impl AnalyzerStore {
         }
     }
 
-    fn try_persist_prepared_chunk(&self, prepared: &[PreparedParsedBlob]) -> Result<()> {
+    fn try_persist_prepared_chunk(
+        &self,
+        prepared: &[PreparedParsedBlob],
+        limits: PersistBatchLimits,
+    ) -> Result<PersistedMutationCost> {
         #[cfg(test)]
         self.parsed_blob_transaction_starts
             .fetch_add(1, Ordering::SeqCst);
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let tx = conn.transaction()?;
+        let mut cost = PersistedMutationCost::default();
+        for blob in prepared {
+            require_current_generation(&tx, blob.lang(), blob.generation)?;
+            let replaced =
+                persisted_blob_mutation_cost_conn(&tx, blob.oid_text.as_str(), blob.lang())?;
+            cost.logical_rows = cost
+                .logical_rows
+                .saturating_add(blob.logical_rows())
+                .saturating_add(replaced.logical_rows);
+            cost.payload_bytes = cost
+                .payload_bytes
+                .saturating_add(blob.payload_bytes())
+                .saturating_add(replaced.payload_bytes);
+        }
+        if prepared.len() > 1
+            && (prepared.len() > limits.max_blobs
+                || cost.logical_rows > limits.max_rows
+                || cost.payload_bytes > limits.max_payload_bytes)
+        {
+            return Err(StoreError::new(format!(
+                "prepared replacement mutation batch exceeds limits: blobs={}, rows={}, bytes={}",
+                prepared.len(),
+                cost.logical_rows,
+                cost.payload_bytes
+            )));
+        }
         for blob in prepared {
             write_prepared_blob_tx(&tx, blob)?;
         }
         tx.commit()?;
-        Ok(())
+        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
+        Ok(cost)
     }
 
-    pub fn hydrate_file_state<A: LanguageAdapter>(
+    #[cfg(test)]
+    pub(crate) fn hydrate_file_state<A: LanguageAdapter>(
         &self,
         oid: Oid,
         lang: &str,
@@ -774,19 +996,31 @@ impl AnalyzerStore {
         file: &ProjectFile,
     ) -> Result<Option<FileState>> {
         let source = file.read_to_string().unwrap_or_default();
-        self.hydrate_file_state_with_source(oid, lang, adapter, file, &source)
+        self.hydrate_file_state_with_source(
+            oid,
+            lang,
+            self.current_generation(lang)?,
+            adapter,
+            file,
+            &source,
+        )
     }
 
     pub fn hydrate_file_state_with_source<A: LanguageAdapter>(
         &self,
         oid: Oid,
         lang: &str,
+        generation: GenerationId,
         adapter: &A,
         file: &ProjectFile,
         source: &str,
     ) -> Result<Option<FileState>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        hydrate_file_state_conn(&conn, oid, lang, adapter, file, source)
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = hydrate_file_state_conn(&tx, oid, lang, adapter, file, source)?;
+        tx.commit()?;
+        Ok(result)
     }
 
     /// Read only the persisted rows required to render a file summary. This
@@ -796,12 +1030,17 @@ impl AnalyzerStore {
         &self,
         oid: Oid,
         lang: &str,
+        generation: GenerationId,
         adapter: &A,
         file: &ProjectFile,
     ) -> Result<Option<SummaryFileProjection>> {
         let _scope = crate::profiling::scope("AnalyzerStore::summary_file_projection");
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        summary_file_projection_conn(&conn, oid, lang, adapter, file)
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = summary_file_projection_conn(&tx, oid, lang, adapter, file)?;
+        tx.commit()?;
+        Ok(result)
     }
 
     /// Hydrate many live file states from persisted blob rows using chunked
@@ -816,13 +1055,17 @@ impl AnalyzerStore {
         adapter: &A,
         source_by_file: &HashMap<ProjectFile, String>,
     ) -> Result<HashMap<ProjectFile, FileState>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        hydrate_file_states_conn(&conn, entries, lang, adapter, source_by_file)
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        let result = hydrate_file_states_conn(&tx, entries, lang, adapter, source_by_file)?;
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn hydrate_file_states_by_key<A: LanguageAdapter>(
         &self,
         entries: &[(ProjectFile, Oid, String)],
+        generations: &HashMap<String, GenerationId>,
         adapter: &A,
         source_by_file: &HashMap<ProjectFile, String>,
     ) -> Result<HashMap<ProjectFile, FileState>> {
@@ -834,16 +1077,23 @@ impl AnalyzerStore {
                 .or_default()
                 .push((file.clone(), *oid));
         }
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(
+            &tx,
+            generations,
+            entries.iter().map(|(_, _, lang)| lang.as_str()),
+        )?;
         for (lang, lang_entries) in by_lang {
             out.extend(hydrate_file_states_conn(
-                &conn,
+                &tx,
                 &lang_entries,
                 &lang,
                 adapter,
                 source_by_file,
             )?);
         }
+        tx.commit()?;
         Ok(out)
     }
 
@@ -853,25 +1103,28 @@ impl AnalyzerStore {
         lang: &str,
         _adapter: &A,
     ) -> Result<HashMap<ProjectFile, Vec<ImportInfo>>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
         let oids = unique_oid_strings(entries);
-        let imports_by_oid = read_import_infos_bulk(&conn, lang, &oids)?;
+        let imports_by_oid = read_import_infos_bulk(&tx, lang, &oids)?;
         let mut out = HashMap::default();
         for (file, oid) in entries {
             if let Some(imports) = imports_by_oid.get(&oid.to_string()) {
                 out.insert(file.clone(), imports.clone());
             }
         }
+        tx.commit()?;
         Ok(out)
     }
 
     pub fn hydrate_import_infos_by_key<A: LanguageAdapter>(
         &self,
         entries: &[(ProjectFile, Oid, String)],
+        generations: &HashMap<String, GenerationId>,
         adapter: &A,
     ) -> Result<HashMap<ProjectFile, Vec<ImportInfo>>> {
         Ok(self
-            .hydrate_import_facts_by_key(entries, adapter)?
+            .hydrate_import_facts_by_key(entries, generations, adapter)?
             .into_iter()
             .map(|(file, facts)| (file, facts.imports))
             .collect())
@@ -880,9 +1133,16 @@ impl AnalyzerStore {
     pub(crate) fn hydrate_import_facts_by_key<A: LanguageAdapter>(
         &self,
         entries: &[(ProjectFile, Oid, String)],
+        generations: &HashMap<String, GenerationId>,
         adapter: &A,
     ) -> Result<HashMap<ProjectFile, ImportFacts>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(
+            &tx,
+            generations,
+            entries.iter().map(|(_, _, lang)| lang.as_str()),
+        )?;
         let mut out = HashMap::default();
         let mut by_lang: HashMap<String, Vec<(ProjectFile, Oid)>> = HashMap::default();
         for (file, oid, lang) in entries {
@@ -893,8 +1153,8 @@ impl AnalyzerStore {
         }
         for (lang, lang_entries) in by_lang {
             let oids = unique_oid_strings(&lang_entries);
-            let packages_by_oid = read_content_packages_bulk(&conn, &lang, &oids)?;
-            let imports_by_oid = read_import_infos_bulk(&conn, &lang, &oids)?;
+            let packages_by_oid = read_content_packages_bulk(&tx, &lang, &oids)?;
+            let imports_by_oid = read_import_infos_bulk(&tx, &lang, &oids)?;
             for (file, oid) in lang_entries {
                 let oid = oid.to_string();
                 let Some(package_name) = packages_by_oid.get(&oid) else {
@@ -909,12 +1169,23 @@ impl AnalyzerStore {
                 );
             }
         }
+        tx.commit()?;
         Ok(out)
     }
 
-    pub(crate) fn content_package(&self, oid: Oid, lang: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        Ok(read_content_packages_bulk(&conn, lang, &[oid.to_string()])?.remove(&oid.to_string()))
+    pub(crate) fn content_package(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+    ) -> Result<Option<String>> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result =
+            read_content_packages_bulk(&tx, lang, &[oid.to_string()])?.remove(&oid.to_string());
+        tx.commit()?;
+        Ok(result)
     }
 
     pub fn declaration_candidate_rows_by_short_name(
@@ -930,16 +1201,21 @@ impl AnalyzerStore {
     pub fn declaration_candidate_rows_by_short_name_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
         short_name: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = declaration_candidate_sql("units.lang = ?1 AND units.short_name = ?2");
-        candidate_rows_for_languages(
-            &conn,
+        let rows = candidate_rows_for_languages(
+            &tx,
             langs.iter().map(String::as_str),
             &sql,
             &[&short_name],
-        )
+        )?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     /// Returns declaration-lookup candidates for a known short name.
@@ -952,56 +1228,75 @@ impl AnalyzerStore {
     pub(crate) fn definition_lookup_candidate_rows_by_short_name_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
         short_name: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = definition_lookup_candidate_sql("units.lang = ?1 AND units.short_name = ?2");
-        candidate_rows_for_languages(
-            &conn,
+        let rows = candidate_rows_for_languages(
+            &tx,
             langs.iter().map(String::as_str),
             &sql,
             &[&short_name],
-        )
+        )?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     pub fn declaration_candidate_rows_by_identifier_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
         identifier: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = declaration_candidate_sql("units.lang = ?1 AND units.identifier = ?2");
-        candidate_rows_for_languages(
-            &conn,
+        let rows = candidate_rows_for_languages(
+            &tx,
             langs.iter().map(String::as_str),
             &sql,
             &[&identifier],
-        )
+        )?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     pub(crate) fn declaration_candidate_rows_by_lookup_key_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
         column: PersistedLookupKey,
         value: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let column = match column {
             PersistedLookupKey::ExactFqn => "exact_fqn",
             PersistedLookupKey::NormalizedFqn => "normalized_fqn",
         };
         let sql = declaration_candidate_sql(&format!("units.lang = ?1 AND units.{column} = ?2"));
-        candidate_rows_for_languages(&conn, langs.iter().map(String::as_str), &sql, &[&value])
+        let rows =
+            candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &[&value])?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     pub(crate) fn declaration_member_rows_for_owner_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
         owner: &str,
         normalized: bool,
         identifier: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let owner_column = if normalized {
             "normalized_fqn"
         } else {
@@ -1023,22 +1318,30 @@ impl AnalyzerStore {
                  AND owner.in_declarations = 1 AND child.identifier = ?3"
             ),
         );
-        candidate_rows_for_languages(
-            &conn,
+        let rows = candidate_rows_for_languages(
+            &tx,
             langs.iter().map(String::as_str),
             &sql,
             &[&owner, &identifier],
-        )
+        )?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     pub(crate) fn declaration_rows_by_package_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
         package: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = declaration_candidate_sql("units.lang = ?1 AND units.content_qualifier = ?2");
-        candidate_rows_for_languages(&conn, langs.iter().map(String::as_str), &sql, &[&package])
+        let rows =
+            candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &[&package])?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     /// One literal, index-ordered page of candidate rows whose persisted
@@ -1051,11 +1354,14 @@ impl AnalyzerStore {
     pub(crate) fn declaration_rows_by_package_prefix_page(
         &self,
         lang: &str,
+        generation: GenerationId,
         package: &str,
         after: Option<(&str, Oid, i64)>,
         limit: usize,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
         let nested = format!("{package}.");
         // '/' is the immediate ASCII successor of '.', so the half-open range
         // ["pkg.", "pkg/") contains exactly strings with the literal "pkg."
@@ -1077,7 +1383,7 @@ impl AnalyzerStore {
             "units.content_qualifier, units.blob_oid, units.unit_key",
         );
         let sql = format!("{sql} LIMIT ?{}", if after.is_some() { 8 } else { 5 });
-        let mut statement = conn.prepare(&sql)?;
+        let mut statement = tx.prepare(&sql)?;
         let mapped = match after {
             Some((after_qualifier, after_oid, after_unit_key)) => statement.query_map(
                 params![
@@ -1097,7 +1403,10 @@ impl AnalyzerStore {
                 candidate_row_from_row,
             )?,
         };
-        collect_candidate_rows(mapped)
+        let rows = collect_candidate_rows(mapped)?;
+        drop(statement);
+        tx.commit()?;
+        Ok(rows)
     }
 
     pub fn declaration_candidate_rows_by_lang(&self, lang: &str) -> Result<Vec<CandidateRow>> {
@@ -1128,16 +1437,26 @@ impl AnalyzerStore {
     pub fn declaration_candidate_rows_by_literal_substring_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
         substring: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = declaration_candidate_sql(
             "units.lang = ?1 AND (
                instr(lower(units.short_name), lower(?2)) > 0
                OR instr(lower(units.content_qualifier), lower(?2)) > 0
              )",
         );
-        candidate_rows_for_languages(&conn, langs.iter().map(String::as_str), &sql, &[&substring])
+        let rows = candidate_rows_for_languages(
+            &tx,
+            langs.iter().map(String::as_str),
+            &sql,
+            &[&substring],
+        )?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     /// Search candidates carry the metadata that `search_symbols` otherwise
@@ -1171,133 +1490,104 @@ impl AnalyzerStore {
     pub fn search_candidate_rows_by_pattern_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
         _pattern: &str,
     ) -> Result<Vec<SearchCandidateRow>> {
         // Regex matching is performed after language-specific FQN hydration.
         // The storage projection intentionally supplies a complete declaration
         // candidate set while avoiding per-candidate file-state hydration.
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let mut out = Vec::new();
         for lang in langs {
-            out.extend(self.search_candidate_rows_by_lang(lang)?);
+            out.extend(search_candidate_rows_by_lang_conn(&tx, lang)?);
         }
+        tx.commit()?;
         Ok(out)
     }
 
     pub fn usage_fact_rows_by_lang(&self, lang: &str) -> Result<Vec<UsageFactRow>> {
         let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let sql = format!(
-            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
-                    units.content_qualifier, units.signature, units.synthetic,
-                    units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                    units.in_definition_lookup, signature.text, metadata.metadata
-             FROM code_units AS units
-             JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
-             LEFT JOIN unit_signatures AS signature
-               ON signature.blob_oid = units.blob_oid
-              AND signature.lang = units.lang
-              AND signature.unit_key = units.unit_key
-              AND signature.ordinal = 0
-             LEFT JOIN unit_signature_metadata AS metadata
-               ON metadata.blob_oid = units.blob_oid
-              AND metadata.lang = units.lang
-              AND metadata.unit_key = units.unit_key
-              AND metadata.ordinal = 0
-             WHERE units.lang = ?1 AND units.in_declarations = 1
-               AND {PARSED_BLOB_COMPLETE_CONDITION}
-             ORDER BY units.blob_oid, units.unit_key"
-        );
-        let mut stmt = conn.prepare_cached(&sql)?;
-        collect_usage_fact_rows(stmt.query_map([lang], usage_fact_row_from_row)?)
+        usage_fact_rows_by_lang_conn(&conn, lang)
     }
 
-    pub fn usage_fact_rows_for_langs(&self, langs: &[String]) -> Result<Vec<UsageFactRow>> {
+    pub fn usage_fact_rows_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<Vec<UsageFactRow>> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let mut out = Vec::new();
         for lang in langs {
-            out.extend(self.usage_fact_rows_by_lang(lang)?);
+            out.extend(usage_fact_rows_by_lang_conn(&tx, lang)?);
         }
+        tx.commit()?;
         Ok(out)
+    }
+
+    pub(crate) fn declaration_and_usage_fact_rows_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<(Vec<CandidateRow>, Vec<UsageFactRow>)> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let declaration_sql = declaration_candidate_sql("units.lang = ?1");
+        let declarations = candidate_rows_for_languages(
+            &tx,
+            langs.iter().map(String::as_str),
+            &declaration_sql,
+            &[],
+        )?;
+        let mut usage_facts = Vec::new();
+        for lang in langs {
+            usage_facts.extend(usage_fact_rows_by_lang_conn(&tx, lang)?);
+        }
+        tx.commit()?;
+        Ok((declarations, usage_facts))
     }
 
     pub fn declaration_candidate_rows_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
     ) -> Result<Vec<CandidateRow>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = declaration_candidate_sql("units.lang = ?1");
-        candidate_rows_for_languages(&conn, langs.iter().map(String::as_str), &sql, &[])
+        let rows = candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &[])?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     pub fn declaration_candidate_rows_with_primary_ranges_for_langs(
         &self,
         langs: &[String],
+        generations: &HashMap<String, GenerationId>,
     ) -> Result<Vec<(CandidateRow, Option<Range>)>> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let sql = declaration_candidate_sql("units.lang = ?1");
         let mut out = Vec::new();
         for lang in langs {
-            let rows = self.declaration_candidate_rows_by_lang(lang)?;
+            let rows =
+                candidate_rows_for_languages(&tx, std::iter::once(lang.as_str()), &sql, &[])?;
             let mut oids: Vec<_> = rows.iter().map(|row| row.blob_oid).collect();
             oids.sort();
             oids.dedup();
-            let ranges = self.primary_ranges_by_unit_for_lang(lang, &oids)?;
+            let ranges = primary_ranges_by_unit_for_lang_conn(&tx, lang, &oids)?;
             out.extend(rows.into_iter().map(|row| {
                 let range = ranges.get(&(row.blob_oid, row.unit_key)).copied();
                 (row, range)
             }));
         }
-        Ok(out)
-    }
-
-    fn primary_ranges_by_unit_for_lang(
-        &self,
-        lang: &str,
-        oids: &[Oid],
-    ) -> Result<HashMap<(Oid, i64), Range>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let mut out = HashMap::default();
-        for chunk in oids.chunks(900) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT blob_oid, unit_key, start_byte, end_byte, start_line, end_line
-                 FROM unit_ranges
-                 WHERE lang = ? AND ordinal = 0 AND blob_oid IN ({placeholders})"
-            );
-            let mut params = Vec::with_capacity(chunk.len() + 1);
-            params.push(lang.to_string());
-            params.extend(chunk.iter().map(Oid::to_string));
-            let mut stmt = conn.prepare_cached(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                let oid_text = row.get::<_, String>(0)?;
-                let oid = Oid::from_str(&oid_text).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })?;
-                Ok((
-                    (oid, row.get::<_, i64>(1)?),
-                    Range {
-                        start_byte: i64_to_usize(row.get::<_, i64>(2)?)
-                            .map_err(rusqlite_error_from_store)?,
-                        end_byte: i64_to_usize(row.get::<_, i64>(3)?)
-                            .map_err(rusqlite_error_from_store)?,
-                        start_line: i64_to_usize(row.get::<_, i64>(4)?)
-                            .map_err(rusqlite_error_from_store)?,
-                        end_line: i64_to_usize(row.get::<_, i64>(5)?)
-                            .map_err(rusqlite_error_from_store)?,
-                    },
-                ))
-            })?;
-            for row in rows {
-                let (key, range) = row?;
-                out.insert(key, range);
-            }
-        }
+        tx.commit()?;
         Ok(out)
     }
 
@@ -1310,46 +1600,23 @@ impl AnalyzerStore {
         if crate::profiling::enabled() {
             crate::profiling::note(format!("language={lang} oid_count={}", oids.len()));
         }
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
         let mut out = Vec::new();
-        for chunk in oids.chunks(900) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
-                        units.content_qualifier, units.signature, units.synthetic,
-                        units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                        units.in_definition_lookup
-                 FROM code_units AS units
-                 JOIN blob_meta AS meta
-                   ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
-                 WHERE units.lang = ? AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
-                   AND units.blob_oid IN ({placeholders})
-                   AND {PARSED_BLOB_COMPLETE_CONDITION}
-                 ORDER BY units.blob_oid, units.unit_key"
-            );
-            let mut params = Vec::with_capacity(chunk.len() + 1);
-            params.push(lang.to_string());
-            params.extend(chunk.iter().map(Oid::to_string));
-            let mut stmt = conn.prepare_cached(&sql)?;
-            out.extend(collect_candidate_rows(stmt.query_map(
-                rusqlite::params_from_iter(params.iter()),
-                candidate_row_from_row,
-            )?)?);
-        }
+        out.extend(definition_lookup_candidate_rows_by_oids_conn(
+            &tx, lang, oids,
+        )?);
         if crate::profiling::enabled() {
             crate::profiling::note(format!("row_count={}", out.len()));
         }
+        tx.commit()?;
         Ok(out)
     }
 
     pub fn definition_lookup_candidate_rows_by_keys(
         &self,
         entries: &[(Oid, String)],
+        generations: &HashMap<String, GenerationId>,
     ) -> Result<Vec<CandidateRow>> {
         let _scope = crate::profiling::scope("AnalyzerStore::definition_lookup_rows_by_keys");
         if crate::profiling::enabled() {
@@ -1359,15 +1626,21 @@ impl AnalyzerStore {
         for (oid, lang) in entries {
             by_lang.entry(lang.clone()).or_default().push(*oid);
         }
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, by_lang.keys().map(String::as_str))?;
         let mut out = Vec::new();
         for (lang, mut oids) in by_lang {
             oids.sort();
             oids.dedup();
-            out.extend(self.definition_lookup_candidate_rows_by_oids(&lang, &oids)?);
+            out.extend(definition_lookup_candidate_rows_by_oids_conn(
+                &tx, &lang, &oids,
+            )?);
         }
         if crate::profiling::enabled() {
             crate::profiling::note(format!("row_count={}", out.len()));
         }
+        tx.commit()?;
         Ok(out)
     }
 
@@ -1386,76 +1659,47 @@ impl AnalyzerStore {
     pub fn declaration_candidate_rows_by_pattern_for_langs(
         &self,
         langs: &[String],
-        pattern: &str,
+        generations: &HashMap<String, GenerationId>,
+        _pattern: &str,
     ) -> Result<Vec<CandidateRow>> {
-        let mut out = Vec::new();
-        for lang in langs {
-            out.extend(self.declaration_candidate_rows_by_pattern(lang, pattern)?);
-        }
-        Ok(out)
+        self.declaration_candidate_rows_for_langs(langs, generations)
     }
 
     pub fn blobs_with_structured_imports(&self, lang: &str, oids: &[Oid]) -> Result<HashSet<Oid>> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let mut out = HashSet::default();
-        for chunk in oids.chunks(900) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT DISTINCT imports.blob_oid
-                 FROM import_details AS imports
-                 JOIN blob_meta AS meta
-                   ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
-                 WHERE imports.lang = ?
-                   AND imports.blob_oid IN ({placeholders})
-                   AND {PARSED_BLOB_COMPLETE_CONDITION}"
-            );
-            let mut params = Vec::with_capacity(chunk.len() + 1);
-            params.push(lang.to_string());
-            params.extend(chunk.iter().map(Oid::to_string));
-            let mut stmt = conn.prepare_cached(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                let oid_text = row.get::<_, String>(0)?;
-                Oid::from_str(&oid_text).map_err(|err| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(err),
-                    )
-                })
-            })?;
-            for row in rows {
-                out.insert(row?);
-            }
-        }
-        Ok(out)
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        let present = blobs_with_structured_imports_conn(&tx, lang, oids)?;
+        tx.commit()?;
+        Ok(present)
     }
 
     pub fn blobs_with_structured_imports_by_keys(
         &self,
         entries: &[(Oid, String)],
+        generations: &HashMap<String, GenerationId>,
     ) -> Result<HashSet<(Oid, String)>> {
         let mut by_lang: HashMap<String, Vec<Oid>> = HashMap::default();
         for (oid, lang) in entries {
             by_lang.entry(lang.clone()).or_default().push(*oid);
         }
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, by_lang.keys().map(String::as_str))?;
         let mut out = HashSet::default();
         for (lang, mut oids) in by_lang {
             oids.sort();
             oids.dedup();
-            for oid in self.blobs_with_structured_imports(&lang, &oids)? {
+            for oid in blobs_with_structured_imports_conn(&tx, &lang, &oids)? {
                 out.insert((oid, lang.clone()));
             }
         }
+        tx.commit()?;
         Ok(out)
     }
 
     pub fn content_row_count(&self, oid: Oid, lang: &str) -> Result<usize> {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
         let oid = oid.to_string();
         let mut total = 0usize;
         for table in [
@@ -1472,9 +1716,22 @@ impl AnalyzerStore {
             "ruby_method_dispatch_modes",
             "scala_traits",
         ] {
-            let sql = format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1 AND lang = ?2");
-            total += conn.query_row(&sql, params![oid, lang], |row| row.get::<_, usize>(0))?;
+            let sql = format!(
+                "SELECT COUNT(*)
+                 FROM {table} AS rows
+                 JOIN blobs AS active_blob
+                   ON active_blob.blob_oid = rows.blob_oid
+                  AND active_blob.lang = rows.lang
+                 LEFT JOIN analysis_epochs AS active_epoch
+                   ON active_epoch.lang = active_blob.lang
+                 WHERE rows.blob_oid = ?1 AND rows.lang = ?2
+                   AND active_blob.generation = COALESCE(active_epoch.generation, 0)"
+            );
+            total = total.saturating_add(
+                tx.query_row(&sql, params![oid, lang], |row| row.get::<_, usize>(0))?,
+            );
         }
+        tx.commit()?;
         Ok(total)
     }
 
@@ -1486,7 +1743,12 @@ impl AnalyzerStore {
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let tx = conn.transaction()?;
         let dead: Vec<(String, String)> = {
-            let mut stmt = tx.prepare("SELECT blob_oid, lang FROM blobs")?;
+            let mut stmt = tx.prepare(
+                "SELECT blobs.blob_oid, blobs.lang
+                 FROM blobs
+                 LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
+                 WHERE blobs.generation = COALESCE(epochs.generation, 0)",
+            )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -1500,14 +1762,27 @@ impl AnalyzerStore {
             dead
         };
         {
-            let mut del = tx.prepare("DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2")?;
+            let mut del = tx.prepare(
+                "DELETE FROM blobs
+                 WHERE blob_oid = ?1 AND lang = ?2
+                   AND generation = COALESCE(
+                     (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
+                   )",
+            )?;
             for (oid, lang) in &dead {
                 del.execute(params![oid, lang])?;
             }
         }
         tx.commit()?;
+        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
         conn.pragma_update(None, "incremental_vacuum", 0)?;
         Ok(dead.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reclaim_stale_generations(&self, max_logical_rows: usize) -> Result<usize> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        reclaim_stale_generations_conn(&mut conn, max_logical_rows)
     }
 
     pub fn seconds_since_gc(&self) -> Result<Option<i64>> {
@@ -1638,6 +1913,7 @@ pub(crate) struct PreparedParsedBlob {
     oid: Oid,
     oid_text: String,
     lang: String,
+    generation: GenerationId,
     state: Arc<FileState>,
     units: Vec<PreparedUnitRow>,
     ranges: Vec<(i64, i64, i64, i64, i64, i64)>,
@@ -1654,6 +1930,8 @@ pub(crate) struct PreparedParsedBlob {
     content_package: String,
     logical_rows: usize,
     payload_bytes: usize,
+    mutation_logical_rows: usize,
+    mutation_payload_bytes: usize,
 }
 
 impl PreparedParsedBlob {
@@ -1675,6 +1953,19 @@ impl PreparedParsedBlob {
 
     pub(crate) fn payload_bytes(&self) -> usize {
         self.payload_bytes
+    }
+
+    fn mutation_logical_rows(&self) -> usize {
+        self.mutation_logical_rows
+    }
+
+    fn mutation_payload_bytes(&self) -> usize {
+        self.mutation_payload_bytes
+    }
+
+    fn include_replaced_cost(&mut self, replaced: PersistedMutationCost) {
+        self.mutation_logical_rows = self.logical_rows.saturating_add(replaced.logical_rows);
+        self.mutation_payload_bytes = self.payload_bytes.saturating_add(replaced.payload_bytes);
     }
 
     #[cfg(test)]
@@ -1751,7 +2042,13 @@ impl PersistBatchStats {
 #[derive(Debug)]
 pub(crate) struct PersistBlobOutcome {
     pub(crate) prepared: PreparedParsedBlob,
-    pub(crate) error: Option<String>,
+    pub(crate) error: Option<StoreError>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PersistedMutationCost {
+    logical_rows: usize,
+    payload_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1777,6 +2074,7 @@ fn saturating_sum(values: impl IntoIterator<Item = usize>) -> usize {
 fn prepare_parsed_blob<A: LanguageAdapter>(
     oid: Oid,
     lang: &str,
+    generation: GenerationId,
     adapter: &A,
     state: Arc<FileState>,
 ) -> Result<PreparedParsedBlob> {
@@ -1962,6 +2260,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         oid,
         oid_text: oid.to_string(),
         lang: lang.to_string(),
+        generation,
         state,
         units,
         ranges,
@@ -1978,19 +2277,28 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         content_package,
         logical_rows,
         payload_bytes,
+        mutation_logical_rows: logical_rows,
+        mutation_payload_bytes: payload_bytes,
     })
 }
 
 fn write_prepared_blob_tx(tx: &Transaction<'_>, blob: &PreparedParsedBlob) -> Result<()> {
     let oid = blob.oid_text.as_str();
     let lang = blob.lang.as_str();
+    let current_generation = current_generation_conn(tx, lang)?;
+    if current_generation != blob.generation {
+        return Err(StoreError::stale_generation(format!(
+            "stale prepared blob {oid}/{lang}: prepared for generation {}, current generation is {}",
+            blob.generation.0, current_generation.0
+        )));
+    }
     tx.execute(
         "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
         params![oid, lang],
     )?;
     tx.execute(
-        "INSERT INTO blobs(blob_oid, lang) VALUES(?1, ?2)",
-        params![oid, lang],
+        "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)",
+        params![oid, lang, blob.generation.0],
     )?;
     {
         let mut stmt = tx.prepare(
@@ -2143,6 +2451,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
     tx: &Transaction<'_>,
     oid: Oid,
     lang: &str,
+    generation: GenerationId,
     adapter: &A,
     state: &FileState,
 ) -> Result<()> {
@@ -2152,8 +2461,8 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
         params![oid, lang],
     )?;
     tx.execute(
-        "INSERT INTO blobs(blob_oid, lang) VALUES(?1, ?2)",
-        params![oid, lang],
+        "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)",
+        params![oid, lang, generation.0],
     )?;
 
     let units = collect_stored_units(adapter, state);
@@ -2988,12 +3297,15 @@ fn read_blob_meta<A: LanguageAdapter>(
 ) -> Result<Option<BlobMetaRow>> {
     let row: Option<(i64, String, i64, RawSideTableCounts)> = conn
         .query_row(
-            "SELECT contains_tests, content_package, stored_unit_count,
+            &format!(
+                "SELECT contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
                     child_count, import_statement_count, import_count, type_identifier_count,
                     ruby_dispatch_count, scala_trait_count
-             FROM blob_meta
-             WHERE blob_oid = ?1 AND lang = ?2 AND is_complete = 1",
+             FROM blob_meta AS meta
+             WHERE blob_oid = ?1 AND lang = ?2
+               AND {PARSED_BLOB_COMPLETE_CONDITION}"
+            ),
             params![oid, lang],
             |row| {
                 Ok((
@@ -3127,13 +3439,14 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, contains_tests, content_package, stored_unit_count,
+            "SELECT meta.blob_oid, contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
                     child_count, import_statement_count, import_count, type_identifier_count,
                     ruby_dispatch_count, scala_trait_count
-             FROM blob_meta
-             WHERE lang = ? AND blob_oid IN ({placeholders}) AND is_complete = 1
-             ORDER BY blob_oid"
+             FROM blob_meta AS meta
+             WHERE meta.lang = ? AND meta.blob_oid IN ({placeholders})
+               AND {PARSED_BLOB_COMPLETE_CONDITION}
+             ORDER BY meta.blob_oid"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -3755,6 +4068,197 @@ where
     Ok(out)
 }
 
+fn search_candidate_rows_by_lang_conn(
+    conn: &Connection,
+    lang: &str,
+) -> Result<Vec<SearchCandidateRow>> {
+    let sql = format!(
+        "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+                units.content_qualifier, units.signature, units.synthetic,
+                units.is_type_alias, units.top_level_ordinal, units.in_declarations,
+                units.in_definition_lookup, meta.contains_tests,
+                primary_range.start_byte, primary_range.end_byte,
+                primary_range.start_line, primary_range.end_line
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         LEFT JOIN unit_ranges AS primary_range
+           ON primary_range.blob_oid = units.blob_oid
+          AND primary_range.lang = units.lang
+          AND primary_range.unit_key = units.unit_key
+          AND primary_range.ordinal = 0
+         WHERE units.lang = ?1 AND units.in_declarations = 1
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY units.blob_oid, units.unit_key"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map([lang], search_candidate_row_from_row)?;
+    collect_search_candidate_rows(rows)
+}
+
+fn usage_fact_rows_by_lang_conn(conn: &Connection, lang: &str) -> Result<Vec<UsageFactRow>> {
+    let sql = format!(
+        "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+                units.content_qualifier, units.signature, units.synthetic,
+                units.is_type_alias, units.top_level_ordinal, units.in_declarations,
+                units.in_definition_lookup, signature.text, metadata.metadata
+         FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+         LEFT JOIN unit_signatures AS signature
+           ON signature.blob_oid = units.blob_oid
+          AND signature.lang = units.lang
+          AND signature.unit_key = units.unit_key
+          AND signature.ordinal = 0
+         LEFT JOIN unit_signature_metadata AS metadata
+           ON metadata.blob_oid = units.blob_oid
+          AND metadata.lang = units.lang
+          AND metadata.unit_key = units.unit_key
+          AND metadata.ordinal = 0
+         WHERE units.lang = ?1 AND units.in_declarations = 1
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY units.blob_oid, units.unit_key"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    collect_usage_fact_rows(stmt.query_map([lang], usage_fact_row_from_row)?)
+}
+
+fn primary_ranges_by_unit_for_lang_conn(
+    conn: &Connection,
+    lang: &str,
+    oids: &[Oid],
+) -> Result<HashMap<(Oid, i64), Range>> {
+    let mut out = HashMap::default();
+    for chunk in oids.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT ranges.blob_oid, ranges.unit_key, ranges.start_byte, ranges.end_byte,
+                    ranges.start_line, ranges.end_line
+             FROM unit_ranges AS ranges
+             JOIN blobs AS active_blob
+               ON active_blob.blob_oid = ranges.blob_oid AND active_blob.lang = ranges.lang
+             LEFT JOIN analysis_epochs AS active_epoch ON active_epoch.lang = active_blob.lang
+             WHERE ranges.lang = ? AND ranges.ordinal = 0
+               AND ranges.blob_oid IN ({placeholders})
+               AND active_blob.generation = COALESCE(active_epoch.generation, 0)"
+        );
+        let mut parameters = Vec::with_capacity(chunk.len() + 1);
+        parameters.push(lang.to_string());
+        parameters.extend(chunk.iter().map(Oid::to_string));
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(parameters.iter()), |row| {
+            let oid_text = row.get::<_, String>(0)?;
+            let oid = Oid::from_str(&oid_text).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?;
+            Ok((
+                (oid, row.get(1)?),
+                Range {
+                    start_byte: i64_to_usize(row.get(2)?).map_err(rusqlite_error_from_store)?,
+                    end_byte: i64_to_usize(row.get(3)?).map_err(rusqlite_error_from_store)?,
+                    start_line: i64_to_usize(row.get(4)?).map_err(rusqlite_error_from_store)?,
+                    end_line: i64_to_usize(row.get(5)?).map_err(rusqlite_error_from_store)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (key, range) = row?;
+            out.insert(key, range);
+        }
+    }
+    Ok(out)
+}
+
+fn definition_lookup_candidate_rows_by_oids_conn(
+    conn: &Connection,
+    lang: &str,
+    oids: &[Oid],
+) -> Result<Vec<CandidateRow>> {
+    let mut out = Vec::new();
+    for chunk in oids.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+                    units.content_qualifier, units.signature, units.synthetic,
+                    units.is_type_alias, units.top_level_ordinal, units.in_declarations,
+                    units.in_definition_lookup
+             FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+             WHERE units.lang = ?
+               AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
+               AND units.blob_oid IN ({placeholders})
+               AND {PARSED_BLOB_COMPLETE_CONDITION}
+             ORDER BY units.blob_oid, units.unit_key"
+        );
+        let mut parameters = Vec::with_capacity(chunk.len() + 1);
+        parameters.push(lang.to_string());
+        parameters.extend(chunk.iter().map(Oid::to_string));
+        let mut stmt = conn.prepare_cached(&sql)?;
+        out.extend(collect_candidate_rows(stmt.query_map(
+            params_from_iter(parameters.iter()),
+            candidate_row_from_row,
+        )?)?);
+    }
+    Ok(out)
+}
+
+fn blobs_with_structured_imports_conn(
+    conn: &Connection,
+    lang: &str,
+    oids: &[Oid],
+) -> Result<HashSet<Oid>> {
+    let mut out = HashSet::default();
+    for chunk in oids.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT DISTINCT imports.blob_oid
+             FROM import_details AS imports
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
+             WHERE imports.lang = ? AND imports.blob_oid IN ({placeholders})
+               AND {PARSED_BLOB_COMPLETE_CONDITION}"
+        );
+        let mut parameters = Vec::with_capacity(chunk.len() + 1);
+        parameters.push(lang.to_string());
+        parameters.extend(chunk.iter().map(Oid::to_string));
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params_from_iter(parameters.iter()), |row| {
+            let oid_text = row.get::<_, String>(0)?;
+            Oid::from_str(&oid_text).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })
+        })?;
+        for row in rows {
+            out.insert(row?);
+        }
+    }
+    Ok(out)
+}
+
 fn read_unit_rows<A: LanguageAdapter>(
     conn: &Connection,
     oid: &str,
@@ -4042,27 +4546,284 @@ fn collect_string_rows(
     Ok(out)
 }
 
-fn ensure_language_epoch_tx(conn: &mut Connection, lang: &str, analysis_epoch: &str) -> Result<()> {
-    let stored_epoch: Option<String> = conn
+fn ensure_language_epochs_tx(
+    conn: &mut Connection,
+    entries: &[(String, String)],
+) -> Result<HashMap<String, GenerationId>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut generations = HashMap::default();
+    for (lang, analysis_epoch) in entries {
+        let stored_epoch: Option<String> = tx
+            .query_row(
+                "SELECT epoch FROM analysis_epochs WHERE lang = ?1",
+                [lang],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored_epoch.as_deref() == Some(analysis_epoch) {
+            let generation = current_generation_conn(&tx, lang)?;
+            generations.insert(lang.clone(), generation);
+            continue;
+        }
+        let generation: i64 = tx.query_row(
+            "UPDATE analysis_generation_sequence
+         SET next_generation = next_generation + 1
+         WHERE id = 1 AND next_generation < 9223372036854775807
+         RETURNING next_generation - 1",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES(?1, ?2, ?3)
+         ON CONFLICT(lang) DO UPDATE SET
+           epoch = excluded.epoch,
+           generation = excluded.generation",
+            params![lang, analysis_epoch, generation],
+        )?;
+        generations.insert(lang.clone(), GenerationId(generation));
+    }
+    tx.commit()?;
+    Ok(generations)
+}
+
+fn require_current_generation(
+    conn: &Connection,
+    lang: &str,
+    generation: GenerationId,
+) -> Result<()> {
+    let current = current_generation_conn(conn, lang)?;
+    if current != generation {
+        return Err(StoreError::stale_generation(format!(
+            "stale analyzer generation for {lang}: captured {}, current {}",
+            generation.0, current.0
+        )));
+    }
+    Ok(())
+}
+
+fn require_generation_map<'a>(
+    conn: &Connection,
+    generations: &HashMap<String, GenerationId>,
+    requested_languages: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    let mut seen = HashSet::default();
+    for lang in requested_languages {
+        if !seen.insert(lang) {
+            continue;
+        }
+        let Some(generation) = generations.get(lang) else {
+            return Err(StoreError::stale_generation(format!(
+                "missing captured analyzer generation for {lang}"
+            )));
+        };
+        require_current_generation(conn, lang, *generation)?;
+    }
+    Ok(())
+}
+
+fn current_generation_conn(conn: &Connection, lang: &str) -> Result<GenerationId> {
+    let generation = conn
         .query_row(
-            "SELECT epoch FROM analysis_epochs WHERE lang = ?1",
+            "SELECT generation FROM analysis_epochs WHERE lang = ?1",
             [lang],
             |row| row.get(0),
         )
+        .optional()?
+        .unwrap_or(GenerationId::BOOTSTRAP.0);
+    Ok(GenerationId(generation))
+}
+
+fn contains_parsed_blob_conn(conn: &Connection, oid: Oid, lang: &str) -> Result<bool> {
+    let sql = format!(
+        "SELECT 1 FROM blob_meta AS meta
+         WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+           AND {PARSED_BLOB_INTEGRITY_CONDITION}
+         LIMIT 1"
+    );
+    Ok(conn
+        .query_row(&sql, params![oid.to_string(), lang], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+fn persisted_blob_mutation_cost_conn(
+    conn: &Connection,
+    oid: &str,
+    lang: &str,
+) -> Result<PersistedMutationCost> {
+    let cost = conn
+        .query_row(
+            "SELECT
+               2 + meta.stored_unit_count + meta.range_count + meta.signature_count
+                 + meta.signature_metadata_count + meta.supertype_count + meta.child_count
+                 + meta.import_statement_count + meta.import_count + meta.type_identifier_count
+                 + meta.ruby_dispatch_count + meta.scala_trait_count,
+               length(meta.content_package)
+                 + COALESCE((SELECT SUM(
+                     length(short_name) + length(identifier) + length(content_qualifier)
+                     + COALESCE(length(exact_fqn), 0) + COALESCE(length(normalized_fqn), 0)
+                     + COALESCE(length(simple_type_name), 0) + COALESCE(length(signature), 0)
+                   ) FROM code_units WHERE blob_oid = meta.blob_oid AND lang = meta.lang), 0)
+                 + COALESCE((SELECT SUM(length(text)) FROM unit_signatures
+                     WHERE blob_oid = meta.blob_oid AND lang = meta.lang), 0)
+                 + COALESCE((SELECT SUM(length(metadata)) FROM unit_signature_metadata
+                     WHERE blob_oid = meta.blob_oid AND lang = meta.lang), 0)
+                 + COALESCE((SELECT SUM(length(raw) + length(lookup_path)) FROM unit_supertypes
+                     WHERE blob_oid = meta.blob_oid AND lang = meta.lang), 0)
+                 + COALESCE((SELECT SUM(length(statement)) FROM import_statements
+                     WHERE blob_oid = meta.blob_oid AND lang = meta.lang), 0)
+                 + COALESCE((SELECT SUM(length(info)) FROM import_details
+                     WHERE blob_oid = meta.blob_oid AND lang = meta.lang), 0)
+                 + COALESCE((SELECT SUM(length(type_identifier)) FROM type_identifiers
+                     WHERE blob_oid = meta.blob_oid AND lang = meta.lang), 0)
+             FROM blob_meta AS meta
+             JOIN blobs AS blob ON blob.blob_oid = meta.blob_oid AND blob.lang = meta.lang
+             WHERE meta.blob_oid = ?1 AND meta.lang = ?2",
+            params![oid, lang],
+            |row| {
+                Ok(PersistedMutationCost {
+                    logical_rows: row.get(0)?,
+                    payload_bytes: row.get(1)?,
+                })
+            },
+        )
         .optional()?;
-    if stored_epoch.as_deref() == Some(analysis_epoch) {
-        return Ok(());
+    Ok(cost.unwrap_or_default())
+}
+
+fn parsed_blob_keys_conn(
+    conn: &Connection,
+    entries: &[(Oid, String)],
+) -> Result<HashSet<(Oid, String)>> {
+    const KEYS_PER_QUERY: usize = 400;
+    let mut unique = Vec::with_capacity(entries.len());
+    let mut seen = HashSet::default();
+    for entry in entries {
+        if seen.insert(entry.clone()) {
+            unique.push(entry.clone());
+        }
+    }
+    let mut present = set_with_capacity(unique.len());
+    for chunk in unique.chunks(KEYS_PER_QUERY) {
+        let values = std::iter::repeat_n("(?, ?)", chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH requested(blob_oid, lang) AS (VALUES {values})
+             SELECT requested.blob_oid, requested.lang
+             FROM requested
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = requested.blob_oid AND meta.lang = requested.lang
+             WHERE {PARSED_BLOB_INTEGRITY_CONDITION}"
+        );
+        let parameters = chunk
+            .iter()
+            .flat_map(|(oid, lang)| [oid.to_string(), lang.clone()])
+            .collect::<Vec<_>>();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(parameters), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (oid, lang) = row?;
+            if let Ok(oid) = Oid::from_str(&oid) {
+                present.insert((oid, lang));
+            }
+        }
+    }
+    Ok(present)
+}
+
+fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize) -> Result<usize> {
+    if max_logical_rows == 0 {
+        return Ok(0);
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let stale_blobs = {
+        let mut stmt = tx.prepare(
+            "SELECT blobs.blob_oid, blobs.lang,
+                    1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
+                      1 + meta.stored_unit_count + meta.range_count + meta.signature_count
+                        + meta.signature_metadata_count + meta.supertype_count + meta.child_count
+                        + meta.import_statement_count + meta.import_count
+                        + meta.type_identifier_count + meta.ruby_dispatch_count
+                        + meta.scala_trait_count END AS logical_rows
+             FROM blobs
+             LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
+             LEFT JOIN blob_meta AS meta
+               ON meta.blob_oid = blobs.blob_oid AND meta.lang = blobs.lang
+             WHERE blobs.generation <> COALESCE(epochs.generation, 0)
+             ORDER BY blobs.lang, blobs.generation, blobs.blob_oid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, usize>(2)?,
+            ))
+        })?;
+        let mut selected = Vec::new();
+        let mut logical_rows = 0usize;
+        for row in rows {
+            let (oid, lang, rows) = row?;
+            if !selected.is_empty() && logical_rows.saturating_add(rows) > max_logical_rows {
+                break;
+            }
+            selected.push((oid, lang));
+            logical_rows = logical_rows.saturating_add(rows);
+            if logical_rows >= max_logical_rows {
+                break;
+            }
+        }
+        (selected, logical_rows)
+    };
+    let (stale_blobs, mut reclaimed) = stale_blobs;
+    {
+        let mut delete = tx.prepare(
+            "DELETE FROM blobs
+             WHERE blob_oid = ?1 AND lang = ?2
+               AND generation <> COALESCE(
+                 (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
+               )",
+        )?;
+        for (oid, lang) in stale_blobs {
+            delete.execute(params![oid, lang])?;
+        }
     }
 
-    let tx = conn.transaction()?;
-    tx.execute("DELETE FROM blobs WHERE lang = ?1", [lang])?;
-    tx.execute(
-        "INSERT INTO analysis_epochs(lang, epoch) VALUES(?1, ?2)
-         ON CONFLICT(lang) DO UPDATE SET epoch = excluded.epoch",
-        params![lang, analysis_epoch],
-    )?;
+    let mut remaining = max_logical_rows.saturating_sub(reclaimed);
+    if remaining > 0 {
+        let removed = tx.execute(
+            "DELETE FROM path_symbol_units
+             WHERE (lang, rel_path, kind, exact_fqn) IN (
+               SELECT units.lang, units.rel_path, units.kind, units.exact_fqn
+               FROM path_symbol_units AS units
+               LEFT JOIN analysis_epochs AS epochs ON epochs.lang = units.lang
+               WHERE units.generation <> COALESCE(epochs.generation, 0)
+               ORDER BY units.lang, units.generation, units.rel_path
+               LIMIT ?1
+             )",
+            [usize_to_i64(remaining)?],
+        )?;
+        reclaimed = reclaimed.saturating_add(removed);
+        remaining = remaining.saturating_sub(removed);
+    }
+    if remaining > 0 {
+        reclaimed = reclaimed.saturating_add(tx.execute(
+            "DELETE FROM path_symbol_snapshots
+             WHERE lang IN (
+               SELECT snapshots.lang
+               FROM path_symbol_snapshots AS snapshots
+               LEFT JOIN analysis_epochs AS epochs ON epochs.lang = snapshots.lang
+               WHERE snapshots.generation <> COALESCE(epochs.generation, 0)
+               ORDER BY snapshots.lang
+               LIMIT ?1
+             )",
+            [usize_to_i64(remaining)?],
+        )?);
+    }
     tx.commit()?;
-    Ok(())
+    Ok(reclaimed)
 }
 
 fn serialize_blob<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
@@ -4163,8 +4924,12 @@ mod tests {
             vec![one, two]
         );
 
-        store.register_blobs(&[one], "rust").unwrap();
-        store.register_blobs(&[one], "rust").unwrap();
+        store
+            .register_blobs(&[one], "rust", GenerationId::BOOTSTRAP)
+            .unwrap();
+        store
+            .register_blobs(&[one], "rust", GenerationId::BOOTSTRAP)
+            .unwrap();
         assert_eq!(store.missing_blobs(&[one, two], "rust").unwrap(), vec![two]);
         assert_eq!(store.missing_blobs(&[one], "python").unwrap(), vec![one]);
     }
@@ -4174,7 +4939,9 @@ mod tests {
         let store = AnalyzerStore::open_in_memory().unwrap();
         let oid = Oid::hash_object(ObjectType::Blob, b"class Registered:\n    pass\n").unwrap();
 
-        store.register_blobs(&[oid], "python").unwrap();
+        store
+            .register_blobs(&[oid], "python", GenerationId::BOOTSTRAP)
+            .unwrap();
 
         assert!(store.contains_blob(oid, "python").unwrap());
         assert!(!store.contains_parsed_blob(oid, "python").unwrap());
@@ -4213,7 +4980,9 @@ mod tests {
                 &parse_state(&JavaAdapter, &java_file),
             )
             .unwrap();
-        store.register_blobs(&[incomplete_oid], "rust").unwrap();
+        store
+            .register_blobs(&[incomplete_oid], "rust", GenerationId::BOOTSTRAP)
+            .unwrap();
 
         let mut entries = vec![
             (python_oid, "python".to_string()),
@@ -4249,6 +5018,34 @@ mod tests {
     }
 
     #[test]
+    fn generation_map_requires_a_token_for_every_requested_storage_language() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let typescript = store
+            .ensure_language_epoch_value("typescript:ts", "ts-epoch")
+            .unwrap();
+        store
+            .ensure_language_epoch_value("typescript:tsx", "tsx-epoch")
+            .unwrap();
+        let oid = oid_for(b"mixed ts storage key");
+        let mut generations = HashMap::default();
+        generations.insert("typescript:ts".to_string(), typescript);
+
+        let error = store
+            .parsed_blob_keys_at_generations(
+                &[
+                    (oid, "typescript:ts".to_string()),
+                    (oid, "typescript:tsx".to_string()),
+                ],
+                &generations,
+            )
+            .unwrap_err();
+
+        assert!(error.is_stale_generation());
+        assert!(error.to_string().contains("missing captured"));
+        assert!(error.to_string().contains("typescript:tsx"));
+    }
+
+    #[test]
     fn package_prefix_pages_are_literal_and_cursor_bounded() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
@@ -4270,7 +5067,13 @@ mod tests {
         }
 
         let first = store
-            .declaration_rows_by_package_prefix_page("java", "a_b", None, 1)
+            .declaration_rows_by_package_prefix_page(
+                "java",
+                GenerationId::BOOTSTRAP,
+                "a_b",
+                None,
+                1,
+            )
             .unwrap();
         assert_eq!(first.len(), 1);
         assert!(matches!(
@@ -4283,7 +5086,13 @@ mod tests {
             first[0].unit_key,
         );
         let second = store
-            .declaration_rows_by_package_prefix_page("java", "a_b", Some(cursor), 16)
+            .declaration_rows_by_package_prefix_page(
+                "java",
+                GenerationId::BOOTSTRAP,
+                "a_b",
+                Some(cursor),
+                16,
+            )
             .unwrap();
         let qualifiers = first
             .iter()
@@ -4311,11 +5120,19 @@ mod tests {
         };
 
         store
-            .sync_path_symbol_units("python", std::slice::from_ref(&row))
+            .sync_path_symbol_units(
+                "python",
+                GenerationId::BOOTSTRAP,
+                std::slice::from_ref(&row),
+            )
             .unwrap();
         let changes_after_cold_sync = store.conn.lock().expect("store mutex").total_changes();
         store
-            .sync_path_symbol_units("python", std::slice::from_ref(&row))
+            .sync_path_symbol_units(
+                "python",
+                GenerationId::BOOTSTRAP,
+                std::slice::from_ref(&row),
+            )
             .unwrap();
         let changes_after_warm_sync = store.conn.lock().expect("store mutex").total_changes();
 
@@ -4341,7 +5158,7 @@ mod tests {
             .unwrap();
 
         let projection = store
-            .summary_file_projection(oid, "java", &adapter, &file)
+            .summary_file_projection(oid, "java", GenerationId::BOOTSTRAP, &adapter, &file)
             .unwrap()
             .expect("complete summary projection");
         let hydrated = store
@@ -4374,7 +5191,7 @@ mod tests {
         }
         assert!(
             store
-                .summary_file_projection(oid, "java", &adapter, &file)
+                .summary_file_projection(oid, "java", GenerationId::BOOTSTRAP, &adapter, &file,)
                 .unwrap()
                 .is_none()
         );
@@ -4399,7 +5216,11 @@ mod tests {
             .unwrap();
 
         let facts = store
-            .hydrate_import_facts_by_key(&[(file.clone(), oid, "java".to_string())], &adapter)
+            .hydrate_import_facts_by_key(
+                &[(file.clone(), oid, "java".to_string())],
+                &HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]),
+                &adapter,
+            )
             .unwrap();
         let facts = facts.get(&file).expect("complete persisted import facts");
         assert_eq!(facts.package_name, "demo");
@@ -4572,7 +5393,7 @@ mod tests {
         let reachable = Oid::hash_object(ObjectType::Blob, b"reachable").unwrap();
         let unreachable = Oid::hash_object(ObjectType::Blob, b"unreachable").unwrap();
         store
-            .register_blobs(&[reachable, unreachable], "rust")
+            .register_blobs(&[reachable, unreachable], "rust", GenerationId::BOOTSTRAP)
             .unwrap();
 
         let mut bloom = GrowableBloom::new(0.01, 8);
@@ -4673,6 +5494,319 @@ mod tests {
     }
 
     #[test]
+    fn repeated_epoch_string_gets_fresh_generation_without_reviving_a1_rows() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model {}\n");
+        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+        let state = parse_state(&JavaAdapter, &file);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+
+        let a1 = store
+            .ensure_language_epoch_value("java", "epoch-a")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", a1, &JavaAdapter, &state)
+            .unwrap();
+        let b = store
+            .ensure_language_epoch_value("java", "epoch-b")
+            .unwrap();
+        let a2 = store
+            .ensure_language_epoch_value("java", "epoch-a")
+            .unwrap();
+
+        assert_ne!(a1, b);
+        assert_ne!(a1, a2);
+        assert_ne!(b, a2);
+        assert!(!store.contains_parsed_blob(oid, "java").unwrap());
+        assert!(
+            store
+                .contains_parsed_blob_at_generation(oid, "java", a1)
+                .unwrap_err()
+                .is_stale_generation()
+        );
+    }
+
+    #[test]
+    fn stale_prepared_register_and_path_writes_cannot_delete_current_rows() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model {}\n");
+        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+        let state = Arc::new(parse_state(&JavaAdapter, &file));
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let a = store
+            .ensure_language_epoch_value("java", "epoch-a")
+            .unwrap();
+        let prepared =
+            AnalyzerStore::prepare_parsed_blob(oid, "java", a, &JavaAdapter, Arc::clone(&state))
+                .unwrap();
+        let b = store
+            .ensure_language_epoch_value("java", "epoch-b")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", b, &JavaAdapter, state.as_ref())
+            .unwrap();
+
+        let (outcomes, stats) =
+            store.persist_prepared_blobs(vec![prepared], PersistBatchLimits::PRODUCTION);
+        assert_eq!(stats.failed_transaction_attempts, 1);
+        assert!(outcomes[0].error.as_ref().unwrap().is_stale_generation());
+        assert!(
+            store
+                .register_blobs(&[oid], "java", a)
+                .unwrap_err()
+                .is_stale_generation()
+        );
+
+        let row = PathSymbolRow {
+            rel_path: "Model.java".to_string(),
+            blob_oid: oid,
+            kind: CodeUnitType::Module,
+            package_name: String::new(),
+            short_name: "Model".to_string(),
+            exact_fqn: "Model".to_string(),
+            normalized_fqn: "Model".to_string(),
+        };
+        store
+            .sync_path_symbol_units("java", b, std::slice::from_ref(&row))
+            .unwrap();
+        assert!(
+            store
+                .sync_path_symbol_units("java", a, std::slice::from_ref(&row))
+                .unwrap_err()
+                .is_stale_generation()
+        );
+        assert!(store.contains_parsed_blob(oid, "java").unwrap());
+        let langs = vec!["java".to_string()];
+        let generations = HashMap::from_iter([("java".to_string(), b)]);
+        assert_eq!(
+            store
+                .path_symbol_rows_by_fqn_for_langs(&langs, &generations, "Model", "Model",)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn candidate_and_path_queries_do_not_leak_across_generation_cutover() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model {}\n");
+        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+        let state = parse_state(&JavaAdapter, &file);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let a = store.ensure_language_epoch_value("java", "a").unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", a, &JavaAdapter, &state)
+            .unwrap();
+        let row = PathSymbolRow {
+            rel_path: "Model.java".to_string(),
+            blob_oid: oid,
+            kind: CodeUnitType::Module,
+            package_name: String::new(),
+            short_name: "Model".to_string(),
+            exact_fqn: "Model".to_string(),
+            normalized_fqn: "Model".to_string(),
+        };
+        store
+            .sync_path_symbol_units("java", a, std::slice::from_ref(&row))
+            .unwrap();
+        let langs = vec!["java".to_string()];
+        let a_map = HashMap::from_iter([("java".to_string(), a)]);
+        assert!(
+            !store
+                .declaration_candidate_rows_for_langs(&langs, &a_map)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .path_symbol_rows_by_fqn_for_langs(&langs, &a_map, "Model", "Model")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let b = store.ensure_language_epoch_value("java", "b").unwrap();
+        let b_map = HashMap::from_iter([("java".to_string(), b)]);
+        assert!(
+            store
+                .declaration_candidate_rows_for_langs(&langs, &a_map)
+                .unwrap_err()
+                .is_stale_generation()
+        );
+        assert!(
+            store
+                .declaration_candidate_rows_for_langs(&langs, &b_map)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .path_symbol_rows_by_fqn_for_langs(&langs, &b_map, "Model", "Model")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn persistent_epoch_publishers_serialize_same_and_different_epochs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("cache.db");
+        drop(AnalyzerStore::open_persistent(&db).unwrap());
+        let same_barrier = Arc::new(std::sync::Barrier::new(2));
+        let same_handles = [0, 1].map(|_| {
+            let barrier = Arc::clone(&same_barrier);
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let store = AnalyzerStore::open_persistent(&db).unwrap();
+                barrier.wait();
+                store.ensure_language_epoch_value("java", "same").unwrap()
+            })
+        });
+        let same = same_handles.map(|handle| handle.join().unwrap());
+        assert_eq!(same[0], same[1]);
+
+        let different_barrier = Arc::new(std::sync::Barrier::new(2));
+        let different_handles = ["left", "right"].map(|epoch| {
+            let barrier = Arc::clone(&different_barrier);
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let store = AnalyzerStore::open_persistent(&db).unwrap();
+                barrier.wait();
+                let generation = store.ensure_language_epoch_value("java", epoch).unwrap();
+                (epoch, generation)
+            })
+        });
+        let different = different_handles.map(|handle| handle.join().unwrap());
+        assert_ne!(different[0].1, different[1].1);
+
+        let conn = crate::cache_db::open_unified_connection(&db).unwrap();
+        let final_pair: (String, i64) = conn
+            .query_row(
+                "SELECT epoch, generation FROM analysis_epochs WHERE lang = 'java'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            different.iter().any(|(epoch, generation)| {
+                *epoch == final_pair.0 && generation.0 == final_pair.1
+            })
+        );
+    }
+
+    #[test]
+    fn hydration_read_snapshot_keeps_meta_and_satellites_on_one_generation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = temp.path().join("cache.db");
+        let file = write_file(temp.path(), "Model.java", "class Alpha {}\n");
+        let oid = oid_for(b"stable-oid");
+        let state_a = parse_state(&JavaAdapter, &file);
+        let writer = AnalyzerStore::open_persistent(&db).unwrap();
+        let reader = AnalyzerStore::open_persistent(&db).unwrap();
+        let a = writer
+            .ensure_language_epoch_value("java", "epoch-a")
+            .unwrap();
+        writer
+            .write_parsed_blob_at_generation(oid, "java", a, &JavaAdapter, &state_a)
+            .unwrap();
+
+        let mut reader_conn = reader.conn.lock().expect("reader mutex");
+        let read_tx = reader_conn.transaction().unwrap();
+        require_current_generation(&read_tx, "java", a).unwrap();
+        let old_meta = read_blob_meta(
+            &read_tx,
+            &oid.to_string(),
+            "java",
+            &JavaAdapter,
+            &file,
+            "class Alpha {}\n",
+        )
+        .unwrap()
+        .unwrap();
+
+        std::fs::write(file.abs_path(), "class Beta {}\n").unwrap();
+        let state_b = parse_state(&JavaAdapter, &file);
+        let b = writer
+            .ensure_language_epoch_value("java", "epoch-b")
+            .unwrap();
+        writer
+            .write_parsed_blob_at_generation(oid, "java", b, &JavaAdapter, &state_b)
+            .unwrap();
+
+        let old_units =
+            read_unit_rows(&read_tx, &oid.to_string(), "java", &JavaAdapter, &file).unwrap();
+        assert_eq!(old_units.len(), old_meta.stored_unit_count);
+        assert!(old_units.iter().any(|row| row.unit.short_name() == "Alpha"));
+        assert!(!old_units.iter().any(|row| row.unit.short_name() == "Beta"));
+        read_tx.commit().unwrap();
+        drop(reader_conn);
+
+        let hydrated = reader
+            .hydrate_file_state_with_source(oid, "java", b, &JavaAdapter, &file, "class Beta {}\n")
+            .unwrap()
+            .unwrap();
+        assert!(
+            hydrated
+                .declarations
+                .iter()
+                .any(|unit| unit.short_name() == "Beta")
+        );
+        assert!(
+            !hydrated
+                .declarations
+                .iter()
+                .any(|unit| unit.short_name() == "Alpha")
+        );
+    }
+
+    #[test]
+    fn stale_generation_reclamation_makes_one_oversize_progress_and_respects_small_budget() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Many.java",
+            "class A {} class B {} class C {} class D {}\n",
+        );
+        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+        let state = parse_state(&JavaAdapter, &file);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let a = store.ensure_language_epoch_value("java", "a").unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", a, &JavaAdapter, &state)
+            .unwrap();
+        store.ensure_language_epoch_value("java", "b").unwrap();
+        let reclaimed = store.reclaim_stale_generations(1).unwrap();
+        assert!(reclaimed > 1, "one oversize blob must still make progress");
+        let physical: usize = store
+            .conn
+            .lock()
+            .expect("store mutex")
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(physical, 0);
+        assert_eq!(store.reclaim_stale_generations(1).unwrap(), 0);
+
+        let one = oid_for(b"one");
+        let two = oid_for(b"two");
+        let c = store.ensure_language_epoch_value("rust", "c").unwrap();
+        store.register_blobs(&[one, two], "rust", c).unwrap();
+        store.ensure_language_epoch_value("rust", "d").unwrap();
+        assert_eq!(store.reclaim_stale_generations(1).unwrap(), 1);
+        let remaining: usize = store
+            .conn
+            .lock()
+            .expect("store mutex")
+            .query_row(
+                "SELECT COUNT(*) FROM blobs WHERE lang = 'rust'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 1);
+    }
+
+    #[test]
     fn prepared_blob_persistence_uses_bounded_transactions() {
         const PREPARED_BLOBS: usize = 257;
         let temp = tempfile::TempDir::new().unwrap();
@@ -4683,8 +5817,14 @@ mod tests {
             .map(|index| {
                 let oid =
                     Oid::hash_object(ObjectType::Blob, format!("blob-{index}").as_bytes()).unwrap();
-                AnalyzerStore::prepare_parsed_blob(oid, "java", &JavaAdapter, Arc::clone(&state))
-                    .unwrap()
+                AnalyzerStore::prepare_parsed_blob(
+                    oid,
+                    "java",
+                    GenerationId::BOOTSTRAP,
+                    &JavaAdapter,
+                    Arc::clone(&state),
+                )
+                .unwrap()
             })
             .collect();
 
@@ -4713,6 +5853,7 @@ mod tests {
             AnalyzerStore::prepare_parsed_blob(
                 Oid::hash_object(ObjectType::Blob, format!("blob-{index}").as_bytes()).unwrap(),
                 "java",
+                GenerationId::BOOTSTRAP,
                 &JavaAdapter,
                 Arc::clone(&state),
             )
@@ -4736,15 +5877,103 @@ mod tests {
     }
 
     #[test]
+    fn prepared_replacement_budget_counts_deleted_rows_and_isolates_oversize_work() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let old_file = write_file(
+            temp.path(),
+            "Old.java",
+            "class A {} class B {} class C {} class D {} class E {} class F {}\n",
+        );
+        let replacement_file = write_file(temp.path(), "Replacement.java", "class Fresh {}\n");
+        let peer_file = write_file(temp.path(), "Peer.java", "class Peer {}\n");
+        let old_state = parse_state(&JavaAdapter, &old_file);
+        let replacement_state = Arc::new(parse_state(&JavaAdapter, &replacement_file));
+        let peer_state = Arc::new(parse_state(&JavaAdapter, &peer_file));
+        let replaced_oid = oid_for(b"replaced logical identity");
+        let peer_oid = oid_for(b"peer logical identity");
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation_a = store
+            .ensure_language_epoch_value("java", "replacement-budget-a")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                replaced_oid,
+                "java",
+                generation_a,
+                &JavaAdapter,
+                &old_state,
+            )
+            .unwrap();
+        let generation_b = store
+            .ensure_language_epoch_value("java", "replacement-budget-b")
+            .unwrap();
+        let replacement = AnalyzerStore::prepare_parsed_blob(
+            replaced_oid,
+            "java",
+            generation_b,
+            &JavaAdapter,
+            replacement_state,
+        )
+        .unwrap();
+        let replacement_insert_rows = replacement.logical_rows();
+        let replacement_insert_bytes = replacement.payload_bytes();
+        let peer = AnalyzerStore::prepare_parsed_blob(
+            peer_oid,
+            "java",
+            generation_b,
+            &JavaAdapter,
+            peer_state,
+        )
+        .unwrap();
+        let row_cap = replacement_insert_rows.saturating_add(peer.logical_rows());
+        let byte_cap = replacement_insert_bytes.saturating_add(peer.payload_bytes());
+
+        let (outcomes, stats) = store.persist_prepared_blobs(
+            vec![replacement, peer],
+            PersistBatchLimits {
+                max_blobs: 8,
+                max_rows: row_cap,
+                max_payload_bytes: byte_cap,
+            },
+        );
+
+        assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
+        assert_eq!(
+            stats.transactions, 2,
+            "oversize replacement must be isolated"
+        );
+        assert_eq!(stats.committed_blobs, 2);
+        assert!(stats.logical_rows > row_cap, "deleted rows must be counted");
+        assert!(
+            stats.peak_batch_rows > row_cap,
+            "one oversize item must progress"
+        );
+        assert!(
+            stats.payload_bytes > byte_cap,
+            "deleted bytes must be counted"
+        );
+        assert!(
+            stats.peak_batch_payload_bytes > byte_cap,
+            "one oversized replacement must progress past the byte cap"
+        );
+        assert_eq!(stats.peak_batch_blobs, 1);
+    }
+
+    #[test]
     fn failed_prepared_blob_isolated_without_hiding_good_peers() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(temp.path(), "Model.java", "class Model {}\n");
         let state = Arc::new(parse_state(&JavaAdapter, &file));
         let prepare = |text: &[u8]| {
             let oid = Oid::hash_object(ObjectType::Blob, text).unwrap();
-            let prepared =
-                AnalyzerStore::prepare_parsed_blob(oid, "java", &JavaAdapter, Arc::clone(&state))
-                    .unwrap();
+            let prepared = AnalyzerStore::prepare_parsed_blob(
+                oid,
+                "java",
+                GenerationId::BOOTSTRAP,
+                &JavaAdapter,
+                Arc::clone(&state),
+            )
+            .unwrap();
             (oid, prepared)
         };
         let (good_a_oid, good_a) = prepare(b"good-a");
@@ -5173,8 +6402,14 @@ mod tests {
             .write_parsed_blob(oid, lang, adapter, parsed.as_ref())
             .unwrap();
         let prepared_store = AnalyzerStore::open_in_memory().unwrap();
-        let prepared =
-            AnalyzerStore::prepare_parsed_blob(oid, lang, adapter, Arc::clone(&parsed)).unwrap();
+        let prepared = AnalyzerStore::prepare_parsed_blob(
+            oid,
+            lang,
+            GenerationId::BOOTSTRAP,
+            adapter,
+            Arc::clone(&parsed),
+        )
+        .unwrap();
         let (outcomes, stats) =
             prepared_store.persist_prepared_blobs(vec![prepared], PersistBatchLimits::PRODUCTION);
         assert_eq!(stats.transactions, 1);

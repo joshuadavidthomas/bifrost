@@ -83,14 +83,18 @@ fn family_scoped_invalidation_keeps_other_family_rows() {
         .ensure_index_compatible("fp1", "chunker1", "bm251")
         .unwrap();
     put_semantic(&semantic, semantic_oid, [5; 32]);
-    analyzer
+    let java_generation = analyzer
         .ensure_language_epoch_value("java", "epoch-a")
         .unwrap();
-    analyzer
+    let python_generation = analyzer
         .ensure_language_epoch_value("python", "epoch-a")
         .unwrap();
-    analyzer.register_blobs(&[java_oid], "java").unwrap();
-    analyzer.register_blobs(&[python_oid], "python").unwrap();
+    analyzer
+        .register_blobs(&[java_oid], "java", java_generation)
+        .unwrap();
+    analyzer
+        .register_blobs(&[python_oid], "python", python_generation)
+        .unwrap();
 
     assert!(
         semantic
@@ -135,7 +139,12 @@ fn gc_trigger_math_uses_combined_registry_growth() {
 
     let a = Oid::hash_object(ObjectType::Blob, b"a").unwrap();
     let b = Oid::hash_object(ObjectType::Blob, b"b").unwrap();
-    analyzer.register_blobs(&[a, b], "python").unwrap();
+    let generation = analyzer
+        .ensure_language_epoch_value("python", "gc-test")
+        .unwrap();
+    analyzer
+        .register_blobs(&[a, b], "python", generation)
+        .unwrap();
     let skipped = cache_gc::maybe_gc_for_analyzer(&analyzer, &repo).unwrap();
     assert!(!skipped.ran);
     assert_eq!(cache_gc::total_blob_count_for_test(&db_path).unwrap(), 2);
@@ -192,8 +201,11 @@ fn forced_gc_sweeps_both_families_in_one_pass() {
     let db_path = brokk_bifrost::gitblob::cache_db_path(&root);
     let analyzer = AnalyzerStore::open_for_workspace(&root).unwrap();
     let semantic = SemanticStore::open(&db_path).unwrap();
+    let generation = analyzer
+        .ensure_language_epoch_value("python", "gc-test")
+        .unwrap();
     analyzer
-        .register_blobs(&[reachable, unreachable], "python")
+        .register_blobs(&[reachable, unreachable], "python", generation)
         .unwrap();
     put_semantic(&semantic, reachable, [8; 32]);
     put_semantic(&semantic, unreachable, [9; 32]);

@@ -131,10 +131,14 @@ fn sweep_with_claim(
          CREATE TEMP TABLE gc_analyzer_candidates(
            blob_oid TEXT NOT NULL,
            lang TEXT NOT NULL,
-           PRIMARY KEY(blob_oid, lang)
+           generation INTEGER NOT NULL,
+           PRIMARY KEY(blob_oid, lang, generation)
          ) WITHOUT ROWID;
-         INSERT INTO gc_analyzer_candidates(blob_oid, lang)
-           SELECT blob_oid, lang FROM blobs;",
+         INSERT INTO gc_analyzer_candidates(blob_oid, lang, generation)
+           SELECT blobs.blob_oid, blobs.lang, blobs.generation
+           FROM blobs
+           LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
+           WHERE blobs.generation = COALESCE(epochs.generation, 0);",
     )
     .map_err(|err| format!("cache GC SQLite error: {err}"))?;
 
@@ -196,37 +200,30 @@ fn sweep_with_claim(
 
     let dead_analyzer = {
         let mut stmt = tx
-            .prepare("SELECT blob_oid, lang FROM gc_analyzer_candidates")
+            .prepare("SELECT blob_oid, lang, generation FROM gc_analyzer_candidates")
             .map_err(|err| format!("cache GC SQLite error: {err}"))?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })
             .map_err(|err| format!("cache GC SQLite error: {err}"))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|err| format!("cache GC SQLite error: {err}"))?
             .into_iter()
-            .filter(|(oid, _)| !live.contains(oid))
+            .filter(|(oid, _, _)| !live.contains(oid))
             .collect::<Vec<_>>()
     };
-    {
-        let mut delete = tx
-            .prepare("DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2")
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-        for (oid, lang) in &dead_analyzer {
-            delete
-                .execute((oid, lang))
-                .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-        }
-    }
+    let analyzer_dropped = delete_analyzer_candidates(&tx, &dead_analyzer)?;
     tx.commit()
         .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     conn.pragma_update(None, "incremental_vacuum", 0)
         .map_err(|err| format!("cache GC SQLite error: {err}"))?;
 
     let semantic_dropped = dead_semantic.len();
-    let analyzer_dropped = dead_analyzer.len();
-
     let total_blobs_after = finish_gc(&claim.db_path)?;
     Ok(GcOutcome {
         ran: true,
@@ -234,6 +231,25 @@ fn sweep_with_claim(
         analyzer_dropped,
         total_blobs_after,
     })
+}
+
+fn delete_analyzer_candidates(
+    tx: &rusqlite::Transaction<'_>,
+    candidates: &[(String, String, i64)],
+) -> Result<usize, String> {
+    let mut delete = tx
+        .prepare(
+            "DELETE FROM blobs
+             WHERE blob_oid = ?1 AND lang = ?2 AND generation = ?3",
+        )
+        .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    let mut dropped = 0usize;
+    for (oid, lang, generation) in candidates {
+        dropped += delete
+            .execute((oid, lang, generation))
+            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
+    }
+    Ok(dropped)
 }
 
 fn live_bloom(repo: &Repository) -> Result<GrowableBloom, String> {
@@ -409,4 +425,60 @@ pub fn set_accounting_for_test(
 #[doc(hidden)]
 pub fn total_blob_count_for_test(db_path: &Path) -> Result<i64, String> {
     total_blob_count(db_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::*;
+
+    #[test]
+    fn analyzer_gc_candidate_cannot_delete_newer_generation_replacement() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        cache_db::configure_connection(&mut conn).unwrap();
+        cache_db::migrate(&mut conn).unwrap();
+        let oid = "1111111111111111111111111111111111111111";
+        conn.execute(
+            "INSERT INTO analysis_epochs(lang, epoch, generation)
+             VALUES('java', 'a', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'java', 1)",
+            [oid],
+        )
+        .unwrap();
+        let candidate = vec![(oid.to_string(), "java".to_string(), 1)];
+
+        conn.execute(
+            "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+            [oid],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE analysis_epochs SET epoch = 'b', generation = 2 WHERE lang = 'java'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'java', 2)",
+            [oid],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        assert_eq!(delete_analyzer_candidates(&tx, &candidate).unwrap(), 0);
+        tx.commit().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT generation FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                [oid],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+    }
 }
