@@ -941,4 +941,65 @@ mod tests {
             "reuse validation within one batch, then revalidate once in a separate batch"
         );
     }
+
+    #[test]
+    fn cpp_type_definition_routing_classifies_only_name_bounded_candidates() {
+        const UNRELATED_DECLARATIONS: usize = 128;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let types = ProjectFile::new(root.clone(), "types.hpp");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let mut header = "namespace ns { struct Target { void run(); }; }\n".to_string();
+        for index in 0..UNRELATED_DECLARATIONS / 2 {
+            header.push_str(&format!("int unrelated_function_{index}();\n"));
+            header.push_str(&format!("using UnrelatedAlias{index} = unsigned long;\n"));
+        }
+        types.write(&header).unwrap();
+        let source = "#include \"types.hpp\"\nnamespace ns { void local_case() { Target local; local.run(); } }\nvoid qualified_case() { ns::Target qualified; qualified.run(); }\n";
+        consumer.write(source).unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = CppAnalyzer::new(project);
+        analyzer.reset_type_alias_classification_count_for_test();
+        let requests = source
+            .match_indices("run")
+            .map(|(start_byte, name)| DefinitionLookupRequest {
+                file: consumer.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(start_byte + name.len()),
+            })
+            .collect::<Vec<_>>();
+
+        let first = resolve_definition_batch_with_source(
+            &analyzer,
+            requests.clone(),
+            consumer.clone(),
+            Arc::new(source.to_string()),
+        );
+        let first_batch_classifications = analyzer.type_alias_classification_count_for_test();
+        let second = resolve_definition_batch_with_source(
+            &analyzer,
+            vec![requests[1].clone()],
+            consumer,
+            Arc::new(source.to_string()),
+        );
+        let second_batch_classifications = analyzer
+            .type_alias_classification_count_for_test()
+            .saturating_sub(first_batch_classifications);
+        for outcome in first.iter().chain(&second) {
+            assert_eq!(outcome.status, DefinitionLookupStatus::Resolved);
+            assert!(
+                outcome
+                    .definitions
+                    .iter()
+                    .any(|unit| unit.short_name() == "Target.run" && unit.package_name() == "ns")
+            );
+        }
+        assert!(
+            first_batch_classifications <= requests.len() * 10
+                && second_batch_classifications <= 10,
+            "provider-backed alias classification must scale with named requests, not {UNRELATED_DECLARATIONS} unrelated visible declarations: first={first_batch_classifications}, second={second_batch_classifications}"
+        );
+    }
 }

@@ -569,6 +569,14 @@ impl VisibilityIndex {
             .flatten()
     }
 
+    pub(in crate::analyzer::usages) fn type_name_candidates<'b>(
+        &'b self,
+        file: &ProjectFile,
+        normalized: &str,
+    ) -> Vec<&'b CodeUnit> {
+        self.candidate_units(file, normalized, TargetKind::Type)
+    }
+
     pub(super) fn visible_members_for_owner_name<'b>(
         &'b self,
         file: &ProjectFile,

@@ -2235,10 +2235,13 @@ fn cpp_resolve_type_alias_unit(
     type_text: &str,
 ) -> Option<CodeUnit> {
     let name = normalize_cpp_type_text(type_text);
-    visibility.visible_units(file).find_map(|unit| {
-        (cpp_unit_is_type_alias(analyzer, unit) && cpp_type_unit_matches_name(unit, &name))
-            .then(|| unit.clone())
-    })
+    visibility
+        .type_name_candidates(file, &name)
+        .into_iter()
+        .find_map(|unit| {
+            (cpp_unit_is_type_alias(analyzer, unit) && cpp_type_unit_matches_name(unit, &name))
+                .then(|| unit.clone())
+        })
 }
 
 fn cpp_resolve_type_unit_inner(
@@ -2253,7 +2256,8 @@ fn cpp_resolve_type_unit_inner(
         return None;
     }
     let mut targets = visibility
-        .visible_units(file)
+        .type_name_candidates(file, &name)
+        .into_iter()
         .filter(|unit| {
             (unit.is_class() || cpp_unit_is_type_alias(analyzer, unit))
                 && cpp_type_unit_matches_name(unit, &name)

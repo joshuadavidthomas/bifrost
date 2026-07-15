@@ -45,6 +45,8 @@ pub struct CppAnalyzer {
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_ancestor_index: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
     direct_descendant_index: Arc<OnceLock<HashMap<CodeUnit, Arc<HashSet<CodeUnit>>>>>,
+    #[cfg(test)]
+    type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
@@ -96,6 +98,8 @@ impl CppAnalyzer {
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_ancestor_index: Arc::new(OnceLock::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -120,6 +124,8 @@ impl CppAnalyzer {
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_ancestor_index: Arc::new(OnceLock::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
+            #[cfg(test)]
+            type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -157,6 +163,18 @@ impl CppAnalyzer {
     #[cfg(test)]
     pub(crate) fn live_oid_validation_count_for_test(&self, file: &ProjectFile) -> usize {
         self.inner.live_oid_validation_count_for_test(file)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_type_alias_classification_count_for_test(&self) {
+        self.type_alias_classification_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn type_alias_classification_count_for_test(&self) -> usize {
+        self.type_alias_classification_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -449,6 +467,9 @@ impl IAnalyzer for CppAnalyzer {
 
 impl TypeAliasProvider for CppAnalyzer {
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+        #[cfg(test)]
+        self.type_alias_classification_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.is_type_alias(code_unit)
     }
 }
