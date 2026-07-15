@@ -5,7 +5,10 @@ pub mod query;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use git2::Oid;
 use growable_bloom_filter::GrowableBloom;
@@ -21,6 +24,8 @@ use crate::analyzer::{
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
 use crate::text_utils::compute_line_starts;
+
+const PREPARED_WRITE_IMMEDIATE_RETRIES: usize = 2;
 
 pub fn analyzer_db_path(workspace_root: &Path) -> PathBuf {
     gitblob::cache_db_path(workspace_root)
@@ -119,6 +124,8 @@ AND meta.scala_trait_count = (
 pub struct AnalyzerStore {
     conn: Mutex<Connection>,
     db_path: Option<PathBuf>,
+    #[cfg(test)]
+    parsed_blob_transaction_starts: AtomicUsize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +394,8 @@ impl AnalyzerStore {
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: Some(db_path.to_path_buf()),
+            #[cfg(test)]
+            parsed_blob_transaction_starts: AtomicUsize::new(0),
         })
     }
 
@@ -397,6 +406,8 @@ impl AnalyzerStore {
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: None,
+            #[cfg(test)]
+            parsed_blob_transaction_starts: AtomicUsize::new(0),
         })
     }
 
@@ -581,9 +592,176 @@ impl AnalyzerStore {
         adapter: &A,
         state: &FileState,
     ) -> Result<()> {
+        #[cfg(test)]
+        self.parsed_blob_transaction_starts
+            .fetch_add(1, Ordering::SeqCst);
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let tx = conn.transaction()?;
         write_parsed_blob_tx(&tx, oid, lang, adapter, state)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parsed_blob_transaction_starts_for_test(&self) -> usize {
+        self.parsed_blob_transaction_starts.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn prepare_parsed_blob<A: LanguageAdapter>(
+        oid: Oid,
+        lang: &str,
+        adapter: &A,
+        state: Arc<FileState>,
+    ) -> Result<PreparedParsedBlob> {
+        prepare_parsed_blob(oid, lang, adapter, state)
+    }
+
+    pub(crate) fn persist_prepared_blobs(
+        &self,
+        prepared: Vec<PreparedParsedBlob>,
+        limits: PersistBatchLimits,
+    ) -> (Vec<PersistBlobOutcome>, PersistBatchStats) {
+        let limits = limits.normalized();
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        let mut stats = PersistBatchStats::default();
+        let mut batch = Vec::new();
+        let mut batch_rows = 0usize;
+        let mut batch_bytes = 0usize;
+        let mut seen = HashSet::default();
+
+        for blob in prepared {
+            if !seen.insert((blob.oid(), blob.lang().to_string())) {
+                outcomes.push(PersistBlobOutcome {
+                    prepared: blob,
+                    error: Some("duplicate prepared blob key in one persistence call".to_string()),
+                });
+                stats.failed_blobs = stats.failed_blobs.saturating_add(1);
+                continue;
+            }
+            let exceeds = !batch.is_empty()
+                && (batch.len() >= limits.max_blobs
+                    || batch_rows.saturating_add(blob.logical_rows()) > limits.max_rows
+                    || batch_bytes.saturating_add(blob.payload_bytes()) > limits.max_payload_bytes);
+            if exceeds {
+                let (batch_outcomes, batch_stats) = self.persist_prepared_chunk(batch);
+                outcomes.extend(batch_outcomes);
+                stats.merge(batch_stats);
+                batch = Vec::new();
+                batch_rows = 0;
+                batch_bytes = 0;
+            }
+            batch_rows = batch_rows.saturating_add(blob.logical_rows());
+            batch_bytes = batch_bytes.saturating_add(blob.payload_bytes());
+            batch.push(blob);
+        }
+        if !batch.is_empty() {
+            let (batch_outcomes, batch_stats) = self.persist_prepared_chunk(batch);
+            outcomes.extend(batch_outcomes);
+            stats.merge(batch_stats);
+        }
+        (outcomes, stats)
+    }
+
+    fn persist_prepared_chunk(
+        &self,
+        mut prepared: Vec<PreparedParsedBlob>,
+    ) -> (Vec<PersistBlobOutcome>, PersistBatchStats) {
+        let batch_blobs = prepared.len();
+        let batch_rows = saturating_sum(prepared.iter().map(PreparedParsedBlob::logical_rows));
+        let batch_bytes = saturating_sum(prepared.iter().map(PreparedParsedBlob::payload_bytes));
+        let result = self.try_persist_prepared_chunk(&prepared);
+
+        match result {
+            Ok(()) => {
+                let stats = PersistBatchStats {
+                    transactions: 1,
+                    committed_blobs: batch_blobs,
+                    logical_rows: batch_rows,
+                    payload_bytes: batch_bytes,
+                    peak_batch_blobs: batch_blobs,
+                    peak_batch_rows: batch_rows,
+                    peak_batch_payload_bytes: batch_bytes,
+                    ..PersistBatchStats::default()
+                };
+                let outcomes = prepared
+                    .into_iter()
+                    .map(|prepared| PersistBlobOutcome {
+                        prepared,
+                        error: None,
+                    })
+                    .collect();
+                (outcomes, stats)
+            }
+            Err(mut error) if prepared.len() == 1 => {
+                let mut failed_attempts = 1;
+                for retry in 1..=PREPARED_WRITE_IMMEDIATE_RETRIES {
+                    std::thread::sleep(Duration::from_millis(10 * retry as u64));
+                    match self.try_persist_prepared_chunk(&prepared) {
+                        Ok(()) => {
+                            return (
+                                vec![PersistBlobOutcome {
+                                    prepared: prepared.pop().expect("single retried prepared blob"),
+                                    error: None,
+                                }],
+                                PersistBatchStats {
+                                    transactions: 1,
+                                    failed_transaction_attempts: failed_attempts,
+                                    committed_blobs: 1,
+                                    logical_rows: batch_rows,
+                                    payload_bytes: batch_bytes,
+                                    peak_batch_blobs: batch_blobs,
+                                    peak_batch_rows: batch_rows,
+                                    peak_batch_payload_bytes: batch_bytes,
+                                    ..PersistBatchStats::default()
+                                },
+                            );
+                        }
+                        Err(retry_error) => {
+                            failed_attempts = failed_attempts.saturating_add(1);
+                            error = retry_error;
+                        }
+                    }
+                }
+                (
+                    vec![PersistBlobOutcome {
+                        prepared: prepared.pop().expect("single failed prepared blob"),
+                        error: Some(error.to_string()),
+                    }],
+                    PersistBatchStats {
+                        failed_transaction_attempts: failed_attempts,
+                        failed_blobs: 1,
+                        peak_batch_blobs: batch_blobs,
+                        peak_batch_rows: batch_rows,
+                        peak_batch_payload_bytes: batch_bytes,
+                        ..PersistBatchStats::default()
+                    },
+                )
+            }
+            Err(_) => {
+                let right = prepared.split_off(prepared.len() / 2);
+                let (mut left_outcomes, mut stats) = self.persist_prepared_chunk(prepared);
+                let (right_outcomes, right_stats) = self.persist_prepared_chunk(right);
+                left_outcomes.extend(right_outcomes);
+                stats.failed_transaction_attempts =
+                    stats.failed_transaction_attempts.saturating_add(1);
+                stats.peak_batch_blobs = stats.peak_batch_blobs.max(batch_blobs);
+                stats.peak_batch_rows = stats.peak_batch_rows.max(batch_rows);
+                stats.peak_batch_payload_bytes = stats.peak_batch_payload_bytes.max(batch_bytes);
+                stats.merge(right_stats);
+                (left_outcomes, stats)
+            }
+        }
+    }
+
+    fn try_persist_prepared_chunk(&self, prepared: &[PreparedParsedBlob]) -> Result<()> {
+        #[cfg(test)]
+        self.parsed_blob_transaction_starts
+            .fetch_add(1, Ordering::SeqCst);
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        for blob in prepared {
+            write_prepared_blob_tx(&tx, blob)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1437,6 +1615,145 @@ struct StoredUnit {
     in_definition_lookup: bool,
 }
 
+#[derive(Debug)]
+struct PreparedUnitRow {
+    key: i64,
+    kind: i64,
+    short_name: String,
+    identifier: String,
+    content_qualifier: String,
+    exact_fqn: Option<String>,
+    normalized_fqn: Option<String>,
+    simple_type_name: Option<String>,
+    signature: Option<String>,
+    synthetic: i64,
+    is_type_alias: i64,
+    top_level_ordinal: Option<i64>,
+    in_declarations: i64,
+    in_definition_lookup: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedParsedBlob {
+    oid: Oid,
+    oid_text: String,
+    lang: String,
+    state: Arc<FileState>,
+    units: Vec<PreparedUnitRow>,
+    ranges: Vec<(i64, i64, i64, i64, i64, i64)>,
+    signatures: Vec<(i64, i64, String)>,
+    signature_metadata: Vec<(i64, i64, Vec<u8>)>,
+    supertypes: Vec<(i64, i64, String, String)>,
+    children: Vec<(i64, i64, i64)>,
+    import_statements: Vec<(i64, String)>,
+    imports: Vec<(i64, Vec<u8>)>,
+    type_identifiers: Vec<String>,
+    ruby_dispatch_modes: Vec<(i64, i64)>,
+    scala_traits: Vec<i64>,
+    contains_tests: i64,
+    content_package: String,
+    logical_rows: usize,
+    payload_bytes: usize,
+}
+
+impl PreparedParsedBlob {
+    pub(crate) fn oid(&self) -> Oid {
+        self.oid
+    }
+
+    pub(crate) fn lang(&self) -> &str {
+        &self.lang
+    }
+
+    pub(crate) fn state(&self) -> &Arc<FileState> {
+        &self.state
+    }
+
+    pub(crate) fn logical_rows(&self) -> usize {
+        self.logical_rows
+    }
+
+    pub(crate) fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_invalid_range_for_test(&mut self) {
+        self.ranges.push((i64::MAX, 0, 0, 0, 0, 0));
+        self.logical_rows = self.logical_rows.saturating_add(1);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PersistBatchLimits {
+    pub(crate) max_blobs: usize,
+    pub(crate) max_rows: usize,
+    pub(crate) max_payload_bytes: usize,
+}
+
+impl PersistBatchLimits {
+    pub(crate) const PRODUCTION: Self = Self {
+        max_blobs: 64,
+        max_rows: 100_000,
+        max_payload_bytes: 32 * 1024 * 1024,
+    };
+
+    fn normalized(self) -> Self {
+        Self {
+            max_blobs: self.max_blobs.max(1),
+            max_rows: self.max_rows.max(1),
+            max_payload_bytes: self.max_payload_bytes.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PersistBatchStats {
+    pub(crate) transactions: usize,
+    pub(crate) failed_transaction_attempts: usize,
+    pub(crate) committed_blobs: usize,
+    pub(crate) failed_blobs: usize,
+    pub(crate) logical_rows: usize,
+    pub(crate) payload_bytes: usize,
+    pub(crate) peak_batch_blobs: usize,
+    pub(crate) peak_batch_rows: usize,
+    pub(crate) peak_batch_payload_bytes: usize,
+    pub(crate) peak_in_flight_items: usize,
+    pub(crate) peak_in_flight_payload_bytes: usize,
+    pub(crate) configured_max_in_flight_items: usize,
+}
+
+impl PersistBatchStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.transactions = self.transactions.saturating_add(other.transactions);
+        self.failed_transaction_attempts = self
+            .failed_transaction_attempts
+            .saturating_add(other.failed_transaction_attempts);
+        self.committed_blobs = self.committed_blobs.saturating_add(other.committed_blobs);
+        self.failed_blobs = self.failed_blobs.saturating_add(other.failed_blobs);
+        self.logical_rows = self.logical_rows.saturating_add(other.logical_rows);
+        self.payload_bytes = self.payload_bytes.saturating_add(other.payload_bytes);
+        self.peak_batch_blobs = self.peak_batch_blobs.max(other.peak_batch_blobs);
+        self.peak_batch_rows = self.peak_batch_rows.max(other.peak_batch_rows);
+        self.peak_batch_payload_bytes = self
+            .peak_batch_payload_bytes
+            .max(other.peak_batch_payload_bytes);
+        self.peak_in_flight_items = self.peak_in_flight_items.max(other.peak_in_flight_items);
+        self.peak_in_flight_payload_bytes = self
+            .peak_in_flight_payload_bytes
+            .max(other.peak_in_flight_payload_bytes);
+        self.configured_max_in_flight_items = self
+            .configured_max_in_flight_items
+            .max(other.configured_max_in_flight_items);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PersistBlobOutcome {
+    pub(crate) prepared: PreparedParsedBlob,
+    pub(crate) error: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PersistedSideTableCounts {
     range_count: usize,
@@ -1449,6 +1766,377 @@ struct PersistedSideTableCounts {
     type_identifier_count: usize,
     ruby_dispatch_count: usize,
     scala_trait_count: usize,
+}
+
+fn saturating_sum(values: impl IntoIterator<Item = usize>) -> usize {
+    values
+        .into_iter()
+        .fold(0usize, |total, value| total.saturating_add(value))
+}
+
+fn prepare_parsed_blob<A: LanguageAdapter>(
+    oid: Oid,
+    lang: &str,
+    adapter: &A,
+    state: Arc<FileState>,
+) -> Result<PreparedParsedBlob> {
+    let stored_units = collect_stored_units(adapter, state.as_ref());
+    let unit_keys: HashMap<CodeUnit, i64> = stored_units
+        .iter()
+        .map(|stored| (stored.unit.clone(), stored.key))
+        .collect();
+    let persist_lookup_keys = adapter.persist_content_stable_lookup_keys();
+    let mut units = Vec::with_capacity(stored_units.len());
+    for stored in stored_units {
+        let exact_fqn = persist_lookup_keys.then(|| stored.unit.fq_name());
+        let normalized_fqn = exact_fqn
+            .as_deref()
+            .map(|fqn| adapter.normalize_full_name(fqn));
+        let simple_type_name = (persist_lookup_keys && stored.unit.is_class())
+            .then(|| adapter.simple_type_name(&stored.unit));
+        units.push(PreparedUnitRow {
+            key: stored.key,
+            kind: code_unit_kind_to_i64(stored.unit.kind()),
+            short_name: stored.unit.short_name().to_string(),
+            identifier: stored.unit.identifier().to_string(),
+            content_qualifier: adapter
+                .storage_content_qualifier(&stored.unit, &state.content_qualifier),
+            exact_fqn,
+            normalized_fqn,
+            simple_type_name,
+            signature: stored.unit.signature().map(str::to_string),
+            synthetic: bool_to_i64(stored.unit.is_synthetic()),
+            is_type_alias: bool_to_i64(stored.is_type_alias),
+            top_level_ordinal: stored.top_level_ordinal.map(usize_to_i64).transpose()?,
+            in_declarations: bool_to_i64(stored.in_declarations),
+            in_definition_lookup: bool_to_i64(stored.in_definition_lookup),
+        });
+    }
+
+    let mut ranges = Vec::new();
+    for (unit, entries) in &state.ranges {
+        let Some(&unit_key) = unit_keys.get(unit) else {
+            continue;
+        };
+        for (ordinal, range) in entries.iter().enumerate() {
+            ranges.push((
+                unit_key,
+                usize_to_i64(ordinal)?,
+                usize_to_i64(range.start_byte)?,
+                usize_to_i64(range.end_byte)?,
+                usize_to_i64(range.start_line)?,
+                usize_to_i64(range.end_line)?,
+            ));
+        }
+    }
+    let mut signatures = Vec::new();
+    for (unit, entries) in &state.signatures {
+        let Some(&unit_key) = unit_keys.get(unit) else {
+            continue;
+        };
+        for (ordinal, signature) in entries.iter().enumerate() {
+            signatures.push((unit_key, usize_to_i64(ordinal)?, signature.clone()));
+        }
+    }
+    let mut signature_metadata = Vec::new();
+    for (unit, entries) in &state.signature_metadata {
+        let Some(&unit_key) = unit_keys.get(unit) else {
+            continue;
+        };
+        for (ordinal, metadata) in entries.iter().enumerate() {
+            signature_metadata.push((unit_key, usize_to_i64(ordinal)?, serialize_blob(metadata)?));
+        }
+    }
+    let mut supertypes = Vec::new();
+    for (unit, entries) in &state.raw_supertypes {
+        let Some(&unit_key) = unit_keys.get(unit) else {
+            continue;
+        };
+        for (ordinal, raw) in entries.iter().enumerate() {
+            supertypes.push((
+                unit_key,
+                usize_to_i64(ordinal)?,
+                raw.clone(),
+                state
+                    .supertype_lookup_paths
+                    .get(unit)
+                    .and_then(|paths| paths.get(ordinal))
+                    .cloned()
+                    .unwrap_or_default(),
+            ));
+        }
+    }
+    let mut children = Vec::new();
+    for (parent, entries) in &state.children {
+        let Some(&parent_key) = unit_keys.get(parent) else {
+            continue;
+        };
+        for (ordinal, child) in entries.iter().enumerate() {
+            let Some(&child_key) = unit_keys.get(child) else {
+                continue;
+            };
+            children.push((parent_key, child_key, usize_to_i64(ordinal)?));
+        }
+    }
+    let mut ruby_dispatch_modes = Vec::new();
+    for (unit, mode) in &state.ruby_method_dispatch_modes {
+        if let Some(&unit_key) = unit_keys.get(unit) {
+            ruby_dispatch_modes.push((unit_key, ruby_dispatch_mode_to_i64(*mode)));
+        }
+    }
+    let mut scala_traits = Vec::new();
+    for unit in &state.scala_traits {
+        if let Some(&unit_key) = unit_keys.get(unit) {
+            scala_traits.push(unit_key);
+        }
+    }
+    let import_statements = state
+        .import_statements
+        .iter()
+        .enumerate()
+        .map(|(ordinal, statement)| Ok((usize_to_i64(ordinal)?, statement.clone())))
+        .collect::<Result<Vec<_>>>()?;
+    let imports = state
+        .imports
+        .iter()
+        .enumerate()
+        .map(|(ordinal, import)| Ok((usize_to_i64(ordinal)?, serialize_blob(import)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut type_identifiers: Vec<_> = state.type_identifiers.iter().cloned().collect();
+    type_identifiers.sort();
+
+    let logical_rows = saturating_sum([
+        2,
+        units.len(),
+        ranges.len(),
+        signatures.len(),
+        signature_metadata.len(),
+        supertypes.len(),
+        children.len(),
+        import_statements.len(),
+        imports.len(),
+        type_identifiers.len(),
+        ruby_dispatch_modes.len(),
+        scala_traits.len(),
+    ]);
+    let unit_string_bytes = saturating_sum(units.iter().map(|row| {
+        saturating_sum([
+            row.short_name.len(),
+            row.identifier.len(),
+            row.content_qualifier.len(),
+            row.exact_fqn.as_ref().map_or(0, String::len),
+            row.normalized_fqn.as_ref().map_or(0, String::len),
+            row.simple_type_name.as_ref().map_or(0, String::len),
+            row.signature.as_ref().map_or(0, String::len),
+        ])
+    }));
+    let string_bytes = saturating_sum([
+        unit_string_bytes,
+        saturating_sum(signatures.iter().map(|(_, _, text)| text.len())),
+        saturating_sum(
+            supertypes
+                .iter()
+                .map(|(_, _, raw, path)| raw.len().saturating_add(path.len())),
+        ),
+        saturating_sum(
+            import_statements
+                .iter()
+                .map(|(_, statement)| statement.len()),
+        ),
+        saturating_sum(type_identifiers.iter().map(String::len)),
+    ]);
+    let binary_bytes = saturating_sum([
+        saturating_sum(signature_metadata.iter().map(|(_, _, bytes)| bytes.len())),
+        saturating_sum(imports.iter().map(|(_, bytes)| bytes.len())),
+    ]);
+    let content_package = adapter.storage_file_content_qualifier(&state.content_qualifier);
+    let contains_tests = bool_to_i64(adapter.storage_contains_tests(&state));
+    let payload_bytes = state
+        .source
+        .len()
+        .saturating_add(string_bytes)
+        .saturating_add(binary_bytes)
+        .saturating_add(content_package.len());
+
+    Ok(PreparedParsedBlob {
+        oid,
+        oid_text: oid.to_string(),
+        lang: lang.to_string(),
+        state,
+        units,
+        ranges,
+        signatures,
+        signature_metadata,
+        supertypes,
+        children,
+        import_statements,
+        imports,
+        type_identifiers,
+        ruby_dispatch_modes,
+        scala_traits,
+        contains_tests,
+        content_package,
+        logical_rows,
+        payload_bytes,
+    })
+}
+
+fn write_prepared_blob_tx(tx: &Transaction<'_>, blob: &PreparedParsedBlob) -> Result<()> {
+    let oid = blob.oid_text.as_str();
+    let lang = blob.lang.as_str();
+    tx.execute(
+        "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
+        params![oid, lang],
+    )?;
+    tx.execute(
+        "INSERT INTO blobs(blob_oid, lang) VALUES(?1, ?2)",
+        params![oid, lang],
+    )?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO code_units(
+               blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
+               exact_fqn, normalized_fqn, simple_type_name, signature, synthetic,
+               is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        )?;
+        for row in &blob.units {
+            stmt.execute(params![
+                oid,
+                lang,
+                row.key,
+                row.kind,
+                row.short_name,
+                row.identifier,
+                row.content_qualifier,
+                row.exact_fqn,
+                row.normalized_fqn,
+                row.simple_type_name,
+                row.signature,
+                row.synthetic,
+                row.is_type_alias,
+                row.top_level_ordinal,
+                row.in_declarations,
+                row.in_definition_lookup,
+            ])?;
+        }
+    }
+    macro_rules! insert_rows {
+        ($sql:expr, $rows:expr, |$stmt:ident, $row:ident| $body:block) => {{
+            let mut $stmt = tx.prepare($sql)?;
+            for $row in $rows $body
+        }};
+    }
+    insert_rows!(
+        "INSERT OR IGNORE INTO unit_ranges(blob_oid, lang, unit_key, ordinal, start_byte, end_byte, start_line, end_line) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        &blob.ranges,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1, row.2, row.3, row.4, row.5])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO unit_signatures(blob_oid, lang, unit_key, ordinal, text) VALUES(?1, ?2, ?3, ?4, ?5)",
+        &blob.signatures,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO unit_signature_metadata(blob_oid, lang, unit_key, ordinal, metadata) VALUES(?1, ?2, ?3, ?4, ?5)",
+        &blob.signature_metadata,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO unit_supertypes(blob_oid, lang, unit_key, ordinal, raw, lookup_path) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        &blob.supertypes,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1, row.2, row.3])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO unit_children(blob_oid, lang, parent_key, child_key, ordinal) VALUES(?1, ?2, ?3, ?4, ?5)",
+        &blob.children,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO import_statements(blob_oid, lang, ordinal, statement) VALUES(?1, ?2, ?3, ?4)",
+        &blob.import_statements,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO import_details(blob_oid, lang, ordinal, info) VALUES(?1, ?2, ?3, ?4)",
+        &blob.imports,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO type_identifiers(blob_oid, lang, type_identifier) VALUES(?1, ?2, ?3)",
+        &blob.type_identifiers,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO ruby_method_dispatch_modes(blob_oid, lang, unit_key, mode) VALUES(?1, ?2, ?3, ?4)",
+        &blob.ruby_dispatch_modes,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row.0, row.1])?;
+        }
+    );
+    insert_rows!(
+        "INSERT OR IGNORE INTO scala_traits(blob_oid, lang, unit_key) VALUES(?1, ?2, ?3)",
+        &blob.scala_traits,
+        |stmt, row| {
+            stmt.execute(params![oid, lang, row])?;
+        }
+    );
+    tx.execute(
+        "INSERT OR IGNORE INTO blob_meta(
+           blob_oid, lang, contains_tests, content_package, stored_unit_count,
+           range_count, signature_count, signature_metadata_count, supertype_count,
+           child_count, import_statement_count, import_count, type_identifier_count,
+           ruby_dispatch_count, scala_trait_count, is_complete
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1)",
+        params![
+            oid,
+            lang,
+            blob.contains_tests,
+            blob.content_package,
+            usize_to_i64(blob.units.len())?,
+            usize_to_i64(blob.ranges.len())?,
+            usize_to_i64(blob.signatures.len())?,
+            usize_to_i64(blob.signature_metadata.len())?,
+            usize_to_i64(blob.supertypes.len())?,
+            usize_to_i64(blob.children.len())?,
+            usize_to_i64(blob.import_statements.len())?,
+            usize_to_i64(blob.imports.len())?,
+            usize_to_i64(blob.type_identifiers.len())?,
+            usize_to_i64(blob.ruby_dispatch_modes.len())?,
+            usize_to_i64(blob.scala_traits.len())?,
+        ],
+    )?;
+    let integrity_sql = format!(
+        "SELECT 1 FROM blob_meta AS meta
+         WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+           AND {PARSED_BLOB_INTEGRITY_CONDITION}"
+    );
+    let complete = tx
+        .query_row(&integrity_sql, params![oid, lang], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !complete {
+        return Err(StoreError::new(format!(
+            "prepared blob {oid}/{lang} failed post-write integrity validation"
+        )));
+    }
+    Ok(())
 }
 
 fn write_parsed_blob_tx<A: LanguageAdapter>(
@@ -3941,6 +4629,155 @@ mod tests {
     }
 
     #[test]
+    fn cpp_epoch_change_hides_old_rows_without_synchronous_physical_deletion() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model { int value; }\n");
+        let oid = oid_for(file.read_to_string().unwrap().as_bytes());
+        // Epoch visibility is keyed by storage language independently of the parser adapter.
+        let adapter = JavaAdapter;
+        let state = parse_state(&adapter, &file);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store.ensure_language_epoch_value("cpp", "epoch-a").unwrap();
+        store
+            .write_parsed_blob(oid, "cpp", &adapter, &state)
+            .unwrap();
+
+        let physical_counts = || {
+            let conn = store.conn.lock().expect("analyzer store mutex poisoned");
+            ["blobs", "blob_meta", "code_units"].map(|table| {
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1 AND lang = 'cpp'"),
+                    [oid.to_string()],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap()
+            })
+        };
+        let before = physical_counts();
+        assert!(before.into_iter().all(|count| count > 0), "{before:?}");
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        store.ensure_language_epoch_value("cpp", "epoch-b").unwrap();
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+        assert_eq!(
+            before,
+            physical_counts(),
+            "epoch invalidation should be a constant-time logical cutover; old physical rows belong to deferred GC"
+        );
+    }
+
+    #[test]
+    fn prepared_blob_persistence_uses_bounded_transactions() {
+        const PREPARED_BLOBS: usize = 257;
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model {}\n");
+        let state = Arc::new(parse_state(&JavaAdapter, &file));
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let prepared = (0..PREPARED_BLOBS)
+            .map(|index| {
+                let oid =
+                    Oid::hash_object(ObjectType::Blob, format!("blob-{index}").as_bytes()).unwrap();
+                AnalyzerStore::prepare_parsed_blob(oid, "java", &JavaAdapter, Arc::clone(&state))
+                    .unwrap()
+            })
+            .collect();
+
+        let (outcomes, stats) = store.persist_prepared_blobs(
+            prepared,
+            PersistBatchLimits {
+                max_blobs: 64,
+                max_rows: usize::MAX,
+                max_payload_bytes: usize::MAX,
+            },
+        );
+
+        assert_eq!(stats.transactions, 5);
+        assert_eq!(stats.committed_blobs, PREPARED_BLOBS);
+        assert_eq!(stats.failed_transaction_attempts, 0);
+        assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
+        assert_eq!(store.parsed_blob_transaction_starts_for_test(), 5);
+    }
+
+    #[test]
+    fn prepared_blob_batches_respect_row_and_payload_caps() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model {}\n");
+        let state = Arc::new(parse_state(&JavaAdapter, &file));
+        let make = |index| {
+            AnalyzerStore::prepare_parsed_blob(
+                Oid::hash_object(ObjectType::Blob, format!("blob-{index}").as_bytes()).unwrap(),
+                "java",
+                &JavaAdapter,
+                Arc::clone(&state),
+            )
+            .unwrap()
+        };
+        let sample = make(99);
+        let row_cap = sample.logical_rows().saturating_mul(2);
+        let byte_cap = sample.payload_bytes().saturating_mul(2);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let (_, stats) = store.persist_prepared_blobs(
+            vec![make(0), make(1), make(2)],
+            PersistBatchLimits {
+                max_blobs: 64,
+                max_rows: row_cap,
+                max_payload_bytes: byte_cap,
+            },
+        );
+        assert_eq!(stats.transactions, 2);
+        assert!(stats.peak_batch_rows <= row_cap);
+        assert!(stats.peak_batch_payload_bytes <= byte_cap);
+    }
+
+    #[test]
+    fn failed_prepared_blob_isolated_without_hiding_good_peers() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model {}\n");
+        let state = Arc::new(parse_state(&JavaAdapter, &file));
+        let prepare = |text: &[u8]| {
+            let oid = Oid::hash_object(ObjectType::Blob, text).unwrap();
+            let prepared =
+                AnalyzerStore::prepare_parsed_blob(oid, "java", &JavaAdapter, Arc::clone(&state))
+                    .unwrap();
+            (oid, prepared)
+        };
+        let (good_a_oid, good_a) = prepare(b"good-a");
+        let (bad_oid, mut bad) = prepare(b"bad");
+        bad.inject_invalid_range_for_test();
+        let (good_b_oid, good_b) = prepare(b"good-b");
+        let store = AnalyzerStore::open_in_memory().unwrap();
+
+        let (outcomes, stats) = store.persist_prepared_blobs(
+            vec![good_a, bad, good_b],
+            PersistBatchLimits {
+                max_blobs: 64,
+                max_rows: usize::MAX,
+                max_payload_bytes: usize::MAX,
+            },
+        );
+
+        assert!(store.contains_parsed_blob(good_a_oid, "java").unwrap());
+        assert!(store.contains_parsed_blob(good_b_oid, "java").unwrap());
+        assert!(!store.contains_parsed_blob(bad_oid, "java").unwrap());
+        assert_eq!(store.content_row_count(bad_oid, "java").unwrap(), 0);
+        assert_eq!(stats.committed_blobs, 2);
+        assert_eq!(stats.failed_blobs, 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.error.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn linked_worktrees_share_analyzer_db_path() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo_root = temp.path().join("repo");
@@ -4059,6 +4896,31 @@ mod tests {
 
         assert_round_trip(&RubyAdapter, "ruby", &ruby_file);
         assert_round_trip(&ScalaAdapter, "scala", &scala_file);
+    }
+
+    #[test]
+    fn prepared_writer_matches_legacy_adapter_projections() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let ruby_file = write_file(
+            root,
+            "lib/demo.rb",
+            "module Demo\n  module_function\n  def build(value)\n    Product.new(value)\n  end\n  class Product\n    attr_reader :name\n    alias_method :label, :name\n  end\nend\n",
+        );
+        let scala_file = write_file(
+            root,
+            "src/main/scala/app/Demo.scala",
+            "package app\nimport scala.collection.mutable.ListBuffer\ntrait Runnable\nclass Worker extends Runnable\n",
+        );
+        let ts_file = write_file(
+            root,
+            "src/demo.test.ts",
+            "import {Thing} from './thing';\nexport class Demo { run(value: Thing): Thing { return value; } }\n",
+        );
+
+        assert_legacy_prepared_parity(&RubyAdapter, "ruby", &ruby_file);
+        assert_legacy_prepared_parity(&ScalaAdapter, "scala", &scala_file);
+        assert_legacy_prepared_parity(&TypescriptAdapter, "typescript", &ts_file);
     }
 
     #[test]
@@ -4296,6 +5158,44 @@ mod tests {
         assert_file_state_equivalent(&parsed, &hydrated);
         assert!(hydrated.source.is_empty());
         assert!(hydrated.parse_errors.is_none());
+    }
+
+    fn assert_legacy_prepared_parity<A: LanguageAdapter>(
+        adapter: &A,
+        lang: &str,
+        file: &ProjectFile,
+    ) {
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let parsed = Arc::new(parse_state(adapter, file));
+        let legacy = AnalyzerStore::open_in_memory().unwrap();
+        legacy
+            .write_parsed_blob(oid, lang, adapter, parsed.as_ref())
+            .unwrap();
+        let prepared_store = AnalyzerStore::open_in_memory().unwrap();
+        let prepared =
+            AnalyzerStore::prepare_parsed_blob(oid, lang, adapter, Arc::clone(&parsed)).unwrap();
+        let (outcomes, stats) =
+            prepared_store.persist_prepared_blobs(vec![prepared], PersistBatchLimits::PRODUCTION);
+        assert_eq!(stats.transactions, 1);
+        assert_eq!(stats.committed_blobs, 1);
+        assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
+
+        let legacy_state = legacy
+            .hydrate_file_state(oid, lang, adapter, file)
+            .unwrap()
+            .unwrap();
+        let prepared_state = prepared_store
+            .hydrate_file_state(oid, lang, adapter, file)
+            .unwrap()
+            .unwrap();
+        assert_file_state_equivalent(parsed.as_ref(), &legacy_state);
+        assert_file_state_equivalent(parsed.as_ref(), &prepared_state);
+        assert_file_state_equivalent(&legacy_state, &prepared_state);
+        assert_eq!(
+            legacy.content_row_count(oid, lang).unwrap(),
+            prepared_store.content_row_count(oid, lang).unwrap()
+        );
     }
 
     fn assert_deleting_side_table_marks_incomplete<A: LanguageAdapter>(

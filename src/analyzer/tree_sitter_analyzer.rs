@@ -1,7 +1,9 @@
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
 use crate::analyzer::store::query::QueryResolver;
-use crate::analyzer::store::{AnalyzerStore, PathSymbolRow};
+use crate::analyzer::store::{
+    AnalyzerStore, PathSymbolRow, PersistBatchLimits, PersistBatchStats, PreparedParsedBlob,
+};
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, DeclarationInfo,
     GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language, Project, ProjectFile, Range,
@@ -31,6 +33,11 @@ const SUMMARY_FILE_PROJECTION_CACHE_CAPACITY: usize = 32;
 const STORE_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STORE_WRITE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const STORE_WRITE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+static PREPARED_FAILURE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static PREPARATION_FAILURE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BulkFileStateSource {
@@ -361,7 +368,7 @@ pub(crate) struct ImportFileFacts {
 
 #[derive(Debug, Clone)]
 struct DirtyFileState {
-    state: FileState,
+    state: Arc<FileState>,
     attempts: usize,
     next_retry_at: Instant,
     _last_error: String,
@@ -373,6 +380,7 @@ struct AnalyzerRuntimeState {
     dirty_file_states: Mutex<HashMap<FileStateCacheKey, DirtyFileState>>,
     dirty_path_symbol_rows: Mutex<HashMap<ProjectFile, (String, PathSymbolRow)>>,
     seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
+    persistence_stats: PersistBatchStats,
 }
 
 impl AnalyzerRuntimeState {
@@ -387,6 +395,7 @@ impl AnalyzerRuntimeState {
             dirty_file_states: Mutex::new(dirty_file_states),
             dirty_path_symbol_rows: Mutex::new(dirty_path_symbol_rows),
             seeded_file_states,
+            persistence_stats: PersistBatchStats::default(),
         }
     }
 
@@ -434,6 +443,45 @@ struct ReconcileFileStates {
     dirty_file_states: HashMap<FileStateCacheKey, DirtyFileState>,
     dirty_path_symbol_rows: HashMap<ProjectFile, (String, PathSymbolRow)>,
 }
+
+enum PreparedAnalysis {
+    AllStarted,
+    Ready {
+        file: ProjectFile,
+        prepared: Box<PreparedParsedBlob>,
+    },
+    PreparationFailed {
+        file: ProjectFile,
+        state: Arc<FileState>,
+        error: String,
+    },
+    Unparseable(ProjectFile),
+}
+
+#[derive(Debug, Default)]
+struct PreparedInFlight {
+    current_items: usize,
+    current_payload_bytes: usize,
+    peak_items: usize,
+    peak_payload_bytes: usize,
+}
+
+impl PreparedInFlight {
+    fn add(&mut self, payload_bytes: usize) {
+        self.current_items = self.current_items.saturating_add(1);
+        self.current_payload_bytes = self.current_payload_bytes.saturating_add(payload_bytes);
+        self.peak_items = self.peak_items.max(self.current_items);
+        self.peak_payload_bytes = self.peak_payload_bytes.max(self.current_payload_bytes);
+    }
+
+    fn remove(&mut self, payload_bytes: usize) {
+        self.current_items = self.current_items.saturating_sub(1);
+        self.current_payload_bytes = self.current_payload_bytes.saturating_sub(payload_bytes);
+    }
+}
+
+type PreparedPersistenceOutcome = Option<(Arc<FileState>, Option<String>)>;
+type PreparedOutcomeHandler<'a> = dyn FnMut(ProjectFile, PreparedPersistenceOutcome) + 'a;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FileStateCacheKey {
@@ -1280,6 +1328,349 @@ where
         })
     }
 
+    fn analyze_prepare_and_persist_files(
+        adapter: &A,
+        project: &dyn Project,
+        config: &AnalyzerConfig,
+        targets: Vec<(ProjectFile, Oid, String)>,
+        progress: Option<BuildProgress>,
+        store_context: &AnalyzerStoreContext,
+        mut on_outcome: impl FnMut(ProjectFile, PreparedPersistenceOutcome),
+    ) -> PersistBatchStats {
+        const PREPARED_CHANNEL_CAPACITY: usize = 8;
+        if targets.is_empty() {
+            return PersistBatchStats::default();
+        }
+
+        let total = targets.len();
+        let language = adapter.parser_language();
+        let completed = AtomicUsize::new(0);
+        let started = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.parallelism())
+            .build()
+            .expect("failed to build analyzer thread pool");
+        let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(PREPARED_CHANNEL_CAPACITY);
+        let producer_progress = progress.clone();
+        let in_flight = Arc::new(Mutex::new(PreparedInFlight::default()));
+        let mut stats = PersistBatchStats::default();
+        let limits = PersistBatchLimits::PRODUCTION;
+        stats.configured_max_in_flight_items = config
+            .parallelism()
+            .saturating_add(PREPARED_CHANNEL_CAPACITY)
+            .saturating_add(limits.max_blobs);
+
+        std::thread::scope(|scope| {
+            let producer_tx = prepared_tx.clone();
+            let producer_in_flight = Arc::clone(&in_flight);
+            scope.spawn(move || {
+                pool.install(|| {
+                    targets.into_par_iter().for_each_init(
+                        || Self::build_parser(language.clone()),
+                        |parser, (file, oid, storage_key)| {
+                            let current_started = started.fetch_add(1, Ordering::SeqCst) + 1;
+                            if current_started == total {
+                                producer_tx
+                                    .send(PreparedAnalysis::AllStarted)
+                                    .expect("persistence receiver should remain connected");
+                            }
+                            let result = match Self::analyze_file(parser, adapter, project, &file) {
+                                Some(state) => {
+                                    let state = Arc::new(state);
+                                    if Self::should_inject_preparation_failure_for_test(&file) {
+                                        PreparedAnalysis::PreparationFailed {
+                                            file,
+                                            state,
+                                            error: "injected preparation failure".to_string(),
+                                        }
+                                    } else {
+                                        match AnalyzerStore::prepare_parsed_blob(
+                                            oid,
+                                            &storage_key,
+                                            adapter,
+                                            Arc::clone(&state),
+                                        ) {
+                                            Ok(mut prepared) => {
+                                                Self::inject_prepared_failure_for_test(
+                                                    &file,
+                                                    &mut prepared,
+                                                );
+                                                PreparedAnalysis::Ready {
+                                                    file,
+                                                    prepared: Box::new(prepared),
+                                                }
+                                            }
+                                            Err(error) => PreparedAnalysis::PreparationFailed {
+                                                file,
+                                                state,
+                                                error: error.to_string(),
+                                            },
+                                        }
+                                    }
+                                }
+                                None => PreparedAnalysis::Unparseable(file),
+                            };
+                            if let Some(progress) = producer_progress.as_ref() {
+                                let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                                let file = match &result {
+                                    PreparedAnalysis::Ready { file, .. }
+                                    | PreparedAnalysis::PreparationFailed { file, .. }
+                                    | PreparedAnalysis::Unparseable(file) => file.clone(),
+                                    PreparedAnalysis::AllStarted => {
+                                        unreachable!("start marker is not a parse result")
+                                    }
+                                };
+                                progress(BuildProgressEvent::new(
+                                    adapter.language(),
+                                    BuildProgressPhase::Parse,
+                                    current,
+                                    total,
+                                    Some(file),
+                                ));
+                            }
+                            if let PreparedAnalysis::Ready { prepared, .. } = &result {
+                                producer_in_flight
+                                    .lock()
+                                    .expect("prepared in-flight mutex poisoned")
+                                    .add(prepared.payload_bytes());
+                            }
+                            producer_tx
+                                .send(result)
+                                .expect("persistence receiver should remain connected");
+                        },
+                    );
+                });
+            });
+            drop(prepared_tx);
+
+            let mut pending = Vec::new();
+            let mut pending_files = HashMap::default();
+            let mut persist_completed = 0usize;
+            let mut tail_mode = false;
+            let flush = |pending: &mut Vec<PreparedParsedBlob>,
+                         pending_files: &mut HashMap<(Oid, String), ProjectFile>,
+                         stats: &mut PersistBatchStats,
+                         persist_completed: &mut usize,
+                         on_outcome: &mut PreparedOutcomeHandler<'_>| {
+                if pending.is_empty() {
+                    return;
+                }
+                let prepared = std::mem::take(pending);
+                let (outcomes, batch_stats) =
+                    store_context.store.persist_prepared_blobs(prepared, limits);
+                *persist_completed = persist_completed.saturating_add(
+                    batch_stats
+                        .committed_blobs
+                        .saturating_add(batch_stats.failed_blobs),
+                );
+                if let Some(progress) = progress.as_ref() {
+                    progress(BuildProgressEvent::new(
+                        adapter.language(),
+                        BuildProgressPhase::Persist,
+                        *persist_completed,
+                        total,
+                        None,
+                    ));
+                }
+                stats.merge(batch_stats);
+                for outcome in outcomes {
+                    in_flight
+                        .lock()
+                        .expect("prepared in-flight mutex poisoned")
+                        .remove(outcome.prepared.payload_bytes());
+                    let key = (outcome.prepared.oid(), outcome.prepared.lang().to_string());
+                    let file = pending_files
+                        .remove(&key)
+                        .expect("prepared outcome must retain its file envelope");
+                    on_outcome(
+                        file,
+                        Some((Arc::clone(outcome.prepared.state()), outcome.error)),
+                    );
+                }
+            };
+
+            let add_ready =
+                |file: ProjectFile,
+                 prepared: Box<PreparedParsedBlob>,
+                 pending: &mut Vec<PreparedParsedBlob>,
+                 pending_files: &mut HashMap<(Oid, String), ProjectFile>| {
+                    let key = (prepared.oid(), prepared.lang().to_string());
+                    if pending_files.insert(key, file).is_some() {
+                        panic!("duplicate prepared blob key in reconcile batch");
+                    }
+                    pending.push(*prepared);
+                    let rows = pending.iter().fold(0usize, |total, blob| {
+                        total.saturating_add(blob.logical_rows())
+                    });
+                    let bytes = pending.iter().fold(0usize, |total, blob| {
+                        total.saturating_add(blob.payload_bytes())
+                    });
+                    pending.len() >= limits.max_blobs
+                        || rows >= limits.max_rows
+                        || bytes >= limits.max_payload_bytes
+                };
+
+            let mut deferred = None;
+            loop {
+                let message = match deferred.take() {
+                    Some(message) => Ok(message),
+                    None => prepared_rx.recv(),
+                };
+                match message {
+                    Ok(PreparedAnalysis::AllStarted) => {
+                        flush(
+                            &mut pending,
+                            &mut pending_files,
+                            &mut stats,
+                            &mut persist_completed,
+                            &mut on_outcome,
+                        );
+                        tail_mode = true;
+                    }
+                    Ok(PreparedAnalysis::Ready { file, prepared }) => {
+                        if add_ready(file, prepared, &mut pending, &mut pending_files) {
+                            flush(
+                                &mut pending,
+                                &mut pending_files,
+                                &mut stats,
+                                &mut persist_completed,
+                                &mut on_outcome,
+                            );
+                        }
+                        if tail_mode {
+                            loop {
+                                match prepared_rx.try_recv() {
+                                    Ok(PreparedAnalysis::Ready { file, prepared }) => {
+                                        if add_ready(
+                                            file,
+                                            prepared,
+                                            &mut pending,
+                                            &mut pending_files,
+                                        ) {
+                                            flush(
+                                                &mut pending,
+                                                &mut pending_files,
+                                                &mut stats,
+                                                &mut persist_completed,
+                                                &mut on_outcome,
+                                            );
+                                        }
+                                    }
+                                    Ok(other) => {
+                                        deferred = Some(other);
+                                        break;
+                                    }
+                                    Err(std::sync::mpsc::TryRecvError::Empty)
+                                    | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                                }
+                            }
+                            flush(
+                                &mut pending,
+                                &mut pending_files,
+                                &mut stats,
+                                &mut persist_completed,
+                                &mut on_outcome,
+                            );
+                        }
+                    }
+                    Ok(PreparedAnalysis::PreparationFailed { file, state, error }) => {
+                        stats.failed_blobs = stats.failed_blobs.saturating_add(1);
+                        persist_completed = persist_completed.saturating_add(1);
+                        if let Some(progress) = progress.as_ref() {
+                            progress(BuildProgressEvent::new(
+                                adapter.language(),
+                                BuildProgressPhase::Persist,
+                                persist_completed,
+                                total,
+                                None,
+                            ));
+                        }
+                        on_outcome(file, Some((state, Some(error))));
+                    }
+                    Ok(PreparedAnalysis::Unparseable(file)) => {
+                        persist_completed = persist_completed.saturating_add(1);
+                        if let Some(progress) = progress.as_ref() {
+                            progress(BuildProgressEvent::new(
+                                adapter.language(),
+                                BuildProgressPhase::Persist,
+                                persist_completed,
+                                total,
+                                None,
+                            ));
+                        }
+                        on_outcome(file, None);
+                    }
+                    Err(std::sync::mpsc::RecvError) => {
+                        flush(
+                            &mut pending,
+                            &mut pending_files,
+                            &mut stats,
+                            &mut persist_completed,
+                            &mut on_outcome,
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+        let in_flight = in_flight.lock().expect("prepared in-flight mutex poisoned");
+        debug_assert_eq!(in_flight.current_items, 0);
+        debug_assert_eq!(in_flight.current_payload_bytes, 0);
+        stats.peak_in_flight_items = in_flight.peak_items;
+        stats.peak_in_flight_payload_bytes = in_flight.peak_payload_bytes;
+        if profiling::enabled() {
+            profiling::note(format!(
+                "persist_transactions={} failed_attempts={} committed_blobs={} failed_blobs={} logical_rows={} prepared_bytes={} peak_batch_blobs={} peak_batch_rows={} peak_batch_bytes={} peak_in_flight_items={} peak_in_flight_bytes={} configured_max_in_flight_items={}",
+                stats.transactions,
+                stats.failed_transaction_attempts,
+                stats.committed_blobs,
+                stats.failed_blobs,
+                stats.logical_rows,
+                stats.payload_bytes,
+                stats.peak_batch_blobs,
+                stats.peak_batch_rows,
+                stats.peak_batch_payload_bytes,
+                stats.peak_in_flight_items,
+                stats.peak_in_flight_payload_bytes,
+                stats.configured_max_in_flight_items,
+            ));
+        }
+        stats
+    }
+
+    fn inject_prepared_failure_for_test(file: &ProjectFile, prepared: &mut PreparedParsedBlob) {
+        #[cfg(test)]
+        {
+            let failure_path = PREPARED_FAILURE_PATH
+                .lock()
+                .expect("prepared failure path mutex poisoned");
+            if failure_path
+                .as_ref()
+                .is_some_and(|path| path == &file.abs_path())
+            {
+                prepared.inject_invalid_range_for_test();
+            }
+        }
+        #[cfg(not(test))]
+        let _ = (file, prepared);
+    }
+
+    fn should_inject_preparation_failure_for_test(file: &ProjectFile) -> bool {
+        #[cfg(test)]
+        {
+            return PREPARATION_FAILURE_PATH
+                .lock()
+                .expect("preparation failure path mutex poisoned")
+                .as_ref()
+                .is_some_and(|path| path == &file.abs_path());
+        }
+        #[cfg(not(test))]
+        {
+            let _ = file;
+            false
+        }
+    }
+
     fn resolve_live_oids(
         project: &dyn Project,
         files: &[ProjectFile],
@@ -1524,6 +1915,7 @@ where
         } = input;
         let mut fresh_parse_errors = HashMap::default();
         let mut seeded_file_states = Vec::new();
+        let mut persistence_stats = PersistBatchStats::default();
         let oid_plan = Self::resolve_live_oids(project, &files, store_context, replace_live_paths);
         match oid_plan {
             Ok(file_oids) => {
@@ -1558,42 +1950,59 @@ where
                 }
                 let parse_targets: Vec<_> = missing
                     .iter()
-                    .filter_map(|blob_key| representative_by_blob_key.get(blob_key).cloned())
+                    .filter_map(|(oid, storage_key)| {
+                        representative_by_blob_key
+                            .get(&(*oid, storage_key.clone()))
+                            .cloned()
+                            .map(|file| (file, *oid, storage_key.clone()))
+                    })
                     .collect();
                 let mut failed_blob_keys = HashSet::default();
                 let mut parsed_files = HashSet::default();
-                for (file, state) in
-                    Self::analyze_files(adapter, project, config, parse_targets, progress.clone())
-                {
-                    let Some(oid) = file_oids.get(&file).copied() else {
-                        continue;
-                    };
-                    let storage_key = adapter.storage_language_key_for_file(&file);
-                    match state {
-                        Some(state) => {
-                            let key = Self::transient_cache_key(oid, &file);
-                            Self::persist_or_mark_dirty(
-                                &mut dirty_file_states,
-                                store_context,
-                                adapter,
-                                &file,
-                                oid,
-                                &storage_key,
-                                &state,
-                            );
-                            if let Some(errors) = state.parse_errors.clone() {
-                                fresh_parse_errors.insert(file.clone(), errors);
+                persistence_stats = Self::analyze_prepare_and_persist_files(
+                    adapter,
+                    project,
+                    config,
+                    parse_targets,
+                    progress.clone(),
+                    store_context,
+                    |file, outcome| {
+                        let Some(oid) = file_oids.get(&file).copied() else {
+                            return;
+                        };
+                        let storage_key = adapter.storage_language_key_for_file(&file);
+                        match outcome {
+                            Some((state, error)) => {
+                                let key = Self::transient_cache_key(oid, &file);
+                                match error {
+                                    Some(error) => {
+                                        dirty_file_states.insert(
+                                            key.clone(),
+                                            Self::dirty_file_state(
+                                                Arc::clone(&state),
+                                                STORE_WRITE_IMMEDIATE_RETRIES + 1,
+                                                error,
+                                            ),
+                                        );
+                                    }
+                                    None => {
+                                        dirty_file_states.remove(&key);
+                                    }
+                                }
+                                if let Some(errors) = state.parse_errors.clone() {
+                                    fresh_parse_errors.insert(file.clone(), errors);
+                                }
+                                if seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY {
+                                    seeded_file_states.push((key, Arc::clone(&state)));
+                                }
+                                parsed_files.insert(file);
                             }
-                            if seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY {
-                                seeded_file_states.push((key, Arc::new(state)));
+                            None => {
+                                failed_blob_keys.insert((oid, storage_key));
                             }
-                            parsed_files.insert(file);
                         }
-                        None => {
-                            failed_blob_keys.insert((oid, storage_key));
-                        }
-                    }
-                }
+                    },
+                );
 
                 let mut hydrate_misses = Vec::new();
                 for file in &files {
@@ -1681,12 +2090,14 @@ where
             }
         }
 
-        AnalyzerRuntimeState::new(
+        let mut state = AnalyzerRuntimeState::new(
             fresh_parse_errors,
             dirty_file_states,
             dirty_path_symbol_rows,
             seeded_file_states,
-        )
+        );
+        state.persistence_stats = persistence_stats;
+        state
     }
 
     fn source_snapshot_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
@@ -1722,7 +2133,11 @@ where
             .min(STORE_WRITE_RETRY_MAX_DELAY)
     }
 
-    fn dirty_file_state(state: FileState, attempts: usize, last_error: String) -> DirtyFileState {
+    fn dirty_file_state(
+        state: Arc<FileState>,
+        attempts: usize,
+        last_error: String,
+    ) -> DirtyFileState {
         DirtyFileState {
             state,
             attempts,
@@ -1774,7 +2189,11 @@ where
             Err(err) => {
                 dirty_file_states.insert(
                     key,
-                    Self::dirty_file_state(state.clone(), STORE_WRITE_IMMEDIATE_RETRIES + 1, err),
+                    Self::dirty_file_state(
+                        Arc::new(state.clone()),
+                        STORE_WRITE_IMMEDIATE_RETRIES + 1,
+                        err,
+                    ),
                 );
             }
         }
@@ -1792,7 +2211,7 @@ where
         &self,
         key: &FileStateCacheKey,
         storage_key: &str,
-    ) -> Option<FileState> {
+    ) -> Option<Arc<FileState>> {
         let state = {
             let dirty_file_states = self
                 .state
@@ -1801,9 +2220,9 @@ where
                 .expect("dirty file-state mutex poisoned");
             let dirty = dirty_file_states.get(key)?;
             if Instant::now() < dirty.next_retry_at {
-                return Some(dirty.state.clone());
+                return Some(Arc::clone(&dirty.state));
             }
-            dirty.state.clone()
+            Arc::clone(&dirty.state)
         };
 
         match self.store_context.store.write_parsed_blob(
@@ -1821,7 +2240,7 @@ where
                 self.transient_file_states
                     .lock()
                     .expect("transient file-state cache mutex poisoned")
-                    .insert(key.clone(), Arc::new(state.clone()));
+                    .insert(key.clone(), Arc::clone(&state));
                 Some(state)
             }
             Err(err) => {
@@ -1834,7 +2253,7 @@ where
                     dirty.attempts = dirty.attempts.saturating_add(1);
                     dirty.next_retry_at = Instant::now() + Self::dirty_retry_delay(dirty.attempts);
                     dirty._last_error = err.to_string();
-                    return Some(dirty.state.clone());
+                    return Some(Arc::clone(&dirty.state));
                 }
                 Some(state)
             }
@@ -1854,7 +2273,7 @@ where
         let key = Self::transient_cache_key(oid, file);
         let storage_key = self.adapter.storage_language_key_for_file(file);
         if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
-            return Some(Arc::new(state));
+            return Some(state);
         }
         if let Some(state) = self
             .query_read_cache
@@ -1937,7 +2356,7 @@ where
         for (file, oid, storage_key) in entries {
             let key = Self::transient_cache_key(oid, &file);
             if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
-                out.insert(file, state);
+                out.insert(file, state.as_ref().clone());
             } else {
                 clean_entries.push((file, oid, storage_key));
             }
@@ -2017,8 +2436,8 @@ where
                 out.insert(
                     file,
                     ImportFileFacts {
-                        package_name: state.package_name,
-                        imports: state.imports,
+                        package_name: state.package_name.clone(),
+                        imports: state.imports.clone(),
                     },
                 );
             } else {
@@ -2167,7 +2586,7 @@ where
                     .insert(
                         key,
                         Self::dirty_file_state(
-                            state.clone(),
+                            Arc::new(state.clone()),
                             STORE_WRITE_IMMEDIATE_RETRIES + 1,
                             err,
                         ),
@@ -2405,7 +2824,7 @@ where
             }
             let storage_key = self.adapter.storage_language_key_for_file(&file);
             if let Some(state) = self.retry_dirty_file_state(&key, &storage_key) {
-                states.push(state);
+                states.push(state.as_ref().clone());
             }
         }
         states
@@ -4181,8 +4600,8 @@ mod tests {
     use crate::analyzer::typescript::TypescriptAdapter;
     use crate::analyzer::{AnalyzerConfig, IAnalyzer, JavaAnalyzer, Language, TestProject};
     use git2::{ObjectType, Oid};
-    use std::path::Path;
-    use std::sync::RwLock;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Condvar, RwLock};
 
     #[derive(Clone)]
     struct CountingOverlayProject {
@@ -4242,6 +4661,269 @@ mod tests {
         fn has_overlay(&self, _file: &ProjectFile) -> bool {
             true
         }
+    }
+
+    #[derive(Clone)]
+    struct BlockingParseProject {
+        delegate: TestProject,
+        blocked_file: PathBuf,
+        blocked_parse_started: std::sync::mpsc::SyncSender<()>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Project for BlockingParseProject {
+        fn root(&self) -> &Path {
+            self.delegate.root()
+        }
+
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            self.delegate.analyzer_languages()
+        }
+
+        fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.all_files()
+        }
+
+        fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.analyzable_files(language)
+        }
+
+        fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+            self.delegate.file_by_rel_path(rel_path)
+        }
+
+        fn read_source(&self, file: &ProjectFile) -> std::io::Result<String> {
+            if file.rel_path() == self.blocked_file {
+                self.blocked_parse_started
+                    .send(())
+                    .expect("blocked parse observer should remain connected");
+                let (released, wake) = &*self.release;
+                let mut released = released.lock().expect("parse release mutex poisoned");
+                while !*released {
+                    released = wake.wait(released).expect("parse release mutex poisoned");
+                }
+            }
+            self.delegate.read_source(file)
+        }
+    }
+
+    #[test]
+    fn reconcile_persists_fast_parse_before_blocked_slow_parse_is_released() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let fast = temp_file(&root, "src/Fast.java");
+        fast.write("package demo; class Fast {}\n")
+            .expect("fast Java source");
+        let slow = temp_file(&root, "src/Slow.java");
+        slow.write("package demo; class Slow {}\n")
+            .expect("slow Java source");
+
+        let (blocked_parse_started_tx, blocked_parse_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (persisted_tx, persisted_rx) = std::sync::mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let project: Arc<dyn Project> = Arc::new(BlockingParseProject {
+            delegate: TestProject::new(&root, Language::Java),
+            blocked_file: slow.rel_path().to_path_buf(),
+            blocked_parse_started: blocked_parse_started_tx,
+            release: Arc::clone(&release),
+        });
+        let store_context = default_store_context(project.as_ref());
+        let store = Arc::clone(&store_context.store);
+        let progress: BuildProgress = Arc::new(move |event| {
+            if event.phase == BuildProgressPhase::Persist && event.completed > 0 {
+                let _ = persisted_tx.try_send(());
+            }
+        });
+
+        let build = std::thread::spawn(move || {
+            TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+                project,
+                JavaAdapter,
+                AnalyzerConfig {
+                    parallelism: Some(2),
+                    ..AnalyzerConfig::default()
+                },
+                store_context,
+                Some(progress),
+            )
+        });
+
+        blocked_parse_started_rx
+            .recv()
+            .expect("slow parse should reach the injected block");
+        persisted_rx
+            .recv()
+            .expect("fast parse should persist while slow parse is blocked");
+        let persistence_starts_before_release = store.parsed_blob_transaction_starts_for_test();
+        {
+            let (released, wake) = &*release;
+            *released.lock().expect("parse release mutex poisoned") = true;
+            wake.notify_all();
+        }
+        build.join().expect("analyzer build should finish");
+
+        assert!(
+            persistence_starts_before_release > 0,
+            "the real reconcile pipeline should start persisting the prepared fast blob while the unrelated slow parser remains blocked"
+        );
+    }
+
+    #[test]
+    fn reconcile_batches_257_small_files_into_five_transactions() {
+        const FILES: usize = 257;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        for index in 0..FILES {
+            let file = temp_file(&root, &format!("src/Type{index}.java"));
+            file.write(format!("package demo; class Type{index} {{}}\n"))
+                .expect("Java source");
+        }
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
+        let store_context = default_store_context(project.as_ref());
+        let store = Arc::clone(&store_context.store);
+
+        let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            JavaAdapter,
+            AnalyzerConfig {
+                parallelism: Some(1),
+                ..AnalyzerConfig::default()
+            },
+            store_context,
+            None,
+        );
+
+        assert_eq!(store.parsed_blob_transaction_starts_for_test(), 5);
+        assert_eq!(analyzer.state.persistence_stats.transactions, 5);
+        assert_eq!(analyzer.state.persistence_stats.committed_blobs, FILES);
+        assert_eq!(analyzer.state.persistence_stats.failed_blobs, 0);
+        assert!(analyzer.state.persistence_stats.peak_in_flight_items > 0);
+        assert!(
+            analyzer.state.persistence_stats.peak_in_flight_items
+                <= analyzer
+                    .state
+                    .persistence_stats
+                    .configured_max_in_flight_items
+        );
+        assert!(
+            analyzer
+                .state
+                .persistence_stats
+                .peak_in_flight_payload_bytes
+                > 0
+        );
+    }
+
+    #[test]
+    fn preparation_failure_reaches_terminal_persist_progress_and_dirty_fallback() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        for name in ["GoodA", "Bad", "GoodB"] {
+            let file = temp_file(&root, &format!("src/{name}.java"));
+            file.write(format!("package demo; class {name} {{}}\n"))
+                .expect("Java source");
+        }
+        let bad = ProjectFile::new(root.clone(), "src/Bad.java");
+        *PREPARATION_FAILURE_PATH
+            .lock()
+            .expect("preparation failure path mutex poisoned") = Some(bad.abs_path().to_path_buf());
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
+        let store_context = default_store_context(project.as_ref());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let progress_events = Arc::clone(&events);
+        let progress: BuildProgress = Arc::new(move |event| {
+            progress_events
+                .lock()
+                .expect("progress event mutex poisoned")
+                .push(event);
+        });
+
+        let analyzer = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
+            project,
+            JavaAdapter,
+            AnalyzerConfig {
+                parallelism: Some(1),
+                ..AnalyzerConfig::default()
+            },
+            store_context,
+            Some(progress),
+        );
+        *PREPARATION_FAILURE_PATH
+            .lock()
+            .expect("preparation failure path mutex poisoned") = None;
+
+        assert_eq!(analyzer.state.persistence_stats.committed_blobs, 2);
+        assert_eq!(analyzer.state.persistence_stats.failed_blobs, 1);
+        let dirty = analyzer.state.dirty_snapshot();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty.keys().next().unwrap().rel_path, bad.rel_path());
+        let events = events.lock().expect("progress event mutex poisoned");
+        let final_persist = events
+            .iter()
+            .rev()
+            .find(|event| event.phase == BuildProgressPhase::Persist)
+            .expect("persist progress event");
+        assert_eq!(final_persist.completed, 3);
+        assert_eq!(final_persist.total, 3);
+    }
+
+    #[test]
+    fn reconcile_keeps_only_irreducible_prepared_failure_dirty() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let good_a = temp_file(&root, "src/GoodA.java");
+        good_a
+            .write("package demo; class GoodA {}\n")
+            .expect("good Java source");
+        let bad = temp_file(&root, "src/Bad.java");
+        bad.write("package demo; class Bad {}\n")
+            .expect("bad Java source");
+        let good_b = temp_file(&root, "src/GoodB.java");
+        good_b
+            .write("package demo; class GoodB {}\n")
+            .expect("good Java source");
+        *PREPARED_FAILURE_PATH
+            .lock()
+            .expect("prepared failure path mutex poisoned") = Some(bad.abs_path().to_path_buf());
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
+        let analyzer = TreeSitterAnalyzer::new_with_config(
+            project,
+            JavaAdapter,
+            AnalyzerConfig {
+                parallelism: Some(3),
+                ..AnalyzerConfig::default()
+            },
+        );
+        *PREPARED_FAILURE_PATH
+            .lock()
+            .expect("prepared failure path mutex poisoned") = None;
+
+        let dirty = analyzer.state.dirty_snapshot();
+        assert_eq!(dirty.len(), 1);
+        let (dirty_key, dirty_state) = dirty.iter().next().unwrap();
+        assert_eq!(dirty_key.rel_path, bad.rel_path());
+        assert_eq!(dirty_state.attempts, STORE_WRITE_IMMEDIATE_RETRIES + 1);
+        for file in [&good_a, &good_b] {
+            let source = file.read_to_string().unwrap();
+            let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+            assert!(
+                analyzer
+                    .store_context
+                    .store
+                    .contains_parsed_blob(oid, "java")
+                    .unwrap()
+            );
+        }
+        let bad_oid =
+            Oid::hash_object(ObjectType::Blob, bad.read_to_string().unwrap().as_bytes()).unwrap();
+        assert!(
+            !analyzer
+                .store_context
+                .store
+                .contains_parsed_blob(bad_oid, "java")
+                .unwrap()
+        );
     }
 
     fn parse_javascript(source: &str) -> Tree {
@@ -4468,7 +5150,7 @@ mod tests {
         dirty.insert(
             key,
             TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
-                parsed,
+                Arc::new(parsed),
                 32,
                 "forced test persistence failure".to_string(),
             ),
@@ -4597,7 +5279,7 @@ mod tests {
         dirty.insert(
             key,
             TreeSitterAnalyzer::<PythonAdapter>::dirty_file_state(
-                parsed,
+                Arc::new(parsed),
                 32,
                 "forced test persistence failure".to_string(),
             ),
