@@ -13945,6 +13945,338 @@ fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
 }
 
 #[test]
+fn cpp_unrelated_qualified_names_do_not_resolve_to_visible_nested_type() {
+    const UNRELATED_ALIAS_TARGET: &str = "base::internal.circular_deque_const_iterator";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "base/containers/circular_deque.h",
+            "namespace base { namespace internal { template <typename T> class circular_deque_const_iterator {}; template <typename T> class circular_deque_iterator { using base = circular_deque_const_iterator<T>; }; } class RealType {}; }\n",
+        )
+        .file(
+            "consumer.cc",
+            "#include \"base/containers/circular_deque.h\"\nvoid exercise() {\n  base::android::AttachCurrentThread();\n  base::BindOnce();\n  base::TimeDelta elapsed;\n  base::RealType real;\n}\n",
+        )
+        .build();
+    let source = project.file("consumer.cc").read_to_string().unwrap();
+    let lines = source.lines().collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                {"path": "consumer.cc", "line": 3, "column": column_of(lines[2], "base")},
+                {"path": "consumer.cc", "line": 4, "column": column_of(lines[3], "base")},
+                {"path": "consumer.cc", "line": 5, "column": column_of(lines[4], "base")},
+                {"path": "consumer.cc", "line": 6, "column": column_of(lines[5], "RealType")},
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[3]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[3]["definitions"][0]["fqn"], "base.RealType",
+        "{value}"
+    );
+    let unrelated_targets = results[..3]
+        .iter()
+        .flat_map(|result| {
+            result["definitions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|definition| definition["fqn"].as_str())
+        })
+        .collect::<Vec<_>>();
+    let unrelated_alias_target_count = unrelated_targets
+        .iter()
+        .filter(|fqn| **fqn == UNRELATED_ALIAS_TARGET)
+        .count();
+    assert_eq!(
+        unrelated_alias_target_count, 0,
+        "unrelated qualified references resolved through the nested `using base` alias: {unrelated_targets:?}"
+    );
+    assert!(unrelated_targets.is_empty(), "{unrelated_targets:?}");
+}
+
+#[test]
+fn cpp_repeated_qualifier_alias_checks_bound_candidate_hydration() {
+    const REFERENCE_COUNT: usize = 32;
+    let mut consumer =
+        "#include \"base/containers/circular_deque.h\"\nvoid exercise() {\n".to_string();
+    for _ in 0..REFERENCE_COUNT {
+        consumer.push_str("  base::BindOnce();\n");
+    }
+    consumer.push_str("}\n");
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "base/containers/circular_deque.h",
+            "namespace base { namespace internal { template <typename T> class circular_deque_const_iterator {}; template <typename T> class circular_deque_iterator { using base = circular_deque_const_iterator<T>; }; } }\n",
+        )
+        .file("consumer.cc", consumer)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    analyzer.reset_candidate_hydration_count_for_test();
+    let value = brokk_bifrost::searchtools::get_definitions_by_location(
+        analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: (0..REFERENCE_COUNT)
+                .map(
+                    |index| brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                        path: "consumer.cc".to_string(),
+                        line: Some(index + 3),
+                        column: Some(3),
+                    },
+                )
+                .collect(),
+        },
+    );
+
+    assert_eq!(value.results.len(), REFERENCE_COUNT, "{value:#?}");
+    assert!(
+        value
+            .results
+            .iter()
+            .all(|result| result.status == "no_definition" && result.definitions.is_empty()),
+        "{value:#?}"
+    );
+    let hydrations = analyzer.candidate_hydration_count_for_test();
+    assert!(
+        hydrations <= 2,
+        "repeated focused qualifiers should reuse the batch source/tree cache; observed {hydrations} candidate hydrations for {REFERENCE_COUNT} references"
+    );
+}
+
+#[test]
+fn cpp_type_qualifier_focus_follows_its_structural_prefix() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            "namespace ns { struct Outer { struct Inner { static void member(); }; using Alias = Inner; static void member(); }; } namespace unrelated { struct Outer {}; }\n",
+        )
+        .file(
+            "consumer.cc",
+            "#include \"types.h\"\nnamespace ns { void exercise() {\n  Outer::member();\n  Outer::Inner::member();\n  Outer::Alias::member();\n} }\n",
+        )
+        .build();
+    let source = project.file("consumer.cc").read_to_string().unwrap();
+    let lines = source.lines().collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                {"path": "consumer.cc", "line": 3, "column": column_of(lines[2], "Outer")},
+                {"path": "consumer.cc", "line": 4, "column": column_of(lines[3], "Inner")},
+                {"path": "consumer.cc", "line": 5, "column": column_of(lines[4], "Alias")},
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    let resolved_fqns = results
+        .iter()
+        .map(|result| {
+            assert_eq!(result["status"], "resolved", "{value}");
+            result["definitions"][0]["fqn"]
+                .as_str()
+                .expect("resolved FQN")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        resolved_fqns,
+        ["ns.Outer", "ns.Outer$Inner", "ns.Outer$Inner"],
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_type_qualifier_focus_searches_enclosing_namespace_prefixes() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            "namespace a { struct Outer { struct Inner { static void member(); }; static void member(); }; } namespace unrelated { struct Outer {}; }\n",
+        )
+        .file(
+            "consumer.cc",
+            "#include \"types.h\"\nnamespace a { namespace b { void exercise() {\n  Outer::member();\n  Outer::Inner::member();\n} } }\n",
+        )
+        .build();
+    let source = project.file("consumer.cc").read_to_string().unwrap();
+    let lines = source.lines().collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                {"path": "consumer.cc", "line": 3, "column": column_of(lines[2], "Outer")},
+                {"path": "consumer.cc", "line": 4, "column": column_of(lines[3], "Inner")},
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    let resolved_fqns = results
+        .iter()
+        .map(|result| {
+            assert_eq!(result["status"], "resolved", "{value}");
+            result["definitions"][0]["fqn"]
+                .as_str()
+                .expect("resolved FQN")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(resolved_fqns, ["a.Outer", "a.Outer$Inner"], "{value}");
+}
+
+#[test]
+fn cpp_type_qualifier_focus_stops_at_the_nearest_nonempty_scope() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            "struct Outer { static void member(); }; namespace ns { struct Outer { static void member(); }; } namespace a { struct Outer { static void member(); }; namespace b { struct Outer { static void member(); }; } }\n",
+        )
+        .file(
+            "consumer.cc",
+            "#include \"types.h\"\nnamespace ns { void first() {\n  Outer::member();\n} }\nnamespace a { namespace b { void second() {\n  Outer::member();\n} } }\n",
+        )
+        .build();
+    let source = project.file("consumer.cc").read_to_string().unwrap();
+    let lines = source.lines().collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                {"path": "consumer.cc", "line": 3, "column": column_of(lines[2], "Outer")},
+                {"path": "consumer.cc", "line": 6, "column": column_of(lines[5], "Outer")},
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    let fqns = results
+        .iter()
+        .map(|result| {
+            assert_eq!(result["status"], "resolved", "{value}");
+            assert_eq!(
+                result["definitions"].as_array().map(Vec::len),
+                Some(1),
+                "nearest nonempty scope must shadow outer declarations: {value}"
+            );
+            result["definitions"][0]["fqn"]
+                .as_str()
+                .expect("resolved FQN")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fqns, ["ns.Outer", "a::b.Outer"], "{value}");
+}
+
+#[test]
+fn cpp_type_qualifier_focus_prefers_the_enclosing_class_scope() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            "struct Inner { static void member(); }; struct Outer { struct Inner { static void member(); }; void exercise() { Inner::member(); } };\n",
+        )
+        .build();
+    let line = "struct Inner { static void member(); }; struct Outer { struct Inner { static void member(); }; void exercise() { Inner::member(); } };";
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [{
+                "path": "types.h",
+                "line": 1,
+                "column": column_of(line, "Inner::member()")
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "enclosing class member must shadow the global type: {value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "Outer$Inner", "{value}");
+}
+
+#[test]
+fn cpp_leading_global_type_qualifier_focus_is_global_only() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            "struct Outer { static void member(); }; namespace ns { struct Outer { static void member(); }; }\n",
+        )
+        .file(
+            "consumer.cc",
+            "#include \"types.h\"\nnamespace ns { void exercise() {\n  ::Outer::member();\n} }\n",
+        )
+        .build();
+    let line = "  ::Outer::member();";
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [{
+                "path": "consumer.cc",
+                "line": 3,
+                "column": column_of(line, "Outer")
+            }]
+        })
+        .to_string(),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "leading global qualifier must exclude the lexical namespace: {value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "Outer", "{value}");
+}
+
+#[test]
+fn cpp_template_type_qualifier_focus_uses_structured_type_names() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            "template <typename T> struct Outer { struct Inner { static void member(); }; static void member(); };\n",
+        )
+        .file(
+            "consumer.cc",
+            "#include \"types.h\"\nvoid exercise() {\n  Outer<int>::member();\n  Outer<int>::Inner::member();\n}\n",
+        )
+        .build();
+    let source = project.file("consumer.cc").read_to_string().unwrap();
+    let lines = source.lines().collect::<Vec<_>>();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                {"path": "consumer.cc", "line": 3, "column": column_of(lines[2], "Outer")},
+                {"path": "consumer.cc", "line": 4, "column": column_of(lines[3], "Inner")},
+            ]
+        })
+        .to_string(),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    let resolved_fqns = results
+        .iter()
+        .map(|result| {
+            assert_eq!(result["status"], "resolved", "{value}");
+            result["definitions"][0]["fqn"]
+                .as_str()
+                .expect("resolved FQN")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(resolved_fqns, ["Outer", "Outer$Inner"], "{value}");
+}
+
+#[test]
 fn cpp_constructor_call_resolves_to_header_constructor_declaration() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

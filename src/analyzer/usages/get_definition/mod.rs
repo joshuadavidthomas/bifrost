@@ -330,7 +330,16 @@ struct DefinitionBatchContext<'a> {
     trees: HashMap<(ProjectFile, Language), Option<Tree>>,
     line_starts: HashMap<ProjectFile, Arc<Vec<usize>>>,
     cpp_visibility: HashMap<ProjectFile, Arc<CppVisibilityIndex>>,
+    // Candidate declaration ranges belong to the analyzer generation, so these
+    // caches must use indexed source rather than the request's live disk source.
+    cpp_indexed_sources: HashMap<ProjectFile, Option<Arc<String>>>,
+    cpp_indexed_trees: HashMap<ProjectFile, Option<Tree>>,
+    cpp_structural_alias_paths: HashMap<CodeUnit, Vec<String>>,
+    cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
+    cpp_enclosing_class_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
     python_contexts: HashMap<ProjectFile, Arc<python::PythonDefinitionContext>>,
+    #[cfg(test)]
+    cpp_class_range_builds: usize,
     #[cfg(test)]
     python_build_counters: Arc<python::PythonDefinitionBuildCounters>,
 }
@@ -346,7 +355,14 @@ impl<'a> DefinitionBatchContext<'a> {
             trees: HashMap::default(),
             line_starts: HashMap::default(),
             cpp_visibility: HashMap::default(),
+            cpp_indexed_sources: HashMap::default(),
+            cpp_indexed_trees: HashMap::default(),
+            cpp_structural_alias_paths: HashMap::default(),
+            cpp_class_ranges: HashMap::default(),
+            cpp_enclosing_class_chains: HashMap::default(),
             python_contexts: HashMap::default(),
+            #[cfg(test)]
+            cpp_class_range_builds: 0,
             #[cfg(test)]
             python_build_counters: Arc::default(),
         }
@@ -396,6 +412,57 @@ impl<'a> DefinitionBatchContext<'a> {
             })
             .clone()
     }
+
+    fn cpp_indexed_source(&mut self, file: &ProjectFile) -> Option<Arc<String>> {
+        self.cpp_indexed_sources
+            .entry(file.clone())
+            .or_insert_with(|| self.analyzer.indexed_source(file).map(Arc::new))
+            .clone()
+    }
+
+    fn cpp_indexed_tree(&mut self, file: &ProjectFile) -> Option<Tree> {
+        if let Some(tree) = self.cpp_indexed_trees.get(file) {
+            return tree.clone();
+        }
+        let parsed = self
+            .cpp_indexed_source(file)
+            .and_then(|source| cpp::parse_cpp_tree(&source));
+        self.cpp_indexed_trees.insert(file.clone(), parsed.clone());
+        parsed
+    }
+
+    fn cpp_class_ranges(&mut self, file: &ProjectFile) -> Arc<ClassRangeIndex> {
+        if let Some(index) = self.cpp_class_ranges.get(file) {
+            return Arc::clone(index);
+        }
+        let index = Arc::new(ClassRangeIndex::build(self.analyzer, file));
+        self.cpp_class_ranges
+            .insert(file.clone(), Arc::clone(&index));
+        #[cfg(test)]
+        {
+            self.cpp_class_range_builds += 1;
+        }
+        index
+    }
+
+    fn cpp_enclosing_class_chain(&mut self, owner: CodeUnit) -> Arc<Vec<CodeUnit>> {
+        self.cpp_enclosing_class_chains
+            .entry(owner.clone())
+            .or_insert_with(|| {
+                let mut classes = Vec::new();
+                let mut current = Some(owner);
+                while let Some(owner) = current {
+                    if !owner.is_class() {
+                        break;
+                    }
+                    current = self.analyzer.parent_of(&owner);
+                    classes.push(owner);
+                }
+                Arc::new(classes)
+            })
+            .clone()
+    }
+
     fn python_context(
         &mut self,
         py: &PythonAnalyzer,
@@ -1105,6 +1172,54 @@ mod tests {
         assert_eq!(python_context.receiver_type_cache_len(), 1);
         assert_eq!(context.python_build_counts(), (1, 1, 2, 0));
         assert!(context.python_contexts.is_empty());
+    }
+
+    #[test]
+    fn cpp_focused_qualifiers_build_class_ranges_once_per_file() {
+        const REFERENCE_COUNT: usize = 32;
+        const UNRELATED_CLASSES: usize = 128;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        let mut source = String::new();
+        for index in 0..UNRELATED_CLASSES {
+            source.push_str(&format!("struct Unrelated{index} {{ int value; }};\n"));
+        }
+        source.push_str("struct Host { void exercise() {\n");
+        for _ in 0..REFERENCE_COUNT {
+            source.push_str("  Unknown::BindOnce();\n");
+        }
+        source.push_str("} };\n");
+        consumer.write(&source).unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = CppAnalyzer::new(project);
+        let requests = source
+            .match_indices("Unknown")
+            .map(|(start_byte, name)| DefinitionLookupRequest {
+                file: consumer.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(start_byte + name.len()),
+            })
+            .collect::<Vec<_>>();
+        let mut context = DefinitionBatchContext::new(&analyzer, true);
+
+        let outcomes = resolve_definition_requests(&analyzer, &mut context, requests, None);
+
+        assert_eq!(outcomes.len(), REFERENCE_COUNT);
+        assert!(outcomes.iter().all(|outcome| {
+            outcome.status == DefinitionLookupStatus::NoDefinition && outcome.definitions.is_empty()
+        }));
+        assert_eq!(
+            context.cpp_class_range_builds, 1,
+            "focused qualifiers in one file should share one class-range index"
+        );
+        assert_eq!(
+            context.cpp_enclosing_class_chains.len(),
+            1,
+            "focused qualifiers in one class should share its enclosing owner chain"
+        );
     }
 
     #[test]

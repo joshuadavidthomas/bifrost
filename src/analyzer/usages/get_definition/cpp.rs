@@ -20,7 +20,6 @@ pub(super) fn resolve_cpp(
         return no_definition("cpp_parse_failed", "C++ source could not be parsed");
     };
     let visibility = context.cpp_visibility(cpp, analyzer, file);
-    let support = context.bounded_support();
     let root = tree.root_node();
     let Some(node) = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)
     else {
@@ -32,6 +31,25 @@ pub(super) fn resolve_cpp(
             ),
         );
     };
+    let reference = cpp_reference_node(node);
+    if let Some(CppReferenceNode::Type(type_node)) = reference {
+        if cpp_is_type_declaration_name(node) {
+            return no_definition(
+                "declaration_or_import_site",
+                format!("`{}` is not a C++ reference site", site.text),
+            );
+        }
+        return resolve_cpp_type(
+            analyzer,
+            context,
+            file,
+            visibility.as_ref(),
+            source,
+            type_node,
+        );
+    }
+
+    let support = context.bounded_support();
     let ctx = CppLookupCtx {
         analyzer,
         support,
@@ -40,23 +58,8 @@ pub(super) fn resolve_cpp(
         source,
         root,
     };
-    match cpp_reference_node(node) {
-        Some(CppReferenceNode::Type(type_node)) => {
-            if cpp_is_type_declaration_name(node) {
-                return no_definition(
-                    "declaration_or_import_site",
-                    format!("`{}` is not a C++ reference site", site.text),
-                );
-            }
-            resolve_cpp_type(
-                analyzer,
-                support,
-                file,
-                ctx.visibility,
-                ctx.source,
-                type_node,
-            )
-        }
+    match reference {
+        Some(CppReferenceNode::Type(_)) => unreachable!("type references returned above"),
         Some(CppReferenceNode::Constructor(constructor)) => {
             resolve_cpp_constructor(ctx, constructor)
         }
@@ -172,6 +175,7 @@ pub(super) fn parse_cpp_tree(source: &str) -> Option<Tree> {
     parser.parse(source, None)
 }
 
+#[derive(Clone, Copy)]
 enum CppReferenceNode<'tree> {
     Type(Node<'tree>),
     Constructor(Node<'tree>),
@@ -268,7 +272,7 @@ fn cpp_is_type_declaration_name(node: Node<'_>) -> bool {
 
 fn resolve_cpp_type(
     analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
+    context: &mut DefinitionBatchContext<'_>,
     file: &ProjectFile,
     visibility: &CppVisibilityIndex,
     source: &str,
@@ -284,6 +288,82 @@ fn resolve_cpp_type(
             format!("`{text}` is not a C++ reference site"),
         );
     }
+    if let Some(qualifier) = cpp_focused_type_qualifier(node, source) {
+        let namespace = cpp_lexical_namespace(node, source);
+        let mut root = node;
+        while let Some(parent) = root.parent() {
+            root = parent;
+        }
+        let enclosing_owner = {
+            let class_ranges = context.cpp_class_ranges(file);
+            let support = context.bounded_support();
+            cpp_enclosing_class_with_ranges(
+                analyzer,
+                support,
+                visibility,
+                file,
+                source,
+                root,
+                node.start_byte(),
+                &class_ranges,
+            )
+        };
+        let enclosing_classes = enclosing_owner
+            .map(|owner| context.cpp_enclosing_class_chain(owner))
+            .unwrap_or_default();
+        let candidates = cpp_focused_type_qualifier_candidates(
+            analyzer,
+            context,
+            visibility,
+            file,
+            &qualifier,
+            namespace.as_deref(),
+            &enclosing_classes,
+        );
+        if !candidates.is_empty() {
+            let support = context.bounded_support();
+            let candidates = candidates
+                .into_iter()
+                .flat_map(|unit| {
+                    cpp_type_definition_candidates(analyzer, visibility, file, support, unit)
+                })
+                .collect();
+            return candidates_outcome(candidates);
+        }
+        if cpp_unresolved_include_boundary(analyzer, file, &qualifier.reference) {
+            return boundary(format!(
+                "`{}` appears to cross a C++ include boundary not indexed in this workspace",
+                qualifier.reference
+            ));
+        }
+        return no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{}` did not resolve to an indexed C++ type qualifier",
+                qualifier.reference
+            ),
+        );
+    }
+    resolve_cpp_type_without_focused_qualifier(
+        analyzer,
+        context.bounded_support(),
+        file,
+        visibility,
+        source,
+        node,
+        &text,
+    )
+}
+
+fn resolve_cpp_type_without_focused_qualifier(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    visibility: &CppVisibilityIndex,
+    source: &str,
+    node: Node<'_>,
+    text: &str,
+) -> DefinitionLookupOutcome {
     if node.kind() == "qualified_identifier"
         && let (Some(scope), Some(name)) = (
             node.child_by_field_name("scope"),
@@ -301,17 +381,12 @@ fn resolve_cpp_type(
     // over the scope-blind visibility index, so a bare `Config` inside `namespace B`
     // resolves to `B::Config` rather than a same-named sibling namespace's (#431).
     if node.kind() == "type_identifier"
-        && let Some(unit) = resolve_in_enclosing_scopes(
-            analyzer,
-            file,
-            &text,
-            node.start_byte(),
-            CodeUnit::is_class,
-        )
+        && let Some(unit) =
+            resolve_in_enclosing_scopes(analyzer, file, text, node.start_byte(), CodeUnit::is_class)
     {
         return candidates_outcome(vec![unit]);
     }
-    if let Some(unit) = visibility.resolve_type(file, &text) {
+    if let Some(unit) = visibility.resolve_type(file, text) {
         return candidates_outcome(cpp_type_definition_candidates(
             analyzer, visibility, file, support, unit,
         ));
@@ -322,7 +397,7 @@ fn resolve_cpp_type(
         visibility,
         file,
         support,
-        &text,
+        text,
         Some(CppTargetKind::Type),
         namespace.as_deref(),
     );
@@ -335,7 +410,7 @@ fn resolve_cpp_type(
             .collect();
         return candidates_outcome(candidates);
     }
-    if cpp_unresolved_include_boundary(analyzer, file, &text) {
+    if cpp_unresolved_include_boundary(analyzer, file, text) {
         return boundary(format!(
             "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
         ));
@@ -344,6 +419,233 @@ fn resolve_cpp_type(
         "no_indexed_definition",
         format!("`{text}` did not resolve to an indexed C++ type"),
     )
+}
+
+struct CppFocusedQualifier {
+    reference: String,
+    identifier: String,
+    components: Vec<String>,
+    globally_qualified: bool,
+}
+
+/// Returns the type path denoted by a focused `::` qualifier. Tree-sitter nests
+/// the components after the first one through successive `name` fields, so walk
+/// those structural parents and prepend each preceding `scope` field. A terminal
+/// member is deliberately excluded from the returned path.
+fn cpp_focused_type_qualifier(node: Node<'_>, source: &str) -> Option<CppFocusedQualifier> {
+    let mut current = node.parent();
+    let access = loop {
+        let parent = current?;
+        if parent.kind() == "qualified_identifier"
+            && qualified_access_focus(node, parent, &["scope"], &["name"])
+                == Some(QualifiedAccessFocus::Qualifier)
+        {
+            break parent;
+        }
+        current = parent.parent();
+    };
+
+    let focused = cpp_node_text(node, source).trim();
+    if focused.is_empty() {
+        return None;
+    }
+    let mut scopes = Vec::new();
+    let mut nested_access = access;
+    let mut globally_qualified = false;
+    while let Some(parent) = nested_access.parent() {
+        if parent.kind() != "qualified_identifier"
+            || qualified_access_focus(nested_access, parent, &["scope"], &["name"])
+                != Some(QualifiedAccessFocus::Member)
+        {
+            break;
+        }
+        if let Some(scope) = parent.child_by_field_name("scope") {
+            scopes.push(cpp_qualifier_scope_component(scope, source)?);
+        } else {
+            globally_qualified = true;
+        }
+        nested_access = parent;
+    }
+    scopes.reverse();
+    scopes.push(focused);
+    let components = scopes.iter().map(|scope| (*scope).to_string()).collect();
+    Some(CppFocusedQualifier {
+        reference: scopes.join("::"),
+        identifier: focused.to_string(),
+        components,
+        globally_qualified,
+    })
+}
+
+fn cpp_qualifier_scope_component<'a>(scope: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let scope = if scope.kind() == "template_type" {
+        scope.child_by_field_name("name")?
+    } else {
+        scope
+    };
+    let component = cpp_node_text(scope, source).trim();
+    (!component.is_empty()).then_some(component)
+}
+
+fn cpp_focused_type_qualifier_candidates(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    qualifier: &CppFocusedQualifier,
+    lexical_namespace: Option<&str>,
+    enclosing_classes: &[CodeUnit],
+) -> Vec<CodeUnit> {
+    let candidates = visibility
+        .visible_identifier_candidates(file, &qualifier.identifier)
+        .filter(|unit| unit.is_class() || cpp_unit_is_type_alias(analyzer, unit))
+        .cloned()
+        .collect::<Vec<_>>();
+    for lookup_path in cpp_qualifier_lookup_tiers(qualifier, lexical_namespace, enclosing_classes) {
+        let mut tier = candidates
+            .iter()
+            .filter(|unit| {
+                cpp_type_qualifier_matches_exact_path(analyzer, context, unit, &lookup_path)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !tier.is_empty() {
+            sort_units(&mut tier);
+            tier.dedup();
+            return tier;
+        }
+    }
+    Vec::new()
+}
+
+fn cpp_qualifier_lookup_tiers(
+    qualifier: &CppFocusedQualifier,
+    lexical_namespace: Option<&str>,
+    enclosing_classes: &[CodeUnit],
+) -> Vec<String> {
+    if qualifier.globally_qualified {
+        return vec![qualifier.reference.clone()];
+    }
+
+    let mut tiers = Vec::new();
+    for owner in enclosing_classes {
+        let owner_name = cpp_name_for(owner);
+        let path = if qualifier
+            .components
+            .first()
+            .is_some_and(|component| component == owner.identifier())
+        {
+            let suffix = qualifier.components[1..].join("::");
+            if suffix.is_empty() {
+                owner_name
+            } else {
+                format!("{owner_name}::{suffix}")
+            }
+        } else {
+            format!("{owner_name}::{}", qualifier.reference)
+        };
+        if !tiers.contains(&path) {
+            tiers.push(path);
+        }
+    }
+    let mut namespace = lexical_namespace;
+    while let Some(current) = namespace {
+        let path = format!("{current}::{}", qualifier.reference);
+        if !tiers.contains(&path) {
+            tiers.push(path);
+        }
+        namespace = current.rsplit_once("::").map(|(parent, _)| parent);
+    }
+    if !tiers.contains(&qualifier.reference) {
+        tiers.push(qualifier.reference.clone());
+    }
+    tiers
+}
+
+fn cpp_type_qualifier_matches_exact_path(
+    analyzer: &dyn IAnalyzer,
+    context: &mut DefinitionBatchContext<'_>,
+    unit: &CodeUnit,
+    lookup_path: &str,
+) -> bool {
+    if cpp_name_for(unit) == lookup_path {
+        return true;
+    }
+    if !cpp_unit_is_type_alias(analyzer, unit) {
+        return false;
+    }
+    cpp_structural_alias_paths(context, analyzer, unit)
+        .iter()
+        .any(|path| path == lookup_path)
+}
+
+fn cpp_structural_alias_paths(
+    context: &mut DefinitionBatchContext<'_>,
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Vec<String> {
+    if let Some(paths) = context.cpp_structural_alias_paths.get(unit) {
+        return paths.clone();
+    }
+    let Some(source) = context.cpp_indexed_source(unit.source()) else {
+        context
+            .cpp_structural_alias_paths
+            .insert(unit.clone(), Vec::new());
+        return Vec::new();
+    };
+    let Some(tree) = context.cpp_indexed_tree(unit.source()) else {
+        context
+            .cpp_structural_alias_paths
+            .insert(unit.clone(), Vec::new());
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    let mut paths = Vec::new();
+    for range in analyzer.ranges(unit) {
+        let Some(mut declaration) =
+            smallest_named_node_covering(root, range.start_byte, range.end_byte)
+        else {
+            continue;
+        };
+        while !matches!(declaration.kind(), "alias_declaration" | "type_definition") {
+            let Some(parent) = declaration.parent() else {
+                break;
+            };
+            declaration = parent;
+        }
+        if !matches!(declaration.kind(), "alias_declaration" | "type_definition") {
+            continue;
+        }
+
+        let mut owners = Vec::new();
+        let mut current = declaration.parent();
+        while let Some(parent) = current {
+            if matches!(
+                parent.kind(),
+                "namespace_definition"
+                    | "class_specifier"
+                    | "struct_specifier"
+                    | "union_specifier"
+                    | "enum_specifier"
+            ) && let Some(name) = parent.child_by_field_name("name")
+            {
+                let name = cpp_node_text(name, &source).trim();
+                if !name.is_empty() {
+                    owners.push(name);
+                }
+            }
+            current = parent.parent();
+        }
+        owners.reverse();
+        owners.push(unit.identifier());
+        paths.push(owners.join("::"));
+    }
+    paths.sort();
+    paths.dedup();
+    context
+        .cpp_structural_alias_paths
+        .insert(unit.clone(), paths.clone());
+    paths
 }
 
 fn cpp_type_definition_candidates(
@@ -629,13 +931,18 @@ fn resolve_cpp_constructor(
     if !owners.is_empty() {
         return candidates_outcome(owners);
     }
-    resolve_cpp_type(
+    let text = normalize_cpp_type_text(cpp_node_text(type_node, ctx.source));
+    if text.is_empty() {
+        return no_definition("no_reference_text", "C++ type reference is blank");
+    }
+    resolve_cpp_type_without_focused_qualifier(
         ctx.analyzer,
         ctx.support,
         ctx.file,
         ctx.visibility,
         ctx.source,
         type_node,
+        &text,
     )
 }
 
@@ -1436,7 +1743,31 @@ fn cpp_enclosing_class(
     root: Node<'_>,
     byte: usize,
 ) -> Option<CodeUnit> {
-    if let Some(fqn) = ClassRangeIndex::build(analyzer, file).enclosing(byte) {
+    let class_ranges = ClassRangeIndex::build(analyzer, file);
+    cpp_enclosing_class_with_ranges(
+        analyzer,
+        support,
+        visibility,
+        file,
+        source,
+        root,
+        byte,
+        &class_ranges,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpp_enclosing_class_with_ranges(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    byte: usize,
+    class_ranges: &ClassRangeIndex,
+) -> Option<CodeUnit> {
+    if let Some(fqn) = class_ranges.enclosing(byte) {
         return support.fqn(fqn).into_iter().next();
     }
     if let Some(owner) = cpp_out_of_line_function_owner(visibility, file, source, root, byte) {
