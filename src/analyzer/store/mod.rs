@@ -4359,12 +4359,13 @@ mod tests {
         let mut parsed: ParsedFile = adapter.parse_file(file, &source, &tree);
         parsed.add_file_scope(file, &source);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
+        let declarations = parsed.declarations().clone();
         FileState {
             source,
             content_qualifier: parsed.content_qualifier,
             package_name: parsed.package_name,
             top_level_declarations: parsed.top_level_declarations,
-            declarations: parsed.declarations,
+            declarations,
             definition_lookup_units: parsed.definition_lookup_units,
             import_statements: parsed.import_statements,
             imports: parsed.imports,

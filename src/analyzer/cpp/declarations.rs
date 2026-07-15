@@ -434,7 +434,7 @@ impl<'a> CppVisitor<'a> {
             "",
             full_name.clone(),
         );
-        if !self.parsed.declarations.contains(&module) {
+        if !self.parsed.contains_declaration(&module) {
             self.parsed
                 .add_code_unit(module.clone(), node, self.source, None, None);
         }
@@ -485,7 +485,7 @@ impl<'a> CppVisitor<'a> {
             false,
         );
         let has_body = cpp_body_node(node).is_some();
-        if !has_body && self.parsed.declarations.contains(&code_unit) {
+        if !has_body && self.parsed.contains_declaration(&code_unit) {
             return;
         }
         if has_body {
@@ -528,7 +528,7 @@ impl<'a> CppVisitor<'a> {
 
     fn has_enum_enumerator_units(&self, parent: &CodeUnit) -> bool {
         let prefix = format!("{}.", parent.short_name());
-        self.parsed.declarations.iter().any(|unit| {
+        self.parsed.declarations().iter().any(|unit| {
             unit.kind() == CodeUnitType::Field
                 && unit.source() == parent.source()
                 && unit.package_name() == parent.package_name()
@@ -554,7 +554,7 @@ impl<'a> CppVisitor<'a> {
                 scope.package_name.clone(),
                 format!("{}.{}", parent.short_name(), name),
             );
-            if self.parsed.declarations.contains(&code_unit) {
+            if self.parsed.contains_declaration(&code_unit) {
                 return WalkControl::Continue;
             }
             self.parsed
@@ -599,7 +599,7 @@ impl<'a> CppVisitor<'a> {
                 scope.package_name.clone(),
                 format!("{}.{}", parent.short_name(), name),
             );
-            if self.parsed.declarations.contains(&code_unit) {
+            if self.parsed.contains_declaration(&code_unit) {
                 continue;
             }
             self.parsed
@@ -787,7 +787,7 @@ impl<'a> CppVisitor<'a> {
         };
         let code_unit =
             function.code_unit_with_synthetic(self.file.clone(), scope.class_unit.is_some());
-        if self.parsed.declarations.contains(&code_unit) {
+        if self.parsed.contains_declaration(&code_unit) {
             return;
         }
         self.parsed
@@ -833,7 +833,7 @@ impl<'a> CppVisitor<'a> {
             scope.package_name.clone(),
             short_name,
         );
-        if self.parsed.declarations.contains(&code_unit) {
+        if self.parsed.contains_declaration(&code_unit) {
             return;
         }
         self.parsed
@@ -945,7 +945,7 @@ impl<'a> CppVisitor<'a> {
                 Some(signature.clone()),
                 false,
             );
-            if has_matching_declaration(&self.parsed.declarations, &code_unit) {
+            if self.parsed.contains_declaration_identity(&code_unit) {
                 continue;
             }
             self.parsed
@@ -965,7 +965,7 @@ impl<'a> CppVisitor<'a> {
             return;
         }
         let code_unit = CodeUnit::new(self.file.clone(), CodeUnitType::Macro, "", name);
-        if has_matching_declaration(&self.parsed.declarations, &code_unit) {
+        if self.parsed.contains_declaration_identity(&code_unit) {
             return;
         }
         self.parsed
@@ -1426,18 +1426,6 @@ fn extract_macro_name(node: Node<'_>, source: &str) -> Option<String> {
 
 fn same_node(left: Node<'_>, right: Node<'_>) -> bool {
     left.id() == right.id()
-}
-
-fn has_matching_declaration(
-    declarations: &crate::hash::HashSet<CodeUnit>,
-    candidate: &CodeUnit,
-) -> bool {
-    declarations.iter().any(|existing| {
-        existing.source() == candidate.source()
-            && existing.kind() == candidate.kind()
-            && existing.package_name() == candidate.package_name()
-            && existing.short_name() == candidate.short_name()
-    })
 }
 
 fn render_cpp_type_signature(
@@ -1947,4 +1935,79 @@ fn cpp_contains_namespace_definition(node: Node<'_>) -> bool {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .any(cpp_contains_namespace_definition)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::LanguageAdapter;
+    use crate::analyzer::cpp::adapter::CppAdapter;
+    use crate::analyzer::tree_sitter_analyzer::{
+        finish_declaration_identity_comparison_probe, start_declaration_identity_comparison_probe,
+    };
+    use std::fmt::Write;
+
+    #[test]
+    fn cpp_alias_and_macro_dedup_comparison_count_is_linear() {
+        const DISTINCT_PER_KIND: usize = 64;
+        let mut source = String::new();
+        for index in 0..DISTINCT_PER_KIND {
+            writeln!(source, "typedef int Alias{index};").unwrap();
+        }
+        writeln!(source, "typedef long Alias0;").unwrap();
+        for index in 0..DISTINCT_PER_KIND {
+            writeln!(source, "#define MACRO_{index} {index}").unwrap();
+        }
+        writeln!(source, "#define MACRO_0 duplicate").unwrap();
+        source.push_str("void overloaded(int value);\nvoid overloaded(double value);\n");
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let file = ProjectFile::new(std::env::temp_dir(), "dedup.cpp");
+
+        start_declaration_identity_comparison_probe();
+        let parsed = CppAdapter.parse_file(&file, &source, &tree);
+        let comparisons = finish_declaration_identity_comparison_probe();
+
+        assert_eq!(
+            DISTINCT_PER_KIND,
+            parsed
+                .declarations()
+                .iter()
+                .filter(|unit| unit.is_class() && unit.short_name().starts_with("Alias"))
+                .count(),
+            "typedef aliases should retain semantic-identity deduplication"
+        );
+        assert_eq!(
+            DISTINCT_PER_KIND,
+            parsed
+                .declarations()
+                .iter()
+                .filter(|unit| {
+                    unit.kind() == CodeUnitType::Macro && unit.short_name().starts_with("MACRO_")
+                })
+                .count(),
+            "macros should retain semantic-identity deduplication"
+        );
+        assert_eq!(
+            2,
+            parsed
+                .declarations()
+                .iter()
+                .filter(|unit| {
+                    unit.kind() == CodeUnitType::Function && unit.short_name() == "overloaded"
+                })
+                .count(),
+            "function overloads must remain distinct"
+        );
+
+        let dedup_inputs = DISTINCT_PER_KIND * 2 + 2;
+        assert!(
+            comparisons <= dedup_inputs * 4,
+            "semantic-identity dedup should perform O(inputs) comparisons; got {comparisons} comparisons for {dedup_inputs} alias/macro inputs"
+        );
+    }
 }

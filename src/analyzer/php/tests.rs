@@ -223,7 +223,7 @@ pub(super) fn php_contains_tests(
         return true;
     }
 
-    if parsed.declarations.iter().any(|code_unit| {
+    if parsed.declarations().iter().any(|code_unit| {
         code_unit.is_function()
             && code_unit
                 .identifier()
@@ -247,7 +247,7 @@ pub(super) fn php_contains_tests(
 fn php_test_classes(parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile) -> HashSet<String> {
     let mut classes = HashSet::default();
     for code_unit in parsed
-        .declarations
+        .declarations()
         .iter()
         .filter(|code_unit| code_unit.is_class())
     {

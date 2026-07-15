@@ -180,7 +180,7 @@ impl<'a> ScalaVisitor<'a> {
             package_name.to_string(),
             short_name,
         );
-        if self.parsed.declarations.contains(&code_unit) {
+        if self.parsed.contains_declaration(&code_unit) {
             return Some(code_unit);
         }
 

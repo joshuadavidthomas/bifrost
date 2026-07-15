@@ -744,7 +744,7 @@ fn visit_rust_impl(
         package_name.to_string(),
         target_name,
     );
-    if !parsed.declarations.contains(&parent) {
+    if !parsed.contains_declaration(&parent) {
         let top_level = parent.clone();
         parsed.add_code_unit(parent.clone(), node, source, None, Some(top_level));
     }

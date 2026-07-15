@@ -428,7 +428,7 @@ impl<'a> PythonVisitor<'a> {
                 self.package_name.to_string(),
                 format!("{}.{}", parent.path, name),
             );
-            if !self.parsed.declarations.contains(&code_unit) {
+            if !self.parsed.contains_declaration(&code_unit) {
                 self.parsed.replace_code_unit(
                     code_unit.clone(),
                     node,

@@ -16,6 +16,7 @@ use git2::{ObjectType, Oid};
 use rayon::prelude::*;
 use regex::RegexBuilder;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -536,7 +537,8 @@ pub struct ParsedFile {
     pub package_name: String,
     pub content_qualifier: String,
     pub top_level_declarations: Vec<CodeUnit>,
-    pub declarations: HashSet<CodeUnit>,
+    declarations: HashSet<CodeUnit>,
+    declaration_identities: HashMap<DeclarationIdentity, usize>,
     pub definition_lookup_units: HashSet<CodeUnit>,
     pub import_statements: Vec<String>,
     pub imports: Vec<ImportInfo>,
@@ -552,6 +554,56 @@ pub struct ParsedFile {
     pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
 }
 
+#[derive(Debug, Clone)]
+struct DeclarationIdentity(CodeUnit);
+
+impl PartialEq for DeclarationIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(test)]
+        DECLARATION_IDENTITY_COMPARISON_PROBE.with(|probe| {
+            if let Some(comparisons) = probe.get() {
+                probe.set(Some(comparisons + 1));
+            }
+        });
+        self.0.source() == other.0.source()
+            && self.0.kind() == other.0.kind()
+            && self.0.package_name() == other.0.package_name()
+            && self.0.short_name() == other.0.short_name()
+    }
+}
+
+impl Eq for DeclarationIdentity {}
+
+impl Hash for DeclarationIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.source().hash(state);
+        self.0.kind().hash(state);
+        self.0.package_name().hash(state);
+        self.0.short_name().hash(state);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static DECLARATION_IDENTITY_COMPARISON_PROBE: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn start_declaration_identity_comparison_probe() {
+    DECLARATION_IDENTITY_COMPARISON_PROBE.with(|probe| probe.set(Some(0)));
+}
+
+#[cfg(test)]
+pub(crate) fn finish_declaration_identity_comparison_probe() -> usize {
+    DECLARATION_IDENTITY_COMPARISON_PROBE.with(|probe| {
+        probe
+            .replace(None)
+            .expect("declaration identity comparison probe should be active")
+    })
+}
+
 impl ParsedFile {
     pub fn new(package_name: String) -> Self {
         Self {
@@ -559,6 +611,7 @@ impl ParsedFile {
             package_name,
             top_level_declarations: Vec::new(),
             declarations: HashSet::default(),
+            declaration_identities: HashMap::default(),
             definition_lookup_units: HashSet::default(),
             import_statements: Vec::new(),
             imports: Vec::new(),
@@ -593,7 +646,7 @@ impl ParsedFile {
         parent: Option<CodeUnit>,
         top_level: Option<CodeUnit>,
     ) {
-        let inserted = self.declarations.insert(code_unit.clone());
+        let inserted = self.insert_declaration(code_unit.clone());
 
         if inserted && parent.is_none() {
             self.top_level_declarations.push(code_unit.clone());
@@ -641,7 +694,7 @@ impl ParsedFile {
         parent: Option<CodeUnit>,
         top_level: Option<CodeUnit>,
     ) {
-        let inserted = self.declarations.insert(code_unit.clone());
+        let inserted = self.insert_declaration(code_unit.clone());
 
         if inserted && parent.is_none() {
             self.top_level_declarations.push(code_unit.clone());
@@ -661,12 +714,11 @@ impl ParsedFile {
 
     pub fn add_file_scope(&mut self, file: &ProjectFile, source: &str) {
         let code_unit = CodeUnit::file_scope(file.clone());
-        if self.declarations.contains(&code_unit) {
+        if !self.insert_declaration(code_unit.clone()) {
             return;
         }
 
         self.top_level_declarations.push(code_unit.clone());
-        self.declarations.insert(code_unit.clone());
         let line_starts = compute_line_starts(source);
         let end_line = line_starts.len().saturating_sub(1);
         self.ranges.entry(code_unit).or_default().push(Range {
@@ -687,6 +739,19 @@ impl ParsedFile {
     ) {
         self.remove_code_unit(&code_unit);
         self.add_code_unit(code_unit, node, source, parent, top_level);
+    }
+
+    pub(crate) fn declarations(&self) -> &HashSet<CodeUnit> {
+        &self.declarations
+    }
+
+    pub(crate) fn contains_declaration(&self, code_unit: &CodeUnit) -> bool {
+        self.declarations.contains(code_unit)
+    }
+
+    pub(crate) fn contains_declaration_identity(&self, code_unit: &CodeUnit) -> bool {
+        self.declaration_identities
+            .contains_key(&DeclarationIdentity(code_unit.clone()))
     }
 
     pub fn set_raw_supertypes(&mut self, code_unit: CodeUnit, raw_supertypes: Vec<String>) {
@@ -768,7 +833,7 @@ impl ParsedFile {
 
         self.top_level_declarations
             .retain(|existing| existing != code_unit);
-        self.declarations.remove(code_unit);
+        self.remove_declaration(code_unit);
         self.definition_lookup_units.remove(code_unit);
         self.raw_supertypes.remove(code_unit);
         self.supertype_lookup_paths.remove(code_unit);
@@ -778,6 +843,38 @@ impl ParsedFile {
         self.scala_traits.remove(code_unit);
         self.type_aliases.remove(code_unit);
         self.ranges.remove(code_unit);
+    }
+
+    fn insert_declaration(&mut self, code_unit: CodeUnit) -> bool {
+        if !self.declarations.insert(code_unit.clone()) {
+            return false;
+        }
+        *self
+            .declaration_identities
+            .entry(DeclarationIdentity(code_unit))
+            .or_default() += 1;
+        true
+    }
+
+    fn remove_declaration(&mut self, code_unit: &CodeUnit) -> bool {
+        if !self.declarations.remove(code_unit) {
+            return false;
+        }
+        let identity = DeclarationIdentity(code_unit.clone());
+        let remove_identity = {
+            let count = self
+                .declaration_identities
+                .get_mut(&identity)
+                .expect("inserted declaration must have a semantic identity count");
+            *count = count
+                .checked_sub(1)
+                .expect("declaration semantic identity count must be positive");
+            *count == 0
+        };
+        if remove_identity {
+            self.declaration_identities.remove(&identity);
+        }
+        true
     }
 }
 
@@ -4182,6 +4279,123 @@ mod tests {
 
     fn temp_file(root: &Path, rel_path: &str) -> ProjectFile {
         ProjectFile::new(root.to_path_buf(), rel_path)
+    }
+
+    fn test_range(start_byte: usize) -> Range {
+        Range {
+            start_byte,
+            end_byte: start_byte + 1,
+            start_line: 0,
+            end_line: 0,
+        }
+    }
+
+    #[test]
+    fn declaration_identity_multiset_survives_replace_until_last_exact_removal() {
+        let file = ProjectFile::new(std::env::temp_dir(), "identity.cpp");
+        let first = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Function,
+            "pkg",
+            "overloaded",
+            Some("(int)".to_string()),
+            false,
+        );
+        let synthetic_variant = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Function,
+            "pkg",
+            "overloaded",
+            Some("(double)".to_string()),
+            true,
+        );
+        let identity_probe =
+            CodeUnit::new(file.clone(), CodeUnitType::Function, "pkg", "overloaded");
+        let mut parsed = ParsedFile::new(String::new());
+        parsed.add_code_unit_with_range(first.clone(), test_range(0), None, None);
+        parsed.add_synthetic_code_unit(synthetic_variant.clone(), None, None);
+        assert!(parsed.contains_declaration_identity(&identity_probe));
+        assert_eq!(
+            Some(&2),
+            parsed
+                .declaration_identities
+                .get(&DeclarationIdentity(identity_probe.clone()))
+        );
+
+        let tree = parse_javascript("const replacement = 1;");
+        let node = tree.root_node().named_child(0).expect("replacement node");
+        parsed.replace_code_unit(first.clone(), node, "const replacement = 1;", None, None);
+        assert_eq!(
+            Some(&2),
+            parsed
+                .declaration_identities
+                .get(&DeclarationIdentity(identity_probe.clone()))
+        );
+
+        parsed.remove_code_unit(&first);
+        assert!(parsed.contains_declaration_identity(&identity_probe));
+        assert_eq!(
+            Some(&1),
+            parsed
+                .declaration_identities
+                .get(&DeclarationIdentity(identity_probe.clone()))
+        );
+        parsed.remove_code_unit(&synthetic_variant);
+        assert!(!parsed.contains_declaration_identity(&identity_probe));
+    }
+
+    #[test]
+    fn declaration_identity_index_tracks_file_scope_and_recursive_removal() {
+        let file = ProjectFile::new(std::env::temp_dir(), "recursive.cpp");
+        let mut parsed = ParsedFile::new(String::new());
+        let file_scope = CodeUnit::file_scope(file.clone());
+        parsed.add_file_scope(&file, "int value;\n");
+        parsed.add_file_scope(&file, "int value;\n");
+        assert_eq!(
+            Some(&1),
+            parsed
+                .declaration_identities
+                .get(&DeclarationIdentity(file_scope.clone()))
+        );
+        parsed.remove_code_unit(&file_scope);
+        assert!(!parsed.contains_declaration_identity(&file_scope));
+
+        let parent = CodeUnit::new(file.clone(), CodeUnitType::Class, "", "Parent");
+        let child_one = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Function,
+            "Parent",
+            "child",
+            Some("(int)".to_string()),
+            false,
+        );
+        let child_two = CodeUnit::with_signature(
+            file,
+            CodeUnitType::Function,
+            "Parent",
+            "child",
+            Some("(double)".to_string()),
+            true,
+        );
+        let child_identity = CodeUnit::new(
+            child_one.source().clone(),
+            CodeUnitType::Function,
+            "Parent",
+            "child",
+        );
+        parsed.add_code_unit_with_range(parent.clone(), test_range(1), None, None);
+        parsed.add_code_unit_with_range(child_one, test_range(2), Some(parent.clone()), None);
+        parsed.add_synthetic_code_unit(child_two, Some(parent.clone()), None);
+        assert_eq!(
+            Some(&2),
+            parsed
+                .declaration_identities
+                .get(&DeclarationIdentity(child_identity.clone()))
+        );
+
+        parsed.remove_code_unit(&parent);
+        assert!(!parsed.contains_declaration_identity(&parent));
+        assert!(!parsed.contains_declaration_identity(&child_identity));
     }
 
     #[test]
