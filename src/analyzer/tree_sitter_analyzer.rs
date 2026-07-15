@@ -518,6 +518,18 @@ struct QueryReadCache {
     file_states: HashMap<FileStateCacheKey, Arc<FileState>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DefinitionRangeStart {
+    Persisted(Option<usize>),
+    FileState,
+}
+
+#[derive(Debug, Clone)]
+struct DefinitionSortCandidate {
+    unit: CodeUnit,
+    range_start: DefinitionRangeStart,
+}
+
 impl QueryReadCache {
     fn begin(&mut self) {
         if self.depth == 0 {
@@ -2829,6 +2841,27 @@ where
         .resolve_rows(rows)
     }
 
+    fn resolve_definition_order_candidate_rows(
+        &self,
+        rows: Vec<crate::analyzer::store::DefinitionOrderCandidateRow>,
+    ) -> Vec<DefinitionSortCandidate> {
+        QueryResolver::from_snapshot(
+            self.adapter.as_ref(),
+            self.project.root(),
+            self.live_snapshot(),
+        )
+        .resolve_rows_with_payload(
+            rows.into_iter()
+                .map(|row| (row.candidate, row.first_start_byte)),
+        )
+        .into_iter()
+        .map(|(unit, first_start_byte)| DefinitionSortCandidate {
+            unit,
+            range_start: DefinitionRangeStart::Persisted(first_start_byte),
+        })
+        .collect()
+    }
+
     fn sql_path_symbol_units(&self, fq_name: &str, normalized: &str) -> Option<Vec<CodeUnit>> {
         if !self.adapter.has_path_synthetic_module_units() {
             return Some(Vec::new());
@@ -3380,16 +3413,36 @@ where
         names
     }
 
+    fn definition_sort_key_for_candidate(
+        &self,
+        candidate: &DefinitionSortCandidate,
+    ) -> (i32, usize, String, String, String, String) {
+        self.definition_sort_key(&candidate.unit, candidate.range_start)
+    }
+
     fn definition_sort_key_for_unit(
         &self,
         code_unit: &CodeUnit,
     ) -> (i32, usize, String, String, String, String) {
-        let first_start_byte = self
-            .ranges(code_unit)
-            .into_iter()
-            .map(|range| range.start_byte)
-            .min()
-            .unwrap_or(usize::MAX);
+        self.definition_sort_key(code_unit, DefinitionRangeStart::FileState)
+    }
+
+    fn definition_sort_key(
+        &self,
+        code_unit: &CodeUnit,
+        range_start: DefinitionRangeStart,
+    ) -> (i32, usize, String, String, String, String) {
+        let first_start_byte = match range_start {
+            DefinitionRangeStart::Persisted(first_start_byte) => {
+                first_start_byte.unwrap_or(usize::MAX)
+            }
+            DefinitionRangeStart::FileState => self
+                .ranges(code_unit)
+                .into_iter()
+                .map(|range| range.start_byte)
+                .min()
+                .unwrap_or(usize::MAX),
+        };
         (
             self.adapter.definition_priority(code_unit),
             first_start_byte,
@@ -3426,7 +3479,7 @@ where
                 let candidates = if include_definition_lookup_units {
                     self.store_context
                         .store
-                        .definition_lookup_candidate_rows_by_short_name_for_langs(
+                        .definition_lookup_order_candidate_rows_by_short_name_for_langs(
                             &langs,
                             self.store_context.generations.as_ref(),
                             &short_name,
@@ -3434,7 +3487,7 @@ where
                 } else {
                     self.store_context
                         .store
-                        .declaration_candidate_rows_by_short_name_for_langs(
+                        .declaration_order_candidate_rows_by_short_name_for_langs(
                             &langs,
                             self.store_context.generations.as_ref(),
                             &short_name,
@@ -3444,31 +3497,45 @@ where
             }
             rows
         };
-        let mut candidates = self.resolve_candidate_rows(rows);
+        let mut candidates = self.resolve_definition_order_candidate_rows(rows);
         candidates.extend(
             self.dirty_units_matching(include_definition_lookup_units, |unit| {
                 unit.fq_name() == fq_name
                     || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+            })
+            .into_iter()
+            .map(|unit| DefinitionSortCandidate {
+                unit,
+                range_start: DefinitionRangeStart::FileState,
             }),
         );
-        candidates.extend(self.sql_path_symbol_units(fq_name, &normalized)?);
-        let has_exact = candidates.iter().any(|unit| unit.fq_name() == fq_name);
+        candidates.extend(
+            self.sql_path_symbol_units(fq_name, &normalized)?
+                .into_iter()
+                .map(|unit| DefinitionSortCandidate {
+                    unit,
+                    range_start: DefinitionRangeStart::FileState,
+                }),
+        );
+        let has_exact = candidates
+            .iter()
+            .any(|candidate| candidate.unit.fq_name() == fq_name);
         let mut matches: Vec<_> = candidates
             .into_iter()
-            .filter(|unit| {
+            .filter(|candidate| {
                 if has_exact {
-                    unit.fq_name() == fq_name
+                    candidate.unit.fq_name() == fq_name
                 } else {
-                    self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+                    self.adapter.normalize_full_name(&candidate.unit.fq_name()) == normalized
                 }
             })
             .collect();
-        matches.sort_by_cached_key(|code_unit| self.definition_sort_key_for_unit(code_unit));
-        matches.dedup();
+        matches.sort_by_cached_key(|candidate| self.definition_sort_key_for_candidate(candidate));
+        matches.dedup_by(|left, right| left.unit == right.unit);
 
         let mut saw_module = false;
-        matches.retain(|code_unit| {
-            if !code_unit.is_module() {
+        matches.retain(|candidate| {
+            if !candidate.unit.is_module() {
                 return true;
             }
             if saw_module {
@@ -3478,7 +3545,12 @@ where
                 true
             }
         });
-        Some(matches)
+        Some(
+            matches
+                .into_iter()
+                .map(|candidate| candidate.unit)
+                .collect(),
+        )
     }
 
     fn sql_lookup_candidates_by_short_name(&self, symbol: &str) -> Option<BTreeSet<CodeUnit>> {

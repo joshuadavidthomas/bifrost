@@ -212,6 +212,14 @@ pub struct CandidateRow {
     pub flags: CandidateFlags,
 }
 
+/// Persisted metadata needed to preserve definition ordering without
+/// reconstructing the candidate's complete file state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DefinitionOrderCandidateRow {
+    pub(crate) candidate: CandidateRow,
+    pub(crate) first_start_byte: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PathSymbolRow {
     pub(crate) rel_path: String,
@@ -1269,24 +1277,45 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
-    /// Returns declaration-lookup candidates for a known short name.
-    ///
-    /// Some languages publish structured synthetic declarations (for example,
-    /// JavaScript property assignments) only to the definition lookup set.
-    /// Forward resolvers still need those rows, but must obtain them through a
-    /// name-bounded query instead of loading every lookup unit in the
-    /// workspace.
-    pub(crate) fn definition_lookup_candidate_rows_by_short_name_for_langs(
+    pub(crate) fn declaration_order_candidate_rows_by_short_name_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         short_name: &str,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<DefinitionOrderCandidateRow>> {
         let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = definition_lookup_candidate_sql("units.lang = ?1 AND units.short_name = ?2");
-        let rows = candidate_rows_for_languages(
+        let sql = definition_order_candidate_sql(
+            "units.lang = ?1 AND units.short_name = ?2",
+            "units.in_declarations = 1",
+        );
+        let rows = definition_order_candidate_rows_for_languages(
+            &tx,
+            langs.iter().map(String::as_str),
+            &sql,
+            &[&short_name],
+        )?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    /// Returns name-bounded declaration-lookup candidates together with the
+    /// persisted range fact needed for definition ordering.
+    pub(crate) fn definition_lookup_order_candidate_rows_by_short_name_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        short_name: &str,
+    ) -> Result<Vec<DefinitionOrderCandidateRow>> {
+        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let sql = definition_order_candidate_sql(
+            "units.lang = ?1 AND units.short_name = ?2",
+            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+        );
+        let rows = definition_order_candidate_rows_for_languages(
             &tx,
             langs.iter().map(String::as_str),
             &sql,
@@ -1865,18 +1894,6 @@ fn declaration_candidate_sql_with_order(predicate: &str, order_by: &str) -> Stri
     )
 }
 
-fn definition_lookup_candidate_sql(predicate: &str) -> String {
-    candidate_rows_sql_with_membership(
-        "units",
-        "FROM code_units AS units
-         JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
-        predicate,
-        "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
-        "units.blob_oid, units.unit_key",
-    )
-}
-
 fn candidate_rows_sql(candidate_alias: &str, from_clause: &str, predicate: &str) -> String {
     candidate_rows_sql_with_membership(
         candidate_alias,
@@ -1894,17 +1911,53 @@ fn candidate_rows_sql_with_membership(
     membership: &str,
     order_by: &str,
 ) -> String {
+    candidate_rows_sql_with_membership_and_projection(
+        candidate_alias,
+        from_clause,
+        predicate,
+        membership,
+        order_by,
+        "",
+    )
+}
+
+fn candidate_rows_sql_with_membership_and_projection(
+    candidate_alias: &str,
+    from_clause: &str,
+    predicate: &str,
+    membership: &str,
+    order_by: &str,
+    extra_projection: &str,
+) -> String {
     format!(
         "SELECT {candidate_alias}.blob_oid, {candidate_alias}.lang, {candidate_alias}.unit_key,
                 {candidate_alias}.kind, {candidate_alias}.short_name,
                 {candidate_alias}.content_qualifier, {candidate_alias}.signature,
                 {candidate_alias}.synthetic, {candidate_alias}.is_type_alias,
                 {candidate_alias}.top_level_ordinal, {candidate_alias}.in_declarations,
-                {candidate_alias}.in_definition_lookup
+                {candidate_alias}.in_definition_lookup{extra_projection}
          {from_clause}
          WHERE {predicate} AND {membership}
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY {order_by}"
+    )
+}
+
+fn definition_order_candidate_sql(predicate: &str, membership: &str) -> String {
+    candidate_rows_sql_with_membership_and_projection(
+        "units",
+        "FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+        predicate,
+        membership,
+        "units.blob_oid, units.unit_key",
+        ",
+                (SELECT MIN(ranges.start_byte)
+                 FROM unit_ranges AS ranges
+                 WHERE ranges.blob_oid = units.blob_oid
+                   AND ranges.lang = units.lang
+                   AND ranges.unit_key = units.unit_key) AS first_start_byte",
     )
 }
 
@@ -1920,6 +1973,26 @@ fn candidate_rows_for_languages<'a>(
         let params = std::iter::once(&lang as &dyn ToSql).chain(values.iter().copied());
         rows.extend(collect_candidate_rows(
             statement.query_map(params_from_iter(params), candidate_row_from_row)?,
+        )?);
+    }
+    Ok(rows)
+}
+
+fn definition_order_candidate_rows_for_languages<'a>(
+    conn: &Connection,
+    langs: impl IntoIterator<Item = &'a str>,
+    sql: &str,
+    values: &[&dyn ToSql],
+) -> Result<Vec<DefinitionOrderCandidateRow>> {
+    let mut statement = conn.prepare_cached(sql)?;
+    let mut rows = Vec::new();
+    for lang in langs {
+        let params = std::iter::once(&lang as &dyn ToSql).chain(values.iter().copied());
+        rows.extend(collect_definition_order_candidate_rows(
+            statement.query_map(
+                params_from_iter(params),
+                definition_order_candidate_row_from_row,
+            )?,
         )?);
     }
     Ok(rows)
@@ -4049,6 +4122,33 @@ fn candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Candidate
     })
 }
 
+fn definition_order_candidate_row_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DefinitionOrderCandidateRow> {
+    let first_start_byte = row
+        .get::<_, Option<i64>>(12)?
+        .map(i64_to_usize)
+        .transpose()
+        .map_err(rusqlite_error_from_store)?;
+    Ok(DefinitionOrderCandidateRow {
+        candidate: candidate_row_from_row(row)?,
+        first_start_byte,
+    })
+}
+
+fn collect_definition_order_candidate_rows<F>(
+    rows: rusqlite::MappedRows<'_, F>,
+) -> Result<Vec<DefinitionOrderCandidateRow>>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<DefinitionOrderCandidateRow>,
+{
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn usage_fact_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageFactRow> {
     let metadata = row
         .get::<_, Option<Vec<u8>>>(13)?
@@ -5345,6 +5445,111 @@ mod tests {
             .expect("method search candidate");
         assert!(method.primary_range.is_some());
         assert!(!method.contains_tests);
+    }
+
+    #[test]
+    fn definition_order_candidates_use_minimum_persisted_range_and_allow_absent_range() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let file = write_file(
+            root,
+            "src/demo/Sample.java",
+            "package demo; class Sample {}\n",
+        );
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let adapter = JavaAdapter;
+        let state = parse_state(&adapter, &file);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "java", &adapter, &state)
+            .unwrap();
+
+        let unit_key = {
+            let conn = store.conn.lock().unwrap();
+            let unit_key = conn
+                .query_row(
+                    "SELECT unit_key FROM code_units
+                     WHERE blob_oid = ?1 AND lang = 'java'
+                       AND short_name = 'Sample' AND in_declarations = 1",
+                    [oid.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            conn.execute(
+                "DELETE FROM unit_ranges
+                 WHERE blob_oid = ?1 AND lang = 'java' AND unit_key = ?2",
+                params![oid.to_string(), unit_key],
+            )
+            .unwrap();
+            for (ordinal, start_byte) in [(0_i64, 20_i64), (1, 5)] {
+                conn.execute(
+                    "INSERT INTO unit_ranges(
+                       blob_oid, lang, unit_key, ordinal,
+                       start_byte, end_byte, start_line, end_line
+                     ) VALUES(?1, 'java', ?2, ?3, ?4, ?5, 0, 0)",
+                    params![
+                        oid.to_string(),
+                        unit_key,
+                        ordinal,
+                        start_byte,
+                        start_byte + 1
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "UPDATE blob_meta
+                 SET range_count = (
+                   SELECT COUNT(*) FROM unit_ranges
+                   WHERE blob_oid = ?1 AND lang = 'java'
+                 )
+                 WHERE blob_oid = ?1 AND lang = 'java'",
+                [oid.to_string()],
+            )
+            .unwrap();
+            unit_key
+        };
+
+        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+        let rows = store
+            .declaration_order_candidate_rows_by_short_name_for_langs(
+                &["java".to_string()],
+                &generations,
+                "Sample",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].first_start_byte, Some(5));
+
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM unit_ranges
+                 WHERE blob_oid = ?1 AND lang = 'java' AND unit_key = ?2",
+                params![oid.to_string(), unit_key],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE blob_meta
+                 SET range_count = (
+                   SELECT COUNT(*) FROM unit_ranges
+                   WHERE blob_oid = ?1 AND lang = 'java'
+                 )
+                 WHERE blob_oid = ?1 AND lang = 'java'",
+                [oid.to_string()],
+            )
+            .unwrap();
+        }
+        let rows = store
+            .declaration_order_candidate_rows_by_short_name_for_langs(
+                &["java".to_string()],
+                &generations,
+                "Sample",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].first_start_byte, None);
     }
 
     #[test]

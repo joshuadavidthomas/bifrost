@@ -1,6 +1,6 @@
 mod common;
 
-use brokk_bifrost::{Language, SearchToolsService};
+use brokk_bifrost::{AnalyzerConfig, Language, SearchToolsService, WorkspaceAnalyzer};
 use common::{
     CSHARP_NESTED_PARTIAL_MAPPER, InlineTestProject, call_search_tool_json,
     csharp_nested_partial_cacheinfo_project,
@@ -13841,6 +13841,107 @@ fn cpp_included_type_resolves_to_definition() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "ns.Service", "{value}");
     assert_eq!(result["definitions"][0]["path"], "target.h", "{value}");
+}
+
+#[test]
+fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
+    const HIDDEN_DUPLICATES: usize = 16;
+    const EXACT_CANDIDATES: usize = HIDDEN_DUPLICATES + 1;
+    let mut builder = InlineTestProject::with_language(Language::Cpp)
+        .file("z_visible.h", "namespace demo { struct Shared {}; }\n")
+        .file(
+            "consumer.cpp",
+            "#include \"z_visible.h\"\ndemo::Shared value;\n",
+        );
+    for index in 0..HIDDEN_DUPLICATES {
+        builder = builder.file(
+            format!("a_hidden_{index:02}.h"),
+            "\nnamespace demo { struct Shared {}; }\n",
+        );
+    }
+    let project = builder.build();
+    let repository =
+        git2::Repository::init(project.root()).expect("git repository for persisted warm analyzer");
+    let mut index = repository.index().expect("git index");
+    index
+        .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+        .expect("stage inline fixture");
+    let tree_id = index.write_tree().expect("fixture tree");
+    let tree = repository.find_tree(tree_id).expect("fixture tree object");
+    let signature =
+        git2::Signature::now("Bifrost Test", "bifrost@example.invalid").expect("fixture signature");
+    repository
+        .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+        .expect("fixture commit");
+
+    let cold_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default());
+    drop(cold_workspace);
+    let warm_workspace =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default());
+    let analyzer = warm_workspace.analyzer();
+
+    analyzer.reset_candidate_hydration_count_for_test();
+    let definitions = analyzer.definitions("demo.Shared").collect::<Vec<_>>();
+    let candidate_hydrations = analyzer.candidate_hydration_count_for_test();
+
+    let actual_paths = definitions
+        .iter()
+        .map(|unit| {
+            unit.source()
+                .rel_path()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    let mut expected_paths = vec!["z_visible.h".to_string()];
+    expected_paths.extend((0..HIDDEN_DUPLICATES).map(|index| format!("a_hidden_{index:02}.h")));
+    assert_eq!(
+        actual_paths, expected_paths,
+        "definition ordering must keep first source position ahead of path tie-breaking"
+    );
+    assert_eq!(
+        definitions.len(),
+        EXACT_CANDIDATES,
+        "the narrow FQN query retains every distinct exact candidate"
+    );
+    // Keep the public semantic result covered, but only after capturing the
+    // narrow FQN query's hydration count so rendering cannot affect it.
+    let line = "demo::Shared value;";
+    let value = brokk_bifrost::searchtools::get_definitions_by_location(
+        analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "consumer.cpp".to_string(),
+                line: Some(2),
+                column: Some(column_of(line, "Shared")),
+            }],
+        },
+    );
+    let result = &value.results[0];
+    assert_eq!(result.status, "resolved", "lookup result: {result:#?}");
+    assert_eq!(
+        result.definitions.len(),
+        EXACT_CANDIDATES,
+        "lookup result: {result:#?}"
+    );
+    let actual_result_paths = result
+        .definitions
+        .iter()
+        .map(|definition| definition.path.clone())
+        .collect::<Vec<_>>();
+    let mut expected_result_paths = (0..HIDDEN_DUPLICATES)
+        .map(|index| format!("a_hidden_{index:02}.h"))
+        .collect::<Vec<_>>();
+    expected_result_paths.push("z_visible.h".to_string());
+    assert_eq!(
+        actual_result_paths, expected_result_paths,
+        "rendered duplicate definitions retain their stable path ordering"
+    );
+    assert_eq!(
+        candidate_hydrations, 0,
+        "resolving persisted candidate rows and sorting them should not hydrate complete candidate file states; observed {candidate_hydrations} candidate hydrations"
+    );
 }
 
 #[test]
