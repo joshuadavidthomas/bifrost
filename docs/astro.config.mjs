@@ -28,7 +28,10 @@ export default defineConfig({
         {
           label: 'Start',
           items: [
+            { label: 'Choose Bifrost', slug: 'choose-bifrost' },
             { label: 'Overview', slug: 'overview' },
+            { label: 'Capabilities', slug: 'capabilities' },
+            { label: '10-Minute Evaluation', slug: 'evaluate-bifrost' },
             { label: 'Install Bifrost', slug: 'install' },
             { label: 'CLI', slug: 'cli' },
           ],
@@ -60,6 +63,8 @@ export default defineConfig({
           label: 'Code Querying',
           items: [
             { label: 'Overview', slug: 'code-querying' },
+            { label: 'Build a Rule', slug: 'build-static-analysis-rule' },
+            { label: 'Agent Result Safety', slug: 'agent-result-safety' },
             { label: 'Semantic Search', slug: 'semantic-search' },
             { label: 'JSON CodeQuery', slug: 'code-query-json' },
             {
@@ -89,6 +94,15 @@ export default defineConfig({
                 },
               ],
             },
+          ],
+        },
+        {
+          label: 'Evaluate and Trust',
+          items: [
+            { label: 'Evidence and Methodology', slug: 'evaluation-evidence' },
+            { label: 'Data Boundaries', slug: 'data-boundaries' },
+            { label: 'Cite Bifrost', slug: 'cite-bifrost' },
+            { label: 'Reproduce an Analysis', slug: 'reproduce-analysis' },
           ],
         },
         {

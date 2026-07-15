@@ -29,12 +29,20 @@ Use the bifrost-code-intelligence skill. Call the Bifrost get_summaries tool on 
 
 Use a source directory or source file for validation. Avoid a prompt that only asks about `README.md`, because that can pass through ordinary file reading without proving the MCP server ran.
 
+## Can My Agent Run RQL?
+
+The installed `bifrost-code-intelligence` skill starts MCP with `symbol|extended`, but its tools remain hidden until Amp loads that skill. After loading it, confirm that `query_code` is available. Ask Amp to call `query_code` with the inline JSON fields `{"match":{"kind":"declaration"},"limit":1}`. Then check a workspace file named `bifrost-smoke.rql` containing `(limit 1 (declaration))` and call `query_code` with `{"query_file":"bifrost-smoke.rql"}`.
+
+The inline call is canonical JSON. MCP does not accept inline RQL text; saved RQL is loaded through `query_file`. Installing some other skill without an MCP definition exposes instructions, not Bifrost tools. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the full surface matrix and [Agent Result Safety](/agent-result-safety/) before making completeness claims.
+
 ## Direct MCP Shape
 
 Bifrost's raw MCP command is:
 
 ```bash
-bifrost --root /path/to/project --mcp core
+bifrost --root /path/to/project --mcp "symbol|extended"
 ```
 
 The skill wrapper above keeps the Bifrost tools hidden until the skill is loaded.
+
+Use `--mcp core` only when you intentionally want navigation without `query_code`.

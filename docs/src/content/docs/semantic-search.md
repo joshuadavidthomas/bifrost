@@ -18,10 +18,11 @@ BIFROST_SEMANTIC_INDEX=auto bifrost --root /path/to/project --mcp core
 ```
 
 Without the `nlp` feature, the `nlp` toolset publishes no tools and `core` degrades to `symbol|workspace`.
+This example is intentionally scoped to symbol navigation plus semantic search and does not expose `query_code`. Add `extended` to the composition when the same agent also needs structural queries.
 
 ## Index
 
-The index lives in `.brokk/semantic_index.db` of the primary repository. Linked git worktrees share the primary repository's index. Vectors and BM25 rows are keyed by content hash, so switching branches re-points rows instead of re-embedding unchanged content.
+The semantic index shares `.brokk/bifrost_cache.db` with the analyzer cache at the primary repository root. Linked git worktrees share that content-addressed database. Vectors and BM25 rows are keyed by content hash, so switching branches re-points rows instead of re-embedding unchanged content.
 
 Once enabled, a background build starts when the workspace is activated. `semantic_search` waits until the index is ready, and the file watcher keeps it updated incrementally.
 
