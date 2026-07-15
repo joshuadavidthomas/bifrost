@@ -47,6 +47,8 @@ Code's language-mode picker to select **Bifrost RQL**. The Bifrost helmet is
 its default file icon when the active VS Code icon theme does not provide a
 more specific `.rql` icon.
 
+The Play action runs through the extension's language-server connection, including unsaved editor text. It is separate from agent MCP: installing the extension does not expose `query_code` to an agent, and an MCP agent can execute saved RQL only through a query-capable toolset and `query_file`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability).
+
 ## Extension Settings
 
 | Setting | Default | Description |

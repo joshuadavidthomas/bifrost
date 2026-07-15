@@ -42,4 +42,6 @@ cargo build --features nlp --bin bifrost
 BIFROST_SEMANTIC_INDEX=auto bifrost --root /path/to/project --mcp core
 ```
 
+This `core` example is intentionally scoped to symbol navigation plus optional semantic search; it does not expose `query_code`. Use `--mcp "symbol|extended"` for a structural-query-capable agent, or add `extended` to the composition when semantic search and structural queries are both required.
+
 See [Semantic Search](../semantic-search/) for model, accelerator, and index details.

@@ -44,3 +44,9 @@ Use the Bifrost MCP get_summaries tool on src/analyzer/usages. Summarize the pac
 ```
 
 The `cursor agent --plugin-dir` CLI path is useful for checking that Cursor can load plugin skills, but it has not proven reliable for plugin-provided MCP servers. Treat the desktop Customize/MCP flow as the MCP validation path.
+
+## Can My Agent Run RQL?
+
+The packaged plugin uses `symbol|extended`. In a fresh chat after enabling MCP, confirm that the Bifrost tool list includes `query_code`, then call it with the inline JSON fields `{"match":{"kind":"declaration"},"limit":1}`. To validate saved RQL, check a workspace file named `bifrost-smoke.rql` containing `(limit 1 (declaration))`, then call `query_code` with `{"query_file":"bifrost-smoke.rql"}`.
+
+The inline call is canonical JSON. MCP accepts RQL only from a workspace `.rql` file through `query_file`. Loading plugin skills without enabling its MCP server provides instructions but no Bifrost tools. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the full surface matrix.

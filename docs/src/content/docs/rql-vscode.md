@@ -11,6 +11,8 @@ With the Bifrost language server running and indexed, use the Play button in
 an RQL editor title to execute the current document. Unsaved edits are sent to
 the active LSP session, so you can refine a query without first saving it.
 
+This Play action is a VS Code language-server feature. It does not start an MCP server, expose `query_code` to an agent, or prove that an agent can run RQL. For agent access, configure a query-capable MCP toolset and use a saved workspace `.rql` file through `query_file`; MCP does not accept unsaved editor text or raw inline RQL. See [MCP query and RQL availability](/mcp/#query-and-rql-availability).
+
 ```lisp
 (result-detail full
   (where "src/lsp/server.rs"

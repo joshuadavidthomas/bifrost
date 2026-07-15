@@ -18,6 +18,7 @@ BIFROST_SEMANTIC_INDEX=auto bifrost --root /path/to/project --mcp core
 ```
 
 Without the `nlp` feature, the `nlp` toolset publishes no tools and `core` degrades to `symbol|workspace`.
+This example is intentionally scoped to symbol navigation plus semantic search and does not expose `query_code`. Add `extended` to the composition when the same agent also needs structural queries.
 
 ## Index
 
