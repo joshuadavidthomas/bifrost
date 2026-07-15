@@ -24,7 +24,8 @@ use super::extractor::{
 };
 use super::resolver::{GoEdgeIndex, TypeRef, node_text};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdges, build_edges, parse_and_collect,
+    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
+    parse_and_collect,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::{IAnalyzer, ProjectFile};
@@ -42,18 +43,19 @@ use tree_sitter::Node;
 /// returns, so live trees are bounded by the worker count rather than the workspace
 /// size (#200). Cross-file resolution comes from the tree-free [`GoEdgeIndex`] and
 /// the index's per-file import facts — no other file's tree is read during a scan.
-pub(super) fn build_go_edges<F>(
+pub(super) fn build_go_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     index: &GoEdgeIndex,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> UsageEdges
+) -> Output
 where
+    Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let files: Vec<ProjectFile> = index.files().cloned().collect();
     let language = tree_sitter_go::LANGUAGE.into();
-    build_edges(&files, keep_file, |file| {
+    build_edge_output(&files, keep_file, |file| {
         let file_pkg = index.package_name_of(file)?;
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             let (alias_packages, dot_packages) = index.namespace_packages(file);
@@ -203,8 +205,12 @@ impl FileScan<'_, '_> {
     /// Hand a resolved reference to the shared collector, which applies the
     /// enclosing-caller attribution, cap counting, and edge dedup.
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector
-            .record(callee, node.start_byte(), node.end_byte());
+        self.collector.record_kind(
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
@@ -217,8 +223,13 @@ impl FileScan<'_, '_> {
     }
 
     fn record_with_caller(&mut self, caller: String, callee: String, node: Node<'_>) {
-        self.collector
-            .record_with_caller(caller, callee, node.start_byte(), node.end_byte());
+        self.collector.record_with_caller_kind(
+            caller,
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 }
 

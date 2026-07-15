@@ -45,7 +45,9 @@ pub(crate) use resolver::{
 
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::js_ts_graph::extractor::scan_files_for_seeds;
-use crate::analyzer::usages::js_ts_graph::resolver::{is_static_member, target_language};
+use crate::analyzer::usages::js_ts_graph::resolver::{
+    combine_jsts_usage_indices, is_static_member, target_language,
+};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface, UsageProof};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{
@@ -62,9 +64,9 @@ use std::sync::Arc;
 
 pub(in crate::analyzer::usages) use crate::analyzer::js_ts::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::analyzer::usages::inverted_edges::CallSite;
-use crate::analyzer::usages::inverted_edges::UsageEdgeWeights;
 use crate::analyzer::usages::inverted_edges::UsageEdges;
 use crate::analyzer::usages::inverted_edges::UsageNodeKey;
+use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageReferenceCounts};
 pub(crate) use inverted::{JsTsScopedNodeStatus, JsTsScopedUsageEdges};
 
 /// Build the whole JS/TS `caller -> callee` edge set in a single inverted pass per
@@ -273,7 +275,8 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
             if analyzed_files_for_language(analyzer, language).is_empty() {
                 continue;
             }
-            let result = inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
+            let result: UsageEdges =
+                inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
             for (key, sites) in result.edges {
                 edges.entry(key).or_default().extend(sites);
             }
@@ -297,6 +300,43 @@ impl<'a> UsageEdgeResolver<'a> for JsTsEdgeResolver {
             unproven_inbound,
         }
     }
+
+    fn build_edge_weights<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        nodes: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdgeWeights
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        let mut edges = std::collections::BTreeMap::new();
+        let mut truncated = std::collections::BTreeMap::new();
+        let mut unproven_inbound = std::collections::BTreeMap::new();
+
+        for language in [Language::TypeScript, Language::JavaScript] {
+            if analyzed_files_for_language(analyzer, language).is_empty() {
+                continue;
+            }
+            let result: UsageEdgeWeights =
+                inverted::build_jsts_edges(analyzer, language, nodes, &keep_file);
+            for (key, weight) in result.edges {
+                *edges.entry(key).or_default() += weight;
+            }
+            for (callee, total) in result.truncated {
+                *truncated.entry(callee).or_insert(0) += total;
+            }
+            for (callee, total) in result.unproven_inbound {
+                *unproven_inbound.entry(callee).or_insert(0) += total;
+            }
+        }
+
+        UsageEdgeWeights {
+            edges,
+            truncated,
+            unproven_inbound,
+        }
+    }
 }
 
 /// Build the whole JS/TS `caller -> callee` edge set using file-scoped node
@@ -309,7 +349,7 @@ pub(crate) fn build_jsts_scoped_usage_edges<F>(
 where
     F: Fn(&ProjectFile) -> bool + Sync + Copy,
 {
-    let mut edges: std::collections::BTreeMap<(UsageNodeKey, UsageNodeKey), usize> =
+    let mut edges: std::collections::BTreeMap<(UsageNodeKey, UsageNodeKey), UsageReferenceCounts> =
         std::collections::BTreeMap::new();
     let mut truncated: std::collections::BTreeMap<UsageNodeKey, usize> =
         std::collections::BTreeMap::new();
@@ -319,31 +359,34 @@ where
         std::collections::BTreeMap::new();
     let mut any = false;
 
+    let mut cached_indices = Vec::new();
+    for language in [Language::TypeScript, Language::JavaScript] {
+        if let Some(index) = cached_jsts_index(analyzer, language, None) {
+            cached_indices.push(index);
+        }
+    }
+    let combined_index = combine_jsts_usage_indices(
+        analyzer,
+        cached_indices.iter().map(std::convert::AsRef::as_ref),
+    );
+
     for language in [Language::TypeScript, Language::JavaScript] {
         if analyzed_files_for_language(analyzer, language).is_empty() {
             continue;
         }
         any = true;
-        let language_nodes: HashSet<UsageNodeKey> = nodes
-            .iter()
-            .filter(|key| crate::analyzer::common::language_for_file(&key.file) == language)
-            .cloned()
-            .collect();
-        if language_nodes.is_empty() {
+        if nodes.is_empty() {
             continue;
         }
-        let Some(index) = cached_jsts_index(analyzer, language, None) else {
-            continue;
-        };
         let result = inverted::build_jsts_scoped_edges(
             analyzer,
-            index.as_ref(),
+            &combined_index,
             language,
-            &language_nodes,
+            nodes,
             keep_file,
         );
         for (key, weight) in result.edges.edges {
-            *edges.entry(key).or_insert(0) += weight;
+            *edges.entry(key).or_default() += weight;
         }
         for (callee, total) in result.edges.truncated {
             *truncated.entry(callee).or_insert(0) += total;

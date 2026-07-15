@@ -23,7 +23,8 @@
 
 use super::extractor::{first_generic_type_argument, type_node_last_segment};
 use crate::analyzer::usages::inverted_edges::{
-    EdgeCollector, UsageEdges, build_edges, parse_and_collect,
+    EdgeCollector, UsageEdgeBuildOutput, build_edge_output, classify_reference_node,
+    parse_and_collect,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::{
@@ -34,19 +35,20 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 /// Build the whole Rust `caller -> callee` edge set in a single inverted pass.
-pub(super) fn build_rust_edges<F>(
+pub(super) fn build_rust_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
     nodes: &HashSet<String>,
     keep_file: F,
-) -> UsageEdges
+) -> Output
 where
+    Output: UsageEdgeBuildOutput<String>,
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let files: Vec<ProjectFile> = rust.get_analyzed_files().into_iter().collect();
     let support = analyzer.global_usage_definition_index();
     let language = tree_sitter_rust::LANGUAGE.into();
-    build_edges(&files, keep_file, |file| {
+    build_edge_output(&files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
             // One shared, cached per-file resolution context. Both this inverted
             // builder and (from Phase 1b) the forward scan resolve references
@@ -114,8 +116,12 @@ impl RustScan<'_, '_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.collector
-            .record(callee, node.start_byte(), node.end_byte());
+        self.collector.record_kind(
+            callee,
+            classify_reference_node(node),
+            node.start_byte(),
+            node.end_byte(),
+        );
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {

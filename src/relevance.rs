@@ -1,8 +1,13 @@
+use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
+use crate::analyzer::usages::workspace_graph::{
+    WorkspaceUsageCatalog, WorkspaceUsageGraph, build_workspace_usage_graph,
+};
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use git2::{Oid, Repository};
 use moka::sync::Cache;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -71,6 +76,55 @@ struct FileRelevance {
     score: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MostRelevantFilesRankingMode {
+    #[default]
+    HistoryImports,
+    UsageGraph,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UsageReferenceWeights {
+    calls: f64,
+    members: f64,
+    types: f64,
+    other: f64,
+}
+
+struct UsageRankingGraph {
+    graph: WorkspaceUsageGraph,
+    node_indices_by_file: HashMap<ProjectFile, Vec<usize>>,
+}
+
+impl UsageReferenceWeights {
+    #[cfg(test)]
+    const UNIFORM: Self = Self {
+        calls: 1.0,
+        members: 1.0,
+        types: 1.0,
+        other: 1.0,
+    };
+
+    // Calibrated against deterministic git co-change retrieval on eight
+    // repositories spanning Python, TypeScript, PHP, Java, Go, C++, and Rust.
+    // The deliberately subtle bias improved the macro average without the Go
+    // regression caused by more aggressive call-first profiles.
+    const CALIBRATED: Self = Self {
+        calls: 1.5,
+        members: 1.25,
+        types: 1.0,
+        other: 0.875,
+    };
+
+    fn combine(self, counts: UsageReferenceCounts) -> f64 {
+        f64::from(counts.calls) * self.calls
+            + f64::from(counts.members) * self.members
+            + f64::from(counts.types) * self.types
+            + f64::from(counts.other) * self.other
+    }
+}
+
 pub(crate) fn most_relevant_project_files(
     analyzer: &dyn IAnalyzer,
     seeds: &[(ProjectFile, f64)],
@@ -125,6 +179,161 @@ pub(crate) fn most_relevant_project_files_with_half_life(
     }
 
     results
+}
+
+pub(crate) fn most_relevant_project_files_with_ranking_mode(
+    analyzer: &dyn IAnalyzer,
+    seeds: &[(ProjectFile, f64)],
+    top_k: usize,
+    half_life: Option<f64>,
+    ranking_mode: MostRelevantFilesRankingMode,
+) -> Vec<ProjectFile> {
+    let _scope = profiling::scope("relevance::most_relevant_project_files_with_ranking_mode");
+    if ranking_mode == MostRelevantFilesRankingMode::HistoryImports {
+        return most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life);
+    }
+    if top_k == 0 {
+        return Vec::new();
+    }
+
+    let seed_weights = seed_weight_map(seeds);
+    if seed_weights.is_empty() {
+        return Vec::new();
+    }
+    let excluded: HashSet<_> = seed_weights.keys().cloned().collect();
+    let mut results = Vec::new();
+    let mut seen = HashSet::default();
+
+    for candidate in related_files_by_usage(analyzer, &seed_weights, top_k) {
+        if append_candidate(&mut results, &mut seen, &excluded, candidate.file, top_k) {
+            return results;
+        }
+    }
+
+    for candidate in most_relevant_project_files_with_half_life(analyzer, seeds, top_k, half_life) {
+        if append_candidate(&mut results, &mut seen, &excluded, candidate, top_k) {
+            break;
+        }
+    }
+    results
+}
+
+fn related_files_by_usage(
+    analyzer: &dyn IAnalyzer,
+    seed_weights: &HashMap<ProjectFile, f64>,
+    k: usize,
+) -> Vec<FileRelevance> {
+    let _scope = profiling::scope("relevance::related_files_by_usage");
+    if k == 0 {
+        return Vec::new();
+    }
+
+    let ranking_graph = build_usage_ranking_graph(analyzer);
+    related_files_by_usage_graph(
+        &ranking_graph,
+        seed_weights,
+        k,
+        UsageReferenceWeights::CALIBRATED,
+    )
+}
+
+fn build_usage_ranking_graph(analyzer: &dyn IAnalyzer) -> UsageRankingGraph {
+    let catalog = {
+        let _scope = profiling::scope("relevance::usage_graph_catalog");
+        WorkspaceUsageCatalog::build(analyzer)
+    };
+    let mut node_indices_by_file: HashMap<ProjectFile, Vec<usize>> = HashMap::default();
+    for (index, node) in catalog.nodes.iter().enumerate() {
+        for file in &node.declaration_files {
+            node_indices_by_file
+                .entry(file.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+
+    let graph = {
+        let _scope = profiling::scope("relevance::usage_graph_construction");
+        build_workspace_usage_graph(analyzer, catalog)
+    };
+    UsageRankingGraph {
+        graph,
+        node_indices_by_file,
+    }
+}
+
+fn related_files_by_usage_graph(
+    ranking_graph: &UsageRankingGraph,
+    seed_weights: &HashMap<ProjectFile, f64>,
+    k: usize,
+    weights: UsageReferenceWeights,
+) -> Vec<FileRelevance> {
+    if k == 0 {
+        return Vec::new();
+    }
+    let graph = &ranking_graph.graph;
+    let mut teleport = vec![0.0; graph.nodes.len()];
+    for (file, weight) in seed_weights.iter().filter(|(_, weight)| **weight > 0.0) {
+        let Some(indices) = ranking_graph.node_indices_by_file.get(file) else {
+            continue;
+        };
+        if indices.is_empty() {
+            continue;
+        }
+        let per_node = *weight / indices.len() as f64;
+        for index in indices {
+            teleport[*index] += per_node;
+        }
+    }
+    if teleport.iter().all(|weight| *weight <= 0.0) {
+        return Vec::new();
+    }
+
+    if graph.edges.is_empty() {
+        return Vec::new();
+    }
+    if profiling::enabled() {
+        let unproven_inbound: usize = graph.nodes.iter().map(|node| node.unproven_inbound).sum();
+        profiling::note(format!(
+            "usage-graph nodes={} edges={} unproven_inbound={unproven_inbound}",
+            graph.nodes.len(),
+            graph.edges.len()
+        ));
+    }
+    let mut outgoing = vec![Vec::new(); graph.nodes.len()];
+    for edge in &graph.edges {
+        outgoing[edge.from].push((edge.to, weights.combine(edge.counts)));
+    }
+    for neighbors in &mut outgoing {
+        neighbors.sort_by_key(|(target, _)| *target);
+    }
+
+    let scores = {
+        let _scope = profiling::scope("relevance::usage_graph_page_rank");
+        weighted_page_rank(&outgoing, &teleport)
+    };
+    let excluded: HashSet<_> = seed_weights.keys().collect();
+    let mut file_scores: HashMap<ProjectFile, f64> = HashMap::default();
+    {
+        let _scope = profiling::scope("relevance::usage_graph_file_aggregation");
+        for (node, score) in graph.nodes.iter().zip(scores) {
+            if node.truncated_inbound.is_some() || excluded.contains(node.primary.source()) {
+                continue;
+            }
+            *file_scores
+                .entry(node.primary.source().clone())
+                .or_insert(0.0) += score;
+        }
+    }
+
+    let mut ranked: Vec<_> = file_scores
+        .into_iter()
+        .filter(|(_, score)| *score > 0.0)
+        .map(|(file, score)| FileRelevance { file, score })
+        .collect();
+    ranked.sort_by(compare_file_relevance);
+    ranked.truncate(k);
+    ranked
 }
 
 pub(crate) fn most_important_project_files(
@@ -270,8 +479,7 @@ fn related_files_by_imports(
         }
     }
 
-    let mut neighbors = vec![Vec::new(); nodes.len()];
-    let mut out_degree = vec![0usize; nodes.len()];
+    let mut outgoing = vec![Vec::new(); nodes.len()];
     for (index, file) in nodes.iter().enumerate() {
         let outs = adjacency.get(file).cloned().unwrap_or_default();
         let mut out_indices = outs
@@ -279,47 +487,13 @@ fn related_files_by_imports(
             .filter_map(|neighbor| index_by_file.get(&neighbor).copied())
             .collect::<Vec<_>>();
         out_indices.sort_unstable();
-        out_degree[index] = out_indices.len();
-        neighbors[index] = out_indices;
+        outgoing[index] = out_indices
+            .into_iter()
+            .map(|neighbor| (neighbor, 1.0))
+            .collect();
     }
 
-    let mut rank = teleport.clone();
-    let mut next = vec![0.0; nodes.len()];
-    for _ in 0..MAX_ITERS {
-        for (index, teleport_weight) in teleport.iter().enumerate() {
-            next[index] = (1.0 - ALPHA) * teleport_weight;
-        }
-
-        let mut dangling_mass = 0.0;
-        for index in 0..nodes.len() {
-            if out_degree[index] == 0 {
-                dangling_mass += rank[index];
-                continue;
-            }
-
-            let share = ALPHA * rank[index] / out_degree[index] as f64;
-            for neighbor in &neighbors[index] {
-                next[*neighbor] += share;
-            }
-        }
-
-        if dangling_mass.abs() > 1.0e-10 {
-            let add = ALPHA * dangling_mass;
-            for (index, teleport_weight) in teleport.iter().enumerate() {
-                next[index] += add * teleport_weight;
-            }
-        }
-
-        let diff = next
-            .iter()
-            .zip(&rank)
-            .map(|(left, right)| (left - right).abs())
-            .sum::<f64>();
-        std::mem::swap(&mut rank, &mut next);
-        if diff < CONVERGENCE_EPSILON {
-            break;
-        }
-    }
+    let rank = weighted_page_rank(&outgoing, &teleport);
 
     let seed_files: HashSet<_> = positive_seeds.keys().cloned().collect();
     let mut ranked = nodes
@@ -338,6 +512,103 @@ fn related_files_by_imports(
     ranked.sort_by(compare_file_relevance);
     ranked.truncate(k);
     ranked
+}
+
+/// Run weighted PageRank over a dense, caller-supplied node order.
+///
+/// Each outgoing entry is `(target_index, positive_weight)`. Transition mass is
+/// divided by the source's total outgoing weight. A non-empty `teleport` vector
+/// is normalized before use; an empty vector selects uniform teleportation,
+/// which is the ordinary global-centrality form of PageRank. Dangling mass is
+/// redistributed through the same teleport vector so personalized rank remains
+/// anchored to its seeds.
+fn weighted_page_rank(outgoing: &[Vec<(usize, f64)>], teleport: &[f64]) -> Vec<f64> {
+    let node_count = outgoing.len();
+    if node_count == 0 {
+        return Vec::new();
+    }
+    assert!(
+        teleport.is_empty() || teleport.len() == node_count,
+        "teleport vector must be empty or match the graph node count"
+    );
+
+    let normalized_teleport = if teleport.is_empty() {
+        vec![1.0 / node_count as f64; node_count]
+    } else {
+        let total = teleport
+            .iter()
+            .copied()
+            .filter(|weight| weight.is_finite() && *weight > 0.0)
+            .sum::<f64>();
+        if total <= 0.0 {
+            vec![1.0 / node_count as f64; node_count]
+        } else {
+            teleport
+                .iter()
+                .map(|weight| {
+                    if weight.is_finite() && *weight > 0.0 {
+                        *weight / total
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        }
+    };
+    // Avoid a separate initialization rule: PageRank starts from the same
+    // distribution it teleports to, preserving the previous personalized path.
+    let mut rank = normalized_teleport.clone();
+    let mut next = vec![0.0; node_count];
+    let outgoing_weight = outgoing
+        .iter()
+        .map(|edges| {
+            edges
+                .iter()
+                .filter_map(|(_, weight)| (weight.is_finite() && *weight > 0.0).then_some(*weight))
+                .sum::<f64>()
+        })
+        .collect::<Vec<_>>();
+
+    for _ in 0..MAX_ITERS {
+        for (index, teleport_weight) in normalized_teleport.iter().enumerate() {
+            next[index] = (1.0 - ALPHA) * teleport_weight;
+        }
+
+        let mut dangling_mass = 0.0;
+        for (source, edges) in outgoing.iter().enumerate() {
+            let total_weight = outgoing_weight[source];
+            if total_weight <= 0.0 {
+                dangling_mass += rank[source];
+                continue;
+            }
+
+            let source_mass = ALPHA * rank[source] / total_weight;
+            for (target, weight) in edges {
+                if *target < node_count && weight.is_finite() && *weight > 0.0 {
+                    next[*target] += source_mass * weight;
+                }
+            }
+        }
+
+        if dangling_mass.abs() > 1.0e-10 {
+            let redistributed = ALPHA * dangling_mass;
+            for (index, teleport_weight) in normalized_teleport.iter().enumerate() {
+                next[index] += redistributed * teleport_weight;
+            }
+        }
+
+        let diff = next
+            .iter()
+            .zip(&rank)
+            .map(|(left, right)| (left - right).abs())
+            .sum::<f64>();
+        std::mem::swap(&mut rank, &mut next);
+        if diff < CONVERGENCE_EPSILON {
+            break;
+        }
+    }
+
+    rank
 }
 
 fn build_import_graph(
@@ -1262,13 +1533,17 @@ fn compare_file_relevance(left: &FileRelevance, right: &FileRelevance) -> std::c
 }
 
 #[cfg(test)]
+mod weight_benchmark;
+
+#[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_RECENCY_HALF_LIFE, FileRelevance, GitProjectContext, RepoCommitChangeCache,
-        clear_repo_commit_change_cache_for_root, commit_age_weight,
+        UsageReferenceWeights, clear_repo_commit_change_cache_for_root, commit_age_weight,
         most_relevant_project_files_with_half_life, related_files_by_git, related_files_by_imports,
-        repo_commit_change_cache,
+        repo_commit_change_cache, weighted_page_rank,
     };
+    use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
     use crate::analyzer::{
         AnalyzerDelegate, JavaAnalyzer, Language, MultiAnalyzer, ProjectFile, PythonAnalyzer,
         TestProject,
@@ -1578,6 +1853,81 @@ mod tests {
                 .iter()
                 .all(|entry| entry.score > 0.0 && entry.score < 1.0)
         );
+    }
+
+    #[test]
+    fn weighted_page_rank_supports_uniform_global_centrality() {
+        let scores = weighted_page_rank(&[vec![(1, 1.0)], Vec::new()], &[]);
+
+        assert_eq!(scores.len(), 2);
+        assert!((scores.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
+        assert!(scores[1] > scores[0], "scores: {scores:?}");
+    }
+
+    #[test]
+    fn weighted_page_rank_uses_edge_weights() {
+        let scores = weighted_page_rank(
+            &[vec![(1, 1.0), (2, 3.0)], Vec::new(), Vec::new()],
+            &[1.0, 0.0, 0.0],
+        );
+
+        assert!(scores[2] > scores[1], "scores: {scores:?}");
+        assert!((scores.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn calibrated_usage_weights_apply_a_subtle_behavioral_preference() {
+        let weights = UsageReferenceWeights::CALIBRATED;
+        let call = weights.combine(UsageReferenceCounts {
+            calls: 1,
+            ..UsageReferenceCounts::default()
+        });
+        let member = weights.combine(UsageReferenceCounts {
+            members: 1,
+            ..UsageReferenceCounts::default()
+        });
+        let type_reference = weights.combine(UsageReferenceCounts {
+            types: 1,
+            ..UsageReferenceCounts::default()
+        });
+        let other = weights.combine(UsageReferenceCounts {
+            other: 1,
+            ..UsageReferenceCounts::default()
+        });
+        assert!(call > member && member > type_reference && type_reference > other);
+
+        let scores = weighted_page_rank(
+            &[
+                vec![(1, call), (2, member), (3, type_reference), (4, other)],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ],
+            &[1.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        assert!(scores[1] > scores[2]);
+        assert!(scores[2] > scores[3]);
+        assert!(scores[3] > scores[4]);
+    }
+
+    #[test]
+    fn weighted_page_rank_returns_dangling_mass_to_personalized_seeds() {
+        let scores = weighted_page_rank(&[vec![(1, 1.0)], Vec::new()], &[2.0, 0.0]);
+
+        assert!(scores[0] > 0.0 && scores[1] > 0.0, "scores: {scores:?}");
+        assert!((scores.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn weighted_page_rank_converges_deterministically_on_a_cycle() {
+        let outgoing = [vec![(1, 1.0)], vec![(2, 1.0)], vec![(0, 1.0)]];
+        let first = weighted_page_rank(&outgoing, &[3.0, 1.0, 0.0]);
+        let second = weighted_page_rank(&outgoing, &[3.0, 1.0, 0.0]);
+
+        assert_eq!(first, second);
+        assert!((first.iter().sum::<f64>() - 1.0).abs() < 1.0e-6);
+        assert!(first.iter().all(|score| score.is_finite() && *score > 0.0));
     }
 
     #[test]
