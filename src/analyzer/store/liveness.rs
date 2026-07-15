@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use git2::{Oid, Repository};
+use git2::{ObjectType, Oid, Repository};
 use sha2::{Digest, Sha256};
 
 use crate::analyzer::ProjectFile;
@@ -36,12 +36,14 @@ impl Liveness {
 
     /// Point resolution: hash the exact bytes visible in the working tree.
     pub fn oid_for_path(&self, file: &ProjectFile) -> Result<Option<Oid>> {
-        if !file.abs_path().is_file() {
+        let rel_path = self.rel_path_from_workdir(file)?;
+        let abs_path = self.workdir.join(rel_path);
+        if !abs_path.is_file() {
             return Ok(None);
         }
-        let repo = self.repo.lock().expect("liveness repo mutex poisoned");
-        let rel_path = self.rel_path_from_workdir(file)?;
-        gitblob::working_tree_oid_for_path(&repo, &rel_path)
+        Oid::hash_file(ObjectType::Blob, abs_path)
+            .map(Some)
+            .map_err(|err| err.to_string())
     }
 
     /// Full live view; rebuilt when the Git index bytes or overlay generation change.

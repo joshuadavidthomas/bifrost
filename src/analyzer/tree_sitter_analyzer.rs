@@ -1733,23 +1733,25 @@ where
     fn resolve_live_oids(
         project: &dyn Project,
         files: &[ProjectFile],
+        config: &AnalyzerConfig,
         store_context: &AnalyzerStoreContext,
         replace_live_paths: bool,
     ) -> Result<HashMap<ProjectFile, Oid>, String> {
-        let mut out = map_with_capacity(files.len());
-        let mut live_entries = Vec::new();
-        for file in files {
-            if !file.exists() && !project.has_overlay(file) {
-                continue;
+        type PlannedLiveOid = Option<(ProjectFile, Oid, LivePathEntry)>;
+
+        let plan_one = |file: &ProjectFile| -> Result<PlannedLiveOid, String> {
+            let has_overlay = project.has_overlay(file);
+            if !file.exists() && !has_overlay {
+                return Ok(None);
             }
-            let (oid, entry) = if project.has_overlay(file) {
+            let (oid, entry) = if has_overlay {
                 let source = project.read_source(file).map_err(|err| err.to_string())?;
                 let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                     .map_err(|err| err.to_string())?;
                 (oid, LivePathEntry::overlay(file.clone(), oid))
             } else if let Some(liveness) = store_context.liveness.as_ref() {
                 let Some(oid) = liveness.oid_for_path(file)? else {
-                    continue;
+                    return Ok(None);
                 };
                 (oid, LivePathEntry::filesystem(file.clone(), oid))
             } else {
@@ -1758,8 +1760,26 @@ where
                     Oid::hash_object(ObjectType::Blob, &bytes).map_err(|err| err.to_string())?;
                 (oid, LivePathEntry::overlay(file.clone(), oid))
             };
+            Ok(Some((file.clone(), oid, entry)))
+        };
+        let planned = if files.len() <= 1 {
+            files.iter().map(&plan_one).collect::<Vec<_>>()
+        } else {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(config.parallelism().clamp(1, files.len()))
+                .build()
+                .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
+            pool.install(|| files.par_iter().map(&plan_one).collect::<Vec<_>>())
+        };
+
+        let mut out = map_with_capacity(files.len());
+        let mut live_entries = Vec::with_capacity(files.len());
+        for result in planned {
+            let Some((file, oid, entry)) = result? else {
+                continue;
+            };
             live_entries.push(entry);
-            out.insert(file.clone(), oid);
+            out.insert(file, oid);
         }
         if let Some(liveness) = store_context.liveness.as_ref() {
             let _ = liveness.refresh_overlay(live_entries.iter().cloned());
@@ -1984,7 +2004,8 @@ where
         let mut fresh_parse_errors = HashMap::default();
         let mut seeded_file_states = Vec::new();
         let mut persistence_stats = PersistBatchStats::default();
-        let oid_plan = Self::resolve_live_oids(project, &files, store_context, replace_live_paths);
+        let oid_plan =
+            Self::resolve_live_oids(project, &files, config, store_context, replace_live_paths);
         match oid_plan {
             Ok(file_oids) => {
                 let all_blob_keys: Vec<_> = files
@@ -5034,6 +5055,78 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct OidRendezvousState {
+        arrivals: usize,
+    }
+
+    #[derive(Clone)]
+    struct RendezvousOverlayProject {
+        delegate: TestProject,
+        calls: Arc<AtomicUsize>,
+        rendezvous: Arc<(Mutex<OidRendezvousState>, Condvar)>,
+        timed_out: Arc<std::sync::atomic::AtomicBool>,
+        fail_reads: bool,
+    }
+
+    impl Project for RendezvousOverlayProject {
+        fn root(&self) -> &Path {
+            self.delegate.root()
+        }
+
+        fn analyzer_languages(&self) -> BTreeSet<Language> {
+            self.delegate.analyzer_languages()
+        }
+
+        fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.all_files()
+        }
+
+        fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+            self.delegate.analyzable_files(language)
+        }
+
+        fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+            self.delegate.file_by_rel_path(rel_path)
+        }
+
+        fn read_source(&self, file: &ProjectFile) -> std::io::Result<String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < 2 {
+                let (state, wake) = &*self.rendezvous;
+                let mut state = state.lock().expect("OID rendezvous mutex poisoned");
+                state.arrivals += 1;
+                wake.notify_all();
+                if state.arrivals < 2 {
+                    let (new_state, timeout) = wake
+                        .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                            state.arrivals < 2
+                        })
+                        .expect("OID rendezvous mutex poisoned");
+                    state = new_state;
+                    if timeout.timed_out() && state.arrivals < 2 {
+                        self.timed_out.store(true, Ordering::SeqCst);
+                        wake.notify_all();
+                    }
+                }
+            }
+            if self.fail_reads {
+                if file.rel_path() == Path::new("src/First.java") {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                return Err(std::io::Error::other(format!(
+                    "{} overlay OID failure",
+                    file.rel_path().display()
+                )));
+            }
+            self.delegate.read_source(file)
+        }
+
+        fn has_overlay(&self, _file: &ProjectFile) -> bool {
+            true
+        }
+    }
+
     #[derive(Clone)]
     struct BlockingParseProject {
         delegate: TestProject,
@@ -5076,6 +5169,137 @@ mod tests {
             }
             self.delegate.read_source(file)
         }
+    }
+
+    #[test]
+    fn live_oid_resolution_hashes_two_overlays_concurrently() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let first = temp_file(&root, "src/First.java");
+        first
+            .write("package demo; class First {}\n")
+            .expect("first Java source");
+        let second = temp_file(&root, "src/Second.java");
+        second
+            .write("package demo; class Second {}\n")
+            .expect("second Java source");
+
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let project: Arc<dyn Project> = Arc::new(RendezvousOverlayProject {
+            delegate: TestProject::new(&root, Language::Java),
+            calls: Arc::new(AtomicUsize::new(0)),
+            rendezvous: Arc::new((Mutex::new(OidRendezvousState::default()), Condvar::new())),
+            timed_out: Arc::clone(&timed_out),
+            fail_reads: false,
+        });
+
+        let analyzer = TreeSitterAnalyzer::new_with_config(
+            project,
+            JavaAdapter,
+            AnalyzerConfig {
+                parallelism: Some(2),
+                ..AnalyzerConfig::default()
+            },
+        );
+
+        assert!(
+            !timed_out.load(Ordering::SeqCst),
+            "both overlay OID reads should rendezvous before the deadlock guard releases either one"
+        );
+        for (file, expected) in [(&first, "First"), (&second, "Second")] {
+            assert!(
+                analyzer
+                    .get_declarations(file)
+                    .iter()
+                    .any(|declaration| declaration.short_name() == expected),
+                "real reconcile should retain the {expected} declaration"
+            );
+        }
+    }
+
+    #[test]
+    fn live_oid_resolution_reports_first_input_error_after_parallel_planning() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let first = temp_file(&root, "src/First.java");
+        first.write("first\n").expect("first source");
+        let second = temp_file(&root, "src/Second.java");
+        second.write("second\n").expect("second source");
+
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let project = RendezvousOverlayProject {
+            delegate: TestProject::new(&root, Language::Java),
+            calls: Arc::new(AtomicUsize::new(0)),
+            rendezvous: Arc::new((Mutex::new(OidRendezvousState::default()), Condvar::new())),
+            timed_out: Arc::clone(&timed_out),
+            fail_reads: true,
+        };
+        let store_context = default_store_context(&project);
+
+        let error = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
+            &project,
+            &[first, second],
+            &AnalyzerConfig {
+                parallelism: Some(2),
+                ..AnalyzerConfig::default()
+            },
+            &store_context,
+            true,
+        )
+        .expect_err("both overlay reads fail");
+
+        assert!(
+            !timed_out.load(Ordering::SeqCst),
+            "the error-order test should exercise concurrent planning"
+        );
+        assert_eq!(error, "src/First.java overlay OID failure");
+    }
+
+    #[test]
+    fn empty_live_oid_planning_preserves_refresh_and_replace_semantics() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "src/Existing.java");
+        let source = "package demo; class Existing {}\n";
+        file.write(source).expect("existing Java source");
+        let project = TestProject::new(&root, Language::Java);
+        let store_context = default_store_context(&project);
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).expect("source OID");
+        store_context
+            .live_paths
+            .refresh([LivePathEntry::overlay(file.clone(), oid)]);
+        let config = AnalyzerConfig {
+            parallelism: Some(2),
+            ..AnalyzerConfig::default()
+        };
+
+        let refreshed = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
+            &project,
+            &[],
+            &config,
+            &store_context,
+            false,
+        )
+        .expect("empty refresh");
+        assert!(refreshed.is_empty());
+        assert_eq!(
+            store_context.live_paths.snapshot().oid_for_path(&file),
+            Some(oid)
+        );
+
+        let replaced = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
+            &project,
+            &[],
+            &config,
+            &store_context,
+            true,
+        )
+        .expect("empty replacement");
+        assert!(replaced.is_empty());
+        assert_eq!(
+            store_context.live_paths.snapshot().oid_for_path(&file),
+            None
+        );
     }
 
     #[test]
