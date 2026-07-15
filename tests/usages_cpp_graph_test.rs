@@ -8,6 +8,7 @@ use brokk_bifrost::{
     WorkspaceAnalyzer,
 };
 use common::InlineTestProject;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 fn cpp_analyzer_with_files(
@@ -6730,4 +6731,200 @@ void ArcBluetoothBridge::Arm() {
         .result;
 
     assert_success_counts(result, &targets[0], 1, 0);
+}
+
+#[test]
+fn authoritative_cpp_class_usage_keeps_owner_header_parameter_type() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "owner.h",
+            r#"namespace ns {
+class Owner {
+public:
+    Owner& operator=(const Owner&) = delete;
+};
+}
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "owner.h"
+void consume(const ns::Owner* value);
+"#,
+        ),
+    ]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "ns.Owner" && !unit.is_synthetic()
+    });
+    let owner = project.file("owner.h");
+    let source = owner.read_to_string().expect("owner header");
+    let return_start = source
+        .find("Owner& operator")
+        .expect("operator return type");
+    let return_end = return_start + "Owner".len();
+    let parameter = source.find("const Owner&").expect("operator parameter");
+    let parameter_start = parameter + "const ".len();
+    let parameter_end = parameter_start + "Owner".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(owner.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(owner.clone()).collect(),
+        "authoritative query must scan only owner.h"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected authoritative owner-header class usage success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(
+        hits.len(),
+        2,
+        "only the operator return and parameter types are Class usages: {hits:#?}"
+    );
+    assert_eq!(
+        hits.iter()
+            .map(|hit| {
+                assert_eq!(hit.file, owner);
+                (hit.start_offset, hit.end_offset)
+            })
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([(return_start, return_end), (parameter_start, parameter_end),]),
+        "exact Owner type_identifiers must survive while declaration names stay excluded"
+    );
+}
+
+#[test]
+fn authoritative_cpp_class_usage_keeps_consumer_qualified_parameter_type() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        (
+            "owner.h",
+            r#"namespace ns {
+class Owner {
+public:
+    Owner& operator=(const Owner&) = delete;
+};
+}
+
+"#,
+        ),
+        (
+            "consumer.cc",
+            r#"#include "owner.h"
+void consume(const ns::Owner* value);
+"#,
+        ),
+    ]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "ns.Owner" && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expected_start = source.find("ns::Owner").expect("qualified parameter type");
+    let expected_end = expected_start + "ns::Owner".len();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect(),
+        "authoritative query must scan only consumer.cc"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected authoritative consumer class usage success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(
+        hits.len(),
+        1,
+        "only the qualified parameter type is a Class usage: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("one consumer type hit");
+    assert_eq!(hit.file, consumer);
+    assert_eq!(
+        (hit.start_offset, hit.end_offset),
+        (expected_start, expected_end),
+        "the exact ns::Owner type node must be returned, excluding value"
+    );
+}
+
+#[test]
+fn authoritative_cpp_class_usage_distinguishes_named_and_abstract_declarators() {
+    let (project, analyzer) = cpp_analyzer_with_files(&[
+        ("owner.h", "namespace ns { class Owner {}; }\n"),
+        (
+            "consumer.cc",
+            r#"#include "owner.h"
+void named_pointer(const ns::Owner* Owner);
+void unnamed_pointer(const ns::Owner*);
+void named_reference(const ns::Owner& Owner);
+void unnamed_reference(const ns::Owner&);
+void named_array(const ns::Owner Owner[2]);
+void unnamed_array(const ns::Owner [2]);
+void named_function(void (*Owner)(ns::Owner));
+void unnamed_function(void (*)(ns::Owner));
+typedef ns::Owner Owner;
+"#,
+        ),
+    ]);
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class && unit.fq_name() == "ns.Owner" && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let expected = source
+        .match_indices("ns::Owner")
+        .map(|(start, text)| (start, start + text.len()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(expected.len(), 9, "fixture type occurrences");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query.result
+    else {
+        panic!("expected named/abstract declarator class usage success");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert_eq!(
+        hits.iter()
+            .map(|hit| {
+                assert_eq!(hit.file, consumer);
+                (hit.start_offset, hit.end_offset)
+            })
+            .collect::<BTreeSet<_>>(),
+        expected,
+        "all named/unnamed pointer, reference, array, function, and alias RHS types must hit exactly; actual Owner declarator names must not"
+    );
 }

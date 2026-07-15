@@ -5,7 +5,7 @@ use crate::analyzer::usages::cpp_call_match::{
 };
 use crate::analyzer::usages::cpp_graph::hits::{
     enclosing_context, is_member_field_declaration_context, push_definition_hit, push_hit,
-    push_self_receiver_hit, push_unproven_hit,
+    push_self_receiver_hit, push_type_hit, push_unproven_hit,
 };
 use crate::analyzer::usages::cpp_graph::resolver::*;
 use crate::analyzer::usages::cpp_graph::syntax::explicit_qualified_callable_value;
@@ -318,6 +318,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
+    if !recovered_return_type && is_nested_type_node(node) {
+        return;
+    }
     if !recovered_return_type && is_declaration_name(node) {
         if let Some((scope, owner)) =
             out_of_line_member_definition_owner(ctx.visibility, ctx.file, ctx.source, node)
@@ -342,7 +345,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         .visibility
         .resolves_to_type(ctx.analyzer, ctx.file, text, &ctx.spec.target)
     {
-        push_hit(hit_node, ctx);
+        push_type_hit(hit_node, ctx);
     } else if let Some(scope) = static_qualifier_type_scope(node, ctx) {
         push_hit(scope, ctx);
     } else if !ctx.visibility.is_visible(ctx.file, &ctx.spec.target) {
@@ -1002,23 +1005,7 @@ fn function_definition_name_node(node: Node<'_>) -> Option<Node<'_>> {
         return None;
     }
     node.child_by_field_name("declarator")
-        .and_then(callable_declarator_name_node)
-}
-
-fn callable_declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
-    match node.kind() {
-        "identifier"
-        | "field_identifier"
-        | "qualified_identifier"
-        | "scoped_identifier"
-        | "operator_name"
-        | "destructor_name" => Some(node),
-        _ => node
-            .child_by_field_name("declarator")
-            .or_else(|| node.child_by_field_name("name"))
-            .or_else(|| node.child_by_field_name("field"))
-            .and_then(callable_declarator_name_node),
-    }
+        .and_then(declarator_name_node)
 }
 
 fn function_definition_signature_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

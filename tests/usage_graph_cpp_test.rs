@@ -82,6 +82,54 @@ fn new_expression_and_type_reference_edge_to_the_class() {
 }
 
 #[test]
+fn scoped_type_reference_creates_one_workspace_graph_edge() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "types.h",
+            r#"#pragma once
+namespace library {
+class Value {};
+}
+"#,
+        )
+        .file(
+            "consumer.cpp",
+            r#"#include "types.h"
+namespace consumer {
+void use() {
+    library::Value value;
+}
+}
+"#,
+        )
+        .build();
+
+    let value = usage_graph_at(project.root(), "{}");
+    let edges: Vec<_> = value["edges"]
+        .as_array()
+        .expect("edges array")
+        .iter()
+        .filter(|edge| {
+            edge["from"].as_str() == Some("consumer.use")
+                && edge["to"].as_str() == Some("library.Value")
+        })
+        .collect();
+
+    assert_eq!(
+        edges.len(),
+        1,
+        "scoped type should produce exactly one edge: {}",
+        value["edges"]
+    );
+    assert_eq!(
+        edges[0]["weight"].as_u64(),
+        Some(1),
+        "scoped type's outer and terminal nodes must not be counted twice: {}",
+        edges[0]
+    );
+}
+
+#[test]
 fn out_of_line_member_definition_qualifiers_edge_to_class() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

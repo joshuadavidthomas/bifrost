@@ -1978,21 +1978,121 @@ pub(in crate::analyzer::usages) fn is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    parent.child_by_field_name("name") == Some(node) && parent.kind() != "template_function"
-        || parent.kind() == "enumerator"
-        || matches!(parent.kind(), "function_declarator" | "init_declarator")
-            && parent
-                .child_by_field_name("declarator")
-                .is_some_and(|declarator| node_contains(declarator, node))
-        || matches!(
-            parent.kind(),
+    if matches!(
+        parent.kind(),
+        "class_specifier"
+            | "struct_specifier"
+            | "union_specifier"
+            | "enum_specifier"
+            | "namespace_definition"
+            | "namespace_alias_definition"
+            | "alias_declaration"
+            | "enumerator"
+    ) && parent
+        .child_by_field_name("name")
+        .is_some_and(|name| same_node(name, node))
+    {
+        return true;
+    }
+
+    let mut current = Some(parent);
+    while let Some(ancestor) = current {
+        let type_definition = ancestor.kind() == "type_definition";
+        if ancestor
+            .child_by_field_name("declarator")
+            .is_some_and(|declarator| {
+                declarator_name_path_contains(declarator, node, type_definition)
+            })
+        {
+            return true;
+        }
+        if matches!(
+            ancestor.kind(),
             "declaration"
                 | "field_declaration"
                 | "parameter_declaration"
                 | "optional_parameter_declaration"
-        ) && parent
+                | "function_definition"
+                | "type_definition"
+                | "alias_declaration"
+                | "class_specifier"
+                | "struct_specifier"
+                | "union_specifier"
+                | "enum_specifier"
+        ) {
+            return false;
+        }
+        current = ancestor.parent();
+    }
+    false
+}
+
+pub(super) fn declarator_name_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier"
+        | "field_identifier"
+        | "qualified_identifier"
+        | "scoped_identifier"
+        | "operator_name"
+        | "destructor_name"
+        | "literal_operator_name" => Some(node),
+        _ => node
             .child_by_field_name("declarator")
-            .is_some_and(|declarator| node_contains(declarator, node))
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| node.child_by_field_name("field"))
+            .and_then(declarator_name_node),
+    }
+}
+
+fn declarator_name_path_contains(
+    declarator: Node<'_>,
+    candidate: Node<'_>,
+    allow_type_identifier: bool,
+) -> bool {
+    let Some(name) = declarator_name_leaf(declarator, allow_type_identifier) else {
+        return false;
+    };
+    let mut current = Some(declarator);
+    while let Some(node) = current {
+        if same_node(node, candidate) {
+            return true;
+        }
+        if same_node(node, name) {
+            return false;
+        }
+        current = node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| node.child_by_field_name("field"));
+    }
+    false
+}
+
+fn declarator_name_leaf(node: Node<'_>, allow_type_identifier: bool) -> Option<Node<'_>> {
+    match node.kind() {
+        "identifier"
+        | "field_identifier"
+        | "operator_name"
+        | "destructor_name"
+        | "literal_operator_name" => Some(node),
+        "type_identifier" if allow_type_identifier => Some(node),
+        _ => node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| node.child_by_field_name("field"))
+            .and_then(|child| declarator_name_leaf(child, allow_type_identifier)),
+    }
+}
+
+/// True when `node` is a component of a larger structured type node whose outer
+/// range is the single reference surfaced to callers.
+pub(super) fn is_nested_type_node(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_type_identifier" | "template_type"
+        )
+    })
 }
 
 pub(super) fn out_of_line_member_definition_owner<'tree>(
@@ -2016,10 +2116,6 @@ pub(super) fn out_of_line_member_definition_owner<'tree>(
     };
     let owner = visibility.canonical_type_for_reference(file, lookup)?;
     Some((scope, owner))
-}
-
-fn node_contains(parent: Node<'_>, child: Node<'_>) -> bool {
-    parent.start_byte() <= child.start_byte() && child.end_byte() <= parent.end_byte()
 }
 
 pub(super) fn has_ancestor_kind(node: Node<'_>, kind: &str) -> bool {

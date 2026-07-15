@@ -27,8 +27,8 @@ use super::resolver::{
     DesignatedInitializerOwner, LexicalCallableValueResolution, TargetKind, VisibilityIndex,
     VisibleMemberResolution, constructor_style_local_declaration, designated_initializer_owner,
     extract_variable_name, first_type_child, infer_cpp_initializer_type, is_declaration_name,
-    is_declarator_node, normalize_type_text, out_of_line_member_definition_owner,
-    recovered_macro_function_return_type, type_owner_of,
+    is_declarator_node, is_nested_type_node, normalize_type_text,
+    out_of_line_member_definition_owner, recovered_macro_function_return_type, type_owner_of,
 };
 use super::syntax::explicit_qualified_callable_value;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
@@ -189,7 +189,7 @@ fn record_reference(
         // A type reference (`Foo x`, base class, `new Foo()`'s type child) resolves
         // to the class. `new Foo()` reaches its type via this case (its type child
         // is itself one of these nodes), so there is no separate construction case.
-        "type_identifier" | "qualified_identifier" | "template_type" => {
+        "type_identifier" | "qualified_identifier" | "scoped_type_identifier" | "template_type" => {
             if is_declaration_name(node) {
                 if let Some((scope, owner)) =
                     out_of_line_member_definition_owner(ctx.visibility, ctx.file, ctx.source, node)
@@ -360,13 +360,6 @@ fn receiver_is_self_like(receiver: Node<'_>) -> bool {
             .is_some_and(receiver_is_self_like),
         _ => false,
     }
-}
-
-/// True when `node` is nested inside a larger qualified/scoped type node, so the
-/// outer node already covers the reference (avoids double counting / partial text).
-fn is_nested_type_node(node: Node<'_>) -> bool {
-    node.parent()
-        .is_some_and(|parent| parent.kind() == "qualified_identifier")
 }
 
 /// If `node` is the `function` of a namespace-qualified free-function call, its target.
