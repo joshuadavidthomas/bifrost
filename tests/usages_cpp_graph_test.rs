@@ -3,7 +3,10 @@ mod common;
 use brokk_bifrost::usages::{
     CppUsageGraphStrategy, ExplicitCandidateProvider, FuzzyResult, UsageAnalyzer, UsageFinder,
 };
-use brokk_bifrost::{CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, ProjectFile};
+use brokk_bifrost::{
+    AnalyzerConfig, CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, ProjectFile,
+    WorkspaceAnalyzer,
+};
 use common::InlineTestProject;
 use std::sync::Arc;
 
@@ -1755,6 +1758,226 @@ void hidden_call(demo::Graph& graph, demo::Rect& rect) {
             .unwrap_or_default(),
         0,
         "wrong-owner, overload, and shadow calls are proven negatives; the hidden same-FQN call must not enter this target's candidate set"
+    );
+}
+
+#[test]
+fn persisted_authoritative_cpp_usage_is_invariant_to_equivalent_method_target_order() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("aaa/gurl_forward.h", "class GURL;\n")
+        .file("base/gurl_forward.h", "class GURL;\n")
+        .file(
+            "url/gurl.h",
+            r#"#pragma once
+#define COMPONENT_EXPORT(component)
+class COMPONENT_EXPORT(URL) GURL {
+public:
+    void Swap(GURL* other);
+    void Swap(int value);
+    bool is_empty() const;
+};
+class WrongGURL {
+public:
+    void Swap(GURL* other);
+};
+"#,
+        )
+        .file(
+            "url/gurl.cc",
+            r#"#include "url/gurl.h"
+void GURL::Swap(GURL* other) {}
+void GURL::Swap(int value) {}
+void WrongGURL::Swap(GURL* other) {}
+"#,
+        )
+        .file(
+            "net/url_request/url_request.cc",
+            r#"#include "aaa/gurl_forward.h"
+#include "base/gurl_forward.h"
+#include "url/gurl.h"
+namespace net {
+class URLRequest {
+public:
+    void BeforeRequestComplete();
+private:
+    GURL delegate_redirect_url_;
+    WrongGURL wrong_;
+};
+void URLRequest::BeforeRequestComplete() {
+    if (false) {
+    } else if (!delegate_redirect_url_.is_empty()) {
+        GURL new_url;
+        new_url.Swap(&delegate_redirect_url_); // positive
+        new_url.Swap(7); // negative-overload
+        wrong_.Swap(&delegate_redirect_url_); // negative-owner
+    }
+}
+}
+"#,
+        )
+        .file(
+            "hidden/gurl.h",
+            r#"class GURL {
+public:
+    void Swap(GURL* other);
+};
+"#,
+        )
+        .file(
+            "hidden/consumer.cc",
+            r#"#include "hidden/gurl.h"
+void hidden_call(GURL& value, GURL& other) {
+    value.Swap(&other); // negative-non-visible-owner
+}
+"#,
+        )
+        .build();
+    let project_handle = project.project_dyn();
+    let cold =
+        WorkspaceAnalyzer::build_persisted(Arc::clone(&project_handle), AnalyzerConfig::default());
+    drop(cold);
+    let reopened = WorkspaceAnalyzer::build_persisted(project_handle, AnalyzerConfig::default());
+    let analyzer = reopened.analyzer();
+
+    let method_in = |path: &str| {
+        let declarations = analyzer.get_all_declarations();
+        declarations
+            .iter()
+            .find(|unit| {
+                unit.kind() == CodeUnitType::Function
+                    && unit.fq_name() == "GURL.Swap"
+                    && unit
+                        .signature()
+                        .is_some_and(|signature| signature.contains("GURL *"))
+                    && slash_path(unit.source()) == path
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("missing GURL.Swap(GURL*) in {path}: {declarations:#?}"))
+    };
+    let implementation = method_in("url/gurl.cc");
+    let declaration = method_in("url/gurl.h");
+    assert!(!implementation.is_synthetic());
+    assert!(declaration.is_synthetic());
+    assert_eq!(implementation.fq_name(), declaration.fq_name());
+    assert_eq!(implementation.signature(), declaration.signature());
+    let declaration_owner = analyzer
+        .parent_of(&declaration)
+        .expect("the synthetic header method should retain its structural GURL parent");
+    assert_eq!(declaration_owner.fq_name(), "GURL");
+    let implementation_owner = analyzer
+        .parent_of(&implementation)
+        .expect("the real out-of-line method should recover the directly included GURL parent");
+    assert_eq!(
+        implementation_owner, declaration_owner,
+        "both persisted physical method representations should recover one logical owner"
+    );
+
+    let consumer = project.file("net/url_request/url_request.cc");
+    let source = consumer.read_to_string().expect("consumer source");
+    let positive = source
+        .find("Swap(&delegate_redirect_url_); // positive")
+        .unwrap();
+    let negative_overload = source.find("Swap(7); // negative-overload").unwrap();
+    let negative_owner = source
+        .find("Swap(&delegate_redirect_url_); // negative-owner")
+        .unwrap();
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = |targets: &[CodeUnit]| {
+        UsageFinder::new()
+            .with_authoritative_scope(true)
+            .query_with_provider(analyzer, targets, Some(&provider), 1, 1)
+            .result
+    };
+
+    for targets in [
+        [declaration.clone(), implementation.clone()],
+        [implementation.clone(), declaration.clone()],
+    ] {
+        let FuzzyResult::Success {
+            hits_by_overload,
+            unproven_total_by_overload,
+            ..
+        } = query(&targets)
+        else {
+            panic!("expected persisted authoritative success for {targets:#?}");
+        };
+        let hits = hits_by_overload
+            .get(&targets[0])
+            .expect("the first requested physical target should retain the result bucket");
+        let covers = |start: usize| {
+            hits.iter().any(|hit| {
+                hit.file == consumer
+                    && hit.start_offset <= start
+                    && start + "Swap".len() <= hit.end_offset
+            })
+        };
+        assert_eq!(
+            hits.len(),
+            1,
+            "equivalent target order must prove exactly one semantic call: targets={targets:#?}, hits={hits:#?}"
+        );
+        assert!(
+            covers(positive),
+            "missing positive for {targets:#?}: {hits:#?}"
+        );
+        assert!(
+            !covers(negative_overload),
+            "wrong overload matched for {targets:#?}: {hits:#?}"
+        );
+        assert!(
+            !covers(negative_owner),
+            "wrong owner matched for {targets:#?}: {hits:#?}"
+        );
+        assert_eq!(
+            unproven_total_by_overload
+                .get(&targets[0])
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "the overload and owner negatives should be proven exclusions"
+        );
+    }
+
+    let hidden_consumer = project.file("hidden/consumer.cc");
+    let hidden_provider = ExplicitCandidateProvider::new(Arc::new(
+        std::iter::once(hidden_consumer.clone()).collect(),
+    ));
+    let hidden_query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            analyzer,
+            &[implementation.clone(), declaration.clone()],
+            Some(&hidden_provider),
+            1,
+            1000,
+        );
+    assert_eq!(
+        hidden_query.candidate_files,
+        std::iter::once(hidden_consumer).collect(),
+        "the hidden-owner negative must scan only its explicit consumer"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = hidden_query.result
+    else {
+        panic!("expected hidden-owner authoritative success");
+    };
+    assert!(
+        hits_by_overload
+            .get(&implementation)
+            .is_none_or(|hits| hits.is_empty()),
+        "a same-FQN owner from a different, non-visible header must not match: {hits_by_overload:#?}"
+    );
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&implementation)
+            .copied()
+            .unwrap_or_default(),
+        1,
+        "the physically non-visible same-FQN owner must remain conservative rather than becoming a proven target"
     );
 }
 

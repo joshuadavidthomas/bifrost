@@ -260,6 +260,15 @@ impl VisibilityIndex {
                 .get(file)
                 .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
     }
+
+    pub(super) fn is_physically_visible(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
+        file == target.source()
+            || self
+                .visible_by_file
+                .get(file)
+                .is_some_and(|visible| visible.contains(target))
+    }
+
     pub(in crate::analyzer::usages) fn resolve_type(
         &self,
         file: &ProjectFile,
