@@ -14,7 +14,7 @@ The first observable improvement is deliberately narrow and urgent: every agent-
 
 - [x] (2026-07-15 09:47Z) Read the handed-off persona review, synchronized detached `HEAD` with `origin/master`, and verified the MCP/RQL contract against `src/mcp_extended.rs`, `src/searchtools_service.rs`, `plugins/bifrost-agent/mcp.json`, and the current docs.
 - [x] (2026-07-15 09:53Z) Added the authoritative MCP/RQL availability matrix, changed query-capable host examples from `core` to `symbol|extended`, added host validation callouts, clarified the RQL and VS Code boundaries, and made the smoke queries executable documentation tests.
-- [ ] Add a first-contact "Choose Bifrost" page that routes readers by analysis question and interface, then add a language/capability/precision matrix grounded in current analyzer behavior.
+- [x] (2026-07-15 09:59Z) Added a first-contact "Choose Bifrost" route by analysis question, interface, and persona; added a source-backed language/capability/precision matrix; updated landing and Start navigation; and inspected desktop and mobile rendering.
 - [ ] Add reproducible ten-minute evaluation journeys for the CLI, agent MCP, and VS Code using a fixture that readers can obtain or create exactly.
 - [ ] Add a static-analysis rule-building guide and an agent-result-safety guide covering result variants, diagnostics, truncation, proof tiers, and provenance.
 - [ ] Correct the known version, traversal, and obsolete tool-name drift and add durable checks where inexpensive.
@@ -30,6 +30,8 @@ The first observable improvement is deliberately narrow and urgent: every agent-
   Evidence: the current package version in `Cargo.toml` is `0.8.2`, while `docs/src/content/docs/rust-library.md` still needs to be checked and corrected during the drift milestone.
 - Observation: The minimal cross-language declaration query is valid in both canonical JSON and RQL, so one smoke can be reused across all agent-host pages without assuming a particular language.
   Evidence: `cargo test --test code_query_docs documented_code_queries_parse` parsed `{"match":{"kind":"declaration"},"limit":1}` and `(limit 1 (declaration))` successfully.
+- Observation: A Markdown table cell containing the literal toolset `symbol|extended` must escape the pipe even when the text is inside backticks.
+  Evidence: the first rendered Choose Bifrost preview split the agent row into four cells; changing it to `symbol\|extended` restored the expected three-column row.
 
 ## Decision Log
 
@@ -48,7 +50,7 @@ The first observable improvement is deliberately narrow and urgent: every agent-
 
 ## Outcomes & Retrospective
 
-The MCP/RQL contract milestone is complete. `mcp.md` now answers availability at first contact, the packaged and manual agent-host setup paths agree on `symbol|extended`, every agent-facing page distinguishes MCP from skills and verifies both inline JSON and saved RQL, and the editor pages clearly identify unsaved RQL execution as an LSP feature. Astro check/build, whitespace validation, and executable query parsing all pass. The broader persona routing and suitability work remains.
+The MCP/RQL contract and persona-routing milestones are complete. `mcp.md` now answers availability at first contact, the packaged and manual agent-host setup paths agree on `symbol|extended`, every agent-facing page distinguishes MCP from skills and verifies both inline JSON and saved RQL, and the editor pages clearly identify unsaved RQL execution as an LSP feature. The landing page now routes first to Choose Bifrost; that page selects analysis and interface before installation, and the adjacent capability matrix records language-specific precision and hard product boundaries. Astro check/build, whitespace validation, executable query parsing, cross-language tutorial coverage, and desktop/mobile rendered previews pass. Reproducible ten-minute journeys remain next.
 
 ## Context and Orientation
 
@@ -147,3 +149,5 @@ The site depends on the versions pinned by `docs/package-lock.json` and the scri
 Plan revision note (2026-07-15): Created the initial self-contained plan after verifying the handed-off review against current `master`. The milestones prioritize the incorrect MCP/RQL setup contract, then build persona routing, reproducible evaluation, safe integration, drift correction, and trust guidance on that foundation.
 
 Plan revision note (2026-07-15 09:53Z): Marked the MCP/RQL milestone complete after aligning all agent-host pages and passing `npm --prefix docs run check`, `npm --prefix docs run build`, `git diff --check`, and the focused executable query-doc test. Recorded the reusable language-neutral smoke query and left persona routing as the next milestone.
+
+Plan revision note (2026-07-15 09:59Z): Marked persona routing and the capability matrix complete after the site generated 42 pages, cross-language tutorial coverage passed, and desktop/mobile previews confirmed usable routes and scroll-contained wide tables. Recorded and corrected the rendered Markdown pipe issue found during preview.

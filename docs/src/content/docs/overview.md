@@ -25,6 +25,8 @@ its compiler or interpreter model, Bifrost keeps language-specific modelling and
 sub-analysis instead of flattening those rules into a lowest-common-denominator
 abstraction.
 
+See [Language and Analysis Capabilities](/capabilities/) for the language-by-capability matrix, precision tiers, external-dependency boundary, and unsupported control-flow, points-to, alias, and data-flow analyses. If you are deciding which Bifrost surface to use, start with [Choose Bifrost](/choose-bifrost/).
+
 ## Main Surfaces
 
 - MCP server: code-navigation tools for AI agents.

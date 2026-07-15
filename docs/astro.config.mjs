@@ -28,7 +28,9 @@ export default defineConfig({
         {
           label: 'Start',
           items: [
+            { label: 'Choose Bifrost', slug: 'choose-bifrost' },
             { label: 'Overview', slug: 'overview' },
+            { label: 'Capabilities', slug: 'capabilities' },
             { label: 'Install Bifrost', slug: 'install' },
             { label: 'CLI', slug: 'cli' },
           ],
