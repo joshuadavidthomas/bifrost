@@ -290,7 +290,6 @@ fn is_bare_term_reference(node: Node<'_>) -> bool {
         | "object_definition"
         | "trait_definition"
         | "enum_definition"
-        | "function_definition"
         | "function_declaration"
         | "parameter"
         | "class_parameter"
@@ -300,6 +299,7 @@ fn is_bare_term_reference(node: Node<'_>) -> bool {
         | "singleton_type"
         | "case_class_pattern"
         | "infix_pattern" => false,
+        "function_definition" => parent.child_by_field_name("body") == Some(node),
         "val_definition" | "var_definition" => parent.child_by_field_name("pattern") != Some(node),
         "field_expression" => parent.child_by_field_name("field") != Some(node),
         _ => true,

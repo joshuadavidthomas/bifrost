@@ -1,10 +1,13 @@
 mod common;
 
 use brokk_bifrost::usages::{
-    FuzzyResult, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
+    ExplicitCandidateProvider, FuzzyResult, ScalaUsageGraphStrategy, UsageAnalyzer, UsageFinder,
+    UsageHit, UsageHitKind,
 };
 use brokk_bifrost::{CodeUnit, CodeUnitType, IAnalyzer, Language, ScalaAnalyzer};
 use common::{InlineTestProject, line_of};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 fn scala_analyzer_with_files(
     files: &[(&str, &str)],
@@ -33,6 +36,78 @@ fn hit_snippets(result: FuzzyResult) -> Vec<String> {
         .into_iter()
         .map(|hit| hit.snippet)
         .collect()
+}
+
+#[test]
+fn authoritative_scala_object_reference_in_direct_method_body_is_exact() {
+    let consumer_source = r#"package app
+
+object Consumer {
+  def token: AnyRef = Token // positive-rhs
+  def parameter(Token: AnyRef): AnyRef = Token // negative-parameter-shadow
+  def local: AnyRef = {
+    val Token: AnyRef = other.Token
+    Token // negative-local-shadow
+  }
+  def otherPackage: AnyRef = other.Token // negative-other-package
+}
+"#;
+    let (project, analyzer) = scala_analyzer_with_files(&[
+        ("app/Token.scala", "package app\nobject Token\n"),
+        ("other/Token.scala", "package other\nobject Token\n"),
+        ("app/Consumer.scala", consumer_source),
+    ]);
+    let target = definition(&analyzer, "app.Token$");
+    let consumer = project.file("app/Consumer.scala");
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            100,
+        );
+    assert_eq!(
+        query.candidate_files,
+        std::iter::once(consumer.clone()).collect(),
+        "authoritative query must scan only the explicit consumer"
+    );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!("expected authoritative Scala usage success");
+    };
+    let actual = hits_by_overload
+        .get(&target)
+        .into_iter()
+        .flatten()
+        .map(|hit| {
+            assert_eq!(hit.file, consumer);
+            (hit.start_offset, hit.end_offset)
+        })
+        .collect::<BTreeSet<_>>();
+    let line = "  def token: AnyRef = Token // positive-rhs";
+    let line_start = consumer_source.find(line).expect("positive fixture line");
+    let token_start = line.find("Token").expect("positive Token");
+    let expected = BTreeSet::from([(
+        line_start + token_start,
+        line_start + token_start + "Token".len(),
+    )]);
+    assert_eq!(actual, expected, "only the direct method RHS is exact");
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "parameter/local shadows and the other-package object are proven negatives"
+    );
 }
 
 #[test]
