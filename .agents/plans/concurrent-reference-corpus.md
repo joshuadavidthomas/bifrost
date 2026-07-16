@@ -16,7 +16,7 @@ The observable acceptance command is a fixture-backed `run-corpus` invocation wi
 - [x] (2026-07-16 23:34Z) Added behavior-focused CLI coverage for bounded overlap, same-clone serialization, resource settings, report completeness, and resumption.
 - [x] (2026-07-16 23:34Z) Ran formatting, 8 focused CLI tests, all-target/all-feature clippy, and the complete feature-enabled test suite successfully.
 - [x] (2026-07-16 23:34Z) Ran the real Java top-ten dry-run with `--repo-jobs 5 --jobs 24`; it accepted the new resource settings and retained the established selection order without opening analyzers or caches.
-- [ ] Update this plan with final integration evidence, commit only the changed files, merge current `origin/master`, and push directly to `master`.
+- [x] (2026-07-16 23:37Z) Committed only the plan, implementation, and tests as `152e1520`; merged current `origin/master` cleanly as `d2645e43`; and reran formatting plus all 8 focused CLI tests successfully on the integrated tree. The integrated HEAD is ready for the direct `master` push.
 
 ## Surprises & Discoveries
 
@@ -63,7 +63,7 @@ The concurrency guarantee is intentionally local to one `run-corpus` process; tw
 
 ## Context and Orientation
 
-`src/bin/bifrost_reference_differential.rs` is the command-line driver. `parse_run_corpus_args` reads corpus-only flags, `select_corpus_repositories` deterministically chooses clone paths from corpus metadata, and `run_corpus_command` currently loops over that selection serially. `run_engine` constructs one `WorkspaceAnalyzer`, then calls `run_reference_differential_with_progress` from `src/reference_differential/mod.rs`. A persisted workspace stores analyzer state in the selected clone's `.brokk/bifrost_cache.db`.
+`src/bin/bifrost_reference_differential.rs` is the command-line driver. `parse_run_corpus_args` reads corpus-only flags, `select_corpus_repositories` deterministically chooses clone paths from corpus metadata, and `run_corpus_command` schedules prepared clone groups through its bounded worker queue. `run_engine` constructs one `WorkspaceAnalyzer`, then calls `run_reference_differential_with_progress` from `src/reference_differential/mod.rs`. A persisted workspace stores analyzer state in the selected clone's `.brokk/bifrost_cache.db`.
 
 `--jobs` is serialized into `ReferenceDifferentialConfig`, contributes to the run fingerprint, and controls the per-repository Rayon pool used for sampled forward files and inverse target groups. A repository worker means one outer operating-system thread responsible for one clone at a time. Repository grouping means collecting all selected language jobs with the same canonical clone path into one queue item so the worker performs them sequentially.
 
@@ -104,7 +104,7 @@ The output must list the same ten Java repositories as before because outer para
 
 ## Validation and Acceptance
 
-Acceptance requires all existing CLI behavior to remain green and the new end-to-end tests to demonstrate bounded concurrent execution rather than merely inspecting configuration fields. With three distinct repositories and `--repo-jobs 2`, two `run` events must occur before the first matching `done`, the observed active count must never exceed two, and all three records must be valid completed JSON. With one clone selected for two languages, the second job for that clone must start only after the first finishes. Repeating a completed concurrent command must append no records and must report that each job was already completed.
+Acceptance requires all existing CLI behavior to remain green and the new end-to-end tests to demonstrate bounded concurrent execution rather than merely inspecting configuration fields. With three distinct repositories and `--repo-jobs 2`, two `run` events must occur before the first matching `complete`, the observed active count must never exceed two, and all three records must be valid completed JSON. With one clone selected for two languages, the second job for that clone must start only after the first finishes. Repeating a completed concurrent command must append no records and must report that each job was already completed.
 
 The real Java dry run must accept `--repo-jobs 5`, retain the established top-ten ordering, and perform no analyzer or cache writes. Formatting, all-target/all-feature clippy, and the full `nlp,python` test suite are required before pushing because the scheduler changes a shared offline runner and analyzer construction configuration.
 
@@ -131,3 +131,5 @@ No new crate is required. Use `std::thread::scope` for bounded outer workers, `s
 Revision note (2026-07-16): Created this ExecPlan after inspecting the serial corpus loop and both analyzer worker pools. It chooses clone-root grouping and a single completion-order writer to preserve cache safety and resumability while adding bounded repository concurrency.
 
 Revision note (2026-07-16 23:34Z): Recorded the completed scheduler, behavior tests, validation results, compatibility adjustment, restricted-sandbox false failures, production top-ten dry-run, and the deliberately process-local scope of clone serialization.
+
+Revision note (2026-07-16 23:37Z): Recorded the implementation commit, clean `origin/master` merge, and successful post-merge focused validation; updated contextual language to describe the completed scheduler.
