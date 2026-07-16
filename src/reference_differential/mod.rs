@@ -13,12 +13,13 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const SOURCE_EVIDENCE_MAX_BYTES: usize = 512;
 const SOURCE_EVIDENCE_TRUNCATION_MARKER: &str = "...[truncated]...";
@@ -31,6 +32,7 @@ pub struct ReferenceDifferentialConfig {
     pub max_candidates_per_file: usize,
     pub max_source_bytes: usize,
     pub max_targets: usize,
+    pub target_parallelism: usize,
     pub max_usage_files: usize,
     pub max_usages: usize,
     pub seed: u64,
@@ -47,6 +49,7 @@ impl Default for ReferenceDifferentialConfig {
             max_candidates_per_file: 20_000,
             max_source_bytes: 2 * 1024 * 1024,
             max_targets: 1_000,
+            target_parallelism: 8,
             max_usage_files: 1_000,
             max_usages: 100_000,
             seed: 0,
@@ -179,6 +182,27 @@ pub struct ReferenceDifferentialFileError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceDifferentialProgress {
+    Inventory {
+        eligible_files: usize,
+        audited_files: usize,
+    },
+    Sampling {
+        sampled_sites: usize,
+        structured_candidates: u64,
+    },
+    ForwardResolution {
+        resolved_sites: usize,
+        distinct_targets: usize,
+    },
+    InverseTarget {
+        completed: usize,
+        total: usize,
+        target: String,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SampledSite {
     priority: [u8; 32],
@@ -212,6 +236,11 @@ struct ResolvedSite {
     targets: Vec<CodeUnit>,
 }
 
+struct PreparedInverseGroup {
+    group: ResolvedGroup,
+    candidate_files: HashSet<ProjectFile>,
+}
+
 /// Audit structured source references against the inverse usage resolver.
 ///
 /// The caller owns workspace construction and persistence. This function reads only
@@ -220,6 +249,14 @@ struct ResolvedSite {
 pub fn run_reference_differential(
     analyzer: &dyn IAnalyzer,
     config: &ReferenceDifferentialConfig,
+) -> Result<ReferenceDifferentialReport, String> {
+    run_reference_differential_with_progress(analyzer, config, &|_| {})
+}
+
+pub fn run_reference_differential_with_progress(
+    analyzer: &dyn IAnalyzer,
+    config: &ReferenceDifferentialConfig,
+    progress: &(dyn Fn(ReferenceDifferentialProgress) + Sync),
 ) -> Result<ReferenceDifferentialReport, String> {
     validate_config(config)?;
     let requested_language = corpus_language(&config.corpus_language)?;
@@ -233,6 +270,10 @@ pub fn run_reference_differential(
 
     let audited = select_audited_files(eligible, config);
     summary.audited_files = audited.len();
+    progress(ReferenceDifferentialProgress::Inventory {
+        eligible_files: summary.eligible_files,
+        audited_files: summary.audited_files,
+    });
     let sampled = collect_sampled_sites(
         analyzer,
         &audited,
@@ -242,11 +283,19 @@ pub fn run_reference_differential(
         &mut file_errors,
     )?;
     summary.sampled_sites = sampled.len();
+    progress(ReferenceDifferentialProgress::Sampling {
+        sampled_sites: summary.sampled_sites,
+        structured_candidates: summary.structured_candidates,
+    });
 
     let (mut records, resolved) =
         forward_resolve_sites(analyzer, sampled, config, &mut summary, &mut file_errors);
     let groups = resolved_groups(resolved);
     summary.distinct_targets = groups.len();
+    progress(ReferenceDifferentialProgress::ForwardResolution {
+        resolved_sites: groups.iter().map(|group| group.site_indexes.len()).sum(),
+        distinct_targets: summary.distinct_targets,
+    });
     compare_inverse(
         analyzer,
         &audited,
@@ -254,6 +303,7 @@ pub fn run_reference_differential(
         config,
         &mut records,
         &mut summary,
+        progress,
     )?;
     recompute_classifications(&records, &mut summary.classifications);
 
@@ -353,6 +403,7 @@ fn validate_config(config: &ReferenceDifferentialConfig) -> Result<(), String> {
         ("max_candidates_per_file", config.max_candidates_per_file),
         ("max_source_bytes", config.max_source_bytes),
         ("max_targets", config.max_targets),
+        ("target_parallelism", config.target_parallelism),
         ("max_usage_files", config.max_usage_files),
         ("max_usages", config.max_usages),
     ] {
@@ -720,6 +771,7 @@ fn compare_inverse(
     config: &ReferenceDifferentialConfig,
     records: &mut [ReferenceDifferentialSite],
     summary: &mut ReferenceDifferentialSummary,
+    progress: &(dyn Fn(ReferenceDifferentialProgress) + Sync),
 ) -> Result<(), String> {
     let files_by_path: HashMap<String, ProjectFile> = audited_files
         .iter()
@@ -733,15 +785,8 @@ fn compare_inverse(
         summary.target_truncated_sites += group.site_indexes.len();
         set_group_inconclusive(records, &group.site_indexes, "target_truncated");
     }
+    let mut prepared = Vec::with_capacity(groups.len());
     for group in groups {
-        let _scope = crate::profiling::scope(format!(
-            "reference_differential::inverse_target[{}]",
-            group
-                .targets
-                .first()
-                .map(CodeUnit::fq_name)
-                .unwrap_or_else(|| "<unknown>".to_string())
-        ));
         let mut paths: Vec<String> = group
             .site_indexes
             .iter()
@@ -775,19 +820,68 @@ fn compare_inverse(
                 "audited inverse scope lost every sampled file for target `{target}`"
             ));
         }
-        summary.queried_targets += 1;
-        let provider = ExplicitCandidateProvider::new(Arc::new(candidate_files.clone()));
-        let query = UsageFinder::new()
-            .with_authoritative_scope(true)
-            .query_with_provider(
-                analyzer,
-                &group.targets,
-                Some(&provider),
-                candidate_files.len(),
-                config.max_usages,
-            );
-        classify_group_result(records, &group, query.result, &candidate_files);
+        prepared.push(PreparedInverseGroup {
+            group,
+            candidate_files,
+        });
     }
+
+    summary.queried_targets += prepared.len();
+    if prepared.is_empty() {
+        return Ok(());
+    }
+
+    let total = prepared.len();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.target_parallelism.min(total))
+        .thread_name(|index| format!("reference-differential-{index}"))
+        .build()
+        .map_err(|err| format!("failed to build inverse target worker pool: {err}"))?;
+    let records = Mutex::new(records);
+    let completed = Mutex::new(0usize);
+    pool.install(|| {
+        prepared.par_iter().for_each(|prepared| {
+            let target = prepared
+                .group
+                .targets
+                .first()
+                .map(CodeUnit::fq_name)
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let _scope = crate::profiling::scope(format!(
+                "reference_differential::inverse_target[{target}]"
+            ));
+            let provider =
+                ExplicitCandidateProvider::new(Arc::new(prepared.candidate_files.clone()));
+            let query = UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    analyzer,
+                    &prepared.group.targets,
+                    Some(&provider),
+                    prepared.candidate_files.len(),
+                    config.max_usages,
+                );
+            {
+                // Target groups partition sampled sites, so workers update disjoint records.
+                // The short lock expresses that invariant safely without retaining every
+                // potentially large query result until the slowest target finishes.
+                let mut records = records.lock().expect("inverse record lock poisoned");
+                classify_group_result(
+                    &mut records,
+                    &prepared.group,
+                    query.result,
+                    &prepared.candidate_files,
+                );
+            }
+            let mut completed = completed.lock().expect("inverse progress lock poisoned");
+            *completed += 1;
+            progress(ReferenceDifferentialProgress::InverseTarget {
+                completed: *completed,
+                total,
+                target,
+            });
+        });
+    });
     Ok(())
 }
 
