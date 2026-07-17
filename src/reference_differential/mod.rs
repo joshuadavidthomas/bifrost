@@ -2,6 +2,7 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{ReferenceCandidateRanges, reference_candidate_ranges};
 use crate::analyzer::test_paths;
+use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, resolve_definition_batch_with_source,
 };
@@ -906,6 +907,22 @@ fn compare_inverse(
     // Nested UsageFinder queries share this outer request context, allowing
     // immutable per-file syntax to be prepared once across target groups.
     let query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    let cpp_roots: HashSet<ProjectFile> = prepared
+        .iter()
+        .filter(|prepared| {
+            prepared
+                .group
+                .targets
+                .first()
+                .is_some_and(|target| language_for_file(target.source()) == Language::Cpp)
+        })
+        .flat_map(|prepared| prepared.candidate_files.iter().cloned())
+        .collect();
+    let cpp_batch = if cpp_roots.is_empty() {
+        None
+    } else {
+        CppAuthoritativeUsageBatch::new(analyzer, &cpp_roots)
+    };
     worker_pool.install(|| {
         prepared.par_iter().for_each(|prepared| {
             let target = prepared
@@ -917,17 +934,35 @@ fn compare_inverse(
             let _scope = crate::profiling::scope(format!(
                 "reference_differential::inverse_target[{target}]"
             ));
-            let provider =
-                ExplicitCandidateProvider::new(Arc::new(prepared.candidate_files.clone()));
-            let query = UsageFinder::new()
-                .with_authoritative_scope(true)
-                .query_with_provider(
-                    analyzer,
-                    &prepared.group.targets,
-                    Some(&provider),
-                    prepared.candidate_files.len(),
-                    config.max_usages,
-                );
+            let result =
+                if let Some(batch) =
+                    cpp_batch.as_ref().filter(|_| {
+                        prepared.group.targets.first().is_some_and(|target| {
+                            language_for_file(target.source()) == Language::Cpp
+                        })
+                    })
+                {
+                    batch
+                        .find_usages(
+                            &prepared.group.targets,
+                            &prepared.candidate_files,
+                            config.max_usages,
+                        )
+                        .into_fuzzy_result()
+                } else {
+                    let provider =
+                        ExplicitCandidateProvider::new(Arc::new(prepared.candidate_files.clone()));
+                    UsageFinder::new()
+                        .with_authoritative_scope(true)
+                        .query_with_provider(
+                            analyzer,
+                            &prepared.group.targets,
+                            Some(&provider),
+                            prepared.candidate_files.len(),
+                            config.max_usages,
+                        )
+                        .result
+                };
             {
                 // Target groups partition sampled sites, so workers update disjoint records.
                 // The short lock expresses that invariant safely without retaining every
@@ -936,7 +971,7 @@ fn compare_inverse(
                 classify_group_result(
                     &mut records,
                     &prepared.group,
-                    query.result,
+                    result,
                     &prepared.candidate_files,
                 );
             }
@@ -1454,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn cpp_inverse_target_groups_share_one_prepared_consumer_syntax_tree() {
+    fn cpp_inverse_target_groups_share_visibility_and_prepared_consumer_syntax() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
         let source = concat!(
@@ -1466,6 +1501,7 @@ mod tests {
         let project = Arc::new(TestProject::new(&root, Language::Cpp));
         let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
         let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        cpp.reset_authoritative_visibility_build_count_for_test();
         let file = ProjectFile::new(&root, "multi_target.cpp");
         let config = ReferenceDifferentialConfig {
             corpus_language: "cpp".to_string(),
@@ -1475,7 +1511,7 @@ mod tests {
             max_source_bytes: 10_000,
             max_targets: 100,
             max_usage_files: 10,
-            max_usages: 100,
+            max_usages: 1,
             ..ReferenceDifferentialConfig::default()
         };
 
@@ -1500,6 +1536,84 @@ mod tests {
             1,
             "both inverse target groups should reuse the same consumer syntax"
         );
+        assert_eq!(
+            cpp.authoritative_visibility_build_count_for_test(),
+            1,
+            "both inverse target groups should reuse one union visibility index"
+        );
+    }
+
+    #[test]
+    fn cpp_union_visibility_preserves_each_groups_authoritative_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::write(root.join("left.h"), "struct LeftOnly { void ping(); };\n").expect("left header");
+        fs::write(root.join("right.h"), "struct RightOnly { void ping(); };\n")
+            .expect("right header");
+        fs::write(
+            root.join("left.cpp"),
+            "#include \"left.h\"\nvoid use_left() { LeftOnly value; value.ping(); }\n",
+        )
+        .expect("left consumer");
+        fs::write(
+            root.join("right.cpp"),
+            "#include \"right.h\"\nvoid use_right() { RightOnly value; value.ping(); }\n",
+        )
+        .expect("right consumer");
+        let project = Arc::new(TestProject::new(&root, Language::Cpp));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let cpp = resolve_analyzer::<CppAnalyzer>(workspace.analyzer()).expect("C++ analyzer");
+        cpp.reset_authoritative_visibility_build_count_for_test();
+        let config = ReferenceDifferentialConfig {
+            corpus_language: "cpp".to_string(),
+            max_files: 10,
+            max_sites: 100,
+            max_candidates_per_file: 100,
+            max_source_bytes: 10_000,
+            max_targets: 100,
+            max_usage_files: 10,
+            max_usages: 10,
+            ..ReferenceDifferentialConfig::default()
+        };
+
+        let report = run_reference_differential(workspace.analyzer(), &config).expect("run audit");
+        for (consumer, expected_target) in [
+            ("use_left", "LeftOnly.ping"),
+            ("use_right", "RightOnly.ping"),
+        ] {
+            let site = report
+                .sites
+                .iter()
+                .find(|site| {
+                    site.source_evidence.contains(consumer)
+                        && site
+                            .targets
+                            .iter()
+                            .any(|target| target.fq_name == expected_target)
+                })
+                .unwrap_or_else(|| panic!("sampled {consumer} call: {:#?}", report.sites));
+            assert_eq!(
+                site.classification,
+                ReferenceClassification::Consistent,
+                "{site:#?}"
+            );
+            assert!(
+                site.targets
+                    .iter()
+                    .any(|target| target.fq_name == expected_target),
+                "{site:#?}"
+            );
+            assert_eq!(
+                site.inverse_hit.as_ref().map(|hit| hit.path.as_str()),
+                Some(if consumer == "use_left" {
+                    "left.cpp"
+                } else {
+                    "right.cpp"
+                }),
+                "the group must retain its exact authoritative consumer roots"
+            );
+        }
+        assert_eq!(cpp.authoritative_visibility_build_count_for_test(), 1);
     }
 
     #[test]
