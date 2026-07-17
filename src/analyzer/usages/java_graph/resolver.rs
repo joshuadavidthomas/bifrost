@@ -460,7 +460,10 @@ pub(super) fn argument_list_arity(node: Node<'_>) -> usize {
         return 0;
     };
     let mut cursor = arguments.walk();
-    arguments.named_children(&mut cursor).count()
+    arguments
+        .children(&mut cursor)
+        .filter(|child| child.is_named() && !child.is_extra())
+        .count()
 }
 
 pub(super) fn resolve_type_from_node(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {

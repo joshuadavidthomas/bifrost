@@ -2758,6 +2758,47 @@ public class UseWidget {
 }
 
 #[test]
+fn java_type_lookup_bare_local_named_type_does_not_become_default_package_class() {
+    let source = r#"
+package app;
+
+import models.Widget;
+
+public class UseWidget {
+    public Widget render() {
+        Widget type = new Widget();
+        return type;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("type.java", "public class type {}\n")
+        .file(
+            "models/Widget.java",
+            "package models; public class Widget {}\n",
+        )
+        .file("app/UseWidget.java", source)
+        .build();
+
+    let value = lookup_type(
+        project.root(),
+        &location_reference(
+            "app/UseWidget.java",
+            source,
+            source.rfind("type;").expect("bare local expression"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "models.Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "models/Widget.java",
+        "{value}"
+    );
+}
+
+#[test]
 fn csharp_type_lookup_resolves_using_explicit_parameter_type() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
@@ -10670,6 +10711,41 @@ public class UseList {
 }
 
 #[test]
+fn java_packaged_external_import_does_not_fall_back_to_default_package_type() {
+    let source = r#"
+package app;
+
+import java.util.HashMap;
+
+public class UseMap {
+    public Object build() {
+        return new HashMap();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("HashMap.java", "public class HashMap {}\n")
+        .file("app/UseMap.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/UseMap.java",
+            source,
+            source.find("HashMap()").expect("constructor type"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(message.contains("outside the indexed workspace"), "{value}");
+}
+
+#[test]
 fn java_local_value_returns_no_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -18221,6 +18297,218 @@ fn java_reference_context_resolves_field_access_member_to_field() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "app.Types.JSON", "{value}");
+}
+
+#[test]
+fn java_nested_type_beats_imported_nested_type_in_constructor_context() {
+    let source = r#"
+package app;
+
+import pkg.Symbol.Visitor;
+
+public class Enclosing {
+    static class Visitor {}
+
+    class Runner {
+        Visitor current = new Visitor();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/Symbol.java",
+            "package pkg; public class Symbol { public static class Visitor {} }\n",
+        )
+        .file("app/Enclosing.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/Enclosing.java",
+            source,
+            source.rfind("new Visitor()").expect("nested constructor"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Enclosing.Visitor",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "app/Enclosing.java",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_nested_type_beats_imported_nested_type_in_parameter_context() {
+    let source = r#"
+package app;
+
+import pkg.Symbol.Visitor;
+
+public class Enclosing {
+    static class Visitor {}
+
+    void accept(Visitor visitor) {}
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/Symbol.java",
+            "package pkg; public class Symbol { public static class Visitor {} }\n",
+        )
+        .file("app/Enclosing.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/Enclosing.java",
+            source,
+            source.find("Visitor visitor").expect("parameter type"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Enclosing.Visitor",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_terminal_token_in_scoped_source_type_resolves_whole_type() {
+    let source = r#"
+package app;
+
+public class Outer {
+    public static class Inner {}
+}
+
+class UseInner {
+    private app.Outer.Inner value;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app/Outer.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/Outer.java",
+            source,
+            source.rfind("Inner value").expect("scoped terminal type"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Outer.Inner",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_terminal_token_in_fully_qualified_external_type_stays_on_boundary() {
+    let source = r#"
+package app;
+
+public class EvaluateInstancesRequest {
+    static class Builder {}
+
+    private com.google.cloud.aiplatform.v1.ExactMatchInput.Builder builder;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app/EvaluateInstancesRequest.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/EvaluateInstancesRequest.java",
+            source,
+            source.rfind("Builder builder").expect("fq terminal type"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(message.contains("ExactMatchInput.Builder"), "{value}");
+}
+
+#[test]
+fn java_terminal_token_in_scoped_external_type_does_not_fall_back_to_same_package() {
+    let source = r#"
+package app;
+
+public class UseValue {
+    private com.google.protobuf.Value payload;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app/Value.java", "package app; public class Value {}\n")
+        .file("app/UseValue.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/UseValue.java",
+            source,
+            source
+                .rfind("Value payload")
+                .expect("scoped external terminal"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(message.contains("com.google.protobuf.Value"), "{value}");
+}
+
+#[test]
+fn java_terminal_token_in_missing_workspace_type_is_not_an_import_boundary() {
+    let source = r#"
+package app;
+
+public class UseMissing {
+    private app.Missing payload;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("app/Known.java", "package app; public class Known {}\n")
+        .file("app/UseMissing.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/UseMissing.java",
+            source,
+            source.find("Missing payload").expect("missing scoped type"),
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_indexed_definition",
+        "{value}"
+    );
 }
 
 #[test]

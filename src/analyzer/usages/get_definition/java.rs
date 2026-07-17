@@ -288,11 +288,16 @@ fn resolve_java_type_reference(
     if normalized.is_empty() {
         return no_definition("no_reference_text", "Java type reference is blank");
     }
-    if let Some(unit) = java.resolve_type_name_in_file(file, normalized) {
-        return candidates_outcome(vec![unit]);
+    if let Some(outcome) =
+        java_explicit_scoped_type_reference(analyzer, java, support, file, source, node)
+    {
+        return outcome;
     }
     if let Some(unit) = java_nested_type_from_context(analyzer, file, normalized, node.start_byte())
     {
+        return candidates_outcome(vec![unit]);
+    }
+    if let Some(unit) = java.resolve_type_name_in_file(file, normalized) {
         return candidates_outcome(vec![unit]);
     }
     if let Some(unit) = java_qualified_nested_type(analyzer, java, file, source, node) {
@@ -307,6 +312,55 @@ fn resolve_java_type_reference(
         "no_indexed_definition",
         format!("`{normalized}` did not resolve to an indexed Java type"),
     )
+}
+
+fn java_explicit_scoped_type_reference(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+) -> Option<DefinitionLookupOutcome> {
+    let scoped = java_enclosing_scoped_type_identifier(node)?;
+    let normalized = normalize_java_type_text(java_node_text(scoped, source));
+    let terminal = normalize_java_type_text(java_node_text(node, source));
+    if normalized.is_empty() || normalized == terminal {
+        return None;
+    }
+
+    if let Some(unit) = java.resolve_type_name_in_file(file, normalized) {
+        return Some(candidates_outcome(vec![unit]));
+    }
+    if let Some(unit) = java_qualified_nested_type(analyzer, java, file, source, node) {
+        return Some(candidates_outcome(vec![unit]));
+    }
+    if java
+        .resolve_type_name_with_external(file, normalized)
+        .is_some()
+    {
+        return Some(boundary(format!(
+            "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
+        )));
+    }
+    if java_scoped_type_qualifier_resolves_in_source(java, file, source, scoped) {
+        return Some(no_definition(
+            "no_indexed_definition",
+            format!("`{normalized}` did not resolve to an indexed Java type"),
+        ));
+    }
+    let qualifier_is_in_workspace = java_scoped_type_qualifier_text(scoped, source)
+        .is_some_and(|qualifier| java_workspace_package_exists(support, qualifier));
+    if java_import_boundary_for_type(java, support, file, normalized) || !qualifier_is_in_workspace
+    {
+        return Some(boundary(format!(
+            "`{normalized}` appears to cross a Java import boundary not indexed in this workspace"
+        )));
+    }
+    Some(no_definition(
+        "no_indexed_definition",
+        format!("`{normalized}` did not resolve to an indexed Java type"),
+    ))
 }
 
 fn resolve_java_method_invocation(
@@ -887,6 +941,43 @@ fn java_qualified_nested_type(
         .find_map(|ancestor| nested(&ancestor))
 }
 
+fn java_enclosing_scoped_type_identifier(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node;
+    loop {
+        if current.kind() == "scoped_type_identifier" {
+            return Some(current);
+        }
+        let parent = current.parent()?;
+        if !matches!(
+            parent.kind(),
+            "annotated_type" | "generic_type" | "scoped_type_identifier"
+        ) {
+            return None;
+        }
+        current = parent;
+    }
+}
+
+fn java_scoped_type_qualifier_resolves_in_source(
+    java: &JavaAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    scoped: Node<'_>,
+) -> bool {
+    java_scoped_type_qualifier_text(scoped, source)
+        .and_then(|qualifier| java.resolve_type_name_in_file(file, qualifier))
+        .is_some()
+}
+
+fn java_scoped_type_qualifier_text<'a>(scoped: Node<'_>, source: &'a str) -> Option<&'a str> {
+    let mut cursor = scoped.walk();
+    scoped
+        .named_children(&mut cursor)
+        .find(|child| child.end_byte() < scoped.end_byte())
+        .map(|qualifier| java_node_text(qualifier, source))
+        .filter(|qualifier| !qualifier.is_empty())
+}
+
 fn java_type_from_node_with_context(
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
@@ -910,8 +1001,15 @@ fn java_type_text_with_context(
     normalized: &str,
     byte: usize,
 ) -> Option<CodeUnit> {
+    if normalized.is_empty() {
+        return None;
+    }
+    if !normalized.contains('.')
+        && let Some(unit) = java_nested_type_from_context(analyzer, file, normalized, byte)
+    {
+        return Some(unit);
+    }
     java.resolve_type_name_in_file(file, normalized)
-        .or_else(|| java_nested_type_from_context(analyzer, file, normalized, byte))
 }
 
 fn java_nested_type_from_context(

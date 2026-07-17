@@ -287,7 +287,11 @@ impl JavaAnalyzer {
         }
 
         let same_package_fqn = self.same_package_fqn(file, normalized);
-        source_type_by_fqn(&same_package_fqn).or_else(|| source_type_by_fqn(normalized))
+        source_type_by_fqn(&same_package_fqn).or_else(|| {
+            self.file_is_in_default_package(file)
+                .then(|| source_type_by_fqn(normalized))
+                .flatten()
+        })
     }
 
     fn forward_source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
@@ -482,7 +486,9 @@ impl JavaAnalyzer {
             return Some(code_unit);
         }
 
-        self.source_type_by_fqn(normalized)
+        self.file_is_in_default_package(file)
+            .then(|| self.source_type_by_fqn(normalized))
+            .flatten()
     }
 
     pub(crate) fn resolve_type_name_with_external(
@@ -625,8 +631,11 @@ impl JavaAnalyzer {
             return Some(code_unit.clone());
         }
         let same_package_fqn = self.same_package_fqn(file, name);
-        self.source_type_by_fqn(&same_package_fqn)
-            .or_else(|| self.source_type_by_fqn(name))
+        self.source_type_by_fqn(&same_package_fqn).or_else(|| {
+            self.file_is_in_default_package(file)
+                .then(|| self.source_type_by_fqn(name))
+                .flatten()
+        })
     }
 
     fn source_type_by_fqn(&self, fqn: &str) -> Option<CodeUnit> {
@@ -660,6 +669,11 @@ impl JavaAnalyzer {
         } else {
             format!("{}.{}", package_name, name)
         }
+    }
+
+    fn file_is_in_default_package(&self, file: &ProjectFile) -> bool {
+        self.cached_package_name(file)
+            .is_none_or(|package| package.is_empty())
     }
 }
 

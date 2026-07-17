@@ -518,6 +518,11 @@ fn method_reference_candidate_has_target_owner(candidate: &CodeUnit, ctx: &ScanC
 
 fn method_reference_owner_fq_names(receiver: Node<'_>, ctx: &mut ScanCtx<'_>) -> Vec<String> {
     match receiver.kind() {
+        "this" | "super" => ctx
+            .class_ranges
+            .enclosing(receiver.start_byte())
+            .map(|owner| vec![owner.to_string()])
+            .unwrap_or_default(),
         "identifier" => ctx
             .bindings
             .resolve_symbol(node_text(receiver, ctx.source))

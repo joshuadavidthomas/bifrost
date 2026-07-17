@@ -2527,6 +2527,96 @@ public class Consumer {
 }
 
 #[test]
+fn java_graph_strategy_matches_this_and_super_method_references_selector_accurately() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "app/BaseFormatter.java",
+            r#"
+package app;
+
+public class BaseFormatter {
+    public String inheritedTrim() { return ""; }
+}
+"#,
+        ),
+        (
+            "app/Helper.java",
+            r#"
+package app;
+
+public class Helper {
+    public void suggestPlugin() {}
+}
+"#,
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+public class Consumer extends BaseFormatter {
+    public String trim() { return ""; }
+    public void suggestPlugin() {}
+    public String replace(String value) { return value; }
+    public String replace(Object value) { return String.valueOf(value); }
+
+    void call() {
+        java.util.function.Supplier<String> currentThis = this::trim; // positive-this-current-class
+        java.util.function.Supplier<String> inheritedThis = this::inheritedTrim; // positive-this-inherited
+        java.util.function.Supplier<String> inheritedSuper = super::inheritedTrim; // positive-super-reference
+        Runnable localOwner = this::suggestPlugin; // negative-wrong-owner
+        java.util.function.Function<Object, String> ambiguous = this::replace; // negative-ambiguous-this-overload
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let current_this_target = definition(&analyzer, "app.Consumer.trim");
+    let current_this_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&current_this_target),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&current_this_hits, "positive-this-current-class");
+
+    let inherited_target = definition(&analyzer, "app.BaseFormatter.inheritedTrim");
+    let inherited_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&inherited_target),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&inherited_hits, "positive-this-inherited");
+    assert_hit_contains(&inherited_hits, "positive-super-reference");
+
+    let wrong_owner_target = definition(&analyzer, "app.Helper.suggestPlugin");
+    let wrong_owner_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&wrong_owner_target),
+        &candidates,
+        1000,
+    ));
+    assert_no_hit_contains(&wrong_owner_hits, "negative-wrong-owner");
+
+    let ambiguous_target = analyzer
+        .get_definitions("app.Consumer.replace")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String)"))
+        .expect("replace(String) overload");
+    let ambiguous_result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&ambiguous_target),
+        &candidates,
+        1000,
+    );
+    assert_success_counts(ambiguous_result, &ambiguous_target, 0, 1);
+}
+
+#[test]
 fn java_graph_strategy_keeps_overloaded_constructor_usage_narrow() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (
@@ -2595,6 +2685,142 @@ public class Consumer {
         "zero-arg constructor should stay narrow"
     );
     assert_eq!(1, one_hits.len(), "one-arg constructor should stay narrow");
+}
+
+#[test]
+fn java_graph_strategy_ignores_comment_extra_nodes_when_matching_java_overloads() {
+    let parser_source = r#"
+package org.telegram;
+
+public class HlsPlaylistParser {
+    ParserException factoryOneArg() {
+        return ParserException.createForMalformedManifest(
+                /* positive-factory-one message= */ "one");
+    }
+
+    ParserException factoryTwoArg() {
+        return ParserException.createForMalformedManifest(
+                /* positive-factory-two message= */ "two",
+                // cause=
+                null);
+    }
+
+    ParserException factoryThreeArg() {
+        return ParserException.createForMalformedManifest(
+                /* wrong-arity-factory-two message= */ "three",
+                /* cause= */ null,
+                /* code= */ 3);
+    }
+
+    ParserException ctorOneArg() {
+        return new ParserException(
+                /* positive-ctor-one message= */ "one");
+    }
+
+    ParserException ctorTwoArg() {
+        return new ParserException(
+                /* positive-ctor-two message= */ "two",
+                // cause=
+                null);
+    }
+
+    ParserException ctorThreeArg() {
+        return new ParserException(
+                /* wrong-arity-ctor-two message= */ "three",
+                /* cause= */ null,
+                /* code= */ 3);
+    }
+}
+"#;
+    let (project, analyzer) = java_analyzer_with_files(&[
+        (
+            "org/telegram/ParserException.java",
+            r#"
+package org.telegram;
+
+public class ParserException {
+    public ParserException(String message) {}
+    public ParserException(String message, Throwable cause) {}
+    public ParserException(String message, Throwable cause, int code) {}
+
+    public static ParserException createForMalformedManifest(String message) {
+        return new ParserException(message);
+    }
+
+    public static ParserException createForMalformedManifest(String message, Throwable cause) {
+        return new ParserException(message, cause);
+    }
+
+    public static ParserException createForMalformedManifest(
+            String message,
+            Throwable cause,
+            int code) {
+        return new ParserException(message, cause, code);
+    }
+}
+"#,
+        ),
+        ("org/telegram/HlsPlaylistParser.java", parser_source),
+    ]);
+
+    let candidates = [project.file("org/telegram/HlsPlaylistParser.java")]
+        .into_iter()
+        .collect();
+    let one_arg_factory = analyzer
+        .get_definitions("org.telegram.ParserException.createForMalformedManifest")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String)"))
+        .expect("missing one-arg factory overload");
+    let two_arg_factory = analyzer
+        .get_definitions("org.telegram.ParserException.createForMalformedManifest")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String, Throwable)"))
+        .expect("missing two-arg factory overload");
+    let two_arg_constructor = analyzer
+        .get_definitions("org.telegram.ParserException.ParserException")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String, Throwable)"))
+        .expect("missing two-arg constructor overload");
+
+    let one_arg_factory_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&one_arg_factory),
+        &candidates,
+        1000,
+    ));
+    assert_eq!(
+        1,
+        one_arg_factory_hits.len(),
+        "one-arg factory overload should stay narrow"
+    );
+    assert_hit_contains(&one_arg_factory_hits, "positive-factory-one");
+    assert_no_hit_contains(&one_arg_factory_hits, "positive-factory-two");
+    assert_no_hit_contains(&one_arg_factory_hits, "wrong-arity-factory-two");
+
+    let two_arg_factory_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&two_arg_factory),
+        &candidates,
+        1000,
+    ));
+    assert_eq!(
+        1,
+        two_arg_factory_hits.len(),
+        "two-arg factory overload should ignore comment extra nodes"
+    );
+    assert_hit_contains(&two_arg_factory_hits, "positive-factory-two");
+    assert_no_hit_contains(&two_arg_factory_hits, "positive-factory-one");
+    assert_no_hit_contains(&two_arg_factory_hits, "wrong-arity-factory-two");
+
+    let two_arg_constructor_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&two_arg_constructor),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&two_arg_constructor_hits, "positive-ctor-two");
+    assert_no_hit_contains(&two_arg_constructor_hits, "positive-ctor-one");
+    assert_no_hit_contains(&two_arg_constructor_hits, "wrong-arity-ctor-two");
 }
 
 #[test]
