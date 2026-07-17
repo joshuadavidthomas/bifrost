@@ -14,7 +14,7 @@ The observable result is three complete JSONL corpus records, one per language a
 - [x] (2026-07-17 00:32Z) Ran a read-only GPT-5.4/medium Oldskool research pass. It confirmed the clean N=1 closure boundaries and identified the dominant stale/false-forward families that must not be rediscovered as inverse bugs.
 - [x] (2026-07-17 00:32Z) Repaired `/mnt/c/Users/jbell/.codex/agents/oldskool.toml` by adding the role's now-required `developer_instructions`; the initial invocation had warned that Codex ignored the malformed role, although explicit model/reasoning overrides still ran GPT-5.4/medium.
 - [x] (2026-07-17 00:32Z) Built the release differential runner and selected the exact top five Java, Go, and Python clones with a no-write dry-run. All fifteen Git repositories are clean; three N=1 repositories and IntelliJ have existing persisted caches, while the other eleven are cold.
-- [ ] Commit and push this campaign-start plan so corpus records are pinned to a clean, published Bifrost head.
+- [x] (2026-07-17 00:36Z) Committed and pushed the campaign-start plan as `2366ea0e`, establishing a clean published Bifrost checkpoint before analyzer cache mutation.
 - [ ] Complete the Java top-five run, triage every raw missing site, file/assign/fix legitimate issues, pass the complete local gate, integrate to `origin/master`, rerun from the fixing head, close issues with evidence, and publish the Java summary.
 - [ ] Complete the Go top-five run under the same discipline and publish the Go summary.
 - [ ] Complete the Python top-five run under the same discipline and publish the Python summary.
@@ -195,3 +195,5 @@ No campaign feature is planned up front; production edits are determined by redu
 Analyzer fixes must operate through the existing structured Java, Go, or Python analyzers and public symbols APIs. Rust tests should use `InlineTestProject` from `tests/common/inline_project.rs`. Python binding behavior is tested through the existing Python integration targets with `--features python` included via the full feature gate. Do not introduce new crates, persistence schemas, or public API shapes unless the reduced root cause genuinely requires them and the plan is revised first with the reason.
 
 Revision note (2026-07-17 00:32Z): Created this self-contained top-five campaign plan after reconciling the completed N=1 Java/Go/Python evidence, validating the new repository-concurrency runner, repairing the Oldskool role schema, pinning all fifteen selected clone heads, and measuring cache/disk/host readiness. It records the user's issue ownership, delegation, local-test, per-language integration, and no-CI-wait requirements before any analyzer mutation.
+
+Revision note (2026-07-17 00:36Z): Recorded the published campaign-start checkpoint so later corpus evidence can distinguish planning state from analyzer/fix heads.
