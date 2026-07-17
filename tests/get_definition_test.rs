@@ -17240,6 +17240,95 @@ object App:
 }
 
 #[test]
+fn scala_receiver_binding_seed_is_bounded_across_repeated_companion_factories() {
+    let mut source = String::from(
+        r#"
+package app
+
+class Symbol {
+  def entered: Symbol = this
+}
+
+object Routes {
+  def make(): Symbol = new Symbol
+}
+
+object Definitions {
+  def newCompleteClassSymbol(): Symbol = new Symbol
+"#,
+    );
+    for index in 0..64 {
+        source.push_str(&format!("  val route{index} = Routes.make()\n"));
+    }
+    source.push_str(
+        r#"  val cls = newCompleteClassSymbol()
+  val selected = cls.entered
+}
+"#,
+    );
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Definitions.scala", source.clone())
+        .build();
+    let entered_start = source.find("cls.entered").expect("member selection") + "cls.".len();
+    let started = std::time::Instant::now();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Definitions.scala", &source, entered_start),
+    );
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "Scala receiver binding reconstruction exceeded its bounded regression budget: {value}"
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Symbol.entered",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_factory_result_binding_shadows_visible_singleton_receiver() {
+    let source = r#"
+package app
+
+class Symbol {
+  def entered: Int = 1
+}
+
+object Factory {
+  def entered: String = "singleton"
+}
+
+object Definitions {
+  def build(): Symbol = new Symbol
+  def run(): Int = {
+    val Factory = build()
+    Factory.entered
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Definitions.scala", source)
+        .build();
+    let entered_start =
+        source.find("Factory.entered").expect("member selection") + "Factory.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Definitions.scala", source, entered_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Symbol.entered",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_extension_method_call_resolves_to_extension_definition() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

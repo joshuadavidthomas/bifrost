@@ -1136,16 +1136,24 @@ fn resolve_scala_field(
             "Scala field expression has no receiver",
         );
     };
-    if let Some(owner) = scala_receiver_type_fqn(ctx, resolver, root, receiver, field.start_byte())
-    {
-        let include_companion = scala_receiver_allows_companion_lookup(
-            ctx,
-            resolver,
-            root,
-            receiver,
-            field.start_byte(),
-            &owner,
-        );
+    let bindings = matches!(receiver.kind(), "identifier" | "type_identifier")
+        .then(|| scala_bindings_before(ctx, resolver, root, field.start_byte()));
+    let owner = match bindings.as_ref() {
+        Some(bindings) => scala_receiver_type_fqn_with_bindings(ctx, resolver, receiver, bindings),
+        None => scala_non_identifier_receiver_type_fqn(ctx, resolver, receiver),
+    };
+    if let Some(owner) = owner {
+        let include_companion = bindings.as_ref().is_some_and(|bindings| {
+            scala_receiver_allows_companion_lookup_with_bindings(
+                ctx,
+                resolver,
+                root,
+                receiver,
+                field.start_byte(),
+                &owner,
+                bindings,
+            )
+        });
         let call_arity = call_arity_for_reference(field_node);
         let candidates = scala_applicable_member_candidate_units(
             ctx,
@@ -1169,13 +1177,14 @@ fn resolve_scala_field(
     )
 }
 
-fn scala_receiver_allows_companion_lookup(
+fn scala_receiver_allows_companion_lookup_with_bindings(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
     root: Node<'_>,
     receiver: Node<'_>,
     cutoff_start: usize,
     owner_fqn: &str,
+    bindings: &LocalInferenceEngine<String>,
 ) -> bool {
     if !matches!(receiver.kind(), "identifier" | "type_identifier") {
         return false;
@@ -1184,8 +1193,7 @@ fn scala_receiver_allows_companion_lookup(
     if name == "this" {
         return false;
     }
-    let bindings = scala_bindings_before(ctx, resolver, root, cutoff_start);
-    if first_precise(&bindings, name).is_some()
+    if first_precise(bindings, name).is_some()
         || bindings.is_shadowed(name)
         || scala_lexical_binding_declares_name_before(root, ctx.source, name, cutoff_start)
         || scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).is_some()
@@ -1600,34 +1608,54 @@ fn scala_receiver_type_fqn(
     receiver: Node<'_>,
     cutoff_start: usize,
 ) -> Option<String> {
-    match receiver.kind() {
-        "identifier" | "type_identifier" => {
-            let name = scala_node_text(receiver, ctx.source).trim();
-            if name == "this" {
-                return ClassRangeIndex::build(ctx.analyzer, ctx.file)
-                    .enclosing(receiver.start_byte())
-                    .map(str::to_string);
+    if !matches!(receiver.kind(), "identifier" | "type_identifier") {
+        return scala_non_identifier_receiver_type_fqn(ctx, resolver, receiver);
+    }
+    let bindings = scala_bindings_before(ctx, resolver, root, cutoff_start);
+    scala_receiver_type_fqn_with_bindings(ctx, resolver, receiver, &bindings)
+}
+
+fn scala_receiver_type_fqn_with_bindings(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    receiver: Node<'_>,
+    bindings: &LocalInferenceEngine<String>,
+) -> Option<String> {
+    if !matches!(receiver.kind(), "identifier" | "type_identifier") {
+        return scala_non_identifier_receiver_type_fqn(ctx, resolver, receiver);
+    }
+    let name = scala_node_text(receiver, ctx.source).trim();
+    if name == "this" {
+        return ClassRangeIndex::build(ctx.analyzer, ctx.file)
+            .enclosing(receiver.start_byte())
+            .map(str::to_string);
+    }
+    first_precise(bindings, name).or_else(|| {
+        scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).or_else(|| {
+            if !bindings.is_shadowed(name)
+                && let Some(imported_member) = resolver.resolve_member(name)
+                && let Some(return_type) =
+                    scala_imported_member_return_type(ctx, resolver, &imported_member)
+            {
+                return Some(return_type);
             }
-            let bindings = scala_bindings_before(ctx, resolver, root, cutoff_start);
-            first_precise(&bindings, name).or_else(|| {
-                scala_enclosing_class_parameter_type(ctx, receiver, name, resolver).or_else(|| {
-                    if !bindings.is_shadowed(name)
-                        && let Some(imported_member) = resolver.resolve_member(name)
-                        && let Some(return_type) =
-                            scala_imported_member_return_type(ctx, resolver, &imported_member)
-                    {
-                        return Some(return_type);
-                    }
-                    (!bindings.is_shadowed(name))
-                        .then(|| {
-                            resolver
-                                .resolve_singleton(name)
-                                .or_else(|| resolver.resolve(name))
-                        })
-                        .flatten()
+            (!bindings.is_shadowed(name))
+                .then(|| {
+                    resolver
+                        .resolve_singleton(name)
+                        .or_else(|| resolver.resolve(name))
                 })
-            })
-        }
+                .flatten()
+        })
+    })
+}
+
+fn scala_non_identifier_receiver_type_fqn(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    receiver: Node<'_>,
+) -> Option<String> {
+    match receiver.kind() {
         // `new Foo().member` — the receiver is typed by the constructed class.
         "instance_expression" => {
             let name = scala_first_type_name(receiver, ctx.source)?;
@@ -2289,7 +2317,18 @@ fn scala_seed_value_definition(
                     node.child_by_field_name("value")
                         .filter(|value| value.end_byte() <= cutoff_start)
                         .and_then(|value| {
-                            scala_call_result_type(ctx, resolver, root, value, value.start_byte())
+                            // The active-path walk seeds definitions in source order, so
+                            // `bindings` already is the exact prefix visible to this value.
+                            // Rebuilding that prefix here recursively re-enters every earlier
+                            // factory-valued definition and amplifies large files exponentially.
+                            scala_call_result_type(
+                                ctx,
+                                resolver,
+                                root,
+                                value,
+                                value.start_byte(),
+                                bindings,
+                            )
                         })
                 })
                 .or_else(|| {
@@ -2323,6 +2362,7 @@ fn scala_call_result_type(
     root: Node<'_>,
     value: Node<'_>,
     cutoff_start: usize,
+    bindings: &LocalInferenceEngine<String>,
 ) -> Option<String> {
     if value.kind() != "call_expression" {
         return None;
@@ -2336,14 +2376,15 @@ fn scala_call_result_type(
             if member.is_empty() {
                 return None;
             }
-            let owner = scala_receiver_type_fqn(ctx, resolver, root, receiver, cutoff_start)?;
-            let include_companion = scala_receiver_allows_companion_lookup(
+            let owner = scala_receiver_type_fqn_with_bindings(ctx, resolver, receiver, bindings)?;
+            let include_companion = scala_receiver_allows_companion_lookup_with_bindings(
                 ctx,
                 resolver,
                 root,
                 receiver,
                 cutoff_start,
                 &owner,
+                bindings,
             );
             scala_member_candidate_units(ctx, &owner, member, include_companion)
                 .into_iter()
