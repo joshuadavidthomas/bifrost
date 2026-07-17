@@ -532,9 +532,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         LexicalTypeResolution::Resolved { .. } => {
-            if let Some(scope) = static_qualifier_type_scope(node, ctx) {
+            if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
                 *ctx.raw_match_count += 1;
-                push_hit(scope, ctx);
+                for scope in scopes {
+                    push_type_hit(scope, ctx);
+                }
             }
             return;
         }
@@ -549,9 +551,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         push_type_hit(hit_node, ctx);
         return;
     }
-    if let Some(scope) = static_qualifier_type_scope(node, ctx) {
+    if let Some(scopes) = static_qualifier_type_scopes(node, ctx) {
         *ctx.raw_match_count += 1;
-        push_hit(scope, ctx);
+        for scope in scopes {
+            push_type_hit(scope, ctx);
+        }
         return;
     }
     if !name_mentions(text, &ctx.spec.member_name) {
@@ -567,49 +571,51 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn static_qualifier_type_scope<'tree>(node: Node<'tree>, ctx: &ScanCtx<'_>) -> Option<Node<'tree>> {
+fn static_qualifier_type_scopes<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Vec<Node<'tree>>> {
     if node.kind() != "qualified_identifier" {
         return None;
     }
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if current.kind() != "qualified_identifier" {
-            continue;
-        }
-        if let Some((components, global)) =
-            qualified_callable_owner_components_in_context(current, ctx.source)
-        {
-            match resolve_type_components_lexically_at_for_target(
-                current,
-                &components,
-                global,
-                ctx.analyzer,
-                ctx.visibility,
-                ctx.file,
-                ctx.source,
-                &ctx.spec.target,
-            ) {
-                LexicalTypeResolution::Resolved {
-                    unit, candidates, ..
-                } if same_visible_symbol(&unit, &ctx.spec.target)
-                    || candidates
-                        .iter()
-                        .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)) =>
-                {
-                    return qualified_owner_terminal_scope_node(current);
+    // `maybe_record_type_hit` rejects nested type nodes before this helper, so
+    // this root contains every structured component needed for prefix lookup.
+    debug_assert!(!is_nested_type_node(node));
+    let qualified = qualified_owner_components(node, ctx.source)?;
+    let mut matches = Vec::new();
+    for component_count in 1..=qualified.names.len() {
+        match resolve_type_components_lexically_at_for_target(
+            node,
+            &qualified.names[..component_count],
+            qualified.global,
+            ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            &ctx.spec.target,
+        ) {
+            LexicalTypeResolution::Resolved {
+                unit, candidates, ..
+            } if same_visible_symbol(&unit, &ctx.spec.target)
+                || candidates
+                    .iter()
+                    .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target)) =>
+            {
+                let matched = qualified.nodes[component_count - 1];
+                if !matches.iter().any(|existing: &Node<'_>| {
+                    existing.start_byte() == matched.start_byte()
+                        && existing.end_byte() == matched.end_byte()
+                }) {
+                    matches.push(matched);
                 }
-                LexicalTypeResolution::Ambiguous => return None,
-                LexicalTypeResolution::Resolved { .. } | LexicalTypeResolution::Missing => {}
             }
-        }
-        let mut cursor = current.walk();
-        for child in current.named_children(&mut cursor) {
-            if child.kind() == "qualified_identifier" {
-                stack.push(child);
-            }
+            // One ambiguous owner prefix makes the entire qualified occurrence
+            // unsafe to attribute, even if another prefix happened to match.
+            LexicalTypeResolution::Ambiguous => return None,
+            LexicalTypeResolution::Resolved { .. } | LexicalTypeResolution::Missing => {}
         }
     }
-    None
+    (!matches.is_empty()).then_some(matches)
 }
 
 fn static_qualifier_name_scope<'tree>(node: Node<'tree>, ctx: &ScanCtx<'_>) -> Option<Node<'tree>> {
@@ -2095,46 +2101,6 @@ fn qualified_callable_owner_components(
     append_cpp_name_components(node, source, &mut components)?;
     components.pop()?;
     (!components.is_empty()).then_some((components, global))
-}
-
-fn qualified_callable_owner_components_in_context(
-    node: Node<'_>,
-    source: &str,
-) -> Option<(Vec<String>, bool)> {
-    let (components, mut global) = qualified_callable_owner_components(node, source)?;
-    let mut prefixes = Vec::new();
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if parent.kind() != "qualified_identifier"
-            || parent.child_by_field_name("name") != Some(current)
-        {
-            break;
-        }
-        if let Some(scope) = parent.child_by_field_name("scope") {
-            let mut prefix = Vec::new();
-            append_cpp_name_components(scope, source, &mut prefix)?;
-            prefixes.push(prefix);
-        } else if parent.child(0).is_some_and(|child| child.kind() == "::") {
-            global = true;
-        } else {
-            return None;
-        }
-        current = parent;
-    }
-    prefixes.reverse();
-    let mut qualified = prefixes.into_iter().flatten().collect::<Vec<_>>();
-    qualified.extend(components);
-    (!qualified.is_empty()).then_some((qualified, global))
-}
-
-fn qualified_owner_terminal_scope_node(mut node: Node<'_>) -> Option<Node<'_>> {
-    loop {
-        let name = node.child_by_field_name("name")?;
-        if name.kind() != "qualified_identifier" {
-            return node.child_by_field_name("scope");
-        }
-        node = name;
-    }
 }
 
 fn type_reference_components(node: Node<'_>, source: &str) -> Option<(Vec<String>, bool)> {

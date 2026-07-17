@@ -2931,6 +2931,32 @@ impl OutOfLineMemberDefinitionOwners<'_> {
     }
 }
 
+pub(super) struct QualifiedOwnerComponents<'tree> {
+    pub(super) nodes: Vec<Node<'tree>>,
+    pub(super) names: Vec<String>,
+    pub(super) global: bool,
+}
+
+pub(super) fn qualified_owner_components<'tree>(
+    node: Node<'tree>,
+    source: &str,
+) -> Option<QualifiedOwnerComponents<'tree>> {
+    let mut nodes = cpp_name_component_nodes(node)?;
+    nodes.pop()?;
+    if nodes.is_empty() {
+        return None;
+    }
+    let names = nodes
+        .iter()
+        .map(|component| node_text(*component, source).to_string())
+        .collect();
+    Some(QualifiedOwnerComponents {
+        nodes,
+        names,
+        global: is_globally_qualified_cpp_name(node),
+    })
+}
+
 pub(super) fn out_of_line_member_definition_owner<'tree>(
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
@@ -2944,36 +2970,27 @@ pub(super) fn out_of_line_member_definition_owner<'tree>(
     {
         return None;
     }
-    let mut component_nodes = cpp_name_component_nodes(node)?;
-    component_nodes.pop()?;
-    if component_nodes.is_empty() {
-        return None;
-    }
-    let components = component_nodes
-        .iter()
-        .map(|component| node_text(*component, source).to_string())
-        .collect::<Vec<_>>();
-    let global = is_globally_qualified_cpp_name(node);
+    let qualified = qualified_owner_components(node, source)?;
     let lexical_scope = enclosing_namespace_components(node, source)?;
     let mut owners = Vec::new();
     let mut innermost = None;
-    for component_count in 1..=components.len() {
+    for component_count in 1..=qualified.names.len() {
         if let LexicalTypeResolution::Resolved { unit, .. } = visibility
             .resolve_type_components_lexically(
                 analyzer,
                 file,
-                &components[..component_count],
-                global,
+                &qualified.names[..component_count],
+                qualified.global,
                 &lexical_scope,
             )
             && !owners
                 .iter()
                 .any(|(_, existing)| same_visible_symbol(existing, &unit))
         {
-            if component_count == components.len() {
-                innermost = Some((component_nodes[component_count - 1], unit.clone()));
+            if component_count == qualified.names.len() {
+                innermost = Some((qualified.nodes[component_count - 1], unit.clone()));
             }
-            owners.push((component_nodes[component_count - 1], unit));
+            owners.push((qualified.nodes[component_count - 1], unit));
         }
     }
     (!owners.is_empty()).then_some(OutOfLineMemberDefinitionOwners { owners, innermost })

@@ -8277,6 +8277,103 @@ void consume() {
 }
 
 #[test]
+fn authoritative_cpp_outer_type_qualifier_inverse_covers_nested_values_and_method_values() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "owners.h",
+            r#"#pragma once
+namespace alpha {
+class Outer {
+ public:
+    struct Nested {
+        static int member;
+    };
+    void callback();
+    void bind() {
+        auto method = &Outer::callback;
+    }
+};
+}
+namespace beta {
+class Outer {
+ public:
+    struct Nested {
+        static int member;
+    };
+};
+}
+
+inline int positive_nested_value() {
+    return alpha::Outer::Nested::member;
+}
+inline int negative_nested_value() {
+    return beta::Outer::Nested::member;
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "alpha.Outer"
+            && !unit.is_synthetic()
+    });
+    let file = project.file("owners.h");
+    let source = file.read_to_string().expect("owner fixture source");
+    let token_range = |line: &str, token: &str| {
+        let line_start = source
+            .find(line)
+            .unwrap_or_else(|| panic!("missing fixture line {line:?}"));
+        let token_start = line_start
+            + line
+                .find(token)
+                .unwrap_or_else(|| panic!("missing {token:?} in {line:?}"));
+        (token_start, token_start + token.len())
+    };
+    let nested_owner = token_range("    return alpha::Outer::Nested::member;", "Outer");
+    let method_owner = token_range("        auto method = &Outer::callback;", "Outer");
+    let wrong_owner = token_range("    return beta::Outer::Nested::member;", "Outer");
+
+    for (start, end) in [nested_owner, method_owner] {
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..start].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "owners.h".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert_eq!(
+            "resolved", forward.results[0].status,
+            "positive outer-owner token {start}..{end} must resolve: {forward:#?}"
+        );
+        assert!(
+            forward.results[0]
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some("alpha.Outer")),
+            "positive outer-owner token {start}..{end} must resolve to alpha.Outer: {forward:#?}"
+        );
+    }
+
+    let hits = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &file);
+    assert_eq!(
+        hits,
+        BTreeSet::from([nested_owner, method_owner]),
+        "inverse lookup must retain only the exact alpha.Outer prefix tokens in the nested value and inline method value; beta owner {wrong_owner:?} must remain excluded"
+    );
+}
+
+#[test]
 fn authoritative_cpp_nested_type_keeps_outer_owner_qualifier_usage() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
