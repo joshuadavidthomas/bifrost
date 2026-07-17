@@ -3,7 +3,8 @@ use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::inverted_edges::ClassRangeIndex;
 use crate::analyzer::usages::java_graph::hits;
 use crate::analyzer::usages::java_graph::resolver::{
-    TargetKind, TargetSpec, argument_list_arity, has_proven_static_import, infer_type_from_value,
+    TargetKind, TargetSpec, argument_list_arity, bare_field_context_matches_target,
+    bare_method_context_matches_target, has_proven_static_import, infer_type_from_value,
     is_declaration_name, is_ignored_type_context, java_method_signatures_match, node_text,
     receiver_matches_target, resolve_type_from_node, same_owner_context, seed_class_binding,
 };
@@ -266,31 +267,33 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if maybe_record_static_qualifier_type_hit(node, ctx) {
         return;
     }
-    if !matches!(
-        node.kind(),
-        "type_identifier" | "scoped_type_identifier" | "generic_type"
-    ) {
+    let Some(type_node) = type_reference_node(node) else {
         return;
-    }
-    if node
+    };
+    if type_node
         .parent()
         .is_some_and(|parent| parent.kind() == "scoped_type_identifier")
     {
         return;
     }
-    if is_ignored_type_context(node) {
+    if is_ignored_type_context(type_node) {
         return;
     }
-    if !type_terminal_name_matches(node, ctx) {
+    if !type_terminal_name_matches(type_node, ctx) {
         return;
     }
-    let Some(resolved) = resolve_type_from_node(node, ctx) else {
+    let Some(resolved) = resolve_type_from_node(type_node, ctx) else {
         return;
     };
     if resolved.fq_name() != ctx.spec.owner.fq_name() {
         return;
     }
-    hits::push_hit(node, ctx);
+    let hit_node = if matches!(node.kind(), "annotation" | "marker_annotation") {
+        expression_name_node(type_node).unwrap_or(type_node)
+    } else {
+        type_node
+    };
+    hits::push_hit(hit_node, ctx);
 }
 
 fn maybe_record_static_qualifier_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> bool {
@@ -362,27 +365,24 @@ fn maybe_record_import_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if node.kind() != "object_creation_expression" {
-        return;
+    if node.kind() == "object_creation_expression" {
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return;
+        };
+        if !type_terminal_name_matches(type_node, ctx) {
+            return;
+        }
+        let Some(resolved) = resolve_type_from_node(type_node, ctx) else {
+            return;
+        };
+        if resolved.fq_name() != ctx.spec.owner.fq_name() {
+            return;
+        }
+        if !callable_arity_matches_target(node, ctx) {
+            return;
+        }
+        hits::push_hit(node, ctx);
     }
-    let Some(type_node) = node.child_by_field_name("type") else {
-        return;
-    };
-    if !type_terminal_name_matches(type_node, ctx) {
-        return;
-    }
-    let Some(resolved) = resolve_type_from_node(type_node, ctx) else {
-        return;
-    };
-    if resolved.fq_name() != ctx.spec.owner.fq_name() {
-        return;
-    }
-    if let Some(expected_arities) = ctx.spec.method_arities.as_ref()
-        && !expected_arities.contains(&argument_list_arity(node))
-    {
-        return;
-    }
-    hits::push_hit(node, ctx);
 }
 
 fn type_terminal_name_matches(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -404,16 +404,14 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node_text(name_node, ctx.source) != ctx.spec.member_name {
         return;
     }
-    if let Some(expected_arities) = ctx.spec.method_arities.as_ref()
-        && !expected_arities.contains(&argument_list_arity(node))
-    {
+    if !callable_arity_matches_target(node, ctx) {
         return;
     }
 
     let receiver_matches = if let Some(object) = node.child_by_field_name("object") {
         receiver_matches_target(object, ctx)
     } else {
-        same_owner_context(node, ctx) || has_proven_static_import(ctx)
+        bare_method_context_matches_target(node, ctx) || has_proven_static_import(ctx)
     };
 
     if receiver_matches {
@@ -478,9 +476,34 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() != "identifier" || node_text(node, ctx.source) != ctx.spec.member_name {
         return;
     }
-    if !is_declaration_name(node)
-        && (same_owner_context(node, ctx) || has_proven_static_import(ctx))
+    if is_declaration_name(node) {
+        return;
+    }
+    let same_owner = same_owner_context(node, ctx);
+    let shadowed = if same_owner {
+        ctx.bindings
+            .is_shadowed_in_non_root_scope(ctx.spec.member_name.as_str())
+    } else {
+        ctx.bindings.is_shadowed(ctx.spec.member_name.as_str())
+    };
+    if !shadowed && (bare_field_context_matches_target(node, ctx) || has_proven_static_import(ctx))
     {
         hits::push_hit(node, ctx);
     }
+}
+
+fn type_reference_node(node: Node<'_>) -> Option<Node<'_>> {
+    match node.kind() {
+        "type_identifier" | "scoped_type_identifier" | "generic_type" => Some(node),
+        "annotation" | "marker_annotation" => node.child_by_field_name("name"),
+        _ => None,
+    }
+}
+
+fn callable_arity_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(expected_arities) = ctx.spec.callable_arities.as_ref() else {
+        return true;
+    };
+    let actual = argument_list_arity(node);
+    expected_arities.iter().any(|arity| arity.accepts(actual))
 }

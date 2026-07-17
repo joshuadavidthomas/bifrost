@@ -1,6 +1,6 @@
 use super::*;
-use crate::analyzer::SignatureMetadata;
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
+use crate::analyzer::{CallableArity, SignatureMetadata};
 use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn determine_package_name(root: Node<'_>, source: &str) -> String {
@@ -349,7 +349,12 @@ fn visit_callable(
     );
     parsed.add_signature_with_metadata(
         code_unit.clone(),
-        SignatureMetadata::with_parameter_labels(callable_sig, parameter_labels),
+        SignatureMetadata::with_parameter_labels(callable_sig, parameter_labels)
+            .with_callable_arity(
+                node.child_by_field_name("parameters")
+                    .map(callable_arity_for_parameters)
+                    .unwrap_or_else(|| CallableArity::exact(0)),
+            ),
     );
 
     if let Some(body) = node.child_by_field_name("body") {
@@ -892,6 +897,24 @@ fn parameter_labels(parameters: Node<'_>, source: &str) -> Vec<String> {
         }
     }
     labels
+}
+
+fn callable_arity_for_parameters(parameters: Node<'_>) -> CallableArity {
+    let mut total = 0usize;
+    let mut repeated = false;
+    let mut cursor = parameters.walk();
+    for child in parameters.named_children(&mut cursor) {
+        match child.kind() {
+            "formal_parameter" => total += 1,
+            "spread_parameter" => {
+                total += 1;
+                repeated = true;
+            }
+            _ => {}
+        }
+    }
+    let required = total.saturating_sub(usize::from(repeated));
+    CallableArity::new(required, total, repeated)
 }
 
 fn spread_parameter_name(parameter: Node<'_>) -> Option<Node<'_>> {

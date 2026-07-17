@@ -239,6 +239,14 @@ where
             .any(|scope| scope.shadows.contains(symbol))
     }
 
+    pub fn is_shadowed_in_non_root_scope(&self, symbol: &str) -> bool {
+        self.scopes
+            .iter()
+            .skip(1)
+            .rev()
+            .any(|scope| scope.shadows.contains(symbol))
+    }
+
     pub fn snapshot(&self) -> LocalBindingsSnapshot<T> {
         let mut declared = HashSet::default();
         let mut bindings = HashMap::default();

@@ -318,10 +318,11 @@ fn resolve_java_method_invocation(
     if name.is_empty() {
         return no_definition("no_method_name", "Java method invocation has a blank name");
     }
+    let arity = Some(java_argument_count(node));
 
     if let Some(object) = node.child_by_field_name("object") {
         if let Some(owner) = java_receiver_type(analyzer, file, source, root, object) {
-            return java_member_candidates(analyzer, support, &owner.fq_name(), name, true);
+            return java_member_candidates(analyzer, support, &owner.fq_name(), name, true, arity);
         }
         return no_definition(
             "unsupported_java_receiver",
@@ -329,14 +330,14 @@ fn resolve_java_method_invocation(
         );
     }
 
-    let static_import = java_static_import_candidates(analyzer, support, file, name);
+    let static_import = java_static_import_candidates(analyzer, support, file, name, arity);
     if static_import.status != DefinitionLookupStatus::NoDefinition {
         return static_import;
     }
 
     let class_ranges = ClassRangeIndex::build(analyzer, file);
     if let Some(owner_fqn) = class_ranges.enclosing(name_node.start_byte()) {
-        return java_member_candidates(analyzer, support, owner_fqn, name, true);
+        return java_member_candidates(analyzer, support, owner_fqn, name, true, arity);
     }
 
     no_definition(
@@ -382,7 +383,7 @@ fn resolve_java_method_reference(
                 )
             });
         if let Some(owner) = owner {
-            return java_constructor_outcome(support, owner, None);
+            return java_constructor_outcome(analyzer, support, owner, None);
         }
         return resolve_java_type_reference(analyzer, java, support, file, source, node);
     }
@@ -401,7 +402,7 @@ fn resolve_java_method_reference(
             )
         });
     if let Some(owner) = owner {
-        return java_member_candidates(analyzer, support, &owner.fq_name(), member, true);
+        return java_member_candidates(analyzer, support, &owner.fq_name(), member, true, None);
     }
 
     no_definition(
@@ -433,19 +434,20 @@ fn resolve_java_constructor_call(
             )
         });
     if let Some(owner) = owner {
-        return java_constructor_outcome(support, owner, Some(java_argument_count(node)));
+        return java_constructor_outcome(analyzer, support, owner, Some(java_argument_count(node)));
     }
     resolve_java_type_reference(analyzer, java, support, file, source, type_node)
 }
 
 fn java_constructor_outcome(
+    analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     owner: CodeUnit,
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
     let mut constructors = support.fqn(&format!("{}.{}", owner.fq_name(), owner.identifier()));
     constructors.retain(|unit| unit.is_function() && !unit.is_synthetic());
-    constructors = java_filter_candidates_by_arity(constructors, arity);
+    constructors = java_filter_candidates_by_arity(analyzer, constructors, arity);
     if !constructors.is_empty() {
         return candidates_outcome(constructors);
     }
@@ -479,6 +481,7 @@ fn java_enclosing_object_creation(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn java_filter_candidates_by_arity(
+    analyzer: &dyn IAnalyzer,
     candidates: Vec<CodeUnit>,
     arity: Option<usize>,
 ) -> Vec<CodeUnit> {
@@ -487,7 +490,7 @@ fn java_filter_candidates_by_arity(
     };
     let filtered: Vec<_> = candidates
         .iter()
-        .filter(|unit| java_signature_arity(unit.signature()) == expected)
+        .filter(|unit| java_callable_accepts_arity(analyzer, unit, expected))
         .cloned()
         .collect();
     if filtered.is_empty() {
@@ -495,6 +498,31 @@ fn java_filter_candidates_by_arity(
     } else {
         filtered
     }
+}
+
+fn java_arity_candidates(
+    analyzer: &dyn IAnalyzer,
+    candidates: &[CodeUnit],
+    arity: Option<usize>,
+) -> Option<Vec<CodeUnit>> {
+    let expected = arity?;
+    let filtered: Vec<_> = candidates
+        .iter()
+        .filter(|unit| java_callable_accepts_arity(analyzer, unit, expected))
+        .cloned()
+        .collect();
+    (!filtered.is_empty()).then_some(filtered)
+}
+
+fn java_callable_accepts_arity(analyzer: &dyn IAnalyzer, unit: &CodeUnit, actual: usize) -> bool {
+    analyzer
+        .signature_metadata(unit)
+        .into_iter()
+        .find_map(|metadata| metadata.callable_arity())
+        .unwrap_or_else(|| {
+            crate::analyzer::CallableArity::exact(java_signature_arity(unit.signature()))
+        })
+        .accepts(actual)
 }
 
 fn java_argument_count(node: Node<'_>) -> usize {
@@ -558,7 +586,7 @@ fn resolve_java_field_access(
         return no_definition("no_field_receiver", "Java field access has no receiver");
     };
     if let Some(owner) = java_receiver_type(analyzer, file, source, root, object) {
-        return java_member_candidates(analyzer, support, &owner.fq_name(), field, false);
+        return java_member_candidates(analyzer, support, &owner.fq_name(), field, false, None);
     }
     no_definition(
         "unsupported_java_receiver",
@@ -579,7 +607,7 @@ fn resolve_java_bare_identifier(
     if let Some(unit) = java.resolve_type_name_in_file(file, name) {
         return candidates_outcome(vec![unit]);
     }
-    let static_import = java_static_import_candidates(analyzer, support, file, name);
+    let static_import = java_static_import_candidates(analyzer, support, file, name, None);
     if static_import.status != DefinitionLookupStatus::NoDefinition {
         return static_import;
     }
@@ -590,7 +618,7 @@ fn resolve_java_bare_identifier(
     if !java_local_binding_before(source, root, name, node.start_byte()) {
         let class_ranges = ClassRangeIndex::build(analyzer, file);
         if let Some(owner_fqn) = class_ranges.enclosing(node.start_byte()) {
-            let outcome = java_member_candidates(analyzer, support, owner_fqn, name, false);
+            let outcome = java_member_candidates(analyzer, support, owner_fqn, name, false, None);
             if outcome.status == DefinitionLookupStatus::Resolved {
                 return outcome;
             }
@@ -1518,13 +1546,18 @@ fn java_member_candidates(
     owner_fqn: &str,
     member: &str,
     allow_generated_accessors: bool,
+    arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
     let mut candidates = support.fqn(&format!("{owner_fqn}.{member}"));
     sort_units(&mut candidates);
     candidates.dedup();
-    if !candidates.is_empty() {
+    if let Some(filtered_candidates) = java_arity_candidates(analyzer, &candidates, arity) {
+        return candidates_outcome(filtered_candidates);
+    }
+    if !candidates.is_empty() && arity.is_none() {
         return candidates_outcome(candidates);
     }
+    let mut fallback_candidates = (!candidates.is_empty()).then_some(candidates);
 
     let owner = analyzer.definitions(owner_fqn).next();
     if allow_generated_accessors && let Some(owner) = owner.as_ref() {
@@ -1553,11 +1586,22 @@ fn java_member_candidates(
             }
             sort_units(&mut level_candidates);
             level_candidates.dedup();
+            if let Some(filtered_level_candidates) =
+                java_arity_candidates(analyzer, &level_candidates, arity)
+            {
+                return candidates_outcome(filtered_level_candidates);
+            }
             if !level_candidates.is_empty() {
-                return candidates_outcome(level_candidates);
+                if arity.is_none() {
+                    return candidates_outcome(level_candidates);
+                }
+                fallback_candidates.get_or_insert(level_candidates);
             }
             level = next_level;
         }
+    }
+    if let Some(candidates) = fallback_candidates {
+        return candidates_outcome(candidates);
     }
     no_definition(
         "no_indexed_definition",
@@ -1788,6 +1832,7 @@ fn java_static_import_candidates(
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
     member: &str,
+    arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
     let mut candidates = Vec::new();
     let mut saw_external = false;
@@ -1817,6 +1862,9 @@ fn java_static_import_candidates(
     }
     sort_units(&mut candidates);
     candidates.dedup();
+    if let Some(filtered_candidates) = java_arity_candidates(analyzer, &candidates, arity) {
+        return candidates_outcome(filtered_candidates);
+    }
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }

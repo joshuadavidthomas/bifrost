@@ -1516,6 +1516,375 @@ public class Target {
 }
 
 #[test]
+fn java_usage_finder_finds_bare_inherited_field_read_and_excludes_local_shadows() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "p/Base.java",
+            r#"
+package p;
+
+public class Base {
+    protected static final int YEAR = 2026;
+}
+"#,
+        ),
+        (
+            "p/Child.java",
+            r#"
+package p;
+
+public class Child extends Base {
+    int inherited() {
+        return YEAR; // positive-inherited-read
+    }
+
+    int localShadow() {
+        int YEAR = 1;
+        return YEAR; // negative-local-shadow
+    }
+
+    int parameterShadow(int YEAR) {
+        return YEAR; // negative-parameter-shadow
+    }
+}
+"#,
+        ),
+        (
+            "p/ShadowChild.java",
+            r#"
+package p;
+
+public class ShadowChild extends Base {
+    int YEAR = 1;
+
+    int inheritedFieldShadow() {
+        return YEAR; // negative-derived-field-shadow
+    }
+}
+"#,
+        ),
+        (
+            "p/MiddleShadow.java",
+            r#"
+package p;
+
+public class MiddleShadow extends Base {
+    protected static final int YEAR = 1;
+}
+"#,
+        ),
+        (
+            "p/GrandChild.java",
+            r#"
+package p;
+
+public class GrandChild extends MiddleShadow {
+    int inheritedFieldShadow() {
+        return YEAR; // negative-intermediate-field-shadow
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "p.Base.YEAR");
+    let hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+
+    assert_eq!(1, hits.len(), "expected only the inherited bare field read");
+    assert_hit_contains(&hits, "positive-inherited-read");
+    assert_no_hit_contains(&hits, "negative-local-shadow");
+    assert_no_hit_contains(&hits, "negative-parameter-shadow");
+    assert_no_hit_contains(&hits, "negative-derived-field-shadow");
+    assert_no_hit_contains(&hits, "negative-intermediate-field-shadow");
+}
+
+#[test]
+fn java_usage_finder_finds_bare_inherited_method_call_and_excludes_self_and_wrong_owner() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "p/Base.java",
+            r#"
+package p;
+
+public class Base {
+    protected void ping(String left, String right) {}
+}
+"#,
+        ),
+        (
+            "p/Pingable.java",
+            r#"
+package p;
+
+public interface Pingable {
+    void ping(String left, String right);
+}
+"#,
+        ),
+        (
+            "p/Child.java",
+            r#"
+package p;
+
+public class Child extends Base implements Pingable {
+    void inherited() {
+        ping("left", "right"); // positive-inherited-call
+    }
+}
+"#,
+        ),
+        (
+            "p/OverrideChild.java",
+            r#"
+package p;
+
+public class OverrideChild extends Base {
+    @Override
+    protected void ping(String left, String right) {}
+
+    void selfCall() {
+        ping("left", "right"); // negative-self-call
+    }
+}
+"#,
+        ),
+        (
+            "p/WrongOwner.java",
+            r#"
+package p;
+
+public class WrongOwner {
+    void ping(String left, String right) {}
+
+    void localCall() {
+        ping("left", "right"); // negative-wrong-owner
+    }
+}
+"#,
+        ),
+        (
+            "p/MiddleOverride.java",
+            r#"
+package p;
+
+public class MiddleOverride extends Base {
+    @Override
+    protected void ping(String left, String right) {}
+}
+"#,
+        ),
+        (
+            "p/GrandChild.java",
+            r#"
+package p;
+
+public class GrandChild extends MiddleOverride {
+    void inheritedOverrideCall() {
+        ping("left", "right"); // negative-intermediate-override
+    }
+}
+"#,
+        ),
+    ]);
+
+    let target = definition(&analyzer, "p.Base.ping");
+    let hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    let reference_hits: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .cloned()
+        .collect();
+
+    assert_eq!(
+        1,
+        reference_hits.len(),
+        "expected only the inherited bare method reference: {reference_hits:#?}"
+    );
+    assert_hit_contains(&reference_hits, "positive-inherited-call");
+    assert_no_hit_contains(&reference_hits, "negative-self-call");
+    assert_no_hit_contains(&reference_hits, "negative-wrong-owner");
+    assert_no_hit_contains(&reference_hits, "negative-intermediate-override");
+}
+
+#[test]
+fn java_graph_strategy_counts_annotation_type_references_without_same_name_confusion() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "target/Tag.java",
+            r#"
+package target;
+
+public @interface Tag {
+    String value() default "";
+}
+"#,
+        ),
+        (
+            "target/Outer.java",
+            r#"
+package target;
+
+public class Outer {
+    public @interface Nested {}
+}
+"#,
+        ),
+        (
+            "other/Tag.java",
+            r#"
+package other;
+
+public @interface Tag {}
+"#,
+        ),
+        (
+            "app/Consumer.java",
+            r#"
+package app;
+
+import target.Outer;
+import target.Tag;
+
+@Tag("ordinary") // positive-ordinary-annotation
+@Tag // positive-marker-annotation
+@Outer.Nested // positive-nested-annotation
+@target.Outer.Nested // positive-qualified-nested-annotation
+@other.Tag // negative-unrelated-same-name
+public class Consumer {}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let tag_target = definition(&analyzer, "target.Tag");
+    let tag_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&tag_target),
+        &candidates,
+        1000,
+    ));
+    assert_eq!(
+        2,
+        tag_hits.len(),
+        "expected only the target.Tag annotations"
+    );
+    assert_hit_contains(&tag_hits, "positive-ordinary-annotation");
+    assert_hit_contains(&tag_hits, "positive-marker-annotation");
+    assert_no_hit_line(&tag_hits, 10);
+
+    let nested_target = definition(&analyzer, "target.Outer.Nested");
+    let nested_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&nested_target),
+        &candidates,
+        1000,
+    ));
+    assert_eq!(
+        2,
+        nested_hits.len(),
+        "expected both nested annotation forms"
+    );
+    assert_hit_contains(&nested_hits, "positive-nested-annotation");
+    assert_hit_contains(&nested_hits, "positive-qualified-nested-annotation");
+    assert_no_hit_line(&nested_hits, 11);
+}
+
+#[test]
+fn java_graph_strategy_accepts_varargs_expanded_and_array_calls_but_rejects_wrong_arity() {
+    let (_project, analyzer) = java_analyzer_with_files(&[
+        (
+            "p/Target.java",
+            r#"
+package p;
+
+public class Target<T> {
+    public void join(String left) {}
+    public void join(String left, String right, String... rest) {}
+    public void receive(Target<T> this, String value) {}
+
+    public Target(String left) {}
+    public Target(String left, String right, String... rest) {}
+}
+"#,
+        ),
+        (
+            "p/Consumer.java",
+            r#"
+package p;
+
+public class Consumer {
+    void call(Target target) {
+        target.join("a", "b", "c"); // positive-varargs-expanded-method
+        target.join("a", "b", new String[]{"c"}); // positive-varargs-array-method
+        target.join("a"); // negative-non-varargs-method
+        target.receive("a"); // positive-explicit-receiver-method
+
+        new Target<>("a", "b", "c"); // positive-varargs-expanded-ctor
+        new Target<>("a", "b", new String[]{"c"}); // positive-varargs-array-ctor
+        new Target<>("a"); // negative-non-varargs-ctor
+    }
+}
+"#,
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let varargs_method = analyzer
+        .get_definitions("p.Target.join")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String, String, String[])"))
+        .expect("missing varargs join overload");
+    let varargs_constructor = analyzer
+        .get_definitions("p.Target.Target")
+        .into_iter()
+        .find(|cu| cu.signature() == Some("(String, String, String[])"))
+        .expect("missing varargs constructor overload");
+    let receiver_method = definition(&analyzer, "p.Target.receive");
+
+    let method_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&varargs_method),
+        &candidates,
+        1000,
+    ));
+    assert_eq!(2, method_hits.len(), "expected both varargs method calls");
+    assert_hit_contains(&method_hits, "positive-varargs-expanded-method");
+    assert_hit_contains(&method_hits, "positive-varargs-array-method");
+    assert_no_hit_line(&method_hits, 8);
+
+    let receiver_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&receiver_method),
+        &candidates,
+        1000,
+    ));
+    assert_eq!(
+        1,
+        receiver_hits.len(),
+        "receiver parameter is not a call argument"
+    );
+    assert_hit_contains(&receiver_hits, "positive-explicit-receiver-method");
+
+    let constructor_hits = hits(JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&varargs_constructor),
+        &candidates,
+        1000,
+    ));
+    assert_eq!(
+        2,
+        constructor_hits.len(),
+        "expected both varargs constructor calls"
+    );
+    assert_hit_contains(&constructor_hits, "positive-varargs-expanded-ctor");
+    assert_hit_contains(&constructor_hits, "positive-varargs-array-ctor");
+    assert_no_hit_line(&constructor_hits, 13);
+}
+
+#[test]
 fn java_graph_strategy_counts_static_field_usages() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (

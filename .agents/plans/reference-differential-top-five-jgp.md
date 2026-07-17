@@ -15,6 +15,15 @@ The observable result is three complete JSONL corpus records, one per language a
 - [x] (2026-07-17 00:32Z) Repaired `/mnt/c/Users/jbell/.codex/agents/oldskool.toml` by adding the role's now-required `developer_instructions`; the initial invocation had warned that Codex ignored the malformed role, although explicit model/reasoning overrides still ran GPT-5.4/medium.
 - [x] (2026-07-17 00:32Z) Built the release differential runner and selected the exact top five Java, Go, and Python clones with a no-write dry-run. All fifteen Git repositories are clean; three N=1 repositories and IntelliJ have existing persisted caches, while the other eleven are cold.
 - [x] (2026-07-17 00:36Z) Committed and pushed the campaign-start plan as `2366ea0e`, establishing a clean published Bifrost checkpoint before analyzer cache mutation.
+- [x] (2026-07-17 01:31Z) Completed the clean-head Java top-five baseline at `082570af` in 54m51s with all five repository jobs successful. The run averaged 829% CPU, peaked at 22.1 GiB RSS, and recorded raw missing counts of google-cloud-java 122, AWS SDK Java 126, IntelliJ 740, Dragonwell 200, and Telegram 344.
+- [x] (2026-07-17 01:31Z) Confirmed Dragonwell `JapaneseImperialCalendar.java:414` bytes `16578..16582` as a live complete-inverse gap for `java.util.Calendar.YEAR`, searched for duplicates, created issue #858 assigned to `jbellis`, and delegated the structured fix plus reduced shadow controls to Oldskool. Root review removed an unnecessary whole-workspace edge-builder expansion and added public reference/location MCP coverage.
+- [x] (2026-07-17 02:12Z) Exhaustively reconciled the remaining Java baseline rows. Google Cloud's 122 rows are invalid forward identities or incompatible focus spans; AWS's 126 split into 105 invalid constructor/receiver-focus rows and 21 live annotation sites; Telegram's 344 reduce to 328 qualifier/focus artifacts, two owner-focus rows, one wrong forward identity, and 13 live sites across annotation/varargs/inherited-field/constructor roots; Dragonwell's 200 reduce to inherited field, annotation, varargs/constructor roots plus invalid residuals; IntelliJ's 740 contain 538 test/testData forward contaminations, qualified-span/static-import/wrong-overload artifacts, and the live roots recorded below.
+- [x] (2026-07-17 02:12Z) Searched open and closed GitHub issues, verified the old #486 was unrelated, and created issues #860 (expanded varargs), #861 (annotation references), #862 (constructor type references), and #863 (bare inherited method round trip), all assigned to `jbellis` before implementation. No issue assigned to another user was reused.
+- [x] (2026-07-17 03:08Z) Reviewed and narrowed the delegated Java implementation: removed an unrelated explicit `this`/`super` constructor expansion, preserved ordinary type hit spans while adding annotation terminals, added subclass-field-shadow controls, invalidated stale Java declaration metadata with a per-language epoch salt, and generalized forward/inverse arity checks through structured `CallableArity` metadata including varargs.
+- [x] (2026-07-17 03:08Z) Proved issues #858, #860, #861, and #862 against every retained production witness. Exact reruns are actionable-zero for Dragonwell `Calendar.YEAR`, Telegram `resourceProvider`, all four annotation repositories, Telegram/IntelliJ varargs calls, IntelliJ `JBList`/`ComboBox`/`TextRange` constructors, Telegram's anonymous-class constructor, and Dragonwell's diamond `Vector<>` constructor.
+- [x] (2026-07-17 03:08Z) Corrected #863 after production review showed the two-argument IntelliJ `append(...)` call was first being resolved forward to a three-argument subclass override. Updated the assigned issue, delegated the forward fix to Oldskool, reviewed it to honor structured varargs arity, and obtained an actionable-zero exact round trip targeting the correct inherited `SimpleColoredComponent.append` declaration.
+- [x] (2026-07-17 03:49Z) Completed root and independent Oldskool review. Root added current-class and nearest-ancestor override/field-shadow controls; Oldskool identified superclass-versus-interface method precedence, which now prefers the single declaring class at a hierarchy level and has a reduced regression. The complete focused suites pass: 58 Java usage-graph tests, 479 definition tests, and 148 public symbols-service tests with one intentional ignore.
+- [x] (2026-07-17 03:55Z) Passed the Java integration gate: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the complete `UV_CACHE_DIR=/tmp/bifrost-uv-cache cargo test --features nlp,python` suite all exited zero. Post-review exact probes remained actionable-zero for Dragonwell `Calendar.YEAR` and the correctly resolved IntelliJ `SimpleColoredComponent.append` call.
 - [ ] Complete the Java top-five run, triage every raw missing site, file/assign/fix legitimate issues, pass the complete local gate, integrate to `origin/master`, rerun from the fixing head, close issues with evidence, and publish the Java summary.
 - [ ] Complete the Go top-five run under the same discipline and publish the Go summary.
 - [ ] Complete the Python top-five run under the same discipline and publish the Python summary.
@@ -33,6 +42,27 @@ The observable result is three complete JSONL corpus records, one per language a
 
 - Observation: The N=1 closure records contain many raw missing rows that are not genuine inverse defects.
   Evidence: final Java retained 122 rows partitioned into 92 invalid class forward identities and 30 owner/receiver-focus method rows; final Go retained 126 invalid rows partitioned into 117 incompatible focus/target identities and nine wrong-owner keyed labels; final Python retained six invalid rows consisting of one wrong receiver identity and five post-rebind wrong-import identities.
+
+- Observation: Repository-level concurrency removed the multi-repository serial wait, but Java remained storage/kernel dominated rather than CPU saturated.
+  Evidence: five `--jobs 24` analyzers completed in 54m51s at 829% average aggregate CPU, with 9,069 user seconds, 18,244 system seconds, 28,701 major faults, and 287,246,208 filesystem output blocks. Fast repositories entered inverse scanning while AWS and google-cloud-java were still in forward resolution, so the outer scheduler behaved concurrently as designed.
+
+- Observation: A raw IntelliJ type-use row that looked like an inverse miss was actually a wrong forward identity.
+  Evidence: `com.google.common.graph.@NotNull MutableNetwork` in `GraphAdapter.java` resolved forward to the unrelated workspace declaration `com.intellij.util.graph.MutableNetwork`. It is not evidence for broadening inverse type matching.
+
+- Observation: Java's precise inverse field scan recognized bare fields only in the declaration owner itself or through static imports, while the forward resolver already follows inherited fields.
+  Evidence: the exact Dragonwell rerun resolved `YEAR` to `java.util.Calendar.YEAR` and returned one missing site with one fully queried target. The reduced `p.Child extends p.Base` case failed before the patch and passes after using hierarchy-aware owner context while rejecting nested-scope local and parameter shadows.
+
+- Observation: The ordinary-constructor rows had two independent structured causes; the first delegated hypothesis that selector grouping or candidate-file scope caused them was disproved.
+  Evidence: refreshed persisted metadata alone left IntelliJ `new ExpandedItemListCellRendererWrapper<>(...)` missing. Temporary exact-path diagnostics showed `generic_type` reached the constructor matcher but `expression_name_node` returned no terminal for diamond syntax. Falling back to the generic node's first named type child fixes diamond constructors. Separately, non-generic IntelliJ `new TextRange(...)` and Telegram anonymous-class construction became consistent only after Java declarations emitted structured callable arity and the Java epoch forced stale metadata to refresh.
+
+- Observation: The apparent inherited-method inverse miss in IntelliJ was initially preceded by an invalid forward overload identity.
+  Evidence: the source call `append("'", SimpleTextAttributes.GRAY_ATTRIBUTES)` has two arguments, while baseline forward resolution selected `ColoredListCellRenderer.append(String, SimpleTextAttributes, boolean)`. Arity-aware forward hierarchy traversal now continues to `SimpleColoredComponent.append(String, SimpleTextAttributes)`, after which hierarchy-aware inverse matching covers the original call. The final exact rerun is actionable-zero.
+
+- Observation: Java cache invalidation is expensive once but warm exact probes are cheap.
+  Evidence: the first post-epoch refresh took about 354 seconds for IntelliJ, 364 seconds for Dragonwell, and 564 seconds for AWS at 40-120 workers. Subsequent exact probes on the same repository loaded the workspace in roughly 2-45 seconds and completed in 5-69 seconds.
+
+- Observation: Nearest-declaring-owner logic must preserve Java's class-over-interface precedence.
+  Evidence: independent Oldskool review found that a superclass and directly implemented interface can declare the same method signature at the same breadth-first hierarchy level, while Java resolves a bare call to the superclass member. The inverse matcher now prefers a single declaring class over same-level interfaces, remains conservative for multiple interface declarations, and the inherited-method reduction exercises `Child extends Base implements Pingable`.
 
 ## Decision Log
 
@@ -58,6 +88,10 @@ The observable result is three complete JSONL corpus records, one per language a
 
 - Decision: Do not wait for GitHub CI after a language push.
   Rationale: The user explicitly asked the campaign to move on after local `cargo test` passes and will report CI failures separately. Local formatting, clippy, focused tests, and the full `cargo test --features nlp,python` suite remain mandatory before integration.
+  Date/Author: 2026-07-17 / Codex
+
+- Decision: Bump only Java's analysis epoch when adding structured callable arity metadata.
+  Rationale: persisted Java declarations from the same package version deserialize the new field as absent and would silently retain exact-only arity behavior, defeating varargs correctness. A Java-only salt refreshes the affected payloads without invalidating Go, Python, or unrelated language caches.
   Date/Author: 2026-07-17 / Codex
 
 ## Outcomes & Retrospective

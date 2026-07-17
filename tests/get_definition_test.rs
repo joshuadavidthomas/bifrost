@@ -10293,6 +10293,124 @@ public class UseUtil {
 }
 
 #[test]
+fn java_unqualified_inherited_method_call_filters_out_wrong_arity_override() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/intellij/ui/SimpleTextAttributes.java",
+            "package com.intellij.ui; public class SimpleTextAttributes { public static final SimpleTextAttributes GRAY_ATTRIBUTES = new SimpleTextAttributes(); }\n",
+        )
+        .file(
+            "com/intellij/ui/SimpleColoredComponent.java",
+            "package com.intellij.ui; public class SimpleColoredComponent { public void append(String text, SimpleTextAttributes attributes) {} public void appendMany(String text, SimpleTextAttributes... attributes) {} }\n",
+        )
+        .file(
+            "com/intellij/ui/ColoredListCellRenderer.java",
+            "package com.intellij.ui; public class ColoredListCellRenderer extends SimpleColoredComponent { public void append(String text, SimpleTextAttributes attributes, boolean isMainText) {} public void appendMany(String text) {} }\n",
+        )
+        .file(
+            "com/intellij/lang/RegExpInspectionConfigurationCellRenderer.java",
+            r#"
+package com.intellij.lang;
+
+import com.intellij.ui.ColoredListCellRenderer;
+import com.intellij.ui.SimpleTextAttributes;
+
+public class RegExpInspectionConfigurationCellRenderer extends ColoredListCellRenderer {
+    public void render() {
+        append("'", SimpleTextAttributes.GRAY_ATTRIBUTES);
+        appendMany("'", SimpleTextAttributes.GRAY_ATTRIBUTES, SimpleTextAttributes.GRAY_ATTRIBUTES);
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        append(\"'\", SimpleTextAttributes.GRAY_ATTRIBUTES);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"com/intellij/lang/RegExpInspectionConfigurationCellRenderer.java","line":9,"column":{}}}]}}"#,
+            column_of(line, "append")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "com.intellij.ui.SimpleColoredComponent.append",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["signature"], "(String, SimpleTextAttributes)",
+        "{value}"
+    );
+
+    let varargs_line = "        appendMany(\"'\", SimpleTextAttributes.GRAY_ATTRIBUTES, SimpleTextAttributes.GRAY_ATTRIBUTES);";
+    let varargs_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"com/intellij/lang/RegExpInspectionConfigurationCellRenderer.java","line":10,"column":{}}}]}}"#,
+            column_of(varargs_line, "appendMany")
+        ),
+    );
+    let varargs_result = &varargs_value["results"][0];
+    assert_eq!(varargs_result["status"], "resolved", "{varargs_value}");
+    assert_eq!(
+        varargs_result["definitions"][0]["fqn"],
+        "com.intellij.ui.SimpleColoredComponent.appendMany",
+        "{varargs_value}"
+    );
+    assert_eq!(
+        varargs_result["definitions"][0]["signature"], "(String, SimpleTextAttributes[])",
+        "{varargs_value}"
+    );
+}
+
+#[test]
+fn java_unqualified_method_call_keeps_matching_local_overload() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "pkg/BaseRenderer.java",
+            "package pkg; public class BaseRenderer { public void append(String text, String attrs) {} }\n",
+        )
+        .file(
+            "pkg/ChildRenderer.java",
+            r#"
+package pkg;
+
+public class ChildRenderer extends BaseRenderer {
+    public void append(String text, String attrs, boolean primary) {}
+
+    public void render() {
+        append("value", "gray", true);
+    }
+}
+"#,
+        )
+        .build();
+
+    let line = "        append(\"value\", \"gray\", true);";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"pkg/ChildRenderer.java","line":8,"column":{}}}]}}"#,
+            column_of(line, "append")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "pkg.ChildRenderer.append",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["signature"], "(String, String, boolean)",
+        "{value}"
+    );
+}
+
+#[test]
 fn java_static_method_receiver_prefers_nearest_declaring_type() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
