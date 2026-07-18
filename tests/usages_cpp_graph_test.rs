@@ -8298,6 +8298,162 @@ typedef ns::Owner Owner;
 }
 
 #[test]
+fn authoritative_cpp_enum_usage_does_not_treat_recovered_abstract_array_size_as_binding() {
+    const ENUMERATOR: &str = "MT76_TM_ATTR_TX_POWER";
+    let source = r#"#include "testmode.h"
+#define nla_for_each_nested(pos, nla, rem) for (; rem; rem--)
+#define APPLY(value) (value)
+
+void recovered_loop(int *tb) {
+    int cur = 0;
+    int rem = 1;
+    nla_for_each_nested(cur, tb[MT76_TM_ATTR_TX_POWER], rem) { // recovered-loop
+        cur++;
+    }
+}
+
+void named_array(int tb[MT76_TM_ATTR_TX_POWER]) {             // named-array-bound
+    int value = tb[MT76_TM_ATTR_TX_POWER];                    // named-array-use
+}
+
+void anonymous_array(int [MT76_TM_ATTR_TX_POWER]);            // anonymous-array-bound
+
+void ordinary(int *tb) {
+    int subscript = tb[MT76_TM_ATTR_TX_POWER];                 // ordinary-subscript
+    int macro_arg = APPLY(tb[MT76_TM_ATTR_TX_POWER]);          // ordinary-macro-arg
+}
+
+void real_shadow(int MT76_TM_ATTR_TX_POWER) {
+    int shadowed = MT76_TM_ATTR_TX_POWER;                      // real-shadow
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "testmode.h",
+            "enum mt76_testmode_attr { MT76_TM_ATTR_UNSPEC, MT76_TM_ATTR_TX_POWER };\n",
+        )
+        .file("testmode.c", source)
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.fq_name() == "mt76_testmode_attr.MT76_TM_ATTR_TX_POWER"
+    });
+    let consumer = project.file("testmode.c");
+    let nth_range = |occurrence: usize| {
+        let start = source
+            .match_indices(ENUMERATOR)
+            .nth(occurrence)
+            .unwrap_or_else(|| panic!("missing enumerator occurrence {occurrence}"))
+            .0;
+        (start, start + ENUMERATOR.len())
+    };
+    let expected = (0..6).map(nth_range).collect::<BTreeSet<_>>();
+    let real_shadow_name = nth_range(6);
+    let real_shadow_use = nth_range(7);
+
+    for &(start, _) in &expected {
+        let line_start = source[..start].rfind('\n').map_or(0, |newline| newline + 1);
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "testmode.c".to_string(),
+                    line: Some(
+                        source[..start]
+                            .bytes()
+                            .filter(|byte| *byte == b'\n')
+                            .count()
+                            + 1,
+                    ),
+                    column: Some(source[line_start..start].chars().count() + 1),
+                }],
+            },
+        )
+        .results
+        .into_iter()
+        .next()
+        .expect("one forward result");
+        assert_eq!(
+            forward.status, "resolved",
+            "forward at {start}: {forward:#?}"
+        );
+        assert_eq!(
+            forward
+                .definitions
+                .iter()
+                .filter_map(|definition| definition.fqn.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([target.fq_name().to_string()]),
+            "forward target at {start}: {forward:#?}"
+        );
+    }
+
+    let provider =
+        ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1,
+            1000,
+        );
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = query.result
+    else {
+        panic!("expected authoritative C++ success");
+    };
+    let actual = hits_by_overload
+        .get(&target)
+        .into_iter()
+        .flatten()
+        .map(|hit| {
+            assert_eq!(hit.file, consumer);
+            (hit.start_offset, hit.end_offset)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(actual, expected, "exact authoritative enum ranges");
+    assert!(!actual.contains(&real_shadow_name));
+    assert!(!actual.contains(&real_shadow_use));
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+        0
+    );
+
+    let FuzzyResult::Success {
+        hits_by_overload,
+        unproven_total_by_overload,
+        ..
+    } = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target))
+    else {
+        panic!("expected whole-project C++ success");
+    };
+    let whole = hits_by_overload
+        .get(&target)
+        .into_iter()
+        .flatten()
+        .filter(|hit| hit.file == consumer)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(whole, expected, "whole-project enum ranges");
+    assert_eq!(
+        unproven_total_by_overload
+            .get(&target)
+            .copied()
+            .unwrap_or_default(),
+        0
+    );
+}
+
+#[test]
 fn authoritative_cpp_class_usage_resolves_bare_type_in_lexical_namespace() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

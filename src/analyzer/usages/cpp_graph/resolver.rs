@@ -2832,6 +2832,11 @@ pub(in crate::analyzer::usages) fn extract_variable_name(
             let name = node_text(node, source).trim();
             (!name.is_empty()).then(|| name.to_string())
         }
+        "abstract_array_declarator"
+        | "abstract_function_declarator"
+        | "abstract_parenthesized_declarator"
+        | "abstract_pointer_declarator"
+        | "abstract_reference_declarator" => None,
         _ => node
             .child_by_field_name("declarator")
             .or_else(|| node.child_by_field_name("name"))
