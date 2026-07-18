@@ -73,6 +73,8 @@ pub(crate) struct ProjectTypes {
     scala_trait_fqns: Option<HashSet<String>>,
     package_types_by_package: Mutex<HashMap<String, PackageTypeEntries>>,
     package_objects_by_package: Mutex<HashMap<String, PackageTypeEntries>>,
+    nested_types_by_owner: Mutex<HashMap<String, PackageTypeEntries>>,
+    nested_objects_by_owner: Mutex<HashMap<String, PackageTypeEntries>>,
     source_facts_by_file: Mutex<HashMap<ProjectFile, ScalaSourceFactsCell>>,
     bulk_file_states: Option<HashMap<ProjectFile, FileState>>,
     callable_alternatives_by_unit: Mutex<HashMap<CodeUnit, CallableAlternativesCell>>,
@@ -91,6 +93,8 @@ impl ProjectTypes {
             scala_trait_fqns: None,
             package_types_by_package: Mutex::new(HashMap::default()),
             package_objects_by_package: Mutex::new(HashMap::default()),
+            nested_types_by_owner: Mutex::new(HashMap::default()),
+            nested_objects_by_owner: Mutex::new(HashMap::default()),
             source_facts_by_file: Mutex::new(HashMap::default()),
             bulk_file_states: None,
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
@@ -153,6 +157,8 @@ impl ProjectTypes {
             ),
             package_types_by_package: Mutex::new(HashMap::default()),
             package_objects_by_package: Mutex::new(HashMap::default()),
+            nested_types_by_owner: Mutex::new(HashMap::default()),
+            nested_objects_by_owner: Mutex::new(HashMap::default()),
             source_facts_by_file: Mutex::new(HashMap::default()),
             bulk_file_states: Some(file_states),
             callable_alternatives_by_unit: Mutex::new(HashMap::default()),
@@ -755,6 +761,98 @@ impl ProjectTypes {
         values
     }
 
+    fn nested_types_in(&self, scala: &ScalaAnalyzer, normalized_owner: &str) -> PackageTypeEntries {
+        if let Some(types) = self
+            .nested_types_by_owner
+            .lock()
+            .expect("nested Scala type cache poisoned")
+            .get(normalized_owner)
+            .cloned()
+        {
+            return types;
+        }
+        let mut grouped: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+        for owner in self
+            .index
+            .by_normalized_fqn(normalized_owner)
+            .iter()
+            .filter(|unit| unit.is_class() && self.type_is_stable_owner(scala, unit))
+        {
+            for unit in self
+                .index
+                .fqn_direct_children(&owner.fq_name())
+                .into_iter()
+                .filter(|unit| unit.is_class())
+            {
+                grouped
+                    .entry(scala_simple_type_name(&unit))
+                    .or_default()
+                    .push(unit);
+            }
+        }
+        let mut values = Vec::new();
+        for (simple, units) in grouped {
+            let ordinary = units
+                .iter()
+                .filter(|unit| !unit.short_name().ends_with('$'))
+                .collect::<Vec<_>>();
+            let selected = if ordinary.is_empty() {
+                units.iter().collect::<Vec<_>>()
+            } else {
+                ordinary
+            };
+            values.extend(
+                selected
+                    .into_iter()
+                    .map(|unit| (simple.clone(), unit.clone())),
+            );
+        }
+        let values = Arc::new(values);
+        self.nested_types_by_owner
+            .lock()
+            .expect("nested Scala type cache poisoned")
+            .insert(normalized_owner.to_string(), values.clone());
+        values
+    }
+
+    fn nested_objects_in(
+        &self,
+        scala: &ScalaAnalyzer,
+        normalized_owner: &str,
+    ) -> PackageTypeEntries {
+        if let Some(types) = self
+            .nested_objects_by_owner
+            .lock()
+            .expect("nested Scala object cache poisoned")
+            .get(normalized_owner)
+            .cloned()
+        {
+            return types;
+        }
+        let mut values = Vec::new();
+        for owner in self
+            .index
+            .by_normalized_fqn(normalized_owner)
+            .iter()
+            .filter(|unit| unit.is_class() && self.type_is_stable_owner(scala, unit))
+        {
+            for unit in self
+                .index
+                .fqn_direct_children(&owner.fq_name())
+                .into_iter()
+                .filter(|unit| unit.is_class() && self.type_accepts_object_roles(scala, unit))
+            {
+                values.push((scala_simple_type_name(&unit), unit));
+            }
+        }
+        let values = Arc::new(values);
+        self.nested_objects_by_owner
+            .lock()
+            .expect("nested Scala object cache poisoned")
+            .insert(normalized_owner.to_string(), values.clone());
+        values
+    }
+
     fn member_by_normalized_fqn(&self, normalized_fqn: &str) -> Option<&CodeUnit> {
         self.index
             .by_normalized_fqn(normalized_fqn)
@@ -874,6 +972,20 @@ impl ProjectTypes {
         scala: &ScalaAnalyzer,
         target: &CodeUnit,
     ) -> bool {
+        if self.type_is_stable_owner(scala, target) {
+            return true;
+        }
+        let source_facts = self.source_facts_for_file(scala, target.source());
+        self.declaration_ranges_for(scala, target)
+            .iter()
+            .any(|range| {
+                source_facts
+                    .case_class_ranges
+                    .contains(&(range.start_byte, range.end_byte))
+            })
+    }
+
+    pub(super) fn type_is_stable_owner(&self, scala: &ScalaAnalyzer, target: &CodeUnit) -> bool {
         if target.short_name().ends_with('$') {
             return true;
         }
@@ -883,6 +995,90 @@ impl ProjectTypes {
             .any(|range| {
                 source_facts
                     .stable_owner_ranges
+                    .contains(&(range.start_byte, range.end_byte))
+            })
+    }
+
+    pub(super) fn exact_companion_objects(
+        &self,
+        scala: &ScalaAnalyzer,
+        target: &CodeUnit,
+    ) -> Vec<CodeUnit> {
+        let target_parent = scala.structural_parent_of(target);
+        self.index
+            .by_normalized_fqn(&scala_normalized_fq_name(&target.fq_name()))
+            .iter()
+            .filter(|candidate| {
+                candidate.is_class()
+                    && *candidate != target
+                    && candidate.source() == target.source()
+                    && candidate.short_name().ends_with('$')
+                    && scala.structural_parent_of(candidate) == target_parent
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn class_accepts_extractor_role(
+        &self,
+        scala: &ScalaAnalyzer,
+        target: &CodeUnit,
+    ) -> bool {
+        self.is_case_class(scala, target)
+    }
+
+    pub(super) fn class_accepts_apply_role(
+        &self,
+        scala: &ScalaAnalyzer,
+        target: &CodeUnit,
+    ) -> bool {
+        self.is_case_class(scala, target)
+            || self
+                .exact_companion_objects(scala, target)
+                .iter()
+                .any(|companion| {
+                    self.members_for_exact_owner_name(&companion.fq_name(), "apply")
+                        .iter()
+                        .any(|unit| unit.is_function())
+                })
+    }
+
+    pub(super) fn class_companion_apply_call_matches(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        target: &CodeUnit,
+        call_arities: Option<&[usize]>,
+    ) -> bool {
+        if self.is_case_class(scala, target)
+            && self.constructor_call_shape_matches(scala, &target.fq_name(), call_arities)
+        {
+            return true;
+        }
+        self.exact_companion_objects(scala, target)
+            .iter()
+            .any(|companion| {
+                self.member_return_type_for_owner_member(
+                    scala,
+                    resolver,
+                    &companion.fq_name(),
+                    "apply",
+                    call_arities,
+                )
+                .is_some_and(|return_type| {
+                    scala_normalized_fq_name(&return_type)
+                        == scala_normalized_fq_name(&target.fq_name())
+                })
+            })
+    }
+
+    fn is_case_class(&self, scala: &ScalaAnalyzer, target: &CodeUnit) -> bool {
+        let source_facts = self.source_facts_for_file(scala, target.source());
+        self.declaration_ranges_for(scala, target)
+            .iter()
+            .any(|range| {
+                source_facts
+                    .case_class_ranges
                     .contains(&(range.start_byte, range.end_byte))
             })
     }
@@ -1372,6 +1568,14 @@ impl NameResolver {
                         names.add(simple.clone(), decl.fq_name(), 1);
                     }
                     for (simple, decl) in types.package_objects_in(scala, decl_package).iter() {
+                        object_names.add(simple.clone(), decl.fq_name(), 1);
+                    }
+                }
+                for owner in import_candidate_normalized_paths(&path, file_package) {
+                    for (simple, decl) in types.nested_types_in(scala, &owner).iter() {
+                        names.add(simple.clone(), decl.fq_name(), 1);
+                    }
+                    for (simple, decl) in types.nested_objects_in(scala, &owner).iter() {
                         object_names.add(simple.clone(), decl.fq_name(), 1);
                     }
                 }

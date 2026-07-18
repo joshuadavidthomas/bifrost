@@ -32,7 +32,11 @@ pub(super) struct TargetSpec {
     pub(super) callable_alternatives: CachedCallableAlternatives,
     pub(super) is_extension_method: bool,
     pub(super) is_object_type: bool,
-    pub(super) accepts_object_roles: bool,
+    pub(super) accepts_extractor_role: bool,
+    pub(super) accepts_apply_role: bool,
+    pub(super) accepts_stable_object_role: bool,
+    object_role_fq_names: HashSet<String>,
+    pub(super) type_parent: Option<CodeUnit>,
     pub(super) unapplied_reference_is_unambiguous: bool,
     pub(super) accepts_companion_apply_syntax: bool,
 }
@@ -42,9 +46,16 @@ impl TargetSpec {
         if target.is_class() {
             let owner_name = scala_display_name(target);
             let is_object_type = target.short_name().ends_with('$');
-            let accepts_object_roles = scala
-                .project_types()
-                .type_accepts_object_roles(scala, target);
+            let types = scala.project_types();
+            let companions = types.exact_companion_objects(scala, target);
+            let accepts_extractor_role = types.class_accepts_extractor_role(scala, target);
+            let accepts_apply_role = types.class_accepts_apply_role(scala, target);
+            let accepts_stable_object_role = types.type_is_stable_owner(scala, target);
+            let mut object_role_fq_names = HashSet::default();
+            if types.type_accepts_object_roles(scala, target) {
+                object_role_fq_names.insert(target.fq_name());
+            }
+            object_role_fq_names.extend(companions.iter().map(CodeUnit::fq_name));
             return Some(Self {
                 target: target.clone(),
                 kind: TargetKind::Type,
@@ -66,7 +77,11 @@ impl TargetSpec {
                 callable_alternatives: Arc::new(Vec::new()),
                 is_extension_method: false,
                 is_object_type,
-                accepts_object_roles,
+                accepts_extractor_role,
+                accepts_apply_role,
+                accepts_stable_object_role,
+                object_role_fq_names,
+                type_parent: scala.structural_parent_of(target),
                 unapplied_reference_is_unambiguous: false,
                 accepts_companion_apply_syntax: false,
             });
@@ -151,7 +166,11 @@ impl TargetSpec {
             callable_alternatives,
             is_extension_method,
             is_object_type: false,
-            accepts_object_roles: false,
+            accepts_extractor_role: false,
+            accepts_apply_role: false,
+            accepts_stable_object_role: false,
+            object_role_fq_names: HashSet::default(),
+            type_parent: None,
             unapplied_reference_is_unambiguous,
             accepts_companion_apply_syntax,
         })
@@ -172,6 +191,10 @@ impl TargetSpec {
     pub(super) fn related_override_owner_fq_matches(&self, owner_fq_name: &str) -> bool {
         self.owner.as_ref().map(CodeUnit::fq_name).as_deref() != Some(owner_fq_name)
             && self.family_owner_fq_names.contains(owner_fq_name)
+    }
+
+    pub(super) fn object_role_fq_matches(&self, object_fq_name: &str) -> bool {
+        self.object_role_fq_names.contains(object_fq_name)
     }
 }
 
@@ -841,11 +864,14 @@ impl Visibility {
                     .cloned(),
             );
         }
-        let object_identity = spec.target.fq_name();
         self.object_type_names.extend(
             self.type_names
                 .iter()
-                .filter(|name| resolver.resolve_object(name).as_deref() == Some(&object_identity))
+                .filter(|name| {
+                    resolver
+                        .resolve_object(name)
+                        .is_some_and(|resolved| spec.object_role_fq_matches(&resolved))
+                })
                 .cloned(),
         );
 
@@ -1014,6 +1040,11 @@ impl Visibility {
                 if spec.owner.is_none() {
                     names.direct_member_names.insert(spec.member_name.clone());
                 }
+            }
+            if spec.type_parent.as_ref().is_some_and(|parent| {
+                normalized_candidates.contains(&scala_normalized_fq_name(&parent.fq_name()))
+            }) {
+                names.type_names.insert(spec.member_name.clone());
             }
             if spec
                 .owner

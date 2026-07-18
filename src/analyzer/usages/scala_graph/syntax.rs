@@ -8,6 +8,7 @@ pub(crate) struct ScalaSourceFacts {
     pub(crate) callable_alternatives_by_range:
         HashMap<(usize, usize), ScalaCallableSourceAlternative>,
     pub(crate) stable_owner_ranges: HashSet<(usize, usize)>,
+    pub(crate) case_class_ranges: HashSet<(usize, usize)>,
 }
 
 #[derive(Clone)]
@@ -64,6 +65,15 @@ pub(crate) fn scala_source_facts(source: &str) -> Option<ScalaSourceFacts> {
                             return_type_path: None,
                         },
                     );
+                }
+                let mut children = node.walk();
+                if node
+                    .children(&mut children)
+                    .any(|child| child.kind() == "case")
+                {
+                    facts
+                        .case_class_ranges
+                        .insert((node.start_byte(), node.end_byte()));
                 }
             }
             "object_definition" | "enum_definition" => {
@@ -256,7 +266,7 @@ fn is_stable_type_qualifier(node: Node<'_>) -> bool {
     })
 }
 
-fn is_extractor_reference(node: Node<'_>) -> bool {
+pub(crate) fn is_extractor_reference(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "case_class_pattern"
             && parent
@@ -265,9 +275,15 @@ fn is_extractor_reference(node: Node<'_>) -> bool {
     })
 }
 
-fn is_infix_pattern_operator(node: Node<'_>) -> bool {
+pub(crate) fn is_infix_pattern_operator(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "infix_pattern" && parent.child_by_field_name("operator") == Some(node)
+    })
+}
+
+pub(crate) fn is_call_function_reference(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node)
     })
 }
 

@@ -1314,6 +1314,235 @@ object Use {
 }
 
 #[test]
+fn scala_class_targets_follow_only_exact_companion_apply_and_extractor_roles() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Model.scala",
+            r#"package model
+case class Event(value: Int)
+final class Settings private (val value: Int)
+object Settings {
+  def apply(value: Int): Settings = new Settings(value)
+  def unapply(settings: Settings): Option[Int] = Some(settings.value)
+}
+final class Plain(val value: Int)
+object Plain { def apply(value: Int): Event = Event(value) }
+"#,
+        ),
+        (
+            "other/Model.scala",
+            r#"package other
+case class Event(value: Int)
+final class Settings(val value: Int)
+object Settings {
+  def apply(value: Int): Settings = new Settings(value)
+  def unapply(settings: Settings): Option[Int] = Some(settings.value)
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import model.{Event => ModelEvent, Settings => ModelSettings, Plain}
+object Use {
+  val event = ModelEvent(1)
+  val wrongEventArity = ModelEvent(1, 2)
+  val settings = ModelSettings(2)
+  val wrongSettingsArity = ModelSettings()
+  val plainReturnsEvent = Plain(3)
+  def extract(value: Any): Int = value match {
+    case ModelEvent(number) => number
+    case ModelSettings(number) => number
+    case Plain(number) => number
+    case _ => 0
+  }
+}
+"#,
+        ),
+        (
+            "other/Use.scala",
+            r#"package other
+object Use {
+  val event = Event(1)
+  val settings = Settings(2)
+  def extract(value: Any): Int = value match {
+    case Event(number) => number
+    case Settings(number) => number
+    case _ => 0
+  }
+}
+"#,
+        ),
+    ]);
+
+    let event = definition(&analyzer, "model.Event");
+    let event_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&event)));
+    assert_hit_contains(&event_hits, "val event = ModelEvent(1)");
+    assert_hit_contains(&event_hits, "case ModelEvent(number)");
+    assert_no_hit_contains(&event_hits, "ModelEvent(1, 2)");
+    assert!(
+        event_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "other/Use.scala"),
+        "same-name package companion leaked: {event_hits:#?}"
+    );
+
+    let settings = definition(&analyzer, "model.Settings");
+    let settings_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&settings)));
+    assert_hit_contains(&settings_hits, "val settings = ModelSettings(2)");
+    assert_no_hit_contains(&settings_hits, "case ModelSettings(number)");
+    assert_no_hit_contains(&settings_hits, "ModelSettings()");
+
+    let plain = definition(&analyzer, "model.Plain");
+    let plain_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&plain)));
+    assert_no_hit_contains(&plain_hits, "Plain(3)");
+    assert_no_hit_contains(&plain_hits, "case Plain(number)");
+}
+
+#[test]
+fn scala_nested_type_visibility_honors_lexical_alias_wildcard_and_ambiguity() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Nested.scala",
+            r#"package model
+object Outer {
+  case class Inner(value: Int)
+  val lexicalType: Inner = Inner(1)
+  val lexicalCall = Inner(2)
+  def lexicalExtract(value: Any): Int = value match {
+    case Inner(number) => number
+    case _ => 0
+  }
+}
+object Sibling { case class Inner(value: Int) }
+"#,
+        ),
+        (
+            "app/Wildcard.scala",
+            r#"package app
+import model.Outer._
+object Wildcard {
+  val typed: Inner = Inner(3)
+  def extract(value: Any): Int = value match {
+    case Inner(number) => number
+    case _ => 0
+  }
+}
+"#,
+        ),
+        (
+            "app/Alias.scala",
+            r#"package app
+import model.Outer.Inner as Renamed
+object Alias {
+  val typed: Renamed = Renamed(4)
+  def extract(value: Any): Int = value match {
+    case Renamed(number) => number
+    case _ => 0
+  }
+}
+"#,
+        ),
+        (
+            "app/Ambiguous.scala",
+            r#"package app
+import model.Outer._
+import model.Sibling._
+object Ambiguous {
+  val typed: Inner = Inner(5)
+  def extract(value: Any): Int = value match {
+    case Inner(number) => number
+    case _ => 0
+  }
+}
+"#,
+        ),
+    ]);
+
+    let inner = definition(&analyzer, "model.Outer$.Inner");
+    let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&inner), 100, 100);
+    for expected in [
+        "app/Wildcard.scala",
+        "app/Alias.scala",
+        "app/Ambiguous.scala",
+    ] {
+        assert!(
+            query
+                .candidate_files
+                .iter()
+                .any(|file| file.rel_path() == expected),
+            "default Scala candidate routing omitted {expected}: {:#?}",
+            query.candidate_files
+        );
+    }
+    let inner_hits = hits(query.result);
+    for expected in [
+        "val lexicalType: Inner = Inner(1)",
+        "val lexicalCall = Inner(2)",
+        "case Inner(number)",
+        "val typed: Inner = Inner(3)",
+        "val typed: Renamed = Renamed(4)",
+        "case Renamed(number)",
+    ] {
+        assert_hit_contains(&inner_hits, expected);
+    }
+    assert!(
+        inner_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "app/Ambiguous.scala"),
+        "ambiguous sibling wildcard imports must not select a nested target: {inner_hits:#?}"
+    );
+}
+
+#[test]
+fn scala_case_class_wildcard_exposes_only_stable_companion_children() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Container.scala",
+            r#"package model
+case class Container(value: Int) {
+  class InstanceNested
+}
+object Container {
+  class CompanionNested
+}
+"#,
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import model.Container.*
+object Use {
+  val companion: CompanionNested = new CompanionNested
+  val invalidInstanceLeak: InstanceNested = new InstanceNested
+}
+"#,
+        ),
+    ]);
+
+    let companion = definition(&analyzer, "model.Container$.CompanionNested");
+    let companion_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&companion)));
+    assert_hit_contains(
+        &companion_hits,
+        "val companion: CompanionNested = new CompanionNested",
+    );
+
+    let instance = definition(&analyzer, "model.Container.InstanceNested");
+    let instance_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&instance)));
+    assert!(
+        instance_hits
+            .iter()
+            .all(|hit| hit.file.rel_path() != "app/Use.scala"),
+        "case-class instance children leaked through companion wildcard import: {instance_hits:#?}"
+    );
+}
+
+#[test]
 fn scala_qualified_call_initializer_seeds_local_receiver_type() {
     let (_project, analyzer) = scala_analyzer_with_files(&[(
         "app/Console.scala",

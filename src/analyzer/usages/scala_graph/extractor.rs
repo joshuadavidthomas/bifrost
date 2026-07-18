@@ -13,8 +13,9 @@ use crate::analyzer::usages::scala_graph::resolver::{
 };
 use crate::analyzer::usages::scala_graph::syntax::{
     call_arities_for_reference, has_ancestor_kind, has_member_qualifier,
-    infix_receiver_for_operator, is_assignment_lhs, is_constructor_like_reference,
-    is_identifier_node, is_owner_qualified_this, is_scala_class_reference,
+    infix_receiver_for_operator, is_assignment_lhs, is_call_function_reference,
+    is_constructor_like_reference, is_extractor_reference, is_identifier_node,
+    is_infix_pattern_operator, is_owner_qualified_this, is_scala_class_reference,
     is_scala_object_reference, is_terminal_stable_field_reference, member_qualifier,
     member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
     resolve_stable_object_expression, scala_union_type_alternative_paths,
@@ -716,13 +717,25 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     .parent()
                     .and_then(|expression| stable_object_expression_fqn(expression, ctx))
                     .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
-            (is_scala_class_reference(node, ctx.source)
+            let lexical_type_matches = nested_target_type_is_lexically_visible(node, ctx);
+            let class_reference = is_scala_class_reference(node, ctx.source)
                 && !ctx.spec.is_object_type
-                && ctx.visibility.class_type_name_matches(text)
-                || is_scala_object_reference(node)
-                    && (ctx.spec.is_object_type || ctx.spec.accepts_object_roles)
-                    && ctx.visibility.object_type_name_matches(text)
-                || terminal_object_matches)
+                && (ctx.visibility.class_type_name_matches(text) || lexical_type_matches);
+            let object_reference = is_scala_object_reference(node)
+                && (ctx.visibility.object_type_name_matches(text) || lexical_type_matches)
+                && (ctx.spec.is_object_type
+                    || ctx.spec.accepts_stable_object_role
+                    || (is_extractor_reference(node) || is_infix_pattern_operator(node))
+                        && ctx.spec.accepts_extractor_role
+                    || is_call_function_reference(node)
+                        && ctx.spec.accepts_apply_role
+                        && ctx.types.class_companion_apply_call_matches(
+                            ctx.scala,
+                            &ctx.name_resolver,
+                            &ctx.spec.target,
+                            call_arities_for_reference(node).as_deref(),
+                        ));
+            (class_reference || object_reference || terminal_object_matches)
                 && !type_reference_is_locally_bound(text, ctx)
         }
         TargetKind::Constructor => {
@@ -745,6 +758,26 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         ctx.bindings.declare_shadow(text.to_string());
     }
+}
+
+fn nested_target_type_is_lexically_visible(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(target_parent) = ctx.spec.type_parent.as_ref() else {
+        return false;
+    };
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
+    while let Some(unit) = current {
+        if &unit == target_parent {
+            return true;
+        }
+        current = ctx.analyzer.parent_of(&unit);
+    }
+    false
 }
 
 fn named_argument_field_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {

@@ -15,11 +15,22 @@ impl ScalaAnalyzer {
             return Vec::new();
         };
         if info.is_wildcard {
-            return self
+            let mut imported: Vec<CodeUnit> = self
                 .importable_declarations_by_package()
                 .get(&path)
                 .map(|units| units.iter().cloned().collect())
                 .unwrap_or_default();
+            for owner in self.inner.definitions(&path).filter(CodeUnit::is_class) {
+                imported.extend(
+                    self.inner
+                        .direct_children(&owner)
+                        .into_iter()
+                        .filter(is_scala_importable_direct_member),
+                );
+            }
+            imported.sort();
+            imported.dedup();
+            return imported;
         }
         self.inner.definitions(&path).collect()
     }
@@ -167,7 +178,11 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
                 return false;
             };
             if info.is_wildcard {
-                return path == target_package;
+                return path == target_package
+                    || self
+                        .inner
+                        .definitions(&path)
+                        .any(|owner| owner.is_class() && owner.source() == target);
             }
             let Some((package, imported)) = path.rsplit_once('.') else {
                 return false;
@@ -288,5 +303,9 @@ fn is_scala_importable_top_level(unit: &CodeUnit) -> bool {
     if unit.short_name().contains('.') {
         return false;
     }
+    unit.is_class() || unit.is_function() || unit.is_field()
+}
+
+fn is_scala_importable_direct_member(unit: &CodeUnit) -> bool {
     unit.is_class() || unit.is_function() || unit.is_field()
 }
