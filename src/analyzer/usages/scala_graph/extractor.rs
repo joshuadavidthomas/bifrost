@@ -15,14 +15,15 @@ use crate::analyzer::usages::scala_graph::resolver::{
     scala_literal_type_name, scala_normalized_fq_name, scala_resolve_declared_type,
 };
 use crate::analyzer::usages::scala_graph::syntax::{
-    ScalaCallableParameterList, ScalaImportContextIndex, ScalaParameterListKind,
-    ScalaQualifiedStableTypeRole, call_arities_for_reference, has_ancestor_kind,
-    has_member_qualifier, infix_receiver_for_operator, is_call_function_reference,
-    is_constructor_like_reference, is_extractor_reference, is_identifier_node,
-    is_infix_pattern_operator, is_owner_qualified_this, is_scala_class_reference,
-    is_scala_object_reference, is_terminal_stable_field_reference, member_qualifier,
-    member_qualifier_node, named_argument_invocation_owner, node_text, parenthesized_arity,
-    qualified_stable_type_reference, resolve_stable_object_expression,
+    ScalaCallableParameterList, ScalaImportContextIndex, ScalaMethodValueContext,
+    ScalaPackageContextIndex, ScalaParameterListKind, ScalaQualifiedStableTypeRole,
+    call_arities_for_reference, has_ancestor_kind, has_member_qualifier,
+    infix_receiver_for_operator, is_bare_companion_method_value_reference,
+    is_call_function_reference, is_constructor_like_reference, is_extractor_reference,
+    is_identifier_node, is_infix_pattern_operator, is_owner_qualified_this,
+    is_scala_class_reference, is_scala_object_reference, is_terminal_stable_field_reference,
+    member_qualifier, member_qualifier_node, named_argument_invocation_owner, node_text,
+    parenthesized_arity, qualified_stable_type_reference, resolve_stable_object_expression,
     scala_union_type_alternative_paths, stable_identifier_reference,
     terminal_invocation_owner_name,
 };
@@ -69,6 +70,7 @@ pub(super) fn scan_file(
     let file_package = package_name_of(scala, file).unwrap_or_default();
     let imports = scala.import_info_of(file);
     let import_contexts = ScalaImportContextIndex::new(&imports, tree.root_node().end_byte());
+    let package_contexts = ScalaPackageContextIndex::new(tree.root_node(), &source);
     let name_resolver = Arc::new(NameResolver::for_file_with_facts(
         scala,
         Some(file),
@@ -79,6 +81,7 @@ pub(super) fn scan_file(
     let visibility = Arc::new(Visibility::for_file_with_imports(
         scala,
         file,
+        &file_package,
         spec,
         &name_resolver,
         &[],
@@ -88,7 +91,7 @@ pub(super) fn scan_file(
         scala,
         analyzer,
         file,
-        file_package: &file_package,
+        active_package: file_package,
         source: &source,
         line_starts: &line_starts,
         spec,
@@ -98,7 +101,9 @@ pub(super) fn scan_file(
         imports,
         import_contexts,
         import_context_cursor: 0,
-        active_import_key: Vec::new(),
+        package_contexts,
+        package_context_cursor: 0,
+        active_resolver_key: None,
         resolver_contexts: HashMap::default(),
         bindings: &mut bindings,
         hits,
@@ -113,7 +118,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) scala: &'a ScalaAnalyzer,
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) file: &'a ProjectFile,
-    pub(super) file_package: &'a str,
+    pub(super) active_package: String,
     pub(super) source: &'a str,
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
@@ -123,8 +128,10 @@ pub(super) struct ScanCtx<'a> {
     imports: Vec<ImportInfo>,
     import_contexts: ScalaImportContextIndex,
     import_context_cursor: usize,
-    active_import_key: Vec<usize>,
-    resolver_contexts: HashMap<Vec<usize>, (Arc<NameResolver>, Arc<Visibility>)>,
+    package_contexts: ScalaPackageContextIndex,
+    package_context_cursor: usize,
+    active_resolver_key: Option<(Vec<String>, Vec<usize>)>,
+    resolver_contexts: HashMap<(Vec<String>, Vec<usize>), (Arc<NameResolver>, Arc<Visibility>)>,
     pub(super) bindings: &'a mut LocalInferenceEngine<String>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) max_usages: usize,
@@ -194,43 +201,56 @@ fn scan_tree(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn activate_import_context(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    let visible = ctx
+    let visible_imports = ctx
         .import_contexts
         .advance_to(node.start_byte(), &mut ctx.import_context_cursor);
-    if visible == ctx.active_import_key {
+    let visible_packages = ctx
+        .package_contexts
+        .advance_to(node.start_byte(), &mut ctx.package_context_cursor);
+    if ctx
+        .active_resolver_key
+        .as_ref()
+        .is_some_and(|(packages, imports)| {
+            packages.as_slice() == visible_packages && imports.as_slice() == visible_imports
+        })
+    {
         return;
     }
-    let key = visible.to_vec();
+    let key = (visible_packages.to_vec(), visible_imports.to_vec());
     if let Some((resolver, visibility)) = ctx.resolver_contexts.get(&key) {
         ctx.name_resolver = resolver.clone();
         ctx.visibility = visibility.clone();
-        ctx.active_import_key = key;
+        ctx.active_package = key.0.last().cloned().unwrap_or_default();
+        ctx.active_resolver_key = Some(key);
         return;
     }
 
-    let visible_imports = key
+    let imports = key
+        .1
         .iter()
         .filter_map(|index| ctx.imports.get(*index).cloned())
         .collect::<Vec<_>>();
-    let resolver = Arc::new(NameResolver::for_file_with_facts(
+    let resolver = Arc::new(NameResolver::for_file_with_package_context(
         ctx.scala,
         Some(ctx.file),
-        Some(ctx.file_package),
-        &visible_imports,
+        &key.0,
+        &imports,
         &ctx.types,
     ));
     let visibility = Arc::new(Visibility::for_file_with_imports(
         ctx.scala,
         ctx.file,
+        key.0.last().map(String::as_str).unwrap_or_default(),
         ctx.spec,
         &resolver,
-        &visible_imports,
+        &imports,
     ));
     ctx.resolver_contexts
         .insert(key.clone(), (resolver.clone(), visibility.clone()));
     ctx.name_resolver = resolver;
     ctx.visibility = visibility;
-    ctx.active_import_key = key;
+    ctx.active_package = key.0.last().cloned().unwrap_or_default();
+    ctx.active_resolver_key = Some(key);
 }
 
 fn scan_import_declaration(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -268,7 +288,7 @@ fn scan_import_declaration_identifier(
 fn matching_names_for_import_declaration(node: Node<'_>, ctx: &ScanCtx<'_>) -> HashSet<String> {
     let mut names = HashSet::default();
     for import in scala_import_infos_from_node(node, ctx.source) {
-        let matched = Visibility::matching_import_names(&import, ctx.spec, ctx.file_package);
+        let matched = Visibility::matching_import_names(&import, ctx.spec, &ctx.active_package);
         names.extend(matched.type_names);
         names.extend(matched.owner_names.into_keys());
         names.extend(matched.direct_member_names);
@@ -885,7 +905,7 @@ fn seed_or_shadow_typed_symbol(
     }
     if let Some(type_name) = type_name
         && let Some(owner_fq_name) =
-            scala_resolve_declared_type(ctx.scala, ctx.file, ctx.file_package, type_name)
+            scala_resolve_declared_type(ctx.scala, ctx.file, &ctx.active_package, type_name)
     {
         ctx.bindings
             .seed_symbol(name.to_string(), owner_fq_name.to_string());
@@ -1054,8 +1074,9 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
             let stable_identifier_object_matches = stable_identifier_object_fqn(node, ctx)
                 .is_some_and(|fqn| fqn == ctx.spec.target.fq_name());
+            let lexical_type = lexically_visible_nested_type(node, text, ctx);
             let lexical_type_matches =
-                ctx.spec.member_name == text && nested_target_type_is_lexically_visible(node, ctx);
+                lexical_type.as_deref() == Some(ctx.spec.target.fq_name().as_str());
             let class_call_shape_matches = !is_constructor_like_reference(node, ctx.source)
                 || ctx.types.constructor_call_shape_matches(
                     ctx.scala,
@@ -1065,8 +1086,11 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             let class_reference = qualified.is_none()
                 && is_scala_class_reference(node, ctx.source)
                 && !ctx.spec.is_object_type
-                && (ctx.visibility.class_type_name_matches(text) || lexical_type_matches)
+                && (lexical_type_matches
+                    || lexical_type.is_none() && ctx.visibility.class_type_name_matches(text))
                 && class_call_shape_matches;
+            let bare_method_value_context = is_bare_companion_method_value_reference(node)
+                .then(|| companion_method_value_context(node, ctx));
             let object_reference = qualified.is_none()
                 && object_syntax
                 && (ctx.visibility.object_type_name_matches(text) || lexical_type_matches)
@@ -1082,9 +1106,42 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                             &ctx.spec.target,
                             call_arities_for_reference(node).as_deref(),
                         ));
+            let incompatible_companion_object_reference = qualified.is_none()
+                && ctx.spec.is_object_type
+                && matches!(
+                    bare_method_value_context,
+                    Some(ScalaMethodValueContext::Incompatible)
+                )
+                && ctx.name_resolver.resolve_object(text).as_deref()
+                    == Some(ctx.spec.target.fq_name().as_str());
+            let companion_method_value = qualified.is_none()
+                && ctx.spec.member_name == text
+                && ctx.spec.accepts_apply_role
+                && bare_method_value_context.is_some()
+                && ctx.name_resolver.resolve(text).as_deref()
+                    == Some(ctx.spec.target.fq_name().as_str())
+                && match bare_method_value_context.unwrap_or(ScalaMethodValueContext::Unknown) {
+                    ScalaMethodValueContext::Unknown => {
+                        ctx.types.class_companion_apply_method_value_matches(
+                            ctx.scala,
+                            &ctx.spec.target,
+                            None,
+                        )
+                    }
+                    ScalaMethodValueContext::Function(arity) => {
+                        ctx.types.class_companion_apply_method_value_matches(
+                            ctx.scala,
+                            &ctx.spec.target,
+                            Some(&[arity]),
+                        )
+                    }
+                    ScalaMethodValueContext::Incompatible => false,
+                };
             (qualified_role_matches
                 || class_reference
                 || object_reference
+                || incompatible_companion_object_reference
+                || companion_method_value
                 || terminal_object_matches
                 || stable_identifier_object_matches)
                 && (qualified.is_some()
@@ -1115,10 +1172,12 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         ctx,
                     )
             });
-            let lexical_owner_matches = ctx.spec.owner_name.as_deref() == Some(text)
-                && nested_target_owner_is_lexically_visible(node, ctx);
+            let lexical_owner = lexically_visible_nested_type(node, text, ctx);
+            let lexical_owner_matches = lexical_owner.as_deref()
+                == ctx.spec.owner.as_ref().map(CodeUnit::fq_name).as_deref();
             qualified_owner_matches
-                || (ctx.visibility.class_type_name_matches(text) || lexical_owner_matches)
+                || (lexical_owner_matches
+                    || lexical_owner.is_none() && ctx.visibility.class_type_name_matches(text))
                     && !type_reference_is_locally_bound(text, ctx)
                     && is_constructor_like_reference(node, ctx.source)
                     && member_call_arity_matches(node, ctx)
@@ -1134,10 +1193,7 @@ fn scan_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
-fn nested_target_type_is_lexically_visible(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
-    let Some(target_parent) = ctx.spec.type_parent.as_ref() else {
-        return false;
-    };
+fn lexically_visible_nested_type(node: Node<'_>, name: &str, ctx: &ScanCtx<'_>) -> Option<String> {
     let range = Range {
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
@@ -1146,12 +1202,14 @@ fn nested_target_type_is_lexically_visible(node: Node<'_>, ctx: &ScanCtx<'_>) ->
     };
     let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
     while let Some(unit) = current {
-        if &unit == target_parent {
-            return true;
+        if unit.is_class()
+            && let Some(nested) = ctx.types.exact_nested_type(&unit.fq_name(), name)
+        {
+            return Some(nested);
         }
         current = ctx.analyzer.parent_of(&unit);
     }
-    false
+    None
 }
 
 fn named_argument_field_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> bool {
@@ -1339,19 +1397,26 @@ fn bare_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>
 }
 
 fn contextual_method_value_call_arities(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Vec<usize>> {
-    explicitly_declared_function_arity(node)
-        .or_else(|| call_parameter_function_arity(node, ctx))
-        .map(|arity| vec![arity])
+    match companion_method_value_context(node, ctx) {
+        ScalaMethodValueContext::Function(arity) => Some(vec![arity]),
+        ScalaMethodValueContext::Unknown | ScalaMethodValueContext::Incompatible => None,
+    }
 }
 
-fn explicitly_declared_function_arity(node: Node<'_>) -> Option<usize> {
-    let definition = node.parent()?;
-    if !matches!(definition.kind(), "val_definition" | "var_definition")
-        || definition.child_by_field_name("value") != Some(node)
+fn companion_method_value_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> ScalaMethodValueContext {
+    if let Some(definition) = node.parent()
+        && matches!(definition.kind(), "val_definition" | "var_definition")
+        && definition.child_by_field_name("value") == Some(node)
     {
-        return None;
+        let Some(type_node) = definition.child_by_field_name("type") else {
+            return ScalaMethodValueContext::Unknown;
+        };
+        return function_type_arity(type_node).map_or(
+            ScalaMethodValueContext::Incompatible,
+            ScalaMethodValueContext::Function,
+        );
     }
-    function_type_arity(definition.child_by_field_name("type")?)
+    call_parameter_method_value_context(node, ctx)
 }
 
 fn function_type_arity(type_node: Node<'_>) -> Option<usize> {
@@ -1363,39 +1428,64 @@ fn function_type_arity(type_node: Node<'_>) -> Option<usize> {
     Some(parameter_types.named_children(&mut cursor).count())
 }
 
-fn call_parameter_function_arity(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<usize> {
-    let arguments = node.parent()?;
+fn call_parameter_method_value_context(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> ScalaMethodValueContext {
+    let Some(arguments) = node.parent() else {
+        return ScalaMethodValueContext::Unknown;
+    };
     if arguments.kind() != "arguments" {
-        return None;
+        return ScalaMethodValueContext::Unknown;
     }
     let mut arguments_cursor = arguments.walk();
-    let parameter_index = arguments
+    let Some(parameter_index) = arguments
         .named_children(&mut arguments_cursor)
-        .position(|argument| argument == node)?;
-    let call = arguments.parent()?;
+        .position(|argument| argument == node)
+    else {
+        return ScalaMethodValueContext::Unknown;
+    };
+    let Some(call) = arguments.parent() else {
+        return ScalaMethodValueContext::Unknown;
+    };
     if call.kind() != "call_expression" || call.child_by_field_name("arguments") != Some(arguments)
     {
-        return None;
+        return ScalaMethodValueContext::Unknown;
     }
 
     let mut parameter_list = 0usize;
-    let mut function = call.child_by_field_name("function")?;
+    let Some(mut function) = call.child_by_field_name("function") else {
+        return ScalaMethodValueContext::Unknown;
+    };
     while function.kind() == "call_expression" {
         parameter_list += 1;
-        function = function.child_by_field_name("function")?;
+        let Some(inner) = function.child_by_field_name("function") else {
+            return ScalaMethodValueContext::Unknown;
+        };
+        function = inner;
     }
     if function.kind() == "generic_function" {
-        function = function.child_by_field_name("function")?;
+        let Some(inner) = function.child_by_field_name("function") else {
+            return ScalaMethodValueContext::Unknown;
+        };
+        function = inner;
     }
     if !matches!(function.kind(), "identifier" | "operator_identifier") {
-        return None;
+        return ScalaMethodValueContext::Unknown;
     }
     let function_name = node_text(function, ctx.source).trim();
-    if function_name.is_empty() || ctx.bindings.is_shadowed(function_name) {
-        return None;
+    if function_name.is_empty() {
+        return ScalaMethodValueContext::Unknown;
     }
-    let call_arities = call_arities_for_reference(function)?;
-    let owner = enclosing_owner_fq_name(function, ctx)?;
+    if ctx.bindings.is_shadowed(function_name) {
+        return ScalaMethodValueContext::Incompatible;
+    }
+    let Some(call_arities) = call_arities_for_reference(function) else {
+        return ScalaMethodValueContext::Unknown;
+    };
+    let Some(owner) = enclosing_owner_fq_name(function, ctx) else {
+        return ScalaMethodValueContext::Unknown;
+    };
     let methods = match ctx.types.bare_member_declarations(
         ctx.scala,
         &owner,
@@ -1404,30 +1494,40 @@ fn call_parameter_function_arity(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<us
     ) {
         BareMemberResolution::Resolved(methods) => methods,
         BareMemberResolution::NoMatch => {
-            let imported = ctx.name_resolver.resolve_member(function_name)?;
+            let Some(imported) = ctx.name_resolver.resolve_member(function_name) else {
+                return ScalaMethodValueContext::Unknown;
+            };
             ctx.scala
                 .definitions(&imported)
                 .filter(CodeUnit::is_function)
                 .collect()
         }
-        BareMemberResolution::Unresolved => return None,
+        BareMemberResolution::Unresolved => return ScalaMethodValueContext::Incompatible,
     };
+    if methods.is_empty() {
+        return ScalaMethodValueContext::Incompatible;
+    }
 
     let mut resolved = None;
     for method in methods {
-        let arity = ctx.types.callable_parameter_function_arity(
+        let Some(arity) = ctx.types.callable_parameter_function_arity(
             ctx.scala,
             &method,
             &call_arities,
             parameter_list,
             parameter_index,
-        )?;
+        ) else {
+            return ScalaMethodValueContext::Incompatible;
+        };
         if resolved.is_some_and(|resolved| resolved != arity) {
-            return None;
+            return ScalaMethodValueContext::Incompatible;
         }
         resolved = Some(arity);
     }
-    resolved
+    resolved.map_or(
+        ScalaMethodValueContext::Incompatible,
+        ScalaMethodValueContext::Function,
+    )
 }
 
 fn stable_object_expression_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {

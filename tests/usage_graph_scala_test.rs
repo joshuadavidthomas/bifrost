@@ -730,6 +730,98 @@ class Consumer {
 }
 
 #[test]
+fn scala_inverted_uses_parser_active_enclosing_package_for_constructors() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/collection/ArrayOps.scala",
+            "package scala.collection\nclass ArrayOps(value: Int)\n",
+        )
+        .file(
+            "scala/collection/immutable/ArraySeq.scala",
+            r#"package scala.collection
+package immutable
+object ArraySeq { def make = new ArrayOps(1) }
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "scala.collection.immutable.ArraySeq$.make",
+            "scala.collection.ArrayOps"
+        ),
+        "{}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn scala_inverted_resolves_unique_unapplied_companion_apply_values() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Token.scala",
+            "package model\ncase class Token(value: Int)\n",
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.Token
+object Use {
+  def accept(value: Int, function: Int => Token): Token = function(value)
+  def keep(value: Any): Any = value
+  def contextual = accept(1, Token)
+  def inferred = Option(1).map(Token)
+  def rejected = keep(Token)
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    for caller in ["app.Use$.contextual", "app.Use$.inferred"] {
+        assert!(
+            has_edge(&value, caller, "model.Token"),
+            "{caller}: {}",
+            value["edges"]
+        );
+    }
+    // The graph schema projects an exact companion-object type dependency
+    // onto the class-shaped type node; direct UsageFinder/MCP assertions above
+    // retain the exact `Token$` versus `Token` identity proof.
+    assert!(
+        has_edge(&value, "app.Use$.rejected", "model.Token"),
+        "{}",
+        value["edges"]
+    );
+}
+
+#[test]
+fn scala_inverted_resolves_same_file_companion_wildcard_nested_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "kyo/ai/Context.scala",
+            r#"package kyo.ai
+import Context.*
+case class Context(calls: List[Call]) {
+  def assistantMessage(calls: List[Call]): Context = this
+}
+object Context { case class Call(id: String) }
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+    assert!(
+        has_edge(
+            &value,
+            "kyo.ai.Context.assistantMessage",
+            "kyo.ai.Context$.Call"
+        ),
+        "{}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn scala_inverted_applies_compilation_unit_import_precedence() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

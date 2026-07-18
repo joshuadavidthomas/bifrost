@@ -748,6 +748,7 @@ impl Visibility {
     pub(super) fn for_file_with_imports(
         scala: &ScalaAnalyzer,
         file: &ProjectFile,
+        active_package: &str,
         spec: &TargetSpec,
         resolver: &NameResolver,
         imports: &[ImportInfo],
@@ -764,7 +765,7 @@ impl Visibility {
             ambiguous_direct_member_names: ambiguous_wildcard_members(scala, file, spec),
         };
 
-        let file_package = package_name_of(scala, file);
+        let file_package = Some(active_package);
         if file == spec.target.source()
             || file_package.as_deref() == Some(spec.target.package_name())
         {
@@ -816,6 +817,16 @@ impl Visibility {
             .resolve_object(&spec.member_name)
             .is_some_and(|resolved| spec.object_role_fq_matches(&resolved))
         {
+            visibility.type_names.insert(spec.member_name.clone());
+        }
+        let class_identity = if spec.kind == TargetKind::Constructor {
+            spec.owner.as_ref().map(CodeUnit::fq_name)
+        } else {
+            Some(spec.target.fq_name())
+        };
+        if class_identity.as_deref().is_some_and(|identity| {
+            resolver.resolve(&spec.member_name).as_deref() == Some(identity)
+        }) {
             visibility.type_names.insert(spec.member_name.clone());
         }
 

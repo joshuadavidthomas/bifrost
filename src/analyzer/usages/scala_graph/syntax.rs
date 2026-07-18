@@ -1,4 +1,4 @@
-use crate::analyzer::scala::scala_type_lookup_segments;
+use crate::analyzer::scala::{scala_package_prefixes_at, scala_type_lookup_segments};
 use crate::analyzer::{CallableArity, ImportInfo, scala_parenthesized_arity};
 use crate::hash::{HashMap, HashSet};
 use tree_sitter::{Node, Parser};
@@ -18,6 +18,13 @@ pub(crate) struct ScalaCallableSourceAlternative {
     pub(crate) parameter_function_arities: Vec<Vec<Option<usize>>>,
     pub(crate) extension_receiver_type_path: Option<Vec<String>>,
     pub(crate) return_type_path: Option<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScalaMethodValueContext {
+    Unknown,
+    Function(usize),
+    Incompatible,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,6 +284,64 @@ pub(crate) struct ScalaImportContextIndex {
     segments: Vec<ScalaImportContextSegment>,
 }
 
+pub(crate) struct ScalaPackageContextIndex {
+    segments: Vec<ScalaPackageContextSegment>,
+}
+
+struct ScalaPackageContextSegment {
+    start_byte: usize,
+    prefixes: Vec<String>,
+}
+
+impl ScalaPackageContextIndex {
+    pub(crate) fn new(root: Node<'_>, source: &str) -> Self {
+        let mut boundaries = vec![0, root.end_byte()];
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "package_clause" {
+                boundaries.push(node.start_byte());
+                boundaries.push(node.end_byte());
+                if let Some(body) = node.child_by_field_name("body") {
+                    boundaries.push(body.start_byte());
+                    boundaries.push(body.end_byte());
+                }
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        let mut segments = Vec::<ScalaPackageContextSegment>::new();
+        for start_byte in boundaries {
+            let prefixes = scala_package_prefixes_at(root, source, start_byte);
+            if let Some(last) = segments.last()
+                && last.prefixes == prefixes
+            {
+                continue;
+            }
+            segments.push(ScalaPackageContextSegment {
+                start_byte,
+                prefixes,
+            });
+        }
+        if segments.is_empty() {
+            segments.push(ScalaPackageContextSegment {
+                start_byte: 0,
+                prefixes: Vec::new(),
+            });
+        }
+        Self { segments }
+    }
+
+    pub(crate) fn advance_to(&self, byte: usize, cursor: &mut usize) -> &[String] {
+        while *cursor + 1 < self.segments.len() && self.segments[*cursor + 1].start_byte <= byte {
+            *cursor += 1;
+        }
+        &self.segments[*cursor].prefixes
+    }
+}
+
 pub(crate) fn scala_import_is_visible_at_byte(import: &ImportInfo, byte: usize) -> bool {
     let Some(path) = import.path.as_ref() else {
         return true;
@@ -358,6 +423,20 @@ pub(crate) fn is_identifier_node(node: Node<'_>) -> bool {
         node.kind(),
         "identifier" | "type_identifier" | "operator_identifier"
     )
+}
+
+pub(crate) fn is_bare_companion_method_value_reference(node: Node<'_>) -> bool {
+    if node.kind() != "identifier" || is_call_function_reference(node) {
+        return false;
+    }
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "arguments" => true,
+        "val_definition" | "var_definition" => parent.child_by_field_name("value") == Some(node),
+        _ => false,
+    }
 }
 
 pub(crate) fn is_type_like_reference(node: Node<'_>, source: &str) -> bool {
@@ -926,6 +1005,35 @@ pub(crate) fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_context_index_preserves_only_parser_active_prefixes() {
+        let source = r#"package scala.collection
+package immutable
+object Use { val value = new ArrayOps(1) }
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_scala::LANGUAGE.into())
+            .expect("Scala grammar");
+        let tree = parser.parse(source, None).expect("Scala tree");
+        let index = ScalaPackageContextIndex::new(tree.root_node(), source);
+        let mut cursor = 0;
+        assert_eq!(
+            index.advance_to(source.find("ArrayOps").unwrap(), &mut cursor),
+            ["scala.collection", "scala.collection.immutable"]
+        );
+
+        let dotted =
+            "package scala.collection.immutable\nobject Use { val value = new ArrayOps(1) }\n";
+        let tree = parser.parse(dotted, None).expect("Scala tree");
+        let index = ScalaPackageContextIndex::new(tree.root_node(), dotted);
+        let mut cursor = 0;
+        assert_eq!(
+            index.advance_to(dotted.find("ArrayOps").unwrap(), &mut cursor),
+            ["scala.collection.immutable"]
+        );
+    }
 
     #[test]
     fn qualified_stable_type_roles_follow_parser_structure() {

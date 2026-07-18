@@ -859,6 +859,181 @@ class Unrelated(protected var i0: Int) {
 }
 
 #[test]
+fn scala_usage_finder_uses_parser_active_enclosing_package_for_constructor() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "scala/collection/ArrayOps.scala",
+            "package scala.collection\nclass ArrayOps(value: Int)\n",
+        ),
+        (
+            "scala/collection/immutable/ArraySeq.scala",
+            r#"package scala.collection
+package immutable
+object ArraySeq {
+  val tail = new ArrayOps(1) // positive-enclosing-package
+}
+"#,
+        ),
+        (
+            "scala/collection/immutable/Shadow.scala",
+            r#"package scala.collection
+package immutable
+object Shadow {
+  class ArrayOps(value: Int)
+  val value = new ArrayOps(2) // negative-inner-package
+}
+"#,
+        ),
+        (
+            "other/ArrayOps.scala",
+            "package other\nclass ArrayOps(value: Int)\n",
+        ),
+        (
+            "scala/collection/immutable/Imported.scala",
+            r#"package scala.collection
+package immutable
+import other.ArrayOps
+object Imported { val value = new ArrayOps(3) } // negative-explicit-import
+"#,
+        ),
+        (
+            "dotted/Use.scala",
+            r#"package scala.collection.immutable
+object Dotted { val value = new ArrayOps(4) } // negative-dotted-parent
+"#,
+        ),
+        (
+            "braced/Use.scala",
+            r#"package scala.collection {
+  package hidden { object Hidden { val value = new ArrayOps(5) } } // positive-braced-child
+}
+package sibling { object Sibling { val value = new ArrayOps(6) } } // negative-braced-sibling
+"#,
+        ),
+    ]);
+
+    let constructor = definition(&analyzer, "scala.collection.ArrayOps.ArrayOps");
+    let constructor_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&constructor)));
+    assert_hit_contains(&constructor_hits, "positive-enclosing-package");
+    assert_hit_contains(&constructor_hits, "positive-braced-child");
+    for marker in [
+        "negative-inner-package",
+        "negative-explicit-import",
+        "negative-dotted-parent",
+        "negative-braced-sibling",
+    ] {
+        assert_no_hit_contains(&constructor_hits, marker);
+    }
+
+    let (_project, ambiguous) = scala_analyzer_with_files(&[
+        (
+            "left/ArrayOps.scala",
+            "package scala.collection\nclass ArrayOps(value: Int)\n",
+        ),
+        (
+            "right/ArrayOps.scala",
+            "package scala.collection\nclass ArrayOps(value: Int)\n",
+        ),
+        (
+            "use/Use.scala",
+            r#"package scala.collection
+package immutable
+object Use { val value = new ArrayOps(1) } // negative-ambiguous-package
+"#,
+        ),
+    ]);
+    let ambiguous_constructor = definition(&ambiguous, "scala.collection.ArrayOps.ArrayOps");
+    let ambiguous_hits = hits(
+        UsageFinder::new()
+            .find_usages_default(&ambiguous, std::slice::from_ref(&ambiguous_constructor)),
+    );
+    assert_no_hit_contains(&ambiguous_hits, "negative-ambiguous-package");
+}
+
+#[test]
+fn scala_usage_finder_resolves_unique_unapplied_companion_apply_values() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Token.scala",
+            r#"package model
+case class Token(value: Int)
+class Manual(value: Int)
+object Manual {
+  def apply(value: Int): Manual = new Manual(value)
+  def apply(value: String): Manual = new Manual(value.length)
+}
+"#,
+        ),
+        (
+            "other/Token.scala",
+            "package other\ncase class Token(value: Int)\n",
+        ),
+        (
+            "app/Use.scala",
+            r#"package app
+import model.{Manual, Token}
+object Use {
+  private def accept(value: Int, function: Int => Token): Token = function(value)
+  private def wrong(function: (Int, Int) => Token): Token = function(1, 2)
+  private def keep(value: Any): Any = value
+  val contextual = accept(1, Token) // positive-contextual-method-value
+  val unavailable = Option(1).map(Token) // positive-unique-method-value
+  val wrongArity = wrong(Token) // negative-wrong-context-arity
+  val nonFunction = keep(Token) // negative-known-non-function-parameter
+  val overloaded = Option(1).map(Manual) // negative-overloaded-apply
+  def local(Token: Int => model.Token): model.Token = Option(1).map(Token).get
+    // negative-local-term
+}
+"#,
+        ),
+        (
+            "app/Imported.scala",
+            r#"package app
+import other.Token
+object Imported { val value = Option(1).map(Token) } // negative-unrelated-import
+"#,
+        ),
+    ]);
+
+    let token = definition(&analyzer, "model.Token");
+    let token_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&token)));
+    assert_hit_contains(&token_hits, "positive-contextual-method-value");
+    assert_hit_contains(&token_hits, "positive-unique-method-value");
+    for marker in [
+        "negative-wrong-context-arity",
+        "negative-known-non-function-parameter",
+        "negative-overloaded-apply",
+        "negative-local-term",
+        "negative-unrelated-import",
+    ] {
+        assert_no_hit_contains(&token_hits, marker);
+    }
+}
+
+#[test]
+fn scala_usage_finder_resolves_same_file_companion_wildcard_nested_type() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "kyo/ai/Context.scala",
+        r#"package kyo.ai
+import Context.*
+case class Context(calls: List[Call]) {
+  def assistantMessage(calls: List[Call] = Nil): Context = this // positive-context-call
+}
+object Context {
+  case class Call(id: String)
+}
+"#,
+    )]);
+
+    let call = definition(&analyzer, "kyo.ai.Context$.Call");
+    let call_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&call)));
+    assert_hit_contains(&call_hits, "positive-context-call");
+}
+
+#[test]
 fn scala_usage_finder_resolves_infix_extractor_object_identity() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

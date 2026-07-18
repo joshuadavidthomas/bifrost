@@ -2924,6 +2924,139 @@ object Use {
 }
 
 #[test]
+fn scan_usages_by_reference_uses_parser_active_scala_package_context() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/collection/ArrayOps.scala",
+            "package scala.collection\nclass ArrayOps(value: Int)\n",
+        )
+        .file(
+            "scala/collection/immutable/ArraySeq.scala",
+            r#"package scala.collection
+package immutable
+object ArraySeq {
+  val value = new ArrayOps(1) // public-positive-package-context
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["scala.collection.ArrayOps.ArrayOps"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    assert!(
+        usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .any(|snippet| snippet.contains("public-positive-package-context")),
+        "{value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_reference_finds_unique_scala_companion_method_values() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Token.scala",
+            "package model\ncase class Token(value: Int)\n",
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.Token
+object Use {
+  def accept(value: Int, function: Int => Token): Token = function(value)
+  def keep(value: Any): Any = value
+  val contextual = accept(1, Token) // public-positive-contextual-method-value
+  val inferred = Option(1).map(Token) // public-positive-unique-method-value
+  val rejected = keep(Token) // public-negative-known-non-function
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["model.Token"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    let snippets = usage["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .filter_map(|hit| hit["snippet"].as_str())
+        .collect::<Vec<_>>();
+    for marker in [
+        "public-positive-contextual-method-value",
+        "public-positive-unique-method-value",
+    ] {
+        assert!(
+            snippets.iter().any(|snippet| snippet.contains(marker)),
+            "expected {marker}: {value}"
+        );
+    }
+    assert!(
+        snippets
+            .iter()
+            .all(|snippet| !snippet.contains("public-negative-known-non-function")),
+        "{value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_reference_finds_same_file_scala_companion_wildcard_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "kyo/ai/Context.scala",
+            r#"package kyo.ai
+import Context.*
+case class Context(calls: List[Call]) {
+  def assistantMessage(calls: List[Call]): Context = this // public-positive-context-call
+}
+object Context { case class Call(id: String) }
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["kyo.ai.Context$.Call"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    assert!(
+        usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .any(|snippet| snippet.contains("public-positive-context-call")),
+        "{value}"
+    );
+}
+
+#[test]
 fn scan_usages_by_reference_resolves_exact_scala_field_chains() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

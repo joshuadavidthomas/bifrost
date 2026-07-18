@@ -27,8 +27,9 @@ use super::resolver::{
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{
-    ScalaCallableParameterList, ScalaImportContextIndex, ScalaParameterListKind,
-    ScalaQualifiedStableTypeRole, ScalaSourceFacts, call_arities_for_reference,
+    ScalaCallableParameterList, ScalaImportContextIndex, ScalaMethodValueContext,
+    ScalaPackageContextIndex, ScalaParameterListKind, ScalaQualifiedStableTypeRole,
+    ScalaSourceFacts, call_arities_for_reference, is_bare_companion_method_value_reference,
     is_constructor_like_reference, is_scala_class_reference, is_scala_object_reference,
     is_terminal_stable_field_reference, node_text, parenthesized_arity,
     qualified_stable_type_reference, resolve_stable_object_expression,
@@ -1472,6 +1473,75 @@ impl ProjectTypes {
             })
     }
 
+    pub(super) fn class_companion_apply_method_value_matches(
+        &self,
+        scala: &ScalaAnalyzer,
+        target: &CodeUnit,
+        contextual_arities: Option<&[usize]>,
+    ) -> bool {
+        let mut alternatives = Vec::new();
+        if self.is_case_class(scala, target) {
+            alternatives.extend(
+                self.callable_alternatives_for(scala, target)
+                    .iter()
+                    .cloned(),
+            );
+        }
+        let normalized_target = scala_normalized_fq_name(&target.fq_name());
+        for companion in self.exact_companion_objects(scala, target) {
+            for apply in self
+                .members_for_exact_owner_name(&companion.fq_name(), "apply")
+                .iter()
+                .filter(|unit| unit.is_function())
+            {
+                alternatives.extend(
+                    self.callable_alternatives_for(scala, apply)
+                        .iter()
+                        .filter(|alternative| {
+                            alternative
+                                .return_type
+                                .as_deref()
+                                .is_some_and(|return_type| {
+                                    scala_normalized_fq_name(return_type) == normalized_target
+                                })
+                        })
+                        .cloned(),
+                );
+            }
+        }
+        let matches = alternatives
+            .iter()
+            .filter(|alternative| {
+                contextual_arities.is_none_or(|arities| {
+                    callable_shape_matches(&alternative.shape, Some(arities), false)
+                })
+            })
+            .count();
+        matches == 1
+    }
+
+    fn unique_companion_apply_method_value_target(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        name: &str,
+        contextual_arities: Option<&[usize]>,
+    ) -> Option<CodeUnit> {
+        let fqn = resolver.resolve(name)?;
+        let mut targets = self
+            .index
+            .by_fqn(&fqn)
+            .iter()
+            .filter(|unit| unit.is_class() && !unit.short_name().ends_with('$'));
+        let target = targets.next()?.clone();
+        if targets.next().is_some()
+            || !self.class_companion_apply_method_value_matches(scala, &target, contextual_arities)
+        {
+            return None;
+        }
+        Some(target)
+    }
+
     fn is_case_class(&self, scala: &ScalaAnalyzer, target: &CodeUnit) -> bool {
         let source_facts = self.source_facts_for_file(scala, target.source());
         self.declaration_ranges_for(scala, target)
@@ -1701,15 +1771,32 @@ struct VisibleNameBindings {
 struct VisibleNameBinding {
     priority: u8,
     candidates: HashSet<String>,
+    declarations: HashSet<CodeUnit>,
 }
 
 impl VisibleNameBindings {
-    fn add(&mut self, name: String, fqn: String, priority: u8) {
+    fn add_declaration(&mut self, name: String, declaration: &CodeUnit, priority: u8) {
+        self.add_candidate(
+            name,
+            declaration.fq_name(),
+            Some(declaration.clone()),
+            priority,
+        );
+    }
+
+    fn add_candidate(
+        &mut self,
+        name: String,
+        fqn: String,
+        declaration: Option<CodeUnit>,
+        priority: u8,
+    ) {
         match self.entries.entry(name) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(VisibleNameBinding {
                     priority,
                     candidates: HashSet::from_iter([fqn]),
+                    declarations: declaration.into_iter().collect(),
                 });
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -1718,18 +1805,20 @@ impl VisibleNameBindings {
                     binding.priority = priority;
                     binding.candidates.clear();
                     binding.candidates.insert(fqn);
+                    binding.declarations.clear();
+                    binding.declarations.extend(declaration);
                 } else if priority == binding.priority {
                     binding.candidates.insert(fqn);
+                    binding.declarations.extend(declaration);
                 }
             }
         }
     }
 
     fn resolve(&self, name: &str) -> Option<String> {
-        let candidates = &self.entries.get(name)?.candidates;
-        (candidates.len() == 1)
-            .then(|| candidates.iter().next().cloned())
-            .flatten()
+        let binding = self.entries.get(name)?;
+        (binding.candidates.len() == 1 && binding.declarations.len() <= 1)
+            .then(|| binding.candidates.iter().next().cloned())?
     }
 
     fn contains(&self, name: &str) -> bool {
@@ -1763,7 +1852,7 @@ fn add_hierarchy_package_type_bindings<F>(
         ordinary
     };
     for decl in selected {
-        names.add(simple.to_string(), decl.fq_name(), priority(decl));
+        names.add_declaration(simple.to_string(), decl, priority(decl));
     }
 }
 
@@ -1784,7 +1873,7 @@ fn add_hierarchy_package_object_bindings<F>(
             unit.is_class() && is_package_level_type(unit) && unit.short_name().ends_with('$')
         })
     {
-        object_names.add(simple.to_string(), decl.fq_name(), priority(decl));
+        object_names.add_declaration(simple.to_string(), decl, priority(decl));
     }
 }
 
@@ -1796,7 +1885,18 @@ impl NameResolver {
         imports: &[crate::analyzer::ImportInfo],
         types: &ProjectTypes,
     ) -> Self {
-        Self::for_file_with_facts_impl(scala, source_file, package, imports, types, true)
+        let package_prefixes = package.into_iter().map(str::to_string).collect::<Vec<_>>();
+        Self::for_file_with_package_context(scala, source_file, &package_prefixes, imports, types)
+    }
+
+    pub(crate) fn for_file_with_package_context(
+        scala: &ScalaAnalyzer,
+        source_file: Option<&ProjectFile>,
+        package_prefixes: &[String],
+        imports: &[crate::analyzer::ImportInfo],
+        types: &ProjectTypes,
+    ) -> Self {
+        Self::for_file_with_facts_impl(scala, source_file, package_prefixes, imports, types, true)
     }
 
     fn for_type_hierarchy_file(
@@ -1859,7 +1959,7 @@ impl NameResolver {
             }
             for normalized in import_candidate_normalized_paths(&path, file_package) {
                 if let Some(decl) = types.type_by_normalized_fqn(&normalized) {
-                    names.add(local_name.to_string(), decl.fq_name(), 2);
+                    names.add_declaration(local_name.to_string(), decl, 2);
                 }
                 if let Some(decl) = types
                     .index
@@ -1867,7 +1967,7 @@ impl NameResolver {
                     .iter()
                     .find(|unit| unit.is_class() && unit.short_name().ends_with('$'))
                 {
-                    object_names.add(local_name.to_string(), decl.fq_name(), 2);
+                    object_names.add_declaration(local_name.to_string(), decl, 2);
                 }
             }
         }
@@ -1900,13 +2000,20 @@ impl NameResolver {
                     Self::for_file_with_facts_impl(
                         scala,
                         Some(file),
-                        Some(target.package_name()),
+                        &[target.package_name().to_string()],
                         &imports,
                         types,
                         false,
                     )
                 }
-                None => Self::for_file_with_facts_impl(scala, Some(file), None, &[], types, false),
+                None => Self::for_file_with_facts_impl(
+                    scala,
+                    Some(file),
+                    &[target.package_name().to_string()],
+                    &[],
+                    types,
+                    false,
+                ),
             },
             None => {
                 let imports = scala.import_info_of(file);
@@ -1919,7 +2026,7 @@ impl NameResolver {
                 Self::for_file_with_facts_impl(
                     scala,
                     Some(file),
-                    Some(target.package_name()),
+                    &[target.package_name().to_string()],
                     &imports,
                     types,
                     false,
@@ -1931,7 +2038,7 @@ impl NameResolver {
     fn for_file_with_facts_impl(
         scala: &ScalaAnalyzer,
         source_file: Option<&ProjectFile>,
-        package: Option<&str>,
+        package_prefixes: &[String],
         imports: &[crate::analyzer::ImportInfo],
         types: &ProjectTypes,
         include_members: bool,
@@ -1943,48 +2050,75 @@ impl NameResolver {
             HashMap::default();
         let mut wildcard_extension_owners = Vec::new();
 
-        let file_package = package.unwrap_or_default();
-        // Types in the file's own package are reachable by simple name. The
-        // default package is a real Scala scope, so it must be seeded too.
-        for (simple, decl) in types.package_types_in(file_package).iter() {
-            let priority = u8::from(source_file == Some(decl.source())) * 3;
-            names.add(simple.clone(), decl.fq_name(), priority);
-        }
-        for (simple, decl) in types.package_objects_in(scala, file_package).iter() {
-            let priority = u8::from(source_file == Some(decl.source())) * 3;
-            object_names.add(simple.clone(), decl.fq_name(), priority);
+        let fallback_default_package = String::new();
+        let active_package_prefixes = if package_prefixes.is_empty() {
+            std::slice::from_ref(&fallback_default_package)
+        } else {
+            package_prefixes
+        };
+        let file_package = active_package_prefixes
+            .last()
+            .map(String::as_str)
+            .unwrap_or_default();
+        // Parser-established package scopes are visible from innermost to
+        // outermost. A dotted package clause contributes only its complete
+        // package; it does not invent parent-package bindings.
+        for (index, package) in active_package_prefixes.iter().enumerate() {
+            // Preserve Scala's ordinary lookup precedence: a wildcard import
+            // beats declarations in another compilation unit of the active
+            // package, an explicit import beats a wildcard, and declarations
+            // in this compilation unit beat imports. Within the package
+            // scopes established by nested/sequential package clauses, the
+            // innermost package wins over its enclosing package.
+            let package_priority = index.min(63) as u8;
+            for (simple, decl) in types.package_types_in(package).iter() {
+                let priority = if source_file == Some(decl.source()) {
+                    224u8.saturating_add(index.min(30) as u8)
+                } else {
+                    package_priority
+                };
+                names.add_declaration(simple.clone(), decl, priority);
+            }
+            for (simple, decl) in types.package_objects_in(scala, package).iter() {
+                let priority = if source_file == Some(decl.source()) {
+                    224u8.saturating_add(index.min(30) as u8)
+                } else {
+                    package_priority
+                };
+                object_names.add_declaration(simple.clone(), decl, priority);
+            }
         }
 
-        let package_prefixes = scala_package_prefixes(file_package);
-        let wildcard_environment =
-            resolve_scala_wildcard_import_environment(imports, &package_prefixes, |candidate| {
-                ScalaWildcardOwnerFacts {
-                    package: !types.package_types_in(candidate).is_empty()
-                        || !types.package_objects_in(scala, candidate).is_empty(),
-                    stable_singleton: types
-                        .object_by_normalized_fqn(scala, &scala_normalized_fq_name(candidate))
-                        .is_some(),
-                }
-            });
+        let wildcard_environment = resolve_scala_wildcard_import_environment(
+            imports,
+            active_package_prefixes,
+            |candidate| ScalaWildcardOwnerFacts {
+                package: !types.package_types_in(candidate).is_empty()
+                    || !types.package_objects_in(scala, candidate).is_empty(),
+                stable_singleton: types
+                    .object_by_normalized_fqn(scala, &scala_normalized_fq_name(candidate))
+                    .is_some(),
+            },
+        );
         if !wildcard_environment.ambiguous {
             for owner in &wildcard_environment.owners {
                 if owner.is_singleton() {
                     let normalized_owner = scala_normalized_fq_name(&owner.declaration_fqn());
                     for (simple, decl) in types.nested_types_in(scala, &normalized_owner).iter() {
-                        names.add(simple.clone(), decl.fq_name(), 1);
+                        names.add_declaration(simple.clone(), decl, 128);
                     }
                     for (simple, decl) in types.nested_objects_in(scala, &normalized_owner).iter() {
-                        object_names.add(simple.clone(), decl.fq_name(), 1);
+                        object_names.add_declaration(simple.clone(), decl, 128);
                     }
                     if include_members {
                         wildcard_extension_owners.push(normalized_owner);
                     }
                 } else {
                     for (simple, decl) in types.package_types_in(&owner.fqn).iter() {
-                        names.add(simple.clone(), decl.fq_name(), 1);
+                        names.add_declaration(simple.clone(), decl, 128);
                     }
                     for (simple, decl) in types.package_objects_in(scala, &owner.fqn).iter() {
-                        object_names.add(simple.clone(), decl.fq_name(), 1);
+                        object_names.add_declaration(simple.clone(), decl, 128);
                     }
                     if include_members {
                         wildcard_extension_owners.push(owner.fqn.clone());
@@ -2014,10 +2148,10 @@ impl NameResolver {
                     .clone()
                     .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(&path).to_string());
                 if let Some(decl) = type_decl {
-                    names.add(local_name.clone(), decl.fq_name(), 2);
+                    names.add_declaration(local_name.clone(), decl, 192);
                 }
                 if let Some(decl) = object_decl {
-                    object_names.add(local_name, decl.fq_name(), 2);
+                    object_names.add_declaration(local_name, decl, 192);
                 }
                 continue;
             }
@@ -2127,17 +2261,6 @@ fn visible_imports_at_byte(
         .filter(|import| scala_import_is_visible_at_byte(import, reference_byte))
         .cloned()
         .collect()
-}
-
-fn scala_package_prefixes(package_name: &str) -> Vec<String> {
-    let mut prefixes = package_name
-        .match_indices('.')
-        .map(|(index, _)| package_name[..index].to_string())
-        .collect::<Vec<_>>();
-    if !package_name.is_empty() {
-        prefixes.push(package_name.to_string());
-    }
-    prefixes
 }
 
 fn import_candidate_normalized_paths(path: &str, package_name: &str) -> HashSet<String> {
@@ -2274,15 +2397,19 @@ where
                     scala,
                     source: parsed.source.as_str(),
                     source_file: file,
-                    package: &state.package_name,
                     imports: &state.imports,
                     import_contexts: ScalaImportContextIndex::new(
                         &state.imports,
                         parsed.tree.root_node().end_byte(),
                     ),
                     import_context_cursor: 0,
+                    package_contexts: ScalaPackageContextIndex::new(
+                        parsed.tree.root_node(),
+                        parsed.source.as_str(),
+                    ),
+                    package_context_cursor: 0,
                     resolver,
-                    active_import_key: Vec::new(),
+                    active_resolver_key: None,
                     resolver_contexts: HashMap::default(),
                     types: &graph.types,
                     class_ranges,
@@ -2299,13 +2426,14 @@ struct ScalaScan<'a, 'b> {
     scala: &'a ScalaAnalyzer,
     source: &'a str,
     source_file: &'a ProjectFile,
-    package: &'a str,
     imports: &'a [crate::analyzer::ImportInfo],
     import_contexts: ScalaImportContextIndex,
     import_context_cursor: usize,
+    package_contexts: ScalaPackageContextIndex,
+    package_context_cursor: usize,
     resolver: Arc<NameResolver>,
-    active_import_key: Vec<usize>,
-    resolver_contexts: HashMap<Vec<usize>, Arc<NameResolver>>,
+    active_resolver_key: Option<(Vec<String>, Vec<usize>)>,
+    resolver_contexts: HashMap<(Vec<String>, Vec<usize>), Arc<NameResolver>>,
     types: &'a ProjectTypes,
     class_ranges: ClassRangeIndex,
     collector: &'a mut EdgeCollector<'b>,
@@ -2319,32 +2447,42 @@ struct ScalaBinding {
 
 impl ScalaScan<'_, '_> {
     fn activate_import_context(&mut self, node: Node<'_>) {
-        let visible = self
+        let visible_imports = self
             .import_contexts
             .advance_to(node.start_byte(), &mut self.import_context_cursor);
-        if visible == self.active_import_key {
+        let visible_packages = self
+            .package_contexts
+            .advance_to(node.start_byte(), &mut self.package_context_cursor);
+        if self
+            .active_resolver_key
+            .as_ref()
+            .is_some_and(|(packages, imports)| {
+                packages.as_slice() == visible_packages && imports.as_slice() == visible_imports
+            })
+        {
             return;
         }
-        let key = visible.to_vec();
+        let key = (visible_packages.to_vec(), visible_imports.to_vec());
         if let Some(resolver) = self.resolver_contexts.get(&key) {
             self.resolver = resolver.clone();
-            self.active_import_key = key;
+            self.active_resolver_key = Some(key);
             return;
         }
-        let visible_imports = key
+        let imports = key
+            .1
             .iter()
             .filter_map(|index| self.imports.get(*index).cloned())
             .collect::<Vec<_>>();
-        let resolver = Arc::new(NameResolver::for_file_with_facts(
+        let resolver = Arc::new(NameResolver::for_file_with_package_context(
             self.scala,
             Some(self.source_file),
-            Some(self.package),
-            &visible_imports,
+            &key.0,
+            &imports,
             self.types,
         ));
         self.resolver_contexts.insert(key.clone(), resolver.clone());
         self.resolver = resolver;
-        self.active_import_key = key;
+        self.active_resolver_key = Some(key);
     }
 
     /// The fqn of the smallest class/object declaration containing `byte`.
@@ -2451,11 +2589,12 @@ fn record_reference(
             let resolved = if object_reference {
                 ctx.resolver.resolve_object(text)
             } else if is_scala_class_reference(node, ctx.source) {
-                ctx.resolver.resolve(text).or_else(|| {
-                    (bindings.resolve_symbol(text).is_unknown() && !bindings.is_shadowed(text))
-                        .then(|| ctx.lexically_visible_type(node.start_byte(), text))
-                        .flatten()
-                })
+                (bindings.resolve_symbol(text).is_unknown() && !bindings.is_shadowed(text))
+                    .then(|| {
+                        ctx.lexically_visible_type(node.start_byte(), text)
+                            .or_else(|| ctx.resolver.resolve(text))
+                    })
+                    .flatten()
             } else {
                 None
             };
@@ -2585,12 +2724,16 @@ fn record_reference(
             {
                 return;
             }
+            let bare_companion_method_value = is_bare_companion_method_value_reference(node);
             if is_scala_class_reference(node, ctx.source)
-                && let Some(fqn) = ctx.resolver.resolve(name).or_else(|| {
-                    (bindings.resolve_symbol(name).is_unknown() && !bindings.is_shadowed(name))
-                        .then(|| ctx.lexically_visible_type(node.start_byte(), name))
-                        .flatten()
+                && !bare_companion_method_value
+                && let Some(fqn) = (bindings.resolve_symbol(name).is_unknown()
+                    && !bindings.is_shadowed(name))
+                .then(|| {
+                    ctx.lexically_visible_type(node.start_byte(), name)
+                        .or_else(|| ctx.resolver.resolve(name))
                 })
+                .flatten()
             {
                 ctx.record(fqn, node);
                 return;
@@ -2606,6 +2749,36 @@ fn record_reference(
                 }
             }
             if bindings.is_shadowed(name) {
+                return;
+            }
+            if bare_companion_method_value {
+                let target = match companion_method_value_context(node, ctx, bindings) {
+                    ScalaMethodValueContext::Unknown => {
+                        ctx.types.unique_companion_apply_method_value_target(
+                            ctx.scala,
+                            &ctx.resolver,
+                            name,
+                            None,
+                        )
+                    }
+                    ScalaMethodValueContext::Function(arity) => {
+                        ctx.types.unique_companion_apply_method_value_target(
+                            ctx.scala,
+                            &ctx.resolver,
+                            name,
+                            Some(&[arity]),
+                        )
+                    }
+                    ScalaMethodValueContext::Incompatible => {
+                        if let Some(object) = ctx.resolver.resolve_object(name) {
+                            ctx.record(object, node);
+                        }
+                        None
+                    }
+                };
+                if let Some(target) = target {
+                    ctx.record(target.fq_name(), node);
+                }
                 return;
             }
             if let Some(reference) = stable_identifier_reference(node, ctx.source) {
@@ -2737,6 +2910,135 @@ fn record_qualified_stable_reference(
         ctx.record(fqn, node);
     }
     true
+}
+
+fn companion_method_value_context(
+    node: Node<'_>,
+    ctx: &ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaBinding>,
+) -> ScalaMethodValueContext {
+    if let Some(definition) = node.parent()
+        && matches!(definition.kind(), "val_definition" | "var_definition")
+        && definition.child_by_field_name("value") == Some(node)
+    {
+        let Some(type_node) = definition.child_by_field_name("type") else {
+            return ScalaMethodValueContext::Unknown;
+        };
+        if type_node.kind() != "function_type" {
+            return ScalaMethodValueContext::Incompatible;
+        }
+        let Some(parameter_types) = type_node.child_by_field_name("parameter_types") else {
+            return ScalaMethodValueContext::Incompatible;
+        };
+        let mut cursor = parameter_types.walk();
+        return ScalaMethodValueContext::Function(
+            parameter_types.named_children(&mut cursor).count(),
+        );
+    }
+    call_parameter_method_value_context(node, ctx, bindings)
+}
+
+fn call_parameter_method_value_context(
+    node: Node<'_>,
+    ctx: &ScalaScan<'_, '_>,
+    bindings: &LocalInferenceEngine<ScalaBinding>,
+) -> ScalaMethodValueContext {
+    let Some(arguments) = node.parent() else {
+        return ScalaMethodValueContext::Unknown;
+    };
+    if arguments.kind() != "arguments" {
+        return ScalaMethodValueContext::Unknown;
+    }
+    let mut arguments_cursor = arguments.walk();
+    let Some(parameter_index) = arguments
+        .named_children(&mut arguments_cursor)
+        .position(|argument| argument == node)
+    else {
+        return ScalaMethodValueContext::Unknown;
+    };
+    let Some(call) = arguments.parent() else {
+        return ScalaMethodValueContext::Unknown;
+    };
+    if call.kind() != "call_expression" || call.child_by_field_name("arguments") != Some(arguments)
+    {
+        return ScalaMethodValueContext::Unknown;
+    }
+
+    let mut parameter_list = 0usize;
+    let Some(mut function) = call.child_by_field_name("function") else {
+        return ScalaMethodValueContext::Unknown;
+    };
+    while function.kind() == "call_expression" {
+        parameter_list += 1;
+        let Some(inner) = function.child_by_field_name("function") else {
+            return ScalaMethodValueContext::Unknown;
+        };
+        function = inner;
+    }
+    if function.kind() == "generic_function" {
+        let Some(inner) = function.child_by_field_name("function") else {
+            return ScalaMethodValueContext::Unknown;
+        };
+        function = inner;
+    }
+    if !matches!(function.kind(), "identifier" | "operator_identifier") {
+        return ScalaMethodValueContext::Unknown;
+    }
+    let function_name = node_text(function, ctx.source).trim();
+    if function_name.is_empty() {
+        return ScalaMethodValueContext::Unknown;
+    }
+    if bindings.is_shadowed(function_name) {
+        return ScalaMethodValueContext::Incompatible;
+    }
+    let Some(call_arities) = call_arities_for_reference(function) else {
+        return ScalaMethodValueContext::Unknown;
+    };
+    let Some(owner) = ctx.enclosing_class(function.start_byte()) else {
+        return ScalaMethodValueContext::Unknown;
+    };
+    let methods = match ctx.types.bare_member_declarations(
+        ctx.scala,
+        owner,
+        function_name,
+        Some(&call_arities),
+    ) {
+        BareMemberResolution::Resolved(methods) => methods,
+        BareMemberResolution::NoMatch => {
+            let Some(imported) = ctx.resolver.resolve_member(function_name) else {
+                return ScalaMethodValueContext::Unknown;
+            };
+            ctx.scala
+                .definitions(&imported)
+                .filter(CodeUnit::is_function)
+                .collect()
+        }
+        BareMemberResolution::Unresolved => return ScalaMethodValueContext::Incompatible,
+    };
+    if methods.is_empty() {
+        return ScalaMethodValueContext::Incompatible;
+    }
+
+    let mut resolved = None;
+    for method in methods {
+        let Some(arity) = ctx.types.callable_parameter_function_arity(
+            ctx.scala,
+            &method,
+            &call_arities,
+            parameter_list,
+            parameter_index,
+        ) else {
+            return ScalaMethodValueContext::Incompatible;
+        };
+        if resolved.is_some_and(|resolved| resolved != arity) {
+            return ScalaMethodValueContext::Incompatible;
+        }
+        resolved = Some(arity);
+    }
+    resolved.map_or(
+        ScalaMethodValueContext::Incompatible,
+        ScalaMethodValueContext::Function,
+    )
 }
 
 /// The fqn of a receiver expression's type, for the shapes that resolve without
