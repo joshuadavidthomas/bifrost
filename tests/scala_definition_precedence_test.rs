@@ -31,6 +31,10 @@ object App {
 
 fn location(source: &str, needle: &str) -> Value {
     let start = source.rfind(needle).expect("reference text");
+    location_at(source, start)
+}
+
+fn location_at(source: &str, start: usize) -> Value {
     let prefix = &source[..start];
     let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
     let column = prefix
@@ -181,4 +185,127 @@ class Child extends Base {
         value["results"][0]["definitions"][0]["fqn"], "app.Base.doTest",
         "{value}"
     );
+}
+
+#[test]
+fn scala_local_pattern_and_recursive_function_bindings_block_indexed_collisions() {
+    let source = r#"package app
+
+object Imported {
+  def loop(value: Int): Int = value
+  val messages: Int = 99
+}
+
+final case class Success(messages: Int)
+
+object Consumer {
+  import Imported.{loop, messages}
+
+  def run(result: Success): Int = {
+    def loop(value: Int): Int =
+      if value == 0 then value else loop(value - 1)
+
+    result match {
+      case Success(messages) => loop(messages)
+    }
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+    let references = ["loop(value - 1)", "loop(messages)", "messages)\n"]
+        .into_iter()
+        .map(|needle| location(source, needle))
+        .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+
+    for result in value["results"].as_array().expect("definition results") {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert!(result["definitions"].is_null(), "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "local_variable_reference",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn scala_qualified_owner_paths_preserve_nested_and_namespace_identity() {
+    let source = r#"package app
+
+class Entry
+class Map
+class LongMap
+class Data
+
+object Outer {
+  class Entry
+}
+
+object view {
+  class Map
+}
+
+object mutable {
+  class LongMap
+}
+
+object Namespace {
+  object Cache {
+    class Data
+  }
+  object State {
+    val data: Cache.Data = new Cache.Data
+  }
+}
+
+object Consumer {
+  val nested: Outer.Entry = new Outer.Entry
+  val mapped: view.Map = new view.Map
+  val mutableMap: mutable.LongMap = new mutable.LongMap
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+    let references = [
+        ("Outer.Entry =", "Outer.".len()),
+        ("view.Map =", "view.".len()),
+        ("mutable.LongMap =", "mutable.".len()),
+        ("Cache.Data =", "Cache.".len()),
+    ]
+    .into_iter()
+    .map(|(marker, terminal_offset)| {
+        location_at(
+            source,
+            source.find(marker).expect("unique qualified type") + terminal_offset,
+        )
+    })
+    .collect::<Vec<_>>();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+
+    let expected = [
+        "app.Outer$.Entry",
+        "app.view$.Map",
+        "app.mutable$.LongMap",
+        "app.Namespace$.Cache$.Data",
+    ];
+    for (result, expected) in value["results"]
+        .as_array()
+        .expect("definition results")
+        .iter()
+        .zip(expected)
+    {
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
 }

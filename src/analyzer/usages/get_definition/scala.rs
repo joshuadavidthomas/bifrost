@@ -1,6 +1,6 @@
 use super::*;
 use crate::analyzer::ImportInfo;
-use crate::analyzer::scala::ScalaSupertypeLookupPath;
+use crate::analyzer::scala::{ScalaSupertypeLookupPath, scala_type_lookup_segments};
 use crate::analyzer::usages::scala_graph::syntax::call_arity_for_reference;
 use crate::analyzer::usages::scala_graph::{
     method_call_arity_applies, method_signature_arity, resolved_extension_receiver_type,
@@ -105,6 +105,15 @@ impl<'a> ForwardScalaNameResolver<'a> {
         kind: ScalaOwnerKind,
     ) -> ScalaNameResolution {
         self.resolve_owner_segments(path.segments(), kind)
+    }
+
+    fn resolve_type_node(
+        &self,
+        node: Node<'_>,
+        source: &str,
+        kind: ScalaOwnerKind,
+    ) -> ScalaNameResolution {
+        self.resolve_owner_segments(&scala_type_lookup_segments(node, source), kind)
     }
 
     fn resolve_owner_segments(
@@ -570,15 +579,11 @@ fn scala_type_lookup_node_fqn(
         "type_identifier" | "stable_type_identifier" | "generic_type"
     ) && scala_is_type_position(node)
     {
-        return scala_resolve_visible_type_annotation(
-            ctx,
-            resolver,
-            scala_node_text(node, ctx.source),
-            node.start_byte(),
-        )
-        .map(|fqn| ScalaTypeLookupResolution::Type {
-            fqn,
-            target_kind: TypeLookupTargetKind::TypeReference,
+        return scala_resolve_visible_type_node(ctx, resolver, node).map(|fqn| {
+            ScalaTypeLookupResolution::Type {
+                fqn,
+                target_kind: TypeLookupTargetKind::TypeReference,
+            }
         });
     }
 
@@ -636,14 +641,9 @@ fn scala_declaration_name_type_fqn(
 ) -> Option<String> {
     match parent.kind() {
         "parameter" | "class_parameter" if parent.child_by_field_name("name") == Some(name) => {
-            parent.child_by_field_name("type").and_then(|type_node| {
-                scala_resolve_visible_type_annotation(
-                    ctx,
-                    resolver,
-                    scala_node_text(type_node, ctx.source),
-                    type_node.start_byte(),
-                )
-            })
+            parent
+                .child_by_field_name("type")
+                .and_then(|type_node| scala_resolve_visible_type_node(ctx, resolver, type_node))
         }
         "val_definition" | "var_definition"
             if parent
@@ -653,25 +653,13 @@ fn scala_declaration_name_type_fqn(
                         && name.end_byte() <= pattern.end_byte()
                 }) =>
         {
-            parent.child_by_field_name("type").and_then(|type_node| {
-                scala_resolve_visible_type_annotation(
-                    ctx,
-                    resolver,
-                    scala_node_text(type_node, ctx.source),
-                    type_node.start_byte(),
-                )
-            })
+            parent
+                .child_by_field_name("type")
+                .and_then(|type_node| scala_resolve_visible_type_node(ctx, resolver, type_node))
         }
         "function_definition" if parent.child_by_field_name("name") == Some(name) => parent
             .child_by_field_name("return_type")
-            .and_then(|type_node| {
-                scala_resolve_visible_type_annotation(
-                    ctx,
-                    resolver,
-                    scala_node_text(type_node, ctx.source),
-                    type_node.start_byte(),
-                )
-            }),
+            .and_then(|type_node| scala_resolve_visible_type_node(ctx, resolver, type_node)),
         _ => {
             let name_text = scala_node_text(name, ctx.source).trim();
             let bindings = scala_bindings_before(ctx, resolver, root, name.end_byte());
@@ -776,6 +764,16 @@ fn scala_reference_node(node: Node<'_>) -> Option<ScalaReferenceNode<'_>> {
             current = parent;
             continue;
         }
+        if parent.kind() == "stable_type_identifier"
+            && parent.named_child(parent.named_child_count().saturating_sub(1)) == Some(current)
+        {
+            current = parent;
+            continue;
+        }
+        if parent.kind() == "generic_type" && parent.child_by_field_name("type") == Some(current) {
+            current = parent;
+            continue;
+        }
         break;
     }
 
@@ -856,8 +854,7 @@ fn resolve_scala_type(
             format!("`{text}` is a local Scala value"),
         );
     }
-    if let Some(fqn) = scala_resolve_visible_type_annotation(ctx, resolver, text, node.start_byte())
-    {
+    if let Some(fqn) = scala_resolve_visible_type_node(ctx, resolver, node) {
         return scala_fqn_outcome(ctx.support, &fqn, text);
     }
     if scala_import_boundary_for_name(ctx.scala, ctx.support, ctx.file, scala_simple_name(text)) {
@@ -1510,6 +1507,20 @@ fn scala_direct_member_candidate_units(
         .into_iter()
         .filter(|unit| unit.fq_name() == exact_fqn)
         .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        let scala_owner_exists = support
+            .fqn(owner_fqn)
+            .into_iter()
+            .any(|unit| unit.is_class() && unit.fq_name() == owner_fqn);
+        if !scala_owner_exists {
+            candidates.extend(
+                support
+                    .fqn_in_language(&exact_fqn, Language::Java)
+                    .into_iter()
+                    .filter(|unit| unit.fq_name() == exact_fqn),
+            );
+        }
+    }
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
@@ -1657,10 +1668,7 @@ fn scala_non_identifier_receiver_type_fqn(
 ) -> Option<String> {
     match receiver.kind() {
         // `new Foo().member` — the receiver is typed by the constructed class.
-        "instance_expression" => {
-            let name = scala_first_type_name(receiver, ctx.source)?;
-            resolver.resolve(name)
-        }
+        "instance_expression" => scala_constructed_type(ctx, receiver, resolver),
         kind => scala_literal_type_name(kind).map(str::to_string),
     }
 }
@@ -1694,28 +1702,6 @@ fn scala_signature_return_type(signature: &str) -> Option<&str> {
     (!return_type.is_empty()).then_some(return_type)
 }
 
-/// The first `type_identifier` (else `identifier`) in a pre-order walk — the
-/// constructed type of a `new Foo(...)` instance expression.
-fn scala_first_type_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
-    let mut fallback = None;
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "type_identifier" => return Some(scala_node_text(node, source).trim()),
-            "identifier" if fallback.is_none() => {
-                fallback = Some(scala_node_text(node, source).trim());
-            }
-            _ => {}
-        }
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        for child in children.into_iter().rev() {
-            stack.push(child);
-        }
-    }
-    fallback
-}
-
 fn scala_enclosing_class_parameter_type(
     ctx: ScalaLookupCtx<'_>,
     node: Node<'_>,
@@ -1747,13 +1733,7 @@ fn scala_enclosing_class_parameter_type(
                     return None;
                 }
                 return parameter.child_by_field_name("type").and_then(|type_node| {
-                    let type_text = scala_node_text(type_node, ctx.source);
-                    scala_resolve_receiver_type_annotation(
-                        ctx,
-                        resolver,
-                        type_text,
-                        type_node.start_byte(),
-                    )
+                    scala_resolve_visible_type_node(ctx, resolver, type_node)
                 });
             }
             return None;
@@ -1796,8 +1776,8 @@ fn scala_active_path_declares_name_before_mode(
         let enters_scope = SCALA_SCOPE_NODES.contains(&node.kind());
         let contains_cutoff = node.start_byte() <= cutoff_start && cutoff_start < node.end_byte();
         if enters_scope && !contains_cutoff {
-            if include_callable_names
-                && node.kind() == "function_definition"
+            if node.kind() == "function_definition"
+                && (include_callable_names || scala_is_local_function_definition(node))
                 && scala_node_declares_name_before(node, source, name, 0, cutoff_start)
             {
                 return true;
@@ -1810,6 +1790,20 @@ fn scala_active_path_declares_name_before_mode(
                 if scala_parameters_declare_name_before(node, source, name, cutoff_start) {
                     return true;
                 }
+                if node.kind() == "function_definition"
+                    && scala_is_local_function_definition(node)
+                    && scala_node_declares_name_before(node, source, name, 0, cutoff_start)
+                {
+                    return true;
+                }
+            }
+            "case_clause"
+                if node.child_by_field_name("pattern").is_some_and(|pattern| {
+                    pattern.end_byte() <= cutoff_start
+                        && scala_pattern_names(pattern, source).contains(&name)
+                }) =>
+            {
+                return true;
             }
             "val_definition" | "var_definition"
                 if !scala_is_direct_member_value_definition(node)
@@ -1978,6 +1972,88 @@ fn scala_resolve_visible_type_annotation(
         .or_else(|| scala_builtin_type_name(type_text).map(str::to_string))
 }
 
+fn scala_resolve_visible_type_node(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    node: Node<'_>,
+) -> Option<String> {
+    let segments = scala_type_lookup_segments(node, ctx.source);
+    if segments.is_empty() {
+        return None;
+    }
+    let kind = scala_type_node_owner_kind(node);
+    match resolver.resolve_type_node(node, ctx.source, kind) {
+        ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => None,
+        ScalaNameResolution::Unresolved
+            if segments.len() > 1 || kind == ScalaOwnerKind::SingletonObject =>
+        {
+            scala_resolve_enclosing_qualified_type(ctx, resolver, node, &segments, kind)
+        }
+        ScalaNameResolution::Unresolved => scala_resolve_visible_type_annotation(
+            ctx,
+            resolver,
+            scala_node_text(node, ctx.source),
+            node.start_byte(),
+        ),
+    }
+}
+
+fn scala_type_node_owner_kind(node: Node<'_>) -> ScalaOwnerKind {
+    let mut current = Some(node);
+    while let Some(node) = current {
+        if node.kind() == "singleton_type" {
+            return ScalaOwnerKind::SingletonObject;
+        }
+        current = node.parent().filter(|parent| {
+            matches!(
+                parent.kind(),
+                "singleton_type" | "stable_type_identifier" | "generic_type"
+            )
+        });
+    }
+    ScalaOwnerKind::Class
+}
+
+fn scala_resolve_enclosing_qualified_type(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver,
+    node: Node<'_>,
+    type_segments: &[String],
+    kind: ScalaOwnerKind,
+) -> Option<String> {
+    let mut owners = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+        ) && let Some(name) = parent.child_by_field_name("name")
+        {
+            let name = scala_node_text(name, ctx.source).trim();
+            if !name.is_empty() {
+                owners.push(name.to_string());
+            }
+        }
+        current = parent.parent();
+    }
+    owners.reverse();
+
+    for prefix_len in (1..=owners.len()).rev() {
+        let mut candidate = Vec::with_capacity(prefix_len + type_segments.len());
+        candidate.extend(owners[..prefix_len].iter().cloned());
+        candidate.extend(type_segments.iter().cloned());
+        match resolver.resolve_owner_segments(&candidate, kind) {
+            ScalaNameResolution::Resolved(owner) => return Some(owner.fqn),
+            ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => {
+                return None;
+            }
+            ScalaNameResolution::Unresolved => {}
+        }
+    }
+    None
+}
+
 fn scala_resolve_receiver_type_annotation(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
@@ -2010,6 +2086,20 @@ fn scala_resolve_visible_term(
     node: Node<'_>,
     name: &str,
 ) -> Option<String> {
+    if let Some(owner) =
+        scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, node.start_byte())
+        && owner.identifier().trim_end_matches('$') == name
+    {
+        let companion = format!("{}$", owner.fq_name().trim_end_matches('$'));
+        if ctx
+            .support
+            .fqn(&companion)
+            .into_iter()
+            .any(|unit| unit.is_class() && unit.fq_name() == companion)
+        {
+            return Some(companion);
+        }
+    }
     if let Some(singleton) = resolver.resolve_singleton(name) {
         return Some(singleton);
     }
@@ -2213,14 +2303,46 @@ fn scala_seed_active_path(
         }
         let enters_scope = SCALA_SCOPE_NODES.contains(&node.kind());
         if enters_scope && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
+            if node.kind() == "function_definition"
+                && scala_is_local_function_definition(node)
+                && let Some(name) = node
+                    .child_by_field_name("name")
+                    .filter(|name| name.start_byte() < cutoff_start)
+            {
+                let name = scala_node_text(name, ctx.source).trim();
+                if !name.is_empty() {
+                    bindings.declare_shadow(name.to_string());
+                }
+            }
             continue;
         }
         if enters_scope {
             bindings.enter_scope();
         }
         match node.kind() {
-            "class_definition" | "function_definition" => {
+            "class_definition" => {
                 scala_seed_parameters(ctx, resolver, node, cutoff_start, bindings)
+            }
+            "function_definition" => {
+                if scala_is_local_function_definition(node)
+                    && let Some(name) = node.child_by_field_name("name")
+                {
+                    let name = scala_node_text(name, ctx.source).trim();
+                    if !name.is_empty() {
+                        bindings.declare_shadow(name.to_string());
+                    }
+                }
+                scala_seed_parameters(ctx, resolver, node, cutoff_start, bindings);
+            }
+            "case_clause" => {
+                if let Some(pattern) = node
+                    .child_by_field_name("pattern")
+                    .filter(|pattern| pattern.end_byte() <= cutoff_start)
+                {
+                    for name in scala_pattern_names(pattern, ctx.source) {
+                        bindings.declare_shadow(name.to_string());
+                    }
+                }
             }
             "val_definition" | "var_definition" if node.start_byte() < cutoff_start => {
                 scala_seed_value_definition(ctx, resolver, root, node, cutoff_start, bindings)
@@ -2450,7 +2572,18 @@ fn scala_constructed_type(
     }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .find(|child| child.kind() == "type_identifier" || child.kind() == "generic_type")
+        .find(|child| {
+            matches!(
+                child.kind(),
+                "type_identifier"
+                    | "stable_type_identifier"
+                    | "generic_type"
+                    | "applied_constructor_type"
+                    | "projected_type"
+                    | "singleton_type"
+                    | "annotated_type"
+            )
+        })
         .or_else(|| {
             matches!(
                 node.kind(),
@@ -2459,23 +2592,20 @@ fn scala_constructed_type(
             .then_some(node)
         })
         .and_then(|type_node| {
-            let type_text = scala_node_text(type_node, ctx.source);
-            resolve_in_enclosing_scopes(
-                ctx.analyzer,
-                ctx.file,
-                scala_simple_name(type_text),
-                type_node.start_byte(),
-                |unit| unit.is_class(),
-            )
-            .map(|unit| unit.fq_name())
-            .or_else(|| {
-                scala_resolve_visible_type_annotation(
-                    ctx,
-                    resolver,
-                    type_text,
-                    type_node.start_byte(),
-                )
-            })
+            let segments = scala_type_lookup_segments(type_node, ctx.source);
+            (segments.len() == 1)
+                .then(|| {
+                    resolve_in_enclosing_scopes(
+                        ctx.analyzer,
+                        ctx.file,
+                        &segments[0],
+                        type_node.start_byte(),
+                        |unit| unit.is_class(),
+                    )
+                })
+                .flatten()
+                .map(|unit| unit.fq_name())
+                .or_else(|| scala_resolve_visible_type_node(ctx, resolver, type_node))
         })
 }
 
@@ -2506,24 +2636,39 @@ fn scala_constructor_type_text(value_text: &str) -> Option<&str> {
 }
 
 fn scala_pattern_names<'a>(node: Node<'_>, source: &'a str) -> Vec<&'a str> {
-    match node.kind() {
-        "identifier" | "operator_identifier" => {
-            let name = scala_node_text(node, source).trim();
-            if name.is_empty() {
-                Vec::new()
-            } else {
-                vec![name]
+    let mut names = Vec::new();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "operator_identifier" => {
+                let name = scala_node_text(node, source).trim();
+                if !name.is_empty() {
+                    names.push(name);
+                }
             }
-        }
-        _ => {
-            let mut names = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                names.extend(scala_pattern_names(child, source));
+            "type_identifier" | "stable_identifier" | "stable_type_identifier" | "literal" => {}
+            "case_class_pattern" | "typed_pattern" | "capture_pattern" | "infix_pattern" => {
+                let excluded_type = node.child_by_field_name("type");
+                let excluded_operator = node.child_by_field_name("operator");
+                let mut cursor = node.walk();
+                let mut children = node
+                    .named_children(&mut cursor)
+                    .filter(|child| {
+                        Some(*child) != excluded_type && Some(*child) != excluded_operator
+                    })
+                    .collect::<Vec<_>>();
+                children.reverse();
+                stack.extend(children);
             }
-            names
+            _ => {
+                let mut cursor = node.walk();
+                let mut children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                children.reverse();
+                stack.extend(children);
+            }
         }
     }
+    names
 }
 
 fn scala_seed_typed(
@@ -2539,7 +2684,7 @@ fn scala_seed_typed(
     }
 }
 
-fn scala_is_direct_member_value_definition(node: Node<'_>) -> bool {
+fn scala_is_direct_member_definition(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(ancestor) = current {
         match ancestor.kind() {
@@ -2551,6 +2696,29 @@ fn scala_is_direct_member_value_definition(node: Node<'_>) -> bool {
             | "lambda_expression" => return false,
             "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
                 return true;
+            }
+            _ => current = ancestor.parent(),
+        }
+    }
+    false
+}
+
+fn scala_is_direct_member_value_definition(node: Node<'_>) -> bool {
+    scala_is_direct_member_definition(node)
+}
+
+fn scala_is_local_function_definition(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(ancestor) = current {
+        match ancestor.kind() {
+            "function_definition"
+            | "block"
+            | "block_expression"
+            | "indented_block"
+            | "case_clause"
+            | "lambda_expression" => return true,
+            "class_definition" | "object_definition" | "trait_definition" | "enum_definition" => {
+                return false;
             }
             _ => current = ancestor.parent(),
         }

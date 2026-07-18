@@ -19272,3 +19272,150 @@ fn javascript_destructured_parameter_definition_reports_binding_leaf() {
     );
     assert_eq!(definition["start_line"], 1, "{value}");
 }
+
+#[test]
+fn scala_qualified_java_constructor_does_not_fall_back_to_scala_simple_name_owner() {
+    let scala_source = r#"
+package app
+
+class Builder {
+  def append(value: String): Builder = this
+}
+
+object Consumer {
+  val built = new javaish.Builder().append("java")
+}
+"#;
+    let project = InlineTestProject::new()
+        .file(
+            "javaish/Builder.java",
+            "package javaish; public class Builder { public Builder append(String value) { return this; } }\n",
+        )
+        .file("app/Consumer.scala", scala_source)
+        .build();
+    let append_start = scala_source.find(".append").expect("qualified Java append") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Consumer.scala", scala_source, append_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["language"], "java", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "javaish.Builder.append",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_qualified_unindexed_java_constructor_does_not_use_scala_simple_name_member() {
+    let source = r#"
+package app
+
+class StringBuilder {
+  def append(value: String): StringBuilder = this
+}
+object Consumer {
+  val built = new java.lang.StringBuilder().append("java")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Consumer.scala", source)
+        .build();
+    let append_start = source.find(".append").expect("qualified append") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Consumer.scala", source, append_start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_owner_does_not_borrow_member_from_same_fqn_java_declaration() {
+    let source = r#"
+package shared
+
+class Builder
+
+object Consumer {
+  val built = new Builder().append("wrong-language")
+}
+"#;
+    let project = InlineTestProject::new()
+        .file(
+            "java/shared/Builder.java",
+            "package shared; public class Builder { public Builder append(String value) { return this; } }\n",
+        )
+        .file("scala/shared/Consumer.scala", source)
+        .build();
+    let append_start = source.find(".append").expect("same-FQN append") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("scala/shared/Consumer.scala", source, append_start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_nested_class_companion_term_beats_constructor_member_identity() {
+    let source = r#"
+package app
+
+object Outer {
+  class Entry {
+    def companion: Entry.type = Entry
+  }
+  object Entry
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Outer.scala", source)
+        .build();
+    let entry_start = source.find("= Entry").expect("companion term") + "= ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Outer.scala", source, entry_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Outer$.Entry$",
+        "{value}"
+    );
+    assert_ne!(
+        result["definitions"][0]["fqn"], "app.Outer$.Entry.Entry",
+        "the class constructor must not win the term-namespace lookup: {value}"
+    );
+}
+
+#[test]
+fn scala_nested_singleton_type_reference_keeps_term_namespace_identity() {
+    let source = r#"
+package app
+
+object Outer {
+  class Entry
+  object Entry
+  val companion: Entry.type = Entry
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Outer.scala", source)
+        .build();
+    let entry_start = source.find("Entry.type").expect("singleton type");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Outer.scala", source, entry_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Outer$.Entry$",
+        "{value}"
+    );
+}
