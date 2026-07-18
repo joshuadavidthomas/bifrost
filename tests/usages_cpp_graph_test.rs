@@ -9094,6 +9094,237 @@ struct NestedDepthSkew : Composite {
 }
 
 #[test]
+fn authoritative_cpp_ordinary_using_type_imports_are_lexical_and_surface_consistent() {
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file(
+            "alpha_a.h",
+            r#"#pragma once
+namespace alpha { struct Imported {}; }
+"#,
+        )
+        .file(
+            "alpha_b.h",
+            r#"#pragma once
+namespace alpha { struct Imported {}; }
+"#,
+        )
+        .file(
+            "consumer.cc",
+            r#"#include "alpha_a.h"
+#include "alpha_b.h"
+
+struct Imported {};
+template <typename T> struct Box {};
+namespace beta { struct Imported {}; }
+
+alpha::Imported qualified_control; // positive-qualified
+
+namespace production_style {
+Imported namespace_before_import; // negative-namespace-before-import
+using alpha::Imported; // positive-namespace-import-owner
+Imported namespace_direct_after; // positive-namespace-direct-after
+Box<Imported> namespace_template_after; // positive-namespace-template-after
+}
+
+void source_order() {
+    Imported before_import; // negative-before-import
+    using alpha::Imported; // positive-import-owner
+    Imported direct_after; // positive-direct-after
+    Box<Imported> templated_after; // positive-template-after
+}
+
+void block_scope() {
+    Imported before_block; // negative-before-block
+    {
+        using alpha::Imported; // positive-block-import-owner
+        Imported inside_block; // positive-inside-block
+    }
+    Imported after_block; // negative-after-block
+}
+
+void beta_import() {
+    using beta::Imported; // negative-beta-import-owner
+    Imported beta_value; // negative-beta-value
+}
+
+namespace shadow {
+using alpha::Imported; // positive-shadow-import-owner
+struct Holder {
+    struct Imported {};
+    Imported shadowed_value; // negative-closer-shadow
+};
+}
+
+void ambiguous_imports() {
+    using alpha::Imported; // positive-ambiguous-alpha-owner
+    using beta::Imported; // negative-ambiguous-beta-owner
+    Imported ambiguous_value; // negative-two-import-ambiguity
+}
+"#,
+        )
+        .build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    let target = definition_by(&analyzer, |unit| {
+        unit.kind() == CodeUnitType::Class
+            && unit.fq_name() == "alpha.Imported"
+            && slash_path(unit.source()) == "alpha_a.h"
+            && !unit.is_synthetic()
+    });
+    let consumer = project.file("consumer.cc");
+    let source = consumer.read_to_string().expect("ordinary using source");
+    let expected = [
+        (
+            "alpha::Imported qualified_control; // positive-qualified",
+            "alpha::Imported",
+        ),
+        (
+            "using alpha::Imported; // positive-namespace-import-owner",
+            "alpha::Imported",
+        ),
+        (
+            "Imported namespace_direct_after; // positive-namespace-direct-after",
+            "Imported",
+        ),
+        (
+            "Box<Imported> namespace_template_after; // positive-namespace-template-after",
+            "Imported",
+        ),
+        (
+            "    using alpha::Imported; // positive-import-owner",
+            "alpha::Imported",
+        ),
+        (
+            "    Imported direct_after; // positive-direct-after",
+            "Imported",
+        ),
+        (
+            "    Box<Imported> templated_after; // positive-template-after",
+            "Imported",
+        ),
+        (
+            "        using alpha::Imported; // positive-block-import-owner",
+            "alpha::Imported",
+        ),
+        (
+            "        Imported inside_block; // positive-inside-block",
+            "Imported",
+        ),
+        (
+            "using alpha::Imported; // positive-shadow-import-owner",
+            "alpha::Imported",
+        ),
+        (
+            "    using alpha::Imported; // positive-ambiguous-alpha-owner",
+            "alpha::Imported",
+        ),
+    ]
+    .map(|(line, token)| fixture_token_range(&source, line, token))
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let forward_expected = [
+        "alpha::Imported qualified_control; // positive-qualified",
+        "using alpha::Imported; // positive-namespace-import-owner",
+        "    using alpha::Imported; // positive-import-owner",
+        "        using alpha::Imported; // positive-block-import-owner",
+        "using alpha::Imported; // positive-shadow-import-owner",
+        "    using alpha::Imported; // positive-ambiguous-alpha-owner",
+    ]
+    .map(|line| fixture_token_range(&source, line, "alpha::Imported"));
+    let negatives = [
+        (
+            "Imported namespace_before_import; // negative-namespace-before-import",
+            "Imported",
+        ),
+        (
+            "    Imported before_import; // negative-before-import",
+            "Imported",
+        ),
+        (
+            "    Imported before_block; // negative-before-block",
+            "Imported",
+        ),
+        (
+            "    Imported after_block; // negative-after-block",
+            "Imported",
+        ),
+        (
+            "    using beta::Imported; // negative-beta-import-owner",
+            "beta::Imported",
+        ),
+        (
+            "    Imported beta_value; // negative-beta-value",
+            "Imported",
+        ),
+        (
+            "    Imported shadowed_value; // negative-closer-shadow",
+            "Imported",
+        ),
+        (
+            "    using beta::Imported; // negative-ambiguous-beta-owner",
+            "beta::Imported",
+        ),
+        (
+            "    Imported ambiguous_value; // negative-two-import-ambiguity",
+            "Imported",
+        ),
+    ]
+    .map(|(line, token)| fixture_token_range(&source, line, token));
+
+    for (start, end) in forward_expected {
+        let focus = end - "Imported".len();
+        let line_start = source[..focus].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = source[..focus]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let column = source[line_start..focus].chars().count() + 1;
+        let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+            &analyzer,
+            brokk_bifrost::searchtools::GetDefinitionParams {
+                references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                    path: "consumer.cc".to_string(),
+                    line: Some(line),
+                    column: Some(column),
+                }],
+            },
+        );
+        assert_eq!(
+            "resolved", forward.results[0].status,
+            "positive ordinary using token {start}..{end} must resolve: {forward:#?}"
+        );
+        assert!(
+            forward.results[0]
+                .definitions
+                .iter()
+                .any(|definition| definition.fqn.as_deref() == Some("alpha.Imported")),
+            "positive ordinary using token {start}..{end} must resolve to alpha.Imported: {forward:#?}"
+        );
+    }
+
+    let targeted = authoritative_exact_ranges(&analyzer, std::slice::from_ref(&target), &consumer);
+    let whole = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let whole_ranges = whole
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == consumer)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        (&targeted, &whole_ranges),
+        (&expected, &expected),
+        "targeted and whole-workspace ordinary using resolution must agree exactly"
+    );
+    assert!(
+        negatives.into_iter().all(|negative| {
+            let negative = BTreeSet::from([negative]);
+            targeted.is_disjoint(&negative) && whole_ranges.is_disjoint(&negative)
+        }),
+        "both surfaces must exclude every fallback, out-of-scope, beta, shadowed, and ambiguous token: targeted={targeted:#?}, whole={whole_ranges:#?}"
+    );
+}
+
+#[test]
 fn authoritative_cpp_using_enum_is_lexical_source_ordered_and_shadow_aware() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(

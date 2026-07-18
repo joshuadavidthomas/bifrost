@@ -23,14 +23,16 @@
 //! re-deriving the namespace. Ambiguous receiver or return identities fail closed.
 
 use super::extractor::{
-    LexicalScopeResolution, enclosing_lexical_scope_components, resolve_type_node_lexically,
-    resolve_using_enum_declaration_owner, using_enum_declaration_type_node,
+    LexicalScopeResolution, enclosing_lexical_scope_components, initialized_ordinary_type_imports,
+    ordinary_using_declaration_type_node, resolve_ordinary_using_declaration_owner,
+    resolve_type_node_lexically, resolve_using_enum_declaration_owner,
+    using_enum_declaration_type_node,
 };
 use super::resolver::{
     DesignatedInitializerOwner, EnclosingMemberOwnerResolution, LexicalCallableValueResolution,
-    LexicalTypeResolution, TargetKind, VisibilityIndex, VisibleMemberResolution, call_arity,
-    constructor_style_local_declaration, cpp_callable_arity, declarator_name_node,
-    designated_initializer_owner, extract_variable_name, first_type_child,
+    LexicalTypeResolution, OrdinaryTypeImportCell, TargetKind, VisibilityIndex,
+    VisibleMemberResolution, call_arity, constructor_style_local_declaration, cpp_callable_arity,
+    declarator_name_node, designated_initializer_owner, extract_variable_name, first_type_child,
     infer_cpp_initializer_binding, infer_cpp_initializer_type, is_declaration_name,
     is_declarator_node, is_nested_type_node, normalize_type_text,
     out_of_line_member_definition_owner, recovered_macro_function_return_type,
@@ -63,11 +65,19 @@ where
     let language = tree_sitter_cpp::LANGUAGE.into();
     build_edge_output(files, keep_file, |file| {
         parse_and_collect(analyzer, file, nodes, &language, |parsed, collector| {
+            let ordinary_type_imports = initialized_ordinary_type_imports(
+                parsed.tree.root_node(),
+                analyzer,
+                visibility,
+                file,
+                parsed.source.as_str(),
+            );
             let mut ctx = CppScan {
                 analyzer,
                 visibility,
                 file,
                 source: parsed.source.as_str(),
+                ordinary_type_imports,
                 class_ranges: ClassRangeIndex::build(analyzer, file),
                 enclosing_member_cache: HashMap::default(),
                 collector,
@@ -83,6 +93,7 @@ struct CppScan<'a, 'b> {
     visibility: &'a VisibilityIndex,
     file: &'a ProjectFile,
     source: &'a str,
+    ordinary_type_imports: OrdinaryTypeImportCell,
     class_ranges: ClassRangeIndex,
     enclosing_member_cache: HashMap<CodeUnit, HashMap<String, EnclosingMemberOwnerResolution>>,
     collector: &'a mut EdgeCollector<'b>,
@@ -159,16 +170,34 @@ fn record_reference(
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
     if node.kind() == "using_declaration" {
-        let Some(type_node) = using_enum_declaration_type_node(node) else {
-            return;
-        };
-        match resolve_using_enum_declaration_owner(
-            node,
-            ctx.analyzer,
-            ctx.visibility,
-            ctx.file,
-            ctx.source,
-        ) {
+        let (resolution, type_node) =
+            if let Some(type_node) = using_enum_declaration_type_node(node) {
+                (
+                    resolve_using_enum_declaration_owner(
+                        node,
+                        ctx.analyzer,
+                        ctx.visibility,
+                        &ctx.ordinary_type_imports,
+                        ctx.file,
+                        ctx.source,
+                    ),
+                    type_node,
+                )
+            } else if let Some(type_node) = ordinary_using_declaration_type_node(node) {
+                (
+                    resolve_ordinary_using_declaration_owner(
+                        node,
+                        ctx.analyzer,
+                        ctx.visibility,
+                        ctx.file,
+                        ctx.source,
+                    ),
+                    type_node,
+                )
+            } else {
+                return;
+            };
+        match resolution {
             LexicalTypeResolution::Resolved { unit, .. } => ctx.record(unit.fq_name(), type_node),
             LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {
                 ctx.record_unproven(node_text(type_node, ctx.source), type_node);
@@ -252,7 +281,14 @@ fn record_reference(
 }
 
 fn record_type_reference(node: Node<'_>, ctx: &mut CppScan<'_, '_>) {
-    match resolve_type_node_lexically(node, ctx.analyzer, ctx.visibility, ctx.file, ctx.source) {
+    match resolve_type_node_lexically(
+        node,
+        ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+    ) {
         LexicalTypeResolution::Resolved { unit, .. } => ctx.record(unit.fq_name(), node),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {}
     }

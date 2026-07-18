@@ -476,12 +476,80 @@ impl CppScanBinding {
 }
 
 type AliasCell = Arc<OnceLock<Box<[CppAlias]>>>;
+pub(super) type OrdinaryTypeImportCell = Arc<OnceLock<Box<[OrdinaryTypeImport]>>>;
+
+pub(super) struct OrdinaryTypeImport {
+    pub(super) name: String,
+    pub(super) target: CodeUnit,
+    pub(super) target_components: Vec<String>,
+    pub(super) declaration_byte: usize,
+    pub(super) scope_start: usize,
+    pub(super) scope_end: usize,
+    pub(super) scope_depth: usize,
+    pub(super) lexical_depth: usize,
+}
+
+pub(super) enum OrdinaryTypeImportResolution<'a> {
+    Resolved(&'a OrdinaryTypeImport),
+    Ambiguous { lexical_depth: usize },
+    Missing,
+}
+
+pub(super) fn resolve_ordinary_type_import<'a>(
+    imports: &'a [OrdinaryTypeImport],
+    node: Node<'_>,
+    name: &str,
+) -> OrdinaryTypeImportResolution<'a> {
+    // Source order and the AST scope range establish which imports are active;
+    // the deepest active AST scope hides imports from enclosing scopes.
+    let active = |import: &&OrdinaryTypeImport| {
+        import.name == name
+            && import.declaration_byte <= node.start_byte()
+            && import.scope_start <= node.start_byte()
+            && node.end_byte() <= import.scope_end
+    };
+    let Some(nearest_depth) = imports
+        .iter()
+        .filter(active)
+        .map(|import| import.scope_depth)
+        .max()
+    else {
+        return OrdinaryTypeImportResolution::Missing;
+    };
+    let mut first: Option<&OrdinaryTypeImport> = None;
+    let mut lexical_depth = 0;
+    let mut ambiguous = false;
+    for import in imports
+        .iter()
+        .filter(active)
+        .filter(|import| import.scope_depth == nearest_depth)
+    {
+        lexical_depth = lexical_depth.max(import.lexical_depth);
+        // Header duplication can yield multiple physical declarations for the
+        // same logical type. Collapse those by the public type identity, while
+        // distinct identities imported into one scope remain ambiguous.
+        if let Some(existing) = first {
+            ambiguous |= existing.target.kind() != import.target.kind()
+                || existing.target.fq_name() != import.target.fq_name();
+        } else {
+            first = Some(import);
+        }
+    }
+    if ambiguous {
+        OrdinaryTypeImportResolution::Ambiguous { lexical_depth }
+    } else {
+        first
+            .map(OrdinaryTypeImportResolution::Resolved)
+            .unwrap_or(OrdinaryTypeImportResolution::Missing)
+    }
+}
 
 pub(in crate::analyzer::usages) struct VisibilityIndex {
     pub(super) visible_by_file: HashMap<ProjectFile, HashSet<CodeUnit>>,
     visible_by_identifier: HashMap<ProjectFile, HashMap<String, Vec<CodeUnit>>>,
     visible_source_files_by_root: HashMap<ProjectFile, HashSet<ProjectFile>>,
     alias_cells: Mutex<HashMap<ProjectFile, AliasCell>>,
+    ordinary_type_import_cells: Mutex<HashMap<ProjectFile, OrdinaryTypeImportCell>>,
     #[cfg(test)]
     alias_source_parse_counts: Mutex<HashMap<ProjectFile, usize>>,
     field_type_facts: Mutex<HashMap<CodeUnit, Option<DeclaredFieldTypeFact>>>,
@@ -552,6 +620,7 @@ impl VisibilityIndex {
             visible_by_identifier,
             visible_source_files_by_root,
             alias_cells: Mutex::new(HashMap::default()),
+            ordinary_type_import_cells: Mutex::new(HashMap::default()),
             #[cfg(test)]
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
@@ -571,6 +640,15 @@ impl VisibilityIndex {
                 .visible_by_file
                 .get(file)
                 .is_some_and(|visible| visible.iter().any(|unit| same_visible_symbol(unit, target)))
+    }
+
+    pub(super) fn ordinary_type_import_cell(&self, file: &ProjectFile) -> OrdinaryTypeImportCell {
+        self.ordinary_type_import_cells
+            .lock()
+            .expect("C++ ordinary type import cache poisoned")
+            .entry(file.clone())
+            .or_default()
+            .clone()
     }
 
     pub(super) fn is_physically_visible(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
@@ -646,6 +724,29 @@ impl VisibilityIndex {
             lexical_scope,
             TypeCandidateResolution::PreserveTarget(target),
         )
+    }
+
+    pub(super) fn resolve_imported_type_candidate(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        import: &OrdinaryTypeImport,
+        direct_target: Option<&CodeUnit>,
+    ) -> LexicalTypeResolution {
+        let candidates = [&import.target];
+        let resolution = direct_target.map_or(
+            TypeCandidateResolution::Canonical,
+            TypeCandidateResolution::PreserveTarget,
+        );
+        let Some(unit) = self.resolve_type_candidates(analyzer, file, &candidates, resolution)
+        else {
+            return LexicalTypeResolution::Ambiguous;
+        };
+        LexicalTypeResolution::Resolved {
+            unit,
+            components: import.target_components.clone(),
+            candidates: vec![import.target.clone()],
+        }
     }
 
     fn resolve_type_components_lexically_inner(
@@ -3970,6 +4071,7 @@ mod tests {
             visible_by_file,
             visible_source_files_by_root: HashMap::default(),
             alias_cells: Mutex::new(HashMap::default()),
+            ordinary_type_import_cells: Mutex::new(HashMap::default()),
             alias_source_parse_counts: Mutex::new(HashMap::default()),
             field_type_facts: Mutex::new(HashMap::default()),
             structured_alias_targets: Mutex::new(HashMap::default()),

@@ -33,6 +33,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) visibility: &'a VisibilityIndex,
     pub(super) file: &'a ProjectFile,
     pub(super) source: &'a str,
+    ordinary_type_imports: OrdinaryTypeImportCell,
     pub(super) line_starts: &'a [usize],
     pub(super) spec: &'a TargetSpec,
     pub(super) target_group: &'a HashSet<CodeUnit>,
@@ -90,11 +91,19 @@ pub(super) fn scan_prepared_file(
     } else {
         Vec::new()
     };
+    let ordinary_type_imports = initialized_ordinary_type_imports(
+        prepared.tree().root_node(),
+        analyzer,
+        visibility,
+        file,
+        prepared.source(),
+    );
     let mut ctx = ScanCtx {
         analyzer,
         visibility,
         file,
         source: prepared.source(),
+        ordinary_type_imports,
         line_starts: prepared.line_starts(),
         spec,
         target_group,
@@ -180,6 +189,7 @@ fn collect_semantic_using_enums(root: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     node,
                     ctx.analyzer,
                     ctx.visibility,
+                    &ctx.ordinary_type_imports,
                     ctx.file,
                     ctx.source,
                 )
@@ -271,6 +281,7 @@ fn seed_using_enum(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         node,
         ctx.analyzer,
         ctx.visibility,
+        &ctx.ordinary_type_imports,
         ctx.file,
         ctx.source,
     ) && matches!(
@@ -448,14 +459,35 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if node.kind() == "using_declaration" {
-        if let LexicalTypeResolution::Resolved { unit, .. } = resolve_using_enum_declaration_owner(
-            node,
-            ctx.analyzer,
-            ctx.visibility,
-            ctx.file,
-            ctx.source,
-        ) && same_visible_symbol(&unit, &ctx.spec.target)
-            && let Some(type_node) = using_enum_declaration_type_node(node)
+        let (resolution, type_node) =
+            if let Some(type_node) = using_enum_declaration_type_node(node) {
+                (
+                    resolve_using_enum_declaration_owner(
+                        node,
+                        ctx.analyzer,
+                        ctx.visibility,
+                        &ctx.ordinary_type_imports,
+                        ctx.file,
+                        ctx.source,
+                    ),
+                    type_node,
+                )
+            } else if let Some(type_node) = ordinary_using_declaration_type_node(node) {
+                (
+                    resolve_ordinary_using_declaration_owner(
+                        node,
+                        ctx.analyzer,
+                        ctx.visibility,
+                        ctx.file,
+                        ctx.source,
+                    ),
+                    type_node,
+                )
+            } else {
+                return;
+            };
+        if let LexicalTypeResolution::Resolved { unit, .. } = resolution
+            && same_visible_symbol(&unit, &ctx.spec.target)
         {
             *ctx.raw_match_count += 1;
             push_type_hit(type_node, ctx);
@@ -515,6 +547,7 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         hit_node,
         ctx.analyzer,
         ctx.visibility,
+        &ctx.ordinary_type_imports,
         ctx.file,
         ctx.source,
         &ctx.spec.target,
@@ -590,6 +623,7 @@ fn static_qualifier_type_scopes<'tree>(
             qualified.global,
             ctx.analyzer,
             ctx.visibility,
+            &ctx.ordinary_type_imports,
             ctx.file,
             ctx.source,
             &ctx.spec.target,
@@ -2271,6 +2305,7 @@ pub(super) fn resolve_type_node_lexically(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
 ) -> LexicalTypeResolution {
@@ -2283,6 +2318,7 @@ pub(super) fn resolve_type_node_lexically(
         global,
         analyzer,
         visibility,
+        ordinary_type_imports,
         file,
         source,
     )
@@ -2292,6 +2328,7 @@ fn resolve_type_node_lexically_for_target(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
     target: &CodeUnit,
@@ -2305,6 +2342,7 @@ fn resolve_type_node_lexically_for_target(
         global,
         analyzer,
         visibility,
+        ordinary_type_imports,
         file,
         source,
         target,
@@ -2315,6 +2353,7 @@ pub(super) fn resolve_using_enum_declaration_owner(
     node: Node<'_>,
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
 ) -> LexicalTypeResolution {
@@ -2333,8 +2372,40 @@ pub(super) fn resolve_using_enum_declaration_owner(
         is_globally_qualified_cpp_name(type_node),
         analyzer,
         visibility,
+        ordinary_type_imports,
         file,
         source,
+    )
+}
+
+pub(super) fn resolve_ordinary_using_declaration_owner(
+    node: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+) -> LexicalTypeResolution {
+    let Some(type_node) = ordinary_using_declaration_type_node(node) else {
+        return LexicalTypeResolution::Missing;
+    };
+    let mut components = Vec::new();
+    if append_cpp_name_components(type_node, source, &mut components).is_none()
+        || components.len() < 2
+    {
+        return LexicalTypeResolution::Missing;
+    }
+    let lexical_scope =
+        match enclosing_lexical_scope_components(type_node, analyzer, visibility, file, source) {
+            LexicalScopeResolution::Resolved(scope) => scope,
+            LexicalScopeResolution::Ambiguous => return LexicalTypeResolution::Ambiguous,
+            LexicalScopeResolution::Missing => return LexicalTypeResolution::Missing,
+        };
+    visibility.resolve_type_components_lexically(
+        analyzer,
+        file,
+        &components,
+        is_globally_qualified_cpp_name(type_node),
+        &lexical_scope,
     )
 }
 
@@ -2348,17 +2419,132 @@ pub(super) fn using_enum_declaration_type_node(node: Node<'_>) -> Option<Node<'_
     .flatten()
 }
 
+pub(super) fn ordinary_using_declaration_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    (node.kind() == "using_declaration" && using_enum_declaration_type_node(node).is_none())
+        .then(|| node.named_child(0))
+        .flatten()
+}
+
+fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize)> {
+    let mut current = node.parent();
+    while let Some(scope) = current {
+        if matches!(
+            scope.kind(),
+            "compound_statement"
+                | "declaration_list"
+                | "field_declaration_list"
+                | "translation_unit"
+        ) {
+            let mut depth = 0;
+            let mut ancestor = scope.parent();
+            while let Some(parent) = ancestor {
+                depth += 1;
+                ancestor = parent.parent();
+            }
+            return Some((scope.start_byte(), scope.end_byte(), depth));
+        }
+        current = scope.parent();
+    }
+    None
+}
+
+fn collect_ordinary_type_imports(
+    root: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+) -> Box<[OrdinaryTypeImport]> {
+    let mut imports = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if let Some(type_node) = ordinary_using_declaration_type_node(node) {
+            let mut target_components = Vec::new();
+            if append_cpp_name_components(type_node, source, &mut target_components).is_some()
+                && target_components.len() >= 2
+                && let LexicalScopeResolution::Resolved(lexical_scope) =
+                    enclosing_lexical_scope_components(
+                        type_node, analyzer, visibility, file, source,
+                    )
+                && let LexicalTypeResolution::Resolved { unit: target, .. } = visibility
+                    .resolve_type_components_lexically_for_forward(
+                        analyzer,
+                        file,
+                        &target_components,
+                        is_globally_qualified_cpp_name(type_node),
+                        &lexical_scope,
+                    )
+                && let Some((scope_start, scope_end, scope_depth)) = ordinary_using_scope(node)
+            {
+                imports.push(OrdinaryTypeImport {
+                    name: target_components
+                        .last()
+                        .expect("ordinary using has a terminal component")
+                        .clone(),
+                    target,
+                    target_components,
+                    declaration_byte: node.end_byte(),
+                    scope_start,
+                    scope_end,
+                    scope_depth,
+                    lexical_depth: lexical_scope.len(),
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    imports.into_boxed_slice()
+}
+
+pub(super) fn initialized_ordinary_type_imports(
+    root: Node<'_>,
+    analyzer: &dyn IAnalyzer,
+    visibility: &VisibilityIndex,
+    file: &ProjectFile,
+    source: &str,
+) -> OrdinaryTypeImportCell {
+    let cell = visibility.ordinary_type_import_cell(file);
+    cell.get_or_init(|| collect_ordinary_type_imports(root, analyzer, visibility, file, source));
+    cell
+}
+
+fn ordinary_type_import_resolution<'a>(
+    node: Node<'_>,
+    components: &[String],
+    global: bool,
+    imports: &'a OrdinaryTypeImportCell,
+) -> OrdinaryTypeImportResolution<'a> {
+    if global || components.len() != 1 {
+        return OrdinaryTypeImportResolution::Missing;
+    }
+    let imports = imports
+        .get()
+        .expect("ordinary type imports initialized when constructing the scan context");
+    resolve_ordinary_type_import(imports, node, &components[0])
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_type_components_lexically_at(
     node: Node<'_>,
     components: &[String],
     global: bool,
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
 ) -> LexicalTypeResolution {
     resolve_type_components_lexically_at_inner(
-        node, components, global, analyzer, visibility, file, source, None,
+        node,
+        components,
+        global,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+        None,
     )
 }
 
@@ -2369,6 +2555,7 @@ fn resolve_type_components_lexically_at_for_target(
     global: bool,
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
     target: &CodeUnit,
@@ -2379,6 +2566,7 @@ fn resolve_type_components_lexically_at_for_target(
         global,
         analyzer,
         visibility,
+        ordinary_type_imports,
         file,
         source,
         Some(target),
@@ -2392,6 +2580,7 @@ fn resolve_type_components_lexically_at_inner(
     global: bool,
     analyzer: &dyn IAnalyzer,
     visibility: &VisibilityIndex,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
     file: &ProjectFile,
     source: &str,
     direct_target: Option<&CodeUnit>,
@@ -2413,7 +2602,7 @@ fn resolve_type_components_lexically_at_inner(
             LexicalScopeResolution::Missing => return LexicalTypeResolution::Missing,
         }
     };
-    direct_target.map_or_else(
+    let normal = direct_target.map_or_else(
         || {
             visibility.resolve_type_components_lexically(
                 analyzer,
@@ -2433,7 +2622,36 @@ fn resolve_type_components_lexically_at_inner(
                 target,
             )
         },
-    )
+    );
+    let normal_depth = match &normal {
+        LexicalTypeResolution::Resolved { components, .. } => {
+            Some(components.len().saturating_sub(1))
+        }
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => None,
+    };
+    // Ordinary using-declarations participate in unqualified lookup at their
+    // lexical scope. They therefore replace the resolver's terminal/global
+    // fallback at the same or a shallower depth. A declaration in a more deeply
+    // nested named scope is the closer lexical result and remains authoritative.
+    // Ambiguous imports fail closed unless such a closer declaration exists.
+    match ordinary_type_import_resolution(node, components, global, ordinary_type_imports) {
+        OrdinaryTypeImportResolution::Missing => normal,
+        OrdinaryTypeImportResolution::Resolved(import)
+            if matches!(&normal, LexicalTypeResolution::Ambiguous)
+                || normal_depth.is_some_and(|depth| depth > import.lexical_depth) =>
+        {
+            normal
+        }
+        OrdinaryTypeImportResolution::Resolved(import) => {
+            visibility.resolve_imported_type_candidate(analyzer, file, import, direct_target)
+        }
+        OrdinaryTypeImportResolution::Ambiguous { lexical_depth }
+            if normal_depth.is_some_and(|depth| depth > lexical_depth) =>
+        {
+            normal
+        }
+        OrdinaryTypeImportResolution::Ambiguous { .. } => LexicalTypeResolution::Ambiguous,
+    }
 }
 
 fn same_owner_context(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
