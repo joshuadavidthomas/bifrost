@@ -1181,6 +1181,7 @@ impl<'a> CppVisitor<'a> {
             is_wildcard: false,
             identifier: None,
             alias: None,
+            path: None,
         });
     }
 
@@ -1279,6 +1280,7 @@ pub(crate) fn recover_quoted_includes(
             is_wildcard: false,
             identifier: None,
             alias: None,
+            path: None,
         });
     }
 }

@@ -6,6 +6,7 @@ pub(crate) mod imports;
 pub(crate) mod structural;
 mod supertypes;
 mod tests;
+pub(crate) mod wildcard_imports;
 
 use crate::analyzer::clone_detection::{CloneCandidateProfile, detect_structural_clone_smells};
 use crate::analyzer::common::language_for_file as file_language;
@@ -32,8 +33,14 @@ use std::sync::{Arc, OnceLock};
 pub(crate) use adapter::ScalaAdapter;
 use clones::{build_scala_clone_candidate_data, refine_scala_clone_similarity};
 pub(crate) use declarations::scala_class_parameter_field_keyword;
+pub(crate) use imports::scala_lexical_scope_path_at;
 pub(crate) use supertypes::{ScalaSupertypeLookupPath, scala_type_lookup_segments};
 use tests::detect_scala_test_assertion_smells;
+pub(crate) use wildcard_imports::{
+    ScalaWildcardImportEnvironment, ScalaWildcardOwnerFacts,
+    resolve_scala_wildcard_import_environment, scala_import_path, scala_import_visible_at,
+    scala_package_prefixes_at,
+};
 
 pub(crate) fn scala_normalize_full_name(fq_name: &str) -> String {
     fq_name.replace("$.", ".").trim_end_matches('$').to_string()
@@ -146,6 +153,28 @@ pub struct ScalaAnalyzer {
 crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
 
 impl ScalaAnalyzer {
+    pub(crate) fn import_lexical_context_for_unit(
+        &self,
+        unit: &CodeUnit,
+    ) -> Option<(
+        Vec<String>,
+        Vec<crate::analyzer::StructuredImportScope>,
+        usize,
+    )> {
+        let reference_byte = self
+            .ranges(unit)
+            .into_iter()
+            .map(|range| range.start_byte)
+            .min()?;
+        let prepared = self.inner.prepared_syntax(unit.source())?;
+        let root = prepared.tree().root_node();
+        Some((
+            scala_package_prefixes_at(root, prepared.source(), reference_byte),
+            scala_lexical_scope_path_at(root, reference_byte),
+            reference_byte,
+        ))
+    }
+
     pub(crate) fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit)
     }

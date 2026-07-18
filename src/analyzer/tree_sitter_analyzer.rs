@@ -6633,6 +6633,7 @@ mod tests {
             is_wildcard: false,
             identifier: Some("value".to_string()),
             alias: None,
+            path: None,
         });
         assert!(adapter.storage_contains_tests(&state));
         assert!(adapter.hydrate_contains_tests(false, &tsx_file, ""));

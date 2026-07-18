@@ -96,8 +96,9 @@ pub use model::{
     CommentDensityStats, DeclarationInfo, DeclarationKind, ExceptionHandlingSmell,
     ExceptionSmellWeights, ImportInfo, Language, MaintainabilitySizeSmell,
     MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError, ParseErrorKind, ProjectFile,
-    Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, SummaryFileProjection,
-    TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
+    Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, StructuredImportPath,
+    StructuredImportScope, SummaryFileProjection, TestAssertionSmell, TestAssertionWeights,
+    metrics_from_declarations,
 };
 pub(crate) use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
