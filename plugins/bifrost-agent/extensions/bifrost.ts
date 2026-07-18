@@ -1,22 +1,16 @@
 import { join } from "node:path";
 
-import {
-  getAgentDir,
-  getSettingsListTheme,
-  type ExtensionAPI,
-} from "@earendil-works/pi-coding-agent";
-import { Container, type SettingItem, SettingsList, Text } from "@earendil-works/pi-tui";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import {
-  BIFROST_CAPABILITIES,
   DEFAULT_BIFROST_CAPABILITIES,
-  normalizeCapabilities,
   type BifrostCapability,
 } from "./bifrost-capabilities.ts";
 import {
   createBifrostSession,
   type BifrostSessionController,
 } from "./bifrost-session.ts";
+import { showBifrostSettings } from "./bifrost-settings-component.ts";
 import {
   createBifrostSettingsStore,
   type BifrostSettingsStore,
@@ -112,124 +106,14 @@ export function configureBifrostExtension(
         ctx.ui.notify("Bifrost has not started a workspace session.", "error");
         return;
       }
-      const workspace = initialStatus.workspace;
-      let desired = new Set<BifrostCapability>(initialStatus.capabilities);
-      let pending = Promise.resolve();
-
-      await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-        const items = capabilitySettingItems(desired);
-        const container = new Container();
-        const header = new Text("", 1, 1);
-        const updateHeader = () => {
-          const status = session.status();
-          header.setText(
-            theme.fg("accent", theme.bold("Bifrost Toolsets"))
-              + `\n${theme.fg("muted", `${status.state} · ${status.workspace ?? workspace}`)}`,
-          );
-        };
-        updateHeader();
-        container.addChild(header);
-
-        let settingsList: SettingsList;
-        settingsList = new SettingsList(
-          items,
-          Math.min(items.length + 2, 15),
-          getSettingsListTheme(),
-          (id, newValue) => {
-            const capability = id as BifrostCapability;
-            pending = pending.then(async () => {
-              const previous = session.status().capabilities;
-              const requestedSet = new Set<BifrostCapability>(previous);
-              if (newValue === "enabled") {
-                requestedSet.add(capability);
-              } else {
-                requestedSet.delete(capability);
-              }
-              const requested = normalizeCapabilities(requestedSet);
-              const applied = await session.applySelection(requested);
-              if (!applied) {
-                desired = new Set(session.status().capabilities);
-                updateSettingValues(settingsList, desired);
-                updateHeader();
-                ctx.ui.notify(
-                  session.status().lastOperationError?.message
-                    ?? "Bifrost could not apply that selection.",
-                  "error",
-                );
-                tui.requestRender();
-                return;
-              }
-
-              try {
-                await dependencies.settingsStore.save(workspace, requested);
-                desired = new Set(session.status().capabilities);
-                updateSettingValues(settingsList, desired);
-                updateHeader();
-                tui.requestRender();
-              } catch (cause) {
-                const rolledBack = await session.applySelection(previous);
-                desired = new Set(session.status().capabilities);
-                updateSettingValues(settingsList, desired);
-                updateHeader();
-                tui.requestRender();
-                const consequence = rolledBack
-                  ? "The previous runtime selection was restored. Check the settings directory and try again."
-                  : "The previous runtime selection could not be restored. Restart Pi before retrying.";
-                throw new Error(`Could not save Bifrost settings. ${consequence}`, { cause });
-              }
-            }).catch((error: unknown) => {
-              updateHeader();
-              tui.requestRender();
-              ctx.ui.notify(
-                error instanceof Error ? error.message : "Bifrost could not update its settings. Restart Pi and try again.",
-                "error",
-              );
-            });
-          },
-          () => done(undefined),
-          { enableSearch: true },
-        );
-        container.addChild(settingsList);
-
-        return {
-          render: (width) => {
-            updateHeader();
-            return container.render(width);
-          },
-          invalidate: () => container.invalidate(),
-          handleInput: (data) => {
-            settingsList.handleInput(data);
-            tui.requestRender();
-          },
-        };
-      });
-      await pending;
+      await showBifrostSettings(
+        ctx,
+        initialStatus.workspace,
+        session,
+        dependencies.settingsStore,
+      );
     },
   });
-}
-
-function capabilitySettingItems(
-  selected: ReadonlySet<BifrostCapability>,
-): SettingItem[] {
-  return BIFROST_CAPABILITIES.map((capability) => ({
-    id: capability.id,
-    label: capability.label,
-    description: capability.description,
-    currentValue: selected.has(capability.id) ? "enabled" : "disabled",
-    values: ["enabled", "disabled"],
-  }));
-}
-
-function updateSettingValues(
-  settingsList: SettingsList,
-  selected: ReadonlySet<BifrostCapability>,
-): void {
-  for (const capability of BIFROST_CAPABILITIES) {
-    settingsList.updateValue(
-      capability.id,
-      selected.has(capability.id) ? "enabled" : "disabled",
-    );
-  }
 }
 
 function defaultDependencies(): BifrostExtensionDependencies {

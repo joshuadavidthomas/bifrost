@@ -57,6 +57,7 @@ const requiredFiles = [
   "extensions/bifrost.ts",
   "extensions/bifrost-capabilities.ts",
   "extensions/bifrost-session.ts",
+  "extensions/bifrost-settings-component.ts",
   "extensions/bifrost-settings.ts",
   "extensions/mcp-adapter.ts",
   "skills/bifrost-code-navigation/SKILL.md",
