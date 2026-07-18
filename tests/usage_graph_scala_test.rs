@@ -798,14 +798,39 @@ object Use {
 #[test]
 fn scala_inverted_resolves_same_file_companion_wildcard_nested_type() {
     let project = InlineTestProject::with_language(Language::Scala)
+        .file("kyo/Chunk.scala", "package kyo\nclass Chunk[+A]\n")
+        .file(
+            "kyo/Batch.scala",
+            r#"package kyo
+object Batch:
+    import internal.*
+    def run[A, S](v: A): A =
+        type Item = A | Int
+        def expand(items: List[Item]) =
+            Kyo.foreach(items) {
+                case ToExpand[A @unchecked, S @unchecked](seq: Seq[Any], cont) =>
+                    Kyo.foreach(seq)(v => v)
+                case item => item
+            }
+        expand(Nil)
+    end run
+    object internal:
+        case class Call[A](v: A)
+    end internal
+end Batch
+"#,
+        )
         .file(
             "kyo/ai/Context.scala",
             r#"package kyo.ai
 import Context.*
-case class Context(calls: List[Call]) {
-  def assistantMessage(calls: List[Call]): Context = this
-}
-object Context { case class Call(id: String) }
+import kyo.*
+case class Context(calls: Chunk[Call]):
+    def assistantMessage(calls: Chunk[Call]): Context = this
+end Context
+object Context:
+    case class Call(id: String)
+end Context
 "#,
         )
         .build();
@@ -815,6 +840,15 @@ object Context { case class Call(id: String) }
             &value,
             "kyo.ai.Context.assistantMessage",
             "kyo.ai.Context$.Call"
+        ),
+        "{}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(
+            &value,
+            "kyo.ai.Context.assistantMessage",
+            "kyo.Batch$.internal$.Call"
         ),
         "{}",
         value["edges"]

@@ -1014,23 +1014,79 @@ object Imported { val value = Option(1).map(Token) } // negative-unrelated-impor
 
 #[test]
 fn scala_usage_finder_resolves_same_file_companion_wildcard_nested_type() {
-    let (_project, analyzer) = scala_analyzer_with_files(&[(
-        "kyo/ai/Context.scala",
-        r#"package kyo.ai
-import Context.*
-case class Context(calls: List[Call]) {
-  def assistantMessage(calls: List[Call] = Nil): Context = this // positive-context-call
-}
-object Context {
-  case class Call(id: String)
-}
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("kyo/Chunk.scala", "package kyo\nclass Chunk[+A]\n"),
+        (
+            "p/Clean.scala",
+            "package p\nclass A\n  class B // clean-indented-top-level\n",
+        ),
+        (
+            "kyo/Batch.scala",
+            r#"package kyo
+object Batch:
+    import internal.*
+    def run[A, S](v: A): A =
+        type Item = A | Int
+        def expand(items: List[Item]) =
+            Kyo.foreach(items) {
+                case ToExpand[A @unchecked, S @unchecked](seq: Seq[Any], cont) =>
+                    Kyo.foreach(seq)(v => v)
+                case item => item
+            }
+        expand(Nil)
+    end run
+    object internal:
+        case class Call[A](v: A) // negative-nested-package-wildcard
+    end internal
+end Batch
 "#,
-    )]);
+        ),
+        (
+            "kyo/ai/Context.scala",
+            r#"package kyo.ai
+import Context.*
+import kyo.*
+case class Context(calls: Chunk[Call]):
+    def assistantMessage(calls: Chunk[Call]): Context = this // positive-context-call
+end Context
+object Context:
+    case class Call(id: String)
+end Context
+"#,
+        ),
+    ]);
+
+    assert!(
+        analyzer
+            .top_level_declarations(&_project.file("kyo/Batch.scala"))
+            .iter()
+            .all(|unit| unit.fq_name() != "kyo.Call"),
+        "structurally nested Batch.internal.Call must not be collected as package-level kyo.Call"
+    );
+    assert!(
+        analyzer
+            .get_definitions("kyo.Batch$.internal$.Call")
+            .iter()
+            .any(|unit| unit.source().rel_path() == _project.file("kyo/Batch.scala").rel_path()),
+        "recovered nested Call must retain its exact Batch.internal owner"
+    );
+    assert!(
+        analyzer
+            .top_level_declarations(&_project.file("p/Clean.scala"))
+            .iter()
+            .any(|unit| unit.fq_name() == "p.B"),
+        "indentation alone must not invent recovery ownership"
+    );
+    assert!(
+        analyzer.get_definitions("p.A.B").is_empty(),
+        "clean root declarations must not be nested without structured recovery evidence"
+    );
 
     let call = definition(&analyzer, "kyo.ai.Context$.Call");
     let call_hits =
         hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&call)));
     assert_hit_contains(&call_hits, "positive-context-call");
+    assert_no_hit_contains(&call_hits, "negative-nested-package-wildcard");
 }
 
 #[test]

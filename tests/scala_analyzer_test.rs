@@ -124,6 +124,18 @@ fn test_simple_unqualified_classes() {
 }
 
 #[test]
+fn scala_indented_root_type_without_unmatched_end_marker_remains_top_level() {
+    let project = inline_scala_project(&[("RootTypes.scala", "package p\nclass A\n  class B\n")]);
+    let analyzer = ScalaAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "RootTypes.scala");
+
+    let top_level = analyzer.top_level_declarations(&file);
+    assert!(top_level.iter().any(|unit| unit.fq_name() == "p.A"));
+    assert!(top_level.iter().any(|unit| unit.fq_name() == "p.B"));
+    assert!(analyzer.get_definitions("p.A.B").is_empty());
+}
+
+#[test]
 fn test_simple_unqualified_trait() {
     let project = inline_scala_project(&[("Foo.scala", "trait Foo {}\n")]);
     let analyzer = ScalaAnalyzer::from_project(project);

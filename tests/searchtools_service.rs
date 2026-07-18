@@ -3022,14 +3022,39 @@ object Use {
 #[test]
 fn scan_usages_by_reference_finds_same_file_scala_companion_wildcard_type() {
     let project = InlineTestProject::with_language(Language::Scala)
+        .file("kyo/Chunk.scala", "package kyo\nclass Chunk[+A]\n")
+        .file(
+            "kyo/Batch.scala",
+            r#"package kyo
+object Batch:
+    import internal.*
+    def run[A, S](v: A): A =
+        type Item = A | Int
+        def expand(items: List[Item]) =
+            Kyo.foreach(items) {
+                case ToExpand[A @unchecked, S @unchecked](seq: Seq[Any], cont) =>
+                    Kyo.foreach(seq)(v => v)
+                case item => item
+            }
+        expand(Nil)
+    end run
+    object internal:
+        case class Call[A](v: A) // public-negative-nested-package-wildcard
+    end internal
+end Batch
+"#,
+        )
         .file(
             "kyo/ai/Context.scala",
             r#"package kyo.ai
 import Context.*
-case class Context(calls: List[Call]) {
-  def assistantMessage(calls: List[Call]): Context = this // public-positive-context-call
-}
-object Context { case class Call(id: String) }
+import kyo.*
+case class Context(calls: Chunk[Call]):
+    def assistantMessage(calls: Chunk[Call]): Context = this // public-positive-context-call
+end Context
+object Context:
+    case class Call(id: String)
+end Context
 "#,
         )
         .build();
@@ -3052,6 +3077,16 @@ object Context { case class Call(id: String) }
             .flat_map(|file| file["hits"].as_array().into_iter().flatten())
             .filter_map(|hit| hit["snippet"].as_str())
             .any(|snippet| snippet.contains("public-positive-context-call")),
+        "{value}"
+    );
+    assert!(
+        usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .all(|snippet| !snippet.contains("public-negative-nested-package-wildcard")),
         "{value}"
     );
 }
