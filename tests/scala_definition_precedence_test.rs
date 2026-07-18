@@ -362,3 +362,56 @@ object Consumer {
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
 }
+
+#[test]
+fn scala_qualified_constructor_prefers_active_outer_package_over_root_decoy() {
+    let source = r#"package scala.collection.immutable
+package test
+
+object RedBlackTreeTests {
+  val t1 = new RedBlackTree.Tree[Int, String]("value")
+  val extracted = t1.value
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "library/RedBlackTree.scala",
+            r#"package scala.collection.immutable
+
+object RedBlackTree {
+  final class Tree[K, V](val value: V)
+}
+"#,
+        )
+        .file(
+            "fixtures/RedBlackTree.scala",
+            r#"object RedBlackTree {
+  final class Tree[K, V](val value: V)
+}
+"#,
+        )
+        .file("app/App.scala", source)
+        .build();
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({
+            "references": [location_at(
+                source,
+                source.rfind("value").expect("qualified receiver member")
+            )]
+        })
+        .to_string(),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"],
+        "scala.collection.immutable.RedBlackTree$.Tree.value",
+        "{value}"
+    );
+    assert_eq!(
+        value["results"][0]["definitions"][0]["path"], "library/RedBlackTree.scala",
+        "{value}"
+    );
+}

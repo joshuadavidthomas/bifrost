@@ -228,18 +228,28 @@ impl<'a> ForwardScalaNameResolver<'a> {
             return wildcard;
         }
 
-        let mut local_candidates = Vec::new();
-        if segments.len() > 1 || self.package.is_empty() {
-            local_candidates.extend(scala_nested_type_candidates(String::new(), segments, false));
+        for package_prefix in self
+            .package_prefixes
+            .iter()
+            .rev()
+            .filter(|prefix| !prefix.is_empty())
+        {
+            let outcome = self.resolve_candidate_tier(
+                scala_nested_type_candidates(package_prefix.clone(), segments, false),
+                kind,
+            );
+            if outcome != ScalaNameResolution::Unresolved {
+                return outcome;
+            }
         }
-        if !self.package.is_empty() {
-            local_candidates.extend(scala_nested_type_candidates(
-                self.package.to_string(),
-                segments,
-                false,
-            ));
+
+        if segments.len() > 1 || self.package_prefixes.iter().all(String::is_empty) {
+            return self.resolve_candidate_tier(
+                scala_nested_type_candidates(String::new(), segments, false),
+                kind,
+            );
         }
-        self.resolve_candidate_tier(local_candidates, kind)
+        ScalaNameResolution::Unresolved
     }
 
     fn resolve_wildcard_singleton(&self, name: &str) -> ScalaNameResolution {
