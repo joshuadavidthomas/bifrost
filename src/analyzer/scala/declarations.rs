@@ -162,6 +162,9 @@ impl<'a> ScalaVisitor<'a> {
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
                     self.visit_field_declaration(child, &current_package, recovery_parent.clone())
                 }
+                "type_definition" => {
+                    self.visit_type_alias(child, &current_package, recovery_parent.clone())
+                }
                 "ERROR" => {
                     // tree-sitter-scala sometimes recovers annotated constructor headers as a
                     // top-level ERROR containing the class, followed by body members as siblings.
@@ -351,6 +354,9 @@ impl<'a> ScalaVisitor<'a> {
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
                     self.visit_field_declaration(child, package_name, Some(parent.clone()))
                 }
+                "type_definition" => {
+                    self.visit_type_alias(child, package_name, Some(parent.clone()))
+                }
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
                     self.visit_type_declaration(
@@ -403,6 +409,9 @@ impl<'a> ScalaVisitor<'a> {
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
                     self.visit_field_declaration(child, package_name, Some(parent.clone()))
                 }
+                "type_definition" => {
+                    self.visit_type_alias(child, package_name, Some(parent.clone()))
+                }
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
                     self.visit_type_declaration(
@@ -446,6 +455,9 @@ impl<'a> ScalaVisitor<'a> {
                 ),
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
                     self.visit_field_declaration(child, package_name, Some(parent.clone()))
+                }
+                "type_definition" => {
+                    self.visit_type_alias(child, package_name, Some(parent.clone()))
                 }
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
@@ -564,6 +576,34 @@ impl<'a> ScalaVisitor<'a> {
             self.parsed
                 .add_signature(code_unit, scala_field_signature(node, self.source, &name));
         }
+    }
+
+    fn visit_type_alias(&mut self, node: Node<'_>, package_name: &str, parent: Option<CodeUnit>) {
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
+        };
+        let name = scala_node_text(name_node, self.source).trim();
+        if name.is_empty() {
+            return;
+        }
+
+        let short_name = parent.as_ref().map_or_else(
+            || name.to_string(),
+            |parent| format!("{}.{}", parent.short_name(), name),
+        );
+        let code_unit = CodeUnit::new(
+            self.file.clone(),
+            CodeUnitType::Field,
+            package_name.to_string(),
+            short_name,
+        );
+        self.parsed
+            .add_code_unit(code_unit.clone(), node, self.source, parent, None);
+        self.parsed.add_signature(
+            code_unit.clone(),
+            scala_node_text(node, self.source).trim().to_string(),
+        );
+        self.parsed.mark_type_alias(code_unit);
     }
 
     fn visit_enum_case(&mut self, node: Node<'_>, package_name: &str, parent: &CodeUnit) {

@@ -20,8 +20,8 @@ use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CodeUnit,
     DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project,
     ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
-    build_direct_descendant_index_from_candidates,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    UsageFactsIndex, build_direct_descendant_index_from_candidates,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -153,6 +153,10 @@ pub struct ScalaAnalyzer {
 crate::analyzer::impl_forward_query_provider!(ScalaAnalyzer);
 
 impl ScalaAnalyzer {
+    pub fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+        self.inner.is_type_alias(code_unit)
+    }
+
     pub(crate) fn import_lexical_context_for_unit(
         &self,
         unit: &CodeUnit,
@@ -371,6 +375,12 @@ impl ScalaAnalyzer {
 
 impl TestDetectionProvider for ScalaAnalyzer {}
 
+impl TypeAliasProvider for ScalaAnalyzer {
+    fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+        self.inner.is_type_alias(code_unit)
+    }
+}
+
 impl IAnalyzer for ScalaAnalyzer {
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         self.inner.begin_query(context);
@@ -531,6 +541,10 @@ impl IAnalyzer for ScalaAnalyzer {
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
+    }
+
+    fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
         Some(self)
     }
 

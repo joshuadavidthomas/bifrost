@@ -21,6 +21,7 @@ struct ForwardScalaExtensionMethod {
 enum ScalaOwnerKind {
     Class,
     SingletonObject,
+    TypeNamespace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -311,18 +312,24 @@ impl<'a> ForwardScalaNameResolver<'a> {
                         format!("{candidate}$")
                     }
                 }
+                ScalaOwnerKind::TypeNamespace => candidate,
             };
             owners.extend(
                 self.support
                     .fqn(&exact)
                     .into_iter()
                     .chain(
-                        (kind == ScalaOwnerKind::Class)
+                        (matches!(kind, ScalaOwnerKind::Class | ScalaOwnerKind::TypeNamespace))
                             .then(|| self.support.fqn_in_language(&exact, Language::Java))
                             .into_iter()
                             .flatten(),
                     )
-                    .filter(|unit| unit.is_class() && unit.fq_name() == exact)
+                    .filter(|unit| {
+                        unit.fq_name() == exact
+                            && (unit.is_class()
+                                || (kind == ScalaOwnerKind::TypeNamespace
+                                    && self.scala.is_type_alias(unit)))
+                    })
                     .map(|unit| ScalaOwnerIdentity {
                         fqn: unit.fq_name(),
                         kind,
@@ -933,6 +940,7 @@ fn scala_is_declaration_name(node: Node<'_>) -> bool {
                 | "object_definition"
                 | "trait_definition"
                 | "enum_definition"
+                | "type_definition"
                 | "function_definition"
                 | "parameter"
                 | "val_definition"
@@ -962,6 +970,62 @@ fn scala_is_pattern_binding(node: Node<'_>, source: &str) -> bool {
         current = parent.parent();
     }
     false
+}
+
+fn scala_unindexed_type_binding_shadows(
+    source: &str,
+    reference: Node<'_>,
+    type_text: &str,
+) -> bool {
+    let Some(name) = scala_type_lookup_segments(reference, source)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            let simple = scala_simple_name(type_text);
+            (!simple.is_empty()).then(|| simple.to_string())
+        })
+    else {
+        return false;
+    };
+
+    let mut current = Some(reference);
+    while let Some(node) = current {
+        let parameters = node.child_by_field_name("type_parameters").or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "type_parameters")
+        });
+        if let Some(parameters) = parameters
+            && scala_type_parameters_declare(parameters, source, &name)
+        {
+            return true;
+        }
+
+        if matches!(node.kind(), "block" | "indented_block") {
+            let mut cursor = node.walk();
+            if node.named_children(&mut cursor).any(|child| {
+                child.kind() == "type_definition"
+                    && child.start_byte() < reference.start_byte()
+                    && child
+                        .child_by_field_name("name")
+                        .is_some_and(|alias| scala_node_text(alias, source).trim() == name)
+            }) {
+                return true;
+            }
+        }
+        current = node.parent();
+    }
+    false
+}
+
+fn scala_type_parameters_declare(parameters: Node<'_>, source: &str, name: &str) -> bool {
+    let mut cursor = parameters.walk();
+    parameters.named_children(&mut cursor).any(|child| {
+        matches!(
+            child.kind(),
+            "identifier" | "operator_identifier" | "type_identifier"
+        ) && scala_node_text(child, source).trim() == name
+    })
 }
 
 fn scala_is_type_position(node: Node<'_>) -> bool {
@@ -999,6 +1063,12 @@ fn resolve_scala_type(
     let text = scala_node_text(node, ctx.source).trim();
     if text.is_empty() {
         return no_definition("no_reference_text", "Scala type reference is blank");
+    }
+    if scala_unindexed_type_binding_shadows(ctx.source, node, text) {
+        return no_definition(
+            "local_type_binding",
+            format!("`{text}` is a local Scala type binding without a stable indexed identity"),
+        );
     }
     if !scala_is_type_position(node)
         && scala_lexical_binding_declares_name_before(root, ctx.source, text, node.start_byte())
@@ -2169,6 +2239,11 @@ fn scala_resolve_visible_type_node(
     }
     let kind = scala_type_node_owner_kind(node);
     let type_text = scala_node_text(node, ctx.source);
+    if let Some(local) =
+        scala_resolve_enclosing_qualified_type(ctx, resolver, node, &segments, kind)
+    {
+        return Some(local);
+    }
     if !scala_type_annotation_has_explicit_import(ctx, type_text)
         && let Some(local) = scala_same_file_type_fqn(ctx, &segments, kind)
     {
@@ -2177,11 +2252,6 @@ fn scala_resolve_visible_type_node(
     match resolver.resolve_type_node(node, ctx.source, kind) {
         ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
         ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => None,
-        ScalaNameResolution::Unresolved
-            if segments.len() > 1 || kind == ScalaOwnerKind::SingletonObject =>
-        {
-            scala_resolve_enclosing_qualified_type(ctx, resolver, node, &segments, kind)
-        }
         ScalaNameResolution::Unresolved => scala_resolve_visible_type_annotation(
             ctx,
             resolver,
@@ -2204,13 +2274,18 @@ fn scala_same_file_type_fqn(
             ScalaOwnerKind::Class => candidate.trim_end_matches('$').to_string(),
             ScalaOwnerKind::SingletonObject if candidate.ends_with('$') => candidate,
             ScalaOwnerKind::SingletonObject => format!("{candidate}$"),
+            ScalaOwnerKind::TypeNamespace => candidate,
         };
         matches.extend(
             ctx.support
                 .fqn(&fqn)
                 .into_iter()
                 .filter(|unit| {
-                    unit.is_class() && unit.fq_name() == fqn && unit.source() == ctx.file
+                    unit.fq_name() == fqn
+                        && unit.source() == ctx.file
+                        && (unit.is_class()
+                            || (kind == ScalaOwnerKind::TypeNamespace
+                                && ctx.scala.is_type_alias(unit)))
                 })
                 .map(|unit| unit.fq_name()),
         );
@@ -2233,7 +2308,7 @@ fn scala_type_node_owner_kind(node: Node<'_>) -> ScalaOwnerKind {
             )
         });
     }
-    ScalaOwnerKind::Class
+    ScalaOwnerKind::TypeNamespace
 }
 
 fn scala_resolve_enclosing_qualified_type(
@@ -2264,7 +2339,27 @@ fn scala_resolve_enclosing_qualified_type(
         let mut candidate = Vec::with_capacity(prefix_len + type_segments.len());
         candidate.extend(owners[..prefix_len].iter().cloned());
         candidate.extend(type_segments.iter().cloned());
-        match resolver.resolve_owner_segments(&candidate, kind) {
+        for package_prefix in resolver
+            .package_prefixes
+            .iter()
+            .rev()
+            .filter(|prefix| !prefix.is_empty())
+        {
+            match resolver.resolve_candidate_tier(
+                scala_nested_type_candidates(package_prefix.clone(), &candidate, false),
+                kind,
+            ) {
+                ScalaNameResolution::Resolved(owner) => return Some(owner.fqn),
+                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => {
+                    return None;
+                }
+                ScalaNameResolution::Unresolved => {}
+            }
+        }
+        match resolver.resolve_candidate_tier(
+            scala_nested_type_candidates(String::new(), &candidate, false),
+            kind,
+        ) {
             ScalaNameResolution::Resolved(owner) => return Some(owner.fqn),
             ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => {
                 return None;
@@ -2320,6 +2415,15 @@ fn scala_resolve_visible_term(
         {
             return Some(companion);
         }
+    }
+    if let Some(singleton) = scala_resolve_enclosing_qualified_type(
+        ctx,
+        resolver,
+        node,
+        &[name.to_string()],
+        ScalaOwnerKind::SingletonObject,
+    ) {
+        return Some(singleton);
     }
     if let Some(singleton) = resolver.resolve_singleton(name) {
         return Some(singleton);
