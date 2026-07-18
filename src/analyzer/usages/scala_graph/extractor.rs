@@ -1,4 +1,4 @@
-use super::inverted::{NameResolver, ProjectTypes};
+use super::inverted::{MemberReturnResolution, NameResolver, ProjectTypes};
 use crate::analyzer::scala::imports::parse_scala_import_infos;
 use crate::analyzer::usages::common::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
@@ -579,35 +579,61 @@ fn call_initializer_return_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<St
         return None;
     }
     let function = node.child_by_field_name("function")?;
-    let (owner_node, member_node) = match function.kind() {
-        "field_expression" => (
-            function.child_by_field_name("value")?,
-            function.child_by_field_name("field")?,
-        ),
-        _ => return None,
-    };
-    let member_name = node_text(member_node, ctx.source).trim();
-    if member_name.is_empty() {
-        return None;
+    match function.kind() {
+        "field_expression" => {
+            let owner_node = function.child_by_field_name("value")?;
+            let member_node = function.child_by_field_name("field")?;
+            let member_name = node_text(member_node, ctx.source).trim();
+            if member_name.is_empty() {
+                return None;
+            }
+            let owner = if owner_node.kind() == "field_expression" {
+                stable_object_expression_fqn(owner_node, ctx)
+            } else if matches!(owner_node.kind(), "identifier" | "type_identifier") {
+                let owner_name = node_text(owner_node, ctx.source).trim();
+                ctx.name_resolver
+                    .resolve_object(owner_name)
+                    .or_else(|| ctx.name_resolver.resolve(owner_name))
+            } else {
+                None
+            }?;
+            let call_arities = call_arities_for_reference(member_node);
+            ctx.types.member_return_type_for_owner_member(
+                ctx.scala,
+                &ctx.name_resolver,
+                &owner,
+                member_name,
+                call_arities.as_deref(),
+            )
+        }
+        "identifier" | "operator_identifier" => {
+            let member_name = node_text(function, ctx.source).trim();
+            if member_name.is_empty() || ctx.bindings.is_shadowed(member_name) {
+                return None;
+            }
+            let call_arities = call_arities_for_reference(function);
+            if let Some(owner) = enclosing_owner_fq_name(function, ctx) {
+                match ctx.types.unqualified_member_return_type(
+                    ctx.scala,
+                    &ctx.name_resolver,
+                    &owner,
+                    member_name,
+                    call_arities.as_deref(),
+                ) {
+                    MemberReturnResolution::Resolved(return_type) => return Some(return_type),
+                    MemberReturnResolution::Unresolved => return None,
+                    MemberReturnResolution::NoMatch => {}
+                }
+            }
+            ctx.name_resolver
+                .resolve_member(member_name)
+                .and_then(|member| {
+                    ctx.types
+                        .member_return_type(ctx.scala, &ctx.name_resolver, &member)
+                })
+        }
+        _ => None,
     }
-    let owner = if owner_node.kind() == "field_expression" {
-        stable_object_expression_fqn(owner_node, ctx)
-    } else if matches!(owner_node.kind(), "identifier" | "type_identifier") {
-        let owner_name = node_text(owner_node, ctx.source).trim();
-        ctx.name_resolver
-            .resolve_object(owner_name)
-            .or_else(|| ctx.name_resolver.resolve(owner_name))
-    } else {
-        None
-    }?;
-    let call_arities = call_arities_for_reference(member_node);
-    ctx.types.member_return_type_for_owner_member(
-        ctx.scala,
-        &ctx.name_resolver,
-        &owner,
-        member_name,
-        call_arities.as_deref(),
-    )
 }
 
 fn seed_value_definition_from_text(text: &str, ctx: &mut ScanCtx<'_>) {

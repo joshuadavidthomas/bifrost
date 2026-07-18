@@ -1579,6 +1579,104 @@ object Action {
 }
 
 #[test]
+fn scala_unqualified_call_initializer_uses_exact_owner_and_hierarchy_return_types() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "model/Messages.scala",
+            r#"package model
+
+class Messages { def tail: Int = 1 }
+class OtherMessages { def tail: Int = 2 }
+"#,
+        ),
+        (
+            "helpers/ImportedFactories.scala",
+            r#"package helpers
+
+import model.{Messages, OtherMessages}
+
+object ImportedFactories {
+  def systemDrain(seed: Int): OtherMessages = new OtherMessages
+  def importedDrain(seed: Int): Messages = new Messages
+}
+"#,
+        ),
+        (
+            "app/Factories.scala",
+            r#"package app
+
+import helpers.ImportedFactories.{importedDrain, systemDrain}
+import model.{Messages, OtherMessages}
+
+trait InheritedFactory {
+  def inheritedDrain(seed: Int): Messages = new Messages
+}
+
+class SameOwnerFactory {
+  def systemDrain(seed: Int): Messages = new Messages
+  def sameOwner(): Int = {
+    val messages = systemDrain(1)
+    messages.tail // positive-same-owner
+  }
+
+  def overloaded(seed: Int): Messages = new Messages
+  def overloaded(seed: String): OtherMessages = new OtherMessages
+  def ambiguousOverload(): Int = {
+    val messages = overloaded(1)
+    messages.tail // negative-overload
+  }
+
+  def otherDrain(seed: Int): OtherMessages = new OtherMessages
+  def wrongReturn(): Int = {
+    val messages = otherDrain(1)
+    messages.tail // negative-return
+  }
+
+  def localShadow(): Int = {
+    def systemDrain(seed: Int): OtherMessages = new OtherMessages
+    val messages = systemDrain(1)
+    messages.tail // negative-local-shadow
+  }
+}
+
+class InheritedConsumer extends InheritedFactory {
+  def run(): Int = {
+    val messages = inheritedDrain(1)
+    messages.tail // positive-inherited
+  }
+}
+
+class ImportedConsumer {
+  def run(): Int = {
+    val messages = importedDrain(1)
+    messages.tail // positive-imported
+  }
+}
+
+class UnrelatedFactory {
+  def systemDrain(seed: Int): OtherMessages = new OtherMessages
+  def run(): Int = {
+    val messages = systemDrain(1)
+    messages.tail // negative-unrelated
+  }
+}
+"#,
+        ),
+    ]);
+    let target = definition(&analyzer, "model.Messages.tail");
+    let hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+
+    assert_hit_contains(&hits, "messages.tail // positive-same-owner");
+    assert_hit_contains(&hits, "messages.tail // positive-inherited");
+    assert_hit_contains(&hits, "messages.tail // positive-imported");
+    assert_no_hit_contains(&hits, "negative-overload");
+    assert_no_hit_contains(&hits, "negative-return");
+    assert_no_hit_contains(&hits, "negative-local-shadow");
+    assert_no_hit_contains(&hits, "negative-unrelated");
+}
+
+#[test]
 fn scala_inherited_companion_apply_fallback_preserves_exact_owner_identity() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

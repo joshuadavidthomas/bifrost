@@ -64,6 +64,12 @@ type ExtensionOwnerMemberKey = (String, String);
 type ExtensionMethodEntries = Arc<Vec<ExtensionMethod>>;
 type OverrideTargetEntries = Arc<Vec<String>>;
 
+pub(super) enum MemberReturnResolution {
+    NoMatch,
+    Unresolved,
+    Resolved(String),
+}
+
 /// Every class/object/trait/enum the project declares, indexed for the per-file
 /// name->fqn rebuild. Built once and shared across all files' scans.
 pub(crate) struct ProjectTypes {
@@ -441,6 +447,79 @@ impl ProjectTypes {
             }
         }
         matched.then_some(resolved_return).flatten()
+    }
+
+    pub(super) fn unqualified_member_return_type(
+        &self,
+        scala: &ScalaAnalyzer,
+        resolver: &NameResolver,
+        owner_fqn: &str,
+        member: &str,
+        call_arities: Option<&[usize]>,
+    ) -> MemberReturnResolution {
+        let mut level = scala
+            .definitions(owner_fqn)
+            .filter(|unit| unit.is_class())
+            .collect::<Vec<_>>();
+        if level.is_empty() {
+            return MemberReturnResolution::NoMatch;
+        }
+        if level.len() > 1 {
+            return MemberReturnResolution::Unresolved;
+        }
+
+        let mut seen = HashSet::default();
+        let mut saw_member = false;
+        while !level.is_empty() {
+            let mut matched_return = None;
+            let mut matched = false;
+            let mut next = Vec::new();
+            for owner in level {
+                if !seen.insert(owner.clone()) {
+                    continue;
+                }
+                let owner_fqn = owner.fq_name();
+                let members = self.members_for_exact_owner_name(&owner_fqn, member);
+                saw_member |= !members.is_empty();
+                if members.iter().any(|unit| unit.is_field()) {
+                    return MemberReturnResolution::Unresolved;
+                }
+                if !self
+                    .method_targets_for_owner_member(scala, &owner_fqn, member, call_arities)
+                    .is_empty()
+                {
+                    matched = true;
+                    let Some(return_type) = self.member_return_type_for_owner_member(
+                        scala,
+                        resolver,
+                        &owner_fqn,
+                        member,
+                        call_arities,
+                    ) else {
+                        return MemberReturnResolution::Unresolved;
+                    };
+                    if matched_return
+                        .as_ref()
+                        .is_some_and(|resolved| resolved != &return_type)
+                    {
+                        return MemberReturnResolution::Unresolved;
+                    }
+                    matched_return = Some(return_type);
+                }
+                next.extend(self.direct_ancestors_for_owner(scala, &owner_fqn));
+            }
+            if matched {
+                return matched_return
+                    .map(MemberReturnResolution::Resolved)
+                    .unwrap_or(MemberReturnResolution::Unresolved);
+            }
+            level = next;
+        }
+        if saw_member {
+            MemberReturnResolution::Unresolved
+        } else {
+            MemberReturnResolution::NoMatch
+        }
     }
 
     fn members_for_exact_owner_name<'a>(&'a self, owner: &str, member: &str) -> Vec<&'a CodeUnit> {
