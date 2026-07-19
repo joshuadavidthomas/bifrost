@@ -1651,24 +1651,33 @@ fn bare_member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>
     if !member_call_arities_match(call_arities.as_deref(), ctx) {
         return false;
     }
-    let Some(owner) = enclosing_owner(node, ctx) else {
+    let Some(mut owner) = enclosing_owner(node, ctx) else {
         return false;
     };
-    let BareMemberResolution::Resolved(methods) = ctx.types.bare_member_declarations_for_owner(
-        ctx.scala,
-        &owner,
-        text,
-        call_arities.as_deref(),
-    ) else {
-        return false;
-    };
-    !methods.is_empty()
-        && methods.iter().all(|method| {
-            ctx.scala
-                .structural_parent_of(method)
-                .or_else(|| ctx.scala.parent_of(method))
-                .is_some_and(|owner| ctx.spec.owner_fq_matches(&owner.fq_name()))
-        })
+    loop {
+        match ctx.types.bare_member_declarations_for_owner(
+            ctx.scala,
+            &owner,
+            text,
+            call_arities.as_deref(),
+        ) {
+            BareMemberResolution::Resolved(methods) => {
+                return !methods.is_empty()
+                    && methods.iter().all(|method| {
+                        ctx.scala
+                            .structural_parent_of(method)
+                            .or_else(|| ctx.scala.parent_of(method))
+                            .is_some_and(|owner| ctx.spec.owner_fq_matches(&owner.fq_name()))
+                    });
+            }
+            BareMemberResolution::Unresolved => return false,
+            BareMemberResolution::NoMatch => {}
+        }
+        let Some(parent) = ctx.analyzer.parent_of(&owner) else {
+            return false;
+        };
+        owner = parent;
+    }
 }
 
 fn contextual_method_value_call_arities(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Vec<usize>> {

@@ -2725,6 +2725,48 @@ class UnrelatedChild extends UnrelatedBase {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_scala_lexical_outer_callables() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Owners.scala",
+            r#"
+package app
+
+object Outer {
+  def catalog(value: Int): Int = value
+  class Inner {
+    val call = catalog(1) // positive-lexical-outer
+  }
+  class Nearer {
+    def catalog(value: Int): Int = value + 1
+    val call = catalog(2) // negative-nearer-owner
+  }
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["app.Outer.catalog"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    assert_eq!(usage["total_hits"], 1, "{value}");
+    assert!(
+        usage["files"][0]["hits"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("positive-lexical-outer")),
+        "expected lexical outer call only: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_by_reference_accepts_scala_default_and_repeated_arity() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(

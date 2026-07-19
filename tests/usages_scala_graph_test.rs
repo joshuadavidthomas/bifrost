@@ -3636,6 +3636,46 @@ object Outer {
 }
 
 #[test]
+fn scala_unqualified_calls_resolve_through_lexical_owner_tiers() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Owners.scala",
+        r#"package app
+
+object Outer {
+  def catalog(value: Int): Int = value
+
+  class Inner {
+    val inheritedLexically = catalog(1) // positive-lexical-outer
+  }
+
+  class Nearer {
+    def catalog(value: Int): Int = value + 1
+    val nearer = catalog(2) // negative-nearer-owner
+  }
+
+  class Shadowed {
+    def run(catalog: Int => Int): Int =
+      catalog(3) // negative-local-shadow
+  }
+}
+
+object Unrelated {
+  def catalog(value: Int): Int = value + 2
+  val call = catalog(4) // negative-unrelated-owner
+}
+"#,
+    )]);
+
+    let target = definition(&analyzer, "app.Outer$.catalog");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(&target_hits, "catalog(1) // positive-lexical-outer");
+    assert_no_hit_contains(&target_hits, "negative-nearer-owner");
+    assert_no_hit_contains(&target_hits, "negative-local-shadow");
+    assert_no_hit_contains(&target_hits, "negative-unrelated-owner");
+}
+
+#[test]
 fn scala_import_hits_ignore_unrelated_aliased_import_path() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         ("Target.scala", "package app\n\nclass Target\n"),

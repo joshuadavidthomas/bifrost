@@ -3345,28 +3345,31 @@ fn record_reference(
                     if name.is_empty() {
                         return;
                     }
-                    if let Some(owner) = ctx.enclosing_class(function.start_byte()) {
-                        let call_arities = call_arities_for_reference(function);
-                        let mut targets = ctx.types.method_targets_for_owner_member(
-                            ctx.scala,
-                            owner,
-                            name,
-                            call_arities.as_deref(),
-                        );
-                        if targets.is_empty() {
-                            targets = ctx.types.inherited_method_targets_for_owner_member(
-                                ctx.scala,
-                                owner,
-                                name,
-                                call_arities.as_deref(),
-                            );
+                    let call_arities = call_arities_for_reference(function);
+                    if let Some(targets) =
+                        ctx.class_ranges
+                            .find_in_enclosing_units(function.start_byte(), |owner| {
+                                let mut targets = ctx.types.method_targets_for_owner_member(
+                                    ctx.scala,
+                                    &owner.fq_name(),
+                                    name,
+                                    call_arities.as_deref(),
+                                );
+                                if targets.is_empty() {
+                                    targets = ctx.types.inherited_method_targets_for_owner_member(
+                                        ctx.scala,
+                                        &owner.fq_name(),
+                                        name,
+                                        call_arities.as_deref(),
+                                    );
+                                }
+                                (!targets.is_empty()).then_some(targets)
+                            })
+                    {
+                        for target in targets {
+                            ctx.record(target, function);
                         }
-                        if !targets.is_empty() {
-                            for target in targets {
-                                ctx.record(target, function);
-                            }
-                            return;
-                        }
+                        return;
                     }
                     record_unqualified_type_application(function, name, ctx, bindings);
                 }

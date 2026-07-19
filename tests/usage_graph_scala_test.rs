@@ -89,6 +89,48 @@ fn resolves_instance_object_and_unqualified_calls() {
 }
 
 #[test]
+fn scala_inverted_resolves_unqualified_calls_through_lexical_owner_tiers() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Owners.scala",
+            r#"package app
+
+object Outer {
+  def catalog(value: Int): Int = value
+
+  class Inner {
+    def use: Int = catalog(1)
+  }
+
+  class Nearer {
+    def catalog(value: Int): Int = value + 1
+    def use: Int = catalog(2)
+  }
+}
+
+object Unrelated {
+  def catalog(value: Int): Int = value + 2
+  def use: Int = catalog(3)
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    assert!(
+        has_edge(&value, "app.Outer$.Inner.use", "app.Outer$.catalog"),
+        "nested lexical call must resolve to the outer owner: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Outer$.Nearer.use", "app.Outer$.catalog")
+            && !has_edge(&value, "app.Unrelated$.use", "app.Outer$.catalog"),
+        "nearer or unrelated owners must not leak to the outer callable: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn type_references_edge_to_the_type_node() {
     let value = usage_graph();
 
