@@ -3676,6 +3676,33 @@ object Unrelated {
 }
 
 #[test]
+fn scala_fresh_instance_receivers_require_a_valid_structured_constructor() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[(
+        "app/Fresh.scala",
+        r#"package app
+
+class Worker(seed: Int) {
+  def run(): Int = seed
+}
+
+object Use {
+  val good = new Worker(1).run() // positive-fresh-instance
+  val wrongConstructor = new Worker().run() // negative-wrong-constructor
+}
+"#,
+    )]);
+
+    let target = definition(&analyzer, "app.Worker.run");
+    let target_hits =
+        hits(UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)));
+    assert_hit_contains(
+        &target_hits,
+        "new Worker(1).run() // positive-fresh-instance",
+    );
+    assert_no_hit_contains(&target_hits, "negative-wrong-constructor");
+}
+
+#[test]
 fn scala_import_hits_ignore_unrelated_aliased_import_path() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         ("Target.scala", "package app\n\nclass Target\n"),

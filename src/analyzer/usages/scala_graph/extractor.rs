@@ -778,6 +778,31 @@ fn constructed_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
         .and_then(|type_node| resolve_type_node(type_node, ctx))
 }
 
+fn constructed_receiver_type_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+    if node.kind() != "instance_expression" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let type_node = node
+        .named_children(&mut cursor)
+        .find(|child| !matches!(child.kind(), "arguments" | "template_body"))?;
+    let path = scala_type_lookup_segments(type_node, ctx.source);
+    let name = path.last()?;
+    let class_fqn = resolve_type_node(type_node, ctx)?;
+    ctx.types
+        .resolve_type_application(
+            ctx.scala,
+            &ctx.name_resolver,
+            Some(&class_fqn),
+            None,
+            name,
+            call_arities_for_reference(type_node).as_deref(),
+            TypeApplicationRole::ExplicitConstructor,
+        )
+        .type_target
+        .map(|target| target.fq_name())
+}
+
 fn resolve_type_node(type_node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
     let path = scala_type_lookup_segments(type_node, ctx.source);
     if path.is_empty() {
@@ -1595,6 +1620,15 @@ fn member_reference_is_proven(node: Node<'_>, text: &str, ctx: &ScanCtx<'_>) -> 
         && let Some(owner_fq_name) = call_initializer_return_owner(qualifier_node, ctx)
     {
         return ctx.spec.receiver_owner_fq_matches(&owner_fq_name)
+            && member_call_arity_matches(node, ctx);
+    }
+    if qualifier_node.kind() == "instance_expression"
+        && !ctx
+            .types
+            .is_scala_trait_declaration(ctx.scala, &ctx.spec.target)
+        && let Some(owner_fq_name) = constructed_receiver_type_owner(qualifier_node, ctx)
+    {
+        return receiver_owner_matches_target_family(&owner_fq_name, ctx)
             && member_call_arity_matches(node, ctx);
     }
     if is_owner_qualified_this(qualifier_node, ctx.source) {

@@ -131,6 +131,38 @@ object Unrelated {
 }
 
 #[test]
+fn scala_inverted_fresh_instance_receivers_require_a_valid_constructor() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Fresh.scala",
+            r#"package app
+
+class Worker(seed: Int) {
+  def run(): Int = seed
+}
+
+object Use {
+  def good: Int = new Worker(1).run()
+  def wrongConstructor: Int = new Worker().run()
+}
+"#,
+        )
+        .build();
+    let value = usage_graph_at(project.root(), "{}");
+
+    assert!(
+        has_edge(&value, "app.Use$.good", "app.Worker.run"),
+        "valid fresh instance must type its member receiver: {}",
+        value["edges"]
+    );
+    assert!(
+        !has_edge(&value, "app.Use$.wrongConstructor", "app.Worker.run"),
+        "wrong constructor shape must not type the receiver: {}",
+        value["edges"]
+    );
+}
+
+#[test]
 fn type_references_edge_to_the_type_node() {
     let value = usage_graph();
 

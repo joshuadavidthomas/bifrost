@@ -3901,6 +3901,7 @@ fn receiver_type_fqn(
                 FieldResolution::NoMatch | FieldResolution::Unresolved => None,
             }
         }),
+        "instance_expression" => constructed_type(receiver, ctx),
         "call_expression" => call_result_type(receiver, ctx, bindings),
         kind => scala_literal_type_name(kind).map(str::to_string),
     }
@@ -4141,14 +4142,28 @@ fn direct_owner_field_owner(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<S
 
 /// The fqn of the type constructed by a `new Foo()` value expression.
 fn constructed_type(node: Node<'_>, ctx: &ScalaScan<'_, '_>) -> Option<String> {
-    if node.kind() == "instance_expression" {
-        let mut cursor = node.walk();
-        return node
-            .named_children(&mut cursor)
-            .find(|child| !matches!(child.kind(), "arguments" | "template_body"))
-            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx));
+    if node.kind() != "instance_expression" {
+        return None;
     }
-    None
+    let mut cursor = node.walk();
+    let type_node = node
+        .named_children(&mut cursor)
+        .find(|child| !matches!(child.kind(), "arguments" | "template_body"))?;
+    let path = scala_type_lookup_segments(type_node, ctx.source);
+    let name = path.last()?;
+    let class_fqn = resolve_receiver_type_node(type_node, ctx)?;
+    ctx.types
+        .resolve_type_application(
+            ctx.scala,
+            &ctx.resolver,
+            Some(&class_fqn),
+            None,
+            name,
+            call_arities_for_reference(type_node).as_deref(),
+            TypeApplicationRole::ExplicitConstructor,
+        )
+        .type_target
+        .map(|target| target.fq_name())
 }
 
 fn call_result_type(
