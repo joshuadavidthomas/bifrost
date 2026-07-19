@@ -18,7 +18,7 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
 - [x] (2026-07-19 18:45Z) Committed the campaign-start plan as `127c5817`, locally excluded generated `.brokk/` state in all 15 selected C#/JS/TS clones, verified their tracked cleanliness, rebuilt the release runner, and recorded SHA-256 `4fcf6bf7c500906cb6ad1e845eac5a450e6b3a14608b22bd34ddcc8c3eb81edf`.
 - [ ] Complete and integrity-check the C# top-five baseline, then exhaustively classify every raw missing row.
 - [ ] File/assign, implement, review, test, and exact-prove every legitimate C# root cause not owned by another user.
-- [ ] Complete the same baseline, disposition, issue, implementation, and proof lifecycle for JavaScript. Completed: all five `127c5817` records and the exhaustive 23-row baseline audit; filed assigned #942/#943; implemented and independently reviewed both fixes; exact-proved all three DevSpace witnesses cleanly at `9547d828`; dispositioned all six Node contract probes; reopened assigned #665 and created assigned #944; implemented and reviewed both Node fixes; passed the combined feature-enabled JS/public-service suites plus all-target/all-feature Clippy. Remaining: clean exact proof for #665/#944, clean full rerun, integration, and issue closure.
+- [ ] Complete the same baseline, disposition, issue, implementation, and proof lifecycle for JavaScript. Completed: all five `127c5817` records and the exhaustive 23-row baseline audit; filed assigned #942/#943; exact-proved all three DevSpace witnesses cleanly at `9547d828`; dispositioned all six Node contract probes; reopened assigned #665 and created assigned #944; implemented/reviewed both Node fixes; at `a72a3892`, exact-proved both #665 sites and three of four #944 sites, then reduced and fixed the remaining declared default-export-root case; passed combined feature-enabled JS/public-service suites plus all-target/all-feature Clippy. Remaining: clean `safer` exact, clean full rerun, integration, and issue closure.
 - [ ] Complete the same baseline, disposition, issue, implementation, and proof lifecycle for TypeScript.
 - [ ] Run final local gates, integrate directly to `origin/master`, rebuild from the clean pushed head, rerun every affected top-five leg, close assigned issues with evidence, and publish compact checked-in reports.
 - [ ] Perform a 25-repository completion audit against the authoritative artifacts, issue state, clean worktree, and remote master, then record the final retrospective.
@@ -54,6 +54,9 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
 
 - Observation: Definition-lookup-only local properties are an intentional declaration boundary, not disposable symbols.
   Evidence: Plain-local member assignments and object-literal fields remain outside the public declaration graph to prevent arbitrary `obj.x` pollution, but bounded forward lookup retains their exact ranges and lexical receiver identity. #944 must recover direct same-binding reads without promoting those units into declarations or weakening the closed #386 boundary owned by another user.
+
+- Observation: A later CommonJS default export changes a plain local property's declaration surface.
+  Evidence: The first clean #944 fixing head made `node.quoteMark`, `node.operator`, and `meta.shortCircuited` consistent, but `safer.kStringMaxLength` remained missing. Prescan recognizes `module.exports = safer`, promotes `safer` to a declared export root, and excludes it from the lookup-only gate even though same-file member identity still depends on the same receiver binding. The follow-up requires an exact structured default-export local, declared parentless field, persisted target range, and matching assignment receiver before adding the default seed and applying lexical-scope matching.
 
 ## Decision Log
 
@@ -99,6 +102,10 @@ The acceptance surface is the MCP `symbols` toolset and its associated Rust and 
 
 - Decision: Accept the #665 and #944 implementations for clean production proof without promoting local properties into the declaration graph.
   Rationale: #665 recognizes hoisted function/generator/class declaration bindings and restricts bare same-file fallback to true bare declarations, preserving #942 only through exact unbound `window.<name>` validation. #944 mirrors forward lookup with a prior structured assignment/object-key range plus equal innermost lexical receiver scope. Its bounded location fallback runs only after ordinary declaration matching fails and accepts only exact same-file parentless fields absent from declarations. The root gate passed 503 definition, 151 public service, 25 JavaScript analyzer, 21 whole-graph, and 81 targeted usage tests (two existing ignores), plus formatting, diff checks, and all-target/all-feature Clippy.
+  Date/Author: 2026-07-19 / Codex
+
+- Decision: Extend #944 to declared properties only when the exact local receiver is the file's structured default export.
+  Rationale: This covers `safer.kStringMaxLength` without general member-name widening. The seed path requires the target to be a parentless declared JavaScript field, the export index to map `default` to one local root, and an exact target range to contain a direct assignment on that root. Same-file reads additionally require a prior range and equal lexical scope; other files retain normal import-edge resolution. The production-shaped public regression reports only two intended same-file reads and the exact `require` consumer, with all pre-definition, write, non-exported, unrelated, and shadowed controls absent.
   Date/Author: 2026-07-19 / Codex
 
 ## Outcomes & Retrospective
@@ -211,3 +218,5 @@ Revision note (2026-07-19 20:10Z): Recorded acceptance of the revised candidate-
 Revision note (2026-07-19 20:45Z): Recorded clean `9547d828` exact proof for #942/#943, the six Node exact-probe dispositions, assigned/reopened #665, newly assigned #944, and the requirement to preserve definition-only local-property identity without reopening the over-declaration boundary owned in #386.
 
 Revision note (2026-07-19 21:30Z): Recorded acceptance of the structured #665 lexical-precedence correction and #944 lookup-only local-property inverse/location path after independent implementation, root review, combined feature-enabled public/analyzer regressions, formatting, diff checks, and all-target/all-feature Clippy.
+
+Revision note (2026-07-19 22:10Z): Recorded the clean `a72a3892` exact outcomes, the remaining `safer.kStringMaxLength` declared default-export-root trigger, and acceptance of its exact structured export/receiver extension after production-shaped public coverage and repeated all-target/all-feature Clippy.

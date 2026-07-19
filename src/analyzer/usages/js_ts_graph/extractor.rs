@@ -1,7 +1,8 @@
 use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::syntax::{
-    JsTsLexicalBindingIndex, JsTsLexicalBindingScope, is_commonjs_require_declarator,
-    is_declaration_identifier, is_object_in_member_expression, is_property_key_in_member, slice,
+    JsTsLexicalBindingIndex, JsTsLexicalBindingScope, direct_property_definitions,
+    is_commonjs_require_declarator, is_declaration_identifier, is_object_in_member_expression,
+    is_property_key_in_member, slice,
 };
 use crate::analyzer::usages::get_definition::js_ts::{
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
@@ -33,6 +34,7 @@ const TARGET_BINDING: &str = "__target__";
 const TARGET_VALUE_BINDING: &str = "__target_value__";
 const TARGET_OBJECT_BINDING: &str = "__target_object__";
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn scan_files_for_seeds(
     analyzer: &dyn IAnalyzer,
     index: &JsTsUsageIndex,
@@ -40,6 +42,7 @@ pub(super) fn scan_files_for_seeds(
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
     language: Language,
+    exported_local_property_root: Option<&str>,
     cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
     let collected: Mutex<BTreeSet<UsageHit>> = Mutex::new(BTreeSet::new());
@@ -60,9 +63,11 @@ pub(super) fn scan_files_for_seeds(
     let lookup_only_local_property = language == Language::JavaScript
         && target_owner.is_none()
         && target.is_field()
+        && exported_local_property_root.is_none()
         && !analyzer.declarations(target.source()).contains(target);
-    let lookup_only_local_property_ranges =
-        lookup_only_local_property.then(|| analyzer.ranges(target));
+    let direct_local_property =
+        lookup_only_local_property || exported_local_property_root.is_some();
+    let direct_local_property_ranges = direct_local_property.then(|| analyzer.ranges(target));
     let target_short = target_seed_identifier(target, target_owner.as_ref());
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
@@ -124,7 +129,7 @@ pub(super) fn scan_files_for_seeds(
         }
 
         let root = tree_ref.root_node();
-        let lexical_bindings = ((browser_global_object.is_some() || lookup_only_local_property)
+        let lexical_bindings = ((browser_global_object.is_some() || direct_local_property)
             && target_self_file)
             .then(|| JsTsLexicalBindingIndex::build(root, source_str));
         let browser_global_object = lexical_bindings.as_ref().and_then(|lexical_bindings| {
@@ -133,14 +138,16 @@ pub(super) fn scan_files_for_seeds(
         });
         let local_property_definitions = lexical_bindings.as_ref().and_then(|lexical_bindings| {
             let target_member = target_member.as_deref()?;
-            let target_ranges = lookup_only_local_property_ranges.as_deref()?;
-            Some(collect_local_property_definitions(
+            let target_ranges = direct_local_property_ranges.as_deref()?;
+            let definitions = collect_local_property_definitions(
                 root,
                 source_str,
                 target_ranges,
                 target_member,
                 lexical_bindings,
-            ))
+                exported_local_property_root,
+            );
+            (!definitions.is_empty()).then_some(definitions)
         });
         let receiver_facts = JsTsReceiverFactProvider::new(
             analyzer,
@@ -259,78 +266,24 @@ fn collect_local_property_definitions(
     target_ranges: &[Range],
     target_member: &str,
     lexical_bindings: &JsTsLexicalBindingIndex,
+    required_receiver: Option<&str>,
 ) -> Vec<LocalPropertyDefinition> {
-    let mut definitions = Vec::new();
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        let receiver = match node.kind() {
-            "assignment_expression" | "augmented_assignment_expression" => node
-                .child_by_field_name("left")
-                .and_then(|left| local_assignment_receiver(left, source, target_member)),
-            "pair" => local_object_pair_receiver(node, source, target_member),
-            _ => None,
-        };
-        if let Some((receiver_node, property_node)) = receiver
-            && let Some(range) = target_ranges
-                .iter()
-                .filter(|range| range_contains_node(range, property_node))
-                .min_by_key(|range| range.end_byte - range.start_byte)
-            && let Some(scope) = lexical_bindings
-                .binding_scope_at(slice(receiver_node, source), receiver_node.start_byte())
-        {
-            let definition = LocalPropertyDefinition {
-                receiver: slice(receiver_node, source).to_string(),
-                scope,
-                range: *range,
-            };
-            if !definitions.contains(&definition) {
-                definitions.push(definition);
+    direct_property_definitions(root, source, target_ranges, target_member)
+        .into_iter()
+        .filter_map(|fact| {
+            let receiver = slice(fact.receiver, source);
+            if required_receiver.is_some_and(|required| receiver != required) {
+                return None;
             }
-        }
-
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-    definitions
-}
-
-fn local_assignment_receiver<'tree>(
-    left: Node<'tree>,
-    source: &str,
-    target_member: &str,
-) -> Option<(Node<'tree>, Node<'tree>)> {
-    if left.kind() != "member_expression" {
-        return None;
-    }
-    let receiver = left.child_by_field_name("object")?;
-    let property = left.child_by_field_name("property")?;
-    (simple_identifier_text(receiver, source).is_some() && slice(property, source) == target_member)
-        .then_some((receiver, property))
-}
-
-fn local_object_pair_receiver<'tree>(
-    pair: Node<'tree>,
-    source: &str,
-    target_member: &str,
-) -> Option<(Node<'tree>, Node<'tree>)> {
-    let property = pair.child_by_field_name("key")?;
-    if slice(property, source) != target_member {
-        return None;
-    }
-    let object = pair.parent().filter(|parent| parent.kind() == "object")?;
-    let declarator = object
-        .parent()
-        .filter(|parent| parent.kind() == "variable_declarator")?;
-    if declarator
-        .child_by_field_name("value")
-        .is_none_or(|value| value.id() != object.id())
-    {
-        return None;
-    }
-    let receiver = declarator.child_by_field_name("name")?;
-    simple_identifier_text(receiver, source).map(|_| (receiver, property))
+            let scope = lexical_bindings.binding_scope_at(receiver, fact.receiver.start_byte())?;
+            let definition = LocalPropertyDefinition {
+                receiver: receiver.to_string(),
+                scope,
+                range: fact.range,
+            };
+            Some(definition)
+        })
+        .collect()
 }
 
 fn range_contains_node(range: &Range, node: Node<'_>) -> bool {
@@ -963,28 +916,29 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let object_text = slice(object, ctx.source);
     let property_text = slice(property, ctx.source);
 
-    if ctx.lookup_only_local_property
-        && ctx
-            .target_member
-            .is_some_and(|target_member| property_text == target_member)
+    if ctx
+        .target_member
+        .is_some_and(|target_member| property_text == target_member)
     {
-        let matches = ctx
+        if let Some((lexical_bindings, definitions)) = ctx
             .lexical_bindings
             .as_ref()
             .zip(ctx.local_property_definitions.as_deref())
-            .is_some_and(|(lexical_bindings, definitions)| {
-                local_property_read_matches(
-                    object,
-                    property,
-                    ctx.source,
-                    lexical_bindings,
-                    definitions,
-                )
-            });
-        if matches {
-            record_hit(property, ctx);
+        {
+            if local_property_read_matches(
+                object,
+                property,
+                ctx.source,
+                lexical_bindings,
+                definitions,
+            ) {
+                record_hit(property, ctx);
+            }
+            return;
         }
-        return;
+        if ctx.lookup_only_local_property {
+            return;
+        }
     }
 
     if let (Some(global_object), Some(target_member)) =

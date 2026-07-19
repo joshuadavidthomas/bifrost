@@ -1,3 +1,4 @@
+use crate::analyzer::Range;
 use crate::analyzer::js_ts::imports::{
     CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
     parse_commonjs_require_bindings_from_node,
@@ -18,6 +19,12 @@ pub(crate) struct JsTsLexicalBindingScope {
 /// their entire scope.
 pub(crate) struct JsTsLexicalBindingIndex {
     scopes_by_name: HashMap<String, Vec<JsTsLexicalBindingScope>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JsTsDirectPropertyDefinition<'tree> {
+    pub(crate) receiver: Node<'tree>,
+    pub(crate) range: Range,
 }
 
 impl JsTsLexicalBindingIndex {
@@ -152,6 +159,90 @@ impl JsTsLexicalBindingIndex {
             scopes.push(scope);
         }
     }
+}
+
+pub(crate) fn direct_property_definitions<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    target_ranges: &[Range],
+    target_member: &str,
+) -> Vec<JsTsDirectPropertyDefinition<'tree>> {
+    let mut definitions = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let receiver = match node.kind() {
+            "assignment_expression" | "augmented_assignment_expression" => node
+                .child_by_field_name("left")
+                .and_then(|left| direct_assignment_receiver(left, source, target_member)),
+            "pair" => direct_object_pair_receiver(node, source, target_member),
+            _ => None,
+        };
+        if let Some((receiver, property)) = receiver
+            && let Some(range) = target_ranges
+                .iter()
+                .filter(|range| range_contains_node(range, property))
+                .min_by_key(|range| range.end_byte - range.start_byte)
+        {
+            let definition = JsTsDirectPropertyDefinition {
+                receiver,
+                range: *range,
+            };
+            definitions.push(definition);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    definitions
+}
+
+fn direct_assignment_receiver<'tree>(
+    left: Node<'tree>,
+    source: &str,
+    target_member: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    if left.kind() != "member_expression" {
+        return None;
+    }
+    let receiver = left.child_by_field_name("object")?;
+    let property = left.child_by_field_name("property")?;
+    (direct_identifier_text(receiver, source).is_some() && slice(property, source) == target_member)
+        .then_some((receiver, property))
+}
+
+fn direct_object_pair_receiver<'tree>(
+    pair: Node<'tree>,
+    source: &str,
+    target_member: &str,
+) -> Option<(Node<'tree>, Node<'tree>)> {
+    let property = pair.child_by_field_name("key")?;
+    if slice(property, source) != target_member {
+        return None;
+    }
+    let object = pair.parent().filter(|parent| parent.kind() == "object")?;
+    let declarator = object
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")?;
+    if declarator
+        .child_by_field_name("value")
+        .is_none_or(|value| value.id() != object.id())
+    {
+        return None;
+    }
+    let receiver = declarator.child_by_field_name("name")?;
+    direct_identifier_text(receiver, source).map(|_| (receiver, property))
+}
+
+fn direct_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    (node.kind() == "identifier")
+        .then(|| slice(node, source))
+        .filter(|text| !text.is_empty())
+}
+
+fn range_contains_node(range: &Range, node: Node<'_>) -> bool {
+    range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte
 }
 
 fn node_scope(node: Node<'_>) -> JsTsLexicalBindingScope {

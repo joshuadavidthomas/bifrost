@@ -4964,6 +4964,89 @@ function sibling() {
 }
 
 #[test]
+fn scan_usages_location_recovers_declared_commonjs_export_root_property_reads() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "safer.js",
+            r#"var plain = {};
+plain.kStringMaxLength = 1;
+consume(plain.kStringMaxLength);
+
+var safer = {};
+if (!safer.kStringMaxLength) {
+  safer.kStringMaxLength = getLimit();
+}
+if (!safer.constants) {
+  safer.constants = {};
+  if (safer.kStringMaxLength) {
+    safer.constants.MAX_STRING_LENGTH = safer.kStringMaxLength;
+  }
+}
+consume(other.kStringMaxLength);
+{
+  const safer = {};
+  consume(safer.kStringMaxLength);
+}
+
+function sibling() {
+  const safer = {};
+  consume(safer.kStringMaxLength);
+}
+
+module.exports = safer;
+"#,
+        )
+        .file(
+            "consumer.js",
+            r#"const exported = require("./safer");
+consume(exported.kStringMaxLength);
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"safer.js","line":7,"column":9,"symbol":"safer.kStringMaxLength"}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let result = only_result(&value);
+
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(
+        "safer.js#safer.kStringMaxLength", result["symbol"],
+        "{value}"
+    );
+    assert_eq!(0, result["unproven_hits"], "payload: {value}");
+    assert_eq!(3, result["total_hits"], "payload: {value}");
+    let hits: BTreeSet<(String, u64)> = result["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .flat_map(|file| {
+            let path = file["path"].as_str().expect("file path").to_string();
+            file["hits"]
+                .as_array()
+                .expect("hits array")
+                .iter()
+                .map(move |hit| (path.clone(), hit["line"].as_u64().expect("hit line")))
+        })
+        .collect();
+    assert_eq!(
+        BTreeSet::from([
+            ("consumer.js".to_string(), 2),
+            ("safer.js".to_string(), 11),
+            ("safer.js".to_string(), 12),
+        ]),
+        hits,
+        "payload: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_location_prefers_scala_class_over_shared_primary_constructor_range() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
