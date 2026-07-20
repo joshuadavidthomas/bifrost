@@ -22,7 +22,7 @@ The observable result is twenty-five clean completed repository records, five pe
 - [x] (2026-07-20 10:18-05:00) Delegated the four nonzero PHP repositories as three disjoint Oldskool triage partitions and independently reviewed the result. All 298 rows are legitimate and exhaustively reduce to 96 owner-relative class references, 200 call-return receiver chains, and four nullsafe calls, with two rows requiring both chain and nullsafe support.
 - [x] (2026-07-20 10:22-05:00) Reproduced clean minimal production witnesses and created assigned issues #960, #961, and #962 before implementation. Exact baseline SHA-256 values are `1305e84e...` for Laravel `self`, `4669d644...` for the CakePHP call chain, and `fa77f406...` for the CakePHP nullsafe call.
 - [x] (2026-07-20 10:50-05:00) Integrated and reviewed Oldskool's #960 implementation, then implemented #961/#962 with one shared stack-safe structured receiver evaluator, nearest declaring-owner lookup, and targeted/inverted behavior coverage. All 51 targeted PHP tests, all 18 PHP usage-graph tests, formatting, diff hygiene, and isolated all-target/all-feature Clippy pass.
-- [ ] Complete clean publication proof, close owned issues, and summarize the PHP task-ranked leg.
+- [x] (2026-07-20 13:05-05:00) Completed the PHP publication boundary. Commit `14aa44cb` was integrated with current `origin/master`, the resulting head was published at `64de341e`, and the exact release runner SHA-256 was `c2ab9b150125c6467ae5809511be4fdbc59381f60b1d6ed92786105703dbc7fc`. All three exact witnesses and all five authoritative task-ranked repositories completed with zero missing, inconclusive, diagnostics, or file errors. The final corpus SHA-256 is `12e80e0c30b982e54440c2ecf1e43b9e3bc05d632199067b6e57539337cd1e68`; assigned issues #960, #961, and #962 are closed with evidence. See `.agents/docs/reference-differential/php-task-ranked-64de341e-summary.md`.
 - [ ] Complete, publish, close owned issues for, and summarize the Rust task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Scala task-ranked leg.
 - [ ] Complete, publish, close owned issues for, and summarize the Java task-ranked leg.
@@ -45,6 +45,9 @@ The observable result is twenty-five clean completed repository records, five pe
 
 - Observation: An unrelated concurrent JS/TS campaign began modifying five tracked JS/TS files in this same worktree while the PHP full gate was running.
   Evidence: The PHP gate passed every library and integration target through the final usage-graph group, including all PHP tests, then failed `usage_graph_ts_test::qualified_type_references_create_exact_workspace_edges`; an isolated rerun reproduced it and exposed warnings in concurrently dirty `js_ts_graph/inverted.rs`. Those files are not part of the PHP change and will not be staged into its checkpoint.
+
+- Observation: The shared branch advanced twice during the PHP publication gate, first with the completed TypeScript parity change and then with its lint-only follow-up, while `origin/master` also gained an LSP cache-isolation commit.
+  Evidence: The final integrated PHP acceptance head is `64de341e`, containing `14aa44cb`, `de27750d`, `c5e4e3d2`, and `64de341e`. A clean detached build embedded that exact Bifrost head and source path. The unrestricted full gate passed every library test; 186 of 187 LSP tests passed in the suite, and the sole resource-contention SIGKILL (`lsp_server_drop_cleanup_exits_cleanly_after_initialize`) passed immediately when rerun alone.
 
 ## Decision Log
 
@@ -70,7 +73,9 @@ The observable result is twenty-five clean completed repository records, five pe
 
 ## Outcomes & Retrospective
 
-No requested language is complete yet. Historical Java and Python issue closures remain valid fixes, PHP #904/#905 are integrated locally, Rust #907 and the large Scala stack exist in a detached historical lineage, and all earlier corpus records are regression-only because their membership was selected by LOC. Update this section after each language boundary with the final head, artifact, row partition, issue list, gates, and summary.
+PHP is complete. Its task-ranked baseline contained 298 legitimate misses: 96 owner-relative type references, 200 call-return receiver chains, and four nullsafe calls, with two chain/nullsafe overlaps. Structured fixes for #960, #961, and #962 reduced all five final repositories to zero actionable and zero inconclusive rows at pushed head `64de341e`; the three issues are closed. Historical #904/#905 remain integrated regression fixes. The focused PHP suites, formatting, diff hygiene, isolated all-feature Clippy, full feature-enabled Cargo gate, exact witnesses, and production corpus all passed. The final artifact and hashes are recorded in `.agents/docs/reference-differential/php-task-ranked-64de341e-summary.md`.
+
+Rust, Scala, Java, and Python remain. Historical fixes and issue closures in those languages remain regression inputs only until their task-ranked repository sets receive the same baseline, exhaustive triage, publication, and final-corpus treatment.
 
 ## Context and Orientation
 
@@ -162,3 +167,5 @@ Keep raw JSONL, logs, exact records, row ledgers, and checksums under `/mnt/opta
 Reuse `reference_differential::run_reference_differential`, `WorkspaceAnalyzer`, `UsageFinder`, language-specific structured forward resolvers and inverse graphs, `AnalyzerStore`, and `InlineTestProject`. Preserve explicit target/file/usage limits and honest `unproven` or `inconclusive` outcomes. Add public SearchTools or Python binding coverage only when the exposed surface changes. Avoid new dependencies unless a reduced root cause requires them and this plan records why.
 
 Revision note (2026-07-20): Created this task-ranked plan after an independent audit proved the prior campaigns used LOC-ranked repository membership. It pins the exact `tasks.py`/`SFT_PREDICATES` selection, invalidates old artifacts only as objective completion evidence, preserves their regression value, and records the issue, delegation, test, publication, and per-language summary boundaries.
+
+Revision note (2026-07-20): Completed the PHP language boundary at pushed head `64de341e`, recorded its zero-residual production evidence, and closed assigned issues #960-#962.
