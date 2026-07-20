@@ -1725,7 +1725,15 @@ pub(super) fn usage_class_field_receiver_type(
         return SymbolResolution::Unknown;
     };
     let candidates =
-        nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, receiver, None);
+        nearest_member_candidates_for_owner(analyzer, csharp, &enclosing, receiver, None)
+            .into_iter()
+            .filter(|candidate| {
+                !(candidate.is_function()
+                    && analyzer.parent_of(candidate).is_some_and(|owner| {
+                        candidate.identifier() == csharp_source_identifier(&owner)
+                    }))
+            })
+            .collect::<Vec<_>>();
     if candidates.is_empty() {
         return SymbolResolution::Unknown;
     }
@@ -1819,6 +1827,11 @@ fn nearest_member_candidates_for_owner_inner(
                 candidates
                     .into_iter()
                     .filter(|candidate: &CodeUnit| candidate.identifier() == name)
+                    .filter(|candidate| {
+                        analyzer
+                            .parent_of(candidate)
+                            .is_some_and(|parent| parent.fq_name() == current.fq_name())
+                    })
                     .filter(|candidate| {
                         explicit_generic_arity.is_none_or(|arity| {
                             candidate.is_function()

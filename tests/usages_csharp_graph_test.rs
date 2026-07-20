@@ -6286,6 +6286,49 @@ public sealed class Service {
     );
 }
 
+#[test]
+fn csharp_graph_attributes_nameof_receiver_to_nongeneric_owner_with_matching_member() {
+    let source = r#"namespace Demo;
+
+[System.Runtime.CompilerServices.CollectionBuilder(
+    typeof(ImmutableEquatableArray),
+    nameof(ImmutableEquatableArray.Create))]
+public sealed class ImmutableEquatableArray<T>
+{
+    public ImmutableEquatableArray(T value) {}
+}
+
+public static class ImmutableEquatableArray
+{
+    public static ImmutableEquatableArray<T> Create<T>(T value) => new(value);
+}
+"#;
+    let (_project, analyzer) =
+        csharp_analyzer_with_files(&[("ImmutableEquatableArray.cs", source)]);
+    let nongeneric = type_definition(&analyzer, "Demo.ImmutableEquatableArray");
+    let generic = type_definition(&analyzer, "Demo.ImmutableEquatableArray`1");
+    let receiver = source
+        .find("ImmutableEquatableArray.Create")
+        .expect("nameof receiver");
+    let receiver_end = receiver + "ImmutableEquatableArray".len();
+
+    let nongeneric_hits = graph_hits(&analyzer, &nongeneric);
+    assert!(
+        nongeneric_hits
+            .iter()
+            .any(|hit| hit.start_offset == receiver && hit.end_offset == receiver_end),
+        "nameof receiver should resolve to the non-generic owner: {nongeneric_hits:#?}"
+    );
+
+    let generic_hits = graph_hits(&analyzer, &generic);
+    assert!(
+        generic_hits
+            .iter()
+            .all(|hit| hit.start_offset != receiver || hit.end_offset != receiver_end),
+        "nameof receiver must not resolve to the same-named generic owner: {generic_hits:#?}"
+    );
+}
+
 // A local of the same name in an unrelated method is provably not the field, so it
 // must be skipped silently rather than poisoning the file's other proven hits.
 #[test]

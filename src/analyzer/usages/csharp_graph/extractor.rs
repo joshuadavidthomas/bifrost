@@ -240,9 +240,48 @@ fn scan_structured_type_candidate(
         Some(resolved) if type_identity_matches(&resolved, &ctx.spec.target.fq_name()) => {
             push_hit(candidate, ctx);
         }
+        Some(resolved)
+            if role == TypeCandidateRole::Receiver
+                && csharp_receiver_member_selects_visible_target(
+                    candidate, &reference, &resolved, ctx,
+                ) =>
+        {
+            push_hit(candidate, ctx);
+        }
         None if role == TypeCandidateRole::Receiver => push_unproven_hit(candidate, ctx),
         Some(_) | None => {}
     }
+}
+
+fn csharp_receiver_member_selects_visible_target(
+    receiver: Node<'_>,
+    reference: &str,
+    resolved_fqn: &str,
+    ctx: &mut ScanCtx<'_>,
+) -> bool {
+    let Some(visible) = ctx.csharp.resolve_usage_visible_type(ctx.file, reference) else {
+        return false;
+    };
+    if !type_identity_matches(&visible.fq_name(), &ctx.spec.target.fq_name()) {
+        return false;
+    }
+    let Some(access) = receiver.parent().filter(|parent| {
+        parent.kind() == "member_access_expression"
+            && member_access_receiver(*parent).is_some_and(|node| same_node(node, receiver))
+    }) else {
+        return false;
+    };
+    let Some(member) = member_access_name(access).and_then(csharp_member_name) else {
+        return false;
+    };
+    let member = node_text(member.identifier, ctx.source);
+    let Some(resolved_owner) = class_unit_for_fq_name(ctx.csharp, resolved_fqn) else {
+        return false;
+    };
+    nearest_member_candidates_for_owner(ctx.analyzer, ctx.csharp, &resolved_owner, member, None)
+        .is_empty()
+        && !nearest_member_candidates_for_owner(ctx.analyzer, ctx.csharp, &visible, member, None)
+            .is_empty()
 }
 
 fn scan_attribute_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
