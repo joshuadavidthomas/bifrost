@@ -30,9 +30,31 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [x] (2026-07-16 15:32+02:00) Implemented #814's identities, capabilities, outcomes/budgets, immutable artifact/procedure IR, invariant validation, scoped handles, bounded renderer, and TypeScript/Java contract fixtures.
 - [x] (2026-07-16 18:01+02:00) Completed #814 after specialist review and final invariant audits; all focused tests, the complete `nlp,python` suite, all-target/all-feature clippy, formatting, and diff checks passed, and the reviewed implementation was checkpointed as `296c1de1` after rebasing onto current `master`.
 - [x] (2026-07-16 19:20+02:00) Addressed all guided-review findings in `1faf8b9b`, including converged typed continuations, targetless uncertain callable creation, and shared bounded-renderer/registry utilities; all repository gates passed.
-- [ ] Complete #815 and the first adapter children: build equivalent per-callable CFGs for TypeScript and Java.
+- [x] (2026-07-17 10:10+02:00) Started #815 execution with the focused living plan `.agents/plans/all-language-cfg-icfg-rollout.md`, spanning callable CFGs, the #816 dispatch prerequisite, one #818 ICFG, all eleven analyzable-language adapters, and the evidence-gated CFG/ICFG slice of #817.
+- [x] (2026-07-17 11:40+02:00) Completed #815 Milestone 1a: canonical rich control-edge IDs, immutable bidirectional adjacency, storage-independent predecessor/successor traversal, corruption validation, bounded schema-v2 rendering, shared CFG contract tests, full repository gates, and post-milestone specialist review are green.
+- [x] (2026-07-17 14:34+02:00) Completed #815 Milestones 1b and 1c: the atomic file/dialect-aware provider, bounded exact source snapshots, complete-only semantic cache, private iterative CFG builder, real TypeScript/TSX callable lowering, source-backed adjacency harness, full repository gates, and specialist review are green.
+- [x] (2026-07-17 16:05+02:00) Completed the TypeScript/TSX and Java reference callable-CFG checkpoints under #815, including the shared inline topology harness, typed advanced-feature gaps, differential cases, representation benchmark, strict repository gates, and post-milestone reviews. The all-language #815 rollout remains open behind the reference ICFG contract.
+- [x] (2026-07-17 16:54+02:00) Completed the #816 dispatch prerequisite and #818 TypeScript/Java vertical slice: exact whole-call resolution, one bounded context-bearing ICFG, matched normal/exceptional returns, typed incomplete boundaries, source-generation validation, shared inline assertions, and post-milestone review are complete. The shared adapter contract is frozen for the remaining #815 languages.
+- [x] (2026-07-17 17:00+02:00) Created and natively attached the nine remaining #815 rollout children: #887 JavaScript/JSX, #886 C#, #888 Python, #889 Go, #891 Rust, #890 PHP, #892 Scala, #893 Ruby, and #894 C/C++, each cross-linked to #816 and #818.
+- [x] (2026-07-18 10:45+02:00) Completed #815 Milestone 4a: JavaScript and JSX now share the structured TypeScript lowering core behind exact flavor identities and pass the common direct-call CFG/ICFG conformance contract with point-scoped advanced-feature gaps.
+- [x] (2026-07-18 11:52+02:00) Completed #815 Milestone 4b: C# now supplies real callable CFGs and direct matched-return ICFGs through the frozen shared provider, builder, dispatch, and snapshot boundary; independent review fixed indexed-call evaluation, target-typed object-initializer order, and conditional-compilation gaps before checkpoint validation.
+- [x] (2026-07-18 12:06+02:00) Validated the reviewed C# checkpoint with formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` repository suite (1,053 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
+- [x] (2026-07-18 13:11+02:00) Completed and validated #815 Milestone 4c: Python now supplies real callable CFGs and direct matched-return ICFGs through the shared engine, with deferred coroutine/generator invocation modeled explicitly; specialist review fixes, 37 CFG, 17 ICFG, 28 language-conformance, 11 provider tests, strict clippy, and the complete host-access feature suite are green.
+- [x] (2026-07-18 14:17+02:00) Completed and validated #815 Milestone 4d: Go now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review made selected-call omissions and partially unspecified evaluation order explicit, proved shadowed `panic`/`recover` dispatch, and passed 37 CFG, 17 ICFG, 37 language-conformance, 11 provider tests, strict clippy, and the complete host-access feature suite.
+- [x] (2026-07-18 15:52+02:00) Completed and validated #815 Milestone 4e: Rust now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review made parameter, lexical, pattern-binding, assignment-replacement, and abrupt-path RAII/Drop omissions exact, prevented fabricated try-block and macro control, exposed implicit trait-call gaps, corrected labeled-block break routing and generic dispatch, and passed 39 CFG, 17 ICFG, 55 language-conformance, 11 provider, and 483 definition tests plus strict clippy and the complete host-access feature suite.
+- [x] (2026-07-18 17:20+02:00) Completed and validated #815 Milestone 4f: PHP now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review corrected whole-chain nullsafe and nullish control, loop and switch grammar, first-class callable classification, method-return dispatch, bounded candidate selection, zero-target ambiguity, and exact `finally` routing, then passed 39 CFG, 18 ICFG, 10 semantic-IR, 73 language-conformance, 11 provider, and 486 definition tests plus strict clippy and the complete host-access feature suite.
+- [x] (2026-07-18 19:00+02:00) Completed #815 Milestone 4g: Scala now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review corrected partial-function and initializer ownership, non-local closure return, curried constructor collapse, parameter-list arity and primary-constructor shape, generic wrapper and operator dispatch, nested-call pruning, structured-argument cardinality, and by-name/implicit-operation gaps, then passed 39 CFG, 18 ICFG, 10 semantic-IR, 93 language-conformance, 11 provider, and 497 definition tests plus focused call-site/call-relation suites.
+- [x] (2026-07-18 19:12+02:00) Validated the final reviewed #815 Milestone 4g tree with formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` suite across every library, binary, integration, and doc-test target.
+- [x] (2026-07-18 21:27+02:00) Completed #815 Milestone 4h: Ruby now supplies real callable CFGs and matched-return ICFGs through the shared engine; specialist review corrected pattern evaluation, callable-table mutation, destructured writers, bounded collection, non-local cleanup, operator and callable-object dispatch, lifecycle-block ownership, and parser-ordered local activation and closure capture, then passed 39 CFG, 18 ICFG, 10 semantic-IR, 111 language-conformance, 11 provider, 497 definition, and 17 Ruby library/dispatch tests.
+- [x] (2026-07-18 21:46+02:00) Validated the final reviewed #815 Milestone 4h tree with formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` suite (1,079 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
+- [x] (2026-07-19 00:48+02:00) Completed #815 Milestone 4i and the all-language adapter rollout: C and C++ now supply real callable CFGs and matched-return ICFGs through the same shared engine as the other nine rollout targets; C/C++ and cross-language specialist reviews closed with no P0/P1 findings after correcting structured linkage, implicit-object and late-static dispatch, path-sensitive return evidence, unresolved-boundary quality, and caller-side implicit evaluation gaps.
+- [x] (2026-07-19 00:48+02:00) Passed the reviewed all-language focused gates: 39 CFG, 25 ICFG, 129 language-conformance, 10 semantic-IR, 11 provider, 9 ICFG-unit, 14 call-relation-unit, and 498 definition tests.
+- [x] (2026-07-19 01:06+02:00) Validated the final reviewed #815 Milestone 4i tree with formatting, diff checks, strict all-target/all-feature clippy, and the complete host-access `nlp,python` suite (1,094 library tests passed, 4 ignored, plus every binary, integration, and doc-test target). The focused #817 persistence measurement remains open.
+- [x] (2026-07-20 09:23+02:00) Completed the focused #817 semantic/CFG lifecycle slice with nine-process release matrices over generated graphs, inline TypeScript/Java fixtures, pinned VS Code, and pinned Spring PetClinic. Bidirectional edge-ID rows remain the hot layout; production SQLite is a measured no-go because the optimistic packed control/call projection failed the VS Code absolute write-overhead gate. Later value-flow, solver, and summary lifecycle decisions remain open under #817.
+- [x] (2026-07-20 09:23+02:00) Completed a post-rollout semantic architecture audit. It confirmed one shared language-neutral ICFG, identified repeated point/effect/call emission and procedure-driver mechanics across adapters, and recommended a dedicated no-semantic-change extraction before #816 value/heap and data-dependence work; no source refactor is implicitly authorized by this planning observation.
+- [x] (2026-07-20 09:59+02:00) Validated the exact final #815/#817 tree with focused representation and persistence tests, formatting and diff checks, strict isolated all-target/all-feature clippy, and the complete host-access `nlp,python` repository suite (1,094 library tests passed, 4 ignored, plus every binary, integration, and doc-test target).
 - [ ] Complete #816 in parallel: expose reusable dispatch, value, heap, and bounded access-path oracles for the reference languages.
-- [ ] Complete #818: stitch CFG fragments through existing call relations into a demand-materialized ICFG.
+- [x] Complete #818's internal TypeScript/Java control-topology slice: stitch CFG fragments through existing call relations into a demand-materialized ICFG. Public query exposure and value/heap transfers remain in their owning issues.
 - [ ] Complete #819 as needed: add iterative reachability, reverse postorder, SCC, and loop utilities; add dominators only after a named client justifies them.
 - [ ] Complete #820: implement an iterative, summary-driven IFDS/IDE-shaped solver with budgets, cancellation, uncertainty, and witnesses.
 - [ ] Complete #821 and #822: prove simple data-flow/taint reuse, then add the finite-state protocol IR and typestate client.
@@ -41,7 +63,7 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - [ ] Complete #824: expose typed, bounded CFG/data-flow/taint/typestate domains through `CodeQuery` and RQL, then adapt diagnostic-neutral findings to #709's policy boundary.
 - [ ] Complete #825: deliver and benchmark one TypeScript/Java resource-lifecycle protocol through internal, query, `.rqlp`, human, and SARIF paths.
 - [ ] Complete #826 only after #825: decide, with evidence, whether WPDS weights or synchronized call/field pushdown precision should be implemented.
-- [ ] Open per-language rollout children under #815 and #816 only after the reference adapters stabilize the neutral contracts.
+- [x] Opened and natively attached per-language rollout children under #815 after the reference CFG/ICFG contract stabilized; their ordered implementation remains tracked in the focused rollout plan.
 
 ## Surprises & Discoveries
 
@@ -78,6 +100,69 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - Observation: GitHub supports native subissues in this repository, so #814 through #826 can be attached directly to #813 while retaining explicit dependency text in each body.
   Evidence: the live `subIssues` query for #813 returned all thirteen children.
 
+- Observation: #815's predecessor/successor contract requires a rich-edge graph shape that the existing payloadless compact graph cannot directly supply.
+  Evidence: semantic CFGs preserve parallel source-target edges with different kinds or evidence, so one canonical `ControlEdge` table plus edge-ID adjacency is required. The focused implementation and rollout are tracked in `.agents/plans/all-language-cfg-icfg-rollout.md`.
+
+- Observation: #815 Milestone 1a validated the initial bidirectional shape without freezing later adapter or ICFG boundaries.
+  Evidence: schema-v2 `ControlFlowGraph` introduced canonical rich edges, outgoing offsets, and incoming edge-ID rows; exact traversal and rendering are deterministic under permuted construction and corrupted incoming order is rejected. At that checkpoint, TypeScript/Java lowering and the provider boundary remained intentionally deferred to the next focused milestones.
+
+- Observation: #815 Milestones 1b and 1c proved that exact source identity, publication, and dead-code isolation are part of the semantic contract rather than adapter conveniences.
+  Evidence: the provider atomically snapshots bounded disk or overlay content with dialect and monotonic overlay revision, caches only complete immutable artifacts by retained bytes, and lowers TypeScript/TSX through an iterative builder whose reachability seal preserves dead internal topology without permitting dead-to-live or dead-to-exit reconnections.
+
+- Observation: the TypeScript/Java differential checkpoint forced one additional neutral completion kind but did not require language-specific CFG storage or a universal syntax-lowering IR.
+  Evidence: Java switch-expression `yield` now uses a shared cleanup-safe yieldable continuation, while Java syntax still maps structured tree-sitter fields directly into the private sequence, branch, loop, call, handler, cleanup, and abrupt-completion builder operations. Java executable initializer fragments are real procedures with scoped deferred-scheduling gaps rather than fabricated constructor flow.
+
+- Observation: bidirectional adjacency remains the measured hot layout even though outgoing-only CSR saves 22-30% retained bytes in representative cases.
+  Evidence: the release matrix measured reverse traversal rising from roughly one millisecond to 6.5-8.5 seconds on 100k-edge synthetic graphs and by 5-7x on TypeScript/Java corpus artifacts. Flat edges made both directions linear scans. The canonical edge table plus outgoing offsets plus incoming edge-ID rows therefore survives the Milestone 2 representation gate.
+
+- Observation: the TypeScript/Java ICFG slice requires context-bearing snapshot nodes even though callable CFG nodes remain context-free.
+  Evidence: two call sites entering one callee share the immutable procedure artifact, but their callee exits must return to different continuations. Interning `(program point, exact bounded call stack)` in the ephemeral snapshot preserves that distinction without cloning or persisting the base CFG.
+
+- Observation: the first post-reference rollout did not require a second adapter engine or ICFG implementation.
+  Evidence: JavaScript/JSX reuse the TypeScript structured lowerer with explicit grammar-flavor branches and unchanged TypeScript fingerprints, while the existing location-first dispatch facade and context-bearing `WorkspaceIcfgProvider` materialize their cross-file calls without language-specific stitching.
+
+- Observation: the first independently implemented post-reference adapter also fit the frozen graph and dispatch boundary, while exposing why conformance must exercise grammar-specific evaluation shapes.
+  Evidence: C# direct calls use the existing dispatch oracle and shared ICFG unchanged. Review-driven tests were still needed to prove indexed delegate evaluation, conditional element binding, target-typed object initializers, and terminal configuration-dependent `#if` boundaries, because those shapes use different tree-sitter fields than superficially similar member and object-creation expressions.
+
+- Observation: async and generator flags are insufficient to determine call-to-body control across languages.
+  Evidence: Python coroutine/generator calls, JavaScript generators, and C# iterators create suspended objects, while JavaScript and C# async calls begin synchronously. The common procedure contract now records invocation timing independently, and the single ICFG represents deferred targets as typed boundaries with explicit caller-continuation models rather than false body entry.
+
+- Observation: deterministic semantic topology and language-defined evaluation order are separate contracts.
+  Evidence: Go fully orders calls, method calls, receives, and logical operations but leaves some surrounding operands and composite-literal elements unordered. The Go adapter retains deterministic source-order rows for identity and rendering while attaching source-backed control gaps to the exact parents whose relative order is incomplete.
+
+- Observation: scheduled or selected calls can be syntactically identifiable without being valid immediate ICFG transfers.
+  Evidence: Go `defer` and `go` evaluate function values and arguments immediately but schedule the outer call for later or concurrent execution; `select` evaluates communication operands before choosing one case. Omitting only the non-immediate or selected-only calls and reporting typed call/scheduling gaps preserves known evaluation without fabricating control.
+
+- Observation: a shared cleanup-continuation stack can represent language-specific destructor uncertainty without inventing destructor bodies or calls.
+  Evidence: Rust parameter, lexical, and pattern scopes use opaque cleanup markers so normal and abrupt exits carry exact cleanup/resource/call/exception gaps at real transfer points, while assignment replacement has its own point-scoped omissions and shared CFG/ICFG destinations remain unchanged.
+
+- Observation: conservative structured lowering sometimes requires suppressing apparently traversable syntax.
+  Evidence: lowering `?` inside an unsupported Rust try block through the procedure completion scope fabricated a return. Treating the try block and macro expansion as terminal typed boundaries is more accurate than plausible-looking inner topology, while operators, indexing, autoderef, and await retain known prefixes with implicit-call gaps.
+
+- Observation: language-local short-circuit scope can be broader than one AST operator node.
+  Evidence: PHP's nullsafe operator skips the remainder of one complete access chain, including later calls, properties, arguments, dynamic names, and subscripts, but nested subexpressions start independent nullsafe scopes. An adapter-owned chain continuation expresses that rule without changing common graph or ICFG mechanics.
+
+- Observation: exact call-expression identity is sufficient for an incomplete dispatch outcome even when no separate callee-leaf span exists.
+  Evidence: unresolved and bounded ambiguous PHP sites retain exact call handles but may have no publishable leaf. Requiring every completed dispatch to retain a target or typed boundary preserves the outcome without fabricated syntax; intermediate nullsafe properties remain definition candidates but no longer consume immediate-call budgets.
+
+- Observation: Scala callable ownership and call completeness cannot be inferred from a node kind or argument delimiter alone.
+  Evidence: standalone `case_block`s are deferred partial-function bodies while match/catch cases execute immediately; initializer subtrees own nested closures but not member methods; parentheses do not prove strict parameters and braces do not prove by-name parameters. The adapter therefore keys partial execution by the current procedure body, preserves synthetic initializer ownership only through executable subtrees, retains one actual per structured argument, and publishes exact deferred/implicit-call/exception gaps whenever signatures or runtime protocols are unresolved.
+
+- Observation: Ruby local-versus-call classification requires a parser-ordered binding timeline, including the source position where each nested callable is created.
+  Evidence: a bare name before its first structured assignment is a call while the same name after that assignment is local; assignment targets activate before their right-hand side, and closures inherit only outer bindings already active at their syntax position. Exact semantic dispatch can apply this timeline, while legacy outgoing-call discovery remains intentionally narrow until it shares the same callable context.
+
+- Observation: the final C/C++ adapter did not require a second graph or ICFG, but it did require link-unit identity and caller-side uncertainty to remain separate from control topology.
+  Evidence: compatible declarations and definitions coalesce through structured C/C++ resolution while configuration, default arguments, implicit conversions/calls, temporaries, RAII, exceptions, spawn, coroutines, and `noexcept` remain exact gaps. The same location-first oracle and context-bearing ICFG then preserve proven targets with partial transfer evidence where appropriate.
+
+- Observation: context-matched return topology alone does not prove complete completion transfer.
+  Evidence: reachable cleanup, exceptional, or non-local gaps on a callee entry-to-exit path can alter whether or how that exit is reached. A bounded iterative forward/reverse path mask now weakens only affected returns, so disconnected omissions no longer contaminate an otherwise exact call while every unresolved dispatch boundary remains incompatible with a complete snapshot.
+
+- Observation: the focused #817 benchmark distinguishes traversal layout from persistence lifecycle and rejects promotion on the conjunction of predeclared gates.
+  Evidence: bidirectional rows traverse the generated 100k branch graph in 0.566/0.566 ms versus outgoing-only 0.559/4,467.02 ms and flat 4,450.98/4,438.78 ms. The optimistic SQLite projection hydrated pinned VS Code in 207.05 ms versus a 24,614.13 ms rebuild and pinned Spring PetClinic in 0.79 ms versus 58.21 ms, but VS Code build-plus-write added 1,275.69 ms and failed the 250 ms absolute-overhead gate. Production storage therefore remains unchanged for this artifact slice.
+
+- Observation: the eleven language adapters share graph and ICFG mechanics but still duplicate a lower-level semantic emission substrate.
+  Evidence: `src/analyzer/semantic/icfg.rs` owns the one generic ICFG, while the language `semantic.rs` modules repeat point allocation, source/evidence mapping, values, effects, gaps, call scaffolding, budget staging, and finalization. The highest-value cleanup is a source-anchor-aware `ProcedureLoweringSession` plus a shared call scaffold and procedure batch driver, not a universal syntax visitor. The generic ICFG also contains two C++-specific gap checks that should become typed gap-impact metadata before value/heap work expands the dependency surface.
+
 ## Decision Log
 
 - Decision: target meet-over-valid-interprocedural-paths analysis rather than SMT-backed path feasibility.
@@ -107,6 +192,62 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
 - Decision: freeze hot immutable base relations into dense IDs plus CSR/CSC, while persisting only stable, expensive, reusable artifacts in SQLite.
   Rationale: this matches the successful compact structural snapshot pattern from PR #802 and avoids persisting query-specific product states or maintaining rich and compact duplicate graphs.
   Date: 2026-07-16.
+
+- Decision: execute #815, the dispatch slice of #816, #818, and all remaining language adapters through one focused living plan while retaining issue-sized checkpoint reviews.
+  Rationale: TypeScript and Java must pressure-test both intraprocedural lowering and matched interprocedural transfers before the contract freezes, while one continuous record keeps all-language capability gaps and the CFG/ICFG lifecycle slice of #817 coherent. Later value-flow, solver, and summary persistence decisions remain in the broader roadmap. The implementation still preserves issue ownership and excludes public query, solver, value/heap, and typestate work.
+  Date: 2026-07-17.
+
+- Decision: publish semantic artifacts only from one bounded, origin- and overlay-revision-aware syntax snapshot, and cache only complete values by conservative retained bytes with per-key single flight.
+  Rationale: key/artifact races, entry-count-only memory bounds, duplicate concurrent lowering, and reuse of cancelled or partial work would all undermine later ICFG and solver correctness. Exact complete artifacts may be reused across analyzer updates when their full source identity is unchanged.
+  Date: 2026-07-17.
+
+- Decision: enforce dead-source isolation with a shared iterative CFG seal after language lowering.
+  Rationale: language adapters retain syntactically present unreachable points for diagnostics and analysis, but those points must never reconnect to entry-reachable control or either real exit. Enforcing the invariant at the graph boundary keeps future adapters honest without replacing their structured completion semantics.
+  Date: 2026-07-17.
+
+- Decision: keep Java switch-expression `yield` distinct from procedure return and loop/switch break in the neutral completion vocabulary.
+  Rationale: yield targets the nearest switch-expression merge and must preserve that destination through intervening cleanup. A dedicated completion kind prevents cross-return and avoids mislabeling language semantics while remaining dormant for adapters that do not emit it.
+  Date: 2026-07-17.
+
+- Decision: retain canonical bidirectional control-edge rows after the TypeScript/Java representation benchmark.
+  Rationale: outgoing-only storage achieved meaningful memory savings but failed the reverse-traversal contract decisively; rebuilding or lazily retaining a reverse index would either reintroduce the same state or make traversal latency unpredictable. Flat storage failed both directions. Persistence remains a separate #817 lifecycle decision.
+  Date: 2026-07-17.
+
+- Decision: confirm bidirectional control-edge rows with the final generated and representative-corpus matrix, and record a no-go for production persistence of the current semantic/CFG control-and-call slice.
+  Rationale: both traversal directions remain hot contractual APIs, and the final matrix reproduced the reverse-traversal penalty of leaner layouts at corpus scale. Although an optimistic packed SQLite DTO demonstrated large hydration savings, it failed the predeclared VS Code absolute write-overhead gate; a fuller equivalent artifact would add payload and invalidation cost. Per-file semantic artifacts remain immutable and byte-bounded in memory, ICFG stitches remain generation-local, and bounded snapshots remain ephemeral. This does not prejudge later value-flow or reusable-summary persistence candidates.
+  Date: 2026-07-20.
+
+- Decision: freeze one exact-location dispatch facade and one context-bearing demand-materialized ICFG as the cross-language control boundary.
+  Rationale: existing query and LSP resolution remains authoritative for candidate discovery, while the ICFG provider alone owns invoke-scaffold suppression, bounded call contexts, matched returns, typed incomplete boundaries, and dense traversal snapshots. This prevents each language adapter from inventing a second resolver or ICFG.
+  Date: 2026-07-17.
+
+- Decision: reuse the JavaScript/TypeScript structured lowering core through flavor-specific semantic providers while preserving separate durable adapter/configuration fingerprints.
+  Rationale: shared control mechanics eliminate drift, but exact prepared-language validation and JavaScript-specific fields, resource declarations, and JSX gaps keep each grammar honest. JSX remains a JavaScript source flavor rather than a new persisted semantic dialect.
+  Date: 2026-07-18.
+
+- Decision: keep C# as a structured language adapter over the shared iterative CFG/ICFG mechanics, and represent unavailable conditional-compilation selection as a terminal source-backed control gap.
+  Rationale: C# callable identity and syntax require an adapter, not another graph or resolver. Selecting a preprocessor arm without compilation symbols would fabricate control, while silently filtering the node would hide incompleteness; the typed boundary preserves both the common contract and honest uncertainty.
+  Date: 2026-07-18.
+
+- Decision: keep Go on the shared CFG/ICFG boundary by modeling `defer`, `go`, and `select` as exact known prefixes plus typed incomplete points, and by qualifying deterministic source-order linearization wherever Go leaves relative operand order unspecified.
+  Rationale: an outer `defer` or goroutine call is not an immediate call-to-entry transfer, a selected case cannot be chosen statically, and nondeterministic graph construction would destabilize identities. Existing scheduling, call, control, cleanup, spawn, and exceptional capability gaps preserve these distinctions without a Go-specific ICFG or false topology.
+  Date: 2026-07-18.
+
+- Decision: keep Rust on the shared CFG/ICFG boundary by using opaque cleanup markers for unknown Drop behavior, terminal boundaries for unsupported try blocks and macros, and point-scoped gaps for implicit trait calls.
+  Rationale: these constructs pressure completion scope, cleanup, and hidden-call completeness but do not justify Rust-specific graph or ICFG mechanics. Known evaluation prefixes remain structured; unknown destructor, residual, expansion, autoderef, operator, and polling behavior is never fabricated.
+  Date: 2026-07-18.
+
+- Decision: keep PHP on the shared CFG/ICFG boundary with adapter-owned chain-scoped nullsafe control and a dispatch invariant based on retained targets or typed boundaries rather than optional callee-leaf spans.
+  Rationale: complete-chain skipping and nullish coalescing are PHP syntax semantics, while unresolved or bounded exact calls are shared dispatch outcomes. Keeping both distinctions explicit prevents false control and silent loss without introducing a PHP graph, resolver, or ICFG.
+  Date: 2026-07-18.
+
+- Decision: keep Scala on the shared CFG/ICFG boundary with adapter-owned callable-body identity and parameter-list metadata, while treating unproven grouping, strictness, and implicit operations as scoped incompleteness.
+  Rationale: partial functions, synthetic initializers, curried applications, right-associative operators, by-name parameters, extractors, auto-application, and interpolation need Scala syntax mapping but not another graph or ICFG. Known evaluation and dispatch use the common builder and oracle; compound infix precedence, prefix dispatch breadth, implicit protocols, and deferred timing remain exact typed boundaries.
+  Date: 2026-07-18.
+
+- Decision: keep Ruby on the shared CFG/ICFG boundary with adapter-owned parser-ordered binding activation and exact dynamic-operation gaps, while leaving legacy outgoing-call discovery conservative.
+  Rationale: bare identifiers, implicit returns, non-local block control, `ensure`, safe navigation, callable-table mutation, and overrideable operators require Ruby syntax and scope mapping but not another graph or ICFG. Exact semantic sites have the callable and source-position context needed for sound call classification; broadening the older outgoing path without that context would fabricate local reads as calls.
+  Date: 2026-07-18.
 
 - Decision: keep language-semantic summaries separate from rule-specific protocol summaries.
   Rationale: adapter/call/value effects can be reused by several clients, while a protocol summary must include its rule hash and map incoming client state to outgoing client state and effects.
@@ -168,6 +309,18 @@ The implementation should feel modular in the same way that Boomerang, IDEal, an
   Rationale: invalid input or I/O is not program ambiguity; adversarial payload must respect finite budgets; and two partial materializations of one durable key must not alias.
   Date: 2026-07-16.
 
+- Decision: complete the all-language CFG/ICFG contract with one C/C++ adapter family and one shared ICFG, retaining dialect, linkage, preprocessing, lifetime, and implicit-evaluation uncertainty as typed adapter or dispatch evidence.
+  Rationale: these are real C/C++ semantic distinctions, but none requires different graph mechanics. Structured declaration/definition coalescing plus exact gaps preserves what is known without inventing a whole-program linker, preprocessor configuration, destructor schedule, or implicit call graph.
+  Date: 2026-07-19.
+
+- Decision: let matched-return evidence describe complete completion transfer, not merely the conditional exit-to-continuation mapping, and calculate that evidence from bounded path-relevant gaps.
+  Rationale: callers need to know whether all modeled behavior on the callee path is represented. Cleanup, exceptional, and non-local gaps on the relevant path therefore make the edge partial; dead disconnected gaps do not. Every unresolved dispatch arm also makes the enclosing snapshot non-complete, with its exact capability preserved.
+  Date: 2026-07-19.
+
+- Decision: tolerate conservative dynamic-dispatch false-partials until #816 exposes explicit closed-dispatch proof.
+  Rationale: current Java, Go, C#, and related receiver adapters cannot always distinguish final, static, nonvirtual, or otherwise closed calls at the semantic-adapter boundary. A false partial is preferable to false completeness; precision tests should assert closure directly once resolver metadata supports it.
+  Date: 2026-07-19.
+
 ## Outcomes & Retrospective
 
 The planning milestone produced root epic #813, thirteen native subissues, and this repository-local ExecPlan. The issue tree now separates the critical path from parallel and evidence-gated work:
@@ -190,6 +343,28 @@ The planning milestone produced root epic #813, thirteen native subissues, and t
 Issue #814 is the first completed implementation milestone. Checkpoint `296c1de1` plus guided-review fixes `1faf8b9b` provide the immutable language-neutral IR/event contract, durable and dense identities, total capabilities, typed outcomes and errors, finite budgets, provider boundary, invariant validation, scoped handles, and bounded renderer. TypeScript and Java remained the right contract fixtures, but they intentionally build neutral artifacts rather than claiming real adapters. The file-level artifact and procedure-local row model survived review without prematurely selecting CSR/CSC or persistence.
 
 The handoff remains narrow: #815 builds real TypeScript/Java callable CFG adapters, #816 refines dynamic dispatch plus value/heap targets, #818 adds matched ICFG call/return edges, and #817 measures lifecycle/storage before persisting anything. Review made this boundary stricter by introducing typed unavailable continuations, exact invoke/suspend outgoing topology, exact gap/evidence correlations, constrained partial local targets, bounded atomic construction, streaming rendering, and materialization-scoped handles.
+
+All nine post-reference rollout checkpoints validate that boundary from reuse and independent-adapter directions. JavaScript/JSX share the TypeScript lowering family; C#, Python, Go, Rust, PHP, Scala, Ruby, and C/C++ map their own structured syntax into the same builder, exact-location dispatch oracle, and context-bearing ICFG. Python and Rust use orthogonal invocation timing so deferred coroutine/generator construction never becomes false immediate body entry. Go keeps scheduled and selected work distinct from immediate calls, Rust uses shared cleanup markers to expose unknown Drop behavior without fabricating destructor topology, PHP owns whole-chain nullsafe continuations, Scala preserves partial-function and curried-application distinctions, Ruby uses parser-ordered binding activation, and C/C++ adds structured link-unit identity plus caller-side implicit-evaluation gaps without changing graph mechanics. Conformance now covers direct calls, common control, nested callables, handlers and cleanup, advanced-feature gaps, grammar-specific evaluation order, deferred call boundaries, scheduling boundaries, destructor uncertainty, nullish flow, chain-scoped short circuiting, expression-valued control, parameter-list dispatch, and matched-return evidence across every analyzable language without adding language-specific graph services.
+
+#815 Milestone 4e completes the Rust adapter checkpoint. Functions, associated and nested functions, closures, async and generator bodies, common control, labels, match guards, calls, semicolonless tails, `?`, await, yield, and dead syntax now use the same immutable CFG, exact-location dispatch, and context-bearing ICFG as the previous languages. Rust-specific uncertainty remains explicit through deferred invocation, terminal try/macro boundaries, implicit-trait gaps, and RAII/Drop gaps for parameter, lexical, pattern-bound, replaced, normal, and abrupt values. Generic free and method calls resolve through the shared oracle, including turbofish syntax, without regressing grouped imports. Focused validation passes 39 CFG, 17 ICFG, 55 language-conformance, 11 provider, and 483 definition tests.
+
+#815 Milestone 4f completes the PHP adapter checkpoint. Functions, methods, constructors, nested functions, closures, arrows, property hooks, common control, numeric break/continue, switch, match, nullish and full-chain nullsafe flow, calls, explicit throw, and cleanup now use the same immutable CFG, exact-location dispatch, and context-bearing ICFG as the previous languages. PHP-specific uncertainty remains explicit for generator suspension, include/require, goto, resource behavior, implicit calls and exceptions, and dynamic runtime protocols. Review proves matched free, typed-method, and nullsafe cross-file returns plus exact normal, handled, and unmatched `finally` paths. Focused validation passes 39 CFG, 18 ICFG, 10 semantic-IR, 73 language-conformance, 11 provider, and 486 definition tests.
+
+#815 Milestone 4g completes the Scala adapter checkpoint. Functions, methods, local definitions, primary and secondary constructors, lambdas, partial functions, givens, synthetic initializers, expression-valued control, ordered guarded match, generic and curried calls, constructors, infix/postfix operators, explicit throw, and cleanup now use the same immutable CFG, exact-location dispatch, and context-bearing ICFG as the previous languages. Scala-specific uncertainty remains explicit for by-name timing, `for` desugaring, implicit selection/pattern/interpolation behavior, non-local return propagation, compound infix grouping, and prefix-operator dispatch breadth. Review proves nested callable ownership, one-site curried returns, fail-closed arity, matched cross-file calls, and braced or Scala 3 indented cleanup. Focused validation passes 39 CFG, 18 ICFG, 10 semantic-IR, 93 language-conformance, 11 provider, and 497 definition tests plus 25 call-site and 5 call-relation unit tests.
+
+#815 Milestone 4h completes the Ruby adapter checkpoint. Top-level and type initializers, instance and singleton methods, constructors, lambdas, attached blocks, common control, implicit returns, `case`, calls, safe navigation, explicit throw, rescue/else/ensure, retry, yield, and non-local block completion now use the same immutable CFG, exact-location dispatch, and context-bearing ICFG as the previous languages. Ruby-specific uncertainty remains explicit for metaprogramming, callable-table mutation, implicit pattern/operator protocols, resources, fibers, threads, ractors, generators, and dynamic invocation. Review proves parser-ordered local activation, creation-time closure capture, exact cleanup routing, matched bare and singleton calls, and typed callable-object boundaries. Focused validation passes 39 CFG, 18 ICFG, 10 semantic-IR, 111 language-conformance, 11 provider, 497 definition, and 17 Ruby library/dispatch tests.
+
+#815 Milestone 4i completes the C/C++ checkpoint and therefore the eleven-language adapter rollout. C and C++ functions, methods, constructors, destructors, operators, lambdas, common control, switch fallthrough, goto, calls, C VLA bounds, explicit throw, handlers, and known cleanup now use the same immutable CFG, exact-location dispatch, and context-bearing ICFG as every other analyzable language. Structured declaration/definition and template-qualified resolution preserve exact cross-file transfers; preprocessing, linkage uncertainty, default arguments, conversions, temporary/RAII cleanup, implicit calls and exceptions, spawn, coroutines, `noexcept`, evaluation-order latitude, and platform extensions remain exact gaps. Cross-language review also made matched-return evidence path-sensitive and budgeted, made every unresolved boundary non-complete, and preserved exact unsupported capabilities. Focused validation passes 39 CFG, 25 ICFG, 10 semantic-IR, 129 language-conformance, 11 provider, 9 ICFG-unit, 14 call-relation-unit, and 498 definition tests.
+
+The focused #817 lifecycle slice now also completes the all-language rollout ExecPlan. Provenance-recorded release matrices retain bidirectional edge-ID rows and reject production SQLite for the current control/call artifact even though packed hydration is much faster: the large TypeScript corpus failed the absolute build-plus-write gate. `.agents/docs/semantic-cfg-lifecycle-benchmark-2026-07-20.md` preserves every retained sample, median, retained size, gate, and provenance record. Production keeps immutable byte-bounded per-file artifacts, generation-local ICFG stitching, and ephemeral bounded slices. The broader roadmap still owns value/heap oracles, data dependence, solver tables, and reusable summary measurements. A read-only architecture audit found one shared ICFG rather than per-language implementations, but also found roughly 4,000-6,000 lines of conservatively removable adapter substrate; the recommended next planning checkpoint is a shared lowering-session/call-scaffold extraction plus a generic dispatch-oracle/ICFG-stitcher split before those layers widen.
+
+#815 Milestone 1a is the first implementation checkpoint after #814. It preserves the rich edge payload once, assigns canonical procedure-local edge IDs, and supplies exact outgoing and incoming views without selecting persistence or exposing query vocabulary. Specialist review corrected topology counting for provenance-parallel edges, made invalid procedure-local point IDs fail explicitly, required canonical incoming hydration order, and strengthened renderer-schema assertions. The complete feature suite and strict all-feature clippy pass; production semantic lowering remains the next checkpoint rather than an implied capability of this graph substrate.
+
+#815 Milestones 1b and 1c provide the first production semantic materialization path and real language adapter. The provider routes exact files through analyzer delegates, atomically snapshots bounded disk or overlay source with dialect identity, publishes only validated artifacts, and retains complete values in a byte-weighted cancellation-aware single-flight cache. TypeScript and TSX now lower callable-local control, expression-level calls, handlers and cleanup, supported async flow, and disconnected dead source through an iterative builder; unsupported advanced semantics remain capability- and point-scoped. The multiline graph harness asserts source-backed predecessor/successor topology and bounded deterministic rendering. Focused tests, strict clippy, the complete `nlp,python` suite, and post-milestone review pass. Java remains the second reference adapter before dispatch and matched ICFG stitching freeze the shared contract.
+
+#815 Milestone 2 completes the second reference adapter. Java lowers methods, constructors, lambdas, executable field/interface/enum initializers, branches, loops, calls, switch statements and expressions, explicit throw, catch/finally, and cleanup relays, while try-with-resources, monitor behavior, implicit exceptions, initializer scheduling, and other omissions remain typed and point-scoped. The differential suite introduced a neutral cleanup-safe switch-yield channel and verified label-equivalent TypeScript/Java core topology. A provenance-recorded release benchmark kept bidirectional edge-ID rows: outgoing-only storage saved memory but made reverse traversal orders of magnitude slower at scale, and flat rows made both directions unacceptable. All focused tests, strict all-feature clippy, the complete `nlp,python` suite, and specialist review pass. The next contract pressure is the location-first dispatch slice and one matched TypeScript/Java ICFG.
+
+#815/#818 Milestone 3 completes that contract pressure. Exact whole-call source locations now flow through the established call resolver, preserving every proof and incomplete outcome. One generation-local provider lazily materializes callees and builds bounded dense slices whose nodes carry exact call-site contexts, so two callers of one procedure and recursive calls return only to their own normal or exceptional continuations. Root and target source identities are checked atomically, unknown calls terminate at typed boundaries, and limits cannot publish orphan graph nodes. The inline harness asserts predecessor/successor topology using source aliases and call contexts rather than dense IDs. Focused tests, strict clippy, the complete `nlp,python` repository suite, and specialist review pass. Remaining language adapters now depend on this frozen boundary rather than creating per-language ICFGs.
 
 ## Context and Orientation
 
@@ -808,7 +983,7 @@ Record true/false positives and negatives, abstention, cold construction, warm i
 
 #826 then evaluates two separate questions. First, whether WPDS-style weights materially improve summary or proof composition. Second, whether a synchronized field/call pushdown component materially improves access-path precision beyond #816. The legitimate outcome is “not yet”; no extension is accepted without exact correctness and resource evidence, and baseline clients must not pay a material disabled cost.
 
-After the pilot, open adapter rollout children under #815 and #816 using the stabilized conformance contract. Do not make every language a prerequisite for shipping the first useful typestate analysis.
+After the TypeScript/Java CFG and ICFG reference contract passes its focused review, begin the per-language #815/#816 rollout recorded in `.agents/plans/all-language-cfg-icfg-rollout.md`. That rollout may proceed alongside the solver and TypeScript/Java typestate pilot: all languages are required by the focused CFG/ICFG plan, but they do not block shipping the first useful TypeScript/Java typestate analysis.
 
 ## Concrete Steps
 
@@ -1204,22 +1379,22 @@ The #824 bridge between the public and internal typestate models is explicit:
 
 The initial #709 implementation may execute only `PolicyAnalysis::Match`, but it parses and retains versioned public `TaintPolicySpec` and `TypestatePolicySpec` values without importing `TaintAnalysisPlan`/`ProtocolSpec` or inventing solver semantics. #824 supplies the compilers above plus adapters from `AnalysisRun<FlowFinding>`, `AnalysisRun<TaintFinding>`, and `AnalysisRun<TypestateFinding>` after those clients exist. There is no context-free conversion from `CodeQueryMatch` or an analysis finding into `PolicyFinding`: evaluation always requires a `PolicyDefinition`. Human and SARIF renderers consume only `PolicyRun`/`PolicyFinding`.
 
-The semantic adapter boundary materializes a mounted source artifact once and resolves procedures inside it:
+The semantic adapter boundary materializes a mounted source artifact once from one prepared syntax snapshot and resolves procedures inside it:
 
     trait ProgramSemanticsProvider {
-        fn language(&self) -> SemanticLanguage;
-        fn capabilities(&self) -> &SemanticCapabilities;
-        fn artifact_key(
+        fn materialize(
             &self,
             file: &ProjectFile,
-            budget: &mut SemanticBudget,
-        ) -> Result<SemanticOutcome<SemanticArtifactKey>, SemanticProviderError>;
-        fn artifact(
-            &self,
-            key: &SemanticArtifactKey,
-            budget: &mut SemanticBudget,
+            request: &mut SemanticRequest<'_>,
         ) -> Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError>;
     }
+
+    struct SemanticRequest<'a> {
+        budget: &'a mut SemanticBudget,
+        cancellation: &'a CancellationToken,
+    }
+
+The provider derives the source revision, dialect-sensitive artifact key, parsed tree, and lowered artifact from the same `TreeSitterAnalyzer::prepared_syntax` value. This atomic operation replaces the earlier split key/artifact sketch, which could race a source or overlay update. Complete artifacts alone enter the bounded per-analyzer cache; cancellation and incomplete outcomes remain explicit and are never cached as complete.
 
 `SemanticArtifact` owns a dense procedure table. `ProcedureHandle` retains an `Arc<SemanticArtifact>` plus its artifact-local `ProcedureId`; local value, point, call, and memory IDs cross provider/oracle boundaries only together with that procedure scope. `ProcedureSemantics` owns dense local IDs, source mappings, semantic effects, and an immutable CFG. It does not own solver facts or protocol states.
 
@@ -1394,3 +1569,35 @@ Plan revision note (2026-07-16): Issue #814 diagnosis corrected the original pro
 Plan revision note (2026-07-16): Completed #814 at reviewed checkpoint `648a9fec`. The final contract uses typed continuations and exact outgoing topology, bidirectional subject-scoped gaps/evidence, direct-child unmaterialized targets, separate provider errors and semantic outcomes, atomic total-payload budgets, indexed validation, streaming bounded rendering, portable shared language/path identity, and materialization-scoped handles. Validation passed 59 semantic unit tests, 10 TypeScript/Java contract tests, the complete `nlp,python` suite, all-target/all-feature clippy with warnings denied, formatting, and diff checks. #815, #816, and #818 retain adapter/CFG, oracle/refinement, and matched-ICFG ownership respectively.
 
 Plan revision note (2026-07-16): Guided review against rebased `origin/master` produced and resolved four findings in `1faf8b9b`. Edge-typed normal and exceptional arms may now converge; recognized callable creation retains typed target uncertainty without requiring a locator; balanced bounded rendering is shared with Rune IR; and registry counting is centralized. The corrected complete `nlp,python` suite and all-feature clippy passed before publication.
+
+Plan revision note (2026-07-17): Began #815 implementation through `.agents/plans/all-language-cfg-icfg-rollout.md`. The focused plan carries the TypeScript/Java CFG reference slice through the dispatch prerequisite, one matched-return ICFG, all eleven analyzable-language adapters, and a measured CFG/ICFG lifecycle decision under #817 while keeping public query, solver, value/heap, and typestate layers outside its scope.
+
+Plan revision note (2026-07-17): Pre-checkpoint review clarified that remaining adapter children begin after the TypeScript/Java CFG/ICFG contract review and may run alongside later solver/pilot work, rather than waiting until after #825. This preserves the focused plan's all-language endpoint without making that rollout a prerequisite for the first TypeScript/Java typestate release.
+
+Plan revision note (2026-07-17): Recorded completion of #815 Milestone 1a. The language-neutral semantic contract now includes canonical procedure-local rich-edge IDs, immutable outgoing/incoming adjacency, exact traversal, defensive hydration checks, scoped handles, and bounded schema-v2 rendering. This is only the CFG storage substrate; the file-aware provider, iterative builder, TypeScript/TSX lowering, Java differential contract, and shared ICFG remain tracked in the focused all-language plan.
+
+Plan revision note (2026-07-17): Recorded completion of #815 Milestones 1b and 1c. Semantic materialization now uses one bounded exact source snapshot with disk/overlay origin, overlay revision, and dialect identity; complete artifacts alone enter a retained-byte single-flight cache. The private iterative builder and first real TypeScript/TSX adapter cover the common callable-control core, preserve dead source behind a generic isolation seal, and expose source-backed predecessor/successor tests. Java, layout measurement, dispatch, and the shared ICFG remain in the focused rollout plan.
+
+Plan revision note (2026-07-17): Recorded completion of #815 Milestone 2. The Java reference adapter now passes the common and extended differential CFG contract, including cleanup-safe switch yield and executable initializer fragments with exact gaps. The measured hot representation remains one canonical edge table with outgoing offsets and incoming edge-ID rows; outgoing-only memory savings did not justify multi-second reverse traversal. Location-first dispatch and the matched TypeScript/Java ICFG are now the next focused checkpoint.
+
+Plan revision note (2026-07-17): Recorded completion of the #816 dispatch prerequisite and #818 TypeScript/Java internal control slice. Exact call expressions reuse the existing resolver, while one bounded context-bearing provider owns generation validation, invoke expansion, matched returns, typed boundaries, and dense predecessor/successor snapshots. The reviewed cross-language adapter boundary is frozen; value/heap transfer, public query exposure, and solver work remain outside the focused rollout.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4a. JavaScript and JSX now pass the same source-backed callable CFG and matched-return ICFG contract as the reference pair through a flavor-aware shared JS/TS lowerer. JavaScript resource management, generator suspension, and JSX uncertainty remain exact point-scoped gaps; the remaining adapters continue in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4b after specialist review. C# now passes the shared callable-CFG and matched-return ICFG contract with structured control, handlers, cleanup, async points, nested callable identity, and exact advanced-feature gaps. Review corrected grammar-sensitive indexed-call, target-typed-initializer, and conditional-compilation omissions; Python is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4c after specialist review. Python now passes the shared callable-CFG and matched-return ICFG contract with exact loop-else, nested callable ownership, handlers and cleanup, typed protocol gaps, and deferred coroutine/generator invocation. Review corrected comprehension eager evaluation, comparison short-circuiting, assertion failure routing, loop-target evaluation, and truth-protocol gaps; Go is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4d after specialist review. Go now passes the shared callable-CFG and matched-return ICFG contract across functions, methods, literals, branches, loops, calls, range, channel operands, deferred calls, and goroutine creation. Review made selected-only call omissions and partially unspecified evaluation order explicit and proved shadowed `panic`/`recover` dispatch; Rust is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4e after specialist review. Rust now passes the shared callable-CFG and matched-return ICFG contract across functions, methods, nested callables, labels, match, loops, calls, semicolonless tails, `?`, await, and generators. Review made parameter, lexical, pattern-binding, assignment-replacement, and abrupt-path RAII omissions exact; stopped unsupported try blocks and macros at typed boundaries; exposed implicit trait calls; corrected labeled-block break routing; and enabled generic/turbofish dispatch without regressing grouped imports. PHP is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4f after specialist review. PHP now passes the shared callable-CFG and matched-return ICFG contract across functions, methods, nested callables, branches, loops, numeric control, nullish and nullsafe flow, switch, match, calls, explicit throw, handlers, and cleanup. Review corrected chain-scoped skipping, coalescing, grammar-sensitive loop and switch behavior, first-class callable recognition, method-return inference, bounded call selection, ambiguous boundaries, and cleanup specialization; Scala is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4g after specialist review. Scala now passes the shared callable-CFG and matched-return ICFG contract across functions, methods, constructors, nested callables, expression-valued branches, loops, match, curried and generic application, operators, explicit throw, handlers, and cleanup. Review corrected callable ownership, non-local closure return, constructor/arity shape, wrapper resolution, nested-call pruning, structured-argument cardinality, and by-name or implicit-call completeness; Ruby is the next adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-18): Recorded completion of #815 Milestone 4h after specialist review. Ruby now passes the shared callable-CFG and matched-return ICFG contract across methods, initializers, lambdas, attached blocks, common control, implicit returns, calls, safe navigation, explicit throw, handlers, cleanup, and non-local block completion. Review corrected pattern evaluation, callable-table mutation, destructured writers, bounded binding collection, cleanup routing, overrideable dispatch, lifecycle blocks, dynamic callable boundaries, and parser-ordered binding/capture semantics; C/C++ is the final adapter checkpoint in the focused rollout plan.
+
+Plan revision note (2026-07-19): Recorded completion of #815 Milestone 4i after C/C++ and all-language specialist review. Every analyzable language now supplies source-backed callable CFGs and matched calls through one exact-location dispatch facade and one context-bearing ICFG. C/C++ adds structured link-unit identity and caller-side implicit-evaluation gaps without introducing another graph or resolver, while shared return evidence is path-relevant and every unresolved boundary is non-complete.
+
+Plan revision note (2026-07-20): Recorded completion of the focused #817 semantic/CFG lifecycle measurement. Fresh-process release matrices over generated shapes and pinned TypeScript/Java repositories confirm bidirectional rows and produce a measured SQLite no-go because the optimistic control/call projection misses the large-corpus absolute write-overhead gate. Aggregate schema v5 separates sample-time Bifrost identity, aggregation-time recommendation identity, and per-dataset repository identity. The same pass recorded the post-rollout architecture audit: preserve adapter-owned syntax semantics, extract their repeated emission and call scaffold into a shared lowering session, replace language checks in the generic ICFG with typed gap impacts, and separate workspace dispatch from language-neutral stitching before value/heap and data-dependence implementation. This is a recommendation for a dedicated follow-up ExecPlan, not an unreviewed source refactor.
