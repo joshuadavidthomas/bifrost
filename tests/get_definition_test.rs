@@ -11694,6 +11694,104 @@ public class UseMap {
 }
 
 #[test]
+fn java_explicit_import_beats_same_named_same_package_type() {
+    let imported_source = r#"
+package app;
+
+import target.Channel;
+
+public interface ImportedHandler {
+    void connected(Channel channel);
+}
+"#;
+    let same_package_source = r#"
+package app;
+
+public interface LocalHandler {
+    void connected(Channel channel);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "target/Channel.java",
+            "package target; public interface Channel {}\n",
+        )
+        .file(
+            "app/Channel.java",
+            "package app; public interface Channel {}\n",
+        )
+        .file("app/ImportedHandler.java", imported_source)
+        .file("app/LocalHandler.java", same_package_source)
+        .build();
+
+    let imported = lookup(
+        project.root(),
+        &location_reference(
+            "app/ImportedHandler.java",
+            imported_source,
+            imported_source
+                .find("Channel channel")
+                .expect("imported type"),
+        ),
+    );
+    assert_eq!(imported["results"][0]["status"], "resolved", "{imported}");
+    assert_eq!(
+        imported["results"][0]["definitions"][0]["fqn"], "target.Channel",
+        "an explicit single-type import must constrain the simple name before same-package lookup: {imported}"
+    );
+
+    let local = lookup(
+        project.root(),
+        &location_reference(
+            "app/LocalHandler.java",
+            same_package_source,
+            same_package_source
+                .find("Channel channel")
+                .expect("same-package type"),
+        ),
+    );
+    assert_eq!(local["results"][0]["status"], "resolved", "{local}");
+    assert_eq!(
+        local["results"][0]["definitions"][0]["fqn"], "app.Channel",
+        "without an explicit import the same-package type must remain visible: {local}"
+    );
+}
+
+#[test]
+fn java_missing_explicit_import_does_not_fall_back_to_same_package_type() {
+    let source = r#"
+package app;
+
+import missing.Channel;
+
+public interface Handler {
+    void connected(Channel channel);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "app/Channel.java",
+            "package app; public interface Channel {}\n",
+        )
+        .file("app/Handler.java", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "app/Handler.java",
+            source,
+            source.find("Channel channel").expect("imported type"),
+        ),
+    );
+
+    assert_eq!(
+        value["results"][0]["status"], "unresolvable_import_boundary",
+        "a matched explicit import must block same-package fallback even when its target is outside the workspace: {value}"
+    );
+}
+
+#[test]
 fn java_local_value_returns_no_definition() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
