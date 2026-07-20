@@ -35,7 +35,8 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             property: 'og:image:alt',
-            content: 'Bifrost static analysis for agents, editors, and large repositories.',
+            content:
+              'Bifrost code intelligence for AI, with structural queries and multi-language analysis designed for repository-scale use.',
           },
         },
         { tag: 'meta', attrs: { name: 'twitter:image', content: socialCardUrl } },
@@ -43,7 +44,8 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             name: 'twitter:image:alt',
-            content: 'Bifrost static analysis for agents, editors, and large repositories.',
+            content:
+              'Bifrost code intelligence for AI, with structural queries and multi-language analysis designed for repository-scale use.',
           },
         },
       ],
