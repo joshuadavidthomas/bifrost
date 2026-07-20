@@ -31,8 +31,8 @@ use super::namespace::{
     scala_type_reference_is_singleton, scala_unindexed_type_binding_shadows,
 };
 use super::resolver::{
-    import_candidate_fq_names, preferred_scala_type, scala_builtin_type_name,
-    scala_extension_receiver_matches_resolved, scala_literal_type_name, scala_normalized_fq_name,
+    preferred_scala_type, scala_builtin_type_name, scala_extension_receiver_matches_resolved,
+    scala_literal_type_name, scala_normalized_fq_name,
 };
 use super::shared::ScalaEdgeGraph;
 use super::syntax::{
@@ -61,8 +61,9 @@ use crate::analyzer::scala::{
     ScalaAdapter, ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaExportSelector,
     ScalaSupertypeLookupPath, ScalaWildcardOwnerFacts, resolve_scala_explicit_import_tier,
     resolve_scala_wildcard_import_environment, scala_class_parameter_field_keyword,
-    scala_enclosing_package_root_candidates, scala_import_path, scala_normalize_full_name,
-    scala_simple_type_name, scala_supertype_lookup_nodes, scala_type_lookup_segments,
+    scala_enclosing_package_root_candidates, scala_import_path, scala_import_path_candidates,
+    scala_normalize_full_name, scala_simple_type_name, scala_supertype_lookup_nodes,
+    scala_type_lookup_segments,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usage_facts::CallableFacts;
@@ -5195,6 +5196,23 @@ impl VisibleNameBindings {
     }
 }
 
+fn add_wildcard_member_bindings(
+    member_names: &mut VisibleNameBindings,
+    declarations: impl IntoIterator<Item = CodeUnit>,
+) {
+    for declaration in declarations {
+        if declaration.is_function() || declaration.is_field() {
+            let visible_name = declaration
+                .short_name()
+                .rsplit('.')
+                .next()
+                .unwrap_or(declaration.short_name())
+                .to_string();
+            member_names.add_declaration(visible_name, &declaration, 128);
+        }
+    }
+}
+
 fn add_hierarchy_package_type_bindings<F>(
     names: &mut VisibleNameBindings,
     types: &ProjectTypes,
@@ -5610,8 +5628,7 @@ impl NameResolver {
             imports,
             active_package_prefixes,
             |candidate| ScalaWildcardOwnerFacts {
-                package: !types.package_types_in(candidate).is_empty()
-                    || !types.package_objects_in(scala, candidate).is_empty(),
+                package: types.index.package_exists(candidate),
                 stable_singleton: types
                     .object_by_normalized_fqn(scala, &scala_normalized_fq_name(candidate))
                     .is_some(),
@@ -5672,23 +5689,81 @@ impl NameResolver {
         }
 
         if include_members {
-            let active_package = active_package_prefixes
-                .last()
-                .map(String::as_str)
-                .unwrap_or_default();
+            // Resolve term and extension bindings one import at a time. An
+            // ambiguous earlier wildcard must not erase a later, independent
+            // wildcard import; it only contributes no bindings of its own.
             for import in imports.iter().filter(|import| import.is_wildcard) {
-                let Some(path) = scala_import_path(import) else {
+                let environment = resolve_scala_wildcard_import_environment(
+                    std::slice::from_ref(import),
+                    active_package_prefixes,
+                    |candidate| ScalaWildcardOwnerFacts {
+                        package: types.index.package_exists(candidate),
+                        stable_singleton: types
+                            .object_by_normalized_fqn(scala, &scala_normalized_fq_name(candidate))
+                            .is_some(),
+                    },
+                );
+                if environment.ambiguous {
                     continue;
-                };
-                for candidate in import_candidate_fq_names(&path, active_package) {
-                    for declaration in types.index.fqn_direct_children(&candidate) {
-                        if declaration.is_function() || declaration.is_field() {
-                            member_names.add_declaration(
-                                declaration.identifier().to_string(),
-                                &declaration,
-                                128,
+                }
+                for owner in &environment.owners {
+                    if owner.is_singleton() {
+                        let normalized_owner = scala_normalized_fq_name(&owner.declaration_fqn());
+                        if let Some(declaration) =
+                            types.object_by_normalized_fqn(scala, &normalized_owner)
+                        {
+                            add_wildcard_member_bindings(
+                                &mut member_names,
+                                types.index.fqn_direct_children(&declaration.fq_name()),
                             );
+                            for (visible_name, member_fqn) in
+                                types.exported_member_bindings(scala, declaration)
+                            {
+                                member_names.add_candidate(visible_name, member_fqn, None, 128);
+                            }
                         }
+                        wildcard_extension_owners.push(normalized_owner);
+                    } else {
+                        add_wildcard_member_bindings(
+                            &mut member_names,
+                            types.index.fqn_direct_children(&owner.fqn),
+                        );
+                        wildcard_extension_owners.push(owner.fqn.clone());
+                    }
+                }
+
+                // Parser-recorded import paths omit Scala's physical `$`
+                // separators. Bridge that logical path to one exact stable
+                // type owner as well as its term companion: enum cases are
+                // children of the enum type, not of an explicit companion
+                // object such as Duration.Units.
+                if let Some(path) = scala_import_path(import) {
+                    let import_prefixes = import
+                        .path
+                        .as_ref()
+                        .map(|path| path.lexical_prefixes.as_slice())
+                        .filter(|prefixes| !prefixes.is_empty())
+                        .unwrap_or(active_package_prefixes);
+                    for candidate in scala_import_path_candidates(&path, import_prefixes) {
+                        let normalized = scala_normalized_fq_name(&candidate);
+                        let mut stable_owners = types
+                            .index
+                            .by_normalized_fqn(&normalized)
+                            .iter()
+                            .filter(|unit| unit.is_class() && !unit.short_name().ends_with('$'))
+                            .filter(|unit| types.type_is_stable_owner(scala, unit));
+                        let Some(owner) = stable_owners.next() else {
+                            continue;
+                        };
+                        if stable_owners.next().is_some() {
+                            break;
+                        }
+                        add_wildcard_member_bindings(
+                            &mut member_names,
+                            types.index.fqn_direct_children(&owner.fq_name()),
+                        );
+                        wildcard_extension_owners.push(normalized);
+                        break;
                     }
                 }
             }

@@ -5650,6 +5650,64 @@ abstract class Use extends FixtureSuite {
 }
 
 #[test]
+fn scala_wildcard_members_resolve_nested_enum_and_isolate_ambiguous_imports() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        (
+            "kyo/Definitions.scala",
+            r#"package kyo
+
+object Duration:
+  enum Units:
+    case Days, Weeks
+  object Units:
+    val all = List(Days, Weeks)
+
+object Ansi:
+  extension (value: String) def cyan: String = value
+
+object internal:
+  def collision: Int = 1
+"#,
+        ),
+        (
+            "kyo/internal/Package.scala",
+            r#"package kyo.internal
+def collision: Int = 2
+"#,
+        ),
+        (
+            "use/Use.scala",
+            r#"package use
+
+import kyo.Duration.Units.*
+import kyo.internal.*
+import kyo.Ansi.*
+
+object Use:
+  val week = Weeks // positive-mixed-enum-owner
+  val shade = "value".cyan // positive-later-unambiguous-wildcard
+  val unresolved = collision // negative-ambiguous-wildcard
+"#,
+        ),
+    ]);
+
+    for (target_fqn, marker) in [
+        ("kyo.Ansi$.cyan", "positive-later-unambiguous-wildcard"),
+        ("kyo.Duration$.Units.Weeks", "positive-mixed-enum-owner"),
+    ] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_hit_contains(&target_hits, marker);
+    }
+
+    for target_fqn in ["kyo.internal$.collision", "kyo.internal.collision"] {
+        let target = definition(&analyzer, target_fqn);
+        let target_hits = authoritative_scala_hits(&analyzer, &target);
+        assert_no_hit_contains(&target_hits, "negative-ambiguous-wildcard");
+    }
+}
+
+#[test]
 fn scala_file_major_parity_callable_negatives_fail_closed() {
     let source = r#"package paritynegative
 
