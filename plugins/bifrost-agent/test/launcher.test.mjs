@@ -458,7 +458,8 @@ test("parses launcher args", () => {
 });
 
 test("exposes cache root override and version compatibility helper", async () => {
-  assert.equal(cacheRootFor({ BIFROST_LAUNCHER_CACHE_DIR: "/tmp/bifrost-cache" }), "/tmp/bifrost-cache");
+  const cacheOverride = "/tmp/bifrost-cache";
+  assert.equal(cacheRootFor({ BIFROST_LAUNCHER_CACHE_DIR: cacheOverride }), path.resolve(cacheOverride));
   assert.equal(isVersionCompatible("0.7.2", "v0.7.2"), true);
   assert.equal(await findOnPath("definitely-not-bifrost", "", undefined, process.cwd()), null);
 });
