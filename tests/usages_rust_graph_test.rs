@@ -3633,7 +3633,7 @@ fn run(x: Foo) {
 }
 
 #[test]
-fn rust_graph_strategy_does_not_seed_trait_receivers_from_non_concrete_parameter_types() {
+fn rust_graph_strategy_resolves_dyn_and_impl_trait_receivers() {
     let (project, analyzer) = rust_analyzer_with_files(&[
         (
             "src/service.rs",
@@ -3642,15 +3642,22 @@ pub struct Foo;
 pub trait Worker {
     fn work(&self);
 }
+pub trait Other {
+    fn work(&self);
+}
 impl Worker for Foo {
     fn work(&self) {}
+}
+pub struct Inherent;
+impl Inherent {
+    pub fn work(&self) {}
 }
 "#,
         ),
         (
             "src/main.rs",
             r#"
-use crate::service::Worker;
+use crate::service::{Inherent, Other, Worker};
 
 fn generic<T: Worker>(x: T) {
     x.work();
@@ -3663,21 +3670,36 @@ fn opaque(x: impl Worker) {
 fn dynamic(x: &dyn Worker) {
     x.work();
 }
+
+fn other_opaque(x: impl Other) {
+    x.work();
+}
+
+fn other_dynamic(x: &dyn Other) {
+    x.work();
+}
+
+fn inherent(x: &Inherent) {
+    x.work();
+}
 "#,
         ),
     ]);
 
-    let target = member(&analyzer, &project.file("src/service.rs"), "Worker", "work");
-    let hits = brokk_bifrost::usages::RustExportUsageGraphStrategy::new()
-        .find_usages(
-            &analyzer,
-            std::slice::from_ref(&target),
-            &analyzer.get_analyzed_files().into_iter().collect(),
-            1000,
-        )
-        .into_either()
-        .expect("non-concrete trait receiver success");
-    assert!(hits.is_empty());
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = brokk_bifrost::usages::RustExportUsageGraphStrategy::new();
+    for (owner, expected) in [("Worker", 2), ("Other", 2), ("Inherent", 1)] {
+        let target = member(&analyzer, &project.file("src/service.rs"), owner, "work");
+        let hits = strategy
+            .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+            .into_either()
+            .expect("structured trait receiver success");
+        assert_eq!(
+            expected,
+            hits.len(),
+            "{owner}.work receiver hits: {hits:#?}"
+        );
+    }
 }
 
 #[test]

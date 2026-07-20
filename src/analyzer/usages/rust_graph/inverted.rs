@@ -534,6 +534,13 @@ fn type_node_fqn_with_impl(
                 .named_children(&mut cursor)
                 .find_map(|child| type_node_fqn_with_impl(child, source, refs, impl_owner_fqn))
         }
+        "abstract_type" | "dynamic_type" => {
+            type_node
+                .child_by_field_name("trait")
+                .and_then(|trait_node| {
+                    type_node_fqn_with_impl(trait_node, source, refs, impl_owner_fqn)
+                })
+        }
         "generic_type" => {
             let base = type_node.child_by_field_name("type")?;
             let base_name = type_node_last_segment(base, source)?;

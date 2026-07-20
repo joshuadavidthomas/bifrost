@@ -947,10 +947,12 @@ fn receiver_type_matches_requested_dispatch(fqn: &str, ctx: &MemberScanCtx<'_>) 
 
     ctx.target_owner_is_trait.then(|| {
         receiver_types.into_iter().any(|receiver_type| {
-            ctx.rust
-                .get_ancestors(&receiver_type)
-                .iter()
-                .any(|ancestor| same_rust_declaration_identity(ancestor, ctx.owner))
+            same_rust_declaration_identity(&receiver_type, ctx.owner)
+                || ctx
+                    .rust
+                    .get_ancestors(&receiver_type)
+                    .iter()
+                    .any(|ancestor| same_rust_declaration_identity(ancestor, ctx.owner))
         })
     })
 }

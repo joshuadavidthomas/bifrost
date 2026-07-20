@@ -386,7 +386,7 @@ pub fn caller() {
 }
 
 #[test]
-fn unsupported_trait_object_receiver_emits_no_partial_edge() {
+fn trait_object_and_impl_trait_receivers_create_exact_trait_edges() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
             "src/lib.rs",
@@ -409,15 +409,27 @@ impl Other {
 pub fn ambiguous(receiver: &dyn Runner) {
     receiver.run();
 }
+
+pub fn opaque(receiver: impl Runner) {
+    receiver.run();
+}
 "#,
         )
         .build();
 
     let value = common::usage_graph::usage_graph_at(project.root(), "{}");
     assert!(
+        find_edge(&value, "ambiguous", "Runner.run").is_some()
+            && find_edge(&value, "opaque", "Runner.run").is_some(),
+        "structured trait receiver types must edge to Runner.run: {}",
+        value["edges"]
+    );
+    assert!(
         find_edge(&value, "ambiguous", "Service.run").is_none()
-            && find_edge(&value, "ambiguous", "Other.run").is_none(),
-        "unsupported trait-object receiver must not emit partial same-name edges: {}",
+            && find_edge(&value, "ambiguous", "Other.run").is_none()
+            && find_edge(&value, "opaque", "Service.run").is_none()
+            && find_edge(&value, "opaque", "Other.run").is_none(),
+        "trait receivers must not emit partial same-name inherent edges: {}",
         value["edges"]
     );
 }
