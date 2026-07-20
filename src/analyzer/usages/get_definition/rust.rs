@@ -718,7 +718,7 @@ fn rust_visible_import_resolution(
             }
         }
     }
-    let targets = rust.resolve_imported_export_from_binder_forward(file, &binder, reference);
+    let targets = rust_forward_import_targets(rust, file, &binder, reference);
     let mut candidates = Vec::new();
     for (target_file, target_name) in targets {
         candidates.extend(rust_import_target_candidates(
@@ -785,11 +785,34 @@ fn rust_import_target_candidates(
             continue;
         };
         let binder = lexical_scope::visible_import_binder_at(&source, source.len());
-        pending.extend(rust.resolve_imported_export_from_binder_forward(&file, &binder, &name));
+        pending.extend(rust_forward_import_targets(rust, &file, &binder, &name));
     }
     sort_units(&mut candidates);
     candidates.dedup();
     candidates
+}
+
+fn rust_forward_import_targets(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    binder: &ImportBinder,
+    reference: &str,
+) -> Vec<(ProjectFile, String)> {
+    let mut targets = rust.resolve_imported_export_from_binder_forward(file, binder, reference);
+    for (local_name, binding) in &binder.bindings {
+        if local_name != reference || binding.kind != ImportKind::Named {
+            continue;
+        }
+        let imported = binding.imported_name.as_deref().unwrap_or(reference);
+        targets.extend(
+            rust.resolve_module_files(file, &binding.module_specifier)
+                .into_iter()
+                .map(|target_file| (target_file, imported.to_string())),
+        );
+    }
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 #[allow(clippy::too_many_arguments)]

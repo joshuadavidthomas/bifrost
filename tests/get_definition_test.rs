@@ -4818,14 +4818,19 @@ fn exercise() {
         .file("src/outer/middle/child.rs")
         .read_to_string()
         .expect("nested child source");
-    let error = nested_child.rfind("Error").expect("nested parent import use");
+    let error = nested_child
+        .rfind("Error")
+        .expect("nested parent import use");
     let value = lookup(
         project.root(),
         &location_reference("src/outer/middle/child.rs", &nested_child, error),
     );
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "outer.error.Error", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "outer.error.Error",
+        "{value}"
+    );
     assert_eq!(
         result["definitions"][0]["path"], "src/outer/error.rs",
         "{value}"
