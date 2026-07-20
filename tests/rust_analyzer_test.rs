@@ -195,6 +195,7 @@ pub struct Option;
             r#"
 // Impl owner members stay indexed without nominal stand-ins.
 use crate::model::Writer;
+use crate::model as m;
 use std::option::Option;
 
 trait LocalTrait {
@@ -206,6 +207,10 @@ trait LocalTrait {
 
 impl Writer {
     fn write(&self) {}
+}
+
+impl LocalTrait for m::Writer {
+    fn act(&self) {}
 }
 
 impl LocalTrait for Option<u8> {
@@ -239,8 +244,18 @@ impl LocalTrait for Self {
         writer_method.source().rel_path().to_string_lossy(),
         "src/impls.rs"
     );
+    let namespace_writer_method = definition(&analyzer, "model.Writer.act");
+    assert_eq!(
+        namespace_writer_method
+            .source()
+            .rel_path()
+            .to_string_lossy(),
+        "src/impls.rs"
+    );
 
     assert!(analyzer.get_definitions("impls.Writer").is_empty());
+    assert!(analyzer.get_definitions("impls.m.Writer").is_empty());
+    assert!(analyzer.get_definitions("m.Writer.act").is_empty());
     assert!(analyzer.get_definitions("impls.Option").is_empty());
     assert!(analyzer.get_definitions("impls.S").is_empty());
     assert!(analyzer.get_definitions("impls.F").is_empty());

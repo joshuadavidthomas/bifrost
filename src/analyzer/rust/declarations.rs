@@ -842,7 +842,7 @@ fn rust_impl_owner(
             local_identity
         }
     } else {
-        rust_impl_owner_identity_from_path(file, package_name, &target_path)?
+        rust_impl_owner_identity_from_path(file, package_name, &target_path, import_binder)?
     };
 
     rust_declared_impl_owner(parsed, &identity).or_else(|| {
@@ -875,14 +875,34 @@ fn rust_impl_owner_identity_from_path(
     file: &ProjectFile,
     package_name: &str,
     path: &[String],
+    import_binder: &ImportBinder,
 ) -> Option<RustImplOwnerIdentity> {
     let (name, module_path) = path.split_last()?;
-    let module_specifier = module_path.join("::");
-    let package_name = super::imports::resolve_rust_module_path_with_crate(
-        package_name,
-        &super::imports::rust_crate_root_package(file),
-        &module_specifier,
-    )?;
+    let crate_package = super::imports::rust_crate_root_package(file);
+    let package_name = if let Some((root, remainder)) = module_path.split_first()
+        && let Some(binding) = import_binder.bindings.get(root)
+        && binding.kind == ImportKind::Namespace
+    {
+        let mut resolved = super::imports::resolve_rust_module_path_with_crate(
+            package_name,
+            &crate_package,
+            &binding.module_specifier,
+        )?;
+        for component in remainder {
+            if !resolved.is_empty() {
+                resolved.push('.');
+            }
+            resolved.push_str(component);
+        }
+        resolved
+    } else {
+        let module_specifier = module_path.join("::");
+        super::imports::resolve_rust_module_path_with_crate(
+            package_name,
+            &crate_package,
+            &module_specifier,
+        )?
+    };
 
     Some(RustImplOwnerIdentity {
         package_name,
