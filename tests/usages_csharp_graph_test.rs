@@ -5870,6 +5870,184 @@ namespace App {
 }
 
 #[test]
+fn usage_finder_csharp_finds_nameof_type_roles_with_persisted_parity() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/NameofTypes.cs",
+            r#"namespace Example;
+
+public sealed class Target {
+    public const string Value = "";
+}
+
+public sealed class Other {
+    public const string Value = "";
+}
+
+public sealed class Consumer {
+    public enum Nested { Value }
+
+    public string Direct() => nameof(Target);
+    public string FullyQualified() => nameof(Example.Target);
+    public string GlobalQualified() => nameof(global::Example.Target);
+    public string QualifiedOwner() => nameof(Target.Value);
+    public string NestedType() => nameof(Nested);
+    public string QualifiedNestedType() => nameof(Consumer.Nested);
+    public string FullyQualifiedNestedType() => nameof(global::Example.Consumer.Nested);
+    public string NestedOwner() => nameof(Nested.Value);
+    public string OtherType() => nameof(Other);
+
+    public string ShadowedDirect() {
+        object Target = new();
+        return nameof(Target);
+    }
+
+    public string ShadowedQualified() {
+        object Target = new();
+        return nameof(Target.ToString);
+    }
+}
+"#,
+        )
+        .build();
+    let consumer = project.file("src/NameofTypes.cs");
+    let source = consumer.read_to_string().expect("nameof type source");
+    let direct = source.find("nameof(Target);").expect("direct nameof type") + "nameof(".len();
+    let qualified = source
+        .find("nameof(Target.Value)")
+        .expect("qualified nameof owner")
+        + "nameof(".len();
+    let fully_qualified = source
+        .find("nameof(Example.Target)")
+        .expect("fully-qualified nameof type")
+        + "nameof(Example.".len();
+    let global_qualified = source
+        .find("nameof(global::Example.Target)")
+        .expect("global-qualified nameof type")
+        + "nameof(global::Example.".len();
+    let nested = source.find("nameof(Nested)").expect("nested nameof type") + "nameof(".len();
+    let qualified_nested = source
+        .find("nameof(Consumer.Nested)")
+        .expect("qualified nested nameof type")
+        + "nameof(Consumer.".len();
+    let fully_qualified_nested = source
+        .find("nameof(global::Example.Consumer.Nested)")
+        .expect("fully-qualified nested nameof type")
+        + "nameof(global::Example.Consumer.".len();
+    let nested_owner = source
+        .find("nameof(Nested.Value)")
+        .expect("nested nameof owner")
+        + "nameof(".len();
+    let other = source.find("nameof(Other)").expect("other nameof type") + "nameof(".len();
+    let shadowed_direct = source
+        .rfind("nameof(Target);")
+        .expect("shadowed direct nameof value")
+        + "nameof(".len();
+    let shadowed_qualified = source
+        .find("nameof(Target.ToString)")
+        .expect("shadowed qualified nameof value")
+        + "nameof(".len();
+
+    let assert_queries = |analyzer: &dyn IAnalyzer| {
+        let type_target = |fq_name: &str| {
+            analyzer
+                .get_all_declarations()
+                .iter()
+                .find(|unit| unit.kind() == CodeUnitType::Class && unit.fq_name() == fq_name)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing C# type {fq_name}"))
+        };
+        let provider =
+            ExplicitCandidateProvider::new(Arc::new(std::iter::once(consumer.clone()).collect()));
+        let query = |target: &CodeUnit| {
+            let targeted = UsageFinder::new()
+                .with_authoritative_scope(true)
+                .query_with_provider(
+                    analyzer,
+                    std::slice::from_ref(target),
+                    Some(&provider),
+                    1,
+                    1000,
+                )
+                .result
+                .into_either()
+                .expect("targeted nameof type query should resolve");
+            let whole_workspace = UsageFinder::new()
+                .query(analyzer, std::slice::from_ref(target), 1000, 1000)
+                .result
+                .into_either()
+                .expect("whole-workspace nameof type query should resolve");
+            (targeted, whole_workspace)
+        };
+
+        let target = type_target("Example.Target");
+        let (targeted, whole_workspace) = query(&target);
+        for hits in [&targeted, &whole_workspace] {
+            assert_eq!(hits.len(), 4, "{hits:#?}");
+            for expected in [direct, qualified, fully_qualified, global_qualified] {
+                assert!(
+                    hits.iter().any(|hit| {
+                        hit.start_offset <= expected && expected + "Target".len() <= hit.end_offset
+                    }),
+                    "missing Target at {expected}: {hits:#?}"
+                );
+            }
+            for shadowed in [shadowed_direct, shadowed_qualified] {
+                assert!(
+                    hits.iter().all(|hit| {
+                        !(hit.start_offset <= shadowed
+                            && shadowed + "Target".len() <= hit.end_offset)
+                    }),
+                    "a local value named Target must not become a type usage: {hits:#?}"
+                );
+            }
+        }
+
+        let nested_target = type_target("Example.Consumer$Nested");
+        let (targeted, whole_workspace) = query(&nested_target);
+        for hits in [&targeted, &whole_workspace] {
+            assert_eq!(hits.len(), 4, "{hits:#?}");
+            for expected in [
+                nested,
+                qualified_nested,
+                fully_qualified_nested,
+                nested_owner,
+            ] {
+                assert!(
+                    hits.iter().any(|hit| {
+                        hit.start_offset <= expected && expected + "Nested".len() <= hit.end_offset
+                    }),
+                    "missing nested type at {expected}: {hits:#?}"
+                );
+            }
+        }
+
+        let other_target = type_target("Example.Other");
+        let (targeted, whole_workspace) = query(&other_target);
+        for hits in [&targeted, &whole_workspace] {
+            assert_eq!(hits.len(), 1, "{hits:#?}");
+            assert!(
+                hits.iter().any(|hit| {
+                    hit.start_offset <= other && other + "Other".len() <= hit.end_offset
+                }),
+                "missing Other nameof type: {hits:#?}"
+            );
+        }
+    };
+
+    {
+        let workspace =
+            WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+                .expect("persisted nameof project should build");
+        assert_queries(workspace.analyzer());
+    }
+    let reopened =
+        WorkspaceAnalyzer::build_persisted(project.project_dyn(), AnalyzerConfig::default())
+            .expect("persisted nameof project should reopen");
+    assert_queries(reopened.analyzer());
+}
+
+#[test]
 fn usage_finder_csharp_candidate_routing_covers_using_and_same_namespace() {
     let (project, analyzer) = csharp_analyzer_with_files(&[
         (

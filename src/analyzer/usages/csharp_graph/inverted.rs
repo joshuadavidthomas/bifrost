@@ -40,7 +40,7 @@ use crate::analyzer::{
     CSharpAnalyzer, CSharpMemberName, CallableArity, CodeUnit, IAnalyzer, ProjectFile,
     csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
     csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
-    csharp_type_leftmost_identifier, csharp_type_reference_root,
+    csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
     csharp_unqualified_invocation_for_name,
 };
 use crate::hash::{HashMap, HashSet};
@@ -289,6 +289,12 @@ fn record_reference(
     if let Some(receiver) = csharp_member_access_type_receiver(node) {
         record_structured_type_candidate(receiver, true, ctx, bindings);
     }
+    if let Some((operand, qualified_owner)) = csharp_nameof_type_candidates(node, ctx.source)
+        && !record_structured_type_candidate(operand, true, ctx, bindings)
+        && let Some(owner) = qualified_owner
+    {
+        record_structured_type_candidate(owner, true, ctx, bindings);
+    }
     if let Some(root) = csharp_type_reference_root(node)
         && same_node(root, node)
     {
@@ -452,10 +458,10 @@ fn record_structured_type_candidate(
     reject_value_receiver: bool,
     ctx: &mut CsScan<'_, '_>,
     bindings: &LocalInferenceEngine<String>,
-) {
+) -> bool {
     if reject_value_receiver {
         let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
-            return;
+            return false;
         };
         let name = node_text(leftmost, ctx.source);
         if !bindings.resolve_symbol(name).is_unknown()
@@ -470,12 +476,15 @@ fn record_structured_type_candidate(
             )
             .is_unknown()
         {
-            return;
+            return false;
         }
     }
     let reference = reference_type_text(candidate, ctx.source);
     if let Some(fqn) = ctx.resolve_type_fqn_at(&reference, candidate) {
         ctx.record(fqn, candidate);
+        true
+    } else {
+        false
     }
 }
 

@@ -19,8 +19,8 @@ use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, csharp_attribute_terminal_name,
     csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
     csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
-    csharp_type_leftmost_identifier, csharp_type_reference_root, csharp_type_terminal_identifier,
-    csharp_unqualified_invocation_for_name,
+    csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
+    csharp_type_terminal_identifier, csharp_unqualified_invocation_for_name,
 };
 use crate::hash::HashMap;
 use crate::text_utils::compute_line_starts;
@@ -133,6 +133,7 @@ enum TargetMemberResolution {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TypeCandidateRole {
     Ordinary,
+    Nameof,
     Pattern,
     Receiver,
 }
@@ -166,10 +167,16 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
-        scan_structured_type_candidate(candidate, TypeCandidateRole::Pattern, ctx);
+        scan_structured_type_candidate(candidate, TypeCandidateRole::Pattern, true, ctx);
     }
     if let Some(receiver) = csharp_member_access_type_receiver(node) {
-        scan_structured_type_candidate(receiver, TypeCandidateRole::Receiver, ctx);
+        scan_structured_type_candidate(receiver, TypeCandidateRole::Receiver, true, ctx);
+    }
+    if let Some((operand, qualified_owner)) = csharp_nameof_type_candidates(node, ctx.source)
+        && !scan_structured_type_candidate(operand, TypeCandidateRole::Nameof, false, ctx)
+        && let Some(owner) = qualified_owner
+    {
+        scan_structured_type_candidate(owner, TypeCandidateRole::Nameof, false, ctx);
     }
     let Some(root) = csharp_type_reference_root(node) else {
         return;
@@ -177,30 +184,32 @@ fn scan_type_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !same_node(root, node) || is_declaration_name(root) {
         return;
     }
-    scan_structured_type_candidate(root, TypeCandidateRole::Ordinary, ctx);
+    scan_structured_type_candidate(root, TypeCandidateRole::Ordinary, true, ctx);
 }
 
 fn scan_structured_type_candidate(
     candidate: Node<'_>,
     role: TypeCandidateRole,
+    filter_by_target_name: bool,
     ctx: &mut ScanCtx<'_>,
-) {
+) -> bool {
     let Some(terminal) = csharp_type_terminal_identifier(candidate) else {
-        return;
+        return false;
     };
     let raw_name = normalize_type_text(node_text(terminal, ctx.source));
-    if raw_name != ctx.spec.member_name
+    if filter_by_target_name
+        && raw_name != ctx.spec.member_name
         && !ctx
             .csharp
             .using_aliases_of(ctx.file)
             .contains_key(&raw_name)
     {
-        return;
+        return false;
     }
 
     if role != TypeCandidateRole::Ordinary {
         let Some(leftmost) = csharp_type_leftmost_identifier(candidate) else {
-            return;
+            return false;
         };
         let left_name = normalize_type_text(node_text(leftmost, ctx.source));
         let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
@@ -224,7 +233,7 @@ fn scan_structured_type_candidate(
             )
             .is_unknown()
         {
-            return;
+            return false;
         }
     }
 
@@ -239,6 +248,7 @@ fn scan_structured_type_candidate(
     ) {
         Some(resolved) if type_identity_matches(&resolved, &ctx.spec.target.fq_name()) => {
             push_hit(candidate, ctx);
+            true
         }
         Some(resolved)
             if role == TypeCandidateRole::Receiver
@@ -247,9 +257,14 @@ fn scan_structured_type_candidate(
                 ) =>
         {
             push_hit(candidate, ctx);
+            true
         }
-        None if role == TypeCandidateRole::Receiver => push_unproven_hit(candidate, ctx),
-        Some(_) | None => {}
+        Some(_) => true,
+        None if role == TypeCandidateRole::Receiver => {
+            push_unproven_hit(candidate, ctx);
+            false
+        }
+        None => false,
     }
 }
 
