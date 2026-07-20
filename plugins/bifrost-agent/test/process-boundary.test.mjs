@@ -50,7 +50,7 @@ test("SDK process boundary initializes, discovers, calls, cancels, and cleans up
   const events = await readRecords(recordPath);
   const started = events.find((event) => event.type === "started");
   assert.deepEqual(started.args, ["--root", temp, "--mcp", "symbol|extended"]);
-  assert.equal(started.cwd, temp);
+  assert.equal(await fsp.realpath(started.cwd), await fsp.realpath(temp));
   await waitFor(() => !isProcessAlive(started.pid));
 });
 

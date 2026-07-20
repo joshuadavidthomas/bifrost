@@ -1,8 +1,11 @@
+const SERVER_TOOLSET_ORDER = ["symbol", "extended", "slopcop", "text"] as const;
+type ServerToolset = (typeof SERVER_TOOLSET_ORDER)[number];
+
 interface CapabilityShape {
   id: string;
   label: string;
   description: string;
-  serverToolset: "symbol" | "extended" | "slopcop" | "text";
+  serverToolsets: readonly ServerToolset[];
   toolRequirements: readonly (readonly string[])[];
   toolVariants?: readonly (readonly string[])[];
 }
@@ -12,7 +15,7 @@ export const BIFROST_CAPABILITIES = [
     id: "symbols",
     label: "Symbols",
     description: "Navigation, definitions, usages, graphs, and commit analysis",
-    serverToolset: "symbol",
+    serverToolsets: ["symbol", "slopcop"],
     toolRequirements: [
       ["search_symbols"],
       ["get_symbol_sources"],
@@ -30,21 +33,21 @@ export const BIFROST_CAPABILITIES = [
     id: "query",
     label: "Structural queries",
     description: "RQL, CodeQuery, symbol locations, and symbol ancestry",
-    serverToolset: "extended",
+    serverToolsets: ["extended"],
     toolRequirements: [["query_code"], ["get_symbol_locations"], ["get_symbol_ancestors"]],
   },
   {
     id: "files",
     label: "File discovery",
     description: "Filename matching, workspace listings, and related-file ranking",
-    serverToolset: "extended",
+    serverToolsets: ["extended"],
     toolRequirements: [["find_filenames"], ["list_files"], ["most_relevant_files"]],
   },
   {
     id: "quality",
     label: "Code quality",
     description: "Complexity, hotspots, clones, smells, dead code, and secrets",
-    serverToolset: "slopcop",
+    serverToolsets: ["slopcop"],
     toolRequirements: [
       ["compute_cyclomatic_complexity"],
       ["compute_cognitive_complexity"],
@@ -63,21 +66,21 @@ export const BIFROST_CAPABILITIES = [
     id: "git",
     label: "Git history",
     description: "Commit-message search, history, and commit diffs",
-    serverToolset: "extended",
+    serverToolsets: ["extended"],
     toolRequirements: [["search_git_commit_messages"], ["get_git_log"], ["get_commit_diff"]],
   },
   {
     id: "text",
     label: "Text search",
     description: "Raw file reads and regular-expression content search",
-    serverToolset: "text",
+    serverToolsets: ["text"],
     toolRequirements: [["get_file_contents"], ["search_file_contents"], ["find_files_containing"]],
   },
   {
     id: "transforms",
     label: "JSON and XML",
     description: "jq filters, XML outlines, and XPath selection",
-    serverToolset: "extended",
+    serverToolsets: ["extended"],
     toolRequirements: [["jq"], ["xml_skim"], ["xml_select"]],
   },
 ] as const satisfies readonly CapabilityShape[];
@@ -112,10 +115,10 @@ export function normalizeCapabilities(values: Iterable<string>): BifrostCapabili
 }
 
 export function serverToolsetExpression(capabilities: readonly BifrostCapability[]): string {
-  const toolsets = new Set(capabilities.map((id) => CAPABILITIES_BY_ID.get(id)!.serverToolset));
-  return ["symbol", "extended", "slopcop", "text"]
-    .filter((toolset) => toolsets.has(toolset as CapabilityShape["serverToolset"]))
-    .join("|");
+  const toolsets = new Set(
+    capabilities.flatMap((id) => CAPABILITIES_BY_ID.get(id)!.serverToolsets),
+  );
+  return SERVER_TOOLSET_ORDER.filter((toolset) => toolsets.has(toolset)).join("|");
 }
 
 export function capabilityForTool(toolName: string): BifrostCapability | undefined {

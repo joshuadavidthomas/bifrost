@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const npmExecPath = process.env.npm_execpath;
+assert.ok(npmExecPath, "npm_execpath is required to run npm portably");
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(packageDir, "..", "..");
 
@@ -38,8 +40,8 @@ try {
   const packDir = path.join(tmpRoot, "pack");
   await fsp.mkdir(packDir);
   const { stdout: packStdout } = await execFileAsync(
-    "npm",
-    ["pack", "--json", "--pack-destination", packDir],
+    process.execPath,
+    [npmExecPath, "pack", "--json", "--pack-destination", packDir],
     { cwd: packageDir, maxBuffer: 10 * 1024 * 1024 },
   );
   const [{ filename: tarballName }] = JSON.parse(packStdout);
@@ -54,8 +56,9 @@ try {
   );
 
   await execFileAsync(
-    "npm",
+    process.execPath,
     [
+      npmExecPath,
       "install",
       "--no-save",
       "--no-audit",
@@ -93,7 +96,7 @@ try {
   const probePath = path.join(consumerDir, "pi-discovery-probe.mjs");
   await fsp.writeFile(probePath, probeScript());
 
-  const { stdout: probeStdout } = await execFileAsync("node", [probePath], {
+  const { stdout: probeStdout } = await execFileAsync(process.execPath, [probePath], {
     cwd: consumerDir,
     maxBuffer: 10 * 1024 * 1024,
   });

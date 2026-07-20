@@ -15,6 +15,7 @@ After this change, Pi users can keep their intended Bifrost capability settings 
 - [x] (2026-07-18 05:45Z) Repaired release checksum projection for the Pi package.
 - [x] (2026-07-18) Removed the synthetic cross-host workflow regression and restored the pre-existing GitHub and VS Code release sequence after a scope audit.
 - [x] (2026-07-18 06:35Z) Completed package, repository, artifact, real-Pi, process-leak, AST-rule, workflow, and independent-review validation.
+- [x] (2026-07-20) Addressed maintainer review: aligned cross-toolset capability requirements with the Rust registry, made process and package tests portable, and expanded Pi package CI to Linux, macOS, and Windows.
 
 ## Surprises & Discoveries
 
@@ -36,6 +37,9 @@ After this change, Pi users can keep their intended Bifrost capability settings 
 - Observation: The configured `claude-agent-sdk` model rejected one Bifrost schema with a top-level union, while Pi’s `openai-codex/gpt-5.4-mini` path accepted the same registered tools.
   Evidence: the first real smoke failed before a tool call with an API schema error. The fresh accepted-provider smoke called `bifrost_get_summaries`, returned `BifrostSession — plugins/bifrost-agent/extensions/bifrost-session.ts`, exited zero, and left the pre-existing Bifrost process list unchanged.
 
+- Observation: Capability-derived fake MCP advertisements can repeat a declaration error instead of catching it.
+  Evidence: Symbols required `analyze_commit` while requesting only the `symbol` server toolset, and the old test fixture invented the same impossible advertisement. Independent Symbol, Slopcop, and Extended fixtures now make the default startup test exercise the real registry boundary.
+
 ## Decision Log
 
 - Decision: Represent session state as a desired capability selection plus a discriminated published connection, with candidate and cleanup resources owned separately by the same session object.
@@ -53,6 +57,10 @@ After this change, Pi users can keep their intended Bifrost capability settings 
 - Decision: Keep Pi release packaging independent from the existing VS Code and GitHub release sequence.
   Rationale: The Pi job needs only its own checksum sidecar, package gates, npm tarball, and release attachment. Reordering existing host publication is unrelated to issue #835.
   Date/Author: 2026-07-18 / user and Pi agent.
+
+- Decision: Let one Pi capability request multiple server toolsets while retaining capability-based activation.
+  Rationale: `analyze_commit` belongs to the Rust `slopcop` registry but is part of Pi's default Symbols capability. Declaring both `symbol` and `slopcop` models that boundary without changing Rust or activating unrelated quality tools.
+  Date/Author: 2026-07-20 / Pi agent after maintainer review.
 
 ## Outcomes & Retrospective
 
@@ -154,3 +162,5 @@ Revision note (2026-07-18): Created this follow-up ExecPlan from the final revie
 Revision note (2026-07-18): Recorded the completed lifecycle owner, race and cleanup discoveries, release projection fix, documentation behavior, and fresh acceptance evidence after independent reviewers returned no lifecycle blockers.
 
 Revision note (2026-07-18): A later scope audit found that reordering GitHub and VS Code publication was unrelated to the Pi issue. Restored the existing sequence, removed its cross-host workflow regression, and retained only a dedicated Pi package job.
+
+Revision note (2026-07-20): Recorded maintainer-review remediation for the default capability/toolset mismatch, independent registry-boundary fixtures, portable npm subprocesses, canonical temporary paths, and three-platform Pi package CI.

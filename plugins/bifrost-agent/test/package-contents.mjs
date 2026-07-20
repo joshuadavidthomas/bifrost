@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
+const npmExecPath = process.env.npm_execpath;
+assert.ok(npmExecPath, "npm_execpath is required to run npm portably");
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = JSON.parse(await fsp.readFile(path.join(packageDir, "package.json"), "utf8"));
 const release = JSON.parse(await fsp.readFile(path.join(packageDir, "bifrost-release.json"), "utf8"));
@@ -44,10 +46,11 @@ assert.ok(
   "README npm install command must match the package version",
 );
 
-const { stdout } = await execFileAsync("npm", ["pack", "--dry-run", "--json"], {
-  cwd: packageDir,
-  maxBuffer: 10 * 1024 * 1024,
-});
+const { stdout } = await execFileAsync(
+  process.execPath,
+  [npmExecPath, "pack", "--dry-run", "--json"],
+  { cwd: packageDir, maxBuffer: 10 * 1024 * 1024 },
+);
 const [{ files }] = JSON.parse(stdout);
 const packed = new Set(files.map((file) => file.path));
 const requiredFiles = [

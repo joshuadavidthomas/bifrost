@@ -102,7 +102,7 @@ To install from GitHub before an npm release, clone the repository and install
 the package directory as a local Pi package:
 
 ```bash
-jj git clone https://github.com/BrokkAi/bifrost.git
+git clone https://github.com/BrokkAi/bifrost.git
 cd bifrost/plugins/bifrost-agent
 npm install
 pi install "$(pwd)"

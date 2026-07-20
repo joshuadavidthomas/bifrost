@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   BIFROST_CAPABILITY_IDS,
+  DEFAULT_BIFROST_CAPABILITIES,
   capabilityForTool,
   normalizeCapabilities,
   piToolName,
@@ -15,6 +16,11 @@ test("normalizes capability order and builds existing Bifrost toolsets", () => {
     normalizeCapabilities(["text", "symbols", "quality", "symbols", "unknown"]),
     ["symbols", "quality", "text"],
   );
+  assert.equal(serverToolsetExpression(["symbols"]), "symbol|slopcop");
+  assert.equal(
+    serverToolsetExpression(DEFAULT_BIFROST_CAPABILITIES),
+    "symbol|extended|slopcop",
+  );
   assert.equal(
     serverToolsetExpression(["symbols", "query", "files", "quality", "git", "transforms"]),
     "symbol|extended|slopcop",
@@ -23,6 +29,9 @@ test("normalizes capability order and builds existing Bifrost toolsets", () => {
 });
 
 test("classifies broad extended tools into Pi capabilities", () => {
+  assert.equal(capabilityForTool("analyze_commit"), "symbols");
+  assert.equal(toolBelongsToSelection("analyze_commit", ["symbols"]), true);
+  assert.equal(toolBelongsToSelection("compute_cyclomatic_complexity", ["symbols"]), false);
   assert.equal(capabilityForTool("query_code"), "query");
   assert.equal(capabilityForTool("list_files"), "files");
   assert.equal(capabilityForTool("get_git_log"), "git");

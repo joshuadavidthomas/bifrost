@@ -163,8 +163,12 @@ jobs:
           grep -Fx 'extension/THIRD_PARTY_LICENSES.txt' /tmp/bifrost-vsix-files.txt
 
   pi-package:
-    name: Pi package
-    runs-on: ubuntu-latest
+    name: Pi package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
 
