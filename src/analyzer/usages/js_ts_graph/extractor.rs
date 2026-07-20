@@ -1,8 +1,9 @@
 use crate::analyzer::js_ts::imports::require_call_module_specifier;
 use crate::analyzer::js_ts::syntax::{
     JsTsLexicalBindingIndex, JsTsLexicalBindingScope, direct_property_definitions,
-    is_commonjs_require_declarator, is_declaration_identifier, is_object_in_member_expression,
-    is_property_key_in_member, slice, static_member_receiver,
+    is_commonjs_require_declarator, is_declaration_identifier,
+    is_lexically_nested_type_declaration, is_object_in_member_expression,
+    is_property_key_in_member, nested_type_identifier_parts, slice, static_member_receiver,
 };
 use crate::analyzer::usages::get_definition::js_ts::{
     ts_resolve_type_text_to_property_owners, ts_type_annotation_text,
@@ -181,6 +182,7 @@ pub(super) fn scan_files_for_seeds(
             lexical_bindings,
             scope_stack: vec![HashMap::default()],
             binding_engine,
+            type_binding_engine: LocalInferenceEngine::new(LocalInferenceConfig::default()),
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
@@ -242,6 +244,7 @@ pub(super) struct ScanCtx<'a> {
     lexical_bindings: Option<JsTsLexicalBindingIndex>,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     binding_engine: LocalInferenceEngine<&'static str>,
+    type_binding_engine: LocalInferenceEngine<()>,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
     pub(super) unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
@@ -353,6 +356,20 @@ impl ScanCtx<'_> {
         self.target_self_file && ident == self.target_short
     }
 
+    fn binds_target_type(&self, ident: &str) -> bool {
+        if self.type_binding_engine.is_shadowed(ident) {
+            return false;
+        }
+        if self
+            .edges
+            .iter()
+            .any(|edge| edge.local_name == ident && edge_binds_bare_identifier(edge))
+        {
+            return true;
+        }
+        self.target_self_file && ident == self.target_short
+    }
+
     fn binds_target_value(&self, ident: &str) -> bool {
         self.binding_engine
             .resolve_symbol(ident)
@@ -389,10 +406,12 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     );
     if introduces_scope {
         ctx.binding_engine.enter_scope();
+        ctx.type_binding_engine.enter_scope();
         register_function_parameters(node, ctx);
         ctx.scope_stack.push(HashMap::default());
         register_scope_parameters(node, ctx);
     }
+    register_lexical_type_shadow(node, ctx);
 
     // Skip import statements outright — bindings declared there are not usages.
     if matches!(
@@ -405,6 +424,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         if introduces_scope {
             ctx.scope_stack.pop();
             ctx.binding_engine.exit_scope();
+            ctx.type_binding_engine.exit_scope();
         }
         return;
     }
@@ -435,6 +455,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 
     match kind {
+        "nested_type_identifier" => handle_nested_type_identifier(node, ctx),
         "identifier" | "type_identifier" | "shorthand_property_identifier" => {
             handle_identifier_candidate(node, ctx);
         }
@@ -452,6 +473,20 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if introduces_scope {
         ctx.scope_stack.pop();
         ctx.binding_engine.exit_scope();
+        ctx.type_binding_engine.exit_scope();
+    }
+}
+
+fn register_lexical_type_shadow(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if !is_lexically_nested_type_declaration(node) {
+        return;
+    }
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let text = slice(name, ctx.source);
+    if text == ctx.target_short {
+        ctx.type_binding_engine.declare_shadow(text.to_string());
     }
 }
 
@@ -893,7 +928,12 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
-    if !ctx.binds_target(text) {
+    let binds_target = if node.kind() == "type_identifier" {
+        ctx.binds_target_type(text)
+    } else {
+        ctx.binds_target(text)
+    };
+    if !binds_target {
         return;
     }
     if is_declaration_identifier(node) {
@@ -921,6 +961,84 @@ fn handle_export_specifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         record_reexport_hit(name, ctx);
     }
+}
+
+fn handle_nested_type_identifier(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let Some((module, name)) = nested_type_identifier_parts(node) else {
+        return;
+    };
+    let name_text = slice(name, ctx.source);
+    if name_text.is_empty() {
+        return;
+    }
+
+    if ctx
+        .target_member
+        .is_some_and(|target_member| target_member == name_text)
+    {
+        match type_qualification_owner_match_status(module, ctx) {
+            ReceiverMatchStatus::Proven => record_hit(name, ctx),
+            ReceiverMatchStatus::Unproven => record_unproven_hit(name, ctx),
+            ReceiverMatchStatus::NoMatch => {}
+        }
+        return;
+    }
+
+    if ctx.target_member.is_none()
+        && simple_identifier_text(module, ctx.source).is_some_and(|module_text| {
+            namespace_member_matches_target(module, module_text, name_text, ctx)
+        })
+    {
+        record_hit(name, ctx);
+    }
+}
+
+fn type_qualification_owner_match_status(
+    module: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> ReceiverMatchStatus {
+    if let Some(module_text) = simple_identifier_text(module, ctx.source) {
+        return ctx
+            .binds_target_type(module_text)
+            .then_some(ReceiverMatchStatus::Proven)
+            .unwrap_or(ReceiverMatchStatus::NoMatch);
+    }
+
+    ReceiverMatchStatus::NoMatch
+}
+
+fn namespace_member_matches_target(
+    object: Node<'_>,
+    object_text: &str,
+    property_text: &str,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if simple_identifier_text(object, ctx.source).is_some()
+        && ctx.binding_engine.is_shadowed(object_text)
+    {
+        return false;
+    }
+    ctx.edges.iter().any(|edge| {
+        edge.local_name == object_text
+            && match &edge.kind {
+                ImportEdgeKind::Namespace => ctx
+                    .seeds
+                    .contains(&(edge.target_file.clone(), property_text.to_string())),
+                ImportEdgeKind::CommonJsRequire(export_name) => property_text == export_name,
+                ImportEdgeKind::Named(_) | ImportEdgeKind::Default => false,
+            }
+            || match &edge.kind {
+                ImportEdgeKind::CommonJsRequire(export_name) => commonjs_nested_member_matches(
+                    object_text,
+                    property_text,
+                    &edge.local_name,
+                    export_name,
+                ),
+                ImportEdgeKind::Namespace | ImportEdgeKind::Named(_) | ImportEdgeKind::Default => {
+                    false
+                }
+            }
+    })
 }
 
 fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -977,28 +1095,7 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // `Namespace.Foo` / `require("./mod").Foo` style access. ESM namespace imports
     // still key by the target's local name; CommonJS module-object edges carry the
     // exported property name so aliases such as `module.exports = { Bar: Foo }` work.
-    let namespace_match = ctx.edges.iter().any(|edge| {
-        edge.local_name == object_text
-            && match &edge.kind {
-                ImportEdgeKind::Namespace => ctx
-                    .seeds
-                    .contains(&(edge.target_file.clone(), property_text.to_string())),
-                ImportEdgeKind::CommonJsRequire(export_name) => property_text == export_name,
-                ImportEdgeKind::Named(_) | ImportEdgeKind::Default => false,
-            }
-            || match &edge.kind {
-                ImportEdgeKind::CommonJsRequire(export_name) => commonjs_nested_member_matches(
-                    object_text,
-                    property_text,
-                    &edge.local_name,
-                    export_name,
-                ),
-                ImportEdgeKind::Namespace | ImportEdgeKind::Named(_) | ImportEdgeKind::Default => {
-                    false
-                }
-            }
-    });
-    if namespace_match {
+    if namespace_member_matches_target(object, object_text, property_text, ctx) {
         record_hit(property, ctx);
         return;
     }
