@@ -14,7 +14,7 @@ Bifrost currently commits a large `licenses/THIRD_PARTY_LICENSES.html` snapshot 
 - [x] (2026-07-20 18:29Z) Added notice producer jobs and artifact downloads to binary and Python publishing workflows.
 - [x] (2026-07-20 18:29Z) Removed the tracked HTML snapshot, ignored local generated output, and updated contributor and public documentation.
 - [x] (2026-07-20 18:36Z) Parsed workflow YAML, validated shell syntax and generation, proved sdist inclusion, and passed all 43 Python tests with the tracked HTML absent.
-- [ ] Commit the implementation checkpoint, merge current upstream master, rerun final checks, and push.
+- [x] (2026-07-20 18:40Z) Committed the implementation checkpoint, merged current upstream master, and passed final formatting, clippy, and `actionlint` checks before push.
 
 ## Surprises & Discoveries
 
@@ -43,7 +43,7 @@ Bifrost currently commits a large `licenses/THIRD_PARTY_LICENSES.html` snapshot 
 
 ## Outcomes & Retrospective
 
-The implementation removes the tracked 10,679-line renderer snapshot while preserving license-policy enforcement. A shared script generates a nonempty report identifying `brokk-bifrost 0.8.6`; a locally built sdist contained `licenses/THIRD_PARTY_LICENSES.html`; and all 43 Python integration tests passed while the tracked file was absent. The remaining work is integration with current upstream master and push validation.
+The implementation removes the tracked 10,679-line renderer snapshot while preserving license-policy enforcement. A shared script generates a nonempty report identifying `brokk-bifrost 0.8.6`; a locally built sdist contained `licenses/THIRD_PARTY_LICENSES.html`; and all 43 Python integration tests passed while the tracked file was absent. After merging current upstream master, `cargo fmt`, strict all-feature clippy, YAML parsing, and `actionlint` passed. Binary and Python publishing now consume generated workflow artifacts rather than repository snapshots.
 
 ## Context and Orientation
 
@@ -92,3 +92,5 @@ Revision note (2026-07-20): Initial plan created after tracing the existing CI a
 Revision note (2026-07-20): Recorded the implemented workflow graph, local sdist proof, ignored generated path, and selective PyPI artifact download.
 
 Revision note (2026-07-20): Recorded successful generation, sdist, and Python-suite validation before the upstream merge checkpoint.
+
+Revision note (2026-07-20): Closed the plan after upstream integration and final workflow, formatting, and clippy validation.
