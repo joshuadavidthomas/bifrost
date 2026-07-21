@@ -22,6 +22,93 @@ fn csharp_analyzer_with_files(
     (project, analyzer)
 }
 
+#[test]
+fn csharp_graph_resolves_delegate_valued_properties_without_method_conflation() {
+    let (project, analyzer) = csharp_analyzer_with_files(&[
+        (
+            "src/Configuration.cs",
+            r#"namespace Demo;
+
+public delegate bool ConstructorPolicy(int value, int adjustment = 0);
+
+public interface IConfiguration
+{
+    ConstructorPolicy Select { get; }
+}
+
+public class Configuration : IConfiguration
+{
+    public ConstructorPolicy Select { get; set; } = (value, adjustment) => value + adjustment > 0;
+}
+
+public sealed class ShadowConfiguration : Configuration
+{
+    public new ConstructorPolicy Select { get; set; } = (value, adjustment) => value + adjustment > 0;
+}
+
+public sealed class OtherConfiguration
+{
+    public ConstructorPolicy Select { get; set; } = (value, adjustment) => value + adjustment > 0;
+}
+
+public sealed class MethodConfiguration
+{
+    public bool Select(int value) => value > 0;
+}
+"#,
+        ),
+        (
+            "src/Consumer.cs",
+            r#"namespace Demo;
+
+public sealed class Consumer
+{
+    public bool ThroughConcrete(Configuration configuration) => configuration.Select(1);
+
+    public bool ThroughInterface(IConfiguration configuration) => configuration.Select(2, 3);
+
+    public bool ThroughShadow(ShadowConfiguration configuration) => configuration.Select(3);
+
+    public bool ThroughOtherOwner(OtherConfiguration configuration) => configuration.Select(4);
+
+    public bool ThroughOrdinaryMethod(MethodConfiguration configuration) => configuration.Select(5);
+
+    public bool ThroughLocalShadow()
+    {
+        ConstructorPolicy Select = (value, adjustment) => value + adjustment > 0;
+        return Select(6);
+    }
+}
+"#,
+        ),
+    ]);
+
+    let concrete = member_field(&analyzer, "Demo.Configuration", "Select");
+    let interface = member_field(&analyzer, "Demo.IConfiguration", "Select");
+
+    for (target, expected_snippet) in [
+        (concrete, "configuration.Select(1)"),
+        (interface, "configuration.Select(2, 3)"),
+    ] {
+        let graph = graph_hits(&analyzer, &target);
+        let routed = UsageFinder::new()
+            .query(&analyzer, std::slice::from_ref(&target), 1000, 1000)
+            .result
+            .into_either()
+            .unwrap_or_else(|error| panic!("{} should route: {error}", target.fq_name()));
+        for hits in [&graph, &routed] {
+            assert_eq!(1, hits.len(), "{}: {hits:#?}", target.fq_name());
+            assert!(
+                hits.iter().all(|hit| {
+                    hit.file == project.file("src/Consumer.cs")
+                        && hit.snippet.contains(expected_snippet)
+                }),
+                "delegate-property lookup must preserve receiver-owner identity and exclude member shadows, local shadows, and ordinary methods: {hits:#?}"
+            );
+        }
+    }
+}
+
 fn definition_by<F>(analyzer: &CSharpAnalyzer, mut predicate: F) -> CodeUnit
 where
     F: FnMut(&CodeUnit) -> bool,
