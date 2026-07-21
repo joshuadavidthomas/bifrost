@@ -21730,38 +21730,94 @@ fn php_bare_function_prefers_same_language_declaration_over_javascript_collision
 
 #[test]
 fn scala_type_reference_keeps_supported_java_definition_resolution() {
+    let source = concat!(
+        "package app\n",
+        "object Use { ",
+        "val explicit = new Greeter(1); ",
+        "val wrongExplicit = new Greeter(); ",
+        "val implicitZero = new ImplicitGreeter(); ",
+        "val wrongImplicit = new ImplicitGreeter(1); ",
+        "val sameNamedMethod = new MethodOnly(); ",
+        "val wrongSameNamedMethod = new MethodOnly(1); ",
+        "val record = new Pair(1, 2); ",
+        "val auxiliaryRecord = new Pair(1); ",
+        "val wrongRecord = new Pair(); ",
+        "val emptyVarargsRecord = new Batch(\"p\"); ",
+        "val populatedVarargsRecord = new Batch(\"p\", \"a\", \"b\"); ",
+        "val wrongVarargsRecord = new Batch(); ",
+        "val compactRecord = new Compact(1); ",
+        "val wrongCompactRecord = new Compact() ",
+        "}\n",
+    );
     let project = InlineTestProject::new()
-        .file("app/Greeter.java", "package app; public class Greeter {}\n")
         .file(
-            "app/Use.scala",
-            "package app\nobject Use { val greeter = new Greeter(); val invalid = new Greeter(1) }\n",
+            "app/Greeter.java",
+            "package app; public class Greeter { public Greeter(int value) {} }\n",
         )
+        .file(
+            "app/ImplicitGreeter.java",
+            "package app; public class ImplicitGreeter {}\n",
+        )
+        .file(
+            "app/MethodOnly.java",
+            "package app; public class MethodOnly { public void MethodOnly(int value) {} }\n",
+        )
+        .file(
+            "app/Pair.java",
+            "package app; public record Pair(int left, int right) { public Pair(int left) { this(left, 0); } }\n",
+        )
+        .file(
+            "app/Batch.java",
+            "package app; public record Batch(String prefix, String... values) {}\n",
+        )
+        .file(
+            "app/Compact.java",
+            "package app; public record Compact(int value) { public Compact { if (value < 0) throw new IllegalArgumentException(); } }\n",
+        )
+        .file("app/Use.scala", source)
         .build();
-    let line = "object Use { val greeter = new Greeter(); val invalid = new Greeter(1) }";
-    let value = lookup(
-        project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Use.scala","line":2,"column":{}}}]}}"#,
-            column_of(line, "Greeter")
-        ),
-    );
 
-    let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["language"], "java", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "app.Greeter", "{value}");
+    for (needle, expected) in [
+        ("new Greeter(1)", "app.Greeter.Greeter"),
+        ("new ImplicitGreeter()", "app.ImplicitGreeter"),
+        ("new MethodOnly()", "app.MethodOnly"),
+        ("new Pair(1, 2)", "app.Pair"),
+        ("new Pair(1)", "app.Pair.Pair"),
+        ("new Batch(\"p\")", "app.Batch"),
+        ("new Batch(\"p\", \"a\", \"b\")", "app.Batch"),
+        ("new Compact(1)", "app.Compact.Compact"),
+    ] {
+        let start = source.find(needle).expect("valid Java construction") + "new ".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Use.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["language"], "java", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
 
-    let invalid = line.rfind("Greeter").expect("invalid Java construction") + 1;
-    let value = lookup(
-        project.root(),
-        &format!(r#"{{"references":[{{"path":"app/Use.scala","line":2,"column":{invalid}}}]}}"#),
-    );
-    let result = &value["results"][0];
-    assert_eq!(result["status"], "no_definition", "{value}");
-    assert_eq!(
-        result["diagnostics"][0]["kind"], "no_applicable_scala_constructor",
-        "{value}"
-    );
+    for needle in [
+        "new Greeter()",
+        "new ImplicitGreeter(1)",
+        "new MethodOnly(1)",
+        "new Pair()",
+        "new Batch()",
+        "new Compact()",
+    ] {
+        let start = source.find(needle).expect("invalid Java construction") + "new ".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Use.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "no_applicable_scala_constructor",
+            "{value}"
+        );
+    }
 }
 
 #[test]

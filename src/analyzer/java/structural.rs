@@ -22,6 +22,10 @@ const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("field_access", NormalizedKind::FieldAccess),
     ("method_declaration", NormalizedKind::Method),
     ("constructor_declaration", NormalizedKind::Constructor),
+    (
+        "compact_constructor_declaration",
+        NormalizedKind::Constructor,
+    ),
     ("lambda_expression", NormalizedKind::Lambda),
     ("class_declaration", NormalizedKind::Class),
     ("interface_declaration", NormalizedKind::Class),

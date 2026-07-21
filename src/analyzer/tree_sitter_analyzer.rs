@@ -397,6 +397,21 @@ impl PreparedSyntaxTree {
         &self.tree
     }
 
+    pub(crate) fn declaration_node(&self, code_unit: &CodeUnit) -> Option<Node<'_>> {
+        let range = self.file_state.ranges.get(code_unit)?.first()?;
+        self.tree
+            .root_node()
+            .descendant_for_byte_range(range.start_byte, range.end_byte)
+    }
+
+    pub(crate) fn direct_children(&self, owner: &CodeUnit) -> &[CodeUnit] {
+        self.file_state
+            .children
+            .get(owner)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn line_starts(&self) -> &[usize] {
         &self.line_starts
     }

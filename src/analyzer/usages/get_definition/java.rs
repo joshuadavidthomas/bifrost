@@ -274,6 +274,7 @@ fn is_java_declaration_or_import_name(node: Node<'_>) -> bool {
                 | "record_declaration"
                 | "method_declaration"
                 | "constructor_declaration"
+                | "compact_constructor_declaration"
                 | "field_declaration"
                 | "variable_declarator"
                 | "formal_parameter"
@@ -981,7 +982,7 @@ fn java_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
     parent.child_by_field_name("name") == Some(name)
         && matches!(
             parent.kind(),
-            "method_declaration" | "constructor_declaration"
+            "method_declaration" | "constructor_declaration" | "compact_constructor_declaration"
         )
 }
 
@@ -1136,6 +1137,7 @@ fn java_type_of_identifier_before(
 const JAVA_TYPE_LOOKUP_SCOPE_NODES: &[&str] = &[
     "method_declaration",
     "constructor_declaration",
+    "compact_constructor_declaration",
     "block",
     "lambda_expression",
     "catch_clause",
@@ -1256,7 +1258,7 @@ fn java_seed_scope_declarations(
     bindings: &mut LocalInferenceEngine<CodeUnit>,
 ) {
     match node.kind() {
-        "method_declaration" | "constructor_declaration" => {
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
             if let Some(parameters) = node.child_by_field_name("parameters") {
                 let mut cursor = parameters.walk();
                 for parameter in parameters.named_children(&mut cursor) {

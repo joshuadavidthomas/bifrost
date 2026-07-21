@@ -128,6 +128,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             node.kind(),
             "method_declaration"
                 | "constructor_declaration"
+                | "compact_constructor_declaration"
                 | "block"
                 | "lambda_expression"
                 | "catch_clause"
@@ -207,7 +208,7 @@ fn scan_try_with_resources(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 fn seed_declarations(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     match node.kind() {
-        "method_declaration" | "constructor_declaration" => {
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
             if let Some(parameters) = node.child_by_field_name("parameters") {
                 let mut cursor = parameters.walk();
                 for child in parameters.named_children(&mut cursor) {

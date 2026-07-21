@@ -180,6 +180,7 @@ const SCOPE_NODES: &[&str] = &[
     "class_body",
     "method_declaration",
     "constructor_declaration",
+    "compact_constructor_declaration",
     "block",
     "lambda_expression",
     "catch_clause",
@@ -466,7 +467,7 @@ fn seed_declarations(
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     match node.kind() {
-        "method_declaration" | "constructor_declaration" => {
+        "method_declaration" | "constructor_declaration" | "compact_constructor_declaration" => {
             if let Some(parameters) = node.child_by_field_name("parameters") {
                 let mut cursor = parameters.walk();
                 for child in parameters.named_children(&mut cursor) {

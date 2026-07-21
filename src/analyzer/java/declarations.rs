@@ -273,6 +273,18 @@ pub(super) fn visit_class_like(
                             parsed,
                         );
                     }
+                    "compact_constructor_declaration" if node.kind() == "record_declaration" => {
+                        visit_compact_constructor(
+                            file,
+                            source,
+                            child,
+                            node,
+                            package_name,
+                            &code_unit,
+                            &top_level,
+                            parsed,
+                        );
+                    }
                     "field_declaration" | "constant_declaration" => {
                         visit_field_declaration(
                             file,
@@ -355,6 +367,69 @@ fn visit_callable(
                     .map(callable_arity_for_parameters)
                     .unwrap_or_else(|| CallableArity::exact(0)),
             ),
+    );
+
+    if let Some(body) = node.child_by_field_name("body") {
+        collect_lambda_expressions(
+            file,
+            source,
+            body,
+            package_name,
+            &code_unit,
+            top_level,
+            parsed,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_compact_constructor(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    record: Node<'_>,
+    package_name: &str,
+    parent: &CodeUnit,
+    top_level: &CodeUnit,
+    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
+) {
+    let Some(name_node) = node.child_by_field_name("name") else {
+        return;
+    };
+    let Some(parameters) = record.child_by_field_name("parameters") else {
+        return;
+    };
+    let name = node_text(name_node, source).trim();
+    if name.is_empty() {
+        return;
+    }
+
+    let signature = canonical_parameters_signature(parameters, source);
+    let short_name = format!("{}.{}", parent.short_name(), name);
+    let declaration_header = callable_signature(node, source);
+    let callable_sig = format!("{declaration_header}{signature}");
+    let code_unit = CodeUnit::with_signature(
+        file.clone(),
+        crate::analyzer::CodeUnitType::Function,
+        package_name.to_string(),
+        short_name,
+        Some(signature),
+        false,
+    );
+    parsed.add_code_unit(
+        code_unit.clone(),
+        node,
+        source,
+        Some(parent.clone()),
+        Some(top_level.clone()),
+    );
+    parsed.add_signature_with_metadata(
+        code_unit.clone(),
+        SignatureMetadata::with_parameter_labels(
+            callable_sig,
+            parameter_labels(parameters, source),
+        )
+        .with_callable_arity(callable_arity_for_parameters(parameters)),
     );
 
     if let Some(body) = node.child_by_field_name("body") {
@@ -632,7 +707,9 @@ pub(super) fn find_nearest_declaration_from_node(
 
     while let Some(node) = current {
         match node.kind() {
-            "method_declaration" | "constructor_declaration" => {
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration" => {
                 if let Some(found) = check_formal_parameters(node, identifier, source) {
                     return Some(found);
                 }

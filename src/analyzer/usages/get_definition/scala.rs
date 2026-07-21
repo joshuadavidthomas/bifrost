@@ -3007,6 +3007,15 @@ fn resolve_scala_constructor(
     let owner_fqn = exact_owner.fq_name();
     let member = scala_constructor_member_name(&owner_fqn);
     let call_shape = call_site_shape_for_reference(type_node);
+    if crate::analyzer::common::language_for_target(&exact_owner) == Language::Java {
+        return resolve_java_constructor_from_scala(
+            ctx,
+            exact_owner,
+            &owner_fqn,
+            member,
+            call_shape.as_ref(),
+        );
+    }
     let constructor_units = ctx
         .support
         .fqn(&format!("{owner_fqn}.{member}"))
@@ -3043,26 +3052,12 @@ fn resolve_scala_constructor(
         }
         ScalaPhysicalCallableCandidates::NoCandidates => {}
     }
-    if crate::analyzer::common::language_for_target(&exact_owner) == Language::Scala
-        && ctx.scala.project_types().constructor_target_matches(
-            ctx.scala,
-            &exact_owner,
-            call_shape.as_ref(),
-            ScalaCallableSiteRole::ExplicitConstruction,
-        )
-        && !constructor_units.iter().any(CodeUnit::is_synthetic)
-    {
-        return candidates_outcome(vec![exact_owner]);
-    }
-    if crate::analyzer::common::language_for_target(&exact_owner) == Language::Java
-        && constructor_units.is_empty()
-        && call_shape.as_ref().is_some_and(|shape| {
-            matches!(
-                shape.lists.as_slice(),
-                [list]
-                    if list.kind == ScalaCallArgumentListKind::Ordinary && list.arity == 0
-            )
-        })
+    if ctx.scala.project_types().constructor_target_matches(
+        ctx.scala,
+        &exact_owner,
+        call_shape.as_ref(),
+        ScalaCallableSiteRole::ExplicitConstruction,
+    ) && !constructor_units.iter().any(CodeUnit::is_synthetic)
     {
         return candidates_outcome(vec![exact_owner]);
     }
@@ -3084,6 +3079,63 @@ fn resolve_scala_constructor(
     no_definition(
         "no_applicable_scala_constructor",
         format!("`{member}` has no indexed primary or secondary constructor matching this call"),
+    )
+}
+
+fn resolve_java_constructor_from_scala(
+    ctx: ScalaLookupCtx<'_>,
+    exact_owner: CodeUnit,
+    owner_fqn: &str,
+    member: &str,
+    call_shape: Option<&ScalaCallSiteShape>,
+) -> DefinitionLookupOutcome {
+    let Some(arity) = call_shape.and_then(|shape| match shape.lists.as_slice() {
+        [list] if list.kind == ScalaCallArgumentListKind::Ordinary => Some(list.arity),
+        _ => None,
+    }) else {
+        return no_definition(
+            "no_applicable_scala_constructor",
+            format!("Java constructor `{owner_fqn}` requires one ordinary argument list"),
+        );
+    };
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(ctx.analyzer) else {
+        return no_definition(
+            "no_indexed_definition",
+            format!("Java analyzer is unavailable for constructor `{owner_fqn}`"),
+        );
+    };
+    let callable_candidates = ctx
+        .support
+        .fqn_in_language(&format!("{owner_fqn}.{member}"), Language::Java)
+        .into_iter()
+        .filter(CodeUnit::is_function)
+        .filter(|unit| !unit.is_synthetic())
+        .collect::<Vec<_>>();
+    let (constructors, owner_shape_accepts) =
+        java.constructor_context(&exact_owner, callable_candidates, arity);
+    let matching = constructors
+        .iter()
+        .filter(|unit| {
+            ctx.analyzer
+                .signature_metadata(unit)
+                .into_iter()
+                .find_map(|metadata| metadata.callable_arity())
+                .unwrap_or_else(|| {
+                    crate::analyzer::CallableArity::exact(java_signature_arity(unit.signature()))
+                })
+                .accepts(arity)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !matching.is_empty() {
+        return candidates_outcome(matching);
+    }
+    if owner_shape_accepts {
+        return candidates_outcome(vec![exact_owner]);
+    }
+    no_definition(
+        "no_applicable_scala_constructor",
+        format!("Java constructor `{owner_fqn}` has no indexed overload accepting arity {arity}"),
     )
 }
 
