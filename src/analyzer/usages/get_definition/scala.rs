@@ -596,9 +596,37 @@ impl<'a> ForwardScalaNameResolver<'a> {
                 continue;
             }
 
+            let prior_imports = self
+                .imports
+                .iter()
+                .filter(|candidate| {
+                    candidate.path.as_ref().is_some_and(|candidate_path| {
+                        candidate_path.declaration_start_byte < path.declaration_start_byte
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let qualifier_resolver = Self {
+                scala: self.scala,
+                support: self.support,
+                package: path
+                    .lexical_prefixes
+                    .last()
+                    .cloned()
+                    .map(Arc::from)
+                    .unwrap_or_else(|| Arc::clone(&self.package)),
+                package_prefixes: if path.lexical_prefixes.is_empty() {
+                    Arc::clone(&self.package_prefixes)
+                } else {
+                    Arc::new(path.lexical_prefixes.clone())
+                },
+                lexical_scopes: Arc::new(path.lexical_scopes.clone()),
+                reference_byte: Some(path.declaration_start_byte),
+                imports: Arc::new(prior_imports),
+            };
             if !owner_segments.is_empty()
-                && let ScalaNameResolution::Resolved(owner) =
-                    self.resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
+                && let ScalaNameResolution::Resolved(owner) = qualifier_resolver
+                    .resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
             {
                 members.extend(
                     self.support
@@ -615,7 +643,12 @@ impl<'a> ForwardScalaNameResolver<'a> {
             }
 
             let flattened = path.segments.join(".");
-            for candidate in import_candidate_fq_names(&flattened, &self.package) {
+            let import_prefixes = if path.lexical_prefixes.is_empty() {
+                self.package_prefixes.as_slice()
+            } else {
+                path.lexical_prefixes.as_slice()
+            };
+            for candidate in scala_import_path_candidates(&flattened, import_prefixes) {
                 members.extend(
                     self.support
                         .fqn(&candidate)
@@ -2980,6 +3013,14 @@ fn resolve_scala_constructor(
         .into_iter()
         .filter(CodeUnit::is_function)
         .filter(|unit| ctx.scala.structural_parent_of(unit).as_ref() == Some(&exact_owner))
+        .filter(|unit| {
+            scala_unit_has_callable_role(ctx.scala, unit, ScalaCallableRole::PrimaryConstructor)
+                || scala_unit_has_callable_role(
+                    ctx.scala,
+                    unit,
+                    ScalaCallableRole::SecondaryConstructor,
+                )
+        })
         .collect::<Vec<_>>();
     let candidates = scala_physical_callable_candidates(
         ctx.scala,
@@ -3011,14 +3052,17 @@ fn resolve_scala_constructor(
         )
         && !constructor_units.iter().any(CodeUnit::is_synthetic)
     {
-        return if constructor_units.is_empty() {
-            candidates_outcome(vec![exact_owner])
-        } else {
-            candidates_outcome(constructor_units)
-        };
+        return candidates_outcome(vec![exact_owner]);
     }
     if crate::analyzer::common::language_for_target(&exact_owner) == Language::Java
         && constructor_units.is_empty()
+        && call_shape.as_ref().is_some_and(|shape| {
+            matches!(
+                shape.lists.as_slice(),
+                [list]
+                    if list.kind == ScalaCallArgumentListKind::Ordinary && list.arity == 0
+            )
+        })
     {
         return candidates_outcome(vec![exact_owner]);
     }

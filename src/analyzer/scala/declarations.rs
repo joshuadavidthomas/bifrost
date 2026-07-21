@@ -4,7 +4,10 @@ use crate::analyzer::{
 use crate::hash::HashMap;
 use tree_sitter::{Node, Tree};
 
-use super::imports::{scala_export_info_from_node, scala_import_infos_from_node_with_prefixes};
+use super::imports::{
+    scala_export_info_from_node, scala_import_infos_from_node_with_prefixes,
+    scala_lexical_scope_path,
+};
 use super::supertypes::{extract_scala_supertypes, scala_full_enum_case_owner_supertype};
 use super::wildcard_imports::scala_package_prefixes_at;
 
@@ -379,8 +382,10 @@ impl<'a> ScalaVisitor<'a> {
             raw_supertypes.push(enum_owner);
         }
         raw_supertypes.extend(extract_scala_supertypes(node, self.source));
+        let lexical_scopes = scala_lexical_scope_path(node);
         for fact in &mut raw_supertypes {
             fact.lookup_path.set_package_prefixes(package_prefixes);
+            fact.lookup_path.set_lexical_scopes(&lexical_scopes);
         }
         if !raw_supertypes.is_empty() {
             self.parsed.set_raw_supertypes(

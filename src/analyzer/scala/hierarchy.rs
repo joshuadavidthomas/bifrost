@@ -326,10 +326,16 @@ fn hierarchy_owner_context_from_state(
         .map(ScalaSupertypeLookupPath::package_prefixes)
         .filter(|prefixes| !prefixes.is_empty())
         .unwrap_or(fallback_package.as_slice());
+    let lexical_scopes = supertype_lookup_paths
+        .first()
+        .map(ScalaSupertypeLookupPath::lexical_scopes)
+        .unwrap_or_default();
     let imports = state
         .imports
         .iter()
-        .filter(|import| scala_import_visible_at(import, package_prefixes, &[], reference_byte))
+        .filter(|import| {
+            scala_import_visible_at(import, package_prefixes, lexical_scopes, reference_byte)
+        })
         .cloned()
         .collect();
     Some(ScalaHierarchyOwnerContext {
@@ -351,8 +357,13 @@ fn hierarchy_import_claims_root(
                 .as_deref()
                 .is_some_and(|visible| visible == root)
     }) || wildcard_baseline.is_some_and(|baseline| {
-        (resolver.resolve(root), resolver.resolve_object(root))
-            != (baseline.resolve(root), baseline.resolve_object(root))
+        let wildcard_is_newly_ambiguous = (resolver.type_binding_is_ambiguous(root)
+            && !baseline.type_binding_is_ambiguous(root))
+            || (resolver.object_binding_is_ambiguous(root)
+                && !baseline.object_binding_is_ambiguous(root));
+        wildcard_is_newly_ambiguous
+            || (resolver.resolve(root), resolver.resolve_object(root))
+                != (baseline.resolve(root), baseline.resolve_object(root))
     })
 }
 

@@ -168,6 +168,34 @@ class DottedListBuffer extends StrictOptimizedSeqFactory[DottedListBuffer]
 }
 
 #[test]
+fn scala_hierarchy_preserves_lexically_nested_import_context_source_free() {
+    let (_project, analyzer) = scala_analyzer_with_files(&[
+        ("lib/Base.scala", "package lib\ntrait Base\n"),
+        (
+            "app/Outer.scala",
+            r#"package app
+object Outer:
+  import lib.Base
+  class Child extends Base
+"#,
+        ),
+    ]);
+    let base = definition(&analyzer, "lib.Base");
+    let child = definition(&analyzer, "app.Outer$.Child");
+
+    analyzer.reset_full_hydration_count_for_test();
+    assert_eq!(
+        fq_names(analyzer.get_direct_descendants(&base)),
+        BTreeSet::from(["app.Outer$.Child".to_string()])
+    );
+    assert_eq!(
+        fq_names(analyzer.get_direct_ancestors(&child)),
+        BTreeSet::from(["lib.Base".to_string()])
+    );
+    assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+}
+
+#[test]
 fn scala_hierarchy_qualified_package_roots_follow_import_and_ambiguity_precedence() {
     let (_project, analyzer) = scala_analyzer_with_files(&[
         (

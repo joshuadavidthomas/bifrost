@@ -19689,6 +19689,42 @@ object App:
 }
 
 #[test]
+fn scala_member_import_alias_does_not_shadow_its_own_qualifier() {
+    let source = r#"
+package app
+
+class Renderer { def render(value: String): String = value }
+object Factory { def default: Renderer = new Renderer }
+
+object App:
+  import Factory.{default => Factory}
+  val direct = Factory.render("ok")
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+
+    for (start, expected) in [
+        (
+            source.rfind("Factory.render").expect("import alias"),
+            "app.Factory$.default",
+        ),
+        (
+            source.rfind("render(\"ok\")").expect("receiver member"),
+            "app.Renderer.render",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("app/App.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
 fn scala_imported_factory_return_type_uses_factory_scope() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -20780,17 +20816,24 @@ package app
 class Multi {
   def this(value: Int) = this()
 }
+class MethodOnly {
+  def MethodOnly(value: Int): Int = value
+}
 
 object Controller {
   val zero = new Multi
   val one = new Multi(1)
+  val ordinary = new MethodOnly
 }
 "#;
     let project = InlineTestProject::with_language(Language::Scala)
         .file("app/ConstructorAlternatives.scala", source)
         .build();
 
-    for needle in ["new Multi\n", "new Multi(1)"] {
+    for (needle, expected) in [
+        ("new Multi\n", "app.Multi"),
+        ("new Multi(1)", "app.Multi.Multi"),
+    ] {
         let start = source.find(needle).expect("constructor call") + "new ".len();
         let value = lookup(
             project.root(),
@@ -20798,11 +20841,20 @@ object Controller {
         );
         let result = &value["results"][0];
         assert_eq!(result["status"], "resolved", "{value}");
-        assert_eq!(
-            result["definitions"][0]["fqn"], "app.Multi.Multi",
-            "{value}"
-        );
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+
+    let start = source
+        .find("new MethodOnly")
+        .expect("ordinary method owner")
+        + "new ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/ConstructorAlternatives.scala", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.MethodOnly", "{value}");
 }
 
 #[test]
@@ -21682,10 +21734,10 @@ fn scala_type_reference_keeps_supported_java_definition_resolution() {
         .file("app/Greeter.java", "package app; public class Greeter {}\n")
         .file(
             "app/Use.scala",
-            "package app\nobject Use { val greeter = new Greeter() }\n",
+            "package app\nobject Use { val greeter = new Greeter(); val invalid = new Greeter(1) }\n",
         )
         .build();
-    let line = "object Use { val greeter = new Greeter() }";
+    let line = "object Use { val greeter = new Greeter(); val invalid = new Greeter(1) }";
     let value = lookup(
         project.root(),
         &format!(
@@ -21698,6 +21750,18 @@ fn scala_type_reference_keeps_supported_java_definition_resolution() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["language"], "java", "{value}");
     assert_eq!(result["definitions"][0]["fqn"], "app.Greeter", "{value}");
+
+    let invalid = line.rfind("Greeter").expect("invalid Java construction") + 1;
+    let value = lookup(
+        project.root(),
+        &format!(r#"{{"references":[{{"path":"app/Use.scala","line":2,"column":{invalid}}}]}}"#),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_applicable_scala_constructor",
+        "{value}"
+    );
 }
 
 #[test]

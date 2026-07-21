@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tree_sitter::Node;
 
+use crate::analyzer::StructuredImportScope;
+
 pub(super) struct ScalaSupertypeFact {
     pub(super) raw: String,
     pub(super) lookup_path: ScalaSupertypeLookupPath,
@@ -18,6 +20,9 @@ pub(crate) struct ScalaSupertypeLookupPath {
     /// scope; one dotted clause retains only its complete package.
     #[serde(default)]
     package_prefixes: Vec<String>,
+    /// Parser-derived enclosing lexical scopes at the owner declaration.
+    #[serde(default)]
+    lexical_scopes: Vec<StructuredImportScope>,
 }
 
 impl ScalaSupertypeLookupPath {
@@ -29,8 +34,16 @@ impl ScalaSupertypeLookupPath {
         &self.package_prefixes
     }
 
+    pub(crate) fn lexical_scopes(&self) -> &[StructuredImportScope] {
+        &self.lexical_scopes
+    }
+
     pub(super) fn set_package_prefixes(&mut self, package_prefixes: &[String]) {
         self.package_prefixes = package_prefixes.to_vec();
+    }
+
+    pub(super) fn set_lexical_scopes(&mut self, lexical_scopes: &[StructuredImportScope]) {
+        self.lexical_scopes = lexical_scopes.to_vec();
     }
 
     pub(super) fn encode(&self) -> String {
@@ -53,6 +66,7 @@ pub(super) fn extract_scala_supertypes(
             lookup_path: ScalaSupertypeLookupPath {
                 segments: scala_type_lookup_segments(lookup_node, source),
                 package_prefixes: Vec::new(),
+                lexical_scopes: Vec::new(),
             },
         })
         .filter(|fact| !fact.lookup_path.segments.is_empty())
@@ -96,6 +110,7 @@ pub(super) fn scala_full_enum_case_owner_supertype(
         lookup_path: ScalaSupertypeLookupPath {
             segments,
             package_prefixes: Vec::new(),
+            lexical_scopes: Vec::new(),
         },
     })
 }

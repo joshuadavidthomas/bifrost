@@ -5867,12 +5867,20 @@ impl NameResolver {
         self.names.resolve_logical(simple)
     }
 
-    fn type_binding_is_ambiguous(&self, raw: &str) -> bool {
+    pub(crate) fn type_binding_is_ambiguous(&self, raw: &str) -> bool {
         let Some(simple) = simple_type_name(raw) else {
             return false;
         };
         self.import_collision_blocks(simple, self.names.priority(simple))
             || self.names.is_ambiguous(simple)
+    }
+
+    pub(crate) fn object_binding_is_ambiguous(&self, raw: &str) -> bool {
+        let Some(simple) = simple_type_name(raw) else {
+            return false;
+        };
+        self.import_collision_blocks(simple, self.object_names.priority(simple))
+            || self.object_names.is_ambiguous(simple)
     }
 
     pub(crate) fn resolve_object(&self, raw: &str) -> Option<String> {
