@@ -17,10 +17,11 @@ use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BuildProgressEvent, BulkFileStateSource,
-    CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, DeclarationInfo, DeclarationKind,
-    ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer, ImportAnalysisProvider, Language,
-    Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
+    CallableArity, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, DeclarationInfo,
+    DeclarationKind, ExceptionHandlingSmell, ExceptionSmellWeights, IAnalyzer,
+    ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -224,6 +225,68 @@ impl JavaAnalyzer {
             .package_names
             .insert(file.clone(), Arc::clone(&package));
         Some(package)
+    }
+
+    /// Classify exact-FQN callable candidates and the source-level constructor
+    /// shape from one coherent parser snapshot.
+    ///
+    /// Java permits an ordinary method to have the same simple name as its
+    /// enclosing class, so FQN and arity alone cannot distinguish the two.
+    pub(crate) fn constructor_context(
+        &self,
+        owner: &CodeUnit,
+        candidates: Vec<CodeUnit>,
+        call_arity: usize,
+    ) -> (Vec<CodeUnit>, bool) {
+        let Some(prepared) = self.inner.prepared_syntax(owner.source()) else {
+            return (Vec::new(), false);
+        };
+        let owner_children = prepared.direct_children(owner);
+        let has_explicit_constructor = owner_children.iter().any(|child| {
+            prepared.declaration_node(child).is_some_and(|node| {
+                matches!(
+                    node.kind(),
+                    "constructor_declaration" | "compact_constructor_declaration"
+                )
+            })
+        });
+        let direct_children = owner_children.iter().collect::<HashSet<_>>();
+        let constructors = candidates
+            .into_iter()
+            .filter(|candidate| direct_children.contains(candidate))
+            .filter(|candidate| {
+                prepared.declaration_node(candidate).is_some_and(|node| {
+                    matches!(
+                        node.kind(),
+                        "constructor_declaration" | "compact_constructor_declaration"
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let owner_shape_accepts = match prepared.declaration_node(owner) {
+            Some(node) if node.kind() == "class_declaration" => {
+                !has_explicit_constructor && call_arity == 0
+            }
+            Some(node) if node.kind() == "record_declaration" => {
+                let Some(parameters) = node.child_by_field_name("parameters") else {
+                    return (constructors, false);
+                };
+                let mut cursor = parameters.walk();
+                let mut required = 0;
+                let mut repeated = false;
+                for parameter in parameters.named_children(&mut cursor) {
+                    match parameter.kind() {
+                        "formal_parameter" => required += 1,
+                        "spread_parameter" => repeated = true,
+                        _ => {}
+                    }
+                }
+                CallableArity::new(required, required + usize::from(repeated), repeated)
+                    .accepts(call_arity)
+            }
+            _ => false,
+        };
+        (constructors, owner_shape_accepts)
     }
 }
 

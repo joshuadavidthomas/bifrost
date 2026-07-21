@@ -1030,12 +1030,12 @@ class AmbiguousImports {
                 ClickExpectation::Locations(&["ambiguous_one_decl"]),
             ),
             ClickCase::new(
-                "interface method references include override and receiver calls",
+                "interface method references exclude concrete override calls",
                 "task_run_decl",
                 ClickOperation::References {
                     include_declaration: false,
                 },
-                ClickExpectation::Locations(&["email_run_decl", "task_run_call", "email_run_call"]),
+                ClickExpectation::Locations(&["email_run_decl", "task_run_call"]),
             ),
             ClickCase::new(
                 "interface method implementation finds override",
@@ -1441,7 +1441,7 @@ void run() {
                 ClickOperation::References {
                     include_declaration: false,
                 },
-                ClickExpectation::Locations(&["make_derived_qualified_call", "make_derived_def"]),
+                ClickExpectation::Locations(&["make_derived_call", "make_derived_def"]),
             ),
             ClickCase::new(
                 "derived method declaration references out-of-line definition and typed calls",

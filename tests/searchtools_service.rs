@@ -256,6 +256,59 @@ fn query_code_loads_workspace_rql_and_json_files() {
 }
 
 #[test]
+fn query_code_exposes_planning_only_explain_and_opt_in_profile_reports() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "class App:\n    pass\n")
+        .build();
+    let queries = project.root().join("queries");
+    fs::create_dir(&queries).expect("query directory");
+    fs::write(
+        queries.join("app-profile.rql"),
+        "(profile (class :name \"App\"))\n",
+    )
+    .expect("profile RQL query");
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let ordinary = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({ "match": { "kind": "class", "name": "App" } }),
+        )
+        .expect("ordinary query");
+    assert!(ordinary.get("format").is_none(), "{ordinary}");
+
+    let explain = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({
+                "execution_mode": "explain",
+                "match": { "kind": "class", "name": "App" }
+            }),
+        )
+        .expect("explain query");
+    assert_eq!(explain["format"], "bifrost_code_query_explain/v1");
+    assert_eq!(explain["scheduling"]["selected"], "sequential");
+    assert!(explain.get("results").is_none(), "{explain}");
+
+    let profile = service
+        .call_tool_value(
+            "query_code",
+            serde_json::json!({ "query_file": "queries/app-profile.rql" }),
+        )
+        .expect("profile query file");
+    assert_eq!(profile["format"], "bifrost_code_query_profile/v1");
+    assert_eq!(profile["result"], ordinary);
+    assert!(
+        profile["operators"]
+            .as_array()
+            .is_some_and(|operators| !operators.is_empty()),
+        "{profile}"
+    );
+    assert_eq!(profile["scheduling"]["peak_concurrency"], 1);
+}
+
+#[test]
 fn query_code_file_input_reports_validation_and_workspace_errors() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("app.py", "class App:\n    pass\n")
@@ -2781,6 +2834,48 @@ class UnrelatedChild extends UnrelatedBase {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_scala_lexical_outer_callables() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Owners.scala",
+            r#"
+package app
+
+object Outer {
+  def catalog(value: Int): Int = value
+  class Inner {
+    val call = catalog(1) // positive-lexical-outer
+  }
+  class Nearer {
+    def catalog(value: Int): Int = value + 1
+    val call = catalog(2) // negative-nearer-owner
+  }
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["app.Outer.catalog"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    assert_eq!(usage["total_hits"], 1, "{value}");
+    assert!(
+        usage["files"][0]["hits"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("positive-lexical-outer")),
+        "expected lexical outer call only: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_by_reference_accepts_scala_default_and_repeated_arity() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -2908,6 +3003,66 @@ object NumberUse {
 }
 
 #[test]
+fn scan_usages_by_reference_finds_scala_unqualified_type_roles() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Model.scala",
+            r#"package model
+class Extracted(val value: Int)
+object Extracted { def unapply(value: Any): Option[Int] = None }
+class Built(val value: Int)
+abstract class Zero
+final class Projected private (val value: Int)
+object Projected { def apply(value: Int): Projected = new Projected(value) }
+trait Growable { def +=(value: Int): Unit }
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.*
+object Use {
+  def extract(value: Any): Int = value match { case Extracted(found) => found; case _ => 0 } // mcp-extractor
+  val built = Built(1) // mcp-universal
+  val projected = Projected(2) // mcp-apply
+  val zero = new Zero: // mcp-zero
+    override def toString = "zero"
+  def grow(target: Growable): Unit = target += 1 // mcp-infix
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (symbol, expected) in [
+        ("model.Extracted", "mcp-extractor"),
+        ("model.Built", "mcp-universal"),
+        ("model.Projected.apply", "mcp-apply"),
+        ("model.Zero", "mcp-zero"),
+        ("model.Growable.+=", "mcp-infix"),
+    ] {
+        let args = serde_json::json!({"symbols": [symbol], "include_tests": true}).to_string();
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args)
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let usage = only_result(&value);
+        assert_eq!(usage["status"], "found", "{symbol}: {value}");
+        assert!(
+            usage["files"].as_array().into_iter().flatten().any(|file| {
+                file["hits"].as_array().into_iter().flatten().any(|hit| {
+                    hit["snippet"]
+                        .as_str()
+                        .is_some_and(|snippet| snippet.contains(expected))
+                })
+            }),
+            "{symbol} missing {expected:?}: {value}"
+        );
+    }
+}
+
+#[test]
 fn scan_usages_by_reference_finds_scala_structured_selection_roles() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -2980,6 +3135,373 @@ object Use {
 }
 
 #[test]
+fn scan_usages_by_reference_uses_parser_active_scala_package_context() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "scala/collection/ArrayOps.scala",
+            "package scala.collection\nclass ArrayOps(value: Int)\n",
+        )
+        .file(
+            "scala/collection/immutable/ArraySeq.scala",
+            r#"package scala.collection
+package immutable
+object ArraySeq {
+  val value = new ArrayOps(1) // public-positive-package-context
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["scala.collection.ArrayOps.ArrayOps"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    assert!(
+        usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .any(|snippet| snippet.contains("public-positive-package-context")),
+        "{value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_reference_resolves_scala_package_alias_roots_without_ambiguity_leaks() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "root/api/Types.scala",
+            "package root.api\nclass ActorContext\n",
+        )
+        .file(
+            "decoy/api/Types.scala",
+            "package decoy.api\nclass ActorContext\n",
+        )
+        .file(
+            "collision/Api.scala",
+            "package collision\nobject Api { class ActorContext }\n",
+        )
+        .file(
+            "collision/Api/Types.scala",
+            "package collision.Api\nclass ActorContext\n",
+        )
+        .file(
+            "root/consumer/Use.scala",
+            r#"package root.consumer
+import root.{api => classic}
+object Use {
+  val context: classic.ActorContext = null // public-positive-package-alias
+}
+"#,
+        )
+        .file(
+            "root/consumer/Ambiguous.scala",
+            r#"package root.consumer
+import root.{api => clash}
+import decoy.{api => clash}
+object Ambiguous {
+  val context: clash.ActorContext = null // public-negative-conflicting-package-alias
+}
+"#,
+        )
+        .file(
+            "root/consumer/Collision.scala",
+            r#"package root.consumer
+import collision.{Api => mixed}
+object Collision {
+  val context: mixed.ActorContext = null // public-negative-same-tier-package-singleton
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["root.api.ActorContext"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    let snippets = usage["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .filter_map(|hit| hit["snippet"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        snippets
+            .iter()
+            .any(|snippet| snippet.contains("public-positive-package-alias")),
+        "{value}"
+    );
+    assert!(
+        snippets
+            .iter()
+            .all(|snippet| !snippet.contains("public-negative-conflicting-package-alias")),
+        "{value}"
+    );
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["collision.Api$.ActorContext"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "verified_absent", "{value}");
+    assert!(
+        usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .all(|snippet| !snippet.contains("public-negative-same-tier-package-singleton")),
+        "{value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_reference_finds_unique_scala_companion_method_values() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Token.scala",
+            "package model\ncase class Token(value: Int)\n",
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.Token
+object Use {
+  def accept(value: Int, function: Int => Token): Token = function(value)
+  def keep(value: Any): Any = value
+  val contextual = accept(1, Token) // public-positive-contextual-method-value
+  val inferred = Option(1).map(Token) // public-positive-unique-method-value
+  val rejected = keep(Token) // public-negative-known-non-function
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["model.Token"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    let snippets = usage["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+        .filter_map(|hit| hit["snippet"].as_str())
+        .collect::<Vec<_>>();
+    for marker in [
+        "public-positive-contextual-method-value",
+        "public-positive-unique-method-value",
+    ] {
+        assert!(
+            snippets.iter().any(|snippet| snippet.contains(marker)),
+            "expected {marker}: {value}"
+        );
+    }
+    assert!(
+        snippets
+            .iter()
+            .all(|snippet| !snippet.contains("public-negative-known-non-function")),
+        "{value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_reference_finds_same_file_scala_companion_wildcard_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("kyo/Chunk.scala", "package kyo\nclass Chunk[+A]\n")
+        .file(
+            "kyo/Batch.scala",
+            r#"package kyo
+object Batch:
+    import internal.*
+    def run[A, S](v: A): A =
+        type Item = A | Int
+        def expand(items: List[Item]) =
+            Kyo.foreach(items) {
+                case ToExpand[A @unchecked, S @unchecked](seq: Seq[Any], cont) =>
+                    Kyo.foreach(seq)(v => v)
+                case item => item
+            }
+        expand(Nil)
+    end run
+    object internal:
+        case class Call[A](v: A) // public-negative-nested-package-wildcard
+    end internal
+end Batch
+"#,
+        )
+        .file(
+            "kyo/ai/Context.scala",
+            r#"package kyo.ai
+import Context.*
+import kyo.*
+case class Context(calls: Chunk[Call]):
+    def assistantMessage(calls: Chunk[Call]): Context = this // public-positive-context-call
+end Context
+object Context:
+    case class Call(id: String)
+end Context
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["kyo.ai.Context$.Call"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert_eq!(usage["status"], "found", "{value}");
+    assert!(
+        usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .any(|snippet| snippet.contains("public-positive-context-call")),
+        "{value}"
+    );
+    assert!(
+        usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .all(|snippet| !snippet.contains("public-negative-nested-package-wildcard")),
+        "{value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_reference_resolves_exact_scala_field_chains() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/Fields.scala",
+            r#"package model
+class Leaf(val token: Int)
+class Middle(val leaf: Leaf)
+class Base(val inherited: Middle)
+class Child extends Base(new Middle(new Leaf(1))) {
+  def inheritedBare: Int = inherited.leaf.token // positive-inherited-bare
+  def inheritedShadow(inherited: other.Middle): Int = inherited.leaf.token // negative-shadow
+}
+object Stable { val middle: Middle = new Middle(new Leaf(2)) }
+object Owners { final class State(var maximumHeapSize: Int) }
+"#,
+        )
+        .file(
+            "other/Fields.scala",
+            "package other\nclass Leaf(val token: Int)\nclass Middle(val leaf: Leaf)\n",
+        )
+        .file(
+            "dup/First.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        )
+        .file(
+            "dup/Second.scala",
+            "package dup\nclass Owner(val value: Int)\n",
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.{Child, Middle, Owners, Stable}
+object Use {
+  def typed(middle: Middle): Int = middle.leaf.token // positive-typed
+  def inherited(child: Child): Int = child.inherited.leaf.token // positive-inherited
+  def stable: Int = Stable.middle.leaf.token // positive-stable
+  def nested: Int = { val state = new Owners.State(1); state.maximumHeapSize } // positive-nested
+  def localShadow(middle: other.Middle): Int = middle.leaf.token // negative-shadow
+  def ambiguous(owner: dup.Owner): Int = owner.value // negative-ambiguous
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    for (symbol, expected) in [
+        ("model.Middle.leaf", "positive-typed"),
+        ("model.Leaf.token", "positive-stable"),
+        ("model.Base.inherited", "positive-inherited-bare"),
+        ("model.Owners$.State.maximumHeapSize", "positive-nested"),
+    ] {
+        let args = serde_json::json!({"symbols": [symbol], "include_tests": true}).to_string();
+        let payload = service
+            .call_tool_json("scan_usages_by_reference", &args)
+            .unwrap();
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        let usage = only_result(&value);
+        assert_eq!(usage["status"], "found", "{value}");
+        let snippets = usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            snippets.iter().any(|snippet| snippet.contains(expected)),
+            "expected {expected:?}: {value}"
+        );
+        assert!(
+            snippets
+                .iter()
+                .all(|snippet| !snippet.contains("negative-shadow")),
+            "local-shadow decoy leaked: {value}"
+        );
+    }
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["dup.Owner.value"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+    assert!(
+        usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|file| file["hits"].as_array().into_iter().flatten())
+            .filter_map(|hit| hit["snippet"].as_str())
+            .all(|snippet| !snippet.contains("negative-ambiguous")),
+        "ambiguous source identity leaked: {value}"
+    );
+}
+
+#[test]
 fn scan_usages_by_reference_resolves_scala_call_initializer_receiver() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -3022,6 +3544,110 @@ object Action {
             .as_str()
             .is_some_and(|snippet| snippet.contains("console.textSent(\"expected\")")),
         "{value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_reference_resolves_shared_scala_union_receiver_member() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "model/CompletionValue.scala",
+            r#"package model
+sealed trait CompletionValue { def insertText: Option[String] = None }
+object CompletionValue {
+  sealed trait Symbolic extends CompletionValue
+  class Workspace extends Symbolic
+  class Extension extends Symbolic
+}
+class Unrelated
+"#,
+        )
+        .file(
+            "app/Use.scala",
+            r#"package app
+import model.CompletionValue.Workspace
+import model.CompletionValue.Extension
+import model.Unrelated
+object Use {
+  def shared(v: Workspace | Extension): Option[String] = v.insertText
+  def rejected(v: Workspace | Unrelated): Option[String] = v.insertText
+}
+"#,
+        )
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_reference",
+            r#"{"symbols":["model.CompletionValue.insertText"],"include_tests":true}"#,
+        )
+        .unwrap();
+    let value: Value = serde_json::from_str(&payload).unwrap();
+    let usage = only_result(&value);
+
+    assert_eq!(usage["status"], "found", "{value}");
+    assert_eq!(usage["total_hits"], 1, "{value}");
+    assert!(
+        usage["files"][0]["hits"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("def shared")),
+        "{value}"
+    );
+}
+
+#[test]
+fn scan_usages_by_location_does_not_expose_nested_scala_type_through_wildcard_import() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "kyo/Chunk.scala",
+            r#"package kyo
+
+sealed abstract class Chunk[+A]:
+  final def dropLeft(n: Int): Chunk[A] = this
+"#,
+        )
+        .file(
+            "kyo/internal/Queue.scala",
+            r#"package kyo.internal
+
+object Queue:
+  final class Chunk
+"#,
+        )
+        .file(
+            "kyo/Channel.scala",
+            r#"package kyo
+
+import kyo.internal.*
+
+object Channel:
+  def offerAll[A](initial: Chunk[A]): Chunk[A] =
+    def loop(currentChunk: Chunk[A]): Chunk[A] =
+      currentChunk.dropLeft(1)
+
+    loop(initial)
+"#,
+        )
+        .build();
+    let service = SearchToolsService::new_without_semantic_index(project.root().to_path_buf())
+        .expect("service");
+
+    let payload = service
+        .call_tool_json(
+            "scan_usages_by_location",
+            r#"{"targets":[{"path":"kyo/Chunk.scala","line":4,"column":13}],"include_tests":true}"#,
+        )
+        .expect("location scan succeeds");
+    let value: Value = serde_json::from_str(&payload).expect("valid response");
+    let usage = only_result(&value);
+    assert_eq!("found", usage["status"], "payload: {value}");
+    assert_eq!(Some(1), usage["total_hits"].as_u64(), "payload: {value}");
+    assert!(
+        usage["files"][0]["hits"][0]["snippet"]
+            .as_str()
+            .is_some_and(|snippet| snippet.contains("currentChunk.dropLeft(1)")),
+        "payload: {value}"
     );
 }
 
@@ -3244,6 +3870,88 @@ public class OverrideChild extends Base {
         "{value}"
     );
     assert_eq!(1, usage["unproven_hits"], "{value}");
+}
+
+#[test]
+fn java_scan_usages_separates_interface_and_concrete_method_ranges() {
+    let runner = r#"package com.example;
+public class Runner {
+    Handler makeAnonymous() {
+        return new Handler() {
+            @Override public String handle(String value) { return value; }
+        };
+    }
+    String run() {
+        Handler handler = new ConsoleHandler();
+        ConsoleHandler direct = new ConsoleHandler();
+        return handler.handle(" Ada ") + ":" + direct.handle(" Grace ") + ":" + makeAnonymous().handle(" Linus ");
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "com/example/Handler.java",
+            "package com.example; public interface Handler { String handle(String value); }\n",
+        )
+        .file(
+            "com/example/ConsoleHandler.java",
+            "package com.example; public class ConsoleHandler implements Handler { @Override public String handle(String value) { return value.trim(); } }\n",
+        )
+        .file("com/example/Runner.java", runner)
+        .build();
+    let service =
+        SearchToolsService::new_without_semantic_index(project.root().to_path_buf()).unwrap();
+
+    let return_line = runner
+        .lines()
+        .find(|line| line.contains("return handler.handle"))
+        .expect("return line");
+    let ranges = return_line
+        .match_indices(".handle")
+        .map(|(byte, _)| {
+            let start = return_line[..byte].chars().count() + 2;
+            (start, start + "handle".chars().count())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(3, ranges.len());
+
+    for (symbol, expected_ranges, expected_total_hits) in [
+        ("com.example.Handler.handle", vec![ranges[0], ranges[2]], 3),
+        ("com.example.ConsoleHandler.handle", vec![ranges[1]], 2),
+    ] {
+        let payload = service
+            .call_tool_json(
+                "scan_usages_by_reference",
+                &serde_json::json!({"symbols": [symbol], "include_tests": true}).to_string(),
+            )
+            .expect("scan succeeds");
+        let value: Value = serde_json::from_str(&payload).expect("valid response");
+        let usage = only_result(&value);
+        assert_eq!("found", usage["status"], "{symbol}: {value}");
+        assert_eq!(
+            expected_total_hits, usage["total_hits"],
+            "{symbol}: {value}"
+        );
+        assert_eq!(0, usage["unproven_hits"], "{symbol}: {value}");
+
+        let runner_hits = usage["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|file| file["path"] == "com/example/Runner.java")
+            .and_then(|file| file["hits"].as_array())
+            .expect("Runner.java hits");
+        let actual_ranges = runner_hits
+            .iter()
+            .map(|hit| {
+                (
+                    hit["column"].as_u64().unwrap() as usize,
+                    hit["end_column"].as_u64().unwrap() as usize,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(expected_ranges, actual_ranges, "{symbol}: {value}");
+    }
 }
 
 #[test]
@@ -4850,6 +5558,14 @@ fn scan_usages_location_target_uses_column_on_same_line_declarations() {
 fn scan_usages_location_batch_follows_chained_rust_type_reexports() {
     let project = InlineTestProject::with_language(Language::Rust)
         .file(
+            "Cargo.toml",
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .file(
             "src/query/ir.rs",
             r#"pub struct CodeQueryPlan;
 pub struct LogicalQueryPlan;
@@ -4870,6 +5586,7 @@ pub use ir::{CodeQueryPlan, LogicalQueryPlan};
             "src/lib.rs",
             r#"pub mod query;
 pub mod structural;
+pub mod execution;
 "#,
         )
         .file(
@@ -4881,7 +5598,7 @@ pub fn execute(plan: &CodeQueryPlan, logical: &LogicalQueryPlan) {}
         )
         .file(
             "src/main.rs",
-            r#"use crate::structural::CodeQueryPlan;
+            r#"use demo::structural::CodeQueryPlan;
 
 fn plan_summary_text(plan: &CodeQueryPlan) {}
 "#,

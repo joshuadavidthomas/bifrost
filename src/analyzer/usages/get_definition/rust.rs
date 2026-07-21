@@ -203,6 +203,7 @@ pub(super) fn resolve_rust(
                     candidates = match crate::analyzer::usages::rust_graph::resolve_trait_associated_item_matching(
                             rust, support, &refs, file, &self_type, name,
                             matches_kind,
+                            site.focus_start_byte,
                         ) {
                             ReceiverAnalysisOutcome::Precise(resolved) => {
                                 rust_member_candidates(resolved, member_kind)
@@ -233,17 +234,38 @@ pub(super) fn resolve_rust(
     {
         return outcome;
     }
+    if let Some(tree) = tree
+        && let Some(candidates) = rust_focused_terminal_scoped_type_candidates(
+            analyzer, rust, support, file, source, tree, site, &refs,
+        )
+    {
+        return candidates_outcome(candidates);
+    }
     let (candidates, scoped_lookup_failed) = if let Some((path, name)) = reference.rsplit_once("::")
     {
-        let resolved = match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
-            rust, support, &refs, file, path, name,
-        ) {
-            ReceiverAnalysisOutcome::Precise(candidates) => candidates,
-            ReceiverAnalysisOutcome::Ambiguous(_)
-            | ReceiverAnalysisOutcome::Unknown
-            | ReceiverAnalysisOutcome::Unsupported { .. }
-            | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
-        };
+        let role = tree
+            .and_then(|tree| rust_bare_reference_role(tree, site))
+            .unwrap_or(RustBareReferenceRole::Callable);
+        let resolved =
+            match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item_matching(
+                rust,
+                support,
+                &refs,
+                file,
+                path,
+                name,
+                rust_scoped_role_candidate(role),
+                site.focus_start_byte,
+            ) {
+                ReceiverAnalysisOutcome::Precise(candidates) => candidates
+                    .into_iter()
+                    .filter(|candidate| rust_role_accepts_scoped(rust, role, candidate))
+                    .collect(),
+                ReceiverAnalysisOutcome::Ambiguous(_)
+                | ReceiverAnalysisOutcome::Unknown
+                | ReceiverAnalysisOutcome::Unsupported { .. }
+                | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
+            };
         (resolved, true)
     } else {
         let resolved = if let Some(tree) = tree
@@ -920,6 +942,34 @@ fn rust_role_accepts_current_module(
     }
 }
 
+fn rust_role_accepts_scoped(
+    rust: &RustAnalyzer,
+    role: RustBareReferenceRole,
+    candidate: &CodeUnit,
+) -> bool {
+    match role {
+        RustBareReferenceRole::Type => {
+            candidate.is_class() || rust_declaration_is_module_type_alias(rust, candidate)
+        }
+        RustBareReferenceRole::Value => {
+            candidate.is_class()
+                || candidate.is_function()
+                || (candidate.is_field() && rust_declaration_is_value_item(rust, candidate))
+        }
+        RustBareReferenceRole::Callable => {
+            candidate.is_class()
+                || candidate.is_function()
+                || (candidate.is_field() && rust_declaration_is_enum_variant(rust, candidate))
+        }
+        RustBareReferenceRole::Owner => {
+            candidate.is_module()
+                || candidate.is_class()
+                || rust_declaration_is_module_type_alias(rust, candidate)
+        }
+        RustBareReferenceRole::Macro => candidate.is_macro(),
+    }
+}
+
 fn rust_value_namespace_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
     candidate.is_class()
         || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
@@ -930,6 +980,29 @@ fn rust_callable_namespace_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) 
     candidate.is_class()
         || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
         || (candidate.is_field() && rust_declaration_is_enum_variant(rust, candidate))
+}
+
+fn rust_scoped_role_candidate(role: RustBareReferenceRole) -> fn(&CodeUnit) -> bool {
+    match role {
+        RustBareReferenceRole::Type => rust_scoped_type_candidate,
+        RustBareReferenceRole::Value | RustBareReferenceRole::Callable => {
+            rust_scoped_value_candidate
+        }
+        RustBareReferenceRole::Owner => rust_scoped_owner_candidate,
+        RustBareReferenceRole::Macro => CodeUnit::is_macro,
+    }
+}
+
+fn rust_scoped_type_candidate(candidate: &CodeUnit) -> bool {
+    candidate.is_class() || candidate.is_field()
+}
+
+fn rust_scoped_value_candidate(candidate: &CodeUnit) -> bool {
+    candidate.is_class() || candidate.is_function() || candidate.is_field()
+}
+
+fn rust_scoped_owner_candidate(candidate: &CodeUnit) -> bool {
+    candidate.is_module() || candidate.is_class() || candidate.is_field()
 }
 
 fn rust_declaration_is_free_function(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
@@ -1185,6 +1258,37 @@ fn rust_enclosing_scoped_type_identifier_name(
         current = candidate.parent();
     }
     None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_focused_terminal_scoped_type_candidates(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    refs: &RustReferenceContext,
+) -> Option<Vec<CodeUnit>> {
+    let focused =
+        smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    let scoped = rust_enclosing_scoped_type_identifier_name(
+        focused,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    )?;
+    let full_path = rust_node_text(scoped, source).trim();
+    let fqn =
+        crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(rust, refs, file, full_path)?;
+    let mut candidates = support
+        .fqn(&fqn)
+        .into_iter()
+        .filter(|candidate| rust_is_type_definition(analyzer, candidate))
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    (!candidates.is_empty()).then_some(candidates)
 }
 
 fn rust_enclosing_ancestor<'tree>(mut node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
@@ -1602,7 +1706,13 @@ fn resolve_rust_field(
             let refs = rust.forward_reference_context_of(file);
             let trait_candidates =
                 match crate::analyzer::usages::rust_graph::resolve_trait_associated_item(
-                    rust, support, &refs, file, &owner, member,
+                    rust,
+                    support,
+                    &refs,
+                    file,
+                    &owner,
+                    member,
+                    field_expression.start_byte(),
                 ) {
                     ReceiverAnalysisOutcome::Precise(resolved) => {
                         rust_member_candidates(resolved, RustMemberKind::Function)
@@ -1712,6 +1822,7 @@ fn rust_token_tree_dotted_member_outcome(
                 &owner,
                 member,
                 CodeUnit::is_function,
+                focused.start_byte(),
             ) {
                 ReceiverAnalysisOutcome::Precise(resolved) => {
                     rust_member_candidates(resolved, RustMemberKind::Function)
@@ -2323,7 +2434,13 @@ fn rust_callable_definition_candidates(
         };
         let refs = rust.forward_reference_context_of(file);
         return match crate::analyzer::usages::rust_graph::resolve_scoped_associated_item(
-            rust, support, &refs, file, path, name,
+            rust,
+            support,
+            &refs,
+            file,
+            path,
+            name,
+            reference_byte,
         ) {
             ReceiverAnalysisOutcome::Precise(candidates) => candidates,
             ReceiverAnalysisOutcome::Ambiguous(_)
@@ -2513,7 +2630,7 @@ fn rust_type_ref(type_node: Node<'_>, source: &str) -> Option<RustTypeRef> {
                 name: name.to_string(),
             })
         }
-        "scoped_type_identifier" => {
+        "scoped_type_identifier" | "scoped_identifier" => {
             let name = node.child_by_field_name("name")?;
             let name = rust_node_text(name, source).trim();
             if name.is_empty() {
@@ -2526,8 +2643,10 @@ fn rust_type_ref(type_node: Node<'_>, source: &str) -> Option<RustTypeRef> {
                 name: name.to_string(),
             })
         }
-        "generic_type" => {
-            let base = node.child_by_field_name("type")?;
+        "generic_type" | "generic_function" => {
+            let base = node
+                .child_by_field_name("type")
+                .or_else(|| node.child_by_field_name("function"))?;
             rust_type_ref(base, source)
         }
         "qualified_type" => {
@@ -2546,8 +2665,9 @@ fn rust_named_type_node(type_node: Node<'_>) -> Option<Node<'_>> {
         "higher_ranked_trait_bound" => type_node
             .child_by_field_name("type")
             .and_then(rust_named_type_node),
-        "generic_type" | "qualified_type" => Some(type_node),
+        "generic_type" | "generic_function" | "qualified_type" => Some(type_node),
         "scoped_type_identifier"
+        | "scoped_identifier"
         | "type_identifier"
         | "identifier"
         | "self"
@@ -2564,8 +2684,9 @@ fn rust_named_type_node(type_node: Node<'_>) -> Option<Node<'_>> {
 
 fn rust_type_path_text(path: Node<'_>, source: &str) -> Option<String> {
     match path.kind() {
-        "generic_type" => path
+        "generic_type" | "generic_function" => path
             .child_by_field_name("type")
+            .or_else(|| path.child_by_field_name("function"))
             .and_then(|base| rust_type_path_text(base, source)),
         "scoped_type_identifier"
         | "scoped_identifier"

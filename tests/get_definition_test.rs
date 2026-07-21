@@ -19979,6 +19979,79 @@ fn scala_object_apply_call_resolves_to_definition() {
 }
 
 #[test]
+fn scala_bare_calls_do_not_confuse_universal_construction_with_instance_apply_or_object() {
+    let source = r#"package app
+
+class FunType(prefix: String) {
+  def apply(index: Int): String = prefix
+}
+
+final class PcConvertToNamedLambdaParameters(driver: String, params: Int)
+object PcConvertToNamedLambdaParameters { val codeActionId = "convert" }
+
+sealed abstract class Chunk[+A] {
+  def apply(index: Int): A
+}
+object Chunk
+
+object Consumer {
+  val funType = FunType("Function")
+  val conversion = PcConvertToNamedLambdaParameters("driver", 1)
+  val header = Chunk("package", "app")
+  val options = Chunk("--driver", "local")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Calls.scala", source)
+        .build();
+    let references = [
+        "FunType(\"Function\")",
+        "PcConvertToNamedLambdaParameters(\"driver\", 1)",
+        "Chunk(\"package\", \"app\")",
+        "Chunk(\"--driver\", \"local\")",
+    ]
+    .into_iter()
+    .map(|needle| {
+        let start = source.find(needle).expect("bare call");
+        let prefix = &source[..start];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix
+            .rsplit_once('\n')
+            .map_or(prefix, |(_, current)| current)
+            .chars()
+            .count()
+            + 1;
+        format!(r#"{{"path":"app/Calls.scala","line":{line},"column":{column}}}"#)
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+    let value = lookup(
+        project.root(),
+        &format!(r#"{{"references":[{references}]}}"#),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "app.FunType.FunType",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"],
+        "app.PcConvertToNamedLambdaParameters.PcConvertToNamedLambdaParameters",
+        "{value}"
+    );
+    for result in &results[2..] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "no_applicable_scala_callable",
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn scala_uppercase_local_call_shadows_same_package_object_apply() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -20133,6 +20206,42 @@ object App:
 }
 
 #[test]
+fn scala_member_import_alias_does_not_shadow_its_own_qualifier() {
+    let source = r#"
+package app
+
+class Renderer { def render(value: String): String = value }
+object Factory { def default: Renderer = new Renderer }
+
+object App:
+  import Factory.{default => Factory}
+  val direct = Factory.render("ok")
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+
+    for (start, expected) in [
+        (
+            source.rfind("Factory.render").expect("import alias"),
+            "app.Factory$.default",
+        ),
+        (
+            source.rfind("render(\"ok\")").expect("receiver member"),
+            "app.Renderer.render",
+        ),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference("app/App.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+}
+
+#[test]
 fn scala_imported_factory_return_type_uses_factory_scope() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -20188,6 +20297,95 @@ object App:
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "app.Renderer.render",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_receiver_binding_seed_is_bounded_across_repeated_companion_factories() {
+    let mut source = String::from(
+        r#"
+package app
+
+class Symbol {
+  def entered: Symbol = this
+}
+
+object Routes {
+  def make(): Symbol = new Symbol
+}
+
+object Definitions {
+  def newCompleteClassSymbol(): Symbol = new Symbol
+"#,
+    );
+    for index in 0..64 {
+        source.push_str(&format!("  val route{index} = Routes.make()\n"));
+    }
+    source.push_str(
+        r#"  val cls = newCompleteClassSymbol()
+  val selected = cls.entered
+}
+"#,
+    );
+
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Definitions.scala", source.clone())
+        .build();
+    let entered_start = source.find("cls.entered").expect("member selection") + "cls.".len();
+    let started = std::time::Instant::now();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Definitions.scala", &source, entered_start),
+    );
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "Scala receiver binding reconstruction exceeded its bounded regression budget: {value}"
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Symbol.entered",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_factory_result_binding_shadows_visible_singleton_receiver() {
+    let source = r#"
+package app
+
+class Symbol {
+  def entered: Int = 1
+}
+
+object Factory {
+  def entered: String = "singleton"
+}
+
+object Definitions {
+  def build(): Symbol = new Symbol
+  def run(): Int = {
+    val Factory = build()
+    Factory.entered
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Definitions.scala", source)
+        .build();
+    let entered_start =
+        source.find("Factory.entered").expect("member selection") + "Factory.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Definitions.scala", source, entered_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Symbol.entered",
         "{value}"
     );
 }
@@ -21135,17 +21333,24 @@ package app
 class Multi {
   def this(value: Int) = this()
 }
+class MethodOnly {
+  def MethodOnly(value: Int): Int = value
+}
 
 object Controller {
   val zero = new Multi
   val one = new Multi(1)
+  val ordinary = new MethodOnly
 }
 "#;
     let project = InlineTestProject::with_language(Language::Scala)
         .file("app/ConstructorAlternatives.scala", source)
         .build();
 
-    for needle in ["new Multi\n", "new Multi(1)"] {
+    for (needle, expected) in [
+        ("new Multi\n", "app.Multi"),
+        ("new Multi(1)", "app.Multi.Multi"),
+    ] {
         let start = source.find(needle).expect("constructor call") + "new ".len();
         let value = lookup(
             project.root(),
@@ -21153,11 +21358,20 @@ object Controller {
         );
         let result = &value["results"][0];
         assert_eq!(result["status"], "resolved", "{value}");
-        assert_eq!(
-            result["definitions"][0]["fqn"], "app.Multi.Multi",
-            "{value}"
-        );
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+
+    let start = source
+        .find("new MethodOnly")
+        .expect("ordinary method owner")
+        + "new ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/ConstructorAlternatives.scala", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.MethodOnly", "{value}");
 }
 
 #[test]
@@ -21632,6 +21846,116 @@ fn scala_stable_identifier_object_val_resolves_in_case_pattern() {
 }
 
 #[test]
+fn scala_stable_identifier_pattern_prefers_nested_object_term_over_same_named_type() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "lib/Maybe.scala",
+            "package lib\nsealed trait Maybe\nobject Maybe { sealed abstract class Absent; case object Absent extends Absent }\n",
+        )
+        .file(
+            "app/Consumer.scala",
+            "package app\nimport lib.Maybe\nobject Consumer { def empty(value: Maybe): Boolean = value match { case Maybe.Absent => true; case _ => false } }\nobject QualifiedConsumer { def empty(value: Maybe): Boolean = value match { case lib.Maybe.Absent => true; case _ => false } }\nobject TypeConsumer { val absent: Maybe.Absent = ??? }\n",
+        )
+        .file(
+            "app/Decoy.scala",
+            "package app\nobject Maybe { sealed abstract class Absent; case object Absent extends Absent }\n",
+        )
+        .build();
+
+    let line = "object Consumer { def empty(value: Maybe): Boolean = value match { case Maybe.Absent => true; case _ => false } }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Consumer.scala","line":3,"column":{}}}]}}"#,
+            column_of(line, "Absent")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["fqn"], "lib.Maybe$.Absent$",
+        "{value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["path"], "lib/Maybe.scala",
+        "{value}"
+    );
+
+    let qualified_line = "object QualifiedConsumer { def empty(value: Maybe): Boolean = value match { case lib.Maybe.Absent => true; case _ => false } }";
+    let qualified_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Consumer.scala","line":4,"column":{}}}]}}"#,
+            column_of(qualified_line, "Absent")
+        ),
+    );
+    assert_eq!(
+        qualified_value["results"][0]["definitions"][0]["fqn"], "lib.Maybe$.Absent$",
+        "{qualified_value}"
+    );
+
+    let type_line = "object TypeConsumer { val absent: Maybe.Absent = ??? }";
+    let type_value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Consumer.scala","line":5,"column":{}}}]}}"#,
+            column_of(type_line, "Absent")
+        ),
+    );
+    assert_eq!(
+        type_value["results"][0]["status"], "resolved",
+        "{type_value}"
+    );
+    assert_eq!(
+        type_value["results"][0]["definitions"][0]["fqn"], "lib.Maybe$.Absent",
+        "{type_value}"
+    );
+}
+
+#[test]
+fn scala_stable_identifier_pattern_honors_package_and_local_term_owners() {
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file(
+            "app/Definitions.scala",
+            "package app\nsealed trait State\nobject State { sealed abstract class Empty; case object Empty extends Empty }\nclass LocalMaybe { val Absent: Int = 1 }\nobject Maybe { case object Absent }\n",
+        )
+        .file(
+            "app/Consumer.scala",
+            "package app\nobject Consumer {\n  def packageTerm(value: State): Boolean = value match { case State.Empty => true; case _ => false }\n  def localTerm(Maybe: LocalMaybe, value: Int): Boolean = value match { case Maybe.Absent => true; case _ => false }\n}\n",
+        )
+        .build();
+
+    let package_line = "  def packageTerm(value: State): Boolean = value match { case State.Empty => true; case _ => false }";
+    let local_line = "  def localTerm(Maybe: LocalMaybe, value: Int): Boolean = value match { case Maybe.Absent => true; case _ => false }";
+    let value = lookup(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app/Consumer.scala","line":3,"column":{}}},{{"path":"app/Consumer.scala","line":4,"column":{}}}]}}"#,
+            column_of(package_line, "Empty"),
+            column_of(local_line, "Absent")
+        ),
+    );
+
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "app.State$.Empty$",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "app.LocalMaybe.Absent",
+        "{value}"
+    );
+}
+
+#[test]
 fn scala_external_import_reports_boundary() {
     let project = InlineTestProject::with_language(Language::Scala)
         .file(
@@ -21923,26 +22247,94 @@ fn php_bare_function_prefers_same_language_declaration_over_javascript_collision
 
 #[test]
 fn scala_type_reference_keeps_supported_java_definition_resolution() {
-    let project = InlineTestProject::new()
-        .file("app/Greeter.java", "package app; public class Greeter {}\n")
-        .file(
-            "app/Use.scala",
-            "package app\nobject Use { val greeter = new Greeter() }\n",
-        )
-        .build();
-    let line = "object Use { val greeter = new Greeter() }";
-    let value = lookup(
-        project.root(),
-        &format!(
-            r#"{{"references":[{{"path":"app/Use.scala","line":2,"column":{}}}]}}"#,
-            column_of(line, "Greeter")
-        ),
+    let source = concat!(
+        "package app\n",
+        "object Use { ",
+        "val explicit = new Greeter(1); ",
+        "val wrongExplicit = new Greeter(); ",
+        "val implicitZero = new ImplicitGreeter(); ",
+        "val wrongImplicit = new ImplicitGreeter(1); ",
+        "val sameNamedMethod = new MethodOnly(); ",
+        "val wrongSameNamedMethod = new MethodOnly(1); ",
+        "val record = new Pair(1, 2); ",
+        "val auxiliaryRecord = new Pair(1); ",
+        "val wrongRecord = new Pair(); ",
+        "val emptyVarargsRecord = new Batch(\"p\"); ",
+        "val populatedVarargsRecord = new Batch(\"p\", \"a\", \"b\"); ",
+        "val wrongVarargsRecord = new Batch(); ",
+        "val compactRecord = new Compact(1); ",
+        "val wrongCompactRecord = new Compact() ",
+        "}\n",
     );
+    let project = InlineTestProject::new()
+        .file(
+            "app/Greeter.java",
+            "package app; public class Greeter { public Greeter(int value) {} }\n",
+        )
+        .file(
+            "app/ImplicitGreeter.java",
+            "package app; public class ImplicitGreeter {}\n",
+        )
+        .file(
+            "app/MethodOnly.java",
+            "package app; public class MethodOnly { public void MethodOnly(int value) {} }\n",
+        )
+        .file(
+            "app/Pair.java",
+            "package app; public record Pair(int left, int right) { public Pair(int left) { this(left, 0); } }\n",
+        )
+        .file(
+            "app/Batch.java",
+            "package app; public record Batch(String prefix, String... values) {}\n",
+        )
+        .file(
+            "app/Compact.java",
+            "package app; public record Compact(int value) { public Compact { if (value < 0) throw new IllegalArgumentException(); } }\n",
+        )
+        .file("app/Use.scala", source)
+        .build();
 
-    let result = &value["results"][0];
-    assert_eq!(result["status"], "resolved", "{value}");
-    assert_eq!(result["definitions"][0]["language"], "java", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "app.Greeter", "{value}");
+    for (needle, expected) in [
+        ("new Greeter(1)", "app.Greeter.Greeter"),
+        ("new ImplicitGreeter()", "app.ImplicitGreeter"),
+        ("new MethodOnly()", "app.MethodOnly"),
+        ("new Pair(1, 2)", "app.Pair"),
+        ("new Pair(1)", "app.Pair.Pair"),
+        ("new Batch(\"p\")", "app.Batch"),
+        ("new Batch(\"p\", \"a\", \"b\")", "app.Batch"),
+        ("new Compact(1)", "app.Compact.Compact"),
+    ] {
+        let start = source.find(needle).expect("valid Java construction") + "new ".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Use.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{value}");
+        assert_eq!(result["definitions"][0]["language"], "java", "{value}");
+        assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
+    }
+
+    for needle in [
+        "new Greeter()",
+        "new ImplicitGreeter(1)",
+        "new MethodOnly(1)",
+        "new Pair()",
+        "new Batch()",
+        "new Compact()",
+    ] {
+        let start = source.find(needle).expect("invalid Java construction") + "new ".len();
+        let value = lookup(
+            project.root(),
+            &location_reference("app/Use.scala", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "no_applicable_scala_constructor",
+            "{value}"
+        );
+    }
 }
 
 #[test]
@@ -22652,4 +23044,151 @@ fn javascript_destructured_parameter_definition_reports_binding_leaf() {
         "{value}"
     );
     assert_eq!(definition["start_line"], 1, "{value}");
+}
+
+#[test]
+fn scala_qualified_java_constructor_does_not_fall_back_to_scala_simple_name_owner() {
+    let scala_source = r#"
+package app
+
+class Builder {
+  def append(value: String): Builder = this
+}
+
+object Consumer {
+  val built = new javaish.Builder().append("java")
+}
+"#;
+    let project = InlineTestProject::new()
+        .file(
+            "javaish/Builder.java",
+            "package javaish; public class Builder { public Builder append(String value) { return this; } }\n",
+        )
+        .file("app/Consumer.scala", scala_source)
+        .build();
+    let append_start = scala_source.find(".append").expect("qualified Java append") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Consumer.scala", scala_source, append_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["language"], "java", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "javaish.Builder.append",
+        "{value}"
+    );
+}
+
+#[test]
+fn scala_qualified_unindexed_java_constructor_does_not_use_scala_simple_name_member() {
+    let source = r#"
+package app
+
+class StringBuilder {
+  def append(value: String): StringBuilder = this
+}
+object Consumer {
+  val built = new java.lang.StringBuilder().append("java")
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Consumer.scala", source)
+        .build();
+    let append_start = source.find(".append").expect("qualified append") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Consumer.scala", source, append_start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_owner_does_not_borrow_member_from_same_fqn_java_declaration() {
+    let source = r#"
+package shared
+
+class Builder
+
+object Consumer {
+  val built = new Builder().append("wrong-language")
+}
+"#;
+    let project = InlineTestProject::new()
+        .file(
+            "java/shared/Builder.java",
+            "package shared; public class Builder { public Builder append(String value) { return this; } }\n",
+        )
+        .file("scala/shared/Consumer.scala", source)
+        .build();
+    let append_start = source.find(".append").expect("same-FQN append") + 1;
+    let value = lookup(
+        project.root(),
+        &location_reference("scala/shared/Consumer.scala", source, append_start),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn scala_nested_class_companion_term_beats_constructor_member_identity() {
+    let source = r#"
+package app
+
+object Outer {
+  class Entry {
+    def companion: Entry.type = Entry
+  }
+  object Entry
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Outer.scala", source)
+        .build();
+    let entry_start = source.find("= Entry").expect("companion term") + "= ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Outer.scala", source, entry_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Outer$.Entry$",
+        "{value}"
+    );
+    assert_ne!(
+        result["definitions"][0]["fqn"], "app.Outer$.Entry.Entry",
+        "the class constructor must not win the term-namespace lookup: {value}"
+    );
+}
+
+#[test]
+fn scala_nested_singleton_type_reference_keeps_term_namespace_identity() {
+    let source = r#"
+package app
+
+object Outer {
+  class Entry
+  object Entry
+  val companion: Entry.type = Entry
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/Outer.scala", source)
+        .build();
+    let entry_start = source.find("Entry.type").expect("singleton type");
+    let value = lookup(
+        project.root(),
+        &location_reference("app/Outer.scala", source, entry_start),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "app.Outer$.Entry$",
+        "{value}"
+    );
 }

@@ -3,7 +3,7 @@ use crate::hash::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use super::declarations::rust_package_name;
-use super::imports::rust_external_module_route;
+use super::imports::{rust_external_module_route, rust_external_module_segments};
 
 pub(super) fn resolve_module_package_for_file(
     importing_file: &ProjectFile,
@@ -52,10 +52,7 @@ pub(super) fn resolve_module_package_for_file(
         }
     }
 
-    resolved.map(|package| match nested {
-        Some(nested) => format!("{package}.{nested}"),
-        None => package,
-    })
+    resolved.map(|package| append_module_package(package, nested.as_deref()))
 }
 
 fn read_manifest(root: &Path, directory: &Path) -> Option<toml::Value> {
@@ -103,6 +100,13 @@ pub(crate) struct RustCargoRouteIndex {
     manifest_by_file: HashMap<ProjectFile, PathBuf>,
     package_by_route: HashMap<(PathBuf, String), String>,
     root_file_by_route: HashMap<(PathBuf, String), ProjectFile>,
+    kind_by_route: HashMap<(PathBuf, String), RustCargoRouteKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RustCargoRouteKind {
+    CurrentLibrary,
+    Dependency,
 }
 
 struct CargoCrate {
@@ -139,13 +143,15 @@ impl RustCargoRouteIndex {
         }
         let mut package_by_route = HashMap::default();
         let mut root_file_by_route = HashMap::default();
+        let mut kind_by_route = HashMap::default();
         for cargo_crate in &crates {
             let own_route = (
                 cargo_crate.directory.clone(),
                 cargo_crate.library_name.clone(),
             );
             package_by_route.insert(own_route.clone(), cargo_crate.root_package.clone());
-            root_file_by_route.insert(own_route, cargo_crate.root_file.clone());
+            root_file_by_route.insert(own_route.clone(), cargo_crate.root_file.clone());
+            kind_by_route.insert(own_route, RustCargoRouteKind::CurrentLibrary);
             for dependencies in cargo_dependency_tables(&cargo_crate.manifest) {
                 for (exposed_name, dependency) in dependencies {
                     let target = dependency
@@ -170,8 +176,12 @@ impl RustCargoRouteIndex {
                             crates[target].root_package.clone(),
                         );
                         root_file_by_route.insert(
-                            (cargo_crate.directory.clone(), exposed_name),
+                            (cargo_crate.directory.clone(), exposed_name.clone()),
                             crates[target].root_file.clone(),
+                        );
+                        kind_by_route.insert(
+                            (cargo_crate.directory.clone(), exposed_name),
+                            RustCargoRouteKind::Dependency,
                         );
                     }
                 }
@@ -181,6 +191,7 @@ impl RustCargoRouteIndex {
             manifest_by_file,
             package_by_route,
             root_file_by_route,
+            kind_by_route,
         }
     }
 
@@ -194,10 +205,23 @@ impl RustCargoRouteIndex {
         let package = self
             .package_by_route
             .get(&(manifest.clone(), normalize_crate_name(root)))?;
-        Some(match nested {
-            Some(nested) => format!("{package}.{nested}"),
-            None => package.clone(),
-        })
+        Some(append_module_package(package.clone(), nested.as_deref()))
+    }
+
+    pub(super) fn resolve_module_package_segments_with_kind(
+        &self,
+        importing_file: &ProjectFile,
+        segments: &[String],
+    ) -> Option<(String, RustCargoRouteKind)> {
+        let manifest = self.manifest_by_file.get(importing_file)?;
+        let (root, nested) = rust_external_module_segments(segments)?;
+        let route = (manifest.clone(), normalize_crate_name(root));
+        let package = self.package_by_route.get(&route)?;
+        let kind = *self.kind_by_route.get(&route)?;
+        Some((
+            append_module_package(package.clone(), nested.as_deref()),
+            kind,
+        ))
     }
 
     pub(super) fn resolve_crate_root_file(
@@ -213,6 +237,23 @@ impl RustCargoRouteIndex {
         self.root_file_by_route
             .get(&(manifest.clone(), normalize_crate_name(root)))
             .cloned()
+    }
+
+    pub(super) fn resolve_crate_root_file_segments_with_kind(
+        &self,
+        importing_file: &ProjectFile,
+        segments: &[String],
+    ) -> Option<(ProjectFile, RustCargoRouteKind)> {
+        let manifest = self.manifest_by_file.get(importing_file)?;
+        let (root, nested) = rust_external_module_segments(segments)?;
+        if nested.is_some() {
+            return None;
+        }
+        let route = (manifest.clone(), normalize_crate_name(root));
+        Some((
+            self.root_file_by_route.get(&route)?.clone(),
+            *self.kind_by_route.get(&route)?,
+        ))
     }
 }
 
@@ -273,6 +314,17 @@ fn normalize_crate_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
+fn append_module_package(mut package: String, nested: Option<&str>) -> String {
+    let Some(nested) = nested else {
+        return package;
+    };
+    if !package.is_empty() {
+        package.push('.');
+    }
+    package.push_str(nested);
+    package
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +380,39 @@ mod tests {
         assert_eq!(
             resolve_module_package_for_file(&consumer, "matcher_lib"),
             Some("matcher.src".to_string())
+        );
+    }
+
+    #[test]
+    fn self_crate_nested_routes_do_not_add_a_leading_package_separator() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        write(&root, "src/lib.rs", "pub mod options;\n");
+        write(&root, "src/options.rs", "pub struct Options;\n");
+        write(&root, "examples/example.rs", "use demo::options;\n");
+
+        let library = ProjectFile::new(root.clone(), "src/lib.rs");
+        let options = ProjectFile::new(root.clone(), "src/options.rs");
+        let example = ProjectFile::new(root.clone(), "examples/example.rs");
+        let routes = RustCargoRouteIndex::build(&[library, options, example.clone()]);
+        let segments = ["demo".to_string(), "options".to_string()];
+
+        assert_eq!(
+            routes.resolve_module_package(&example, "demo::options"),
+            Some("options".to_string())
+        );
+        assert_eq!(
+            routes.resolve_module_package_segments_with_kind(&example, &segments),
+            Some(("options".to_string(), RustCargoRouteKind::CurrentLibrary))
+        );
+        assert_eq!(
+            resolve_module_package_for_file(&example, "demo::options"),
+            Some("options".to_string())
         );
     }
 
