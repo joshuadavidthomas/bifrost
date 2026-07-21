@@ -374,15 +374,7 @@ impl RustUsageIndex {
             }
             match index.exports_by_name.get(&name) {
                 Some(ExportEntry::Local { .. }) => return true,
-                Some(ExportEntry::ReexportedNamed {
-                    module_specifier,
-                    imported_name,
-                }) => pending.extend(
-                    self.module_files
-                        .resolve(&file, module_specifier)
-                        .into_iter()
-                        .map(|target| (target, imported_name.clone())),
-                ),
+                Some(ExportEntry::ReexportedNamed { .. }) => return true,
                 Some(ExportEntry::Default {
                     local_name: Some(_),
                 }) => return true,
