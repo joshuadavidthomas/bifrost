@@ -437,6 +437,7 @@ pub(crate) fn resolve_scoped_associated_item(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_scoped_associated_item_matching(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
@@ -473,6 +474,7 @@ pub(crate) fn resolve_scoped_associated_item_matching(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_owner_associated_item_matching(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
@@ -509,6 +511,7 @@ pub(crate) fn resolve_owner_associated_item_matching(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_exact_owner_associated_item_matching(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
@@ -575,6 +578,7 @@ pub(crate) fn resolve_trait_associated_item(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_trait_associated_item_matching(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
@@ -617,6 +621,7 @@ pub(crate) fn resolve_trait_associated_item_matching(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_trait_associated_item_for_owner_matching(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
