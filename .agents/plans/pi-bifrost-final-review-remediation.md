@@ -18,6 +18,7 @@ After this change, Pi users can keep their intended Bifrost capability settings 
 - [x] (2026-07-20) Addressed maintainer review: aligned cross-toolset capability requirements with the Rust registry, made process and package tests portable, and expanded Pi package CI to Linux, macOS, and Windows.
 - [x] (2026-07-20) Sanitized MCP- and model-controlled terminal content before trusted Pi theme styling while preserving raw oversized diagnostics in overflow files.
 - [x] (2026-07-20) Fixed the Windows package CI failure by preserving each JSON projection's existing line endings in the release-version synchronizer and adding CRLF check/update regressions.
+- [x] (2026-07-21) Rebased onto current upstream after merge-test failures, reconciled upstream's release-version helper without a duplicate declaration, synchronized the Pi package to Bifrost 0.8.6, and absorbed upstream's Rust re-export usage fix.
 
 ## Surprises & Discoveries
 
@@ -174,3 +175,5 @@ Revision note (2026-07-20): Recorded maintainer-review remediation for the defau
 Revision note (2026-07-20): Added terminal-control sanitization and security regressions after review reproduced an OSC 52 sequence surviving call and result rendering.
 
 Revision note (2026-07-20): Recorded the Windows CI remediation after the release-version check treated CRLF serialization differences as stale metadata.
+
+Revision note (2026-07-21): Recorded the current-upstream rebase required after the PR merge ref combined independently added release-version helpers and ran before the upstream Rust re-export fix.

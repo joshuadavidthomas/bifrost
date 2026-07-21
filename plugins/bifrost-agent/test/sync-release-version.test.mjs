@@ -27,6 +27,7 @@ const jsonProjections = [
 const allProjections = [
   ...jsonProjections,
   "plugins/bifrost-agent/README.md",
+  "docs/src/content/docs/rust-library.md",
 ];
 
 test("release version check accepts synced CRLF projections", async () => {
@@ -103,6 +104,11 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
     root,
     "plugins/bifrost-agent/README.md",
     `Install:${lineEnding}${lineEnding}pi install npm:@brokk/bifrost-agent@${projectionVersion}${lineEnding}`,
+  );
+  await writeFixtureFile(
+    root,
+    "docs/src/content/docs/rust-library.md",
+    `Install:${lineEnding}${lineEnding}brokk-bifrost = "${projectionVersion}"${lineEnding}`,
   );
   return root;
 }

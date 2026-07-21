@@ -137,16 +137,3 @@ function updateText(relativePath, mutate, original = undefined) {
   }
   return relativePath;
 }
-
-function updateText(relativePath, mutate) {
-  const absolutePath = path.join(repoRoot, relativePath);
-  const original = fs.readFileSync(absolutePath, "utf8");
-  const next = mutate(original);
-  if (next === original) {
-    return null;
-  }
-  if (!checkOnly) {
-    fs.writeFileSync(absolutePath, next);
-  }
-  return relativePath;
-}
