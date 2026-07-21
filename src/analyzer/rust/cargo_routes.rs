@@ -52,10 +52,7 @@ pub(super) fn resolve_module_package_for_file(
         }
     }
 
-    resolved.map(|package| match nested {
-        Some(nested) => format!("{package}.{nested}"),
-        None => package,
-    })
+    resolved.map(|package| append_module_package(package, nested.as_deref()))
 }
 
 fn read_manifest(root: &Path, directory: &Path) -> Option<toml::Value> {
@@ -208,10 +205,7 @@ impl RustCargoRouteIndex {
         let package = self
             .package_by_route
             .get(&(manifest.clone(), normalize_crate_name(root)))?;
-        Some(match nested {
-            Some(nested) => format!("{package}.{nested}"),
-            None => package.clone(),
-        })
+        Some(append_module_package(package.clone(), nested.as_deref()))
     }
 
     pub(super) fn resolve_module_package_segments_with_kind(
@@ -225,10 +219,7 @@ impl RustCargoRouteIndex {
         let package = self.package_by_route.get(&route)?;
         let kind = *self.kind_by_route.get(&route)?;
         Some((
-            match nested {
-                Some(nested) => format!("{package}.{nested}"),
-                None => package.clone(),
-            },
+            append_module_package(package.clone(), nested.as_deref()),
             kind,
         ))
     }
@@ -323,6 +314,17 @@ fn normalize_crate_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
+fn append_module_package(mut package: String, nested: Option<&str>) -> String {
+    let Some(nested) = nested else {
+        return package;
+    };
+    if !package.is_empty() {
+        package.push('.');
+    }
+    package.push_str(nested);
+    package
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +380,39 @@ mod tests {
         assert_eq!(
             resolve_module_package_for_file(&consumer, "matcher_lib"),
             Some("matcher.src".to_string())
+        );
+    }
+
+    #[test]
+    fn self_crate_nested_routes_do_not_add_a_leading_package_separator() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        write(&root, "src/lib.rs", "pub mod options;\n");
+        write(&root, "src/options.rs", "pub struct Options;\n");
+        write(&root, "examples/example.rs", "use demo::options;\n");
+
+        let library = ProjectFile::new(root.clone(), "src/lib.rs");
+        let options = ProjectFile::new(root.clone(), "src/options.rs");
+        let example = ProjectFile::new(root.clone(), "examples/example.rs");
+        let routes = RustCargoRouteIndex::build(&[library, options, example.clone()]);
+        let segments = ["demo".to_string(), "options".to_string()];
+
+        assert_eq!(
+            routes.resolve_module_package(&example, "demo::options"),
+            Some("options".to_string())
+        );
+        assert_eq!(
+            routes.resolve_module_package_segments_with_kind(&example, &segments),
+            Some(("options".to_string(), RustCargoRouteKind::CurrentLibrary))
+        );
+        assert_eq!(
+            resolve_module_package_for_file(&example, "demo::options"),
+            Some("options".to_string())
         );
     }
 

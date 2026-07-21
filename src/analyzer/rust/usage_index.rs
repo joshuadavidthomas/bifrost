@@ -601,17 +601,24 @@ impl RustModuleFiles {
                 .collect();
         }
 
-        let Some(resolved_module) =
-            resolve_rust_module_segments_with_crate(importing_module, &crate_package, segments)
-        else {
-            return rust_module_files_from_segments(importing_file, segments)
-                .into_iter()
-                .map(|file| RustResolvedModuleRoute {
-                    target_module: ModuleKey::new(&file, &rust_package_name(&file)),
-                    target_file: file,
-                    provenance: RustRouteProvenance::Local,
-                })
-                .collect();
+        let resolved_module = if matches!(
+            segments.first().map(String::as_str),
+            Some("crate" | "self" | "super")
+        ) {
+            let Some(resolved) =
+                resolve_rust_module_segments_with_crate(importing_module, &crate_package, segments)
+            else {
+                return Vec::new();
+            };
+            resolved
+        } else {
+            let relative = ModuleKey::new(importing_file, importing_module).with_suffix(segments);
+            if self.files_for_module(&relative).is_empty() {
+                resolve_rust_module_segments_with_crate(importing_module, &crate_package, segments)
+                    .unwrap_or_else(|| relative.package())
+            } else {
+                relative.package()
+            }
         };
 
         let mut files = self
