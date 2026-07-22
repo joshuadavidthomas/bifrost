@@ -7309,7 +7309,46 @@ fn record_reference(
             if record_local_stable_imported_member(node, name, ctx, bindings)
                 || record_local_stable_field_reference(node, ctx, bindings)
                 || record_enclosing_field_qualifier(node, name, ctx, bindings)
-                || record_intermediate_stable_object_reference(node, ctx, bindings)
+            {
+                return;
+            }
+            if !is_terminal_stable_field_reference(node) && !is_field_expression_value(node) {
+                let enclosing_owner = ctx.enclosing_class_unit(node.start_byte());
+                let binding_blocks_member_lookup = bindings.is_shadowed(name)
+                    && precise_scala_binding(bindings, name).is_none_or(|binding| {
+                        binding
+                            .declaration_owner
+                            .as_ref()
+                            .is_none_or(|declaration_owner| {
+                                enclosing_owner == Some(declaration_owner)
+                            })
+                    });
+                let field_allows_method_lookup = if !binding_blocks_member_lookup
+                    && let Some(owner) = enclosing_owner
+                {
+                    match ctx.types.field_for_owner_unit(ctx.scala, owner, name) {
+                        FieldResolution::Resolved(field) => {
+                            ctx.record_exact(field.declaration, ScalaReferenceRole::Field, node);
+                            return;
+                        }
+                        FieldResolution::NoMatch => true,
+                        FieldResolution::Unresolved => false,
+                    }
+                } else {
+                    !binding_blocks_member_lookup
+                };
+                if !binding_blocks_member_lookup
+                    && field_allows_method_lookup
+                    && !matches!(
+                        companion_method_value_context(node, ctx, bindings),
+                        ScalaMethodValueContext::Function(_)
+                    )
+                    && record_lexically_visible_parameterless_method(node, name, ctx)
+                {
+                    return;
+                }
+            }
+            if record_intermediate_stable_object_reference(node, ctx, bindings)
                 || (!is_terminal_stable_field_reference(node)
                     && record_qualified_stable_reference(node, ctx, bindings))
             {

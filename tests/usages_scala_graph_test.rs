@@ -7061,23 +7061,26 @@ fn scala_declared_alias_receivers_and_unqualified_parameterless_values_resolve_e
             "model/Schedule.scala",
             r#"package model
 
-trait Schedule[A] {
+trait Schedule[-Env, -In, +Out] {
   type State
-  def whileOutput(predicate: A => Boolean): Schedule[A] = this
-  def addDelay(delay: A => Int): Schedule[A] = this
+  def whileOutput(predicate: Out => Boolean): Schedule[Env, In, Out] = this
+  def addDelay(delay: Out => Int): Schedule[Env, In, Out] = this
 }
 
 object Schedule {
-  type WithState[S, A] = Schedule[A] { type State = S }
+  val elapsed: Schedule.WithState[Int, Any, Any, Int] =
+    new Schedule[Any, Any, Int] { type State = Int }
+  val forever: Schedule.WithState[Long, Any, Any, Int] =
+    new Schedule[Any, Any, Int] { type State = Long }
 
-  val elapsed: Schedule.WithState[Int, Int] = new Schedule[Int] { type State = Int }
-  val forever: Schedule.WithState[Long, Int] = new Schedule[Int] { type State = Long }
-
-  def during(limit: Int): Schedule[Int] =
+  def during(limit: Int): Schedule[Any, Any, Int] =
     elapsed.whileOutput(_ < limit) // positive-declared-alias-while
 
-  def spaced(delay: Int): Schedule[Int] =
+  def spaced(delay: Int): Schedule[Any, Any, Int] =
     forever.addDelay(_ => delay) // positive-declared-alias-delay
+
+  type WithState[State0, -Env, -In0, +Out0] =
+    Schedule[Env, In0, Out0] { type State = State0 }
 }
 
 trait OtherSchedule[A] {
@@ -7102,15 +7105,21 @@ trait RandomApi {
 }
 
 object RandomApi {
+  val nextDouble: Int = 1
+  val nextFloat: Int = 1
+
   private final case class Live(seed: Int) extends RandomApi {
-    override def nextDouble: Double = 0.5
-    override def nextFloat: Float = 0.25f
+    def nextDouble: Double = 0.5
+    def nextFloat: Float = 0.25f
 
     def betweenDouble(min: Double, max: Double): Double =
       betweenDoubleWith(min, max)(nextDouble) // positive-next-double-value
 
     def betweenFloat(min: Float, max: Float): Float =
       betweenFloatWith(min, max)(nextFloat) // positive-next-float-value
+
+    def shadow(nextDouble: Double): Double =
+      betweenDoubleWith(0.0, 1.0)(nextDouble) // negative-other-local-double
   }
 
   private def betweenDoubleWith(min: Double, max: Double)(next: Double): Double = next
