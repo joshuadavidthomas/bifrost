@@ -466,6 +466,7 @@ fn i3b_fires_when_scan_resolved_symbol_is_absent_from_search() {
         ProbeKind::ScanSearch {
             expected_display_fq: "a.b.Foo.bar".to_string(),
             expected_path: "src/Foo.scala".to_string(),
+            is_module: false,
         },
         json!({"files": [], "total_files": 0, "note": "No files matched."}),
     )];
@@ -488,6 +489,7 @@ fn i3b_silent_when_search_lists_the_declaration() {
         ProbeKind::ScanSearch {
             expected_display_fq: "a.b.Foo.bar".to_string(),
             expected_path: "src/Foo.scala".to_string(),
+            is_module: false,
         },
         json!({"files": [{"path": "src/Foo.scala", "functions": [{"symbol": "a.b.Foo.bar", "line": 12}]}]}),
     )];
@@ -496,6 +498,48 @@ fn i3b_silent_when_search_lists_the_declaration() {
     check_i3b(&refs(&records), "scala", &mut sink, &mut summary);
     assert!(sink.into_sorted_vec().is_empty());
     assert_eq!(summary.i3b_scan_resolution_checks, 1);
+}
+
+// Absence from a result set cut by the file limit is unverifiable (the
+// "constructor" case: hundreds of legit hits, the target ranked out).
+#[test]
+fn i3b_skips_truncated_result_sets() {
+    let records = vec![record(
+        "i3b",
+        "search_symbols",
+        ProbeKind::ScanSearch {
+            expected_display_fq: "a.b.Foo.bar".to_string(),
+            expected_path: "src/Foo.scala".to_string(),
+            is_module: false,
+        },
+        json!({"files": [{"path": "src/Other.scala", "functions": [{"symbol": "a.b.Other.bar", "line": 1}]}], "total_files": 40, "truncated": true}),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i3b(&refs(&records), "scala", &mut sink, &mut summary);
+    assert_eq!(summary.skipped_scan_search_truncated, 1);
+    assert!(sink.into_sorted_vec().is_empty());
+}
+
+// A module unit's "name" is its file path; search_symbols has no contract
+// to find it as a symbol (the I1(b) module naming convention).
+#[test]
+fn i3b_skips_module_scan_targets() {
+    let records = vec![record(
+        "i3b",
+        "search_symbols",
+        ProbeKind::ScanSearch {
+            expected_display_fq: "aggregate-model-catalog.test.mjs".to_string(),
+            expected_path: "scripts/aggregate-model-catalog.test.mjs".to_string(),
+            is_module: true,
+        },
+        json!({"files": [], "total_files": 0, "truncated": false}),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i3b(&refs(&records), "ts", &mut sink, &mut summary);
+    assert_eq!(summary.skipped_scan_search_module, 1);
+    assert!(sink.into_sorted_vec().is_empty());
 }
 
 #[test]
@@ -823,6 +867,67 @@ fn i1c_fires_when_source_text_differs_from_range() {
     assert_eq!(
         violations[0].signature,
         "(I1, scala, get_symbol_sources, source-text-differs-from-range)"
+    );
+}
+
+// A block from a file outside the sample is unverifiable from this run's
+// input: skip, never fire (the oh-my-openagent case — a probe resolved into
+// a file no sampled symbol declares in).
+#[test]
+fn i1c_skips_blocks_in_files_outside_the_sample() {
+    let input = I1Input {
+        files: vec![I1File {
+            path: "src/hook.ts".to_string(),
+            text: Some("export const x = 1\n".to_string()),
+            parse_errors: Some(vec![]),
+        }],
+        symbols: vec![],
+    };
+    let records = vec![record(
+        "i1c",
+        "get_symbol_sources",
+        ProbeKind::Spelling {
+            order: 0,
+            spelling: "getCachedVersion".to_string(),
+        },
+        json!({"sources": [{"label": "getCachedVersion", "path": "src/checker/cached-version.ts", "start_line": 22, "end_line": 79, "text": "export function getCachedVersion() {}"}]}),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i1c(&refs(&records), &input, "ts", &mut sink, &mut summary);
+    assert_eq!(summary.skipped_unsampled_source, 1);
+    assert!(sink.into_sorted_vec().is_empty());
+}
+
+// With the file's text in hand, a range running past indexed EOF is the
+// genuine violation the shape exists for.
+#[test]
+fn i1c_fires_when_reported_range_exceeds_the_sampled_file() {
+    let input = I1Input {
+        files: vec![I1File {
+            path: "src/Foo.scala".to_string(),
+            text: Some("class Foo {\n  def bar: Int = 1\n}\n".to_string()),
+            parse_errors: Some(vec![]),
+        }],
+        symbols: vec![],
+    };
+    let records = vec![record(
+        "i1c",
+        "get_symbol_sources",
+        ProbeKind::Spelling {
+            order: 0,
+            spelling: "Foo".to_string(),
+        },
+        json!({"sources": [{"label": "a.b.Foo", "path": "src/Foo.scala", "start_line": 2, "end_line": 9, "text": "def bar: Int = 1"}]}),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i1c(&refs(&records), &input, "scala", &mut sink, &mut summary);
+    let violations = sink.into_sorted_vec();
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert_eq!(
+        violations[0].signature,
+        "(I1, scala, get_symbol_sources, source-range-outside-sampled-source)"
     );
 }
 

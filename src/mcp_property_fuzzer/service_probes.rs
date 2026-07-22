@@ -268,6 +268,15 @@ pub struct ProbeSummary {
     pub calls_errored: usize,
     pub render_mode_comparisons: usize,
     pub i1c_source_text_checks: usize,
+    /// I1(c) blocks whose file was outside the sampled input (or had no
+    /// source text available): unverifiable, neither pass nor fail.
+    pub skipped_unsampled_source: usize,
+    /// I3(b) follow-ups skipped because the search result set was truncated
+    /// at the file limit: absence from an incomplete set is unverifiable.
+    pub skipped_scan_search_truncated: usize,
+    /// I3(b) follow-ups skipped because the scan target is a module unit,
+    /// whose name is its file path, not a searchable symbol.
+    pub skipped_scan_search_module: usize,
     pub i2_spelling_groups: usize,
     pub i3a_summary_element_checks: usize,
     pub i3b_scan_resolution_checks: usize,
@@ -315,11 +324,17 @@ pub enum ProbeKind {
     /// listed, expected to resolve under `element_path`.
     SummaryElementSource { element_path: String },
     /// I3b: `scan_usages_by_reference` for one sampled symbol.
-    Scan { expected_display_fq: String },
+    Scan {
+        expected_display_fq: String,
+        /// Module units are named after their file; the terminal-name search
+        /// follow-up is meaningless for them (a file name is not a symbol).
+        is_module: bool,
+    },
     /// I3b follow-up: `search_symbols` for the scanned symbol's terminal name.
     ScanSearch {
         expected_display_fq: String,
         expected_path: String,
+        is_module: bool,
     },
     /// I5: a fixed negative shape real agents produced in traces; the
     /// expectation is not resolution but a non-empty corrective hint.
@@ -539,16 +554,19 @@ pub fn dump_probe_records(records: &[&ProbeRecord], path: &Path) -> Result<(), S
             }
             ProbeKind::Scan {
                 expected_display_fq,
+                is_module,
             } => {
-                json!({"kind": "scan", "expected_display_fq": expected_display_fq})
+                json!({"kind": "scan", "expected_display_fq": expected_display_fq, "is_module": is_module})
             }
             ProbeKind::ScanSearch {
                 expected_display_fq,
                 expected_path,
+                is_module,
             } => json!({
                 "kind": "scan_search",
                 "expected_display_fq": expected_display_fq,
                 "expected_path": expected_path,
+                "is_module": is_module,
             }),
             ProbeKind::Negative { shape } => json!({"kind": "negative", "shape": shape}),
             ProbeKind::HonestySearch {
@@ -762,6 +780,7 @@ fn generate_probes(
                 symbol_path: path.to_string(),
                 kind: ProbeKind::Scan {
                     expected_display_fq: symbol.display_fq.clone(),
+                    is_module: symbol.kind == CodeUnitType::Module,
                 },
                 outcome: None,
                 elapsed_ms: None,
@@ -1088,6 +1107,7 @@ fn derive_follow_ups(
                 }
                 ProbeKind::Scan {
                     expected_display_fq,
+                    is_module,
                 } => {
                     if let Some(entry) = array_field(structured, "results").next() {
                         let status = entry.get("status").and_then(Value::as_str).unwrap_or("");
@@ -1116,6 +1136,7 @@ fn derive_follow_ups(
                                 kind: ProbeKind::ScanSearch {
                                     expected_display_fq: expected_display_fq.clone(),
                                     expected_path: definition_path.to_string(),
+                                    is_module: *is_module,
                                 },
                                 outcome: None,
                                 elapsed_ms: None,
@@ -1372,12 +1393,16 @@ pub fn check_i1c(
             };
             summary.i1c_source_text_checks += 1;
             let file = input.files.iter().find(|file| file.path == path);
-            let expected = file
-                .and_then(|file| file.text.as_deref())
-                .and_then(|file_text| {
-                    line_slice(file_text, start_line as usize, end_line as usize)
-                });
-            let Some(expected) = expected else {
+            let Some(file_text) = file.and_then(|file| file.text.as_deref()) else {
+                // The block's file is outside the sample (a probe resolved
+                // into an unsampled file) or its source text is unavailable:
+                // the claim is unverifiable from this run's input, which is
+                // not evidence of a contract break.
+                summary.skipped_unsampled_source += 1;
+                continue;
+            };
+            let Some(expected) = line_slice(file_text, start_line as usize, end_line as usize)
+            else {
                 sink.record(violation(
                     InvariantKind::I1,
                     language,
@@ -1877,14 +1902,33 @@ pub fn check_i3b(
         let ProbeKind::ScanSearch {
             expected_display_fq,
             expected_path,
+            is_module,
         } = &record.kind
         else {
             continue;
         };
+        if *is_module {
+            // A module's "name" is its file path; searching for it as a
+            // symbol is not a contract search_symbols has (the I1(b) module
+            // naming convention), so absence proves nothing.
+            summary.skipped_scan_search_module += 1;
+            continue;
+        }
         let Some(structured) = structured_outcome(record) else {
             continue;
         };
         summary.i3b_scan_resolution_checks += 1;
+        if structured
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            // The result set was cut by the file limit; the expected
+            // declaration may simply have ranked out. Absence from a
+            // truncated set is unverifiable, not a violation.
+            summary.skipped_scan_search_truncated += 1;
+            continue;
+        }
         let mut found = false;
         let mut inspected = 0_usize;
         for file in array_field(structured, "files") {
