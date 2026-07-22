@@ -151,6 +151,39 @@ fn i2_fires_when_spellings_resolve_to_different_declarations() {
     );
 }
 
+// Two files can define the same fq display name (parallel packages,
+// cross-built source trees). Their spelling sets must stay separate groups:
+// each is internally consistent, and merging them fabricates cross-file
+// declaration drift no single symbol exhibits.
+#[test]
+fn i2_silent_when_same_fq_symbols_live_in_different_files() {
+    let core_path = "packages/lsp-core/src/lsp/workspace-edit.ts";
+    let senpi_path = "packages/omo-senpi/src/components/lsp/lsp/workspace-edit.ts";
+    let mut records = vec![
+        spelling(1, "ApplyResult.success", sources_block(core_path, 9)),
+        spelling(
+            3,
+            "packages/lsp-core/src/lsp/workspace-edit.ts#ApplyResult.success",
+            sources_block(core_path, 9),
+        ),
+        spelling(1, "ApplyResult.success", sources_block(senpi_path, 14)),
+        spelling(
+            3,
+            "packages/omo-senpi/src/components/lsp/lsp/workspace-edit.ts#ApplyResult.success",
+            sources_block(senpi_path, 14),
+        ),
+    ];
+    for (index, record) in records.iter_mut().enumerate() {
+        record.symbol_fq = "ApplyResult.success".to_string();
+        record.symbol_path = if index < 2 { core_path } else { senpi_path }.to_string();
+    }
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i2(&refs(&records), "ts", &mut sink, &mut summary);
+    assert_eq!(summary.i2_spelling_groups, 2);
+    assert!(sink.into_sorted_vec().is_empty());
+}
+
 fn defs_spelling(
     order: usize,
     spelling: &str,

@@ -1564,16 +1564,25 @@ pub fn check_i2(
     sink: &mut ViolationSink,
     summary: &mut ProbeSummary,
 ) {
-    let mut groups: HashMap<(&str, &str), Vec<&ProbeRecord>> = HashMap::new();
+    // Group key includes the declaring file: different files can define
+    // identical fq display names (parallel source trees, cross-built
+    // packages, vendored copies), and merging their spelling sets would
+    // fabricate cross-file "different declaration" drift that no single
+    // symbol exhibits.
+    let mut groups: HashMap<(&str, &str, &str), Vec<&ProbeRecord>> = HashMap::new();
     for record in records {
         if matches!(record.kind, ProbeKind::Spelling { .. }) {
             groups
-                .entry((record.tool, record.symbol_fq.as_str()))
+                .entry((
+                    record.tool,
+                    record.symbol_fq.as_str(),
+                    record.symbol_path.as_str(),
+                ))
                 .or_default()
                 .push(record);
         }
     }
-    for ((tool, symbol_fq), mut group) in groups {
+    for ((tool, symbol_fq, _), mut group) in groups {
         group.sort_by_key(|record| match &record.kind {
             ProbeKind::Spelling { order, .. } => *order,
             _ => 0,
