@@ -360,6 +360,67 @@ fn i2_fires_when_one_declarations_spellings_drift_at_the_location_stage() {
     assert_eq!(violations[0].shape, "spelling-status-drift");
 }
 
+// Location verdicts legitimately differ across *different* reference sites:
+// one symbol's probes span several (context, target) references (a php
+// property and its same-named method share one display fq — Faker's
+// `Address::$state` vs `Address::state()`), so drift is only comparable
+// within one reference site.
+#[test]
+fn i2_silent_when_location_verdicts_differ_across_reference_sites() {
+    let records = vec![
+        defs_spelling(
+            0,
+            "state",
+            "return static::randomElement(static::$state);",
+            "randomElement",
+            "not_found",
+        ),
+        defs_spelling(
+            1,
+            "Faker.Provider.en_AU.Address.state",
+            "return static::randomElement(static::$state);",
+            "randomElement",
+            "resolved",
+        ),
+        defs_spelling(
+            2,
+            "src/Faker/Provider/en_AU/Address.php#state",
+            "return static::randomElement(static::$state);",
+            "randomElement",
+            "resolved",
+        ),
+        defs_spelling(
+            0,
+            "state",
+            "'Australian Capital Territory', 'New South Wales'",
+            "Australian",
+            "not_found",
+        ),
+        defs_spelling(
+            1,
+            "Faker.Provider.en_AU.Address.state",
+            "'Australian Capital Territory', 'New South Wales'",
+            "Australian",
+            "no_definition",
+        ),
+        defs_spelling(
+            2,
+            "src/Faker/Provider/en_AU/Address.php#state",
+            "'Australian Capital Territory', 'New South Wales'",
+            "Australian",
+            "no_definition",
+        ),
+    ];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i2(&refs(&records), "php", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+    assert_eq!(
+        summary.i2_spelling_groups, 2,
+        "one group per reference site"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // I3 — cross-tool round-trips
 // ---------------------------------------------------------------------------
@@ -440,6 +501,38 @@ fn i3a_fires_when_ambiguity_excludes_the_listed_path() {
     let violations = sink.into_sorted_vec();
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert_eq!(violations[0].shape, "summaries-listed-symbol-unresolvable");
+}
+
+// Ambiguity at the product's offered-match cap is undecidable: the matches
+// are a truncated prefix, so the listed selector's absence proves nothing
+// (livewire's global `UnitTest` cut behind 25 namespaced candidates).
+#[test]
+fn i3a_silent_when_ambiguity_matches_hit_the_offer_cap() {
+    // AMBIGUOUS_SYMBOL_MATCH_LIMIT (pub(crate) in src/searchtools/mod.rs);
+    // if the cap ever rises above 25 this test starts failing loudly, which
+    // is the direction we want.
+    let matches: Vec<String> = (0..25)
+        .map(|index| format!("Livewire.Feature{index}.UnitTest"))
+        .collect();
+    let records = vec![record(
+        "i3a",
+        "get_symbol_sources",
+        ProbeKind::SummaryElementSource {
+            element_path: "src/Mechanisms/HandleRequests/UnitTest.php".to_string(),
+        },
+        json!({
+            "ambiguous": [{
+                "target": "UnitTest",
+                "matches": matches,
+            }],
+            "not_found": [],
+            "sources": []
+        }),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i3a(&refs(&records), "php", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
 }
 
 #[test]
@@ -1325,6 +1418,34 @@ fn ts_module_units_are_excluded_from_spelling_probes() {
         summary.symbols_excluded_module_spelling > 0,
         "module unit should be excluded from spelling probes: {summary:?}"
     );
+    assert!(report.violations.is_empty(), "{:?}", report.violations);
+}
+
+// A constructor carries its class's display identifier, so the bare and
+// path-anchored terminal spellings legitimately resolve to the *type*
+// declaration; only the qualified spellings name the constructor. I2 must
+// not compare the two families (the Terminal.Gui `TestRunnable` /
+// `AnsiSnapshotException` false different-declaration fires).
+#[test]
+fn csharp_constructor_spelling_probes_skip_bare_terminal() {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/Widget.cs",
+            "namespace Ns {\n    public class Widget {\n        public int Value;\n        public Widget(int value) { Value = value; }\n    }\n}\n",
+        )
+        .build();
+    let service =
+        SearchToolsService::new_manual_without_semantic_index(project.root().to_path_buf())
+            .expect("service");
+    let workspace = service.analyzer_snapshot().expect("analyzer snapshot");
+    let report = run_invariants_with_service(
+        &service,
+        workspace.analyzer(),
+        &fuzzer_config("csharp"),
+        None,
+        4,
+    )
+    .expect("run invariants");
     assert!(report.violations.is_empty(), "{:?}", report.violations);
 }
 

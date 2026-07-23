@@ -756,6 +756,11 @@ fn generate_probes(
                 break;
             }
             let symbol = &input.symbols[index];
+            // Constructor spellings reduce to the qualified pair (see
+            // spelling_set); batching them adds no signal.
+            if symbol.aux_constructor {
+                continue;
+            }
             let path = input.files[symbol.file_index].path.as_str();
             let Some((context, target)) = definition_context(input, symbol) else {
                 continue;
@@ -848,12 +853,22 @@ fn generate_probes(
 /// from that candidate list; probing the companion through the stripped
 /// spelling would resolve to its class — a different unit — and every
 /// derived expectation would be meaningless.
+///
+/// Constructors (the `aux_constructor` convention: a callable carrying its
+/// class's display identifier, e.g. C# `TestRunnable.TestRunnable`) only
+/// get the qualified spellings: their bare and path-anchored terminal
+/// spellings legitimately resolve to the *type* declaration, so comparing
+/// them against the constructor's qualified resolution fires a false
+/// spelling-resolves-to-different-declaration (Terminal.Gui triage).
 fn spelling_set(symbol: &SymbolFacts, path: &str) -> Vec<String> {
     let qualified = if symbol.fq_name.ends_with('$') {
         &symbol.fq_name
     } else {
         &symbol.display_fq
     };
+    if symbol.aux_constructor {
+        return vec![qualified.clone(), format!("{path}#{qualified}")];
+    }
     vec![
         symbol.identifier.clone(),
         qualified.clone(),
@@ -1681,20 +1696,31 @@ pub fn check_i2(
     // packages, vendored copies), and merging their spelling sets would
     // fabricate cross-file "different declaration" drift that no single
     // symbol exhibits.
-    let mut groups: HashMap<(&str, &str, &str), Vec<&ProbeRecord>> = HashMap::new();
+    //
+    // For get_definitions_by_reference the key also includes the reference
+    // site (context + target): the checker rules premise *identical*
+    // context/target, and one symbol legitimately has several probe
+    // references — a property and its same-named method share one display fq
+    // in php (Faker's `Address::$state` vs `Address::state()`), so their
+    // probes land in one (fq, path) bucket, and comparing location verdicts
+    // across different references fabricates drift (tier-3 Faker).
+    let mut groups: HashMap<(&str, &str, &str, &str, &str), Vec<&ProbeRecord>> = HashMap::new();
     for record in records {
         if matches!(record.kind, ProbeKind::Spelling { .. }) {
+            let (context, target) = spelling_reference_site(record);
             groups
                 .entry((
                     record.tool,
                     record.symbol_fq.as_str(),
                     record.symbol_path.as_str(),
+                    context,
+                    target,
                 ))
                 .or_default()
                 .push(record);
         }
     }
-    for ((tool, symbol_fq, _), mut group) in groups {
+    for ((tool, symbol_fq, _, _, _), mut group) in groups {
         group.sort_by_key(|record| match &record.kind {
             ProbeKind::Spelling { order, .. } => *order,
             _ => 0,
@@ -1908,6 +1934,31 @@ fn spelling_evidence(record: &ProbeRecord, outcome: &SpellingOutcome) -> Value {
     json!({ "spelling": spelling, "status": outcome.status_label() })
 }
 
+/// The reference site a spelling probe queries, for I2 grouping:
+/// `get_definitions_by_reference` probes carry `references[0].{context,target}`;
+/// `get_symbol_sources` selector probes have no reference site and share one
+/// per-symbol group.
+fn spelling_reference_site(record: &ProbeRecord) -> (&str, &str) {
+    record
+        .arguments
+        .get("references")
+        .and_then(Value::as_array)
+        .and_then(|references| references.first())
+        .map(|reference| {
+            (
+                reference
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                reference
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            )
+        })
+        .unwrap_or(("", ""))
+}
+
 /// I3(a): a symbol `get_summaries` lists under file F must resolve via
 /// `get_symbol_sources`, and its reported path must be F.
 pub fn check_i3a(
@@ -1938,14 +1989,23 @@ pub fn check_i3a(
             // listed one (the bfg shape: `LFS.Pointer` offered only
             // `LFS$.Pointer`/`LFS$.Pointer$`, no exact match).
             let own_selector = format!("{element_path}#");
-            let resolvable_from_listing = array_field(structured, "ambiguous")
+            let candidates: Vec<&str> = array_field(structured, "ambiguous")
                 .filter_map(|entry| entry.get("matches").and_then(Value::as_array))
                 .flatten()
                 .filter_map(Value::as_str)
-                .any(|candidate| {
-                    candidate.starts_with(&own_selector) || candidate == record.symbol_fq
-                });
-            if !resolvable_from_listing {
+                .collect();
+            let resolvable_from_listing = candidates.iter().any(|candidate| {
+                candidate.starts_with(&own_selector) || *candidate == record.symbol_fq
+            });
+            // The product caps offered matches at AMBIGUOUS_SYMBOL_MATCH_LIMIT
+            // (selectors.rs); at the cap the list is a truncated prefix, so
+            // the listed selector's absence proves nothing — it may sort
+            // beyond the cut (livewire's global `UnitTest` behind 25
+            // namespaced `Livewire.*.UnitTest` candidates). Undecidable:
+            // never a violation.
+            let undecidable_at_match_cap =
+                candidates.len() >= crate::searchtools::AMBIGUOUS_SYMBOL_MATCH_LIMIT;
+            if !resolvable_from_listing && !undecidable_at_match_cap {
                 sink.record(violation(
                     InvariantKind::I3,
                     language,
