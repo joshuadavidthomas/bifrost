@@ -58,7 +58,7 @@ impl LanguageAdapter for CppAdapter {
             recovered_class_sibling_scopes: HashMap::default(),
             consumed_fragment_regions: Vec::new(),
         };
-        visitor.visit_container(root, "", None, None, None);
+        visitor.visit_container(root, "", None, None, None, Vec::new());
         recover_quoted_includes(source, &mut parsed);
         parsed
     }

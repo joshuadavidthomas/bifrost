@@ -17,6 +17,18 @@ pub(super) struct ScopeInfo {
     template_metadata: Option<CppTemplateMetadata>,
     declarations_are_fields: bool,
     recovered_specialization_member_scope: bool,
+    /// Namespace targets of every `using namespace X;` directive lexically
+    /// visible at this point in the file (declaration order), threaded
+    /// forward sibling-by-sibling by the sequential container walk (see
+    /// `CppWork::Siblings`). An out-of-line member definition written as a
+    /// bare `Class::method` at file/namespace scope with no enclosing
+    /// `namespace {}` block (issue #1093, e.g. log4cxx's
+    /// `using namespace LOG4CXX_NS; ... LogString HTMLLayout::getContentType()
+    /// const { ... }`) has no other structural signal for which namespace
+    /// actually owns `Class`; this is the best-effort candidate list used to
+    /// recover it so the definition's indexed identity matches its header
+    /// declaration's.
+    visible_using_namespaces: Vec<String>,
 }
 
 struct CppContainer<'tree> {
@@ -29,9 +41,22 @@ struct CppNodeWork<'tree> {
     scope: ScopeInfo,
 }
 
+/// Cursor over one container's remaining named children, processed one at a
+/// time (rather than all at once) so a `using namespace X;` sibling can
+/// update `scope.visible_using_namespaces` for the siblings that follow it,
+/// matching real C++ using-directive semantics. Nested container work is
+/// still pushed and fully drained before the cursor resumes (stack LIFO
+/// order), preserving the original left-to-right visitation order.
+struct CppSiblingsWork<'tree> {
+    parent: Node<'tree>,
+    next_index: usize,
+    scope: ScopeInfo,
+}
+
 enum CppWork<'tree> {
     Container(CppContainer<'tree>),
     Node(CppNodeWork<'tree>),
+    Siblings(CppSiblingsWork<'tree>),
 }
 
 fn class_like_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -688,19 +713,73 @@ fn first_class_like_child(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-fn push_cpp_child_work<'tree>(
+/// Push a container's children as a `Siblings` cursor rather than snapshotting
+/// them all with one shared scope: children are visited one at a time so a
+/// `using namespace X;` sibling can affect the scope threaded to the siblings
+/// that textually follow it (issue #1093).
+fn push_cpp_container_work<'tree>(
     node: Node<'tree>,
     scope: ScopeInfo,
     stack: &mut Vec<CppWork<'tree>>,
 ) {
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(CppWork::Node(CppNodeWork {
-                node: child,
-                scope: scope.clone(),
-            }));
-        }
+    stack.push(CppWork::Siblings(CppSiblingsWork {
+        parent: node,
+        next_index: 0,
+        scope,
+    }));
+}
+
+/// Advance a `Siblings` cursor by one child: dispatch the current child under
+/// the scope accumulated from its *earlier* siblings, then push a
+/// continuation for the remaining siblings carrying the scope updated for
+/// *this* child (only `using namespace X;` directives change it). Pushing the
+/// continuation before the current child's own node work means the current
+/// child's subtree fully drains (LIFO) before the next sibling is visited,
+/// preserving left-to-right order.
+fn advance_cpp_siblings<'tree>(
+    siblings: CppSiblingsWork<'tree>,
+    source: &str,
+    stack: &mut Vec<CppWork<'tree>>,
+) {
+    let Some(child) = siblings.parent.named_child(siblings.next_index) else {
+        return;
+    };
+    let current_scope = siblings.scope.clone();
+    let mut next_scope = siblings.scope;
+    if let Some(namespace) = cpp_using_namespace_target(child, source) {
+        next_scope.visible_using_namespaces.push(namespace);
     }
+    stack.push(CppWork::Siblings(CppSiblingsWork {
+        parent: siblings.parent,
+        next_index: siblings.next_index + 1,
+        scope: next_scope,
+    }));
+    stack.push(CppWork::Node(CppNodeWork {
+        node: child,
+        scope: current_scope,
+    }));
+}
+
+/// The namespace target of a `using namespace X;` directive, or `None` for
+/// any other `using_declaration` shape (`using X;`, `using X::Y;`) or node
+/// kind. Distinguished structurally by the presence of the grammar's literal
+/// `namespace` keyword token among the node's children -- not by inspecting
+/// source text -- so it never misreads a member-importing using-declaration
+/// as a namespace directive.
+fn cpp_using_namespace_target(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "using_declaration" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let is_namespace_directive = node
+        .children(&mut cursor)
+        .any(|child| child.kind() == "namespace");
+    if !is_namespace_directive {
+        return None;
+    }
+    let target = node.named_child(0)?;
+    let text = normalize_cpp_whitespace(node_text(target, source));
+    (!text.is_empty()).then_some(text)
 }
 
 pub(super) struct CppVisitor<'a> {
@@ -720,6 +799,7 @@ pub(super) struct CppVisitor<'a> {
 }
 
 impl<'a> CppVisitor<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn visit_container(
         &mut self,
         node: Node<'_>,
@@ -727,6 +807,7 @@ impl<'a> CppVisitor<'a> {
         module: Option<CodeUnit>,
         class_unit: Option<CodeUnit>,
         template_signature: Option<String>,
+        visible_using_namespaces: Vec<String>,
     ) {
         let scope = ScopeInfo {
             package_name: package_name.to_string(),
@@ -736,6 +817,7 @@ impl<'a> CppVisitor<'a> {
             template_metadata: None,
             declarations_are_fields: false,
             recovered_specialization_member_scope: false,
+            visible_using_namespaces,
         };
         self.run_container_work(node, scope);
     }
@@ -757,7 +839,10 @@ impl<'a> CppVisitor<'a> {
         while let Some(work) = stack.pop() {
             match work {
                 CppWork::Container(container) => {
-                    push_cpp_child_work(container.node, container.scope, &mut stack);
+                    push_cpp_container_work(container.node, container.scope, &mut stack);
+                }
+                CppWork::Siblings(siblings) => {
+                    advance_cpp_siblings(siblings, self.source, &mut stack);
                 }
                 CppWork::Node(work) => {
                     if self.node_is_inside_consumed_fragment(work.node) {
@@ -802,6 +887,7 @@ impl<'a> CppVisitor<'a> {
             template_metadata: None,
             declarations_are_fields: true,
             recovered_specialization_member_scope: false,
+            visible_using_namespaces: scope.visible_using_namespaces.clone(),
         };
         self.run_container_work(root, member_scope);
     }
@@ -975,6 +1061,7 @@ impl<'a> CppVisitor<'a> {
             template_metadata: scope.template_metadata.clone(),
             declarations_are_fields: false,
             recovered_specialization_member_scope: false,
+            visible_using_namespaces: scope.visible_using_namespaces.clone(),
         };
         let container = cpp_body_node(node).unwrap_or(node);
         stack.push(CppWork::Container(CppContainer {
@@ -1243,7 +1330,10 @@ impl<'a> CppVisitor<'a> {
             while let Some(work) = stack.pop() {
                 match work {
                     CppWork::Container(container) => {
-                        push_cpp_child_work(container.node, container.scope, &mut stack);
+                        push_cpp_container_work(container.node, container.scope, &mut stack);
+                    }
+                    CppWork::Siblings(siblings) => {
+                        advance_cpp_siblings(siblings, self.source, &mut stack);
                     }
                     CppWork::Node(work) => self.visit_node(work.node, &work.scope, &mut stack),
                 }
@@ -1328,6 +1418,7 @@ impl<'a> CppVisitor<'a> {
             scope.module.clone(),
             scope.class_unit.clone(),
             scope.template_signature.clone(),
+            scope.visible_using_namespaces.clone(),
         );
         true
     }
@@ -2048,6 +2139,21 @@ fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String,
             };
             Some(owner_parts.last().unwrap_or(&"").to_string())
         } else {
+            // A bare `Class::member` qualifier at file/namespace scope carries
+            // no namespace segment of its own. If the enclosing lexical scope
+            // is also unqualified, the declarator alone cannot say which
+            // namespace owns `Class` -- but a `using namespace X;` directive
+            // already in effect at this point in the file (#1093, e.g.
+            // log4cxx's `using namespace LOG4CXX_NS;` followed by out-of-line
+            // `LogString HTMLLayout::getContentType() const {...}`) is the
+            // remaining structural signal for it, so fall back to it rather
+            // than leaving the definition's package empty while its header
+            // declaration (parsed inside the `namespace {}` block) keeps the
+            // real one -- an identity split that made the same member
+            // unresolvable under its own displayed spelling.
+            if package_name.is_empty() {
+                package_name = cpp_using_directive_namespace_for_bare_owner(scope);
+            }
             Some(owner_parts[0].to_string())
         };
         return (owner_path, name, package_name);
@@ -2059,6 +2165,25 @@ fn split_cpp_name(raw_name: &str, scope: &ScopeInfo) -> (Option<String>, String,
         .as_ref()
         .map(|parent| parent.short_name().to_string());
     (owner_path, cleaned.to_string(), package_name)
+}
+
+/// Best-effort package-name recovery for a bare (unqualified-by-itself) owner
+/// class name at file/namespace scope, from the `using namespace` directives
+/// visible at this point in the file. Several may be in scope at once (a
+/// primary `using namespace NS;` alongside deeper conveniences like `using
+/// namespace NS::helpers;`); since the declarator gives no way to tell which
+/// one actually declares the owner class, prefer the shallowest (fewest
+/// `::`-separated segments) as the file's most likely "home" namespace,
+/// breaking ties by declaration order. Returns an empty string (leaving the
+/// caller's package unqualified, as before) when no using-namespace directive
+/// is in scope.
+fn cpp_using_directive_namespace_for_bare_owner(scope: &ScopeInfo) -> String {
+    scope
+        .visible_using_namespaces
+        .iter()
+        .min_by_key(|namespace| namespace.split("::").count())
+        .cloned()
+        .unwrap_or_default()
 }
 
 struct CppQualifiedNameComponent {
@@ -2103,15 +2228,27 @@ fn split_structured_templated_cpp_name(
         .map(|component| component.name.as_str())
         .collect::<Vec<_>>()
         .join("::");
+    let explicit_package_is_empty = explicit_package.is_empty();
     let package_name = match (
         explicitly_global,
         scope.package_name.is_empty(),
-        explicit_package.is_empty(),
+        explicit_package_is_empty,
     ) {
         (true, _, _) => explicit_package,
         (false, _, true) => scope.package_name.clone(),
         (false, true, false) => explicit_package,
         (false, false, false) => format!("{}::{explicit_package}", scope.package_name),
+    };
+    // Same identity-split fallback as `split_cpp_name` (#1093): a template
+    // specialization's owner class named with no namespace segment of its own
+    // (`explicit_package` empty) at file scope (`explicitly_global` false)
+    // with nothing enclosing (`package_name` still empty) has no structural
+    // signal for its namespace besides an in-scope `using namespace X;`.
+    let package_name = if package_name.is_empty() && !explicitly_global && explicit_package_is_empty
+    {
+        cpp_using_directive_namespace_for_bare_owner(scope)
+    } else {
+        package_name
     };
     let owner_path = components[owner_start..]
         .iter()
