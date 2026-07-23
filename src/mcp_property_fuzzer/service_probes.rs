@@ -1953,14 +1953,23 @@ pub fn check_i3a(
             // listed one (the bfg shape: `LFS.Pointer` offered only
             // `LFS$.Pointer`/`LFS$.Pointer$`, no exact match).
             let own_selector = format!("{element_path}#");
-            let resolvable_from_listing = array_field(structured, "ambiguous")
+            let candidates: Vec<&str> = array_field(structured, "ambiguous")
                 .filter_map(|entry| entry.get("matches").and_then(Value::as_array))
                 .flatten()
                 .filter_map(Value::as_str)
-                .any(|candidate| {
-                    candidate.starts_with(&own_selector) || candidate == record.symbol_fq
-                });
-            if !resolvable_from_listing {
+                .collect();
+            let resolvable_from_listing = candidates.iter().any(|candidate| {
+                candidate.starts_with(&own_selector) || *candidate == record.symbol_fq
+            });
+            // The product caps offered matches at AMBIGUOUS_SYMBOL_MATCH_LIMIT
+            // (selectors.rs); at the cap the list is a truncated prefix, so
+            // the listed selector's absence proves nothing — it may sort
+            // beyond the cut (livewire's global `UnitTest` behind 25
+            // namespaced `Livewire.*.UnitTest` candidates). Undecidable:
+            // never a violation.
+            let undecidable_at_match_cap =
+                candidates.len() >= crate::searchtools::AMBIGUOUS_SYMBOL_MATCH_LIMIT;
+            if !resolvable_from_listing && !undecidable_at_match_cap {
                 sink.record(violation(
                     InvariantKind::I3,
                     language,

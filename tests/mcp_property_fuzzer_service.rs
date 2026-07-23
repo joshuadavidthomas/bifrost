@@ -442,6 +442,38 @@ fn i3a_fires_when_ambiguity_excludes_the_listed_path() {
     assert_eq!(violations[0].shape, "summaries-listed-symbol-unresolvable");
 }
 
+// Ambiguity at the product's offered-match cap is undecidable: the matches
+// are a truncated prefix, so the listed selector's absence proves nothing
+// (livewire's global `UnitTest` cut behind 25 namespaced candidates).
+#[test]
+fn i3a_silent_when_ambiguity_matches_hit_the_offer_cap() {
+    // AMBIGUOUS_SYMBOL_MATCH_LIMIT (pub(crate) in src/searchtools/mod.rs);
+    // if the cap ever rises above 25 this test starts failing loudly, which
+    // is the direction we want.
+    let matches: Vec<String> = (0..25)
+        .map(|index| format!("Livewire.Feature{index}.UnitTest"))
+        .collect();
+    let records = vec![record(
+        "i3a",
+        "get_symbol_sources",
+        ProbeKind::SummaryElementSource {
+            element_path: "src/Mechanisms/HandleRequests/UnitTest.php".to_string(),
+        },
+        json!({
+            "ambiguous": [{
+                "target": "UnitTest",
+                "matches": matches,
+            }],
+            "not_found": [],
+            "sources": []
+        }),
+    )];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i3a(&refs(&records), "php", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+}
+
 #[test]
 fn i3a_fires_when_reported_path_differs_from_listed_path() {
     let records = vec![record(
