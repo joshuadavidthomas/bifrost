@@ -90,7 +90,7 @@ pub(crate) use go::{
     packages::{GoModuleRoot, go_module_roots},
 };
 pub(crate) use i_analyzer::AnalyzerQueryScope;
-pub use i_analyzer::{AnalyzerQueryContext, IAnalyzer};
+pub use i_analyzer::{AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer};
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
@@ -100,8 +100,8 @@ pub use model::{
     ExceptionSmellWeights, ImportInfo, Language, MaintainabilitySizeSmell,
     MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError, ParseErrorKind, ProjectFile,
     Range, RubyMethodDispatchMode, SearchSymbolCandidate, SignatureMetadata, StructuredImportPath,
-    StructuredImportScope, SummaryFileProjection, TestAssertionSmell, TestAssertionWeights,
-    metrics_from_declarations,
+    StructuredImportPathKind, StructuredImportScope, SummaryFileProjection, TestAssertionSmell,
+    TestAssertionWeights, metrics_from_declarations,
 };
 pub(crate) use model::{
     CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,
