@@ -1696,20 +1696,31 @@ pub fn check_i2(
     // packages, vendored copies), and merging their spelling sets would
     // fabricate cross-file "different declaration" drift that no single
     // symbol exhibits.
-    let mut groups: HashMap<(&str, &str, &str), Vec<&ProbeRecord>> = HashMap::new();
+    //
+    // For get_definitions_by_reference the key also includes the reference
+    // site (context + target): the checker rules premise *identical*
+    // context/target, and one symbol legitimately has several probe
+    // references — a property and its same-named method share one display fq
+    // in php (Faker's `Address::$state` vs `Address::state()`), so their
+    // probes land in one (fq, path) bucket, and comparing location verdicts
+    // across different references fabricates drift (tier-3 Faker).
+    let mut groups: HashMap<(&str, &str, &str, &str, &str), Vec<&ProbeRecord>> = HashMap::new();
     for record in records {
         if matches!(record.kind, ProbeKind::Spelling { .. }) {
+            let (context, target) = spelling_reference_site(record);
             groups
                 .entry((
                     record.tool,
                     record.symbol_fq.as_str(),
                     record.symbol_path.as_str(),
+                    context,
+                    target,
                 ))
                 .or_default()
                 .push(record);
         }
     }
-    for ((tool, symbol_fq, _), mut group) in groups {
+    for ((tool, symbol_fq, _, _, _), mut group) in groups {
         group.sort_by_key(|record| match &record.kind {
             ProbeKind::Spelling { order, .. } => *order,
             _ => 0,
@@ -1921,6 +1932,31 @@ fn spelling_evidence(record: &ProbeRecord, outcome: &SpellingOutcome) -> Value {
         return json!(null);
     };
     json!({ "spelling": spelling, "status": outcome.status_label() })
+}
+
+/// The reference site a spelling probe queries, for I2 grouping:
+/// `get_definitions_by_reference` probes carry `references[0].{context,target}`;
+/// `get_symbol_sources` selector probes have no reference site and share one
+/// per-symbol group.
+fn spelling_reference_site(record: &ProbeRecord) -> (&str, &str) {
+    record
+        .arguments
+        .get("references")
+        .and_then(Value::as_array)
+        .and_then(|references| references.first())
+        .map(|reference| {
+            (
+                reference
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                reference
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            )
+        })
+        .unwrap_or(("", ""))
 }
 
 /// I3(a): a symbol `get_summaries` lists under file F must resolve via

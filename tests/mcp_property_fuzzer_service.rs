@@ -360,6 +360,67 @@ fn i2_fires_when_one_declarations_spellings_drift_at_the_location_stage() {
     assert_eq!(violations[0].shape, "spelling-status-drift");
 }
 
+// Location verdicts legitimately differ across *different* reference sites:
+// one symbol's probes span several (context, target) references (a php
+// property and its same-named method share one display fq — Faker's
+// `Address::$state` vs `Address::state()`), so drift is only comparable
+// within one reference site.
+#[test]
+fn i2_silent_when_location_verdicts_differ_across_reference_sites() {
+    let records = vec![
+        defs_spelling(
+            0,
+            "state",
+            "return static::randomElement(static::$state);",
+            "randomElement",
+            "not_found",
+        ),
+        defs_spelling(
+            1,
+            "Faker.Provider.en_AU.Address.state",
+            "return static::randomElement(static::$state);",
+            "randomElement",
+            "resolved",
+        ),
+        defs_spelling(
+            2,
+            "src/Faker/Provider/en_AU/Address.php#state",
+            "return static::randomElement(static::$state);",
+            "randomElement",
+            "resolved",
+        ),
+        defs_spelling(
+            0,
+            "state",
+            "'Australian Capital Territory', 'New South Wales'",
+            "Australian",
+            "not_found",
+        ),
+        defs_spelling(
+            1,
+            "Faker.Provider.en_AU.Address.state",
+            "'Australian Capital Territory', 'New South Wales'",
+            "Australian",
+            "no_definition",
+        ),
+        defs_spelling(
+            2,
+            "src/Faker/Provider/en_AU/Address.php#state",
+            "'Australian Capital Territory', 'New South Wales'",
+            "Australian",
+            "no_definition",
+        ),
+    ];
+    let mut sink = Default::default();
+    let mut summary = ProbeSummary::default();
+    check_i2(&refs(&records), "php", &mut sink, &mut summary);
+    assert!(sink.into_sorted_vec().is_empty());
+    assert_eq!(
+        summary.i2_spelling_groups, 2,
+        "one group per reference site"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // I3 — cross-tool round-trips
 // ---------------------------------------------------------------------------
