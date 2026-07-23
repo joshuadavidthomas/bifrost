@@ -17,11 +17,11 @@ The cap is a stack of five serializers, ranked by measured impact. This plan rem
 ## Progress
 
 - [x] (2026-07-22) M1 — Store read-connection pool + single-writer routing + statement hygiene. `ReaderPool` (readonly WAL connections, lazy checkout, transient over-capacity burst, capacity = available_parallelism) inside `AnalyzerStore`; 44 pure-read methods routed off the writer mutex; ephemeral workspaces moved to delete-on-drop temp-file DBs (with a single-connection fallback path); statement cache 64 on every connection; `read_unit_rows`/`contains_parsed_blob_conn`/`parsed_blob_keys_conn` on `prepare_cached`; ALL 14 `_bulk` IN-list readers plus the cascade-cost VALUES query padded to fixed arity ladders with NULLs (root-cause generalization of the plan's two named sites). Measured at jobs=24 on the baseline repo (cold index, comparable load): CPU 267%→687%, wall 5:02→2:59, get_symbol_sources p50 719ms→60ms (12x), get_definitions p50 1.8s→369ms, scan p50 51.3s→29.4s; get_summaries (n=77) and search_symbols (n=19) regressed modestly — both sit behind the M4 projection-cache and M5 git-subprocess serializers, next in line. Peak RSS 1.4GB→3.0GB (per-connection page caches + real concurrency). Note: `analyzer_persistence` has a PRE-EXISTING load-correlated flake in the warm-* test family (fails 1-3 tests under heavy box load with or without M1; stash-controlled repetition proved independence) — tracked separately.
-- [ ] M2 — Session read-first locking (write lock only when the watcher reports changes).
-- [ ] M3 — Watcher-driven liveness validation (kill the per-call stat storm).
-- [ ] M4 — Cache hygiene: O(1) LRU touch, bigger caps, route handler reads through in-memory sources.
-- [ ] M5 — relevance: reuse git-derived state across calls keyed by HEAD.
-- [ ] Final: concurrent-throughput measurement before/after (fuzzer `--jobs 1` vs `--jobs 24`), full validation, merge + push.
+- [x] (2026-07-22) M2 — Session read-first locking: has_pending peek, read-lock no-change path, staleness pass reads outside locks. Measured: wall 5:02→42.4s cumulative at jobs=24.
+- [x] (2026-07-22) M3 — Liveness stat-validation memoized per snapshot instance (write-once validated flag at snapshot build; invalidation = the pre-existing generation-bump snapshot rebuild, verified for watcher and Manual flows). Zero additional fs::metadata across query contexts, proven by a new stat counter; aggregate wall unchanged on the lookup-dominated benchmark (the remaining stat cost was small there; the win concentrates in scan-heavy/slow-mount workloads).
+- [x] (2026-07-22) M4 — Stamped lazy-LRU (O(1) touch + bounded compaction), caps 128→1024/32→128, all 8 handler disk-read sites routed through indexed_source.
+- [x] (2026-07-22) M5 — Recent-commit OID list cached per repo keyed by peeled HEAD OID (rev-list spawned only on HEAD movement), discover-root cached per workspace, hoisted HEAD-tree peel; per-cache fill counter keeps the cache-hit test deterministic under parallel execution.
+- [x] (2026-07-22) Final: clean canonical measurement on a quiet box at final HEAD (fresh index, same config): jobs=24 wall 5:02→42.5s (267%→1523% CPU), p50 sources 719→26ms, defs 1809→105ms, summaries 450→359ms, scan 51.3s→14.5s, search 4106→2438ms — every tool better than baseline, the M1-era summaries/search regressions erased. jobs=1 wall 14:04→4:00, p50 sources 15→8ms, defs 273→31ms, scan 3166→1727ms — the uncontended case improved 3.5x too. All milestones pushed.
 
 ## Surprises & Discoveries
 
@@ -52,6 +52,13 @@ The cap is a stack of five serializers, ranked by measured impact. This plan rem
   Date/Author: 2026-07-22 / Claude
 
 ## Outcomes & Retrospective
+
+The plan achieved its purpose and then some. Five milestones landed as five commits, each measured. Canonical before/after at final HEAD (quiet box, fresh index, 2,555 probe calls):
+
+    jobs=24: wall 5:02 -> 42.5s, CPU 267% -> 1523%; p50 sources 719->26ms, defs 1809->105ms, summaries 450->359ms, scan 51.3s->14.5s, search 4106->2438ms
+    jobs=1 : wall 14:04 -> 4:00, CPU ~101% -> 109%; p50 sources 15->8ms, defs 273->31ms, summaries 146->53ms, scan 3166->1727ms, search 1120->778ms
+
+Every tool improved at both concurrency levels; the transient M1-era summaries/search regressions were exactly the M4/M5 serializers and disappeared when those landed. Lessons: (1) the stack-of-serializers model held — each milestone exposed the next bottleneck, and per-milestone measurement caught the two intermediate regressions immediately; (2) two latent correctness bugs surfaced by the new concurrency were fixed en route (the #1099 GC-vs-warm-build race; a test asserting absolute values of a process-global counter); (3) the biggest design leverage came from reusing existing machinery — WAL was already on, the generation counter already existed, the watcher already knew what changed — the milestones mostly connected what was there. Remaining headroom: scan_usages (14.5s p50 under load) is now the outlier and would be the target of any follow-up; parallel query scheduling (gated off in issue-918 because of the old contention) can be revisited.
 
 Baseline captured (2026-07-22, pre-M1 HEAD, local git-initialized copy of oh-my-openagent, fuzzer probe phase `--invariants I2,I3,I5 --max-service-symbols 300 --max-scan-probes 20 --cache-mode persisted`, 2,555 calls; note: moderate background load from concurrent agent builds, treat as indicative — a clean re-run happens before/after M1 integration):
 
