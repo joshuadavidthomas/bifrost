@@ -2884,37 +2884,26 @@ fn csharp_enclosing_class(
     file: &ProjectFile,
     byte: usize,
 ) -> Option<CodeUnit> {
-    if definitions.session().is_some() {
-        let range = Range {
-            start_byte: byte,
-            end_byte: byte.saturating_add(1),
-            start_line: 0,
-            end_line: 0,
-        };
-        let mut current =
-            definitions.query_optional(|| analyzer.enclosing_code_unit(file, &range))?;
-        while !current.is_class() {
-            current = definitions.parent_of(analyzer, &current)?;
-        }
-        return Some(current);
-    }
-    if let Some(unit) = ClassRangeIndex::build(analyzer, file).enclosing_unit(byte) {
-        return Some(unit.clone());
-    }
-
     let range = Range {
         start_byte: byte,
         end_byte: byte.saturating_add(1),
         start_line: 0,
         end_line: 0,
     };
-    let mut current = analyzer.enclosing_code_unit(file, &range)?;
-    loop {
-        if current.is_class() {
-            return Some(current);
-        }
-        current = analyzer.parent_of(&current)?;
+    if definitions.session().is_some() {
+        let start = definitions.query_optional(|| analyzer.enclosing_code_unit(file, &range))?;
+        return crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+            definitions.parent_of(analyzer, unit)
+        })
+        .find(CodeUnit::is_class);
     }
+    if let Some(unit) = ClassRangeIndex::build(analyzer, file).enclosing_unit(byte) {
+        return Some(unit.clone());
+    }
+
+    let start = analyzer.enclosing_code_unit(file, &range)?;
+    crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| analyzer.parent_of(unit))
+        .find(CodeUnit::is_class)
 }
 
 fn resolve_csharp_in_enclosing_scopes(
@@ -2933,26 +2922,16 @@ fn resolve_csharp_in_enclosing_scopes(
         start_line: 0,
         end_line: 0,
     };
-    let mut scope = definitions
+    let scope = definitions
         .query_optional(|| analyzer.enclosing_code_unit(file, &range))?
         .fq_name();
-    loop {
-        if scope.is_empty() || !definitions.scope_step() {
-            return None;
-        }
-        let child_fqn = format!("{scope}.{name}");
-        if let Some(child) = definitions
-            .fqn(&child_fqn)
-            .into_iter()
-            .find(CodeUnit::is_class)
-        {
-            return Some(child);
-        }
-        match scope.rfind('.') {
-            Some(index) => scope.truncate(index),
-            None => return None,
-        }
-    }
+    resolve_qualified_name_in_shrinking_scopes(
+        &scope,
+        name,
+        || definitions.scope_step(),
+        |fqn| definitions.fqn(fqn),
+        CodeUnit::is_class,
+    )
 }
 
 fn resolve_csharp_nested_type_in_enclosing_classes(
@@ -2965,25 +2944,20 @@ fn resolve_csharp_nested_type_in_enclosing_classes(
     if name.is_empty() || name.contains('.') {
         return None;
     }
-    let mut enclosing = csharp_enclosing_class(analyzer, definitions, file, byte)?;
-    loop {
-        if !definitions.scope_step() {
-            return None;
-        }
-        let child_fqn = format!("{}.{}", enclosing.fq_name(), name);
-        if let Some(child) = definitions
+    let enclosing = csharp_enclosing_class(analyzer, definitions, file, byte)?;
+    crate::analyzer::usages::common::enclosing_owner_chain(enclosing, |unit| {
+        definitions
+            .parent_of(analyzer, unit)
+            .filter(CodeUnit::is_class)
+    })
+    .map_while(|owner| definitions.scope_step().then_some(owner))
+    .find_map(|owner| {
+        let child_fqn = format!("{}.{}", owner.fq_name(), name);
+        definitions
             .fqn(&child_fqn)
             .into_iter()
             .find(CodeUnit::is_class)
-        {
-            return Some(child);
-        }
-        let parent = definitions.parent_of(analyzer, &enclosing)?;
-        if !parent.is_class() {
-            return None;
-        }
-        enclosing = parent;
-    }
+    })
 }
 
 fn csharp_import_boundary_for_type(

@@ -124,7 +124,7 @@ impl<'a> JavaResolutionSession<'a> {
         file: &ProjectFile,
         byte: usize,
     ) -> Option<CodeUnit> {
-        let mut unit = self.query_optional_row(|| {
+        let start = self.query_optional_row(|| {
             analyzer.enclosing_code_unit(
                 file,
                 &Range {
@@ -135,10 +135,10 @@ impl<'a> JavaResolutionSession<'a> {
                 },
             )
         })?;
-        while !unit.is_class() {
-            unit = self.parent_of(analyzer, &unit)?;
-        }
-        Some(unit)
+        crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+            self.parent_of(analyzer, unit)
+        })
+        .find(CodeUnit::is_class)
     }
 
     fn structured_query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {

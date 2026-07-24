@@ -2159,7 +2159,7 @@ fn resolve_cpp_type(
             )
         };
         let enclosing_classes = enclosing_owner
-            .map(|owner| context.cpp_enclosing_class_chain(owner))
+            .map(|owner| context.enclosing_owner_chain(owner, CodeUnit::is_class))
             .unwrap_or_default();
         let candidates = cpp_focused_type_qualifier_candidates(
             analyzer,

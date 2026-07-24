@@ -2,6 +2,7 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
 };
+use crate::analyzer::usages::common::namespace_prefixes;
 use crate::analyzer::usages::cpp_graph::{
     CallArityEvidence, CppBareCallTargetResolution, CppDesignatedInitializerOwner,
     CppLexicalScopeResolution, CppLexicalTypeResolution, CppTargetKind, CppVisibilityIndex,
@@ -194,23 +195,45 @@ pub(super) fn resolve_qualified_in_enclosing_scopes(
         start_line: 0,
         end_line: 0,
     };
-    let mut scope = analyzer.enclosing_code_unit(file, &range)?.fq_name();
-    loop {
-        if scope.is_empty() {
-            // Only *enclosing* named scopes are tried here; the bare top level is
-            // left to the caller's normal name resolution, which applies imports
-            // and shadowing (so this cannot override a glob import / local shadow).
-            return None;
-        }
-        let child_fqn = format!("{scope}.{reference}");
-        if let Some(child) = analyzer.definitions(&child_fqn).find(|unit| accept(unit)) {
-            return Some(child);
-        }
-        match scope.rfind('.') {
-            Some(idx) => scope.truncate(idx),
-            None => return None,
-        }
-    }
+    let scope = analyzer.enclosing_code_unit(file, &range)?.fq_name();
+    resolve_qualified_name_in_shrinking_scopes(
+        &scope,
+        reference,
+        || true,
+        |fqn| analyzer.definitions(fqn).collect(),
+        accept,
+    )
+}
+
+/// Budget-parametric core shared by [`resolve_qualified_in_enclosing_scopes`]
+/// and C#'s bounded fork (`resolve_csharp_in_enclosing_scopes`): try
+/// `{prefix}.{reference}` at `scope`, then at each progressively shorter
+/// dotted prefix of `scope` in turn (never the bare top level — see the doc
+/// comment above), returning the first hit `definitions_for` reports that
+/// `accept` approves.
+///
+/// `definitions_for` supplies the definitions source (an unbounded
+/// `analyzer.definitions` call, or a session-aware/budget-charging one), and
+/// `charge_hop` gates each prefix attempt (an always-`true` closure for
+/// unbounded callers). Once `charge_hop` declines, the walk stops
+/// immediately without formatting or looking up further prefixes — matching
+/// how csharp's/java's per-hop `scope_step` budgets truncate the walk today.
+pub(super) fn resolve_qualified_name_in_shrinking_scopes(
+    scope: &str,
+    reference: &str,
+    mut charge_hop: impl FnMut() -> bool,
+    mut definitions_for: impl FnMut(&str) -> Vec<CodeUnit>,
+    accept: impl Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    namespace_prefixes(scope)
+        .take_while(|prefix| !prefix.is_empty())
+        .map_while(|prefix| charge_hop().then_some(prefix))
+        .find_map(|prefix| {
+            let candidate = format!("{prefix}.{reference}");
+            definitions_for(&candidate)
+                .into_iter()
+                .find(|unit| accept(unit))
+        })
 }
 
 pub(crate) const SCALA_UNSUPPORTED_CALL_TARGET_SHAPE: &str = "unsupported_scala_call_target_shape";
@@ -511,7 +534,7 @@ struct DefinitionBatchContext<'a> {
     cpp_navigation_indexes: HashMap<ProjectFile, Option<Arc<cpp::CppNavigationIndex>>>,
     cpp_structural_alias_paths: HashMap<CodeUnit, Vec<String>>,
     cpp_class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
-    cpp_enclosing_class_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
+    enclosing_owner_chains: HashMap<CodeUnit, Arc<Vec<CodeUnit>>>,
     python_contexts: HashMap<ProjectFile, Arc<python::PythonDefinitionContext>>,
     navigation_target_limit: usize,
     #[cfg(test)]
@@ -540,7 +563,7 @@ impl<'a> DefinitionBatchContext<'a> {
             cpp_navigation_indexes: HashMap::default(),
             cpp_structural_alias_paths: HashMap::default(),
             cpp_class_ranges: HashMap::default(),
-            cpp_enclosing_class_chains: HashMap::default(),
+            enclosing_owner_chains: HashMap::default(),
             python_contexts: HashMap::default(),
             navigation_target_limit: 256,
             #[cfg(test)]
@@ -698,20 +721,31 @@ impl<'a> DefinitionBatchContext<'a> {
         index
     }
 
-    fn cpp_enclosing_class_chain(&mut self, owner: CodeUnit) -> Arc<Vec<CodeUnit>> {
-        self.cpp_enclosing_class_chains
+    /// Generalized, memoized version of the enclosing-owner-chain walk (see
+    /// `common::enclosing_owner_chain`): `owner` plus every contiguous
+    /// ancestor `accept` approves, stopping at the first rejection.
+    ///
+    /// The cache key is `owner` alone, not `(owner, accept)` — every caller
+    /// today shares one predicate (C++'s `CodeUnit::is_class`). A second
+    /// predicate reused through this same cache would silently return the
+    /// first-cached chain for a given owner; give it a predicate-aware key
+    /// before adding one.
+    fn enclosing_owner_chain(
+        &mut self,
+        owner: CodeUnit,
+        accept: impl Fn(&CodeUnit) -> bool,
+    ) -> Arc<Vec<CodeUnit>> {
+        let analyzer = self.analyzer;
+        self.enclosing_owner_chains
             .entry(owner.clone())
             .or_insert_with(|| {
-                let mut classes = Vec::new();
-                let mut current = Some(owner);
-                while let Some(owner) = current {
-                    if !owner.is_class() {
-                        break;
-                    }
-                    current = self.analyzer.parent_of(&owner);
-                    classes.push(owner);
-                }
-                Arc::new(classes)
+                Arc::new(
+                    crate::analyzer::usages::common::enclosing_owner_chain(owner, |unit| {
+                        analyzer.parent_of(unit)
+                    })
+                    .take_while(|unit| accept(unit))
+                    .collect(),
+                )
             })
             .clone()
     }
@@ -1762,7 +1796,7 @@ mod tests {
             "focused qualifiers in one file should share one class-range index"
         );
         assert_eq!(
-            context.cpp_enclosing_class_chains.len(),
+            context.enclosing_owner_chains.len(),
             1,
             "focused qualifiers in one class should share its enclosing owner chain"
         );
