@@ -2104,6 +2104,14 @@ fn resolve_cpp_type(
                 })
         {
             let reference = cpp_callable_reference_text(template_node, source);
+            // NOTE (#1158, site cpp.rs:2107): flagged for "missing the sibling's
+            // enclosing-scope consultation", but this is a template-id qualified
+            // reference. The shared enclosing-scope resolver composes candidates
+            // with `.` while a cpp qualified reference keeps `::`, so consulting
+            // it is inert here (unlike sibling 2453, which sees a bare
+            // type_identifier). A workspace-internal qualified type resolves
+            // through the normal name/visibility paths above before reaching
+            // this branch. Pinned by issue_1158's cpp repros.
             if cpp_unresolved_include_boundary(analyzer, file, &reference) {
                 return boundary(format!(
                     "`{reference}` appears to cross a C++ include boundary not indexed in this workspace"
@@ -2399,6 +2407,13 @@ fn resolve_cpp_type_without_focused_qualifier(
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
+        // NOTE (#1158, site cpp.rs:2402): flagged for "missing sibling 2453's
+        // enclosing-scope consultation", but 2453 sees a bare type_identifier
+        // while this branch handles qualified/scoped identifiers whose `::`
+        // separator the shared `.`-composing enclosing-scope resolver cannot
+        // match — consulting it here is inert. A workspace-internal qualified
+        // type resolves through the visible-name/owner-member paths above before
+        // reaching this branch. Pinned by issue_1158's cpp repros.
         if cpp_unresolved_include_boundary(analyzer, file, text) {
             return boundary(format!(
                 "`{text}` appears to cross a C++ include boundary not indexed in this workspace"

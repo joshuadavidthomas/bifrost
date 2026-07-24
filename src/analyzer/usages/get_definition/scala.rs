@@ -5639,14 +5639,19 @@ fn resolve_scala_type(
             )
         })
     });
+    let mut missing_local_import = false;
     match local_import {
         Some(ScalaNameResolution::Resolved(owner)) => {
             return candidates_outcome(vec![owner._declaration]);
         }
         Some(ScalaNameResolution::MissingExplicitImport) => {
-            return boundary(format!(
-                "`{text}` is bound by a local explicit Scala import whose declaration is not indexed in this workspace"
-            ));
+            // Defer the boundary: a local explicit import binds the name but its
+            // declaration is not indexed — yet the enclosing lexical namespace
+            // (the enclosing class's own type, an exact owner-namespace child)
+            // may still resolve it. Run that probe first, exactly as the
+            // non-local sibling below does, and claim a boundary only if it finds
+            // nothing (#1158, restoring the symmetry with the non-local branch).
+            missing_local_import = true;
         }
         Some(ScalaNameResolution::Ambiguous) => {
             return no_definition(
@@ -5673,6 +5678,11 @@ fn resolve_scala_type(
             );
         }
         ScalaTypeNamespaceResolution::NoMatch => {}
+    }
+    if missing_local_import {
+        return boundary(format!(
+            "`{text}` is bound by a local explicit Scala import whose declaration is not indexed in this workspace"
+        ));
     }
     if !type_segments.is_empty() {
         match resolver

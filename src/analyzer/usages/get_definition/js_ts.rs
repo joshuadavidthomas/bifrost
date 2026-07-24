@@ -669,14 +669,18 @@ fn resolve_js_ts_module_binding(
 ) -> DefinitionLookupOutcome {
     let files = crate::analyzer::resolve_js_ts_module_specifier(file, module, language, aliases);
     if files.is_empty() {
-        if is_bare_js_ts_specifier(module) {
-            return boundary(format!(
-                "`{module}` is a package import outside this partial workspace analysis"
-            ));
-        }
-        return boundary(format!(
-            "`{module}` could not be resolved to a workspace JS/TS file"
-        ));
+        // Only a bare specifier (`react`, `lodash`) is a confident external
+        // package boundary. A relative/absolute specifier (`./`, `../`, `/`)
+        // that resolves to no file is an in-workspace path that did not land —
+        // a typo or a not-yet-indexed sibling — never a confident cross-workspace
+        // claim (#1158): treat the relative shape as workspace-internal so the
+        // gate yields `no_definition` instead of `boundary`.
+        return gated_boundary(
+            || !is_bare_js_ts_specifier(module),
+            format!("`{module}` is a package import outside this partial workspace analysis"),
+            "no_indexed_definition",
+            format!("`{module}` could not be resolved to a workspace JS/TS file"),
+        );
     }
 
     let candidates = resolve_js_ts_module_binding_candidates(

@@ -1019,6 +1019,15 @@ fn resolve_rust_unscoped(
         return candidates_outcome(candidates);
     }
     if rust_reference_looks_external(reference) {
+        // NOTE (#1158, site rust.rs:1022): the survey flagged this branch for
+        // "missing the enclosing-scope member fallback its siblings have", but
+        // that fallback cannot help here. `rust_reference_looks_external` is only
+        // true for a `::`-qualified path, and the shared enclosing-scope resolver
+        // composes candidates with `.` (`{scope}.{reference}`), so it never
+        // matches a `::`-qualified reference. When this branch is reached the
+        // qualified path has already been resolved-and-exhausted upstream (the
+        // scoped-associated-item and visible-import paths), so the boundary is
+        // the honest outcome. Pinned by issue_1158's rust repro.
         return boundary(format!(
             "`{reference}` appears to cross a Rust crate/module boundary not indexed in this workspace"
         ));
@@ -1438,6 +1447,20 @@ fn rust_macro_name_outcome(
             RustVisibleImportResolution::Resolved(candidates)
             | RustVisibleImportResolution::GlobResolved(candidates) => candidates,
             RustVisibleImportResolution::BoundButUnindexed => {
+                // An unresolvable macro import must not blind the reference to a
+                // workspace-declared macro of the same name in an enclosing
+                // scope: macros keep their own namespace, so consult it before
+                // claiming an unindexed boundary (#1158, the macro-namespace
+                // analogue of the type-namespace fallback its siblings run).
+                if let Some(unit) = resolve_in_enclosing_scopes(
+                    analyzer,
+                    file,
+                    name,
+                    site.focus_start_byte,
+                    CodeUnit::is_macro,
+                ) {
+                    return Some(candidates_outcome(vec![unit]));
+                }
                 return Some(boundary(format!(
                     "Rust macro `{name}` is imported across a crate/module boundary that is not indexed"
                 )));

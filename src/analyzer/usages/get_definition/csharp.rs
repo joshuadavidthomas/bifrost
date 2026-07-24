@@ -682,9 +682,19 @@ fn resolve_csharp_in_session(
             if outcome.status == DefinitionLookupStatus::NoDefinition
                 && csharp_static_using_boundary_for_member(csharp, definitions, file)
             {
-                return boundary(format!(
-                    "`{member}` appears to cross a C# static using boundary not indexed in this workspace"
-                ));
+                // The unindexed-static-using signal is member-blind (any
+                // unresolved `using static` trips it). Tie the confident claim to
+                // this member: if a static-using target the workspace *does*
+                // index declares `member`, the missing resolution is a
+                // workspace-internal gap, never an external boundary (#1158).
+                return gated_boundary(
+                    || csharp_member_declared_by_indexed_static_using(definitions, file, member),
+                    format!(
+                        "`{member}` appears to cross a C# static using boundary not indexed in this workspace"
+                    ),
+                    "no_indexed_definition",
+                    format!("`{member}` did not resolve to an indexed C# member"),
+                );
             }
             outcome
         }
@@ -2996,15 +3006,48 @@ fn csharp_static_using_boundary_for_member(
     definitions: &CSharpDefinitionProvider<'_>,
     file: &ProjectFile,
 ) -> bool {
-    definitions.import_statements(file).iter().any(|raw| {
-        raw.trim()
-            .trim_start_matches("global ")
-            .trim_start_matches("using ")
-            .trim_end_matches(';')
-            .trim()
-            .strip_prefix("static ")
-            .is_some_and(|target| !definitions.type_exists(target.trim()))
+    csharp_static_using_targets(definitions, file).any(|target| !definitions.type_exists(&target))
+}
+
+/// True when `member` is declared by a `using static` target the workspace
+/// actually indexes — e.g. `using static Workspace.MathUtils;` where `MathUtils`
+/// exists and declares the member. The unindexed-static-using signal above is
+/// member-blind (it trips on any unresolved static using), so this ties the
+/// confident boundary to the specific member: a member a workspace static-using
+/// provides is workspace-internal, never an external boundary (#1158).
+fn csharp_member_declared_by_indexed_static_using(
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    member: &str,
+) -> bool {
+    csharp_static_using_targets(definitions, file).any(|target| {
+        definitions.type_exists(&target)
+            && !definitions
+                .members_for_owner_name(&target, member)
+                .is_empty()
     })
+}
+
+/// The `using static <target>;` targets declared in `file`, one per static-using
+/// directive (global or file-scoped). Shared by the static-using boundary
+/// predicates so the member-blind and member-specific checks agree on which
+/// directives count.
+fn csharp_static_using_targets(
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+) -> impl Iterator<Item = String> {
+    definitions
+        .import_statements(file)
+        .into_iter()
+        .filter_map(|raw| {
+            raw.trim()
+                .trim_start_matches("global ")
+                .trim_start_matches("using ")
+                .trim_end_matches(';')
+                .trim()
+                .strip_prefix("static ")
+                .map(|target| target.trim().to_string())
+        })
 }
 
 const CSHARP_SCOPE_NODES: &[&str] = &[

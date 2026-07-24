@@ -1328,6 +1328,38 @@ fn boundary(message: String) -> DefinitionLookupOutcome {
     )
 }
 
+/// Emit a confident cross-workspace boundary claim only when the target is *not*
+/// workspace-internal.
+///
+/// Every confident `boundary()` claim answers two questions, and the second one
+/// is the one call sites keep forgetting:
+///
+/// 1. Is there an *external signal* — an unresolved import/include/using, a
+///    looks-external path? The caller checks this at the call site (it is
+///    language- and shape-specific) and only reaches here when it is true.
+/// 2. Does the workspace nonetheless *declare or contain* this target — a
+///    same-named enclosing-scope member (the #1126 shape) or a workspace
+///    namespace/module the qualifier names (the #1089 shape)? If so, the honest
+///    outcome is `no_definition`, never a boundary.
+///
+/// `workspace_internal` answers (2). Routing confident claims through this
+/// constructor makes the second check structural instead of a per-site
+/// convention: a new emission site cannot skip it, because it cannot reach
+/// `boundary()` without supplying the closure. Where both guard families apply,
+/// callers `OR` them inside the closure.
+fn gated_boundary(
+    workspace_internal: impl FnOnce() -> bool,
+    boundary_message: String,
+    no_definition_kind: impl Into<String>,
+    no_definition_message: impl Into<String>,
+) -> DefinitionLookupOutcome {
+    if workspace_internal() {
+        no_definition(no_definition_kind, no_definition_message)
+    } else {
+        boundary(boundary_message)
+    }
+}
+
 fn import_boundary_workspace_message(message: String) -> String {
     let message = message.replace(
         "outside this partial ",
