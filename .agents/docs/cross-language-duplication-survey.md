@@ -231,7 +231,16 @@ call_tool/symbol_sources/definition_reference_status (~14 bodies).
 **Explicitly leave as copies (divergence is the design):** scala/cpp/ruby import
 models; AST-walk owner queries (impl targets, out-of-line owners, bounded
 pre-index walkers, sub-CodeUnit scopes, ruby lexical stack, go package model);
-range/ancestor containment helpers; CFG/ICFG graph walks; policy value walks.
+range/ancestor containment helpers; CFG/ICFG graph walks; policy value walks;
+**the typed declaration-visitor work-stacks** (cpp `CppWork::{Container,Node,
+Siblings}`, python `PythonWork::{Container,Statement}`, php `PhpWork::{Container,
+Node}`, scala `ScalaWork::{CompilationUnit,TemplateBody}`, and the csharp/ruby/java
+single-variant equivalents) — a shared `ContainerWalk<Scope>` would own only
+~45-50 LOC of stack ceremony against ~30-42 LOC of per-language ceremony each,
+carries no cross-copy invariant that drifts (each visitor's substance —
+sibling-scope threading, recovery state machines, fragmented-export reparse — is
+language-unique), and cannot host scala's heterogeneous `CompilationUnit` payload;
+see Concern 5 Tier 3 item 1 for the full mass-per-hole arithmetic.
 
 ## Concern 5: traversal work-stacks + test helpers (survey complete)
 
@@ -263,6 +272,31 @@ judge separately. Scale: ~332 hand-rolled work-stack initializations, ~387
      eventually the 7 tuple-stack languages. Cpp's Container/Node/Siblings is the
      most general seed. ~200+ LOC of dispatch boilerplate, but visit-node bodies
      stay language-specific — mass-per-hole must be computed honestly.
+     **RESOLVED: LEAVE AS COPIES (mass-per-hole computed 2026-07-24).** The shared
+     skeleton a generic `ContainerWalk<Scope>` would own is ~45-50 LOC total
+     (enum + `push_children` + LIFO drain + a generic Siblings-advance hook +
+     Visitor trait). The per-language ceremony it replaces is only ~30-42 LOC each
+     (cpp ~42, python ~36, php ~29), and it fails all three mandate gates:
+     (1) NO cross-copy invariant that drifts — cpp's using-directive
+     sibling-threading (#1093 `advance_cpp_siblings` + `visible_using_namespaces`),
+     scala's end-ident/dedent recovery-owner state machine, and cpp's #938/#941
+     fragmented-export reparse are each language-unique, not a shared invariant
+     kept in sync; the LIFO drain is trivially-correct and stable, not a recurring
+     bug class. (2) The plug surface is NOT small/uniform: cpp needs a scope-update
+     hook + the Siblings variant; scala's `CompilationUnit` variant carries a
+     heterogeneous payload (`children: Vec<Node>, index, package, prefixes,
+     recovery_owners`) that is a different shape from every other variant's
+     `(node, scope)` — it breaks the "generic scope payload" premise and would keep
+     its own walk regardless. (3) It does NOT lower the next-language cost: the
+     dispatch bodies (the actual mass — cpp `visit_node` ~120 LOC, scala
+     `process_compilation_unit` ~170 LOC) push child work onto the stack THEMSELVES
+     at ~40 sites, so genericizing forces `&mut Vec<Work<Scope>>` through every
+     unchanged dispatch signature — pure churn against the #1093/#938/#941/#1120/
+     #1121 canaries for ~50-70 net LOC saved (scala likely can't even participate).
+     The genuinely-shared enter/exit walk was already captured by Tier 1
+     (`walk_tree_iterative`, `subtree_contains`); the declaration visitors
+     deliberately do not use it because each threads a mutating scope and pushes
+     heterogeneous work mid-dispatch — which IS the language-specific part.
   2. `enumerate_procedures` skeleton — 10 near-clones in the semantic modules
      (sibling-key dedup, declaration_paths, budget/cancel checks) with
      language-specific frame fields (Go adds three). Highest payoff (~10x skeleton
