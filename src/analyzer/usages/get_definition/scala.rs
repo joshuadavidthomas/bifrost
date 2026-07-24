@@ -723,6 +723,23 @@ impl<'a> ForwardScalaNameResolver<'a> {
                 ));
                 break;
             }
+            // The import's leading segments may name an object/class in this
+            // lexical package rather than a sub-package: `import
+            // LocalScheduler.Activation` inside `package com.twitter.concurrent`
+            // targets the nested `com.twitter.concurrent.LocalScheduler.Activation`,
+            // where `LocalScheduler` is a singleton object, not a package. The
+            // `package_exists` split above skips such a path; qualify the whole
+            // segment chain under the lexical package as an owner nesting so the
+            // same-file nested declaration resolves instead of drawing a false
+            // "declaration is not indexed" boundary (issue #1126 twitter
+            // `Activation`).
+            if !lexical_package.is_empty() {
+                tiers.push(scala_nested_type_candidates(
+                    lexical_package.to_string(),
+                    &segments,
+                    false,
+                ));
+            }
         }
         tiers.push(scala_nested_type_candidates(
             String::new(),

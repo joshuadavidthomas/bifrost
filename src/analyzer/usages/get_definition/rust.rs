@@ -819,6 +819,19 @@ fn resolve_rust_unscoped(
                             | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
                         };
                 }
+                if candidates.is_empty() && member_kind == RustMemberKind::Function {
+                    // `Self::Variant(..)` reads syntactically as a call yet names a
+                    // tuple enum variant — a field-namespace member, not a method.
+                    // Without this, the variant is missed and the reference falls
+                    // through to a false import-boundary claim even though the
+                    // variant is indexed in this file (issue #1126 nushell
+                    // `SqliteError` vs `use rusqlite::Error as SqliteError`).
+                    candidates = support
+                        .fqn(&format!("{self_type}.{name}"))
+                        .into_iter()
+                        .filter(|candidate| candidate.is_field())
+                        .collect();
+                }
                 candidates
             }
             None => support.fqn(&self_type),
@@ -949,6 +962,14 @@ fn resolve_rust_unscoped(
                     );
                     if !local.is_empty() {
                         return candidates_outcome(local);
+                    }
+                    if let Some(unit) = rust_enclosing_scope_member_fallback(
+                        analyzer,
+                        file,
+                        reference,
+                        site.focus_start_byte,
+                    ) {
+                        return candidates_outcome(vec![unit]);
                     }
                     return boundary(format!(
                         "`{reference}` is explicitly imported across a Rust crate/module boundary that is not indexed"
@@ -2511,6 +2532,39 @@ fn rust_focused_prefix_resolution_outcome(
                 return candidates_outcome(if local.is_empty() { imported } else { local });
             }
             RustVisibleImportResolution::BoundButUnindexed => {
+                // The owner segment (`Error::Variant`, `Foo::Bar`) shares its
+                // spelling with an unresolvable explicit import, but the path
+                // owner is resolved against the local type/module namespace — an
+                // import never shadows a same-file enum/type. Try the local owner
+                // before claiming an unindexed boundary; only claim it when no
+                // workspace-internal owner exists (issue #1126 meilisearch
+                // `Error` vs `use thiserror::Error`).
+                let mut syntax_root = root;
+                while let Some(parent) = syntax_root.parent() {
+                    syntax_root = parent;
+                }
+                let local = rust_current_module_candidates(
+                    analyzer,
+                    rust,
+                    support,
+                    file,
+                    syntax_root,
+                    site.focus_start_byte,
+                    site.focus_end_byte,
+                    focused_text,
+                    RustBareReferenceRole::Owner,
+                );
+                if !local.is_empty() {
+                    return candidates_outcome(local);
+                }
+                if let Some(unit) = rust_enclosing_scope_member_fallback(
+                    analyzer,
+                    file,
+                    focused_text,
+                    site.focus_start_byte,
+                ) {
+                    return candidates_outcome(vec![unit]);
+                }
                 return boundary(format!(
                     "focused Rust owner `{focused_text}` is explicitly imported across a crate/module boundary that is not indexed"
                 ));
@@ -2631,6 +2685,19 @@ fn rust_focused_prefix_resolution_outcome(
         || rust_binder_has_external_binding(&binder, root_name)
         || rust_extern_prelude_root(rust, support, file, refs, root, root_name)
     {
+        // Before a confident boundary claim, resolve the focused segment against
+        // the enclosing type/trait scope: `Self::TransactionManager::run` names
+        // the associated type `Connection::TransactionManager`, which shares its
+        // spelling with an imported trait but is a distinct namespace and lives
+        // in this file (issue #1126 diesel `TransactionManager`).
+        if let Some(unit) = rust_enclosing_scope_member_fallback(
+            analyzer,
+            file,
+            focused_text,
+            site.focus_start_byte,
+        ) {
+            return candidates_outcome(vec![unit]);
+        }
         return boundary(format!(
             "focused Rust path segment `{focused_text}` crosses a crate/module boundary not indexed in this workspace"
         ));
@@ -5187,7 +5254,34 @@ fn rust_reference_looks_external(reference: &str) -> bool {
     reference
         .split("::")
         .next()
-        .is_some_and(|root| !matches!(root, "crate" | "self" | "super") && root != reference)
+        // `Self` roots a path into the lexically enclosing type's own
+        // members, never a crate boundary; treat it like `self`/`crate`/`super`.
+        .is_some_and(|root| {
+            !matches!(root, "crate" | "self" | "super" | "Self") && root != reference
+        })
+}
+
+/// Resolve a name to a workspace-internal declaration that lives in an
+/// *enclosing type/trait/impl/enum* scope of the reference — an enum variant,
+/// associated type, nested type, or the enclosing type itself.
+///
+/// An explicit `use` binds a bare name in the *module* namespace only; Rust
+/// keeps enum-variant, associated-item, and type namespaces separate, so such a
+/// path segment (`Error::Variant`, `Self::AssocType`, a variant declaration
+/// name) is never shadowed by a same-named import. Consulting this before any
+/// "explicitly imported across an unindexed boundary" claim upholds the
+/// invariant that a confident non-indexing claim is never emitted for a name the
+/// workspace actually declares (issue #1126: diesel `Expression`/
+/// `TransactionManager`, meilisearch `Error`, nushell `SqliteError`).
+fn rust_enclosing_scope_member_fallback(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    name: &str,
+    byte: usize,
+) -> Option<CodeUnit> {
+    resolve_in_enclosing_scopes(analyzer, file, name, byte, |candidate| {
+        candidate.is_field() || candidate.is_class()
+    })
 }
 
 pub(super) fn parse_rust_tree(source: &str) -> Option<Tree> {
