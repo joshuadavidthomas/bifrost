@@ -11,6 +11,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::analyzer::fq_name::FqName;
 use crate::hash::{HashMap, HashSet};
 use crate::path_normalization::NormalizePath;
 
@@ -1800,7 +1801,7 @@ impl fmt::Display for ProjectFile {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 struct CodeUnitInner {
     source: ProjectFile,
     kind: CodeUnitType,
@@ -1808,6 +1809,16 @@ struct CodeUnitInner {
     short_name: String,
     signature: Option<String>,
     synthetic: bool,
+    /// Structured, interned form of the qualified name (see
+    /// `.agents/plans/fqname-interned-segments.md`). During the staged
+    /// migration this rides ALONGSIDE the legacy `package_name`/`short_name`
+    /// strings, which remain authoritative. It is empty for languages not yet
+    /// migrated and for units reconstructed from the legacy string path (e.g.
+    /// cache load). It is deliberately excluded from `CodeUnit`'s identity
+    /// (`PartialEq`/`Eq`/`Hash`/`Ord`): it is a redundant derived form of the
+    /// strings, so a populated-`fq` unit and an empty-`fq` unit describing the
+    /// same declaration must still compare equal.
+    fq: FqName,
 }
 
 #[derive(Clone)]
@@ -1831,12 +1842,57 @@ impl CodeUnit {
         signature: Option<String>,
         synthetic: bool,
     ) -> Self {
+        Self::with_signature_and_fq(
+            source,
+            kind,
+            package_name,
+            short_name,
+            signature,
+            synthetic,
+            FqName::new(),
+        )
+    }
+
+    /// Construct a unit while also recording the structured [`FqName`].
+    ///
+    /// This is the M1 dual-representation entry point: per-language extractors
+    /// build the `fq` by interning segments at the exact site where they know
+    /// each segment's kind, and pass it here. When `fq` is non-empty a
+    /// debug/test-only assertion verifies it round-trips to the legacy joined
+    /// string, so a mis-tagged or missing segment fails loudly in tests while
+    /// the strings still drive behavior. Passing an empty `fq` (the default via
+    /// [`Self::with_signature`]/[`Self::new`]) opts a unit out until its
+    /// language is migrated.
+    pub(crate) fn with_signature_and_fq(
+        source: ProjectFile,
+        kind: CodeUnitType,
+        package_name: impl Into<String>,
+        short_name: impl Into<String>,
+        signature: Option<String>,
+        synthetic: bool,
+        fq: FqName,
+    ) -> Self {
         let package_name = package_name.into();
         let short_name = short_name.into();
         assert!(
             !short_name.is_empty(),
             "short_name must not be empty (kind={kind:?}, package_name={package_name:?}, source={source}, signature={signature:?}, synthetic={synthetic})"
         );
+
+        #[cfg(any(test, debug_assertions))]
+        if !fq.is_empty() {
+            let interner = crate::analyzer::fq_name::segment_interner();
+            let expected = if package_name.is_empty() {
+                short_name.clone()
+            } else {
+                format!("{package_name}.{short_name}")
+            };
+            debug_assert_eq!(
+                fq.display(interner),
+                expected,
+                "FqName does not round-trip to the legacy qualified name (kind={kind:?}, package_name={package_name:?}, short_name={short_name:?})"
+            );
+        }
 
         Self(Arc::new(CodeUnitInner {
             source,
@@ -1845,7 +1901,19 @@ impl CodeUnit {
             short_name,
             signature,
             synthetic,
+            fq,
         }))
+    }
+
+    /// Like [`Self::new`] but records the structured [`FqName`] (M1).
+    pub(crate) fn new_fq(
+        source: ProjectFile,
+        kind: CodeUnitType,
+        package_name: impl Into<String>,
+        short_name: impl Into<String>,
+        fq: FqName,
+    ) -> Self {
+        Self::with_signature_and_fq(source, kind, package_name, short_name, None, false, fq)
     }
 
     pub fn file_scope(source: ProjectFile) -> Self {
@@ -1874,6 +1942,14 @@ impl CodeUnit {
 
     pub fn short_name(&self) -> &str {
         &self.0.short_name
+    }
+
+    /// The structured, interned qualified name (M1 dual representation). Empty
+    /// for languages not yet migrated and for cache-loaded units; the legacy
+    /// `package_name`/`short_name` strings remain authoritative until M3. See
+    /// `.agents/plans/fqname-interned-segments.md`.
+    pub(crate) fn fq(&self) -> &FqName {
+        &self.0.fq
     }
 
     pub fn signature(&self) -> Option<&str> {
@@ -1917,24 +1993,26 @@ impl CodeUnit {
     }
 
     pub fn without_signature(&self) -> Self {
-        Self::with_signature(
+        Self::with_signature_and_fq(
             self.0.source.clone(),
             self.0.kind,
             self.0.package_name.clone(),
             self.0.short_name.clone(),
             None,
             self.0.synthetic,
+            self.0.fq.clone(),
         )
     }
 
     pub fn with_synthetic(&self, synthetic: bool) -> Self {
-        Self::with_signature(
+        Self::with_signature_and_fq(
             self.0.source.clone(),
             self.0.kind,
             self.0.package_name.clone(),
             self.0.short_name.clone(),
             self.0.signature.clone(),
             synthetic,
+            self.0.fq.clone(),
         )
     }
 

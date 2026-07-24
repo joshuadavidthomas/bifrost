@@ -45,10 +45,13 @@ the analyzer tree.
 
 ## Progress
 
-- [ ] M0: `FqName` + interner module with unit tests and a memory/size measurement.
+- [x] (2026-07-24) M0: `FqName` + interner module with unit tests and a
+      memory/size measurement. Landed as `src/analyzer/fq_name.rs` (registered
+      in `src/analyzer/mod.rs`). Ten `--lib fq_name` tests pass; measurement
+      recorded in Surprises & Discoveries.
 - [ ] M1: dual representation — emission points populate `FqName` alongside the
       legacy strings, with an equivalence check (per language; check off individually).
-  - [ ] rust  - [ ] cpp  - [ ] java  - [ ] python  - [ ] go  - [ ] php
+  - [ ] rust  - [ ] cpp  - [ ] java  - [ ] python  - [x] go (2026-07-24)  - [ ] php
   - [ ] ruby  - [ ] scala  - [ ] csharp  - [ ] javascript  - [ ] typescript
 - [ ] M2: shared services and selectors consume `FqName`; input parsing produces it.
 - [ ] M3: persistence flip — store schema carries segments; single epoch salt bump.
@@ -56,7 +59,51 @@ the analyzer tree.
 
 ## Surprises & Discoveries
 
-(to be filled during implementation)
+- Observation (M0 memory measurement): interning is a large win because Bifrost's
+  qualified names share heavy prefixes (directory/package heads, owner types).
+  Evidence — the `measure_interned_vs_legacy_bytes` test builds a real corpus
+  from this crate's own `src/` tree (527 `.rs` files → 1581 synthetic fq names:
+  each path component a `Path` segment, the file stem a `Type`, two `Member`
+  leaves):
+
+        [fq_name measurement] corpus: 527 files, 1581 fq names
+        [fq_name measurement] summed legacy string bytes: 43285
+        [fq_name measurement] interner entries: 371, unique text bytes: 3646 (+1484 bytes of ids)
+        [fq_name measurement] interned/legacy text ratio: 0.084
+
+  Interned unique text is ~8.4% of the summed legacy string bytes (3646 vs
+  43285); adding the 4-byte-per-entry id table (1484 bytes) it is still ~12%.
+  The memory question is answered with numbers: the interned representation is
+  far smaller than the concatenated strings even before counting that each
+  `FqName` now stores 4-byte ids instead of owning its own `String`.
+
+- Observation (go): a Go `package_name` is the canonical *import path*
+  (`github.com/foo/bar`), so its `/`-separated components are `Path` segments and
+  a component that itself contains a literal dot (`github.com`) must stay a single
+  segment. Canonical `display()` therefore renders `/` between adjacent `Path`
+  segments and `.` at the `Path`→name transition, which is exactly the legacy
+  `fq_name()` shape. Evidence: `display_round_trips_go_import_path` asserts
+  `github.com/foo/bar.Baz.method`, and every go analyzer/usages suite passes with
+  the debug/test equivalence assertion active (it compares `fq.display()` to the
+  legacy `package_name.short_name` join for every constructed unit).
+
+- Observation (equivalence assertion fires): a deliberate mutation (appending a
+  bogus `Member` segment `"BOGUS_MUTATION"` in `visit_go_type_spec`) made the
+  `debug_assert_eq!` in `CodeUnit::with_signature_and_fq` fail loudly across the
+  go suites before it was reverted. Evidence:
+
+        thread panicked at src/analyzer/model.rs:1890:
+        assertion `left == right` failed: FqName does not round-trip to the legacy
+        qualified name (kind=Class, package_name="main", short_name="Target")
+          left: "main.Target.BOGUS_MUTATION"
+          right: "main.Target"
+
+- Observation (`_module_` scope): Go package-level `var`/`const`/`type alias`
+  units carry the synthetic scope segment `GO_MODULE_SCOPE_SEGMENT` (`_module_`)
+  in their `short_name` (`_module_.name`). It is emitted as a `Package` segment
+  (a module scope), which round-trips identically; its precise kind only matters
+  once M2 walks owner chains, and can be revisited there without affecting the M1
+  string equivalence.
 
 ## Decision Log
 
@@ -78,6 +125,49 @@ the analyzer tree.
 - Decision: SegmentIds are process-local; persistence stores segment text+kind, never
   IDs. Rationale: IDs from a hash-consing interner are not stable across processes or
   runs; persisting them would couple the store to interner insertion order.
+- Decision (M0): the interner is a single process-global `OnceLock<SegmentInterner>`
+  (accessor `crate::analyzer::fq_name::segment_interner()`), not per-workspace.
+  Rationale: threading a per-workspace interner through every `CodeUnit`
+  constructor across eleven languages is a large mechanical cost with no
+  correctness benefit while the legacy strings remain authoritative; entries are
+  tiny and text-deduplicated, and the plan explicitly permits one interner per
+  process. Date/Author: 2026-07-24, implementation (go/M0 wave).
+- Decision (M0): the interner is sharded (16 shards), each an
+  `RwLock<{ by_text: FxHashMap<String, SmallVec<[(kind,id);2]>>, entries:
+  Vec<(&'static str, kind)> }>`. `SegmentId(u32)` encodes `index*SHARD_COUNT +
+  shard` so a bare id resolves without a side table. Segment text is leaked once
+  on first insert (`Box::leak`) so `resolve` can return a `&str` that outlives
+  the read guard; the interner is grow-only for the process lifetime and bounded
+  by the segment vocabulary, so the leak is an arena, not a leak-per-call.
+  Rationale: extraction is file-parallel, so `intern` must be lock-cheap; the hot
+  (hit) path takes only a read lock and the `String`-keyed map allows borrowed
+  `&str` lookups with no allocation. Date/Author: 2026-07-24, implementation.
+- Decision (M0): `SmallVec<[SegmentId; 8]>` sourced from a new direct dependency
+  `smallvec = "1"` (already present transitively at 1.15.2 in `Cargo.lock`; no
+  new crate is downloaded). Rationale: the plan mandates the type; adding it as a
+  direct dependency is the sanctioned way to use it. Date/Author: 2026-07-24.
+- Decision (M0): canonical `FqName::display` renders `/` between two adjacent
+  `Path` segments, `$` before a `Companion` segment, and `.` otherwise;
+  `display_native(Cpp, ..)` additionally renders `::` between adjacent `Package`
+  segments. Rationale: the plan's "`.`-joined" is the common case, but go's
+  legacy `fq_name()` already embeds `/` inside `package_name`
+  (`github.com/foo/bar.Sym`), so the canonical display MUST reproduce `/` to
+  round-trip. Path segments are always a leading prefix, so `Path`→name is `.`.
+  The `Companion`/`::` rules are provisional until scala/cpp are migrated (they
+  are unit-tested but unused by go). Date/Author: 2026-07-24.
+- Decision (M1 CodeUnit field): `fq: FqName` is added to `CodeUnitInner` and is
+  DELIBERATELY EXCLUDED from `CodeUnit`'s identity (`PartialEq`/`Eq`/`Hash`/`Ord`,
+  which are hand-written and reference the string fields directly). The unused
+  derived `PartialEq/Eq/Hash` on `CodeUnitInner` were dropped (kept `Debug`) so
+  no path accidentally includes `fq` in identity. Rationale: `fq` is a redundant
+  derived form of the strings, and during dual representation a freshly-extracted
+  unit (populated `fq`) and a cache-loaded or not-yet-migrated unit (empty `fq`)
+  describing the SAME declaration must compare equal, or every `HashMap<CodeUnit,
+  ..>` lookup would break. Non-migrated languages stay compiling because
+  `with_signature`/`new` default `fq` to `FqName::new()` (empty) and the
+  equivalence assertion is skipped for empty `fq`. Go opts in via the new
+  `pub(crate)` `CodeUnit::new_fq` / `with_signature_and_fq`. Date/Author:
+  2026-07-24.
 - Decision: the issue-1162 landing deliberately left scope-side fq strings verbatim
   (C++'s mixed `::`/`.` store) as a workaround; that workaround inverts at M3 when
   the store carries explicit segments and C++ emits tagged segments like every other
