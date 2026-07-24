@@ -697,7 +697,9 @@ fn resolve_js_ts_module_binding(
         if let Some((reexport_file, external_module)) = cached_jsts_index(analyzer, language, None)
             .and_then(|index| index.unresolved_reexport_boundary(&files, exported_name))
         {
-            return boundary(format!(
+            // gated upstream: `unresolved_reexport_boundary` only returns Some for
+            // a re-export chain that terminates outside the indexed workspace.
+            return boundary_unchecked(format!(
                 "`{exported_name}` is re-exported by `{}` from `{external_module}`, which is outside the indexed workspace",
                 rel_path_string(&reexport_file)
             ));

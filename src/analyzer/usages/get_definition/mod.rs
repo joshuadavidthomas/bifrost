@@ -177,8 +177,18 @@ pub(super) fn resolve_in_enclosing_scopes(
 /// `internal::EachMatcher` inside `namespace testing` must resolve to
 /// `testing::internal::EachMatcher` — the reference is multi-segment, so the
 /// single-segment walk above cannot try it (tier-4 gmock shape, #1129's
-/// sibling). Scope segments and reference segments share the `.` separator
-/// here, matching how the indexed fq strings compose.
+/// sibling).
+///
+/// The reference is normalized to the canonical `.`-joined segment form the
+/// indexed fq strings use *before* composing candidates: a `::`-qualified
+/// reference (`inner::Config`, `a::b::C`), a `\`-qualified php name, or a
+/// `/`-qualified path reduces to `inner.Config` / `a.b.C`. Without this the
+/// composed candidate keeps the source separator (`{scope}.inner::Config`) and
+/// can never match a `.`-joined fq string, which silently made this fallback
+/// inert for every `::`-qualified reference in a dot-store language (#1162 — the
+/// #1126 safety net structurally did not exist for those shapes). The scope side
+/// is deliberately left verbatim; see the inline note below for why C++'s
+/// `::`-headed namespace fq names must not be normalized.
 pub(super) fn resolve_qualified_in_enclosing_scopes(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -189,20 +199,49 @@ pub(super) fn resolve_qualified_in_enclosing_scopes(
     if reference.is_empty() {
         return None;
     }
+    let language = language_for_file(file);
+    let normalized = normalize_reference_to_fq_segments(language, reference);
+    if normalized.is_empty() {
+        return None;
+    }
     let range = Range {
         start_byte: byte,
         end_byte: byte + 1,
         start_line: 0,
         end_line: 0,
     };
+    // The scope's fq name is used verbatim, NOT normalized. In languages whose
+    // stored fq names keep a source separator in the namespace head (C++ indexes
+    // `cutlass::gemm::warp.OperandSharedStorage.OperandLayout` — `::` between
+    // namespaces, `.` down the owner/member chain), the scope prefix must keep
+    // that same `::` head to match the indexed string; `namespace_prefixes`
+    // still walks the dot-joined owner/member tail, which is where the
+    // enclosing-scope members live. Normalizing the scope to all-`.` would break
+    // that match (it regresses cutlass's template-parameter resolution). Only the
+    // *reference* is normalized (below/above): that is what lets a `::`-qualified
+    // reference match a `.`-joined candidate in a dot-store language (rust);
+    // C++'s `::`-headed namespace fqns are a separate indexing concern (#1162).
     let scope = analyzer.enclosing_code_unit(file, &range)?.fq_name();
     resolve_qualified_name_in_shrinking_scopes(
         &scope,
-        reference,
+        &normalized,
         || true,
         |fqn| analyzer.definitions(fqn).collect(),
         accept,
     )
+}
+
+/// Normalize a qualified-name *reference* into the canonical `.`-joined segment
+/// form used when composing enclosing-scope candidates, honoring the language's
+/// full separator set (`::`, `.`, `\`, `/`, `+`) via the shared structured
+/// [`parse_symbol_path`] splitter rather than an ad-hoc `replace`/`split`.
+/// This is what lets a `::`-qualified reference match a `.`-joined candidate in
+/// a language whose indexed fq strings are `.`-joined (rust). It is a no-op for
+/// a bare single-segment reference — which is what every current C++ caller
+/// passes (C++'s `::`-headed namespace fq names are a separate indexing concern;
+/// see the scope note in `resolve_qualified_in_enclosing_scopes`). #1162.
+fn normalize_reference_to_fq_segments(language: Language, reference: &str) -> String {
+    crate::analyzer::symbol_lookup::parse_symbol_path(language, reference).join(".")
 }
 
 /// Budget-parametric core shared by [`resolve_qualified_in_enclosing_scopes`]
@@ -1320,7 +1359,19 @@ fn definition_symbol_key(unit: &CodeUnit) -> (String, String) {
     (unit.fq_name(), format!("{:?}", unit.kind()))
 }
 
-fn boundary(message: String) -> DefinitionLookupOutcome {
+/// Emit a confident cross-workspace boundary claim *without* the structural
+/// workspace-internal gate. This is the raw emitter; it is `_unchecked` on
+/// purpose so that every remaining call site is greppable and must justify why
+/// it does not go through [`gated_boundary`].
+///
+/// Prefer [`gated_boundary`] for any new site: it forces the second, load-
+/// bearing question ("does the workspace nonetheless declare this?") to be
+/// answered structurally. Only call `boundary_unchecked` when that question is
+/// already answered upstream on this path — an exhausted resolver verdict, a
+/// preceding enclosing-scope/workspace-namespace probe that returned early, or a
+/// predicate that already fused the workspace check. Each such call MUST carry a
+/// `// gated upstream:` comment naming where its guard lives.
+fn boundary_unchecked(message: String) -> DefinitionLookupOutcome {
     diagnostic_outcome(
         DefinitionLookupStatus::UnresolvableImportBoundary,
         "unresolvable_import_boundary",
@@ -1345,8 +1396,8 @@ fn boundary(message: String) -> DefinitionLookupOutcome {
 /// `workspace_internal` answers (2). Routing confident claims through this
 /// constructor makes the second check structural instead of a per-site
 /// convention: a new emission site cannot skip it, because it cannot reach
-/// `boundary()` without supplying the closure. Where both guard families apply,
-/// callers `OR` them inside the closure.
+/// [`boundary_unchecked`] without supplying the closure. Where both guard
+/// families apply, callers `OR` them inside the closure.
 fn gated_boundary(
     workspace_internal: impl FnOnce() -> bool,
     boundary_message: String,
@@ -1356,7 +1407,7 @@ fn gated_boundary(
     if workspace_internal() {
         no_definition(no_definition_kind, no_definition_message)
     } else {
-        boundary(boundary_message)
+        boundary_unchecked(boundary_message)
     }
 }
 

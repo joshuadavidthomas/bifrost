@@ -2104,16 +2104,23 @@ fn resolve_cpp_type(
                 })
         {
             let reference = cpp_callable_reference_text(template_node, source);
-            // NOTE (#1158, site cpp.rs:2107): flagged for "missing the sibling's
-            // enclosing-scope consultation", but this is a template-id qualified
-            // reference. The shared enclosing-scope resolver composes candidates
-            // with `.` while a cpp qualified reference keeps `::`, so consulting
-            // it is inert here (unlike sibling 2453, which sees a bare
-            // type_identifier). A workspace-internal qualified type resolves
-            // through the normal name/visibility paths above before reaching
-            // this branch. Pinned by issue_1158's cpp repros.
+            // NOTE (#1162, site cpp.rs:2107 — pinned): the shared enclosing-scope
+            // resolver is now reference-separator-aware, so a `::`-qualified
+            // template-id no longer keeps its `::` in the composed candidate. But
+            // consulting it here is still inert for C++: nested-namespace
+            // declarations are indexed with `::` in the namespace head of their fq
+            // name (`outer::inner.Gizmo`), and the resolver's dot-based prefix
+            // walk starts from the enclosing scope's own `::`-headed fq name — it
+            // can descend the `.`-joined owner/member tail but never re-compose a
+            // *sibling* namespace (`outer::inner`) from `outer::deep`. Verified:
+            // the fallback returns `None` for the sibling-namespace shape. The
+            // effective fix is normalizing C++'s fq indexing (declarations/graph,
+            // out of the get_definition lane); wiring the fallback here would be a
+            // dead net until then. gated upstream: workspace-owned shapes resolve
+            // through the visibility/owner-member paths above; only external
+            // template-ids reach the honest include boundary below.
             if cpp_unresolved_include_boundary(analyzer, file, &reference) {
-                return boundary(format!(
+                return boundary_unchecked(format!(
                     "`{reference}` appears to cross a C++ include boundary not indexed in this workspace"
                 ));
             }
@@ -2213,7 +2220,10 @@ fn resolve_cpp_type(
             return candidates_outcome(vec![parameter]);
         }
         if cpp_unresolved_include_boundary(analyzer, file, &qualifier.reference) {
-            return boundary(format!(
+            // gated upstream: the enclosing-scope parameter probe above returned
+            // early for any workspace-declared qualifier; only an external one
+            // (with an unresolved include) reaches here.
+            return boundary_unchecked(format!(
                 "`{}` appears to cross a C++ include boundary not indexed in this workspace",
                 qualifier.reference
             ));
@@ -2407,15 +2417,22 @@ fn resolve_cpp_type_without_focused_qualifier(
         if !candidates.is_empty() {
             return candidates_outcome(candidates);
         }
-        // NOTE (#1158, site cpp.rs:2402): flagged for "missing sibling 2453's
-        // enclosing-scope consultation", but 2453 sees a bare type_identifier
-        // while this branch handles qualified/scoped identifiers whose `::`
-        // separator the shared `.`-composing enclosing-scope resolver cannot
-        // match — consulting it here is inert. A workspace-internal qualified
-        // type resolves through the visible-name/owner-member paths above before
-        // reaching this branch. Pinned by issue_1158's cpp repros.
+        // NOTE (#1162, site cpp.rs:2402 — pinned): sibling 2453 (bare
+        // type_identifier) consults the enclosing scope; this branch handles the
+        // `::`-qualified/scoped identifier. The shared resolver is now
+        // reference-separator-aware (#1162), but consulting it is still inert for
+        // C++: nested-namespace declarations are indexed with `::` in the
+        // namespace head of their fq name (`outer::inner.Gizmo`), and the
+        // resolver's dot-based prefix walk starts from the enclosing scope's own
+        // `::`-headed fq name — it descends the `.`-joined owner/member tail but
+        // never re-composes a sibling namespace (`outer::inner`) from
+        // `outer::deep`. Verified: the fallback returns `None` for that shape. The
+        // effective fix is normalizing C++'s fq indexing (declarations/graph, out
+        // of the get_definition lane). gated upstream: workspace-owned shapes
+        // resolve through the visible-name/owner-member paths above; only
+        // genuinely-external shapes reach the boundary.
         if cpp_unresolved_include_boundary(analyzer, file, text) {
-            return boundary(format!(
+            return boundary_unchecked(format!(
                 "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
             ));
         }
@@ -2505,8 +2522,11 @@ fn resolve_cpp_type_without_focused_qualifier(
     if !macros.is_empty() {
         return candidates_outcome(macros);
     }
+    // gated upstream: the type_identifier branch already ran the enclosing-scope
+    // member fallback and the visible-name/lexical resolvers; a workspace-owned
+    // bare type would have resolved there, so only an external one reaches here.
     if cpp_unresolved_include_boundary(analyzer, file, text) {
-        return boundary(format!(
+        return boundary_unchecked(format!(
             "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
         ));
     }
@@ -2936,8 +2956,11 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
             if construction_boundary {
                 return construction;
             }
+            // gated upstream: the owner/member candidate resolution above is the
+            // workspace check; a workspace-declared callable resolves there, so
+            // only an external one (with an unresolved include) reaches here.
             if cpp_unresolved_include_boundary(ctx.analyzer, ctx.file, &text) {
-                return boundary(format!(
+                return boundary_unchecked(format!(
                     "`{text}` appears to cross a C++ include boundary not indexed in this workspace"
                 ));
             }

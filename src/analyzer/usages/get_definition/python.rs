@@ -1838,12 +1838,13 @@ fn python_fqn_outcome(
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
-    if python_crosses_unindexed_boundary(support, fqn) {
-        return boundary(format!(
+    // `python_crosses_unindexed_boundary` is `!python_workspace_module_exists`,
+    // so its negation is the workspace-internal gate.
+    gated_boundary(
+        || !python_crosses_unindexed_boundary(support, fqn),
+        format!(
             "`{raw}` resolves to `{fqn}`, which is outside this partial Python workspace analysis"
-        ));
-    }
-    no_definition(
+        ),
         "no_indexed_definition",
         format!("`{raw}` resolved to `{fqn}`, but no indexed Python definition was found"),
     )
@@ -1858,12 +1859,12 @@ fn python_module_outcome(
     if let Some(module) = py.resolve_module_code_unit(module_fq) {
         return candidates_outcome(vec![module]);
     }
-    if python_crosses_unindexed_boundary(support, module_fq) {
-        return boundary(format!(
+    // Same workspace-namespace gate as the fqn path above.
+    gated_boundary(
+        || !python_crosses_unindexed_boundary(support, module_fq),
+        format!(
             "`{raw}` resolves to module `{module_fq}`, which is outside this partial Python workspace analysis"
-        ));
-    }
-    no_definition(
+        ),
         "no_indexed_definition",
         format!("`{raw}` resolved to module `{module_fq}`, but no indexed Python module was found"),
     )

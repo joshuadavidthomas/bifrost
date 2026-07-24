@@ -1849,12 +1849,11 @@ fn csharp_type_outcome(
     ) {
         return candidates_outcome(vec![unit]);
     }
-    if csharp_import_boundary_for_type(csharp, definitions, file, reference) {
-        return boundary(format!(
-            "`{reference}` appears to cross a C# using boundary not indexed in this workspace"
-        ));
-    }
-    no_definition(
+    // `csharp_import_boundary_for_type` fuses the unresolved-using signal with
+    // the workspace type/namespace check; its negation is the workspace gate.
+    gated_boundary(
+        || !csharp_import_boundary_for_type(csharp, definitions, file, reference),
+        format!("`{reference}` appears to cross a C# using boundary not indexed in this workspace"),
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed C# type"),
     )
@@ -1881,18 +1880,17 @@ fn csharp_attribute_outcome(
         }
         return outcome;
     }
-    if csharp_attribute_alias_boundary(csharp, definitions, file, name, source)
-        || names
-            .iter()
-            .any(|name| csharp_import_boundary_for_type(csharp, definitions, file, name))
-    {
-        let reference = names.first().map(String::as_str).unwrap_or_default();
-        return boundary(format!(
-            "`{reference}` appears to cross a C# using boundary not indexed in this workspace"
-        ));
-    }
     let reference = names.first().map(String::as_str).unwrap_or_default();
-    no_definition(
+    // Both disjuncts are workspace-fused boundary predicates (alias target /
+    // using target the workspace does not index); their negation is the gate.
+    gated_boundary(
+        || {
+            !(csharp_attribute_alias_boundary(csharp, definitions, file, name, source)
+                || names
+                    .iter()
+                    .any(|name| csharp_import_boundary_for_type(csharp, definitions, file, name)))
+        },
+        format!("`{reference}` appears to cross a C# using boundary not indexed in this workspace"),
         "no_indexed_definition",
         format!("`{reference}` did not resolve to an indexed C# attribute type"),
     )
