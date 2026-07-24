@@ -2209,7 +2209,7 @@ fn mixed_symbol_sources_render_recovery_before_source_bodies() {
 
 // A `path#symbol` anchor may itself contain `#` (marked's fixture
 // `bin-config#hash.js`): the split must prefer the point whose anchor is a
-// real file, not blindly take the first `#` (tier-4 marked, #1130).
+// real file, not blindly take the first `#` (tier-4 marked, #1131).
 #[test]
 fn hash_in_path_anchor_resolves_to_deepest_file_split() {
     let project = InlineTestProject::with_language(Language::JavaScript)

@@ -471,7 +471,12 @@ pub(super) fn resolve_selectable_definitions(
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionResolution {
-    let selector = split_definition_selector(input);
+    let selector = split_definition_selector_with_resolver(input, |anchor| {
+        matches!(
+            WorkspaceFileResolver::new(analyzer.project()).resolve_literal(anchor),
+            ResolvedFileInput::File(_)
+        )
+    });
     let (mut anchor, mut lookup) = match selector {
         DefinitionSelector::Name(name) => (None, name),
         DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
@@ -591,6 +596,35 @@ pub(super) fn capped_ambiguous_symbol(target: &str, mut matches: Vec<String>) ->
 /// (`charts/Anchor.ts#Anchor`), returned in a prior ambiguity result, picks one
 /// of several same-named definitions.
 pub(super) fn split_definition_selector(input: &str) -> DefinitionSelector<'_> {
+    split_definition_selector_with_resolver(input, looks_like_path_selector_anchor)
+}
+
+/// File-aware split: `#`-bearing paths (marked's fixture
+/// `bin-config#hash.js`) mean the first `#` is not always the anchor
+/// boundary. Walk every split point and prefer the first whose anchor is a
+/// real file; fall back to the plain parse when none checks out (the
+/// `file.rs#r#type` raw-identifier case keeps its first-`#` split because
+/// `file.rs` resolves).
+pub(super) fn split_definition_selector_with_resolver<'a>(
+    input: &'a str,
+    anchor_is_file: impl Fn(&str) -> bool,
+) -> DefinitionSelector<'a> {
+    if input.matches('#').count() > 1 {
+        for (index, _) in input.match_indices('#') {
+            let (anchor, name) = input.split_at(index);
+            let name = &name[1..];
+            if !anchor.is_empty()
+                && !name.is_empty()
+                && looks_like_path_selector_anchor(anchor)
+                && anchor_is_file(anchor)
+            {
+                return DefinitionSelector::FileAnchored {
+                    anchor: anchor.to_string(),
+                    lookup: name,
+                };
+            }
+        }
+    }
     match input.split_once('#') {
         Some((anchor, name))
             if !anchor.is_empty()

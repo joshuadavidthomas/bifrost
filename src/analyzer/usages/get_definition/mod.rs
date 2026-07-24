@@ -169,6 +169,25 @@ pub(super) fn resolve_in_enclosing_scopes(
     if name.is_empty() || name.contains('.') {
         return None;
     }
+    resolve_qualified_in_enclosing_scopes(analyzer, file, name, byte, accept)
+}
+
+/// The dotted-reference generalization of [`resolve_in_enclosing_scopes`]:
+/// `internal::EachMatcher` inside `namespace testing` must resolve to
+/// `testing::internal::EachMatcher` — the reference is multi-segment, so the
+/// single-segment walk above cannot try it (tier-4 gmock shape, #1129's
+/// sibling). Scope segments and reference segments share the `.` separator
+/// here, matching how the indexed fq strings compose.
+pub(super) fn resolve_qualified_in_enclosing_scopes(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    reference: &str,
+    byte: usize,
+    accept: impl Fn(&CodeUnit) -> bool,
+) -> Option<CodeUnit> {
+    if reference.is_empty() {
+        return None;
+    }
     let range = Range {
         start_byte: byte,
         end_byte: byte + 1,
@@ -183,7 +202,7 @@ pub(super) fn resolve_in_enclosing_scopes(
             // and shadowing (so this cannot override a glob import / local shadow).
             return None;
         }
-        let child_fqn = format!("{scope}.{name}");
+        let child_fqn = format!("{scope}.{reference}");
         if let Some(child) = analyzer.definitions(&child_fqn).find(|unit| accept(unit)) {
             return Some(child);
         }
