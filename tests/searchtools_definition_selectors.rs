@@ -2207,6 +2207,38 @@ fn mixed_symbol_sources_render_recovery_before_source_bodies() {
     assert!(recovery < source, "{rendered}");
 }
 
+// A `path#symbol` anchor may itself contain `#` (marked's fixture
+// `bin-config#hash.js`): the split must prefer the point whose anchor is a
+// real file, not blindly take the first `#` (tier-4 marked, #1130).
+#[test]
+fn hash_in_path_anchor_resolves_to_deepest_file_split() {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "src/bin-config#hash.js",
+            "export default {\n  breaks: true,\n};\n",
+        )
+        .build();
+
+    for selector in [
+        "src/bin-config#hash.js#default",
+        "src/bin-config#hash.js#breaks",
+    ] {
+        let result = call_tool(
+            &project,
+            "get_symbol_sources",
+            &format!(r#"{{"symbols":["{selector}"]}}"#),
+        );
+        assert!(
+            result["not_found"].as_array().unwrap().is_empty(),
+            "{selector} must resolve: {result}"
+        );
+        assert!(
+            !result["sources"].as_array().unwrap().is_empty(),
+            "{selector} must have sources: {result}"
+        );
+    }
+}
+
 // C# generic types are indexed with arity (`CountingCollection`1`) but
 // users spell them without it; every natural spelling must still resolve
 // (issue #1063).
