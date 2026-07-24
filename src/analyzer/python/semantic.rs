@@ -6,6 +6,11 @@
 
 use tree_sitter::Node;
 
+use super::bindings::{
+    PythonDirectScopeBindingKind, PythonLexicalNameResolution, PythonLexicalScopeInventory,
+    python_direct_scope_bindings_bounded,
+};
+use crate::analyzer::lexical_definitions::{PythonMethodBinding, formal_parameter_slots_for_owner};
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, DriveError,
     ProcedureCfgBuilder, ScopeBinding, ScopeFrameId,
@@ -13,10 +18,10 @@ use crate::analyzer::semantic::cfg::{
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
 use crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree;
-use crate::analyzer::{ProjectFile, PythonAnalyzer};
-use crate::hash::HashMap;
+use crate::analyzer::{Language, ProjectFile, PythonAnalyzer, Range};
+use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"python-cfg-v1";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v3";
 
 impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
 
@@ -45,30 +50,35 @@ impl ProgramSemanticsLowerer for PythonSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let specs = match enumerate_procedures(file, prepared, budget, cancellation)? {
-            ProcedureEnumeration::Complete(specs) => specs,
-            ProcedureEnumeration::ExceededBudget { exceeded, work } => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
+        let (specs, class_names, enumeration_work) =
+            match enumerate_procedures(file, prepared, budget, cancellation)? {
+                ProcedureEnumeration::Complete {
+                    specs,
+                    class_names,
                     work,
-                });
-            }
-            ProcedureEnumeration::Cancelled => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work: SemanticWork::default(),
-                });
-            }
-        };
+                } => (specs, class_names, work),
+                ProcedureEnumeration::ExceededBudget { exceeded, work } => {
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                ProcedureEnumeration::Cancelled { work } => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work,
+                    });
+                }
+            };
 
         lower_procedure_batch(
             &specs,
-            SemanticWork::default(),
+            enumeration_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(prepared, spec, staged_budget, cancellation)
+                lower_procedure(prepared, spec, &class_names, staged_budget, cancellation)
             },
         )
     }
@@ -97,6 +107,12 @@ fn python_capabilities() -> SemanticCapabilities {
         SemanticCapability::DynamicDispatch,
         SemanticCapability::CallableReferences,
         SemanticCapability::Values,
+        SemanticCapability::Assignments,
+        SemanticCapability::Allocations,
+        SemanticCapability::LocalFlow,
+        SemanticCapability::ParameterFlow,
+        SemanticCapability::ReceiverFlow,
+        SemanticCapability::Captures,
         SemanticCapability::ResourceManagement,
         SemanticCapability::DeferredExecution,
         SemanticCapability::AsyncSuspendResume,
@@ -110,6 +126,7 @@ fn python_capabilities() -> SemanticCapabilities {
 #[derive(Clone)]
 struct ProcedureSpec<'tree> {
     id: ProcedureId,
+    callable: Node<'tree>,
     body: Node<'tree>,
     locator: SemanticLocator,
     lexical_parent: Option<ProcedureId>,
@@ -118,18 +135,25 @@ struct ProcedureSpec<'tree> {
 }
 
 enum ProcedureEnumeration<'tree> {
-    Complete(Vec<ProcedureSpec<'tree>>),
+    Complete {
+        specs: Vec<ProcedureSpec<'tree>>,
+        class_names: HashSet<Box<str>>,
+        work: SemanticWork,
+    },
     ExceededBudget {
         exceeded: SemanticBudgetExceeded,
         work: SemanticWork,
     },
-    Cancelled,
+    Cancelled {
+        work: SemanticWork,
+    },
 }
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
     lexical_parent: Option<ProcedureId>,
     declaration_path: usize,
+    entry_precharged: bool,
 }
 
 fn enumerate_procedures<'tree>(
@@ -161,16 +185,106 @@ fn enumerate_procedures<'tree>(
         segment: file_segment,
     }];
     let mut preflight = SemanticWork::default();
+    let mut traversal_work = SemanticWork::default();
+    let mut module_bindings: HashMap<Box<str>, PythonDirectScopeBindingKind> = HashMap::default();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
         declaration_path: 0,
+        entry_precharged: false,
     }];
 
     while let Some(frame) = stack.pop() {
         if cancellation.is_cancelled() {
-            return Ok(ProcedureEnumeration::Cancelled);
+            return Ok(ProcedureEnumeration::Cancelled {
+                work: sum_lowering_work(preflight, traversal_work),
+            });
         }
+        if !frame.entry_precharged {
+            let traversal = sum_lowering_work(
+                traversal_work,
+                SemanticWork {
+                    nested_entries: 1,
+                    ..SemanticWork::default()
+                },
+            );
+            let traversal_candidate = sum_lowering_work(preflight, traversal);
+            if let Err(exceeded) = budget.check(traversal_candidate) {
+                return Ok(ProcedureEnumeration::ExceededBudget {
+                    exceeded,
+                    work: traversal_candidate,
+                });
+            }
+            traversal_work = traversal;
+        }
+
+        if frame.lexical_parent.is_none() && frame.declaration_path == 0 {
+            let mut binding_scan_cancelled = false;
+            let mut binding_scan_exceeded = None;
+            let bindings =
+                python_direct_scope_bindings_bounded(frame.node, prepared.source(), || {
+                    if cancellation.is_cancelled() {
+                        binding_scan_cancelled = true;
+                        return false;
+                    }
+                    let next = sum_lowering_work(
+                        traversal_work,
+                        SemanticWork {
+                            nested_entries: 1,
+                            ..SemanticWork::default()
+                        },
+                    );
+                    let candidate = sum_lowering_work(preflight, next);
+                    match budget.check(candidate) {
+                        Ok(()) => {
+                            traversal_work = next;
+                            true
+                        }
+                        Err(exceeded) => {
+                            binding_scan_exceeded = Some((exceeded, candidate));
+                            false
+                        }
+                    }
+                });
+            let Some(bindings) = bindings else {
+                if binding_scan_cancelled {
+                    return Ok(ProcedureEnumeration::Cancelled {
+                        work: sum_lowering_work(preflight, traversal_work),
+                    });
+                }
+                let (exceeded, work) =
+                    binding_scan_exceeded.expect("bounded binding scan stopped without a cause");
+                return Ok(ProcedureEnumeration::ExceededBudget { exceeded, work });
+            };
+            for binding in bindings {
+                let Some(name) = node_text(prepared.source(), binding.declaration) else {
+                    continue;
+                };
+                if let Some(existing) = module_bindings.get_mut(name) {
+                    // Multiple module bindings are not a proven class identity,
+                    // even when more than one of them is a class declaration.
+                    *existing = PythonDirectScopeBindingKind::Other;
+                    continue;
+                }
+                let inventory = sum_lowering_work(
+                    traversal_work,
+                    SemanticWork {
+                        owned_text_bytes: name.len(),
+                        ..SemanticWork::default()
+                    },
+                );
+                let inventory_candidate = sum_lowering_work(preflight, inventory);
+                if let Err(exceeded) = budget.check(inventory_candidate) {
+                    return Ok(ProcedureEnumeration::ExceededBudget {
+                        exceeded,
+                        work: inventory_candidate,
+                    });
+                }
+                traversal_work = inventory;
+                module_bindings.insert(name.into(), binding.kind);
+            }
+        }
+
         let child_path = frame.declaration_path;
         let mut container_body_scope = None;
         if let Some(segment_kind) = declaration_container_kind(frame.node) {
@@ -218,15 +332,17 @@ fn enumerate_procedures<'tree>(
                 anchor,
             );
             let candidate = sum_lowering_work(preflight, procedure_identity_preflight(&locator));
-            if let Err(exceeded) = budget.check(candidate) {
+            let candidate_with_traversal = sum_lowering_work(candidate, traversal_work);
+            if let Err(exceeded) = budget.check(candidate_with_traversal) {
                 return Ok(ProcedureEnumeration::ExceededBudget {
                     exceeded,
-                    work: candidate,
+                    work: candidate_with_traversal,
                 });
             }
             preflight = candidate;
             specs.push(ProcedureSpec {
                 id,
+                callable: frame.node,
                 body,
                 locator,
                 lexical_parent: frame.lexical_parent,
@@ -237,9 +353,34 @@ fn enumerate_procedures<'tree>(
             callable_body_scope = Some((body.id(), id, callable_path));
         }
 
-        let mut cursor = frame.node.walk();
-        let children = frame.node.named_children(&mut cursor).collect::<Vec<_>>();
-        for child in children.into_iter().rev() {
+        for child_index in (0..frame.node.child_count()).rev() {
+            if cancellation.is_cancelled() {
+                return Ok(ProcedureEnumeration::Cancelled {
+                    work: sum_lowering_work(preflight, traversal_work),
+                });
+            }
+            let Some(child) = frame
+                .node
+                .child(child_index)
+                .filter(|child| child.is_named())
+            else {
+                continue;
+            };
+            let traversal = sum_lowering_work(
+                traversal_work,
+                SemanticWork {
+                    nested_entries: 1,
+                    ..SemanticWork::default()
+                },
+            );
+            let traversal_candidate = sum_lowering_work(preflight, traversal);
+            if let Err(exceeded) = budget.check(traversal_candidate) {
+                return Ok(ProcedureEnumeration::ExceededBudget {
+                    exceeded,
+                    work: traversal_candidate,
+                });
+            }
+            traversal_work = traversal;
             let child_path = container_body_scope
                 .filter(|(body_id, _)| *body_id == child.id())
                 .map(|(_, path)| path)
@@ -252,11 +393,24 @@ fn enumerate_procedures<'tree>(
                 node: child,
                 lexical_parent,
                 declaration_path,
+                entry_precharged: true,
             });
         }
     }
 
-    Ok(ProcedureEnumeration::Complete(specs))
+    let class_names = module_bindings
+        .into_iter()
+        .filter_map(|(name, kind)| {
+            (kind == PythonDirectScopeBindingKind::ClassDeclaration).then_some(name)
+        })
+        .collect();
+    Ok(ProcedureEnumeration::Complete {
+        specs,
+        class_names,
+        // Procedure lowering accounts retained locator identity. Seed only the
+        // one-time file inventory to avoid charging that identity twice.
+        work: traversal_work,
+    })
 }
 
 fn declaration_container_kind(node: Node<'_>) -> Option<DeclarationSegmentKind> {
@@ -458,15 +612,24 @@ impl<'tree> CleanupBody<'tree> {
 }
 
 struct LoweringContext<'tree, 'targets> {
+    prepared: &'tree PreparedSyntaxTree,
+    callable: Node<'tree>,
     session: ProcedureLoweringSession<'targets>,
+    expression_values: HashMap<usize, ValueId>,
+    parameters: HashMap<Box<str>, ValueId>,
+    locals: HashMap<Box<str>, ValueId>,
+    receiver: Option<ValueId>,
+    class_names: &'targets HashSet<Box<str>>,
+    bindings: PythonLexicalScopeInventory<'tree>,
     cleanups: Vec<CleanupRegion<'tree>>,
 }
 
-fn lower_procedure<'tree>(
+fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
+    class_names: &'targets HashSet<Box<str>>,
     budget: &SemanticBudget,
-    cancellation: &CancellationToken,
+    cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), PythonLoweringError> {
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
@@ -485,10 +648,26 @@ fn lower_procedure<'tree>(
         exceptional_exit,
         function_scope,
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
+    let bindings = collect_semantic_binding_inventory(
+        spec.callable,
+        prepared.source(),
+        &mut builder,
+        cancellation,
+    )?;
     let mut context = LoweringContext {
+        prepared,
+        callable: spec.callable,
         session,
+        expression_values: HashMap::default(),
+        parameters: HashMap::default(),
+        locals: HashMap::default(),
+        receiver: None,
+        class_names,
+        bindings,
         cleanups: Vec::new(),
     };
+    context.emit_procedure_inputs(&mut builder, spec)?;
+    context.emit_local_bindings(&mut builder)?;
 
     if spec.properties.is_async {
         context.add_gap(
@@ -510,6 +689,16 @@ fn lower_procedure<'tree>(
             "generator construction, suspension, and resumption are not fully modeled",
         )?;
     }
+    if spec.lexical_parent.is_some() {
+        context.add_gap(
+            &mut builder,
+            entry,
+            SemanticGapSubject::Procedure,
+            SemanticCapability::Captures,
+            SemanticGapKind::Unsupported,
+            "lexical captures by nested Python callables are not yet modeled",
+        )?;
+    }
 
     let body_entry = context.point(&mut builder, spec.body, Vec::new())?;
     let body_work = if spec.body.kind() == "block" {
@@ -529,6 +718,17 @@ fn lower_procedure<'tree>(
     } else {
         let implicit_return = context.point(&mut builder, spec.body, Vec::new())?;
         let value = context.value(&mut builder, implicit_return, SemanticValueKind::Return)?;
+        let source =
+            context.expression_value(&mut builder, spec.body, expression_value_kind(spec.body))?;
+        context.append_effect(
+            &mut builder,
+            implicit_return,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Return,
+                source,
+                target: value,
+            },
+        )?;
         context.append_effect(
             &mut builder,
             implicit_return,
@@ -592,11 +792,260 @@ fn lower_procedure<'tree>(
         .map_err(|error| PythonLoweringError::Budget(error, Box::new(work_before_freeze)))
 }
 
+fn collect_semantic_binding_inventory<'tree>(
+    callable: Node<'tree>,
+    source: &str,
+    builder: &mut ProcedureCfgBuilder,
+    cancellation: &CancellationToken,
+) -> Result<PythonLexicalScopeInventory<'tree>, PythonLoweringError> {
+    let mut stop = None;
+    let inventory = PythonLexicalScopeInventory::collect_bounded(callable, source, || {
+        match charge_python_binding_step(builder, cancellation) {
+            Ok(()) => true,
+            Err(error) => {
+                stop = Some(error);
+                false
+            }
+        }
+    });
+    if let Some(error) = stop {
+        return Err(error);
+    }
+    inventory.ok_or_else(|| {
+        PythonLoweringError::Invalid("Python callable binding inventory was unavailable".into())
+    })
+}
+
+fn charge_python_binding_step(
+    builder: &mut ProcedureCfgBuilder,
+    cancellation: &CancellationToken,
+) -> Result<(), PythonLoweringError> {
+    if cancellation.is_cancelled() {
+        return Err(PythonLoweringError::Cancelled(Box::new(
+            builder.prospective_work(),
+        )));
+    }
+    let candidate = sum_lowering_work(
+        builder.prospective_work(),
+        SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        },
+    );
+    builder
+        .descend_nested_entry()
+        .map_err(|exceeded| PythonLoweringError::Budget(exceeded, Box::new(candidate)))
+}
+
 fn callable_returns_value(_source: &str, spec: &ProcedureSpec<'_>) -> bool {
     spec.kind == ProcedureKind::Lambda
 }
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
+    fn emit_procedure_inputs(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        spec: &ProcedureSpec<'tree>,
+    ) -> Result<(), PythonLoweringError> {
+        let declaration_range = node_range(spec.callable);
+        let layout = formal_parameter_slots_for_owner(
+            Language::Python,
+            spec.callable,
+            self.prepared.source(),
+            &declaration_range,
+        )
+        .unwrap_or_default();
+        let first_slot_is_receiver = spec.kind == ProcedureKind::Method
+            && !matches!(layout.python_binding, Some(PythonMethodBinding::Static));
+        let mut ordinal = 0_u32;
+        for (slot_index, slot) in layout.slots.into_iter().enumerate() {
+            if self.session.cancellation().is_cancelled() {
+                return Err(PythonLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            let declaration = spec
+                .callable
+                .named_descendant_for_byte_range(
+                    slot.declaration_range.start_byte,
+                    slot.declaration_range.end_byte,
+                )
+                .unwrap_or(spec.callable);
+            let mapping_node = slot
+                .names
+                .iter()
+                .find_map(|name| {
+                    python_binding_name_node(declaration, self.prepared.source(), name)
+                })
+                .unwrap_or(declaration);
+            let metadata = self.value_mapping(builder, mapping_node)?;
+            let receiver = first_slot_is_receiver && slot_index == 0;
+            let value = if receiver {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Receiver,
+                )?;
+                self.receiver = Some(value);
+                value
+            } else {
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Parameter {
+                        ordinal,
+                        multiplicity: formal_multiplicity(slot.variadic),
+                    },
+                )?;
+                ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    PythonLoweringError::Invalid("too many Python formal parameters".into())
+                })?;
+                value
+            };
+            for name in slot.names {
+                self.parameters.insert(name.into_boxed_str(), value);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_local_bindings(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+    ) -> Result<(), PythonLoweringError> {
+        let bindings = self
+            .bindings
+            .local_bindings()
+            .map(|(name, declaration)| (Box::<str>::from(name), declaration))
+            .collect::<Vec<_>>();
+        for (name, declaration) in bindings {
+            if self.session.cancellation().is_cancelled() {
+                return Err(PythonLoweringError::Cancelled(Box::new(
+                    builder.prospective_work(),
+                )));
+            }
+            if self.parameters.contains_key(name.as_ref())
+                || self.locals.contains_key(name.as_ref())
+            {
+                continue;
+            }
+            let metadata = self.value_mapping(builder, declaration)?;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Local,
+            )?;
+            self.locals.insert(name, value);
+        }
+        Ok(())
+    }
+
+    fn binding_value(&self, name: &str) -> Option<ValueId> {
+        self.locals
+            .get(name)
+            .copied()
+            .or_else(|| self.parameters.get(name).copied())
+    }
+
+    fn module_class_fallback_allowed(
+        &self,
+        builder: &mut ProcedureCfgBuilder,
+        reference: Node<'tree>,
+    ) -> Result<bool, PythonLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), reference) else {
+            return Ok(false);
+        };
+        if self.binding_value(name).is_some() || !self.class_names.contains(name) {
+            return Ok(false);
+        }
+        match self.bindings.name_resolution_at(name, reference) {
+            PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal => {
+                return Ok(false);
+            }
+            PythonLexicalNameResolution::Global => return Ok(true),
+            PythonLexicalNameResolution::Unbound => {}
+        }
+
+        let reference_start = reference.start_byte();
+        let reference_end = reference.end_byte();
+        let mut current = self.callable;
+        while let Some(parent) = current.parent() {
+            charge_python_binding_step(builder, self.session.cancellation())?;
+            if matches!(parent.kind(), "function_definition" | "lambda")
+                && parent.child_by_field_name("body").is_some_and(|body| {
+                    body.start_byte() <= reference_start && reference_end <= body.end_byte()
+                })
+            {
+                let inventory = collect_semantic_binding_inventory(
+                    parent,
+                    self.prepared.source(),
+                    builder,
+                    self.session.cancellation(),
+                )?;
+                match inventory.name_resolution_at(name, reference) {
+                    PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal => {
+                        return Ok(false);
+                    }
+                    PythonLexicalNameResolution::Global => return Ok(true),
+                    PythonLexicalNameResolution::Unbound => {}
+                }
+            }
+            current = parent;
+        }
+        Ok(true)
+    }
+
+    fn expression_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        kind: SemanticValueKind,
+    ) -> Result<ValueId, PythonLoweringError> {
+        if let Some(value) = self.expression_values.get(&node.id()) {
+            return Ok(*value);
+        }
+        let metadata = self.value_mapping(builder, node)?;
+        let value = self
+            .session
+            .add_value_with_metadata(builder, metadata, kind)?;
+        self.expression_values.insert(node.id(), value);
+        Ok(value)
+    }
+
+    fn emit_lexical_input_flow(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        target: ValueId,
+    ) -> Result<(), PythonLoweringError> {
+        let Some(name) = node_text(self.prepared.source(), node) else {
+            return Ok(());
+        };
+        let Some(source) = self.binding_value(name) else {
+            return Ok(());
+        };
+        let kind = if Some(source) == self.receiver {
+            ValueFlowKind::Receiver
+        } else if self.locals.get(name) == Some(&source) {
+            ValueFlowKind::Local
+        } else {
+            ValueFlowKind::Parameter
+        };
+        if source != target {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::ValueFlow {
+                    kind,
+                    source,
+                    target,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn step(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -809,6 +1258,31 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let value = (!values.is_empty())
                     .then(|| self.value(builder, terminal, SemanticValueKind::Return))
                     .transpose()?;
+                if let ([source_node], Some(target)) = (values.as_slice(), value) {
+                    let source = self.expression_value(
+                        builder,
+                        *source_node,
+                        expression_value_kind(*source_node),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Return,
+                            source,
+                            target,
+                        },
+                    )?;
+                } else if values.len() > 1 {
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::ReturnFlow,
+                        SemanticGapKind::Unsupported,
+                        "Python tuple return identity is not decomposed into independent values",
+                    )?;
+                }
                 self.append_effect(builder, terminal, SemanticEffect::ProcedureReturn { value })?;
                 self.abrupt(
                     builder,
@@ -1053,6 +1527,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PythonLoweringError> {
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        if node.kind() == "identifier" {
+            self.emit_lexical_input_flow(builder, node, entry, result)?;
+        }
         match node.kind() {
             "call" => self.call_expression(builder, node, entry, next, scope, stack),
             "lambda" => self.callable_expression(builder, node, entry, next),
@@ -1133,10 +1611,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "parenthesized_expression" => {
                 if let Some(value) = first_runtime_named_child(node) {
+                    let terminal = self.point(builder, node, Vec::new())?;
+                    let source =
+                        self.expression_value(builder, value, expression_value_kind(value))?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: source,
+                        },
+                    )?;
+                    self.edge(builder, terminal, next)?;
                     stack.push(Work::Expression {
                         node: value,
                         entry,
-                        next,
+                        next: EdgeTarget::normal(terminal),
                         scope,
                     });
                     Ok(())
@@ -1148,11 +1638,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.comparison_expression(builder, node, entry, next, scope, stack)
             }
             "attribute" | "subscript" => {
-                self.implicit_exception_gap(builder, entry, node)?;
                 self.add_gap(
                     builder,
                     entry,
-                    SemanticGapSubject::Point,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unsupported,
+                    implicit_exception_detail(node),
+                )?;
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::Value(result),
                     SemanticCapability::Calls,
                     SemanticGapKind::Unknown,
                     "descriptor or special-method invocation requires type refinement",
@@ -1161,22 +1658,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
             "list_comprehension" | "set_comprehension" | "dictionary_comprehension" => {
+                self.session
+                    .add_allocation(builder, entry, result, AllocationKind::Object)?;
                 self.comprehension_expression(builder, node, entry, None, scope, stack)
             }
             "generator_expression" => {
+                self.session
+                    .add_allocation(builder, entry, result, AllocationKind::Object)?;
                 self.comprehension_expression(builder, node, entry, Some(next), scope, stack)
             }
-            "assignment"
-            | "augmented_assignment"
-            | "named_expression"
+            "assignment" | "named_expression" => {
+                self.assignment_expression(builder, node, entry, next, scope, stack)
+            }
+            "list" | "set" | "dictionary" => {
+                self.session
+                    .add_allocation(builder, entry, result, AllocationKind::Object)?;
+                let children = runtime_expression_children(node);
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "tuple" => {
+                self.session
+                    .add_allocation(builder, entry, result, AllocationKind::Array)?;
+                let children = runtime_expression_children(node);
+                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            "augmented_assignment"
             | "binary_operator"
             | "unary_operator"
             | "not_operator"
             | "expression_list"
-            | "list"
-            | "set"
-            | "tuple"
-            | "dictionary"
             | "pair"
             | "slice"
             | "argument_list"
@@ -1207,6 +1717,115 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             kind if is_runtime_leaf(kind) => self.edge(builder, entry, next),
             _ => self.unhandled_control_syntax(builder, node, entry, next),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assignment_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), PythonLoweringError> {
+        let (binding, source_node) = if node.kind() == "named_expression" {
+            (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("value"),
+            )
+        } else {
+            (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("right"),
+            )
+        };
+        let boundary = self.point(builder, node, Vec::new())?;
+        match (binding, source_node) {
+            (Some(binding), Some(source_node)) if binding.kind() == "identifier" => {
+                let name = node_text(self.prepared.source(), binding).ok_or_else(|| {
+                    PythonLoweringError::Invalid(
+                        "Python assignment has an invalid identifier range".into(),
+                    )
+                })?;
+                if let Some(target) = self.binding_value(name) {
+                    let source = self.expression_value(
+                        builder,
+                        source_node,
+                        expression_value_kind(source_node),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::Assignment {
+                            target,
+                            value: source,
+                        },
+                    )?;
+                    let kind = if Some(target) == self.receiver {
+                        ValueFlowKind::Receiver
+                    } else if self.locals.get(name) == Some(&target) {
+                        ValueFlowKind::Local
+                    } else {
+                        ValueFlowKind::Parameter
+                    };
+                    self.append_effect(
+                        builder,
+                        boundary,
+                        SemanticEffect::ValueFlow {
+                            kind,
+                            source,
+                            target,
+                        },
+                    )?;
+                    if node.kind() == "named_expression" {
+                        let result =
+                            self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+                        self.append_effect(
+                            builder,
+                            boundary,
+                            SemanticEffect::Assignment {
+                                target: result,
+                                value: source,
+                            },
+                        )?;
+                    }
+                }
+            }
+            (Some(_), Some(_)) => {
+                self.add_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unsupported,
+                    "Python unpacking, attribute, and item assignment identity is not yet lowered",
+                )?;
+            }
+            _ => {
+                self.add_gap(
+                    builder,
+                    boundary,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unknown,
+                    "Python assignment is missing a structured binding or value",
+                )?;
+            }
+        }
+        if operation_can_throw_implicitly(node) {
+            self.implicit_exception_gap(builder, boundary, node)?;
+        }
+        self.edge(builder, boundary, next)?;
+        let children = runtime_expression_children(node);
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(boundary),
+            scope,
+            stack,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2080,13 +2699,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let invoke = self.point(builder, node, Vec::new())?;
         let normal = self.point(builder, node, Vec::new())?;
         let exceptional = self.point(builder, node, Vec::new())?;
-        let callee = self.value(builder, invoke, SemanticValueKind::Callable)?;
-        let result = self.value(builder, invoke, SemanticValueKind::Temporary)?;
-        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
         let function = required_field(node, "function")?;
+        let callee = self.expression_value(builder, function, SemanticValueKind::Callable)?;
+        let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
+        let thrown = self.value(builder, invoke, SemanticValueKind::Exception)?;
         let receiver_node = python_call_receiver(function);
         let receiver = receiver_node
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Receiver))
+            .map(|receiver| {
+                self.expression_value(builder, receiver, expression_value_kind(receiver))
+            })
             .transpose()?;
         let callable_kind = if receiver.is_some() {
             CallableReferenceKind::BoundMethod
@@ -2113,15 +2734,41 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let arguments = call_arguments(node);
         let argument_values = arguments
             .iter()
-            .map(|_| self.value(builder, invoke, SemanticValueKind::Temporary))
+            .map(
+                |argument| -> Result<SemanticCallArgument, PythonLoweringError> {
+                    let value_node = python_argument_value_node(*argument);
+                    let value = self.expression_value(
+                        builder,
+                        value_node,
+                        expression_value_kind(value_node),
+                    )?;
+                    let expansion = match argument.kind() {
+                        "list_splat" => CallArgumentExpansion::Spread(ArgumentDomain::Positional),
+                        "dictionary_splat" => {
+                            CallArgumentExpansion::Spread(ArgumentDomain::Keyword)
+                        }
+                        "keyword_argument" => {
+                            CallArgumentExpansion::Direct(ArgumentDomain::Keyword)
+                        }
+                        _ => CallArgumentExpansion::Direct(ArgumentDomain::Positional),
+                    };
+                    Ok(SemanticCallArgument { value, expansion })
+                },
+            )
             .collect::<Result<Vec<_>, _>>()?;
+        if function.kind() == "identifier"
+            && self.module_class_fallback_allowed(builder, function)?
+        {
+            self.session
+                .add_allocation(builder, invoke, result, AllocationKind::Object)?;
+        }
         let call_site = self.session.add_call_site(
             builder,
             CallSiteScaffold {
                 point: invoke,
                 callee,
                 receiver,
-                arguments: argument_values.into_iter().map(Into::into).collect(),
+                arguments: argument_values.into_boxed_slice(),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -2297,22 +2944,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         node: Node<'tree>,
     ) -> Result<(), PythonLoweringError> {
-        let detail = match node.kind() {
-            "attribute" => {
-                "attribute lookup, descriptor execution, and missing-attribute failures are not lowered"
-            }
-            "subscript" => {
-                "subscription special-method, key, index, and bounds failures are not lowered"
-            }
-            _ => "implicit exceptions from Python runtime operations are not lowered",
-        };
         self.add_gap(
             builder,
             point,
             SemanticGapSubject::Point,
             SemanticCapability::ExceptionalControlFlow,
             SemanticGapKind::Unsupported,
-            detail,
+            implicit_exception_detail(node),
         )
     }
 
@@ -2571,6 +3209,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
     }
 
+    fn value_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, PythonLoweringError> {
+        let anchor = source_anchor(node, 0).map_err(PythonLoweringError::Invalid)?;
+        self.session
+            .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
     fn metadata(&self, point: ProgramPointId) -> Result<PointMetadata, PythonLoweringError> {
         self.session.metadata(point)
     }
@@ -2629,6 +3277,42 @@ fn context_manager_expression(item: Node<'_>) -> Result<Node<'_>, PythonLowering
         .into_iter()
         .find(|child| alias.is_none_or(|alias| alias.id() != child.id()))
         .ok_or_else(|| missing_field(value, "context expression"))
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    }
+}
+
+fn python_binding_name_node<'tree>(
+    root: Node<'tree>,
+    source: &str,
+    expected: &str,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && node_text(source, node) == Some(expected) {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    None
+}
+
+fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
+    match node.kind() {
+        "lambda" => SemanticValueKind::Callable,
+        "integer" | "float" | "true" | "false" | "none" | "ellipsis" | "string" => {
+            SemanticValueKind::Constant
+        }
+        _ => SemanticValueKind::Temporary,
+    }
 }
 
 fn runtime_expression_children(node: Node<'_>) -> Vec<Node<'_>> {
@@ -2865,6 +3549,16 @@ fn call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
     }
 }
 
+fn python_argument_value_node(argument: Node<'_>) -> Node<'_> {
+    match argument.kind() {
+        "keyword_argument" => argument.child_by_field_name("value").unwrap_or(argument),
+        "list_splat" | "dictionary_splat" => {
+            first_runtime_named_child(argument).unwrap_or(argument)
+        }
+        _ => argument,
+    }
+}
+
 fn call_function_requires_evaluation(function: Node<'_>) -> bool {
     function.kind() != "identifier"
 }
@@ -2914,6 +3608,18 @@ fn missing_field(node: Node<'_>, field: &str) -> PythonLoweringError {
         node.start_byte(),
         node.end_byte()
     ))
+}
+
+fn implicit_exception_detail(node: Node<'_>) -> &'static str {
+    match node.kind() {
+        "attribute" => {
+            "attribute lookup, descriptor execution, and missing-attribute failures are not lowered"
+        }
+        "subscript" => {
+            "subscription special-method, key, index, and bounds failures are not lowered"
+        }
+        _ => "implicit exceptions from Python runtime operations are not lowered",
+    }
 }
 
 fn operation_can_throw_implicitly(node: Node<'_>) -> bool {

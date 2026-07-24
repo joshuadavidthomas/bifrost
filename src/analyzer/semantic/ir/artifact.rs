@@ -1,9 +1,10 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::mem::size_of;
 use std::sync::Arc;
 
 use crate::compact_graph::CompactRows;
-use crate::hash::HashMap;
+use crate::hash::{HashMap, HashSet};
 
 use super::super::capabilities::SemanticCapabilities;
 use super::super::ids::{
@@ -437,6 +438,8 @@ pub struct ProcedureSemantics {
     memory_locations: Box<[MemoryLocation]>,
     captures: Box<[CaptureBinding]>,
     call_sites: Box<[SemanticCallSite]>,
+    call_phase_points: CallPhasePointIndex,
+    call_result_sites: CallResultSiteIndex,
     source_mappings: Box<[SourceMapping]>,
     evidence_rows: Box<[Evidence]>,
     gaps: Box<[SemanticGap]>,
@@ -457,6 +460,7 @@ impl ProcedureSemantics {
     ) -> Result<Self, SemanticIrError> {
         let cfg =
             ControlFlowGraph::try_from_edges(parts.id, parts.points.len(), parts.control_edges)?;
+        let (call_phase_points, call_result_sites) = index_call_phases(&parts.call_sites);
         Ok(Self {
             id: parts.id,
             locator: parts.locator,
@@ -470,6 +474,8 @@ impl ProcedureSemantics {
             memory_locations: parts.memory_locations.into_boxed_slice(),
             captures: parts.captures.into_boxed_slice(),
             call_sites: parts.call_sites.into_boxed_slice(),
+            call_phase_points,
+            call_result_sites,
             source_mappings: parts.source_mappings.into_boxed_slice(),
             evidence_rows: parts.evidence_rows.into_boxed_slice(),
             gaps: parts.gaps.into_boxed_slice(),
@@ -528,6 +534,30 @@ impl ProcedureSemantics {
 
     pub fn call_sites(&self) -> &[SemanticCallSite] {
         &self.call_sites
+    }
+
+    /// Sorted call-phase points for logarithmic exact-membership checks.
+    pub(crate) fn call_phase_points(&self, value: ValueId) -> Option<&[ProgramPointId]> {
+        self.call_phase_points.get(&value).map(Box::as_ref)
+    }
+
+    pub(crate) fn call_result_site_ids(
+        &self,
+        value: ValueId,
+        normal_point: ProgramPointId,
+    ) -> Option<&[CallSiteId]> {
+        self.call_result_sites
+            .get(&(value, normal_point))
+            .map(Box::as_ref)
+    }
+
+    /// Conservatively estimate heap storage retained by the derived call-phase
+    /// indexes. The `HashMap` headers are inline in `ProcedureSemantics` and
+    /// therefore covered by its row size; this accounts for retained bucket
+    /// capacity, boxed-slice payloads, and allocator/control metadata.
+    pub(crate) fn call_indexes_retained_bytes(&self) -> u64 {
+        boxed_slice_index_retained_bytes(&self.call_phase_points)
+            .saturating_add(boxed_slice_index_retained_bytes(&self.call_result_sites))
     }
 
     pub fn source_mappings(&self) -> &[SourceMapping] {
@@ -628,6 +658,64 @@ impl ProcedureSemantics {
     pub fn point(&self, id: ProgramPointId) -> Option<&ProgramPoint> {
         self.points.get(id.index())
     }
+}
+
+type CallPhasePointIndex = HashMap<ValueId, Box<[ProgramPointId]>>;
+type CallResultSiteIndex = HashMap<(ValueId, ProgramPointId), Box<[CallSiteId]>>;
+
+fn index_call_phases(
+    call_sites: &[SemanticCallSite],
+) -> (CallPhasePointIndex, CallResultSiteIndex) {
+    let mut indexed = HashMap::<ValueId, Vec<ProgramPointId>>::default();
+    let mut indexed_pairs = HashSet::default();
+    let mut result_sites = HashMap::<(ValueId, ProgramPointId), Vec<CallSiteId>>::default();
+    let mut push = |value, point| {
+        if indexed_pairs.insert((value, point)) {
+            indexed.entry(value).or_default().push(point);
+        }
+    };
+    for call in call_sites {
+        push(call.callee, call.point);
+        if let (Some(result), Some(point)) = (call.result, call.normal_continuation.target()) {
+            push(result, point);
+            result_sites
+                .entry((result, point))
+                .or_default()
+                .push(call.id);
+        }
+        if let (Some(thrown), Some(point)) = (call.thrown, call.exceptional_continuation.target()) {
+            push(thrown, point);
+        }
+    }
+    let phase_points = indexed
+        .into_iter()
+        .map(|(value, mut points)| {
+            points.sort_unstable();
+            (value, points.into_boxed_slice())
+        })
+        .collect();
+    let result_sites = result_sites
+        .into_iter()
+        .map(|(site, calls)| (site, calls.into_boxed_slice()))
+        .collect();
+    (phase_points, result_sites)
+}
+
+fn boxed_slice_index_retained_bytes<K, V>(index: &HashMap<K, Box<[V]>>) -> u64 {
+    fn rows(count: usize, row_size: usize) -> u64 {
+        (count as u64).saturating_mul(row_size as u64)
+    }
+
+    let bucket_size = size_of::<K>()
+        .saturating_add(size_of::<Box<[V]>>())
+        .saturating_add(size_of::<usize>().saturating_mul(2));
+    index
+        .values()
+        .fold(rows(index.capacity(), bucket_size), |retained, payload| {
+            retained
+                .saturating_add(rows(payload.len(), size_of::<V>()))
+                .saturating_add((size_of::<usize>().saturating_mul(2)) as u64)
+        })
 }
 
 /// One immutable interpretation of one mounted source snapshot.
@@ -874,3 +962,55 @@ pub type CaptureHandle = ProcedureLocalHandle<CaptureId>;
 pub type SourceMappingHandle = ProcedureLocalHandle<SourceMappingId>;
 pub type EvidenceHandle = ProcedureLocalHandle<EvidenceId>;
 pub type SemanticGapHandle = ProcedureLocalHandle<SemanticGapId>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call_with_shared_result(id: u32) -> SemanticCallSite {
+        SemanticCallSite {
+            id: CallSiteId::new(id),
+            point: ProgramPointId::new(id),
+            callee: ValueId::new(id),
+            receiver: None,
+            arguments: Box::new([]),
+            result: Some(ValueId::new(7)),
+            thrown: None,
+            declared_targets: CallableTargetResolution::Unknown,
+            target_evidence: EvidenceId::new(0),
+            normal_continuation: ControlContinuation::Target(ProgramPointId::new(11)),
+            exceptional_continuation: ControlContinuation::Absent,
+            source: SourceMappingId::new(0),
+            evidence: EvidenceId::new(0),
+        }
+    }
+
+    #[test]
+    fn call_result_index_retains_every_call_at_a_shared_value_and_point() {
+        let calls = [call_with_shared_result(0), call_with_shared_result(1)];
+
+        let (_, result_sites) = index_call_phases(&calls);
+
+        assert_eq!(
+            result_sites
+                .get(&(ValueId::new(7), ProgramPointId::new(11)))
+                .map(Box::as_ref),
+            Some([CallSiteId::new(0), CallSiteId::new(1)].as_slice())
+        );
+    }
+
+    #[test]
+    fn call_phase_index_sorts_shared_value_points_for_bounded_membership() {
+        let mut later = call_with_shared_result(12);
+        later.callee = ValueId::new(9);
+        let mut earlier = call_with_shared_result(3);
+        earlier.callee = ValueId::new(9);
+
+        let (phase_points, _) = index_call_phases(&[later, earlier]);
+
+        assert_eq!(
+            phase_points.get(&ValueId::new(9)).map(Box::as_ref),
+            Some([ProgramPointId::new(3), ProgramPointId::new(12)].as_slice())
+        );
+    }
+}

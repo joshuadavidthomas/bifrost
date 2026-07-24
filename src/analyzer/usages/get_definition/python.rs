@@ -1,10 +1,1141 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
+use crate::analyzer::lexical_definitions::{
+    PythonMethodBinding, formal_parameter_slots_for_owner_bounded,
+};
+use crate::analyzer::python::bindings::{
+    PythonLexicalNameResolution, PythonLexicalScopeInventory,
+    python_unambiguous_module_class_binding_bounded,
+};
+use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const PYTHON_RECEIVER_TYPE_CACHE_LIMIT: usize = 512;
+
+pub(crate) struct PythonDefinitionProvider<'a> {
+    python: &'a PythonAnalyzer,
+    session: &'a ResolutionSession,
+}
+
+impl<'a> PythonDefinitionProvider<'a> {
+    pub(crate) fn new(python: &'a PythonAnalyzer, session: &'a ResolutionSession) -> Self {
+        Self { python, session }
+    }
+
+    pub(crate) fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut units = self.session.query_limited_rows(|limit| {
+            self.python
+                .declaration_candidates_by_fqn_limited(fqn, limit, || {
+                    self.session.observe_cancellation()
+                })
+        });
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    pub(crate) fn identifier(&self, identifier: &str) -> Vec<CodeUnit> {
+        let mut units = self.session.query_limited_rows(|limit| {
+            self.python
+                .declaration_candidates_by_identifier_limited(identifier, limit, || {
+                    self.session.observe_cancellation()
+                })
+        });
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    pub(crate) fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        self.identifier(identifier)
+            .into_iter()
+            .filter(|unit| unit.source() == file)
+            .collect()
+    }
+
+    pub(crate) fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
+        let mut units = self.session.query_limited_rows(|limit| {
+            self.python
+                .member_candidates_for_owner_limited(owner_fqn, name, limit, || {
+                    self.session.observe_cancellation()
+                })
+        });
+        sort_units(&mut units);
+        units.dedup();
+        units
+    }
+
+    pub(crate) fn ranges(&self, unit: &CodeUnit) -> Vec<Range> {
+        self.session
+            .query_limited_rows(|limit| self.python.ranges_limited(unit, limit))
+    }
+
+    fn scope_step(&self) -> bool {
+        self.session.scope_step()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PythonTypeLookupResolution {
+    pub(crate) unit: CodeUnit,
+    pub(crate) target_kind: TypeLookupTargetKind,
+}
+
+pub(crate) fn resolve_python_bounded(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(python) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
+        return session.finish(no_definition(
+            "python_analyzer_unavailable",
+            "Python analyzer is unavailable",
+        ));
+    };
+    let Some(tree) = tree else {
+        return session.finish(no_definition(
+            "python_parse_failed",
+            "Python source could not be parsed",
+        ));
+    };
+    let support = PythonDefinitionProvider::new(python, &session);
+    let Some(node) = python_smallest_named_node_covering_bounded(
+        &support,
+        tree.root_node(),
+        site.focus_start_byte,
+        site.focus_end_byte,
+    ) else {
+        return session.finish(no_definition(
+            "no_indexed_definition",
+            format!(
+                "`{}` did not resolve to an indexed Python definition",
+                site.text
+            ),
+        ));
+    };
+    let outcome = match python_reference_node_bounded(&support, node) {
+        Some(PythonReferenceNode::Attribute { object, attribute }) => {
+            let member = python_slice(attribute, source);
+            let receiver = python_type_for_expression_bounded(
+                &support,
+                file,
+                source,
+                tree.root_node(),
+                object,
+                0,
+            );
+            match receiver {
+                Some(receiver) if !member.is_empty() => {
+                    let candidates = support.members_for_owner_name(&receiver.fq_name(), member);
+                    if candidates.is_empty() {
+                        no_definition(
+                            "no_indexed_definition",
+                            format!(
+                                "`{}.{member}` is not indexed as a Python definition",
+                                receiver.fq_name()
+                            ),
+                        )
+                    } else {
+                        candidates_outcome(candidates)
+                    }
+                }
+                _ => no_definition(
+                    "python_dynamic_receiver",
+                    format!(
+                        "`{}` has no structurally proven Python receiver type",
+                        site.text
+                    ),
+                ),
+            }
+        }
+        Some(PythonReferenceNode::Identifier(identifier)) => {
+            let name = python_slice(identifier, source);
+            let candidates = support.file_identifier(file, name);
+            if candidates.is_empty() {
+                no_definition(
+                    "no_indexed_definition",
+                    format!("`{name}` did not resolve to an indexed Python definition"),
+                )
+            } else {
+                candidates_outcome(candidates)
+            }
+        }
+        Some(PythonReferenceNode::KeywordArgument { .. }) | None => no_definition(
+            "python_reference_shape_unsupported",
+            format!(
+                "`{}` is not a supported bounded Python reference shape",
+                site.text
+            ),
+        ),
+    };
+    session.finish(outcome)
+}
+
+pub(crate) fn python_type_lookup_resolution_bounded(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> Option<PythonTypeLookupResolution> {
+    let node = python_smallest_named_node_covering_bounded(
+        support,
+        root,
+        site.focus_start_byte,
+        site.focus_end_byte,
+    )?;
+    let target_kind = if node.kind() == "identifier"
+        && !python_has_lexical_binding_bounded(support, node, source)
+        && python_class_candidate_for_name(support, file, source, node, python_slice(node, source))
+            .is_some()
+    {
+        TypeLookupTargetKind::TypeReference
+    } else {
+        TypeLookupTargetKind::ValueExpression
+    };
+    let unit = python_type_for_expression_bounded(support, file, source, root, node, 0)?;
+    Some(PythonTypeLookupResolution { unit, target_kind })
+}
+
+fn python_smallest_named_node_covering_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    mut node: Node<'tree>,
+    start: usize,
+    end: usize,
+) -> Option<Node<'tree>> {
+    if !support.scope_step() || node.end_byte() < end || node.start_byte() > start {
+        return None;
+    }
+    loop {
+        let mut cursor = node.walk();
+        let mut containing = None;
+        for child in node.named_children(&mut cursor) {
+            if !support.scope_step() {
+                return None;
+            }
+            if child.start_byte() <= start && child.end_byte() >= end {
+                containing = Some(child);
+                break;
+            }
+        }
+        match containing {
+            Some(child) => node = child,
+            None => return Some(node),
+        }
+    }
+}
+
+fn python_named_children_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    node: Node<'tree>,
+) -> Option<Vec<Node<'tree>>> {
+    let mut children = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if !support.scope_step() {
+            return None;
+        }
+        children.push(child);
+    }
+    Some(children)
+}
+
+fn python_keyword_argument_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    node: Node<'tree>,
+) -> Option<PythonReferenceNode<'tree>> {
+    if !support.scope_step() || node.kind() != "identifier" {
+        return None;
+    }
+    let kwarg = node.parent()?;
+    if !support.scope_step()
+        || kwarg.kind() != "keyword_argument"
+        || kwarg.child_by_field_name("name") != Some(node)
+    {
+        return None;
+    }
+    let arguments = kwarg.parent()?;
+    if !support.scope_step() || arguments.kind() != "argument_list" {
+        return None;
+    }
+    let call = arguments.parent()?;
+    if !support.scope_step() || call.kind() != "call" {
+        return None;
+    }
+    Some(PythonReferenceNode::KeywordArgument { call, name: node })
+}
+
+fn python_reference_node_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    node: Node<'tree>,
+) -> Option<PythonReferenceNode<'tree>> {
+    if let Some(keyword) = python_keyword_argument_bounded(support, node) {
+        return Some(keyword);
+    }
+    if !support.scope_step() {
+        return None;
+    }
+    let original = node;
+    let mut node = node;
+    while let Some(parent) = node.parent() {
+        if !support.scope_step() {
+            return None;
+        }
+        if parent.kind() != "attribute" {
+            break;
+        }
+        if parent.child_by_field_name("attribute") == Some(node)
+            || parent.child_by_field_name("attribute") == Some(original)
+        {
+            node = parent;
+        } else {
+            break;
+        }
+    }
+    match node.kind() {
+        "attribute" => {
+            let object = node.child_by_field_name("object")?;
+            let attribute = node.child_by_field_name("attribute")?;
+            Some(PythonReferenceNode::Attribute { object, attribute })
+        }
+        "identifier" => Some(PythonReferenceNode::Identifier(node)),
+        _ => None,
+    }
+}
+
+fn node_range(node: Node<'_>) -> Range {
+    Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    }
+}
+
+fn python_type_for_expression_bounded(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+    depth: usize,
+) -> Option<CodeUnit> {
+    if depth >= 12 || !support.scope_step() {
+        return None;
+    }
+    match node.kind() {
+        "identifier" => {
+            let name = python_slice(node, source);
+            if let Some(receiver) = python_current_receiver_class(support, file, source, node, name)
+            {
+                Some(receiver)
+            } else if python_has_lexical_binding_bounded(support, node, source) {
+                python_bound_type_for_identifier(support, file, source, root, node, name, depth + 1)
+            } else {
+                python_class_candidate_for_name(support, file, source, node, name)
+            }
+        }
+        "call" => {
+            let function = node.child_by_field_name("function")?;
+            let callable = match function.kind() {
+                "identifier" => {
+                    let name = python_slice(function, source);
+                    let lexical_binding = python_lexical_binding_bounded(support, function, source);
+                    match lexical_binding {
+                        PythonLexicalBinding::Other => return None,
+                        PythonLexicalBinding::LocalFunction(declaration) => {
+                            return python_function_return_type_from_node_bounded(
+                                support,
+                                file,
+                                source,
+                                root,
+                                declaration,
+                                depth + 1,
+                            );
+                        }
+                        PythonLexicalBinding::UnboundOrGlobal => {
+                            if let Some(class) = python_class_candidate_for_name(
+                                support, file, source, function, name,
+                            ) {
+                                return Some(class);
+                            }
+                        }
+                    }
+                    unique_python_candidate(
+                        support
+                            .file_identifier(file, name)
+                            .into_iter()
+                            .filter(CodeUnit::is_function)
+                            .filter(|candidate| {
+                                python_same_file_function_visible_at(
+                                    support, source, function, candidate,
+                                )
+                                .unwrap_or(false)
+                            })
+                            .collect(),
+                    )
+                }
+                "attribute" => {
+                    let object = function.child_by_field_name("object")?;
+                    let member = python_slice(function.child_by_field_name("attribute")?, source);
+                    let receiver = python_type_for_expression_bounded(
+                        support,
+                        file,
+                        source,
+                        root,
+                        object,
+                        depth + 1,
+                    )?;
+                    unique_python_candidate(
+                        support
+                            .members_for_owner_name(&receiver.fq_name(), member)
+                            .into_iter()
+                            .filter(CodeUnit::is_function)
+                            .collect(),
+                    )
+                }
+                _ => None,
+            }?;
+            python_callable_return_type_in_tree(support, file, source, root, &callable, depth + 1)
+        }
+        "parenthesized_expression" => {
+            let child = node.named_child(0)?;
+            python_type_for_expression_bounded(support, file, source, root, child, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+fn python_class_candidate_for_name(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    site: Node<'_>,
+    name: &str,
+) -> Option<CodeUnit> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut file_candidates = support
+        .file_identifier(file, name)
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .collect::<Vec<_>>();
+    file_candidates.retain(|candidate| {
+        python_same_file_class_visible_at(support, source, site, candidate).unwrap_or(false)
+    });
+    if let Some(candidate) = unique_python_candidate(file_candidates) {
+        return Some(candidate);
+    }
+    if !name.contains('.') {
+        return None;
+    }
+    let exact_candidates = support
+        .fqn(name)
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .collect::<Vec<_>>();
+    unique_python_candidate(exact_candidates)
+}
+
+#[derive(Clone, Copy)]
+struct PythonReferenceVisibility<'tree> {
+    class_scope: Option<Node<'tree>>,
+    deferred_body: bool,
+}
+
+#[derive(Clone, Copy)]
+enum PythonClassDeclarationScope<'tree> {
+    Module,
+    Class(Node<'tree>),
+    Other,
+}
+
+#[derive(Clone, Copy)]
+enum PythonFunctionDeclarationScope<'tree> {
+    Module,
+    Function(Node<'tree>),
+    Other,
+}
+
+fn python_same_file_class_visible_at(
+    support: &PythonDefinitionProvider<'_>,
+    source: &str,
+    site: Node<'_>,
+    candidate: &CodeUnit,
+) -> Option<bool> {
+    let visibility = python_reference_visibility_bounded(support, site)?;
+    let declaration = python_class_node_for_candidate_bounded(support, source, site, candidate)?;
+    if !visibility.deferred_body && declaration.start_byte() > site.start_byte() {
+        return Some(false);
+    }
+    let declaration_scope = python_class_declaration_scope_bounded(support, declaration)?;
+    let visible = match declaration_scope {
+        PythonClassDeclarationScope::Module => {
+            let mut root = site;
+            while let Some(parent) = root.parent() {
+                if !support.scope_step() {
+                    return None;
+                }
+                root = parent;
+            }
+            python_unambiguous_module_class_binding_bounded(
+                root,
+                source,
+                candidate.identifier(),
+                || support.scope_step(),
+            )?
+        }
+        PythonClassDeclarationScope::Class(scope) => visibility
+            .class_scope
+            .is_some_and(|visible| visible == scope),
+        PythonClassDeclarationScope::Other => false,
+    };
+    Some(visible)
+}
+
+fn python_reference_visibility_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    site: Node<'tree>,
+) -> Option<PythonReferenceVisibility<'tree>> {
+    let site_start = site.start_byte();
+    let site_end = site.end_byte();
+    let mut class_scope = None;
+    let mut current = site;
+    while let Some(parent) = current.parent() {
+        if !support.scope_step() {
+            return None;
+        }
+        if matches!(parent.kind(), "function_definition" | "lambda")
+            && parent
+                .child_by_field_name("body")
+                .is_some_and(|body| body.start_byte() <= site_start && site_end <= body.end_byte())
+        {
+            return Some(PythonReferenceVisibility {
+                class_scope: None,
+                deferred_body: true,
+            });
+        }
+        if class_scope.is_none() && parent.kind() == "class_definition" {
+            class_scope = Some(parent);
+        }
+        current = parent;
+    }
+    Some(PythonReferenceVisibility {
+        class_scope,
+        deferred_body: false,
+    })
+}
+
+fn python_class_node_for_candidate_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    source: &str,
+    site: Node<'tree>,
+    candidate: &CodeUnit,
+) -> Option<Node<'tree>> {
+    let mut root = site;
+    while let Some(parent) = root.parent() {
+        if !support.scope_step() {
+            return None;
+        }
+        root = parent;
+    }
+    for range in support.ranges(candidate) {
+        if range.start_byte >= range.end_byte || range.end_byte > source.len() {
+            continue;
+        }
+        let Some(mut node) = python_smallest_named_node_covering_bounded(
+            support,
+            root,
+            range.start_byte,
+            range.end_byte,
+        ) else {
+            continue;
+        };
+        loop {
+            if node.kind() == "class_definition"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| python_slice(name, source) == candidate.identifier())
+            {
+                return Some(node);
+            }
+            if node.kind() == "decorated_definition" {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if !support.scope_step() {
+                        return None;
+                    }
+                    if child.kind() == "class_definition"
+                        && child.child_by_field_name("name").is_some_and(|name| {
+                            python_slice(name, source) == candidate.identifier()
+                        })
+                    {
+                        return Some(child);
+                    }
+                }
+            }
+            let Some(parent) = node.parent() else {
+                break;
+            };
+            if !support.scope_step() {
+                return None;
+            }
+            node = parent;
+        }
+    }
+    None
+}
+
+fn python_class_declaration_scope_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    declaration: Node<'tree>,
+) -> Option<PythonClassDeclarationScope<'tree>> {
+    let mut current = declaration;
+    while let Some(parent) = current.parent() {
+        if !support.scope_step() {
+            return None;
+        }
+        match parent.kind() {
+            "module" => return Some(PythonClassDeclarationScope::Module),
+            "class_definition" => return Some(PythonClassDeclarationScope::Class(parent)),
+            "decorated_definition" => current = parent,
+            "function_definition" | "lambda" => {
+                return Some(PythonClassDeclarationScope::Other);
+            }
+            "if_statement" | "for_statement" | "while_statement" | "try_statement"
+            | "with_statement" | "match_statement" | "case_clause" => {
+                return Some(PythonClassDeclarationScope::Other);
+            }
+            _ => current = parent,
+        }
+    }
+    Some(PythonClassDeclarationScope::Other)
+}
+
+fn python_same_file_function_visible_at(
+    support: &PythonDefinitionProvider<'_>,
+    source: &str,
+    site: Node<'_>,
+    candidate: &CodeUnit,
+) -> Option<bool> {
+    let declaration = python_function_node_for_candidate_bounded(support, source, site, candidate)?;
+    let visibility = python_reference_visibility_bounded(support, site)?;
+    match python_function_declaration_scope_bounded(support, declaration)? {
+        PythonFunctionDeclarationScope::Module => {
+            Some(visibility.deferred_body || declaration.start_byte() <= site.start_byte())
+        }
+        PythonFunctionDeclarationScope::Function(owner) => {
+            let nearest = python_enclosing_callable_bounded(support, site)?;
+            let mut inside_owner = false;
+            let mut current = Some(site);
+            while let Some(node) = current {
+                if !support.scope_step() {
+                    return None;
+                }
+                if node == owner {
+                    inside_owner = true;
+                    break;
+                }
+                current = node.parent();
+            }
+            Some(
+                inside_owner && (nearest != owner || declaration.start_byte() <= site.start_byte()),
+            )
+        }
+        PythonFunctionDeclarationScope::Other => Some(false),
+    }
+}
+
+fn python_function_node_for_candidate_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    source: &str,
+    site: Node<'tree>,
+    candidate: &CodeUnit,
+) -> Option<Node<'tree>> {
+    let mut root = site;
+    while let Some(parent) = root.parent() {
+        if !support.scope_step() {
+            return None;
+        }
+        root = parent;
+    }
+    for range in support.ranges(candidate) {
+        if range.start_byte >= range.end_byte || range.end_byte > source.len() {
+            continue;
+        }
+        let Some(mut node) = python_smallest_named_node_covering_bounded(
+            support,
+            root,
+            range.start_byte,
+            range.end_byte,
+        ) else {
+            continue;
+        };
+        loop {
+            if node.kind() == "function_definition"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| python_slice(name, source) == candidate.identifier())
+            {
+                return Some(node);
+            }
+            if node.kind() == "decorated_definition" {
+                for child in python_named_children_bounded(support, node)? {
+                    if child.kind() == "function_definition"
+                        && child.child_by_field_name("name").is_some_and(|name| {
+                            python_slice(name, source) == candidate.identifier()
+                        })
+                    {
+                        return Some(child);
+                    }
+                }
+            }
+            let Some(parent) = node.parent() else {
+                break;
+            };
+            if !support.scope_step() {
+                return None;
+            }
+            node = parent;
+        }
+    }
+    None
+}
+
+fn python_function_declaration_scope_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    declaration: Node<'tree>,
+) -> Option<PythonFunctionDeclarationScope<'tree>> {
+    let mut current = declaration;
+    while let Some(parent) = current.parent() {
+        if !support.scope_step() {
+            return None;
+        }
+        match parent.kind() {
+            "module" => return Some(PythonFunctionDeclarationScope::Module),
+            "function_definition" | "lambda" => {
+                return Some(PythonFunctionDeclarationScope::Function(parent));
+            }
+            "decorated_definition" => current = parent,
+            "class_definition" | "if_statement" | "for_statement" | "while_statement"
+            | "try_statement" | "with_statement" | "match_statement" | "case_clause" => {
+                return Some(PythonFunctionDeclarationScope::Other);
+            }
+            _ => current = parent,
+        }
+    }
+    Some(PythonFunctionDeclarationScope::Other)
+}
+
+fn unique_python_candidate(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
+    sort_units(&mut candidates);
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn python_current_receiver_class(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    name: &str,
+) -> Option<CodeUnit> {
+    if !matches!(name, "self" | "cls") {
+        return None;
+    }
+    let function = python_enclosing_callable_bounded(support, node)?;
+    let layout = formal_parameter_slots_for_owner_bounded(
+        Language::Python,
+        function,
+        source,
+        &node_range(function),
+        || support.scope_step(),
+    )?;
+    if matches!(layout.python_binding, Some(PythonMethodBinding::Static))
+        || layout
+            .slots
+            .first()
+            .is_none_or(|slot| !slot.names.iter().any(|candidate| candidate == name))
+    {
+        return None;
+    }
+    let mut parent = function.parent();
+    while let Some(candidate) = parent {
+        if !support.scope_step() {
+            return None;
+        }
+        if candidate.kind() == "class_definition" {
+            let class_name = candidate.child_by_field_name("name")?;
+            return python_class_candidate_for_name(
+                support,
+                file,
+                source,
+                node,
+                python_slice(class_name, source),
+            );
+        }
+        if matches!(candidate.kind(), "function_definition" | "lambda") {
+            return None;
+        }
+        parent = candidate.parent();
+    }
+    None
+}
+
+fn python_bound_type_for_identifier(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    identifier: Node<'_>,
+    name: &str,
+    depth: usize,
+) -> Option<CodeUnit> {
+    let function = python_enclosing_callable_bounded(support, identifier)?;
+    if let Some(parameters) = function.child_by_field_name("parameters")
+        && let Some(annotation) =
+            python_parameter_annotation_bounded(support, parameters, source, name)
+    {
+        return python_type_from_annotation_bounded(support, file, source, annotation, depth + 1);
+    }
+
+    let body = function.child_by_field_name("body")?;
+    let mut best: Option<Node<'_>> = None;
+    let mut stack = vec![body];
+    while let Some(candidate) = stack.pop() {
+        if !support.scope_step() {
+            return None;
+        }
+        if candidate.start_byte() >= identifier.start_byte() {
+            continue;
+        }
+        if candidate != body
+            && matches!(
+                candidate.kind(),
+                "function_definition" | "lambda" | "class_definition"
+            )
+        {
+            continue;
+        }
+        if candidate.kind() == "assignment"
+            && let Some(left) = candidate.child_by_field_name("left")
+            && left.kind() == "identifier"
+            && python_slice(left, source) == name
+            && best.is_none_or(|previous| previous.start_byte() < candidate.start_byte())
+        {
+            best = Some(candidate);
+        }
+        let children = python_named_children_bounded(support, candidate)?;
+        stack.extend(children.into_iter().rev());
+    }
+    let assignment = best?;
+    if let Some(annotation) = assignment.child_by_field_name("type") {
+        return python_type_from_annotation_bounded(support, file, source, annotation, depth + 1);
+    }
+    let value = assignment.child_by_field_name("right")?;
+    python_type_for_expression_bounded(support, file, source, root, value, depth + 1)
+}
+
+fn python_parameter_annotation_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    parameters: Node<'tree>,
+    source: &str,
+    name: &str,
+) -> Option<Node<'tree>> {
+    let mut stack = vec![parameters];
+    while let Some(node) = stack.pop() {
+        if !support.scope_step() {
+            return None;
+        }
+        if matches!(node.kind(), "typed_parameter" | "typed_default_parameter") {
+            let binding = node.child_by_field_name("name").or_else(|| {
+                node.named_child(0)
+                    .filter(|candidate| candidate.kind() == "identifier")
+            });
+            if binding.is_some_and(|binding| python_slice(binding, source) == name) {
+                if let Some(annotation) = node.child_by_field_name("type") {
+                    return Some(annotation);
+                }
+                for candidate in python_named_children_bounded(support, node)? {
+                    if candidate.kind() != "identifier" {
+                        return Some(candidate);
+                    }
+                }
+                return None;
+            }
+        }
+        let children = python_named_children_bounded(support, node)?;
+        stack.extend(children.into_iter().rev());
+    }
+    None
+}
+
+fn python_type_from_annotation_bounded(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    annotation: Node<'_>,
+    depth: usize,
+) -> Option<CodeUnit> {
+    if depth >= 12 || !support.scope_step() {
+        return None;
+    }
+    match annotation.kind() {
+        "identifier" | "string_content" => python_class_candidate_for_name(
+            support,
+            file,
+            source,
+            annotation,
+            python_slice(annotation, source),
+        ),
+        "attribute" => {
+            let exact = python_slice(annotation, source);
+            unique_python_candidate(
+                support
+                    .fqn(exact)
+                    .into_iter()
+                    .filter(CodeUnit::is_class)
+                    .collect(),
+            )
+        }
+        "string" => {
+            let content = python_named_children_bounded(support, annotation)?
+                .into_iter()
+                .find(|child| child.kind() == "string_content")?;
+            python_type_from_annotation_bounded(support, file, source, content, depth + 1)
+        }
+        _ => {
+            let mut candidates = Vec::new();
+            let mut stack = vec![annotation];
+            while let Some(node) = stack.pop() {
+                if !support.scope_step() {
+                    return None;
+                }
+                if node != annotation
+                    && matches!(node.kind(), "identifier" | "attribute" | "string")
+                    && let Some(candidate) =
+                        python_type_from_annotation_bounded(support, file, source, node, depth + 1)
+                {
+                    candidates.push(candidate);
+                    continue;
+                }
+                let children = python_named_children_bounded(support, node)?;
+                stack.extend(children.into_iter().rev());
+            }
+            unique_python_candidate(candidates)
+        }
+    }
+}
+
+fn python_callable_return_type_in_tree(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    callable: &CodeUnit,
+    depth: usize,
+) -> Option<CodeUnit> {
+    if callable.source() != file || depth >= 12 {
+        return None;
+    }
+    let ranges = support.ranges(callable);
+    let mut functions = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if !support.scope_step() {
+            return None;
+        }
+        if node.kind() == "function_definition"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| python_slice(name, source) == callable.identifier())
+            && ranges.iter().any(|range| {
+                range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte
+            })
+        {
+            functions.push(node);
+            continue;
+        }
+        let children = python_named_children_bounded(support, node)?;
+        stack.extend(children.into_iter().rev());
+    }
+    let function = (functions.len() == 1).then(|| functions.remove(0))?;
+    python_function_return_type_from_node_bounded(support, file, source, root, function, depth)
+}
+
+fn python_function_return_type_from_node_bounded(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    function: Node<'_>,
+    depth: usize,
+) -> Option<CodeUnit> {
+    if let Some(annotation) = function.child_by_field_name("return_type") {
+        return python_type_from_annotation_bounded(support, file, source, annotation, depth + 1);
+    }
+
+    let body = function.child_by_field_name("body")?;
+    let mut returns = Vec::new();
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if !support.scope_step() {
+            return None;
+        }
+        if node != body
+            && matches!(
+                node.kind(),
+                "function_definition" | "lambda" | "class_definition"
+            )
+        {
+            continue;
+        }
+        if node.kind() == "return_statement"
+            && let Some(value) = node.named_child(0)
+            && let Some(candidate) =
+                python_type_for_expression_bounded(support, file, source, root, value, depth + 1)
+        {
+            returns.push(candidate);
+            continue;
+        }
+        let children = python_named_children_bounded(support, node)?;
+        stack.extend(children.into_iter().rev());
+    }
+    unique_python_candidate(returns)
+}
+
+fn python_enclosing_callable_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if !support.scope_step() {
+            return None;
+        }
+        if matches!(candidate.kind(), "function_definition" | "lambda") {
+            return Some(candidate);
+        }
+        parent = candidate.parent();
+    }
+    None
+}
+
+fn python_has_lexical_binding_bounded(
+    support: &PythonDefinitionProvider<'_>,
+    identifier: Node<'_>,
+    source: &str,
+) -> bool {
+    !matches!(
+        python_lexical_binding_bounded(support, identifier, source),
+        PythonLexicalBinding::UnboundOrGlobal
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PythonLexicalBinding<'tree> {
+    UnboundOrGlobal,
+    LocalFunction(Node<'tree>),
+    Other,
+}
+
+fn python_lexical_binding_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    identifier: Node<'tree>,
+    source: &str,
+) -> PythonLexicalBinding<'tree> {
+    let name = python_slice(identifier, source);
+    let reference_start = identifier.start_byte();
+    let reference_end = identifier.end_byte();
+    let mut current = identifier;
+    let mut unresolved_nonlocal = false;
+    while let Some(candidate) = current.parent() {
+        if !support.scope_step() {
+            // Exhausted or cancelled binding discovery must never reopen the
+            // module-level class fallback.
+            return PythonLexicalBinding::Other;
+        }
+        if matches!(candidate.kind(), "function_definition" | "lambda")
+            && candidate.child_by_field_name("body").is_some_and(|body| {
+                body.start_byte() <= reference_start && reference_end <= body.end_byte()
+            })
+        {
+            let Some(inventory) =
+                PythonLexicalScopeInventory::collect_bounded(candidate, source, || {
+                    support.scope_step()
+                })
+            else {
+                return PythonLexicalBinding::Other;
+            };
+            match inventory.name_resolution_at(name, identifier) {
+                PythonLexicalNameResolution::Local => {
+                    let Some(declaration) = inventory.local_function_declaration(name, identifier)
+                    else {
+                        return PythonLexicalBinding::Other;
+                    };
+                    let Some(PythonFunctionDeclarationScope::Function(owner)) =
+                        python_function_declaration_scope_bounded(support, declaration)
+                    else {
+                        return PythonLexicalBinding::Other;
+                    };
+                    let Some(nearest) = python_enclosing_body_callable_bounded(support, identifier)
+                    else {
+                        return PythonLexicalBinding::Other;
+                    };
+                    return if owner == candidate
+                        && (nearest != owner || declaration.start_byte() <= identifier.start_byte())
+                    {
+                        PythonLexicalBinding::LocalFunction(declaration)
+                    } else {
+                        PythonLexicalBinding::Other
+                    };
+                }
+                PythonLexicalNameResolution::Nonlocal => unresolved_nonlocal = true,
+                PythonLexicalNameResolution::Global => {
+                    return PythonLexicalBinding::UnboundOrGlobal;
+                }
+                PythonLexicalNameResolution::Unbound => {}
+            }
+        }
+        current = candidate;
+    }
+    if unresolved_nonlocal {
+        PythonLexicalBinding::Other
+    } else {
+        PythonLexicalBinding::UnboundOrGlobal
+    }
+}
+
+fn python_enclosing_body_callable_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let reference_start = node.start_byte();
+    let reference_end = node.end_byte();
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if !support.scope_step() {
+            return None;
+        }
+        if matches!(candidate.kind(), "function_definition" | "lambda")
+            && candidate.child_by_field_name("body").is_some_and(|body| {
+                body.start_byte() <= reference_start && reference_end <= body.end_byte()
+            })
+        {
+            return Some(candidate);
+        }
+        parent = candidate.parent();
+    }
+    None
+}
 
 pub(super) fn resolve_python(
     analyzer: &dyn IAnalyzer,
@@ -1115,4 +2246,240 @@ fn python_is_non_reference_context(node: Node<'_>) -> bool {
         parent = current.parent();
     }
     false
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
+    use crate::analyzer::{Language, Range};
+    use crate::path_utils::rel_path_string;
+    use crate::test_support::AnalyzerFixture;
+
+    fn wide_deep_member_fixture() -> (
+        AnalyzerFixture,
+        ProjectFile,
+        String,
+        Tree,
+        ResolvedReferenceSite,
+    ) {
+        let statements = (0..96)
+            .map(|index| format!("    value{index} = {index}\n"))
+            .collect::<String>();
+        let expression = format!("{}service{}.run()", "(".repeat(24), ")".repeat(24));
+        let source = format!(
+            "class Service:\n    def run(self) -> None:\n        pass\n\n\
+             def use(service: Service) -> None:\n{statements}    {expression}\n"
+        );
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Python, &[("receiver.py", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "receiver.py");
+        let tree = parse_python_tree(&source).expect("Python tree");
+        let expression_start = source.rfind(&expression).expect("Python member call");
+        let start_byte = expression_start + expression.rfind("run").expect("member name");
+        let end_byte = start_byte + "run".len();
+        let start_line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "run".to_string(),
+            range: Range {
+                start_byte,
+                end_byte,
+                start_line,
+                end_line: start_line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: end_byte,
+        };
+        (fixture, file, source, tree, site)
+    }
+
+    #[test]
+    fn bounded_python_wide_deep_walk_stops_without_partial_result() {
+        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
+        let outcome = resolve_python_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::tiny(),
+            None,
+        );
+
+        assert!(matches!(
+            outcome,
+            BoundedResolution::Exceeded {
+                limit: ReceiverBudgetLimit::ScopeNodes,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bounded_python_wide_deep_walk_honors_mid_walk_cancellation() {
+        let (fixture, file, source, tree, site) = wide_deep_member_fixture();
+        let cancellation = CancellationToken::cancel_after_checks_for_test(12);
+        let outcome = resolve_python_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            Some(&cancellation),
+        );
+
+        assert!(matches!(outcome, BoundedResolution::Cancelled { .. }));
+    }
+
+    #[test]
+    fn bounded_python_local_function_call_retains_its_return_type() {
+        let source = r#"class Product:
+    def run(self) -> None:
+        pass
+
+def caller() -> None:
+    def make() -> Product:
+        return Product()
+
+    value = make()
+    value.run()
+"#;
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::Python, &[("local_factory.py", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "local_factory.py");
+        let tree = parse_python_tree(source).expect("Python tree");
+        let start_byte = source.rfind("run").expect("member name");
+        let start_line = source[..start_byte]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1;
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "run".to_string(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + "run".len(),
+                start_line,
+                end_line: start_line,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + "run".len(),
+        };
+        let outcome = resolve_python_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("local factory lookup did not complete: {outcome:#?}");
+        };
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.fq_name().ends_with("Product.run")),
+            "{value:#?}"
+        );
+    }
+
+    #[test]
+    fn bounded_python_local_function_requires_definite_visibility() {
+        for (path, source) in [
+            (
+                "forward_local_factory.py",
+                r#"class Product:
+    def run(self) -> None:
+        pass
+
+def caller() -> None:
+    value = make()
+    value.run()
+
+    def make() -> Product:
+        return Product()
+"#,
+            ),
+            (
+                "conditional_local_factory.py",
+                r#"class Product:
+    def run(self) -> None:
+        pass
+
+def caller(flag) -> None:
+    if flag:
+        def make() -> Product:
+            return Product()
+
+    value = make()
+    value.run()
+"#,
+            ),
+            (
+                "header_forward_local_factory.py",
+                r#"class Product:
+    def run(self) -> None:
+        pass
+
+def outer() -> None:
+    def nested(argument=make().run()) -> None:
+        pass
+
+    def make() -> Product:
+        return Product()
+"#,
+            ),
+        ] {
+            let fixture = AnalyzerFixture::new_for_language(Language::Python, &[(path, source)]);
+            let file = ProjectFile::new(fixture.project_root(), path);
+            let tree = parse_python_tree(source).expect("Python tree");
+            let start_byte = source.rfind("run").expect("member name");
+            let start_line = source[..start_byte]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let site = ResolvedReferenceSite {
+                path: rel_path_string(&file),
+                text: "run".to_string(),
+                range: Range {
+                    start_byte,
+                    end_byte: start_byte + "run".len(),
+                    start_line,
+                    end_line: start_line,
+                },
+                focus_start_byte: start_byte,
+                focus_end_byte: start_byte + "run".len(),
+            };
+            let outcome = resolve_python_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, .. } = outcome else {
+                panic!("{path} lookup did not complete: {outcome:#?}");
+            };
+            assert!(
+                value
+                    .definitions
+                    .iter()
+                    .all(|definition| !definition.fq_name().ends_with("Product.run")),
+                "{path}: {value:#?}"
+            );
+        }
+    }
 }

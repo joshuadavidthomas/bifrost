@@ -19,14 +19,12 @@ use crate::analyzer::{CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, re
 use crate::hash::HashSet;
 pub(in crate::analyzer::usages) use reference::{
     GoReferenceResolution, GoSelectorDescriptor, go_selector_descriptor,
-    resolve_go_reference_with_namespaces,
+    go_selector_descriptor_with_scope, resolve_go_reference_with_namespaces,
 };
 use std::collections::BTreeSet;
 
-pub(in crate::analyzer::usages) use resolver::extract_go_import_path;
 pub(crate) use resolver::{
-    GoIndexedMemberLookup, default_go_import_local_name, go_embedded_field_unit_type_text,
-    go_simple_type_name, go_type_name_parts, go_unique_indexed_member_candidate_at_nearest_depth,
+    default_go_import_local_name, go_simple_type_name, go_type_name_parts,
     resolve_go_import_namespaces,
 };
 

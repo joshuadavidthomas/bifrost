@@ -2,21 +2,30 @@
 
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::{
-    AbstractObjectIdentity, OracleLimitValues, OracleLimits, SemanticBudget,
-    SemanticBudgetDimension, SemanticBudgetExceeded, SemanticOutcome, SemanticProviderError,
-    SemanticRequest, SemanticWork, SourcePointsToResult, WorkspaceSemanticOracle,
+    AbstractObjectIdentity, CandidateCoverage, OracleLimitValues, OracleLimits, SemanticBudget,
+    SemanticBudgetDimension, SemanticBudgetExceeded, SemanticCapability, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticWork, SourcePointsToResult,
+    WorkspaceSemanticOracle,
 };
+use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::structural::FileFacts;
+use crate::analyzer::structural::provider::StructuralSyntaxLimitedOutcome;
 use crate::analyzer::tree_sitter_analyzer::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
 };
 use crate::analyzer::usages::get_definition::{
-    DefinitionLookupOutcome, DefinitionLookupStatus,
+    BoundedResolution, DefinitionLookupOutcome, DefinitionLookupStatus,
     java::{BoundedJavaResolution, JavaResolutionSession, resolve_java_bounded},
     js_ts::parse_js_ts_tree,
-    parse_tree_for_language, resolve_reference_site_with_line_starts,
+    parse_tree_for_language, resolve_cpp_bounded, resolve_csharp_bounded, resolve_go_bounded,
+    resolve_php_bounded, resolve_python_bounded, resolve_reference_site_with_line_starts,
+    resolve_ruby_bounded, resolve_rust_bounded, resolve_scala_bounded,
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, TypeLookupStatus, TypeLookupType, java::resolve_java_type_bounded,
+    resolve_cpp_type_bounded, resolve_csharp_type_bounded, resolve_go_type_bounded,
+    resolve_php_type_bounded, resolve_python_type_bounded, resolve_ruby_type_bounded,
+    resolve_rust_type_bounded, resolve_scala_type_bounded,
 };
 use crate::analyzer::usages::js_ts_graph::receiver_analysis::{
     JsTsReceiverSyntaxIndex, JsTsReceiverSyntaxIndexBuild,
@@ -28,13 +37,21 @@ use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisReport, ReceiverAnalysisWork,
     ReceiverBudgetLimit, ReceiverValue,
 };
-use crate::analyzer::usages::reference_site::SourceLocationRequest;
+use crate::analyzer::usages::receiver_sites::{
+    ReceiverSiteIndex, ReceiverSiteIndexBuild, ReceiverSiteIndexLimit, ReceiverSiteInputMode,
+    ReceiverSiteKind, ReceiverSiteSelection, ReceiverSiteSelectionLimit, build_receiver_site_index,
+};
+use crate::analyzer::usages::reference_site::{ResolvedReferenceSite, SourceLocationRequest};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, Range, WorkspaceAnalyzer,
+    AnalyzerDefinitionLookup, CSharpAnalyzer, CodeUnit, CppAnalyzer, DispatchExtensibility,
+    GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer, ProjectFile,
+    PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
+    WorkspaceAnalyzer, resolve_analyzer,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
+use crate::path_utils::rel_path_string;
 use crate::text_utils::compute_line_starts;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -86,6 +103,7 @@ pub(crate) struct ReceiverQueryReport {
     pub(crate) analysis: ReceiverQueryAnalysis,
     pub(crate) work: ReceiverAnalysisWork,
     pub(crate) candidates_truncated: bool,
+    pub(crate) semantic_unsupported: Option<SemanticCapability>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +118,7 @@ pub(crate) struct ReceiverQueryService<'a> {
     definitions: AnalyzerDefinitionLookup<'a>,
     prepared_files: RefCell<HashMap<ProjectFile, PreparedReceiverFile>>,
     prepared_java_files: RefCell<HashMap<ProjectFile, PreparedJavaReceiverFile>>,
+    prepared_structural_files: RefCell<HashMap<ProjectFile, PreparedStructuralReceiverFile>>,
 }
 
 struct PreparedReceiverFile {
@@ -107,6 +126,20 @@ struct PreparedReceiverFile {
     tree: tree_sitter::Tree,
     imports: crate::analyzer::usages::model::ImportBinder,
     syntax_index: Arc<JsTsReceiverSyntaxIndex>,
+}
+
+struct PreparedStructuralReceiverFile {
+    facts: Arc<FileFacts>,
+    sites: ReceiverSiteIndex,
+    syntax: Arc<crate::analyzer::tree_sitter_analyzer::PreparedSyntaxTree>,
+}
+
+impl PreparedStructuralReceiverFile {
+    fn matches(&self, facts: &Arc<FileFacts>) -> bool {
+        Arc::ptr_eq(&self.facts, facts)
+            && self.sites.source() == facts.source()
+            && self.syntax.source() == facts.source()
+    }
 }
 
 struct PreparedJavaReceiverFile {
@@ -133,13 +166,17 @@ impl PreparedJavaReceiverFile {
 }
 
 enum SemanticReceiverGate {
+    Bypassed {
+        work: ReceiverAnalysisWork,
+    },
     Available {
         work: ReceiverAnalysisWork,
-        points_to: Option<SourcePointsToResult>,
-        truncated: bool,
+        points_to: SourcePointsToResult,
+        evidence: SemanticReceiverEvidence,
     },
     Unavailable {
         work: ReceiverAnalysisWork,
+        unsupported: Option<SemanticCapability>,
     },
     Exceeded {
         work: ReceiverAnalysisWork,
@@ -150,8 +187,9 @@ enum SemanticReceiverGate {
 impl SemanticReceiverGate {
     fn work(&self) -> ReceiverAnalysisWork {
         match self {
-            Self::Available { work, .. }
-            | Self::Unavailable { work }
+            Self::Bypassed { work }
+            | Self::Available { work, .. }
+            | Self::Unavailable { work, .. }
             | Self::Exceeded { work, .. } => *work,
         }
     }
@@ -159,7 +197,98 @@ impl SemanticReceiverGate {
     fn exceeded_limit(&self) -> Option<ReceiverBudgetLimit> {
         match self {
             Self::Exceeded { limit, .. } => Some(*limit),
-            Self::Available { .. } | Self::Unavailable { .. } => None,
+            Self::Bypassed { .. } | Self::Available { .. } | Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticReceiverEvidence {
+    ExhaustiveComplete,
+    Incomplete {
+        coverage: CandidateCoverage,
+        unsupported: Option<SemanticCapability>,
+        origin: SemanticReceiverIncompleteness,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticReceiverIncompleteness {
+    /// The retained candidates are individually proven and complete, but a
+    /// globally incomplete adapter capability keeps the candidate set open.
+    GlobalCapabilitiesWithProvenCandidates,
+    /// Query-local uncertainty, including unproven candidates and disabled or
+    /// truncated call context.
+    Local,
+}
+
+impl SemanticReceiverEvidence {
+    fn from_outcome<T>(outcome: &SemanticOutcome<T>, coverage: CandidateCoverage) -> Self {
+        if outcome.is_complete() && coverage.is_exhaustive() {
+            Self::ExhaustiveComplete
+        } else {
+            Self::Incomplete {
+                coverage,
+                unsupported: match outcome {
+                    SemanticOutcome::Unsupported { capability, .. } => Some(*capability),
+                    _ => None,
+                },
+                origin: SemanticReceiverIncompleteness::Local,
+            }
+        }
+    }
+
+    fn from_points_to_outcome(
+        outcome: &SemanticOutcome<SourcePointsToResult>,
+        points_to: &SourcePointsToResult,
+    ) -> Self {
+        let mut evidence = Self::from_outcome(outcome, points_to.coverage());
+        if matches!(
+            evidence,
+            Self::Incomplete {
+                coverage: CandidateCoverage::Open,
+                unsupported: None,
+                ..
+            }
+        ) && points_to.globally_incomplete_with_proven_candidates()
+        {
+            evidence = Self::Incomplete {
+                coverage: CandidateCoverage::Open,
+                unsupported: None,
+                origin: SemanticReceiverIncompleteness::GlobalCapabilitiesWithProvenCandidates,
+            };
+        }
+        evidence
+    }
+
+    const fn supports_precise(self) -> bool {
+        matches!(self, Self::ExhaustiveComplete)
+    }
+
+    const fn legacy_provider_can_close(self) -> bool {
+        matches!(
+            self,
+            Self::Incomplete {
+                origin: SemanticReceiverIncompleteness::GlobalCapabilitiesWithProvenCandidates,
+                ..
+            }
+        )
+    }
+
+    const fn is_truncated(self) -> bool {
+        matches!(
+            self,
+            Self::Incomplete {
+                coverage: CandidateCoverage::Truncated,
+                ..
+            }
+        )
+    }
+
+    const fn unsupported_capability(self) -> Option<SemanticCapability> {
+        match self {
+            Self::Incomplete { unsupported, .. } => unsupported,
+            Self::ExhaustiveComplete => None,
         }
     }
 }
@@ -232,40 +361,78 @@ impl ReceiverWorkLedger {
     }
 }
 
-enum JavaCompatibilityOutcome<T> {
+enum CompatibilityOutcome<T> {
     Complete(T),
     Exceeded(ReceiverBudgetLimit),
 }
 
-fn charge_java_compatibility<T>(
+fn charge_compatibility<T>(
     ledger: &mut ReceiverWorkLedger,
     resolution: BoundedJavaResolution<T>,
-) -> Result<JavaCompatibilityOutcome<T>, ReceiverQueryError> {
+) -> Result<CompatibilityOutcome<T>, ReceiverQueryError> {
     let aggregate_limit = ledger.charge_analysis(resolution.work()).err();
     match resolution {
         BoundedJavaResolution::Complete { value, .. } => Ok(match aggregate_limit {
-            Some(limit) => JavaCompatibilityOutcome::Exceeded(limit),
-            None => JavaCompatibilityOutcome::Complete(value),
+            Some(limit) => CompatibilityOutcome::Exceeded(limit),
+            None => CompatibilityOutcome::Complete(value),
         }),
-        BoundedJavaResolution::Exceeded { limit, .. } => Ok(JavaCompatibilityOutcome::Exceeded(
+        BoundedJavaResolution::Exceeded { limit, .. } => Ok(CompatibilityOutcome::Exceeded(
             aggregate_limit.unwrap_or(limit),
         )),
         BoundedJavaResolution::Cancelled { .. } => Err(ReceiverQueryError::Cancelled),
     }
 }
 
-fn charge_java_scope_step(ledger: &mut ReceiverWorkLedger) -> Result<(), ReceiverBudgetLimit> {
+fn charge_bounded_resolution<T>(
+    ledger: &mut ReceiverWorkLedger,
+    resolution: BoundedResolution<T>,
+) -> Result<CompatibilityOutcome<T>, ReceiverQueryError> {
+    let aggregate_limit = ledger.charge_analysis(resolution.work()).err();
+    match resolution {
+        BoundedResolution::Complete { value, .. } => Ok(match aggregate_limit {
+            Some(limit) => CompatibilityOutcome::Exceeded(limit),
+            None => CompatibilityOutcome::Complete(value),
+        }),
+        BoundedResolution::Exceeded { limit, .. } => Ok(CompatibilityOutcome::Exceeded(
+            aggregate_limit.unwrap_or(limit),
+        )),
+        BoundedResolution::Cancelled { .. } => Err(ReceiverQueryError::Cancelled),
+    }
+}
+
+fn charge_scope_step(ledger: &mut ReceiverWorkLedger) -> Result<(), ReceiverBudgetLimit> {
     ledger.charge_analysis(ReceiverAnalysisWork {
         scope_nodes: 1,
         ..ReceiverAnalysisWork::default()
     })
 }
 
-fn charge_java_summary_step(ledger: &mut ReceiverWorkLedger) -> Result<(), ReceiverBudgetLimit> {
+fn charge_summary_step(ledger: &mut ReceiverWorkLedger) -> Result<(), ReceiverBudgetLimit> {
     ledger.charge_analysis(ReceiverAnalysisWork {
         summary_expansions: 1,
         ..ReceiverAnalysisWork::default()
     })
+}
+
+fn charge_limited_projection<T>(
+    batch: LimitedQueryRows<T>,
+    cancellation: Option<&CancellationToken>,
+    ledger: &mut ReceiverWorkLedger,
+) -> Result<CompatibilityOutcome<Vec<T>>, ReceiverQueryError> {
+    check_cancelled(cancellation)?;
+    let charged_rows = batch.inspected.max(batch.rows.len());
+    for _ in 0..charged_rows {
+        check_cancelled(cancellation)?;
+        if let Err(limit) = charge_scope_step(ledger) {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
+        }
+    }
+    if !batch.complete {
+        return Ok(CompatibilityOutcome::Exceeded(
+            ReceiverBudgetLimit::ScopeNodes,
+        ));
+    }
+    Ok(CompatibilityOutcome::Complete(batch.rows))
 }
 
 impl<'a> ReceiverQueryService<'a> {
@@ -276,6 +443,7 @@ impl<'a> ReceiverQueryService<'a> {
             definitions: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             prepared_files: RefCell::new(HashMap::default()),
             prepared_java_files: RefCell::new(HashMap::default()),
+            prepared_structural_files: RefCell::new(HashMap::default()),
         }
     }
 
@@ -287,7 +455,30 @@ impl<'a> ReceiverQueryService<'a> {
             definitions: AnalyzerDefinitionLookup::new(analyzer, Language::None),
             prepared_files: RefCell::new(HashMap::default()),
             prepared_java_files: RefCell::new(HashMap::default()),
+            prepared_structural_files: RefCell::new(HashMap::default()),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn analyze_with_structural_facts(
+        &self,
+        operation: ReceiverQueryOperation,
+        file: &ProjectFile,
+        range: Range,
+        input: ReceiverQueryInput,
+        facts: &Arc<FileFacts>,
+        budget: ReceiverAnalysisBudget,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
+        self.analyze_with_optional_structural_facts(
+            operation,
+            file,
+            range,
+            input,
+            Some(facts),
+            budget,
+            cancellation,
+        )
     }
 
     pub(crate) fn analyze(
@@ -299,8 +490,53 @@ impl<'a> ReceiverQueryService<'a> {
         budget: ReceiverAnalysisBudget,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
+        self.analyze_with_optional_structural_facts(
+            operation,
+            file,
+            range,
+            input,
+            None,
+            budget,
+            cancellation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_with_optional_structural_facts(
+        &self,
+        operation: ReceiverQueryOperation,
+        file: &ProjectFile,
+        range: Range,
+        input: ReceiverQueryInput,
+        structural_facts: Option<&Arc<FileFacts>>,
+        budget: ReceiverAnalysisBudget,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
         check_cancelled(cancellation)?;
         let language = language_for_file(file);
+        let structural_receiver_supported = matches!(
+            language,
+            Language::Cpp
+                | Language::CSharp
+                | Language::Go
+                | Language::Php
+                | Language::Python
+                | Language::Ruby
+                | Language::Rust
+                | Language::Scala
+        );
+        if structural_receiver_supported {
+            return self.analyze_structural(
+                operation,
+                file,
+                language,
+                range,
+                input,
+                structural_facts,
+                budget,
+                cancellation,
+            );
+        }
         let indexed_source = self.analyzer.indexed_source(file);
         if language == Language::Java {
             return self.analyze_java(
@@ -588,6 +824,7 @@ impl<'a> ReceiverQueryService<'a> {
                         ),
                         work: member_report.analysis.work,
                         candidates_truncated: member_report.analysis.candidates_truncated,
+                        semantic_unsupported: None,
                     },
                     gate,
                     &mut ledger,
@@ -606,10 +843,8 @@ impl<'a> ReceiverQueryService<'a> {
         cancellation: Option<&CancellationToken>,
     ) -> Result<SemanticReceiverGate, ReceiverQueryError> {
         let Some(workspace) = self.workspace else {
-            return Ok(SemanticReceiverGate::Available {
+            return Ok(SemanticReceiverGate::Bypassed {
                 work: ReceiverAnalysisWork::default(),
-                points_to: None,
-                truncated: false,
             });
         };
         let cancellation = cancellation.cloned().unwrap_or_default();
@@ -631,6 +866,33 @@ impl<'a> ReceiverQueryService<'a> {
             )
             .map_err(ReceiverQueryError::SemanticProvider)?;
         let work = semantic.work();
+        let unsupported = match &outcome {
+            SemanticOutcome::Unsupported { capability, .. } => Some(*capability),
+            _ => None,
+        };
+        let evidence = outcome.available_value().map(|points_to| {
+            let evidence = SemanticReceiverEvidence::from_points_to_outcome(&outcome, points_to);
+            if semantic.call_context_disabled
+                && points_to.object_candidates().any(|candidate| {
+                    matches!(
+                        candidate.value().identity(),
+                        AbstractObjectIdentity::CallResult(_)
+                    )
+                })
+            {
+                SemanticReceiverEvidence::Incomplete {
+                    coverage: if points_to.coverage().is_truncated() {
+                        CandidateCoverage::Truncated
+                    } else {
+                        CandidateCoverage::Open
+                    },
+                    unsupported,
+                    origin: SemanticReceiverIncompleteness::Local,
+                }
+            } else {
+                evidence
+            }
+        });
         match outcome {
             SemanticOutcome::Cancelled { .. } => Err(ReceiverQueryError::Cancelled),
             SemanticOutcome::ExceededBudget { exceeded, .. } => {
@@ -642,12 +904,507 @@ impl<'a> ReceiverQueryService<'a> {
             outcome => match outcome.available_value() {
                 Some(points_to) if !points_to.is_empty() => Ok(SemanticReceiverGate::Available {
                     work,
-                    points_to: Some(points_to.clone()),
-                    truncated: points_to.coverage().is_truncated(),
+                    points_to: points_to.clone(),
+                    evidence: evidence.expect("available semantic value has evidence quality"),
                 }),
-                Some(_) | None => Ok(SemanticReceiverGate::Unavailable { work }),
+                Some(_) | None => Ok(SemanticReceiverGate::Unavailable { work, unsupported }),
             },
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn analyze_structural(
+        &self,
+        operation: ReceiverQueryOperation,
+        file: &ProjectFile,
+        language: Language,
+        range: Range,
+        input: ReceiverQueryInput,
+        structural_facts: Option<&Arc<FileFacts>>,
+        budget: ReceiverAnalysisBudget,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ReceiverQueryReport, ReceiverQueryError> {
+        let Some(workspace) = self.workspace else {
+            return Ok(unsupported_report(
+                operation,
+                file,
+                language,
+                range,
+                "receiver_semantic_workspace_unavailable",
+                None,
+            ));
+        };
+
+        let mut ledger = ReceiverWorkLedger::new(budget);
+        let Some(facts) = structural_facts else {
+            return Ok(unsupported_report(
+                operation,
+                file,
+                language,
+                range,
+                "receiver_structural_facts_unavailable",
+                None,
+            ));
+        };
+        let prepared_matches = self
+            .prepared_structural_files
+            .borrow()
+            .get(file)
+            .is_some_and(|prepared| prepared.matches(facts));
+        if !prepared_matches {
+            match build_receiver_site_index(
+                Arc::clone(facts),
+                ReceiverSiteIndexLimit {
+                    max_work_items: ledger.remaining_budget().max_scope_nodes,
+                },
+                cancellation,
+            ) {
+                ReceiverSiteIndexBuild::Complete {
+                    index,
+                    inspected_work,
+                } => {
+                    ledger
+                        .charge_setup(inspected_work)
+                        .expect("completed site indexing fits its supplied receiver budget");
+                    check_cancelled(cancellation)?;
+                    let syntax_nodes = index.source().len().div_ceil(256).max(1);
+                    if ledger.charge_setup(syntax_nodes).is_err() {
+                        return Ok(setup_budget_report(
+                            operation,
+                            file,
+                            language,
+                            range,
+                            index.source(),
+                            ledger.work(),
+                        ));
+                    }
+                    let Some(syntax) = prepared_structural_syntax_limited(
+                        self.analyzer,
+                        language,
+                        file,
+                        index.source().len(),
+                        cancellation,
+                    ) else {
+                        let mut report = unsupported_report(
+                            operation,
+                            file,
+                            language,
+                            range,
+                            "receiver_analyzer_unavailable",
+                            Some(index.source()),
+                        );
+                        report.work = ledger.work();
+                        return Ok(report);
+                    };
+                    let syntax = match syntax {
+                        StructuralSyntaxLimitedOutcome::Available(syntax) => {
+                            let syntax = syntax.into_inner();
+                            if syntax.source() == index.source() {
+                                syntax
+                            } else {
+                                let mut report = unsupported_report(
+                                    operation,
+                                    file,
+                                    language,
+                                    range,
+                                    "receiver_source_snapshot_mismatch",
+                                    Some(index.source()),
+                                );
+                                report.work = ledger.work();
+                                return Ok(report);
+                            }
+                        }
+                        StructuralSyntaxLimitedOutcome::Exceeded { .. } => {
+                            let mut report = unsupported_report(
+                                operation,
+                                file,
+                                language,
+                                range,
+                                "receiver_source_snapshot_mismatch",
+                                Some(index.source()),
+                            );
+                            report.work = ledger.work();
+                            return Ok(report);
+                        }
+                        StructuralSyntaxLimitedOutcome::Cancelled => {
+                            return Err(ReceiverQueryError::Cancelled);
+                        }
+                        StructuralSyntaxLimitedOutcome::Unavailable => {
+                            let mut report = unsupported_report(
+                                operation,
+                                file,
+                                language,
+                                range,
+                                "receiver_source_parse_failed",
+                                Some(index.source()),
+                            );
+                            report.work = ledger.work();
+                            return Ok(report);
+                        }
+                    };
+                    check_cancelled(cancellation)?;
+                    self.prepared_structural_files.borrow_mut().insert(
+                        file.clone(),
+                        PreparedStructuralReceiverFile {
+                            facts: Arc::clone(facts),
+                            sites: index,
+                            syntax,
+                        },
+                    );
+                }
+                ReceiverSiteIndexBuild::Exceeded { inspected_work } => {
+                    let _ = ledger.charge_setup(inspected_work);
+                    return Ok(setup_budget_report(
+                        operation,
+                        file,
+                        language,
+                        range,
+                        facts.source(),
+                        ledger.work(),
+                    ));
+                }
+                ReceiverSiteIndexBuild::Cancelled { inspected_work } => {
+                    let _ = ledger.charge_setup(inspected_work);
+                    return Err(ReceiverQueryError::Cancelled);
+                }
+            }
+        }
+
+        let prepared_files = self.prepared_structural_files.borrow();
+        let prepared = prepared_files
+            .get(file)
+            .expect("structural receiver sites were prepared above");
+        debug_assert!(prepared.matches(facts));
+        let source = prepared.sites.source();
+        let selection_mode = match input {
+            ReceiverQueryInput::ContainingSite => ReceiverSiteInputMode::ContainingSite,
+            ReceiverQueryInput::Expression => ReceiverSiteInputMode::Expression,
+        };
+        let selected = match prepared.sites.select_bounded(
+            range,
+            selection_mode,
+            ReceiverSiteSelectionLimit {
+                max_inspected_sites: ledger.remaining_budget().max_scope_nodes,
+            },
+            cancellation,
+        ) {
+            ReceiverSiteSelection::Complete {
+                site,
+                inspected_sites,
+            } => {
+                ledger
+                    .charge_setup(inspected_sites)
+                    .expect("completed site selection fits its supplied receiver budget");
+                site
+            }
+            ReceiverSiteSelection::Exceeded { inspected_sites } => {
+                let _ = ledger.charge_setup(inspected_sites);
+                return Ok(setup_budget_report(
+                    operation,
+                    file,
+                    language,
+                    range,
+                    source,
+                    ledger.work(),
+                ));
+            }
+            ReceiverSiteSelection::Cancelled { inspected_sites } => {
+                let _ = ledger.charge_setup(inspected_sites);
+                return Err(ReceiverQueryError::Cancelled);
+            }
+        };
+        let query_range = match (operation, input, selected) {
+            (ReceiverQueryOperation::MemberTargets, _, Some(site))
+            | (_, ReceiverQueryInput::ContainingSite, Some(site)) => site.receiver_range,
+            (ReceiverQueryOperation::MemberTargets, _, None)
+            | (_, ReceiverQueryInput::ContainingSite, None) => {
+                let mut report = unsupported_report(
+                    operation,
+                    file,
+                    language,
+                    range,
+                    "receiver_site_without_receiver",
+                    Some(source),
+                );
+                report.work = ledger.work();
+                return Ok(report);
+            }
+            (_, ReceiverQueryInput::Expression, _) => range,
+        };
+        let member_range = (operation == ReceiverQueryOperation::MemberTargets)
+            .then(|| selected.and_then(|site| site.member_range))
+            .flatten();
+        if operation == ReceiverQueryOperation::MemberTargets && member_range.is_none() {
+            let mut report = unsupported_report(
+                operation,
+                file,
+                language,
+                range,
+                "member_target_site_unsupported",
+                Some(source),
+            );
+            report.work = ledger.work();
+            return Ok(report);
+        }
+        let syntax_kind = selected.map_or("expression", |site| match site.kind {
+            ReceiverSiteKind::Call => "call",
+            ReceiverSiteKind::FieldAccess => "field_access",
+        });
+        let member_name = member_range
+            .and_then(|member| source.get(member.start_byte..member.end_byte))
+            .filter(|member| !member.is_empty())
+            .map(str::to_string);
+        let report_site = site(
+            file,
+            language,
+            query_range,
+            source,
+            syntax_kind,
+            member_name,
+        );
+
+        let fallback_cancellation = CancellationToken::default();
+        let cancellation = cancellation.unwrap_or(&fallback_cancellation);
+        check_cancelled(Some(cancellation))?;
+        if let Err(limit) = charge_scope_step(&mut ledger) {
+            return Ok(budget_report(operation, report_site, ledger.work(), limit));
+        }
+
+        let reference_site = structural_reference_site(file, source, query_range);
+        let resolution = resolve_structural_type_bounded(
+            language,
+            self.analyzer,
+            file,
+            source,
+            Some(prepared.syntax.tree()),
+            &reference_site,
+            ledger.remaining_budget(),
+            Some(cancellation),
+        );
+        let type_outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
+            CompatibilityOutcome::Complete(outcome) => outcome,
+            CompatibilityOutcome::Exceeded(limit) => {
+                return Ok(budget_report(operation, report_site, ledger.work(), limit));
+            }
+        };
+        if let Some(reason) = structural_receiver_unsupported_reason(language, &type_outcome) {
+            let mut report = unknown_report(operation, report_site, ledger.work(), false);
+            neutral_unsupported(&mut report.analysis, reason);
+            return Ok(report);
+        }
+        let static_type_reference = type_outcome.target_kind == TypeLookupTargetKind::TypeReference;
+        let static_type_resolved = type_outcome.status == TypeLookupStatus::Resolved;
+
+        if operation != ReceiverQueryOperation::MemberTargets && static_type_reference {
+            let projection = match project_static_receiver_values(
+                &type_outcome,
+                Some(cancellation),
+                &mut ledger,
+            )? {
+                CompatibilityOutcome::Complete(projection) => projection,
+                CompatibilityOutcome::Exceeded(limit) => {
+                    return Ok(budget_report(operation, report_site, ledger.work(), limit));
+                }
+            };
+            let mut analysis = ReceiverQueryAnalysis::Values(receiver_type_outcome(
+                type_outcome.status,
+                projection.values,
+            ));
+            if projection.truncated {
+                neutral_incomplete(&mut analysis);
+            }
+            return Ok(ReceiverQueryReport {
+                operation,
+                site: report_site,
+                analysis,
+                work: ledger.work(),
+                candidates_truncated: projection.truncated,
+                semantic_unsupported: None,
+            });
+        }
+
+        let semantic = (!static_type_reference)
+            .then(|| {
+                self.semantic_receiver_gate(
+                    file,
+                    query_range,
+                    ledger.remaining_budget(),
+                    Some(cancellation),
+                )
+            })
+            .transpose()?;
+        if let Some(semantic) = &semantic
+            && let Some(limit) = charge_semantic_gate(&mut ledger, semantic)
+        {
+            return Ok(budget_report(operation, report_site, ledger.work(), limit));
+        }
+        let (points_to, evidence) = match semantic {
+            None => (None, SemanticReceiverEvidence::ExhaustiveComplete),
+            Some(SemanticReceiverGate::Available {
+                points_to,
+                evidence,
+                ..
+            }) => (Some(points_to), evidence),
+            Some(SemanticReceiverGate::Bypassed { .. }) => {
+                return Ok(unknown_report(operation, report_site, ledger.work(), false));
+            }
+            Some(SemanticReceiverGate::Unavailable { unsupported, .. }) => {
+                let mut report = unknown_report(operation, report_site, ledger.work(), false);
+                if let Some(capability) = unsupported {
+                    neutral_unsupported(&mut report.analysis, capability.label());
+                }
+                return Ok(report);
+            }
+            Some(SemanticReceiverGate::Exceeded { .. }) => {
+                unreachable!("semantic gate budget exits before compatibility analysis")
+            }
+        };
+
+        if operation == ReceiverQueryOperation::MemberTargets {
+            let member_range = member_range.expect("member target range was validated above");
+            let reference_site = structural_reference_site(file, source, member_range);
+            let resolution = resolve_structural_definition_bounded(
+                language,
+                self.analyzer,
+                file,
+                source,
+                Some(prepared.syntax.tree()),
+                &reference_site,
+                ledger.remaining_budget(),
+                Some(cancellation),
+            );
+            let outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
+                CompatibilityOutcome::Complete(outcome) => outcome,
+                CompatibilityOutcome::Exceeded(limit) => {
+                    return Ok(budget_report(operation, report_site, ledger.work(), limit));
+                }
+            };
+            let (outcome, resolution_truncated) =
+                definition_outcome(outcome, ledger.remaining_budget().max_targets);
+            let mut analysis = ReceiverQueryAnalysis::MemberTargets(outcome);
+            let statically_bound_data_member =
+                structural_member_is_statically_bound_data_member(language, &analysis);
+            let evidence_supports_precision =
+                evidence.supports_precise() || statically_bound_data_member;
+            let mut dispatch_supports_precise = statically_bound_data_member;
+            if !statically_bound_data_member
+                && analysis_is_precise(&analysis)
+                && evidence.supports_precise()
+                && !resolution_truncated
+                && (!static_type_reference || static_type_resolved)
+            {
+                dispatch_supports_precise = match structural_member_dispatch_supports_precise(
+                    self.analyzer,
+                    language,
+                    &analysis,
+                    Some(cancellation),
+                    &mut ledger,
+                )? {
+                    CompatibilityOutcome::Complete(supports_precise) => supports_precise,
+                    CompatibilityOutcome::Exceeded(limit) => {
+                        return Ok(budget_report(operation, report_site, ledger.work(), limit));
+                    }
+                };
+            }
+            if !evidence_supports_precision
+                || resolution_truncated
+                || !dispatch_supports_precise
+                || (static_type_reference && !static_type_resolved)
+            {
+                neutral_incomplete(&mut analysis);
+            }
+            return Ok(ReceiverQueryReport {
+                operation,
+                site: report_site,
+                analysis,
+                work: ledger.work(),
+                candidates_truncated: evidence.is_truncated() || resolution_truncated,
+                semantic_unsupported: evidence.unsupported_capability(),
+            });
+        }
+
+        let points_to = points_to
+            .expect("non-static structural receiver analysis requires neutral points-to evidence");
+        let query_node = match java_smallest_named_node_covering(
+            prepared.syntax.tree().root_node(),
+            query_range.start_byte,
+            query_range.end_byte,
+            Some(cancellation),
+            &mut ledger,
+        )? {
+            CompatibilityOutcome::Complete(node) => node,
+            CompatibilityOutcome::Exceeded(limit) => {
+                return Ok(budget_report(operation, report_site, ledger.work(), limit));
+            }
+        };
+        let factories = if points_to_contains_call_result(&points_to, Some(cancellation))?
+            && let Some(factory_node) =
+                query_node.and_then(|node| structural_factory_name_node(language, node))
+        {
+            let factory_site = structural_reference_site(file, source, node_range(factory_node));
+            let resolution = resolve_structural_definition_bounded(
+                language,
+                self.analyzer,
+                file,
+                source,
+                Some(prepared.syntax.tree()),
+                &factory_site,
+                ledger.remaining_budget(),
+                Some(cancellation),
+            );
+            match charge_bounded_resolution(&mut ledger, resolution)? {
+                CompatibilityOutcome::Complete(outcome)
+                    if outcome.status == DefinitionLookupStatus::Resolved
+                        && !outcome.definitions.is_empty()
+                        && outcome.definitions.iter().all(|definition| {
+                            if language == Language::Cpp {
+                                definition.is_callable()
+                            } else {
+                                definition.is_function()
+                            }
+                        })
+                        && (language == Language::Cpp || outcome.definitions.len() == 1) =>
+                {
+                    outcome.definitions
+                }
+                CompatibilityOutcome::Complete(_) => Vec::new(),
+                CompatibilityOutcome::Exceeded(limit) => {
+                    return Ok(budget_report(operation, report_site, ledger.work(), limit));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let values = project_receiver_values(
+            workspace,
+            &points_to,
+            &type_outcome,
+            &factories,
+            false,
+            Some(cancellation),
+            &mut ledger,
+        )?;
+        let projection = match values {
+            CompatibilityOutcome::Complete(projection) => projection,
+            CompatibilityOutcome::Exceeded(limit) => {
+                return Ok(budget_report(operation, report_site, ledger.work(), limit));
+            }
+        };
+        let mut analysis = ReceiverQueryAnalysis::Values(receiver_type_outcome(
+            type_outcome.status,
+            projection.values,
+        ));
+        if !evidence.supports_precise() || projection.truncated || projection.multiple_identities {
+            neutral_incomplete(&mut analysis);
+        }
+        Ok(ReceiverQueryReport {
+            operation,
+            site: report_site,
+            analysis,
+            work: ledger.work(),
+            candidates_truncated: evidence.is_truncated() || projection.truncated,
+            semantic_unsupported: evidence.unsupported_capability(),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -752,8 +1509,8 @@ impl<'a> ReceiverQueryService<'a> {
             cancellation,
             &mut ledger,
         )? {
-            JavaCompatibilityOutcome::Complete(Some(node)) => node,
-            JavaCompatibilityOutcome::Complete(None) => {
+            CompatibilityOutcome::Complete(Some(node)) => node,
+            CompatibilityOutcome::Complete(None) => {
                 let mut report = unsupported_report(
                     operation,
                     file,
@@ -765,7 +1522,7 @@ impl<'a> ReceiverQueryService<'a> {
                 report.work = ledger.work();
                 return Ok(report);
             }
-            JavaCompatibilityOutcome::Exceeded(limit) => {
+            CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(
                     operation,
                     site(file, Language::Java, range, &prepared.source, "query", None),
@@ -780,8 +1537,8 @@ impl<'a> ReceiverQueryService<'a> {
                 if input == ReceiverQueryInput::ContainingSite =>
             {
                 match java_receiver_at_site(input_node, cancellation, &mut ledger)? {
-                    JavaCompatibilityOutcome::Complete(Some(receiver)) => receiver,
-                    JavaCompatibilityOutcome::Complete(None) => {
+                    CompatibilityOutcome::Complete(Some(receiver)) => receiver,
+                    CompatibilityOutcome::Complete(None) => {
                         let mut report = unsupported_report(
                             operation,
                             file,
@@ -793,7 +1550,7 @@ impl<'a> ReceiverQueryService<'a> {
                         report.work = ledger.work();
                         return Ok(report);
                     }
-                    JavaCompatibilityOutcome::Exceeded(limit) => {
+                    CompatibilityOutcome::Exceeded(limit) => {
                         return Ok(budget_report(
                             operation,
                             site(
@@ -816,8 +1573,8 @@ impl<'a> ReceiverQueryService<'a> {
         };
         let query_range = node_range(query_node);
         let member_node = match java_member_node_at_site(input_node, cancellation, &mut ledger)? {
-            JavaCompatibilityOutcome::Complete(member) => member,
-            JavaCompatibilityOutcome::Exceeded(limit) => {
+            CompatibilityOutcome::Complete(member) => member,
+            CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(
                     operation,
                     site(
@@ -860,25 +1617,47 @@ impl<'a> ReceiverQueryService<'a> {
                 limit,
             ));
         }
-        let (points_to, mut candidates_truncated) = match semantic {
-            SemanticReceiverGate::Available {
-                points_to: Some(points_to),
-                truncated,
-                ..
-            } => (points_to, truncated),
-            SemanticReceiverGate::Available {
-                points_to: None, ..
-            }
-            | SemanticReceiverGate::Unavailable { .. } => {
-                let mut report =
-                    java_unknown_report(operation, file, query_node, &prepared.source, member_name);
-                report.work = ledger.work();
-                return Ok(report);
-            }
-            SemanticReceiverGate::Exceeded { .. } => {
-                unreachable!("semantic gate budget exits before compatibility analysis")
-            }
-        };
+        let (points_to, mut candidates_truncated, supports_precise, semantic_unsupported) =
+            match semantic {
+                SemanticReceiverGate::Available {
+                    points_to,
+                    evidence,
+                    ..
+                } => (
+                    points_to,
+                    evidence.is_truncated(),
+                    evidence.supports_precise(),
+                    evidence.unsupported_capability(),
+                ),
+                SemanticReceiverGate::Bypassed { .. } => {
+                    let mut report = java_unknown_report(
+                        operation,
+                        file,
+                        query_node,
+                        &prepared.source,
+                        member_name,
+                    );
+                    report.work = ledger.work();
+                    return Ok(report);
+                }
+                SemanticReceiverGate::Unavailable { unsupported, .. } => {
+                    let mut report = java_unknown_report(
+                        operation,
+                        file,
+                        query_node,
+                        &prepared.source,
+                        member_name,
+                    );
+                    report.work = ledger.work();
+                    if let Some(capability) = unsupported {
+                        neutral_unsupported(&mut report.analysis, capability.label());
+                    }
+                    return Ok(report);
+                }
+                SemanticReceiverGate::Exceeded { .. } => {
+                    unreachable!("semantic gate budget exits before compatibility analysis")
+                }
+            };
 
         self.definitions.set_language(Language::Java);
         if operation == ReceiverQueryOperation::MemberTargets {
@@ -897,9 +1676,9 @@ impl<'a> ReceiverQueryService<'a> {
                 ledger.remaining_budget(),
                 cancellation,
             );
-            let outcome = match charge_java_compatibility(&mut ledger, outcome)? {
-                JavaCompatibilityOutcome::Complete(outcome) => outcome,
-                JavaCompatibilityOutcome::Exceeded(limit) => {
+            let outcome = match charge_compatibility(&mut ledger, outcome)? {
+                CompatibilityOutcome::Complete(outcome) => outcome,
+                CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(budget_report(
                         operation,
                         site(
@@ -916,8 +1695,12 @@ impl<'a> ReceiverQueryService<'a> {
                 }
             };
             let (outcome, truncated) =
-                java_definition_outcome(outcome, ledger.remaining_budget().max_targets);
+                definition_outcome(outcome, ledger.remaining_budget().max_targets);
             candidates_truncated |= truncated;
+            let mut analysis = ReceiverQueryAnalysis::MemberTargets(outcome);
+            if !supports_precise || candidates_truncated {
+                neutral_incomplete(&mut analysis);
+            }
             return Ok(ReceiverQueryReport {
                 operation,
                 site: site(
@@ -928,9 +1711,10 @@ impl<'a> ReceiverQueryService<'a> {
                     query_node.kind(),
                     member_name,
                 ),
-                analysis: ReceiverQueryAnalysis::MemberTargets(outcome),
+                analysis,
                 work: ledger.work(),
                 candidates_truncated,
+                semantic_unsupported,
             });
         }
 
@@ -943,9 +1727,9 @@ impl<'a> ReceiverQueryService<'a> {
             ledger.remaining_budget(),
             cancellation,
         );
-        let mut type_outcome = match charge_java_compatibility(&mut ledger, type_resolution)? {
-            JavaCompatibilityOutcome::Complete(outcome) => outcome,
-            JavaCompatibilityOutcome::Exceeded(limit) => {
+        let mut type_outcome = match charge_compatibility(&mut ledger, type_resolution)? {
+            CompatibilityOutcome::Complete(outcome) => outcome,
+            CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(
                     operation,
                     site(
@@ -963,10 +1747,10 @@ impl<'a> ReceiverQueryService<'a> {
         };
         if type_outcome.types.is_empty() {
             let receiver_owners =
-                java_current_receiver_owners(workspace, &points_to, cancellation, &mut ledger)?;
+                current_receiver_owners(workspace, &points_to, cancellation, &mut ledger)?;
             let receiver_owners = match receiver_owners {
-                JavaCompatibilityOutcome::Complete(owners) => owners,
-                JavaCompatibilityOutcome::Exceeded(limit) => {
+                CompatibilityOutcome::Complete(owners) => owners,
+                CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(budget_report(
                         operation,
                         site(
@@ -994,8 +1778,8 @@ impl<'a> ReceiverQueryService<'a> {
         if type_outcome.types.is_empty() {
             let context_node =
                 match java_contextual_type_node(query_node, cancellation, &mut ledger)? {
-                    JavaCompatibilityOutcome::Complete(context_node) => context_node,
-                    JavaCompatibilityOutcome::Exceeded(limit) => {
+                    CompatibilityOutcome::Complete(context_node) => context_node,
+                    CompatibilityOutcome::Exceeded(limit) => {
                         return Ok(budget_report(
                             operation,
                             site(
@@ -1021,9 +1805,9 @@ impl<'a> ReceiverQueryService<'a> {
                     ledger.remaining_budget(),
                     cancellation,
                 );
-                type_outcome = match charge_java_compatibility(&mut ledger, contextual)? {
-                    JavaCompatibilityOutcome::Complete(outcome) => outcome,
-                    JavaCompatibilityOutcome::Exceeded(limit) => {
+                type_outcome = match charge_compatibility(&mut ledger, contextual)? {
+                    CompatibilityOutcome::Complete(outcome) => outcome,
+                    CompatibilityOutcome::Exceeded(limit) => {
                         return Ok(budget_report(
                             operation,
                             site(
@@ -1048,7 +1832,9 @@ impl<'a> ReceiverQueryService<'a> {
             .sum::<usize>()
             > ledger.remaining_budget().max_targets;
 
-        let factory = if let Some(factory_node) = java_factory_name_node(query_node) {
+        let factory = if points_to_contains_call_result(&points_to, cancellation)?
+            && let Some(factory_node) = java_factory_name_node(query_node)
+        {
             let factory_resolution = java_definition_at(
                 self.analyzer,
                 &self.definitions,
@@ -1058,11 +1844,11 @@ impl<'a> ReceiverQueryService<'a> {
                 ledger.remaining_budget(),
                 cancellation,
             );
-            match charge_java_compatibility(&mut ledger, factory_resolution)? {
-                JavaCompatibilityOutcome::Complete(outcome) => (outcome.definitions.len() == 1)
+            match charge_compatibility(&mut ledger, factory_resolution)? {
+                CompatibilityOutcome::Complete(outcome) => (outcome.definitions.len() == 1)
                     .then(|| outcome.definitions.into_iter().next())
                     .flatten(),
-                JavaCompatibilityOutcome::Exceeded(limit) => {
+                CompatibilityOutcome::Exceeded(limit) => {
                     return Ok(budget_report(
                         operation,
                         site(
@@ -1091,12 +1877,12 @@ impl<'a> ReceiverQueryService<'a> {
             ledger.remaining_budget(),
             cancellation,
         );
-        let type_reference = match charge_java_compatibility(&mut ledger, type_resolution)? {
-            JavaCompatibilityOutcome::Complete(outcome) => {
+        let type_reference = match charge_compatibility(&mut ledger, type_resolution)? {
+            CompatibilityOutcome::Complete(outcome) => {
                 !outcome.definitions.is_empty()
                     && outcome.definitions.iter().all(CodeUnit::is_class)
             }
-            JavaCompatibilityOutcome::Exceeded(limit) => {
+            CompatibilityOutcome::Exceeded(limit) => {
                 return Ok(budget_report(
                     operation,
                     site(
@@ -1114,20 +1900,20 @@ impl<'a> ReceiverQueryService<'a> {
         };
         check_cancelled(cancellation)?;
 
-        let analysis = match operation {
+        let mut analysis = match operation {
             ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::PointsTo => {
-                let values = java_receiver_values(
+                let values = project_receiver_values(
                     workspace,
                     &points_to,
                     &type_outcome,
-                    factory,
+                    factory.as_slice(),
                     type_reference,
                     cancellation,
                     &mut ledger,
                 )?;
-                let (values, truncated) = match values {
-                    JavaCompatibilityOutcome::Complete(values) => values,
-                    JavaCompatibilityOutcome::Exceeded(limit) => {
+                let projection = match values {
+                    CompatibilityOutcome::Complete(projection) => projection,
+                    CompatibilityOutcome::Exceeded(limit) => {
                         return Ok(budget_report(
                             operation,
                             site(
@@ -1143,13 +1929,20 @@ impl<'a> ReceiverQueryService<'a> {
                         ));
                     }
                 };
-                candidates_truncated |= truncated;
-                ReceiverQueryAnalysis::Values(java_type_outcome(type_outcome.status, values))
+                candidates_truncated |= projection.truncated;
+                let mut outcome = receiver_type_outcome(type_outcome.status, projection.values);
+                if projection.multiple_identities {
+                    downgrade_precise(&mut outcome);
+                }
+                ReceiverQueryAnalysis::Values(outcome)
             }
             ReceiverQueryOperation::MemberTargets => {
                 unreachable!("member targets return through the exact Java resolver above")
             }
         };
+        if !supports_precise || candidates_truncated {
+            neutral_incomplete(&mut analysis);
+        }
 
         check_cancelled(cancellation)?;
 
@@ -1166,12 +1959,15 @@ impl<'a> ReceiverQueryService<'a> {
             analysis,
             work: ledger.work(),
             candidates_truncated,
+            semantic_unsupported,
         })
     }
 
     #[cfg(test)]
     fn prepared_file_count(&self) -> usize {
-        self.prepared_files.borrow().len() + self.prepared_java_files.borrow().len()
+        self.prepared_files.borrow().len()
+            + self.prepared_java_files.borrow().len()
+            + self.prepared_structural_files.borrow().len()
     }
 }
 
@@ -1183,6 +1979,207 @@ fn charge_semantic_gate(
         .charge_analysis(gate.work())
         .err()
         .or_else(|| gate.exceeded_limit())
+}
+
+fn analysis_is_precise(analysis: &ReceiverQueryAnalysis) -> bool {
+    match analysis {
+        ReceiverQueryAnalysis::Values(outcome) => outcome.is_precise(),
+        ReceiverQueryAnalysis::MemberTargets(outcome) => outcome.is_precise(),
+    }
+}
+
+fn prepared_structural_syntax_limited(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    file: &ProjectFile,
+    max_source_bytes: usize,
+    cancellation: Option<&CancellationToken>,
+) -> Option<StructuralSyntaxLimitedOutcome> {
+    analyzer
+        .structural_search_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == language)
+        .map(|provider| provider.structural_syntax_limited(file, max_source_bytes, cancellation))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_structural_type_bounded(
+    language: Language,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&tree_sitter::Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<TypeLookupOutcome> {
+    match language {
+        Language::Cpp => {
+            resolve_cpp_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::CSharp => {
+            resolve_csharp_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Go => {
+            resolve_go_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Php => {
+            resolve_php_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Python => {
+            resolve_python_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Ruby => {
+            resolve_ruby_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Rust => {
+            resolve_rust_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Scala => {
+            resolve_scala_type_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        _ => unreachable!("unsupported structural receiver language"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_structural_definition_bounded(
+    language: Language,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&tree_sitter::Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<DefinitionLookupOutcome> {
+    match language {
+        Language::Cpp => {
+            resolve_cpp_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::CSharp => {
+            resolve_csharp_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Go => {
+            resolve_go_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Php => {
+            resolve_php_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Python => {
+            resolve_python_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Ruby => {
+            resolve_ruby_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Rust => {
+            resolve_rust_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        Language::Scala => {
+            resolve_scala_bounded(analyzer, file, source, tree, site, budget, cancellation)
+        }
+        _ => unreachable!("unsupported structural receiver language"),
+    }
+}
+
+fn structural_receiver_unsupported_reason(
+    language: Language,
+    outcome: &TypeLookupOutcome,
+) -> Option<&'static str> {
+    match language {
+        Language::Cpp
+            if outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "cpp_c_receiver_unsupported") =>
+        {
+            Some("cpp_c_receiver_unsupported")
+        }
+        Language::CSharp
+            if outcome
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "csharp_dynamic_receiver_unsupported") =>
+        {
+            Some("csharp_dynamic_receiver_unsupported")
+        }
+        _ => None,
+    }
+}
+
+fn structural_member_dispatch_supports_precise(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    analysis: &ReceiverQueryAnalysis,
+    cancellation: Option<&CancellationToken>,
+    ledger: &mut ReceiverWorkLedger,
+) -> Result<CompatibilityOutcome<bool>, ReceiverQueryError> {
+    let ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(targets)) = analysis
+    else {
+        return Ok(CompatibilityOutcome::Complete(false));
+    };
+    let [target] = targets.as_slice() else {
+        return Ok(CompatibilityOutcome::Complete(false));
+    };
+    check_cancelled(cancellation)?;
+    if structural_member_is_statically_bound_data_member(language, analysis) {
+        return Ok(CompatibilityOutcome::Complete(true));
+    }
+    if let Err(limit) = charge_summary_step(ledger) {
+        return Ok(CompatibilityOutcome::Exceeded(limit));
+    }
+    if let Err(limit) = charge_scope_step(ledger) {
+        return Ok(CompatibilityOutcome::Exceeded(limit));
+    }
+    let provider_limit = ledger.remaining_budget().max_scope_nodes.saturating_add(1);
+    let metadata = match language {
+        Language::Cpp => resolve_analyzer::<CppAnalyzer>(analyzer)
+            .map(|cpp| cpp.signature_metadata_limited(target, provider_limit)),
+        Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
+            .map(|csharp| csharp.signature_metadata_limited(target, provider_limit)),
+        Language::Go => resolve_analyzer::<GoAnalyzer>(analyzer)
+            .map(|go| go.signature_metadata_limited(target, provider_limit)),
+        Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer)
+            .map(|php| php.signature_metadata_limited(target, provider_limit)),
+        Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer)
+            .map(|python| python.signature_metadata_limited(target, provider_limit)),
+        Language::Ruby => resolve_analyzer::<RubyAnalyzer>(analyzer)
+            .map(|ruby| ruby.signature_metadata_limited(target, provider_limit)),
+        Language::Rust => resolve_analyzer::<RustAnalyzer>(analyzer)
+            .map(|rust| rust.signature_metadata_limited(target, provider_limit)),
+        Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer)
+            .map(|scala| scala.signature_metadata_limited(target, provider_limit)),
+        _ => None,
+    };
+    let Some(metadata) = metadata else {
+        return Ok(CompatibilityOutcome::Exceeded(
+            ReceiverBudgetLimit::ScopeNodes,
+        ));
+    };
+    let metadata = match charge_limited_projection(metadata, cancellation, ledger)? {
+        CompatibilityOutcome::Complete(metadata) => metadata,
+        CompatibilityOutcome::Exceeded(limit) => {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
+        }
+    };
+    if metadata.is_empty() {
+        return Ok(CompatibilityOutcome::Complete(false));
+    }
+    Ok(CompatibilityOutcome::Complete(metadata.iter().all(
+        |metadata| metadata.dispatch_extensibility() == Some(DispatchExtensibility::Closed),
+    )))
+}
+
+fn structural_member_is_statically_bound_data_member(
+    language: Language,
+    analysis: &ReceiverQueryAnalysis,
+) -> bool {
+    let ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(targets)) = analysis
+    else {
+        return false;
+    };
+    matches!(targets.as_slice(), [target] if target.is_field())
+        && matches!(language, Language::Cpp | Language::Go)
 }
 
 fn finalize_legacy_report(
@@ -1204,19 +2201,32 @@ fn apply_semantic_gate(
     gate: SemanticReceiverGate,
 ) -> ReceiverQueryReport {
     match gate {
+        SemanticReceiverGate::Bypassed { .. } => {}
         SemanticReceiverGate::Available {
             points_to,
-            truncated,
+            evidence,
             ..
         } => {
-            if let Some(points_to) = points_to {
-                let removed = retain_neutral_backed_values(&mut report.analysis, &points_to);
-                report.candidates_truncated |= removed;
+            let removed = retain_neutral_backed_values(&mut report.analysis, &points_to);
+            report.candidates_truncated |= removed;
+            report.candidates_truncated |= evidence.is_truncated();
+            report.semantic_unsupported = evidence.unsupported_capability();
+            // The legacy JS/TS provider independently proves closure for its
+            // supported lexical forms. Preserve that proof only when neutral
+            // candidates are themselves proven/complete and openness comes
+            // from the adapter's global capability surface. Query-local
+            // uncertainty (including disabled call context) remains
+            // non-precise.
+            if !evidence.supports_precise() && !evidence.legacy_provider_can_close() {
+                neutral_incomplete(&mut report.analysis);
             }
-            report.candidates_truncated |= truncated;
         }
-        SemanticReceiverGate::Unavailable { .. } => {
-            neutral_unknown(&mut report.analysis);
+        SemanticReceiverGate::Unavailable { unsupported, .. } => {
+            if let Some(capability) = unsupported {
+                neutral_unsupported(&mut report.analysis, capability.label());
+            } else {
+                neutral_unknown(&mut report.analysis);
+            }
         }
         SemanticReceiverGate::Exceeded { limit, .. } => {
             neutral_exceeded(&mut report.analysis, limit);
@@ -1303,6 +2313,7 @@ fn neutral_object_supports_receiver(
         // instance, allocation, static object, or module for the stable DTO.
         (
             AbstractObjectIdentity::Value(_)
+            | AbstractObjectIdentity::CallResult(_)
             | AbstractObjectIdentity::LexicalCell(_)
             | AbstractObjectIdentity::CaptureSlot(_)
             | AbstractObjectIdentity::TypeSummary(_)
@@ -1317,6 +2328,36 @@ fn neutral_unknown(analysis: &mut ReceiverQueryAnalysis) {
     match analysis {
         ReceiverQueryAnalysis::Values(outcome) => replace_with_neutral_unknown(outcome),
         ReceiverQueryAnalysis::MemberTargets(outcome) => replace_with_neutral_unknown(outcome),
+    }
+}
+
+fn neutral_incomplete(analysis: &mut ReceiverQueryAnalysis) {
+    match analysis {
+        ReceiverQueryAnalysis::Values(outcome) => downgrade_precise(outcome),
+        ReceiverQueryAnalysis::MemberTargets(outcome) => downgrade_precise(outcome),
+    }
+}
+
+fn neutral_unsupported(analysis: &mut ReceiverQueryAnalysis, reason: &'static str) {
+    match analysis {
+        ReceiverQueryAnalysis::Values(outcome) => {
+            *outcome = ReceiverAnalysisOutcome::Unsupported { reason };
+        }
+        ReceiverQueryAnalysis::MemberTargets(outcome) => {
+            *outcome = ReceiverAnalysisOutcome::Unsupported { reason };
+        }
+    }
+}
+
+fn downgrade_precise<T>(outcome: &mut ReceiverAnalysisOutcome<T>) {
+    let ReceiverAnalysisOutcome::Precise(_) = outcome else {
+        return;
+    };
+    let previous = std::mem::replace(outcome, ReceiverAnalysisOutcome::Unknown);
+    if let ReceiverAnalysisOutcome::Precise(values) = previous
+        && !values.is_empty()
+    {
+        *outcome = ReceiverAnalysisOutcome::Ambiguous(values);
     }
 }
 
@@ -1354,6 +2395,7 @@ fn replace_with_neutral_exceeded<T>(
 struct ReceiverSemanticBridge {
     budget: SemanticBudget,
     oracle_limits: OracleLimits,
+    call_context_disabled: bool,
 }
 
 impl ReceiverSemanticBridge {
@@ -1371,12 +2413,16 @@ impl ReceiverSemanticBridge {
         let scope = receiver.max_scope_nodes;
         let summaries = receiver.max_summary_expansions;
         let targets = receiver.max_targets.max(1);
-        // Oracle limits are positive by contract. Source projections always
-        // start with an empty OracleCallContext, so this representational
-        // minimum does not retain a call frame when receiver context depth is
-        // explicitly zero.
+        // Oracle limits are positive by contract. Preserve the caller's zero
+        // context request separately so any retained call-result candidate is
+        // downgraded even though the representational minimum is one frame.
         let context = receiver.context_depth.max(1);
         let text = scope.saturating_mul(1_024).max(1);
+        // Publishing each retained points-to candidate consumes one nested
+        // entry after graph traversal succeeds. Reserve that bounded tail so
+        // an otherwise complete receiver query cannot fail while serializing
+        // its final candidate set.
+        let publication_reserve = targets.min(scope - Self::SCOPE_DIMENSIONS);
         let [
             procedures,
             blocks,
@@ -1388,10 +2434,10 @@ impl ReceiverSemanticBridge {
             gaps,
             events,
             control_edges,
-            nested_entries,
-        ] = partition_receiver_limit::<{ Self::SCOPE_DIMENSIONS }>(scope);
-        let [call_sites, memory_locations, captures] =
-            partition_receiver_limit::<{ Self::SUMMARY_DIMENSIONS }>(summaries);
+            mut nested_entries,
+        ] = partition_receiver_limit::<{ Self::SCOPE_DIMENSIONS }>(scope - publication_reserve);
+        nested_entries += publication_reserve;
+        let [call_sites, memory_locations, captures] = partition_receiver_summary_limit(summaries);
         let budget = SemanticBudget::new(SemanticWork {
             source_bytes: text,
             procedures,
@@ -1427,6 +2473,7 @@ impl ReceiverSemanticBridge {
         Ok(Self {
             budget,
             oracle_limits,
+            call_context_disabled: receiver.context_depth == 0,
         })
     }
 
@@ -1493,25 +2540,92 @@ fn partition_receiver_limit<const DIMENSIONS: usize>(total: usize) -> [usize; DI
     std::array::from_fn(|index| quotient + usize::from(index < remainder))
 }
 
-fn java_receiver_values(
+fn partition_receiver_summary_limit(total: usize) -> [usize; 3] {
+    debug_assert!(total >= 3);
+    // Receiver queries are call-heavy: factory provenance and bounded
+    // interprocedural flow revisit call sites while memory/capture rows remain
+    // secondary. Keep every dimension positive, reserve half of the remaining
+    // aggregate capacity for calls, then split the rest across memory and
+    // captures. The three limits still sum exactly to the caller's aggregate
+    // summary budget.
+    let remaining = total - 3;
+    let call_extra = remaining.div_ceil(2);
+    let secondary = remaining - call_extra;
+    let memory_extra = secondary.div_ceil(2);
+    let capture_extra = secondary - memory_extra;
+    [1 + call_extra, 1 + memory_extra, 1 + capture_extra]
+}
+
+struct ReceiverValueProjection {
+    values: Vec<ReceiverValue>,
+    truncated: bool,
+    multiple_identities: bool,
+}
+
+fn projected_type_definitions(type_outcome: &TypeLookupOutcome) -> impl Iterator<Item = &CodeUnit> {
+    let definitions_per_type = if type_outcome.status == TypeLookupStatus::Resolved {
+        1
+    } else {
+        usize::MAX
+    };
+    type_outcome
+        .types
+        .iter()
+        .flat_map(move |ty| ty.definitions.iter().take(definitions_per_type))
+}
+
+fn project_static_receiver_values(
+    type_outcome: &TypeLookupOutcome,
+    cancellation: Option<&CancellationToken>,
+    ledger: &mut ReceiverWorkLedger,
+) -> Result<CompatibilityOutcome<ReceiverValueProjection>, ReceiverQueryError> {
+    let limit = ledger.remaining_budget().max_targets;
+    let projected_count = projected_type_definitions(type_outcome).count();
+    let mut values = Vec::with_capacity(projected_count.min(limit));
+    for definition in projected_type_definitions(type_outcome) {
+        if values.len() >= limit {
+            break;
+        }
+        check_cancelled(cancellation)?;
+        if let Err(limit) = charge_scope_step(ledger) {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
+        }
+        values.push(ReceiverValue::ClassOrStaticObject(definition.clone()));
+    }
+    Ok(CompatibilityOutcome::Complete(ReceiverValueProjection {
+        values,
+        truncated: projected_count > limit,
+        multiple_identities: false,
+    }))
+}
+
+fn project_receiver_values(
     workspace: &WorkspaceAnalyzer,
     points_to: &SourcePointsToResult,
     type_outcome: &crate::analyzer::usages::get_type::TypeLookupOutcome,
-    factory: Option<CodeUnit>,
+    factories: &[CodeUnit],
     type_reference: bool,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
-) -> Result<JavaCompatibilityOutcome<(Vec<ReceiverValue>, bool)>, ReceiverQueryError> {
+) -> Result<CompatibilityOutcome<ReceiverValueProjection>, ReceiverQueryError> {
     let limit = ledger.remaining_budget().max_targets;
     let mut allocations = Vec::new();
     let mut allocations_truncated = false;
     let mut current_receiver = false;
+    let mut nominal_instance = false;
+    let mut source_value_identity = false;
+    let mut call_results = Vec::new();
+    let mut identities = Vec::new();
     for candidate in points_to.object_candidates() {
         check_cancelled(cancellation)?;
-        if let Err(limit) = charge_java_scope_step(ledger) {
-            return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+        if let Err(limit) = charge_scope_step(ledger) {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
         }
-        match candidate.value().identity() {
+        let identity = candidate.value().identity();
+        if !identities.contains(&identity) {
+            identities.push(identity);
+        }
+        match identity {
             AbstractObjectIdentity::Allocation(allocation) => {
                 if !allocations.contains(allocation) {
                     if allocations.len() >= limit {
@@ -1526,102 +2640,276 @@ fn java_receiver_values(
             {
                 current_receiver = true;
             }
-            _ => {}
+            AbstractObjectIdentity::CallResult(result) => {
+                if !call_results.contains(result) {
+                    call_results.push(result.clone());
+                }
+            }
+            AbstractObjectIdentity::Value(_) => source_value_identity = true,
+            AbstractObjectIdentity::ProcedurePort(_)
+            | AbstractObjectIdentity::Static(_)
+            | AbstractObjectIdentity::LexicalCell(_)
+            | AbstractObjectIdentity::CaptureSlot(_)
+            | AbstractObjectIdentity::TypeSummary(_)
+            | AbstractObjectIdentity::ModuleObject(_)
+            | AbstractObjectIdentity::External(_) => nominal_instance = true,
         }
     }
-    let projected_count = type_outcome
-        .types
-        .iter()
-        .map(|ty| ty.definitions.len())
-        .sum::<usize>()
-        .saturating_mul(if current_receiver || allocations.is_empty() {
-            1
+    let static_reference = matches!(
+        type_outcome.target_kind,
+        crate::analyzer::usages::target_kind::TypeLookupTargetKind::TypeReference
+    ) || type_reference;
+    let mut factory_ranges = Vec::new();
+    if !call_results.is_empty() {
+        for factory in factories {
+            let ranges = match code_unit_ranges_bounded(
+                workspace.analyzer(),
+                factory,
+                cancellation,
+                ledger,
+            )? {
+                CompatibilityOutcome::Complete(ranges) => ranges,
+                CompatibilityOutcome::Exceeded(limit) => {
+                    return Ok(CompatibilityOutcome::Exceeded(limit));
+                }
+            };
+            factory_ranges.push((factory, ranges));
+        }
+    }
+    let mut matching_factories = Vec::new();
+    let mut unmatched_call_result = factories.is_empty() && !call_results.is_empty();
+    for result in &call_results {
+        let mut matched = None;
+        for (factory, ranges) in &factory_ranges {
+            check_cancelled(cancellation)?;
+            if let Err(limit) = charge_scope_step(ledger) {
+                return Ok(CompatibilityOutcome::Exceeded(limit));
+            }
+            if call_result_matches_factory(result, factory, ranges) {
+                matched = Some((*factory).clone());
+                break;
+            }
+        }
+        if let Some(factory) = matched {
+            if !matching_factories.contains(&factory) {
+                matching_factories.push(factory);
+            }
         } else {
-            allocations.len()
-        });
+            unmatched_call_result = true;
+        }
+    }
+    // A fully matched call result is the specific public identity for the
+    // exact factory expression. Some lowerers also retain generic source-value
+    // scaffolding at that span; publishing it as a second nominal instance
+    // duplicates the same expression and falsely turns one factory result into
+    // an ambiguous answer. Other symbolic roots and unmatched calls remain
+    // independent candidates.
+    let factory_covers_source_value =
+        !matching_factories.is_empty() && !unmatched_call_result && !call_results.is_empty();
+    let include_nominal_instance =
+        nominal_instance || (source_value_identity && !factory_covers_source_value);
+    let projection_kinds = if static_reference {
+        1
+    } else {
+        allocations
+            .len()
+            .saturating_add(usize::from(current_receiver))
+            .saturating_add(usize::from(
+                include_nominal_instance || unmatched_call_result,
+            ))
+            .saturating_add(matching_factories.len())
+    };
+    let projected_count = projected_type_definitions(type_outcome)
+        .count()
+        .saturating_mul(projection_kinds);
     let mut values = Vec::new();
-    for definition in type_outcome
-        .types
-        .iter()
-        .flat_map(|ty| ty.definitions.iter())
-    {
+    for definition in projected_type_definitions(type_outcome) {
         if values.len() >= limit {
             break;
         }
         check_cancelled(cancellation)?;
-        if let Err(limit) = charge_java_scope_step(ledger) {
-            return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+        if let Err(limit) = charge_scope_step(ledger) {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
         }
-        let value = if current_receiver {
-            ReceiverValue::CurrentReceiver(definition.clone())
-        } else if matches!(
-            type_outcome.target_kind,
-            crate::analyzer::usages::target_kind::TypeLookupTargetKind::TypeReference
-        ) || type_reference
-        {
-            ReceiverValue::ClassOrStaticObject(definition.clone())
-        } else if allocations.is_empty() {
-            ReceiverValue::InstanceType(definition.clone())
-        } else {
-            for allocation in &allocations {
-                if values.len() >= limit {
-                    break;
-                }
-                check_cancelled(cancellation)?;
-                if let Err(limit) = charge_java_scope_step(ledger) {
-                    return Ok(JavaCompatibilityOutcome::Exceeded(limit));
-                }
-                let row = allocation
-                    .procedure()
-                    .semantics()
-                    .allocation(allocation.id())
-                    .expect("allocation handles are validated");
-                let span = allocation
-                    .procedure()
-                    .semantics()
-                    .source_mapping(row.source)
-                    .expect("allocation source is validated")
-                    .locator
-                    .anchor()
-                    .span();
-                let key = allocation.procedure().artifact().key();
-                let file = ProjectFile::new(
-                    workspace.analyzer().project().root().to_path_buf(),
-                    key.path().as_path(),
-                );
-                values.push(ReceiverValue::AllocationSite {
-                    ty: definition.clone(),
-                    file,
-                    range: Range {
-                        start_byte: span.start_byte() as usize,
-                        end_byte: span.end_byte() as usize,
-                        start_line: span.start().line() as usize,
-                        end_line: span.end().line() as usize,
-                    },
-                });
-            }
+        if static_reference {
+            values.push(ReceiverValue::ClassOrStaticObject(definition.clone()));
+            continue;
+        }
+        if current_receiver {
+            values.push(ReceiverValue::CurrentReceiver(definition.clone()));
+        }
+        for allocation in &allocations {
             if values.len() >= limit {
                 break;
             }
-            continue;
-        };
-        values.push(if let Some(factory) = &factory {
-            ReceiverValue::FactoryReturn {
-                factory: factory.clone(),
-                value: Box::new(value),
+            check_cancelled(cancellation)?;
+            if let Err(limit) = charge_scope_step(ledger) {
+                return Ok(CompatibilityOutcome::Exceeded(limit));
             }
-        } else {
-            value
-        });
+            let row = allocation
+                .procedure()
+                .semantics()
+                .allocation(allocation.id())
+                .expect("allocation handles are validated");
+            let span = allocation
+                .procedure()
+                .semantics()
+                .source_mapping(row.source)
+                .expect("allocation source is validated")
+                .locator
+                .anchor()
+                .span();
+            let key = allocation.procedure().artifact().key();
+            let file = ProjectFile::new(
+                workspace.analyzer().project().root().to_path_buf(),
+                key.path().as_path(),
+            );
+            values.push(ReceiverValue::AllocationSite {
+                ty: definition.clone(),
+                file,
+                range: Range {
+                    start_byte: span.start_byte() as usize,
+                    end_byte: span.end_byte() as usize,
+                    start_line: span.start().line() as usize,
+                    end_line: span.end().line() as usize,
+                },
+            });
+        }
+        if (include_nominal_instance || unmatched_call_result) && values.len() < limit {
+            let value = ReceiverValue::InstanceType(definition.clone());
+            values.push(value);
+        }
+        for factory in &matching_factories {
+            if values.len() >= limit {
+                break;
+            }
+            values.push(ReceiverValue::FactoryReturn {
+                factory: factory.clone(),
+                value: Box::new(ReceiverValue::InstanceType(definition.clone())),
+            });
+        }
         if values.len() >= limit {
             break;
         }
     }
     values.truncate(limit);
-    Ok(JavaCompatibilityOutcome::Complete((
+    Ok(CompatibilityOutcome::Complete(ReceiverValueProjection {
         values,
-        allocations_truncated || projected_count > limit,
-    )))
+        truncated: allocations_truncated || projected_count > limit,
+        multiple_identities: identities
+            .iter()
+            .filter(|identity| {
+                !factory_covers_source_value
+                    || !matches!(identity, AbstractObjectIdentity::Value(_))
+            })
+            .count()
+            > 1,
+    }))
+}
+
+fn points_to_contains_call_result(
+    points_to: &SourcePointsToResult,
+    cancellation: Option<&CancellationToken>,
+) -> Result<bool, ReceiverQueryError> {
+    for candidate in points_to.object_candidates() {
+        check_cancelled(cancellation)?;
+        if matches!(
+            candidate.value().identity(),
+            AbstractObjectIdentity::CallResult(_)
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn code_unit_ranges_bounded(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+    cancellation: Option<&CancellationToken>,
+    ledger: &mut ReceiverWorkLedger,
+) -> Result<CompatibilityOutcome<Vec<Range>>, ReceiverQueryError> {
+    check_cancelled(cancellation)?;
+    if let Err(limit) = charge_summary_step(ledger) {
+        return Ok(CompatibilityOutcome::Exceeded(limit));
+    }
+    let language = language_for_file(unit.source());
+    if matches!(
+        language,
+        Language::Cpp
+            | Language::CSharp
+            | Language::Go
+            | Language::Java
+            | Language::JavaScript
+            | Language::Php
+            | Language::Python
+            | Language::Ruby
+            | Language::Rust
+            | Language::Scala
+            | Language::TypeScript
+    ) {
+        if let Err(limit) = charge_scope_step(ledger) {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
+        }
+        let provider_limit = ledger.remaining_budget().max_scope_nodes.saturating_add(1);
+        let ranges = match language {
+            Language::Cpp => resolve_analyzer::<CppAnalyzer>(analyzer)
+                .map(|cpp| cpp.ranges_limited(unit, provider_limit)),
+            Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
+                .map(|csharp| csharp.ranges_limited(unit, provider_limit)),
+            Language::Go => resolve_analyzer::<GoAnalyzer>(analyzer)
+                .map(|go| go.ranges_limited(unit, provider_limit)),
+            Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer)
+                .map(|java| java.inner().ranges_limited(unit, provider_limit)),
+            Language::JavaScript => resolve_analyzer::<JavascriptAnalyzer>(analyzer)
+                .map(|javascript| javascript.ranges_limited(unit, provider_limit)),
+            Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer)
+                .map(|php| php.ranges_limited(unit, provider_limit)),
+            Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer)
+                .map(|python| python.ranges_limited(unit, provider_limit)),
+            Language::Ruby => resolve_analyzer::<RubyAnalyzer>(analyzer)
+                .map(|ruby| ruby.ranges_limited(unit, provider_limit)),
+            Language::Rust => resolve_analyzer::<RustAnalyzer>(analyzer)
+                .map(|rust| rust.ranges_limited(unit, provider_limit)),
+            Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer)
+                .map(|scala| scala.ranges_limited(unit, provider_limit)),
+            Language::TypeScript => resolve_analyzer::<TypescriptAnalyzer>(analyzer)
+                .map(|typescript| typescript.ranges_limited(unit, provider_limit)),
+            _ => unreachable!("language was checked above"),
+        };
+        let Some(ranges) = ranges else {
+            return Ok(CompatibilityOutcome::Exceeded(
+                ReceiverBudgetLimit::ScopeNodes,
+            ));
+        };
+        return charge_limited_projection(ranges, cancellation, ledger);
+    }
+    Ok(CompatibilityOutcome::Exceeded(
+        ReceiverBudgetLimit::ScopeNodes,
+    ))
+}
+
+fn call_result_matches_factory(
+    result: &crate::analyzer::semantic::CallResultHandle,
+    factory: &CodeUnit,
+    factory_ranges: &[Range],
+) -> bool {
+    let callee = result.callee();
+    if callee.artifact().key().path().as_path() != factory.source().rel_path() {
+        return false;
+    }
+    let Some(declaration) = callee.semantics().locator().declaration().segments().last() else {
+        return false;
+    };
+    if declaration.name() != Some(factory.identifier()) {
+        return false;
+    }
+    let span = callee.semantics().locator().anchor().span();
+    let start = span.start_byte() as usize;
+    let end = span.end_byte() as usize;
+    factory_ranges
+        .iter()
+        .any(|range| range.start_byte <= start && end <= range.end_byte)
 }
 
 fn java_factory_name_node(node: Node<'_>) -> Option<Node<'_>> {
@@ -1629,6 +2917,104 @@ fn java_factory_name_node(node: Node<'_>) -> Option<Node<'_>> {
         return None;
     }
     node.child_by_field_name("name")
+}
+
+fn structural_factory_name_node(language: Language, node: Node<'_>) -> Option<Node<'_>> {
+    match language {
+        Language::Cpp => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let function = node.child_by_field_name("function")?;
+            match function.kind() {
+                "field_expression" => function.child_by_field_name("field"),
+                "qualified_identifier" => function.child_by_field_name("name"),
+                "identifier" => Some(function),
+                _ => None,
+            }
+        }
+        Language::CSharp => {
+            if node.kind() != "invocation_expression" {
+                return None;
+            }
+            let function = node.child_by_field_name("function")?;
+            match function.kind() {
+                "member_access_expression" => function.child_by_field_name("name"),
+                "identifier" | "generic_name" => Some(function),
+                _ => None,
+            }
+        }
+        Language::Go => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let function = node.child_by_field_name("function")?;
+            match function.kind() {
+                "selector_expression" => function.child_by_field_name("field"),
+                "identifier" => Some(function),
+                _ => None,
+            }
+        }
+        Language::Php => match node.kind() {
+            "function_call_expression" => node.child_by_field_name("function"),
+            "member_call_expression"
+            | "nullsafe_member_call_expression"
+            | "scoped_call_expression" => node.child_by_field_name("name"),
+            _ => None,
+        },
+        Language::Python => {
+            if node.kind() != "call" {
+                return None;
+            }
+            let function = node.child_by_field_name("function")?;
+            match function.kind() {
+                "attribute" => function.child_by_field_name("attribute"),
+                "identifier" => Some(function),
+                _ => None,
+            }
+        }
+        Language::Ruby => {
+            if node.kind() != "call" {
+                return None;
+            }
+            node.child_by_field_name("method")
+        }
+        Language::Rust => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let mut function = node.child_by_field_name("function")?;
+            while function.kind() == "generic_function" {
+                function = function.child_by_field_name("function")?;
+            }
+            match function.kind() {
+                "field_expression" => function.child_by_field_name("field"),
+                "scoped_identifier" | "scoped_type_identifier" => {
+                    function.child_by_field_name("name")
+                }
+                "identifier" => Some(function),
+                _ => None,
+            }
+        }
+        Language::Scala => {
+            if node.kind() != "call_expression" {
+                return None;
+            }
+            let mut function = node.child_by_field_name("function")?;
+            while function.kind() == "call_expression" {
+                function = function.child_by_field_name("function")?;
+            }
+            if function.kind() == "generic_function" {
+                function = function.child_by_field_name("function")?;
+            }
+            match function.kind() {
+                "field_expression" => function.child_by_field_name("field"),
+                "identifier" | "operator_identifier" => Some(function),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn java_definition_at(
@@ -1785,27 +3171,27 @@ fn java_parent_node<'tree>(
     node: Node<'tree>,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
-) -> Result<JavaCompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
+) -> Result<CompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
     check_cancelled(cancellation)?;
-    if let Err(limit) = charge_java_scope_step(ledger) {
-        return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+    if let Err(limit) = charge_scope_step(ledger) {
+        return Ok(CompatibilityOutcome::Exceeded(limit));
     }
-    Ok(JavaCompatibilityOutcome::Complete(node.parent()))
+    Ok(CompatibilityOutcome::Complete(node.parent()))
 }
 
 fn java_contextual_type_node<'tree>(
     mut node: Node<'tree>,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
-) -> Result<JavaCompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
+) -> Result<CompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
     loop {
         let parent = match java_parent_node(node, cancellation, ledger)? {
-            JavaCompatibilityOutcome::Complete(Some(parent)) => parent,
-            JavaCompatibilityOutcome::Complete(None) => {
-                return Ok(JavaCompatibilityOutcome::Complete(None));
+            CompatibilityOutcome::Complete(Some(parent)) => parent,
+            CompatibilityOutcome::Complete(None) => {
+                return Ok(CompatibilityOutcome::Complete(None));
             }
-            JavaCompatibilityOutcome::Exceeded(limit) => {
-                return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+            CompatibilityOutcome::Exceeded(limit) => {
+                return Ok(CompatibilityOutcome::Exceeded(limit));
             }
         };
         if parent.kind() == "variable_declarator"
@@ -1813,7 +3199,7 @@ fn java_contextual_type_node<'tree>(
                 value.start_byte() <= node.start_byte() && value.end_byte() >= node.end_byte()
             })
         {
-            return Ok(JavaCompatibilityOutcome::Complete(
+            return Ok(CompatibilityOutcome::Complete(
                 parent.child_by_field_name("name"),
             ));
         }
@@ -1821,13 +3207,13 @@ fn java_contextual_type_node<'tree>(
             parent.kind(),
             "statement" | "expression_statement" | "return_statement" | "block"
         ) {
-            return Ok(JavaCompatibilityOutcome::Complete(None));
+            return Ok(CompatibilityOutcome::Complete(None));
         }
         node = parent;
     }
 }
 
-fn java_definition_outcome(
+fn definition_outcome(
     outcome: DefinitionLookupOutcome,
     limit: usize,
 ) -> (ReceiverAnalysisOutcome<CodeUnit>, bool) {
@@ -1857,18 +3243,18 @@ fn java_definition_outcome(
     (outcome, truncated)
 }
 
-fn java_current_receiver_owners(
+fn current_receiver_owners(
     workspace: &WorkspaceAnalyzer,
     points_to: &SourcePointsToResult,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
-) -> Result<JavaCompatibilityOutcome<Vec<CodeUnit>>, ReceiverQueryError> {
+) -> Result<CompatibilityOutcome<Vec<CodeUnit>>, ReceiverQueryError> {
     let analyzer = workspace.analyzer();
     let mut owners = Vec::new();
     for candidate in points_to.object_candidates() {
         check_cancelled(cancellation)?;
-        if let Err(limit) = charge_java_scope_step(ledger) {
-            return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+        if let Err(limit) = charge_scope_step(ledger) {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
         }
         let AbstractObjectIdentity::ProcedurePort(port) = candidate.value().identity() else {
             continue;
@@ -1880,8 +3266,8 @@ fn java_current_receiver_owners(
             analyzer.project().root().to_path_buf(),
             port.procedure().artifact().key().path().as_path(),
         );
-        if let Err(limit) = charge_java_scope_step(ledger) {
-            return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+        if let Err(limit) = charge_scope_step(ledger) {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
         }
         let byte = port
             .procedure()
@@ -1899,19 +3285,19 @@ fn java_current_receiver_owners(
         let Some(mut owner) = analyzer.enclosing_code_unit(&file, &range) else {
             continue;
         };
-        if let Err(limit) = charge_java_scope_step(ledger) {
-            return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+        if let Err(limit) = charge_scope_step(ledger) {
+            return Ok(CompatibilityOutcome::Exceeded(limit));
         }
         while !owner.is_class() {
             check_cancelled(cancellation)?;
-            if let Err(limit) = charge_java_summary_step(ledger) {
-                return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+            if let Err(limit) = charge_summary_step(ledger) {
+                return Ok(CompatibilityOutcome::Exceeded(limit));
             }
             let Some(parent) = analyzer.parent_of(&owner) else {
                 break;
             };
-            if let Err(limit) = charge_java_scope_step(ledger) {
-                return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+            if let Err(limit) = charge_scope_step(ledger) {
+                return Ok(CompatibilityOutcome::Exceeded(limit));
             }
             owner = parent;
         }
@@ -1919,16 +3305,27 @@ fn java_current_receiver_owners(
             owners.push(owner);
         }
     }
-    Ok(JavaCompatibilityOutcome::Complete(owners))
+    Ok(CompatibilityOutcome::Complete(owners))
 }
 
-fn java_type_outcome<T>(status: TypeLookupStatus, values: Vec<T>) -> ReceiverAnalysisOutcome<T> {
-    if values.is_empty() {
+fn receiver_type_outcome<T>(status: TypeLookupStatus, values: Vec<T>) -> ReceiverAnalysisOutcome<T>
+where
+    T: Eq,
+{
+    let mut unique = Vec::with_capacity(values.len());
+    for value in values {
+        if !unique.contains(&value) {
+            unique.push(value);
+        }
+    }
+    if unique.is_empty() {
         return ReceiverAnalysisOutcome::Unknown;
     }
     match status {
-        TypeLookupStatus::Resolved => ReceiverAnalysisOutcome::Precise(values),
-        TypeLookupStatus::Ambiguous => ReceiverAnalysisOutcome::Ambiguous(values),
+        TypeLookupStatus::Resolved if unique.len() == 1 => ReceiverAnalysisOutcome::Precise(unique),
+        TypeLookupStatus::Resolved | TypeLookupStatus::Ambiguous => {
+            ReceiverAnalysisOutcome::Ambiguous(unique)
+        }
         TypeLookupStatus::NoType
         | TypeLookupStatus::InvalidLocation
         | TypeLookupStatus::NotFound => ReceiverAnalysisOutcome::Unknown,
@@ -1966,6 +3363,7 @@ fn java_unknown_report(
         analysis,
         work: ReceiverAnalysisWork::default(),
         candidates_truncated: false,
+        semantic_unsupported: None,
     }
 }
 
@@ -1993,6 +3391,31 @@ fn budget_report(
         analysis,
         work,
         candidates_truncated: false,
+        semantic_unsupported: None,
+    }
+}
+
+fn unknown_report(
+    operation: ReceiverQueryOperation,
+    site: ReceiverQuerySite,
+    work: ReceiverAnalysisWork,
+    candidates_truncated: bool,
+) -> ReceiverQueryReport {
+    let analysis = match operation {
+        ReceiverQueryOperation::MemberTargets => {
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Unknown)
+        }
+        ReceiverQueryOperation::ReceiverTargets | ReceiverQueryOperation::PointsTo => {
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Unknown)
+        }
+    };
+    ReceiverQueryReport {
+        operation,
+        site,
+        analysis,
+        work,
+        candidates_truncated,
+        semantic_unsupported: None,
     }
 }
 
@@ -2000,27 +3423,27 @@ fn java_receiver_at_site<'tree>(
     mut node: Node<'tree>,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
-) -> Result<JavaCompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
+) -> Result<CompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
     loop {
         match node.kind() {
             "method_invocation" => {
-                return Ok(JavaCompatibilityOutcome::Complete(
+                return Ok(CompatibilityOutcome::Complete(
                     node.child_by_field_name("object"),
                 ));
             }
             "field_access" => {
-                return Ok(JavaCompatibilityOutcome::Complete(
+                return Ok(CompatibilityOutcome::Complete(
                     node.child_by_field_name("object"),
                 ));
             }
             _ => {
                 node = match java_parent_node(node, cancellation, ledger)? {
-                    JavaCompatibilityOutcome::Complete(Some(parent)) => parent,
-                    JavaCompatibilityOutcome::Complete(None) => {
-                        return Ok(JavaCompatibilityOutcome::Complete(None));
+                    CompatibilityOutcome::Complete(Some(parent)) => parent,
+                    CompatibilityOutcome::Complete(None) => {
+                        return Ok(CompatibilityOutcome::Complete(None));
                     }
-                    JavaCompatibilityOutcome::Exceeded(limit) => {
-                        return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+                    CompatibilityOutcome::Exceeded(limit) => {
+                        return Ok(CompatibilityOutcome::Exceeded(limit));
                     }
                 };
             }
@@ -2034,21 +3457,21 @@ fn java_smallest_named_node_covering<'tree>(
     end: usize,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
-) -> Result<JavaCompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
+) -> Result<CompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
     check_cancelled(cancellation)?;
-    if let Err(limit) = charge_java_scope_step(ledger) {
-        return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+    if let Err(limit) = charge_scope_step(ledger) {
+        return Ok(CompatibilityOutcome::Exceeded(limit));
     }
     if node.end_byte() < end || node.start_byte() > start {
-        return Ok(JavaCompatibilityOutcome::Complete(None));
+        return Ok(CompatibilityOutcome::Complete(None));
     }
     loop {
         let mut cursor = node.walk();
         let mut containing_child = None;
         for child in node.named_children(&mut cursor) {
             check_cancelled(cancellation)?;
-            if let Err(limit) = charge_java_scope_step(ledger) {
-                return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+            if let Err(limit) = charge_scope_step(ledger) {
+                return Ok(CompatibilityOutcome::Exceeded(limit));
             }
             if child.start_byte() <= start && child.end_byte() >= end {
                 containing_child = Some(child);
@@ -2057,7 +3480,7 @@ fn java_smallest_named_node_covering<'tree>(
         }
         match containing_child {
             Some(child) => node = child,
-            None => return Ok(JavaCompatibilityOutcome::Complete(Some(node))),
+            None => return Ok(CompatibilityOutcome::Complete(Some(node))),
         }
     }
 }
@@ -2066,7 +3489,7 @@ fn java_member_node_at_site<'tree>(
     mut node: Node<'tree>,
     cancellation: Option<&CancellationToken>,
     ledger: &mut ReceiverWorkLedger,
-) -> Result<JavaCompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
+) -> Result<CompatibilityOutcome<Option<Node<'tree>>>, ReceiverQueryError> {
     loop {
         let member = match node.kind() {
             "method_invocation" => node.child_by_field_name("name"),
@@ -2074,15 +3497,15 @@ fn java_member_node_at_site<'tree>(
             _ => None,
         };
         if let Some(member) = member {
-            return Ok(JavaCompatibilityOutcome::Complete(Some(member)));
+            return Ok(CompatibilityOutcome::Complete(Some(member)));
         }
         node = match java_parent_node(node, cancellation, ledger)? {
-            JavaCompatibilityOutcome::Complete(Some(parent)) => parent,
-            JavaCompatibilityOutcome::Complete(None) => {
-                return Ok(JavaCompatibilityOutcome::Complete(None));
+            CompatibilityOutcome::Complete(Some(parent)) => parent,
+            CompatibilityOutcome::Complete(None) => {
+                return Ok(CompatibilityOutcome::Complete(None));
             }
-            JavaCompatibilityOutcome::Exceeded(limit) => {
-                return Ok(JavaCompatibilityOutcome::Exceeded(limit));
+            CompatibilityOutcome::Exceeded(limit) => {
+                return Ok(CompatibilityOutcome::Exceeded(limit));
             }
         };
     }
@@ -2102,6 +3525,7 @@ fn values_report(
         analysis: ReceiverQueryAnalysis::Values(analysis.outcome),
         work: analysis.work,
         candidates_truncated: analysis.candidates_truncated,
+        semantic_unsupported: None,
     }
 }
 
@@ -2137,6 +3561,7 @@ fn unsupported_report(
         analysis,
         work: ReceiverAnalysisWork::default(),
         candidates_truncated: false,
+        semantic_unsupported: None,
     }
 }
 
@@ -2154,6 +3579,23 @@ fn setup_budget_report(
         work,
         ReceiverBudgetLimit::ScopeNodes,
     )
+}
+
+fn structural_reference_site(
+    file: &ProjectFile,
+    source: &str,
+    range: Range,
+) -> ResolvedReferenceSite {
+    ResolvedReferenceSite {
+        path: rel_path_string(file),
+        text: source
+            .get(range.start_byte..range.end_byte)
+            .unwrap_or_default()
+            .to_string(),
+        range,
+        focus_start_byte: range.start_byte,
+        focus_end_byte: range.end_byte,
+    }
 }
 
 fn site(
@@ -2227,6 +3669,19 @@ mod tests {
         }
     }
 
+    fn csharp_structural_facts(
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+    ) -> Arc<FileFacts> {
+        workspace
+            .analyzer()
+            .structural_search_providers()
+            .into_iter()
+            .find(|provider| provider.structural_language() == Language::CSharp)
+            .and_then(|provider| provider.structural_facts(file))
+            .expect("C# structural facts")
+    }
+
     #[test]
     fn points_to_reports_factory_and_allocation_provenance_with_work() {
         let source = r#"
@@ -2267,6 +3722,126 @@ export function caller() {
             ),
             "unexpected analysis: {:?}",
             report.analysis
+        );
+    }
+
+    #[test]
+    fn workspace_factory_provenance_fits_the_default_aggregate_budget() {
+        let source = r#"
+class Service {
+  run() {}
+}
+
+class Other {
+  run() {}
+}
+
+function makeService() {
+  return new Service();
+}
+
+function consume(value: Service) {
+  value.run();
+}
+
+export function caller(flag: boolean) {
+  const direct = new Service();
+  direct.run();
+
+  const factory = makeService();
+  factory.run();
+
+  const ambiguous = flag ? new Service() : new Other();
+  ambiguous.run();
+
+  consume(new Service());
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
+        file.write(source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::TypeScript)),
+            AnalyzerConfig::default(),
+        );
+
+        let service = ReceiverQueryService::from_workspace(&workspace);
+        let receiver_range = last_marker_range(source, "factory");
+        let gate = service
+            .semantic_receiver_gate(
+                &file,
+                receiver_range,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("workspace semantic gate");
+        let gate_work = gate.work();
+        assert!(matches!(
+            gate,
+            SemanticReceiverGate::Available {
+                evidence: SemanticReceiverEvidence::Incomplete {
+                    origin: SemanticReceiverIncompleteness::GlobalCapabilitiesWithProvenCandidates,
+                    ..
+                },
+                ..
+            }
+        ));
+        let report = service
+            .analyze(
+                ReceiverQueryOperation::PointsTo,
+                &file,
+                receiver_range,
+                ReceiverQueryInput::Expression,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("workspace receiver query");
+
+        assert!(
+            matches!(
+                &report.analysis,
+                ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(values))
+                    if matches!(
+                        values.as_slice(),
+                        [ReceiverValue::FactoryReturn { factory, value }]
+                            if factory.fq_name().ends_with("makeService")
+                                && matches!(value.as_ref(), ReceiverValue::AllocationSite { ty, .. } if ty.fq_name().ends_with("Service"))
+                    )
+            ),
+            "{report:#?}\nsemantic gate work: {gate_work:#?}"
+        );
+        assert!(
+            report.work.summary_expansions
+                <= ReceiverAnalysisBudget::default().max_summary_expansions,
+            "{report:#?}"
+        );
+
+        let context_disabled = service
+            .analyze(
+                ReceiverQueryOperation::PointsTo,
+                &file,
+                receiver_range,
+                ReceiverQueryInput::Expression,
+                ReceiverAnalysisBudget {
+                    context_depth: 0,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                None,
+            )
+            .expect("context-disabled workspace receiver query");
+        assert!(
+            matches!(
+                &context_disabled.analysis,
+                ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Ambiguous(values))
+                    if matches!(
+                        values.as_slice(),
+                        [ReceiverValue::FactoryReturn { factory, value }]
+                            if factory.fq_name().ends_with("makeService")
+                                && matches!(value.as_ref(), ReceiverValue::AllocationSite { ty, .. } if ty.fq_name().ends_with("Service"))
+                    )
+            ),
+            "{context_disabled:#?}"
         );
     }
 
@@ -2457,11 +4032,780 @@ export function caller() {
     }
 
     #[test]
+    fn csharp_queries_share_cached_setup_exact_resolution_budget_and_cancellation() {
+        let source = r#"
+namespace Demo;
+class Service { public void Run() {} }
+class Caller {
+    void Run() {}
+    void Call(Service service) {
+        service.Run();
+        Run();
+    }
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.cs"));
+        file.write(source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::CSharp)),
+            AnalyzerConfig::default(),
+        );
+        let service = ReceiverQueryService::from_workspace(&workspace);
+        let facts = csharp_structural_facts(&workspace, &file);
+        let range = marker_range(source, "service.Run");
+
+        let first = service
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("first C# receiver query");
+        let second = service
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("cached C# receiver query");
+        for report in [&first, &second] {
+            assert!(
+                matches!(
+                    report.analysis,
+                    ReceiverQueryAnalysis::MemberTargets(
+                        ReceiverAnalysisOutcome::Precise(ref targets)
+                    ) if matches!(targets.as_slice(), [target] if target.fq_name() == "Demo.Service.Run")
+                ),
+                "{report:#?}"
+            );
+        }
+        assert_eq!(service.prepared_file_count(), 1);
+        assert!(first.work.setup_nodes > second.work.setup_nodes);
+        assert!(
+            second.work.setup_nodes > 0,
+            "cached site selection must remain charged"
+        );
+
+        let warm_scope = second
+            .work
+            .setup_nodes
+            .saturating_add(second.work.scope_nodes);
+        assert!(warm_scope > 0);
+        let bounded = service
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget {
+                    max_scope_nodes: warm_scope - 1,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                None,
+            )
+            .expect("bounded cached C# receiver query");
+        assert!(matches!(
+            bounded.analysis,
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
+                limit: "scope_nodes"
+            })
+        ));
+        assert!(
+            bounded
+                .work
+                .setup_nodes
+                .saturating_add(bounded.work.scope_nodes)
+                < warm_scope
+        );
+
+        let cold = ReceiverQueryService::from_workspace(&workspace)
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget::tiny(),
+                None,
+            )
+            .expect("tiny-budget C# receiver query");
+        assert!(matches!(
+            cold.analysis,
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::ExceededBudget {
+                limit: "scope_nodes"
+            })
+        ));
+        assert!(
+            cold.work.setup_nodes.saturating_add(cold.work.scope_nodes)
+                <= ReceiverAnalysisBudget::tiny().max_scope_nodes
+        );
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert_eq!(
+            service.analyze_with_structural_facts(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget::default(),
+                Some(&cancellation),
+            ),
+            Err(ReceiverQueryError::Cancelled)
+        );
+        let mid_cancellation = CancellationToken::cancel_after_checks_for_test(3);
+        assert_eq!(
+            service.analyze_with_structural_facts(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget::default(),
+                Some(&mid_cancellation),
+            ),
+            Err(ReceiverQueryError::Cancelled)
+        );
+
+        let unsupported = service
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                last_marker_range(source, "Run()"),
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("implicit-receiver C# query");
+        assert!(matches!(
+            unsupported.analysis,
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Unsupported {
+                reason: "receiver_site_without_receiver"
+            })
+        ));
+        assert!(
+            unsupported.work.setup_nodes > 0,
+            "unsupported site selection must report its work"
+        );
+    }
+
+    #[test]
+    fn csharp_nested_member_resolution_fits_the_default_receiver_budget() {
+        let source = r#"
+namespace Demo;
+class Service
+{
+    public Service Next => this;
+    public void Run() {}
+}
+class Caller
+{
+    void Call()
+    {
+        var local = new Service();
+        local.Next.Run();
+    }
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.cs"));
+        file.write(source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::CSharp)),
+            AnalyzerConfig::default(),
+        );
+        let service = ReceiverQueryService::from_workspace(&workspace);
+        let facts = csharp_structural_facts(&workspace, &file);
+        let range = marker_range(source, "local.Next.Run");
+
+        let report = service
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("nested C# receiver query");
+
+        assert!(
+            matches!(
+                report.analysis,
+                ReceiverQueryAnalysis::MemberTargets(
+                    ReceiverAnalysisOutcome::Ambiguous(ref targets)
+                ) if matches!(targets.as_slice(), [target] if target.fq_name() == "Demo.Service.Run")
+            ),
+            "{report:#?}"
+        );
+        assert!(
+            report.work.summary_expansions
+                <= ReceiverAnalysisBudget::default().max_summary_expansions,
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn csharp_persisted_metadata_and_ranges_are_bounded_without_file_hydration() {
+        let source = r#"
+namespace Demo;
+sealed class Service {
+    public void Run() {}
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.cs"));
+        file.write(source).expect("write source");
+        let project = Arc::new(TestProject::new(root, Language::CSharp));
+        {
+            let _cold =
+                WorkspaceAnalyzer::build_persisted(project.clone(), AnalyzerConfig::default())
+                    .expect("cold persisted C# workspace");
+        }
+        let workspace = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+            .expect("warm persisted C# workspace");
+        let target = workspace
+            .analyzer()
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name() == "Demo.Service.Run")
+            .expect("persisted service method");
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(workspace.analyzer())
+            .expect("workspace C# analyzer");
+        csharp.reset_full_hydration_count_for_test();
+
+        let one_metadata = csharp.signature_metadata_limited(&target, 1);
+        assert_eq!(one_metadata.rows.len(), 1);
+        assert_eq!(one_metadata.inspected, 1);
+        let complete_metadata = csharp.signature_metadata_limited(&target, 2);
+        assert_eq!(complete_metadata.rows.len(), 1);
+        assert!(complete_metadata.complete);
+
+        let one_range = csharp.ranges_limited(&target, 1);
+        assert_eq!(one_range.rows.len(), 1);
+        assert_eq!(one_range.inspected, 1);
+        let complete_ranges = csharp.ranges_limited(&target, 2);
+        assert_eq!(complete_ranges.rows.len(), 1);
+        assert!(complete_ranges.complete);
+
+        let analysis =
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(vec![
+                target.clone(),
+            ]));
+        let mut dispatch_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
+        assert!(matches!(
+            structural_member_dispatch_supports_precise(
+                workspace.analyzer(),
+                Language::CSharp,
+                &analysis,
+                None,
+                &mut dispatch_ledger,
+            )
+            .expect("bounded dispatch metadata"),
+            CompatibilityOutcome::Complete(true)
+        ));
+
+        let mut range_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
+        assert!(matches!(
+            code_unit_ranges_bounded(
+                workspace.analyzer(),
+                &target,
+                None,
+                &mut range_ledger,
+            )
+            .expect("bounded declaration ranges"),
+            CompatibilityOutcome::Complete(ranges) if ranges.len() == 1
+        ));
+
+        let tiny_budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 1,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let mut tiny_dispatch_ledger = ReceiverWorkLedger::new(tiny_budget);
+        assert!(matches!(
+            structural_member_dispatch_supports_precise(
+                workspace.analyzer(),
+                Language::CSharp,
+                &analysis,
+                None,
+                &mut tiny_dispatch_ledger,
+            )
+            .expect("tiny dispatch metadata budget"),
+            CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
+        ));
+        let mut tiny_range_ledger = ReceiverWorkLedger::new(tiny_budget);
+        assert!(matches!(
+            code_unit_ranges_bounded(workspace.analyzer(), &target, None, &mut tiny_range_ledger,)
+                .expect("tiny declaration range budget"),
+            CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
+        ));
+        assert_eq!(
+            csharp.full_hydration_count_for_test(),
+            0,
+            "bounded receiver metadata/range reads must not hydrate persisted FileState"
+        );
+    }
+
+    #[test]
+    fn java_factory_ranges_are_limited_and_cancellable_without_file_hydration() {
+        let source = r#"
+class Service {}
+class Sample {
+    static Service makeService() { return new Service(); }
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Sample.java"));
+        file.write(source).expect("write source");
+        let project = Arc::new(TestProject::new(root, Language::Java));
+        {
+            let _cold =
+                WorkspaceAnalyzer::build_persisted(project.clone(), AnalyzerConfig::default())
+                    .expect("cold persisted Java workspace");
+        }
+        let workspace = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
+            .expect("warm persisted Java workspace");
+        let factory = workspace
+            .analyzer()
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name().ends_with("Sample.makeService"))
+            .expect("persisted Java factory");
+        let java = resolve_analyzer::<JavaAnalyzer>(workspace.analyzer())
+            .expect("workspace Java analyzer");
+        java.inner().reset_full_hydration_count_for_test();
+
+        let tiny_budget = ReceiverAnalysisBudget {
+            max_scope_nodes: 1,
+            ..ReceiverAnalysisBudget::default()
+        };
+        let mut tiny_ledger = ReceiverWorkLedger::new(tiny_budget);
+        assert!(matches!(
+            code_unit_ranges_bounded(workspace.analyzer(), &factory, None, &mut tiny_ledger)
+                .expect("tiny Java factory range budget"),
+            CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
+        ));
+        assert_eq!(tiny_ledger.work().scope_nodes, 1);
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let mut cancelled_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
+        assert!(matches!(
+            code_unit_ranges_bounded(
+                workspace.analyzer(),
+                &factory,
+                Some(&cancellation),
+                &mut cancelled_ledger,
+            ),
+            Err(ReceiverQueryError::Cancelled)
+        ));
+        assert_eq!(cancelled_ledger.work(), ReceiverAnalysisWork::default());
+        assert_eq!(
+            java.inner().full_hydration_count_for_test(),
+            0,
+            "bounded Java factory-range validation must not hydrate persisted FileState"
+        );
+    }
+
+    #[test]
+    fn js_ts_factory_ranges_are_limited_and_cancellable_without_file_hydration() {
+        fn assert_limited_and_cancellable(analyzer: &dyn IAnalyzer, factory: &CodeUnit) {
+            let tiny_budget = ReceiverAnalysisBudget {
+                max_scope_nodes: 1,
+                ..ReceiverAnalysisBudget::default()
+            };
+            let mut tiny_ledger = ReceiverWorkLedger::new(tiny_budget);
+            assert!(matches!(
+                code_unit_ranges_bounded(analyzer, factory, None, &mut tiny_ledger)
+                    .expect("tiny JS/TS factory range budget"),
+                CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
+            ));
+            assert_eq!(tiny_ledger.work().scope_nodes, 1);
+
+            let cancellation = CancellationToken::default();
+            cancellation.cancel();
+            let mut cancelled_ledger = ReceiverWorkLedger::new(ReceiverAnalysisBudget::default());
+            assert!(matches!(
+                code_unit_ranges_bounded(
+                    analyzer,
+                    factory,
+                    Some(&cancellation),
+                    &mut cancelled_ledger,
+                ),
+                Err(ReceiverQueryError::Cancelled)
+            ));
+            assert_eq!(cancelled_ledger.work(), ReceiverAnalysisWork::default());
+        }
+
+        let typescript_temp = tempfile::tempdir().expect("TypeScript temp dir");
+        let typescript_root = typescript_temp
+            .path()
+            .canonicalize()
+            .expect("canonical TypeScript temp dir");
+        let typescript_file =
+            ProjectFile::new(typescript_root.clone(), PathBuf::from("factory.ts"));
+        typescript_file
+            .write("class Service {}\nfunction makeService() { return new Service(); }\n")
+            .expect("write TypeScript source");
+        let typescript_project = Arc::new(TestProject::new(typescript_root, Language::TypeScript));
+        {
+            let _cold = WorkspaceAnalyzer::build_persisted(
+                typescript_project.clone(),
+                AnalyzerConfig::default(),
+            )
+            .expect("cold persisted TypeScript workspace");
+        }
+        let typescript_workspace =
+            WorkspaceAnalyzer::build_persisted(typescript_project, AnalyzerConfig::default())
+                .expect("warm persisted TypeScript workspace");
+        let typescript_factory = typescript_workspace
+            .analyzer()
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name().ends_with("makeService"))
+            .expect("persisted TypeScript factory");
+        let typescript = resolve_analyzer::<TypescriptAnalyzer>(typescript_workspace.analyzer())
+            .expect("workspace TypeScript analyzer");
+        typescript.reset_full_hydration_count_for_test();
+        assert_limited_and_cancellable(typescript_workspace.analyzer(), &typescript_factory);
+        assert_eq!(
+            typescript.full_hydration_count_for_test(),
+            0,
+            "bounded TypeScript factory-range validation must not hydrate persisted FileState"
+        );
+
+        let javascript_temp = tempfile::tempdir().expect("JavaScript temp dir");
+        let javascript_root = javascript_temp
+            .path()
+            .canonicalize()
+            .expect("canonical JavaScript temp dir");
+        let javascript_file =
+            ProjectFile::new(javascript_root.clone(), PathBuf::from("factory.js"));
+        javascript_file
+            .write("class Service {}\nfunction makeService() { return new Service(); }\n")
+            .expect("write JavaScript source");
+        let javascript_project = Arc::new(TestProject::new(javascript_root, Language::JavaScript));
+        {
+            let _cold = WorkspaceAnalyzer::build_persisted(
+                javascript_project.clone(),
+                AnalyzerConfig::default(),
+            )
+            .expect("cold persisted JavaScript workspace");
+        }
+        let javascript_workspace =
+            WorkspaceAnalyzer::build_persisted(javascript_project, AnalyzerConfig::default())
+                .expect("warm persisted JavaScript workspace");
+        let javascript_factory = javascript_workspace
+            .analyzer()
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name().ends_with("makeService"))
+            .expect("persisted JavaScript factory");
+        let javascript = resolve_analyzer::<JavascriptAnalyzer>(javascript_workspace.analyzer())
+            .expect("workspace JavaScript analyzer");
+        javascript.inner().reset_full_hydration_count_for_test();
+        assert_limited_and_cancellable(javascript_workspace.analyzer(), &javascript_factory);
+        assert_eq!(
+            javascript.inner().full_hydration_count_for_test(),
+            0,
+            "bounded JavaScript factory-range validation must not hydrate persisted FileState"
+        );
+    }
+
+    #[test]
+    fn csharp_requires_per_call_facts_and_rejects_a_mismatched_cached_snapshot() {
+        let source = r#"
+namespace Demo;
+class Service { public void Run() {} }
+class Caller {
+    void Call(Service service) { service.Run(); }
+}
+"#;
+        let unrelated_source = r#"
+namespace Other;
+class DifferentService { public void Execute() {} }
+class DifferentCaller {
+    void Call(DifferentService service) { service.Execute(); }
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.cs"));
+        let unrelated_file = ProjectFile::new(root.clone(), PathBuf::from("Unrelated.cs"));
+        file.write(source).expect("write receiver source");
+        unrelated_file
+            .write(unrelated_source)
+            .expect("write unrelated source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::CSharp)),
+            AnalyzerConfig::default(),
+        );
+        let service = ReceiverQueryService::from_workspace(&workspace);
+        let facts = csharp_structural_facts(&workspace, &file);
+        let unrelated_facts = csharp_structural_facts(&workspace, &unrelated_file);
+        let range = marker_range(source, "service.Run");
+
+        let prepared = service
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("prepare exact C# receiver facts");
+        assert!(matches!(
+            prepared.analysis,
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(_))
+        ));
+
+        let missing = service
+            .analyze(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("missing-facts C# receiver query");
+        assert!(matches!(
+            missing.analysis,
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Unsupported {
+                reason: "receiver_structural_facts_unavailable"
+            })
+        ));
+
+        let mismatched = service
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::MemberTargets,
+                &file,
+                range,
+                ReceiverQueryInput::ContainingSite,
+                &unrelated_facts,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("mismatched-facts C# receiver query");
+        assert!(matches!(
+            mismatched.analysis,
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Unsupported {
+                reason: "receiver_source_snapshot_mismatch"
+            })
+        ));
+
+        let prepared_files = service.prepared_structural_files.borrow();
+        let cached = prepared_files.get(&file).expect("prepared receiver file");
+        assert!(cached.matches(&facts));
+        assert!(!cached.matches(&unrelated_facts));
+    }
+
+    #[test]
+    fn csharp_candidate_cap_cannot_remain_precise() {
+        let source = r#"
+namespace Demo {
+    class Service { public void Run() {} }
+    class Caller {
+        void Call(bool flag) {
+            var service = flag ? new Service() : new Service();
+            service.Run();
+        }
+    }
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Partial.cs"));
+        file.write(source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::CSharp)),
+            AnalyzerConfig::default(),
+        );
+        let facts = csharp_structural_facts(&workspace, &file);
+        let report = ReceiverQueryService::from_workspace(&workspace)
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::ReceiverTargets,
+                &file,
+                last_marker_range(source, "service.Run"),
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget {
+                    max_targets: 1,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                None,
+            )
+            .expect("candidate-capped C# receiver query");
+
+        assert!(report.candidates_truncated, "{report:#?}");
+        assert!(matches!(
+            report.analysis,
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Ambiguous(ref values))
+                if values.len() == 1
+        ));
+    }
+
+    #[test]
+    fn csharp_dynamic_receiver_remains_explicit_after_prior_calls() {
+        let source = r#"
+namespace Demo;
+class Service {
+    public void Run() {}
+    public void Touch(Service value) {}
+}
+class Caller {
+    void Call(Service service, dynamic opaque) {
+        service.Run();
+        service.Run();
+        service.Run();
+        service.Run();
+        service.Run();
+        service.Run();
+        service.Run();
+        service.Run();
+        opaque.Run();
+    }
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Dynamic.cs"));
+        file.write(source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::CSharp)),
+            AnalyzerConfig::default(),
+        );
+        let receiver_range = last_marker_range(source, "opaque");
+        let mut semantic =
+            ReceiverSemanticBridge::new(ReceiverAnalysisBudget::default()).expect("bridge");
+        let cancellation = CancellationToken::default();
+        let semantic_outcome = semantic
+            .oracle(&workspace)
+            .pointees_at_source(
+                &file,
+                receiver_range,
+                &mut SemanticRequest::new(&mut semantic.budget, &cancellation),
+            )
+            .expect("dynamic receiver points-to query");
+        assert!(
+            !matches!(semantic_outcome, SemanticOutcome::ExceededBudget { .. }),
+            "default receiver budget must cover a moderate method: {semantic_outcome:#?}"
+        );
+
+        let facts = csharp_structural_facts(&workspace, &file);
+        let report = ReceiverQueryService::from_workspace(&workspace)
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::ReceiverTargets,
+                &file,
+                last_marker_range(source, "opaque.Run"),
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("dynamic C# receiver query");
+        assert!(
+            matches!(
+                report.analysis,
+                ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Unsupported {
+                    reason: "csharp_dynamic_receiver_unsupported"
+                })
+            ),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn csharp_current_receiver_has_exhaustive_neutral_evidence() {
+        let source = r#"
+namespace Demo;
+class Caller {
+    void Touch() {}
+    void Call() { this.Touch(); }
+}
+"#;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = ProjectFile::new(root.clone(), PathBuf::from("Current.cs"));
+        file.write(source).expect("write source");
+        let workspace = WorkspaceAnalyzer::build(
+            Arc::new(TestProject::new(root, Language::CSharp)),
+            AnalyzerConfig::default(),
+        );
+        let service = ReceiverQueryService::from_workspace(&workspace);
+        let gate = service
+            .semantic_receiver_gate(
+                &file,
+                last_marker_range(source, "this"),
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("current-receiver semantic gate");
+        let SemanticReceiverGate::Available {
+            points_to,
+            evidence,
+            ..
+        } = gate
+        else {
+            panic!("current receiver must have neutral evidence");
+        };
+        let coverages = points_to
+            .observations()
+            .iter()
+            .map(|observation| observation.objects().coverage())
+            .collect::<Vec<_>>();
+        assert!(
+            evidence.supports_precise(),
+            "current receiver evidence must be exhaustive; evidence={evidence:?}, observations={coverages:?}"
+        );
+
+        let facts = csharp_structural_facts(&workspace, &file);
+        let report = service
+            .analyze_with_structural_facts(
+                ReceiverQueryOperation::ReceiverTargets,
+                &file,
+                last_marker_range(source, "this.Touch"),
+                ReceiverQueryInput::ContainingSite,
+                &facts,
+                ReceiverAnalysisBudget::default(),
+                None,
+            )
+            .expect("current receiver query");
+        assert!(
+            matches!(
+                report.analysis,
+                ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(ref values))
+                    if matches!(values.as_slice(), [ReceiverValue::CurrentReceiver(_)])
+            ),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
     fn unsupported_language_returns_an_explicit_row() {
         let source = "value = object.member\n";
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
-        let file = ProjectFile::new(root.clone(), PathBuf::from("app.py"));
+        let file = ProjectFile::new(root.clone(), PathBuf::from("app.txt"));
         file.write(source).expect("write source");
         let analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
@@ -2477,7 +4821,7 @@ export function caller() {
             )
             .expect("unsupported result");
 
-        assert_eq!(report.site.language, Language::Python);
+        assert_eq!(report.site.language, Language::None);
         assert!(matches!(
             report.analysis,
             ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Unsupported {
@@ -2676,7 +5020,7 @@ class Sample {
             .expect("bounded receiver parent walk");
         assert!(matches!(
             receiver_result,
-            JavaCompatibilityOutcome::Complete(Some(node)) if node == receiver
+            CompatibilityOutcome::Complete(Some(node)) if node == receiver
         ));
         assert_eq!(receiver_ledger.work().scope_nodes, 1);
 
@@ -2685,7 +5029,7 @@ class Sample {
             .expect("bounded member parent walk");
         assert!(matches!(
             member_result,
-            JavaCompatibilityOutcome::Complete(Some(node)) if node == member
+            CompatibilityOutcome::Complete(Some(node)) if node == member
         ));
         assert_eq!(member_ledger.work().scope_nodes, 1);
 
@@ -2694,7 +5038,7 @@ class Sample {
             .expect("bounded contextual parent walk");
         assert!(matches!(
             contextual_result,
-            JavaCompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
+            CompatibilityOutcome::Exceeded(ReceiverBudgetLimit::ScopeNodes)
         ));
         assert_eq!(contextual_ledger.work().scope_nodes, 1);
 
@@ -2949,10 +5293,7 @@ class Sample {
             )
             .expect("Java semantic points-to gate");
         let points_to = match gate {
-            SemanticReceiverGate::Available {
-                points_to: Some(points_to),
-                ..
-            } => points_to,
+            SemanticReceiverGate::Available { points_to, .. } => points_to,
             _ => panic!("expected Java allocation points-to facts"),
         };
 
@@ -3001,11 +5342,11 @@ class Sample {
             max_targets: 1,
             ..ReceiverAnalysisBudget::default()
         });
-        let projected = java_receiver_values(
+        let projected = project_receiver_values(
             &workspace,
             &points_to,
             &type_outcome,
-            None,
+            &[],
             false,
             None,
             &mut ledger,
@@ -3014,7 +5355,11 @@ class Sample {
         assert!(
             matches!(
                 projected,
-                JavaCompatibilityOutcome::Complete((ref values, true))
+                CompatibilityOutcome::Complete(ReceiverValueProjection {
+                    ref values,
+                    truncated: true,
+                    ..
+                })
                     if matches!(values.as_slice(), [ReceiverValue::AllocationSite { .. }])
             ),
             "projection must return one allocation and report truncation"
@@ -3066,10 +5411,7 @@ class Sample {
             )
             .expect("cartesian Java semantic points-to gate");
         let cartesian_points_to = match cartesian_gate {
-            SemanticReceiverGate::Available {
-                points_to: Some(points_to),
-                ..
-            } => points_to,
+            SemanticReceiverGate::Available { points_to, .. } => points_to,
             _ => panic!("expected cartesian Java allocation points-to facts"),
         };
         let cartesian_candidate_steps = cartesian_points_to.object_candidates().count();
@@ -3119,11 +5461,11 @@ class Sample {
             max_targets: cartesian_limit,
             ..ReceiverAnalysisBudget::default()
         });
-        let cartesian_projection = java_receiver_values(
+        let cartesian_projection = project_receiver_values(
             &cartesian_workspace,
             &cartesian_points_to,
             &cartesian_types,
-            None,
+            &[],
             false,
             None,
             &mut cartesian_ledger,
@@ -3132,7 +5474,11 @@ class Sample {
         assert!(
             matches!(
                 cartesian_projection,
-                JavaCompatibilityOutcome::Complete((ref values, true)) if values.len() == 3
+                CompatibilityOutcome::Complete(ReceiverValueProjection {
+                    ref values,
+                    truncated: true,
+                    ..
+                }) if values.len() == 3
             ),
             "Cartesian projection must stop at the value cap without exhausting the budget"
         );
@@ -3254,8 +5600,10 @@ export function caller() {
         let semantic = bridge.budget.limits();
         assert_eq!(semantic.procedures, 2);
         assert_eq!(semantic.control_edges, 1);
-        assert_eq!(semantic.nested_entries, 1);
-        assert_eq!(semantic.call_sites, 3);
+        assert_eq!(semantic.nested_entries, 4);
+        assert_eq!(semantic.call_sites, 4);
+        assert_eq!(semantic.memory_locations, 3);
+        assert_eq!(semantic.captures, 2);
         assert_eq!(semantic.source_bytes, 17 * 1_024);
         let aggregate_limits = ReceiverSemanticBridge::receiver_work(semantic);
         assert_eq!(aggregate_limits.scope_nodes, 17);
@@ -3350,6 +5698,85 @@ export function caller() {
             ReceiverSemanticBridge::receiver_limit(nested_scope),
             ReceiverBudgetLimit::ScopeNodes
         );
+    }
+
+    #[test]
+    fn semantic_receiver_evidence_requires_complete_exhaustive_input_for_precision() {
+        let outcomes = [
+            SemanticOutcome::Complete {
+                value: (),
+                work: SemanticWork::default(),
+            },
+            SemanticOutcome::Ambiguous {
+                candidates: (),
+                work: SemanticWork::default(),
+            },
+            SemanticOutcome::Unknown {
+                partial: Some(()),
+                work: SemanticWork::default(),
+            },
+            SemanticOutcome::Unsupported {
+                capability: crate::analyzer::semantic::SemanticCapability::Values,
+                partial: Some(()),
+                work: SemanticWork::default(),
+            },
+            SemanticOutcome::Unproven {
+                partial: (),
+                work: SemanticWork::default(),
+            },
+        ];
+        let coverages = [
+            CandidateCoverage::Exhaustive,
+            CandidateCoverage::Open,
+            CandidateCoverage::Truncated,
+        ];
+
+        for (outcome_index, outcome) in outcomes.iter().enumerate() {
+            for coverage in coverages {
+                let evidence = SemanticReceiverEvidence::from_outcome(outcome, coverage);
+                assert_eq!(
+                    evidence.supports_precise(),
+                    outcome_index == 0 && coverage == CandidateCoverage::Exhaustive
+                );
+                assert_eq!(
+                    evidence.is_truncated(),
+                    coverage == CandidateCoverage::Truncated
+                );
+                assert!(
+                    !evidence.legacy_provider_can_close(),
+                    "raw incomplete evidence must not be reclassified as global capability openness"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_semantic_evidence_downgrades_values_and_member_targets() {
+        let (_temp, _file, analyzer) = test_project("class Service {}\n");
+        let service = analyzer
+            .definitions("Service")
+            .find(CodeUnit::is_class)
+            .expect("Service class");
+        let mut values = ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(vec![
+            ReceiverValue::InstanceType(service.clone()),
+        ]));
+        let mut members =
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Precise(vec![
+                service.clone(),
+            ]));
+        neutral_incomplete(&mut values);
+        neutral_incomplete(&mut members);
+
+        assert!(matches!(
+            values,
+            ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Ambiguous(ref values))
+                if values == &[ReceiverValue::InstanceType(service.clone())]
+        ));
+        assert!(matches!(
+            members,
+            ReceiverQueryAnalysis::MemberTargets(ReceiverAnalysisOutcome::Ambiguous(ref targets))
+                if targets == &[service]
+        ));
     }
 
     #[test]
