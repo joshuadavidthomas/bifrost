@@ -474,6 +474,12 @@ fn record_call(
                 return;
             };
             if receiver_is_self_like(receiver) {
+                // `this->m()` / `(*this).m()` is a same-owner call (#1138):
+                // record it as unproven inbound rather than dropping it, so a
+                // member reachable only through same-owner calls reads
+                // INCONCLUSIVE, never confidently dead — uniformly with the
+                // other languages.
+                ctx.record_unproven(name, field);
                 return;
             }
             if let Some(receiver_owner) = receiver_type_unit(receiver, ctx, bindings, 32) {

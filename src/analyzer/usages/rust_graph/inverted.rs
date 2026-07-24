@@ -38,6 +38,7 @@ use crate::analyzer::usages::rust_graph::resolver::{
     resolve_rust_token_tree_paths, rust_token_path_segment_is_qualified,
     rust_unique_nominal_reference_namespace,
 };
+use crate::analyzer::usages::same_owner::route_same_owner;
 use crate::analyzer::{
     CodeUnit, GlobalUsageDefinitionIndex, IAnalyzer, ProjectFile, RustAnalyzer,
     RustReferenceContext,
@@ -448,11 +449,25 @@ fn handle_method_call(node: Node<'_>, ctx: &mut RustScan<'_, '_>, scopes: &[Scop
     if receiver_name.is_empty() || method_name.is_empty() {
         return;
     }
-    if let Some(owner) = receiver_type(scopes, receiver_name) {
-        ctx.record(format!("{owner}.{method_name}"), field);
-    } else {
-        ctx.record_unproven(method_name, field);
-    }
+    // A `self.method()` call is a same-owner reference (#1138): make the routing
+    // explicit rather than relying on `self` accidentally never seeding a
+    // `receiver_type`. Same-owner is recorded unproven — inconclusive, never a
+    // proven inbound edge — matching every other language. (This is the thin
+    // inverted-context self proof; it deliberately does NOT reuse the rich
+    // scan-side `receiver_owner_proof`.)
+    let is_same_owner = receiver.kind() == "self" || receiver_name == "self";
+    route_same_owner(
+        ctx,
+        is_same_owner,
+        |ctx| ctx.record_unproven(method_name, field),
+        |ctx| {
+            if let Some(owner) = receiver_type(scopes, receiver_name) {
+                ctx.record(format!("{owner}.{method_name}"), field);
+            } else {
+                ctx.record_unproven(method_name, field);
+            }
+        },
+    );
 }
 
 /// The local names a function/closure binds through its parameters. `let`

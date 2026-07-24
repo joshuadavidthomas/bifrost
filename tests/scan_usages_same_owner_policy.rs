@@ -15,8 +15,11 @@
 
 mod common;
 
+use brokk_bifrost::code_quality::{
+    ReportDeadCodeAndUnusedAbstractionSmellsParams, report_dead_code_and_unused_abstraction_smells,
+};
 use brokk_bifrost::{
-    AnalyzerConfig, Language,
+    AnalyzerConfig, IAnalyzer, Language,
     searchtools::{
         ScanUsagesByReferenceParams, ScanUsagesEntry, ScanUsagesStatus, scan_usages_by_reference,
     },
@@ -90,6 +93,57 @@ fn assert_verified_absent(language: Language, files: &[(&str, &str)], symbol: &s
     assert_eq!(
         entry.same_owner_sites, None,
         "{language:?} {symbol} should have no same-owner sites: {entry:#?}"
+    );
+}
+
+/// The fq_name of the (single) function/method named `identifier` in the
+/// project. Language-agnostic: reads the analyzer's own declarations so the
+/// dead-code report round-trips through `get_definitions`.
+fn function_fqname(analyzer: &dyn IAnalyzer, identifier: &str) -> String {
+    for file in analyzer.analyzed_files() {
+        for unit in analyzer.declarations(&file) {
+            if unit.is_function() && unit.identifier() == identifier {
+                return unit.fq_name();
+            }
+        }
+    }
+    panic!("no function named {identifier} in the project");
+}
+
+/// Dead-code / inverted-builder alignment (#1138): a method whose ONLY caller is
+/// a same-owner receiver must read INCONCLUSIVE — never a confident proven
+/// inbound edge (alive from the self-edge alone), never confidently dead. The
+/// same-owner call is recorded as *unproven* inbound, matching Rust/Java.
+fn assert_same_owner_only_inconclusive(
+    language: Language,
+    files: &[(&str, &str)],
+    target_identifier: &str,
+) {
+    let mut project = InlineTestProject::with_language(language);
+    for (path, contents) in files {
+        project = project.file(*path, *contents);
+    }
+    let built = project.build();
+    let workspace = built.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let fq_name = function_fqname(analyzer, target_identifier);
+    let file_paths = files.iter().map(|(path, _)| path.to_string()).collect();
+    let report = report_dead_code_and_unused_abstraction_smells(
+        analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths,
+            fq_names: vec![fq_name.clone()],
+            ..Default::default()
+        },
+    )
+    .report;
+    assert!(
+        report.contains("could not be proven or disproven"),
+        "{language:?} {fq_name}: a same-owner-only caller must be inconclusive: {report}"
+    );
+    assert!(
+        !report.contains("one workspace inbound edge"),
+        "{language:?} {fq_name}: same-owner call must not be a proven inbound edge: {report}"
     );
 }
 
@@ -175,6 +229,134 @@ uniformity_case!(cpp_same_owner_only, Language::Cpp, CPP);
 fn go_same_owner_only() {
     assert_same_owner_only(Language::Go, GO, "Foo.target");
     assert_verified_absent(Language::Go, GO, "Foo.uncalled");
+}
+
+// --- Inverted-builder / dead-code alignment (#1138): the same-owner-only caller
+// must be INCONCLUSIVE for every language whose inverted builder now routes
+// same-owner references to unproven inbound (all nine; Scala is out of scope). --
+
+macro_rules! inconclusive_case {
+    ($name:ident, $lang:expr, $files:expr) => {
+        #[test]
+        fn $name() {
+            assert_same_owner_only_inconclusive($lang, $files, "target");
+        }
+    };
+}
+
+inconclusive_case!(java_same_owner_only_inconclusive, Language::Java, JAVA);
+inconclusive_case!(
+    python_same_owner_only_inconclusive,
+    Language::Python,
+    PYTHON
+);
+inconclusive_case!(ruby_same_owner_only_inconclusive, Language::Ruby, RUBY);
+inconclusive_case!(php_same_owner_only_inconclusive, Language::Php, PHP);
+inconclusive_case!(
+    csharp_same_owner_only_inconclusive,
+    Language::CSharp,
+    CSHARP
+);
+inconclusive_case!(rust_same_owner_only_inconclusive, Language::Rust, RUST);
+inconclusive_case!(
+    typescript_same_owner_only_inconclusive,
+    Language::TypeScript,
+    TYPESCRIPT
+);
+inconclusive_case!(
+    javascript_same_owner_only_inconclusive,
+    Language::JavaScript,
+    JAVASCRIPT
+);
+inconclusive_case!(go_same_owner_only_inconclusive, Language::Go, GO);
+
+// C++ member candidates route through the precise per-symbol path (no bulk usage
+// graph for members), which reports them as inconclusive (the precise strategy is
+// unavailable for the inline single-file project) rather than the graph-path
+// "could not be proven or disproven" wording. Either way the invariant holds: the
+// same-owner-only method is never confidently dead nor confidently alive. (The
+// inverted `this->m()` -> record_unproven change itself is exercised by the scan
+// surface, `cpp_same_owner_only`.)
+#[test]
+fn cpp_same_owner_only_inconclusive() {
+    let mut project = InlineTestProject::with_language(Language::Cpp);
+    for (path, contents) in CPP {
+        project = project.file(*path, *contents);
+    }
+    let built = project.build();
+    let workspace = built.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let fq_name = function_fqname(analyzer, "target");
+    let report = report_dead_code_and_unused_abstraction_smells(
+        analyzer,
+        ReportDeadCodeAndUnusedAbstractionSmellsParams {
+            file_paths: CPP.iter().map(|(path, _)| path.to_string()).collect(),
+            fq_names: vec![fq_name.clone()],
+            ..Default::default()
+        },
+    )
+    .report;
+    assert!(
+        report.contains("inconclusive"),
+        "Cpp {fq_name}: a same-owner-only caller must be inconclusive: {report}"
+    );
+    assert!(
+        !report.contains("no non-self usages found"),
+        "Cpp {fq_name}: same-owner-only method must not be confidently dead: {report}"
+    );
+    assert!(
+        !report.contains("one workspace inbound edge"),
+        "Cpp {fq_name}: same-owner call must not be a proven inbound edge: {report}"
+    );
+}
+
+// --- C# scan-side widening (#1014 deferral, now unlocked by the inverted
+// record_unproven routing): a bare implicit-this call and an own-type static call
+// classify as same-owner; a bare method-group *value* stays external. -----------
+
+#[test]
+fn csharp_bare_implicit_this_call_is_same_owner() {
+    // `caller()` calls `target()` with no receiver — an implicit-this call on the
+    // current instance. Before the widening this counted as an external usage
+    // (found, 1 hit); now it is a same-owner site.
+    let files: &[(&str, &str)] = &[(
+        "Foo.cs",
+        "class Foo {\n  void target() {}\n  void caller() { target(); }\n}\n",
+    )];
+    assert_same_owner_only(Language::CSharp, files, "Foo.target");
+}
+
+#[test]
+fn csharp_own_type_static_call_is_same_owner() {
+    // `Foo.target()` from within `Foo` names the own type as a static receiver — a
+    // same-owner site, mirroring Java's own-type-static rule.
+    let files: &[(&str, &str)] = &[(
+        "Foo.cs",
+        "class Foo {\n  static void target() {}\n  void caller() { Foo.target(); }\n}\n",
+    )];
+    assert_same_owner_only(Language::CSharp, files, "Foo.target");
+}
+
+#[test]
+fn csharp_bare_method_group_value_stays_external() {
+    // A bare method-group *value* (delegate capture) is a genuine usage even
+    // within the owning type — it is not a self-receiver *call*, so it stays on
+    // the external surface (must not flatten to same-owner).
+    let files: &[(&str, &str)] = &[(
+        "Foo.cs",
+        "using System;\nclass Foo {\n  void target() {}\n  void caller() { Action a = target; a(); }\n}\n",
+    )];
+    let entry = scan(Language::CSharp, files, "Foo.target", false);
+    assert_eq!(
+        entry.status,
+        ScanUsagesStatus::Found,
+        "a bare method-group value is an external usage: {entry:#?}"
+    );
+    assert_eq!(entry.total_hits, Some(1), "{entry:#?}");
+    assert_eq!(
+        entry.same_owner_sites, None,
+        "a method-group value must not be classified same-owner: {entry:#?}"
+    );
 }
 
 // --- Mixed: one external caller + one same-owner caller -> found, external 1,

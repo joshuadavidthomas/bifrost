@@ -103,6 +103,17 @@ pub(super) enum ScalaResolvedReference {
     Logical(String),
 }
 
+/// Same-owner policy (#1138): Scala's per-language proof is honestly `false`.
+///
+/// Unlike the other languages, Scala's usage graph is event-driven and does not
+/// carry the receiver shape (`this`/self-type/own-object) to the record site, so
+/// no reference can be classified as same-owner here — self-calls stay on the
+/// external surface, exactly as they were before #1014. Wiring the shared
+/// same-owner consumers into Scala requires threading receiver-shape through this
+/// event pipeline (or classifying at hit materialization from the enclosing
+/// template identity); that graph-shape change is deliberately out of scope
+/// (tracked in #1138). Documented here at the sink so the omission is a stated
+/// design decision, not an oversight.
 pub(super) trait ScalaReferenceSink {
     fn may_match_name(&self, _name: &str) -> bool {
         true
