@@ -1162,8 +1162,14 @@ fn derive_follow_ups(
                             // the module's "path" is a convention, not a
                             // per-file contract, so I3a's path check cannot
                             // apply (java packages, like go blanks and the
-                            // I1(b) module naming convention).
-                            if element.get("kind").and_then(Value::as_str) == Some("module") {
+                            // I1(b) module naming convention). The
+                            // file-level "excerpt" element is the same
+                            // convention for js/ts files: its "symbol" is
+                            // the file path (phpstan's website js docs).
+                            if matches!(
+                                element.get("kind").and_then(Value::as_str),
+                                Some("module") | Some("excerpt")
+                            ) {
                                 summary.skipped_module_summary_element += 1;
                                 continue;
                             }

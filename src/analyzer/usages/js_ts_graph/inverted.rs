@@ -1275,6 +1275,15 @@ fn record_receiver_member(
     ctx: &mut TsScan<'_, '_>,
 ) -> bool {
     if object.kind() == "this" {
+        // `this.member` is a same-owner reference (#1138): record it as unproven
+        // inbound rather than dropping it (matched-but-unrecorded), so a member
+        // reachable only through same-owner access reads INCONCLUSIVE, never
+        // confidently dead.
+        ctx.collector.record_unproven_name(
+            property_text,
+            property.start_byte(),
+            property.end_byte(),
+        );
         return true;
     }
     match ctx.receiver_provider.resolve_member_targets(
@@ -1304,6 +1313,15 @@ fn record_scoped_receiver_member(
     ctx: &mut ScopedTsScan<'_, '_>,
 ) -> bool {
     if object.kind() == "this" {
+        // `this.member` is a same-owner reference (#1138): record it as unproven
+        // inbound rather than dropping it (matched-but-unrecorded), so a member
+        // reachable only through same-owner access reads INCONCLUSIVE, never
+        // confidently dead.
+        ctx.collector.record_unproven_name(
+            property_text,
+            property.start_byte(),
+            property.end_byte(),
+        );
         return true;
     }
     match ctx.receiver_provider.resolve_member_targets(

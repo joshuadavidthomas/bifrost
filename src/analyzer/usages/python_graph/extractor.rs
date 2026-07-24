@@ -1112,10 +1112,16 @@ fn enclosing_class_for_node(
         end_line: 0,
     };
     let enclosing = analyzer.enclosing_code_unit(file, &range)?;
-    if enclosing.is_class() {
-        return Some(enclosing);
-    }
-    target_owner_code_unit(analyzer, &enclosing)
+    // Python's structural model never separately indexes nested
+    // function/lambda scopes as their own CodeUnit, so `self`/`cls` can only
+    // ever need the enclosing unit itself or (a method's owner) exactly one
+    // `parent_of` hop up — `.take(2)` keeps that bound explicit rather than
+    // an unbounded walk that could climb past the same-file owner class.
+    crate::analyzer::usages::common::enclosing_owner_chain(enclosing, |unit| {
+        analyzer.parent_of(unit)
+    })
+    .take(2)
+    .find(|unit| unit.is_class() && unit.source() == file)
 }
 
 fn attribute_chain<'a>(node: Node<'a>) -> Option<(Node<'a>, Vec<Node<'a>>)> {

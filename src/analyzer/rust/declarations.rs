@@ -387,6 +387,28 @@ fn visit_rust_module(
                         parsed,
                     );
                 }
+                "const_item" | "static_item" => {
+                    visit_rust_field(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
+                }
+                "type_item" => {
+                    visit_rust_alias(
+                        file,
+                        source,
+                        child,
+                        Some(&code_unit),
+                        package_name,
+                        in_test_region,
+                        parsed,
+                    );
+                }
                 "mod_item" => {
                     visit_rust_module(
                         file,

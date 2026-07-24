@@ -438,12 +438,16 @@ fn handle_attribute<'a>(
     if let Some(facts) = facts
         && ctx.targets_by_terminal.contains_key(attribute_text)
     {
-        if let Some(type_fqn) = ctx.receiver_type_fqn(facts, object_text) {
+        if matches!(object_text, "self" | "cls") {
+            // `self.member` / `cls.member` is a same-owner reference (#1138):
+            // record it as unproven inbound rather than a proven edge, so a
+            // member reachable only through same-owner access reads
+            // INCONCLUSIVE, never confidently dead — matching the other
+            // languages.
+            ctx.record_unproven_name(attribute_text, attribute);
+        } else if let Some(type_fqn) = ctx.receiver_type_fqn(facts, object_text) {
             ctx.record(format!("{type_fqn}.{attribute_text}"), attribute);
-        } else if object.kind() == "identifier"
-            && !matches!(object_text, "self" | "cls")
-            && !ctx.named.contains_key(object_text)
-        {
+        } else if object.kind() == "identifier" && !ctx.named.contains_key(object_text) {
             let resolution = facts.resolution_for(object_text);
             if resolution.is_ambiguous()
                 || (resolution.is_unknown() && is_receiver_parameter(scopes, object_text))

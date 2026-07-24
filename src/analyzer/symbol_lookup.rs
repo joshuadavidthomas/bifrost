@@ -703,7 +703,14 @@ fn split_segments_on_dollar(segments: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn parse_symbol_path(language: Language, value: &str) -> Vec<String> {
+/// Split a client- or source-provided qualified-name path into its canonical
+/// segments, honoring every separator the language uses (`::`, `.`, `\`, `/`,
+/// `+`) plus per-language segment normalization (Go receivers, Rust `r#`
+/// raw-identifier escapes, C++ `operator` tokens). The returned segments are
+/// separator-free and join with `.` to match how indexed fq strings compose,
+/// which is what makes this the structured way to normalize a `::`-qualified
+/// reference before an enclosing-scope walk.
+pub(crate) fn parse_symbol_path(language: Language, value: &str) -> Vec<String> {
     let trimmed = value.trim().trim_start_matches('\\');
     let mut segments = Vec::new();
     let mut current = String::new();
