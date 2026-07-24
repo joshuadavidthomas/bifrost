@@ -2270,13 +2270,15 @@ fn resolve_cpp_type(
         // inside OperandSharedStorage): the enclosing-scope walk finds the
         // parameter's declaration when it is indexed; without it the
         // qualifier drew a dishonest include-boundary claim (tier-4
-        // DeepSpeed).
+        // DeepSpeed). The stand-in is restricted to parameter-like hits
+        // (fields, not real types) so a class scope missing the member
+        // stays an ordinary no-definition.
         if let Some(parameter) = resolve_in_enclosing_scopes(
             analyzer,
             file,
             &qualifier.reference,
             node.start_byte(),
-            |unit| unit.source() == file,
+            |unit| unit.source() == file && unit.is_field(),
         ) {
             return candidates_outcome(vec![parameter]);
         }
@@ -2441,10 +2443,15 @@ fn resolve_cpp_type_without_focused_qualifier(
                 if !candidates.is_empty() {
                     return candidates_outcome(candidates);
                 }
-                // A parameter's members are unknowable statically; the best
-                // answer for the qualified reference is the parameter
-                // declaration itself.
-                return candidates_outcome(vec![parameter]);
+                // Only a parameter-like scope hit (a field, not a real
+                // type) may stand in for the qualified reference: its
+                // members are unknowable statically. A class scope with no
+                // such member is an ordinary no-definition, not evidence
+                // the owner resolves (cpp_macro_decorated_out_of_line
+                // regression).
+                if parameter.is_field() {
+                    return candidates_outcome(vec![parameter]);
+                }
             }
         }
     }

@@ -123,15 +123,18 @@ pub(crate) fn symbol_source_candidate_files(
         .map(|item| item.input.trim())
         .filter(|symbol| !symbol.is_empty())
     {
-        let (mut anchor, mut lookup) = match split_definition_selector(symbol) {
-            DefinitionSelector::Name(name) => (None, name),
-            DefinitionSelector::FileAnchored { anchor, lookup } => {
-                if let ResolvedFileInput::File(file) = resolver.resolve_literal(&anchor) {
-                    files.insert(file);
+        let (mut anchor, mut lookup) =
+            match split_definition_selector_with_resolver(symbol, |anchor| {
+                matches!(resolver.resolve_literal(anchor), ResolvedFileInput::File(_))
+            }) {
+                DefinitionSelector::Name(name) => (None, name),
+                DefinitionSelector::FileAnchored { anchor, lookup } => {
+                    if let ResolvedFileInput::File(file) = resolver.resolve_literal(&anchor) {
+                        files.insert(file);
+                    }
+                    (Some(anchor), lookup)
                 }
-                (Some(anchor), lookup)
-            }
-        };
+            };
 
         if anchor.is_none()
             && let Some(PathQualifiedSelector::Resolved {
@@ -259,7 +262,13 @@ pub fn get_symbol_sources(
                 }
                 SelectableDefinitionResolution::NotFound(_) => {
                     if let DefinitionSelector::FileAnchored { anchor, lookup } =
-                        split_definition_selector(&symbol)
+                        split_definition_selector_with_resolver(&symbol, |anchor| {
+                            matches!(
+                                WorkspaceFileResolver::new(analyzer.project())
+                                    .resolve_literal(anchor),
+                                ResolvedFileInput::File(_)
+                            )
+                        })
                     {
                         let generated =
                             java_generated_accessor_source_blocks(analyzer, lookup, Some(&anchor));
