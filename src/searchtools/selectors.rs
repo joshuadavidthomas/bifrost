@@ -63,6 +63,10 @@ pub(super) const SYMBOL_NOT_FOUND_NOTE: &str =
 pub(super) const FILE_NOT_FOUND_NOTE: &str =
     "no workspace file matched this path; check the relative path or pass a glob pattern";
 
+pub(super) const RESOLVED_BUT_NOT_RENDERABLE_NOTE: &str = "the selector resolved to a declaration, but this surface has no renderable content for it \
+     (it may be a lookup-only or non-source-backed unit); re-call search_symbols to confirm the \
+     selector, or retry with a more specific (e.g. file-anchored path#symbol) selector";
+
 #[derive(Debug, Clone, Copy)]
 pub(super) enum PathLikeSymbolGuidanceContext {
     DefinitionByReference,
@@ -159,7 +163,7 @@ pub(super) fn symbol_source_anchor_not_found_input(
 }
 
 pub(super) fn renderable_not_found_input(input: impl Into<String>) -> NotFoundInput {
-    not_found_input(input, None)
+    not_found_input(input, Some(RESOLVED_BUT_NOT_RENDERABLE_NOTE.to_string()))
 }
 
 #[derive(Debug, Clone, Serialize)]
