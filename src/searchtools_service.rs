@@ -14,7 +14,6 @@ use crate::{
     file_tools::{
         find_filenames, find_files_containing, get_file_contents, list_files, search_file_contents,
     },
-    git_tools::{get_commit_diff, get_git_log, search_git_commit_messages},
     profiling,
     searchtools::{
         ActivateWorkspaceParams, ActiveWorkspaceResult, GetActiveWorkspaceParams,
@@ -705,17 +704,6 @@ impl SearchToolsService {
             }
             "list_files" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 list_files(workspace.analyzer(), params)
-            }),
-            "search_git_commit_messages" => {
-                Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                    search_git_commit_messages(workspace.analyzer(), params)
-                })
-            }
-            "get_git_log" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                get_git_log(workspace.analyzer(), params)
-            }),
-            "get_commit_diff" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
-                get_commit_diff(workspace.analyzer(), params)
             }),
             "jq" => Self::decode_and_run(&snapshot, arguments, |workspace, params| {
                 jq(workspace.analyzer(), params)

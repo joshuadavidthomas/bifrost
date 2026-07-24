@@ -1616,23 +1616,6 @@ namespace Demo
         self.assertEqual(["alpha", "beta"], selected.files[0].matches)
         self.assertEqual(["1", "2"], attrs.files[0].matches)
 
-    def test_git_tools_return_text(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            _init_git_repo(root)
-            (root / "a.txt").write_text("alpha\n")
-            _git_commit(root, "Add alpha file")
-
-            with SearchToolsClient(root=root) as client:
-                log = client.get_git_log()
-                diff = client.get_commit_diff("HEAD")
-                search = client.search_git_commit_messages("alpha")
-
-        self.assertIn("Add alpha file", log.text)
-        self.assertIn("a.txt", diff.text)
-        self.assertIn("alpha", search.text)
-        self.assertEqual(log.text, log.render_text())
-
     def test_update_paths_returns_typed_metrics(self) -> None:
         with SearchToolsClient(root=self.fixture_root) as client:
             result = client.update_paths(["A.java"])

@@ -17,7 +17,7 @@ use std::sync::LazyLock;
 // Bound MCP-supplied path lists so a single call cannot allocate an
 // unbounded `Vec<String>` of report lines or pin the analyzer scanning
 // thousands of files. Mirrors the per-tool caps already used in
-// `file_tools.rs` / `git_tools.rs`.
+// `file_tools.rs`.
 pub(crate) const MAX_FILE_PATHS: usize = 200;
 
 // Hard cap on report lines (one line per flagged function). Protects the

@@ -87,9 +87,6 @@ exposes:
 | `search_file_contents(patterns, *, file_path=None, context_lines=None, case_insensitive=False)` | Grep contents with context. |
 | `find_files_containing(patterns, *, limit=None, case_insensitive=False)` | Find files whose contents match. |
 | `list_files(directory_path="", *, max_entries=None)` | List files under a directory. |
-| `get_git_log(*, file_path=None, limit=None)` | Recent commits (optionally for one path). |
-| `get_commit_diff(revision, *, max_files=None, lines_per_file=None)` | Unified diff for a commit. |
-| `search_git_commit_messages(pattern, *, limit=None)` | Regex search over commit messages. |
 | `jq(file_path, filter_expr, *, max_files=None, matches_per_file=None)` | Run a jq filter over JSON files. |
 | `xml_skim(file_path, *, max_files=None)` | Summarize XML element structure. |
 | `xml_select(file_path, xpath, *, output=XmlSelectOutput.TEXT, attr_name=None, max_files=None)` | Evaluate an XPath over XML files. |
@@ -108,7 +105,7 @@ exposes:
 Pass `render_line_numbers=False` to drop line numbers from rendered text while
 keeping the structured line metadata on the result objects.
 
-The git tools return a `GitTextResult` (`.text`), the slopcop tools return a
+The slopcop tools return a
 `CodeQualityReport` (`.report`), and the rest return structured dataclasses from
 `bifrost_searchtools.models`. The per-rule tuning knobs on the smell reports are
 passed through `options` (keys map 1:1 to the Rust tool arguments).

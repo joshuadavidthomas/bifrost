@@ -63,13 +63,6 @@ export const BIFROST_CAPABILITIES = [
     ],
   },
   {
-    id: "git",
-    label: "Git history",
-    description: "Commit-message search, history, and commit diffs",
-    serverToolsets: ["extended"],
-    toolRequirements: [["search_git_commit_messages"], ["get_git_log"], ["get_commit_diff"]],
-  },
-  {
     id: "text",
     label: "Text search",
     description: "Raw file reads and regular-expression content search",

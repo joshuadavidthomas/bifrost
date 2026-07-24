@@ -19,9 +19,6 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
     "find_filenames",
     "list_files",
     "most_relevant_files",
-    "search_git_commit_messages",
-    "get_git_log",
-    "get_commit_diff",
     "jq",
     "xml_skim",
     "xml_select",
@@ -492,75 +489,6 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                     }
                 },
                 "required": ["seed_file_paths"]
-            }),
-        ),
-        tool_descriptor(
-            "search_git_commit_messages",
-            "Regex search across the workspace's git commit messages. Returns matching commits as a sequence of <commit id=\"...\"> blocks, each containing <message> and <edited_files>.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regular expression to match against commit messages."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 20,
-                        "minimum": 1,
-                        "maximum": 100,
-                        "description": "Maximum number of matching commits to return (capped at 100)."
-                    }
-                },
-                "required": ["pattern"]
-            }),
-        ),
-        tool_descriptor(
-            "get_git_log",
-            "Return recent commits, optionally filtered to those that touch a given path. Output is a <git_log> wrapper containing <entry> elements with hash, author, date and the commit message body.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Optional project-relative file or directory path to filter by, or an absolute path inside the active workspace."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "default": 20,
-                        "minimum": 1,
-                        "maximum": 100,
-                        "description": "Maximum number of commits to return (capped at 100)."
-                    }
-                }
-            }),
-        ),
-        tool_descriptor(
-            "get_commit_diff",
-            "Return the unified diff for a single commit versus its parent (or the empty tree for root commits), wrapped in a <commit_diff> element with revision, short_hash, files_total, files_included and truncated attributes. Truncated by file count and lines per file.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "revision": {
-                        "type": "string",
-                        "description": "Commit reference (short hash, full hash, branch, tag)."
-                    },
-                    "max_files": {
-                        "type": "integer",
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": 100,
-                        "description": "Maximum number of files to include in the diff (capped at 100)."
-                    },
-                    "lines_per_file": {
-                        "type": "integer",
-                        "default": 1000,
-                        "minimum": 1,
-                        "maximum": 5000,
-                        "description": "Maximum number of diff lines per file (capped at 5000)."
-                    }
-                },
-                "required": ["revision"]
             }),
         ),
         tool_descriptor(

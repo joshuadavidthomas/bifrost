@@ -57,9 +57,6 @@ pub fn normalize_tool_arguments(
         | "report_dead_code_and_unused_abstraction_smells" => {
             normalize_string_array_field(&mut arguments, "file_paths", workspace_root)?
         }
-        "get_git_log" => {
-            normalize_optional_string_field(&mut arguments, "file_path", workspace_root)?
-        }
         _ => {}
     }
     Ok(arguments)
@@ -176,12 +173,6 @@ pub fn normalize_tool_arguments_for_cli(
         | "report_dead_code_and_unused_abstraction_smells" => normalize_cli_string_array_field(
             &mut arguments,
             "file_paths",
-            workspace_root,
-            &mut overlays,
-        )?,
-        "get_git_log" => normalize_cli_optional_string_field(
-            &mut arguments,
-            "file_path",
             workspace_root,
             &mut overlays,
         )?,

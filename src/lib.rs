@@ -8,7 +8,6 @@ pub mod commit_analysis;
 mod compact_graph;
 pub mod file_tools;
 mod git_file;
-pub mod git_tools;
 pub mod gitblob;
 pub mod hash;
 pub mod lsp;

@@ -3422,33 +3422,6 @@ class ListFilesResult:
 
 
 # ---------------------------------------------------------------------------
-# Git tools
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class GitTextResult:
-    """A git tool result.
-
-    The Rust git tools (``get_git_log``, ``get_commit_diff``,
-    ``search_git_commit_messages``) render their own XML-shaped text rather than
-    structured JSON, so the payload is surfaced verbatim as ``text``.
-    """
-
-    text: str
-
-    @classmethod
-    def from_text(cls, text: str) -> GitTextResult:
-        return cls(text=text)
-
-    def render_text(self) -> str:
-        return self.text
-
-    def __str__(self) -> str:
-        return self.text
-
-
-# ---------------------------------------------------------------------------
 # Structured data tools
 # ---------------------------------------------------------------------------
 

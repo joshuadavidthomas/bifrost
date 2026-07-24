@@ -23,7 +23,6 @@ from .models import (
     FindFilenamesResult,
     FindFilesContainingResult,
     GetFileContentsResult,
-    GitTextResult,
     JqResult,
     ListFilesResult,
     MostRelevantFilesResult,
@@ -636,49 +635,6 @@ class SearchToolsClient:
         if max_entries is not None:
             arguments["max_entries"] = max_entries
         return ListFilesResult.from_dict(self._call_tool("list_files", arguments))
-
-    # ------------------------------------------------------------------
-    # Git tools
-    # ------------------------------------------------------------------
-
-    def search_git_commit_messages(
-        self, pattern: str, *, limit: int | None = None
-    ) -> GitTextResult:
-        """Regex search across git commit messages. Returns XML-shaped ``<commit>`` blocks."""
-        arguments: dict[str, Any] = {"pattern": pattern}
-        if limit is not None:
-            arguments["limit"] = limit
-        return GitTextResult.from_text(
-            self._call_tool_text("search_git_commit_messages", arguments)
-        )
-
-    def get_git_log(
-        self, *, file_path: str | None = None, limit: int | None = None
-    ) -> GitTextResult:
-        """Return recent commits, optionally filtered to those touching ``file_path``."""
-        arguments: dict[str, Any] = {}
-        if file_path is not None:
-            arguments["file_path"] = file_path
-        if limit is not None:
-            arguments["limit"] = limit
-        return GitTextResult.from_text(self._call_tool_text("get_git_log", arguments))
-
-    def get_commit_diff(
-        self,
-        revision: str,
-        *,
-        max_files: int | None = None,
-        lines_per_file: int | None = None,
-    ) -> GitTextResult:
-        """Return the unified diff for a single commit (``revision``: hash, branch, or tag)."""
-        arguments: dict[str, Any] = {"revision": revision}
-        if max_files is not None:
-            arguments["max_files"] = max_files
-        if lines_per_file is not None:
-            arguments["lines_per_file"] = lines_per_file
-        return GitTextResult.from_text(
-            self._call_tool_text("get_commit_diff", arguments)
-        )
 
     def analyze_commit(
         self,
