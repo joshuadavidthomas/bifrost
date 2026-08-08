@@ -1218,12 +1218,14 @@ pub fn resolve_active_semantic_models(
             &evidence,
             &request.bifrost_version,
         ) else {
+            let reason =
+                strict_activation_mismatch_reason(&loaded.manifest, &loaded.shard, &evidence);
             push_loaded_explanation(
                 &mut report,
                 request.limits,
                 &loaded,
                 SemanticModelActivationStatus::Incompatible,
-                "complete activation evidence does not satisfy the manifest and shard selector",
+                &reason,
             );
             continue;
         };
@@ -1873,6 +1875,134 @@ fn strict_coordinate_matches(
                 VersionReq::parse(requirement).is_ok_and(|requirement| requirement.matches(version))
             }
         },
+    }
+}
+
+/// Explain a failed strict activation match. When the evidence names a
+/// required coordinate but an exact version requirement rejects it, the
+/// explanation names the workspace version and the pack requirement (#1884).
+/// Every other rejection keeps the generic statement.
+fn strict_activation_mismatch_reason(
+    manifest: &CompiledPackManifest,
+    shard: &CompiledShard,
+    evidence: &[SemanticModelActivationEvidence],
+) -> String {
+    let scoped = || {
+        evidence
+            .iter()
+            .filter(|row| row.language == manifest.language && row.ecosystem == manifest.ecosystem)
+    };
+    for constraint in &manifest.compatibility.toolchains {
+        let Ok(requirement) = VersionReq::parse(&constraint.requirement) else {
+            continue;
+        };
+        let satisfied = scoped().any(|row| {
+            row.toolchain.as_ref().is_some_and(|toolchain| {
+                toolchain.name == constraint.name
+                    && toolchain
+                        .version
+                        .as_ref()
+                        .is_some_and(|version| requirement.matches(version))
+            })
+        });
+        if satisfied {
+            continue;
+        }
+        if let Some(toolchain) = scoped()
+            .filter_map(|row| row.toolchain.as_ref())
+            .find(|toolchain| toolchain.name == constraint.name)
+        {
+            return match &toolchain.version {
+                Some(version) => format!(
+                    "workspace toolchain {} {version} does not satisfy the pack requirement {}",
+                    constraint.name, constraint.requirement
+                ),
+                None => format!(
+                    "workspace toolchain {} has no exact version and does not satisfy the pack requirement {}",
+                    constraint.name, constraint.requirement
+                ),
+            };
+        }
+    }
+    for selector in shard.activation() {
+        for row in scoped() {
+            if !strict_coordinate_names_match(selector.package.as_ref(), row.package.as_ref())
+                || !strict_coordinate_names_match(selector.module.as_ref(), row.module.as_ref())
+                || !strict_coordinate_names_match(
+                    selector.toolchain.as_ref(),
+                    row.toolchain.as_ref(),
+                )
+            {
+                continue;
+            }
+            if !(selector.targets.is_empty()
+                || row
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| selector.targets.contains(target)))
+                || !(selector.configurations.is_empty()
+                    || row.configuration.as_ref().is_some_and(|configuration| {
+                        selector.configurations.contains(configuration)
+                    }))
+                || !selector
+                    .artifact_sha256
+                    .as_ref()
+                    .is_none_or(|expected| row.artifact_sha256.as_ref() == Some(expected))
+            {
+                continue;
+            }
+            for (axis, coordinate_selector, coordinate_evidence) in [
+                ("package", selector.package.as_ref(), row.package.as_ref()),
+                ("module", selector.module.as_ref(), row.module.as_ref()),
+                (
+                    "toolchain",
+                    selector.toolchain.as_ref(),
+                    row.toolchain.as_ref(),
+                ),
+            ] {
+                let (Some(coordinate_selector), Some(coordinate_evidence)) =
+                    (coordinate_selector, coordinate_evidence)
+                else {
+                    continue;
+                };
+                let Some(requirement_source) = &coordinate_selector.version else {
+                    continue;
+                };
+                let Ok(requirement) = VersionReq::parse(requirement_source) else {
+                    continue;
+                };
+                let satisfied = coordinate_evidence
+                    .version
+                    .as_ref()
+                    .is_some_and(|version| requirement.matches(version));
+                if !satisfied {
+                    return match &coordinate_evidence.version {
+                        Some(version) => format!(
+                            "workspace {axis} {} {version} does not satisfy the pack requirement {requirement_source}",
+                            coordinate_selector.name
+                        ),
+                        None => format!(
+                            "workspace {axis} {} has no exact version and does not satisfy the pack requirement {requirement_source}",
+                            coordinate_selector.name
+                        ),
+                    };
+                }
+            }
+        }
+    }
+    "complete activation evidence does not satisfy the manifest and shard selector".to_owned()
+}
+
+/// The name half of `strict_coordinate_matches`: whether the evidence names
+/// the selector's coordinate at all.
+fn strict_coordinate_names_match(
+    selector: Option<&super::NameSelector>,
+    evidence: Option<&CatalogCoordinate>,
+) -> bool {
+    match (selector, evidence) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(selector), Some(evidence)) => selector.name == evidence.name,
     }
 }
 

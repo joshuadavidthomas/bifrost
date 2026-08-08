@@ -25,6 +25,7 @@ mod kotlin;
 pub(crate) mod languages;
 pub mod lexical_definitions;
 mod multi_analyzer;
+pub mod packs_document;
 mod php;
 mod python;
 pub mod reference_candidates;
