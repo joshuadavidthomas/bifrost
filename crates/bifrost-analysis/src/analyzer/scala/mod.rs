@@ -466,6 +466,60 @@ impl ScalaAnalyzer {
         })
     }
 
+    /// How far a lookup for `name` from `file` could see past the workspace,
+    /// and the external type it landed on when it landed on one.
+    ///
+    /// The JVM half of boundary refinement, mirroring
+    /// `JavaAnalyzer::external_boundary_evidence`. The tiers are the external
+    /// tiers of [`ScalaSource::simple_type_proof`] -- a written qualified name,
+    /// `java.lang`, the file's explicit and wildcard imports, the file's own
+    /// package -- read against the built index rather than a peek, because the
+    /// trace runs on the resolver path where building is permitted. A hit is
+    /// [`BoundaryStatus::ExternalIndexed`] with the resolved external type; a
+    /// miss against an index whose producers reported truncation is
+    /// [`BoundaryStatus::ExternalDeclaredUnindexed`], because the build
+    /// declared artifacts the index never finished reading.
+    pub(crate) fn external_boundary_evidence(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> (BoundaryStatus, Option<String>) {
+        let external = self.external_declaration_index();
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        let indexed = |ty: &crate::analyzer::jvm::external::JvmExternalType| {
+            (BoundaryStatus::ExternalIndexed, Some(ty.fqn().to_owned()))
+        };
+        if name.contains('.')
+            && let Some(ty) = external.resolve_qualified_name(name, &package_name)
+        {
+            return indexed(ty);
+        }
+        if let Some(ty) = external.resolve_java_lang(name) {
+            return indexed(ty);
+        }
+        for import in self.inner.import_info_of(file) {
+            let Some(path) = scala_import_path(&import) else {
+                continue;
+            };
+            if import.is_wildcard {
+                if let Some(ty) = external.resolve_wildcard_import(&path, name, &package_name) {
+                    return indexed(ty);
+                }
+            } else if import.local_name() == Some(name)
+                && let Some(ty) = external.resolve_explicit_import(&path, &package_name)
+            {
+                return indexed(ty);
+            }
+        }
+        if let Some(ty) = external.resolve_same_package(&package_name, name) {
+            return indexed(ty);
+        }
+        if external.production_diagnostic_count() > 0 {
+            return (BoundaryStatus::ExternalDeclaredUnindexed, None);
+        }
+        (BoundaryStatus::ExternalUnknown, None)
+    }
+
     /// Whether a bare Scala type name is declared in `file` itself or anywhere
     /// in `package_name`. The source-declaration half of both
     /// [`ScalaSource::simple_type_proof`] and

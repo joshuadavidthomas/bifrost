@@ -18,6 +18,7 @@ mod imports;
 mod semantic;
 mod structural;
 use crate::analyzer::Range;
+use crate::analyzer::structural::BoundaryStatus;
 
 // The language halves of the type-resolution and hierarchy logic moved to
 // `brokk-bifrost-csharp`; re-exporting the modules keeps every
@@ -285,6 +286,42 @@ impl CSharpAnalyzer {
             &self.using_namespaces_of(file),
             &self.using_aliases_of(file),
         )
+    }
+
+    /// How far a lookup for `name` from `file` could see past the workspace,
+    /// and the external type it landed on when it landed on one.
+    ///
+    /// The C# half of boundary refinement, mirroring
+    /// `JavaAnalyzer::external_boundary_evidence`: the reference is resolved
+    /// against the assembly declaration index with the same file inputs
+    /// [`Self::external_type_candidates`] uses. One distinct identity is
+    /// [`BoundaryStatus::ExternalIndexed`] with that identity; several distinct
+    /// identities are still indexed -- the name certainly exists in the
+    /// compiled references -- but no single target can be reported. A miss
+    /// against an index that could not read everything the build declared
+    /// (incomplete discovery, or an assembly whose decode gave up part way) is
+    /// [`BoundaryStatus::ExternalDeclaredUnindexed`], the same collapse the C#
+    /// diagnostics pass renders as its typed suppression reasons.
+    pub(crate) fn external_boundary_evidence(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> (BoundaryStatus, Option<String>) {
+        let candidates = self.external_type_candidates(file, name);
+        // Two assemblies publishing the same identity are one type as far as a
+        // name lookup is concerned; only distinct identities are an ambiguity.
+        let distinct: HashSet<&str> = candidates.iter().map(|ty| ty.fqn()).collect();
+        let mut identities = distinct.into_iter();
+        match (identities.next(), identities.len()) {
+            (Some(fqn), 0) => return (BoundaryStatus::ExternalIndexed, Some(fqn.to_owned())),
+            (Some(_), _) => return (BoundaryStatus::ExternalIndexed, None),
+            (None, _) => {}
+        }
+        let index = self.external_declaration_index();
+        if !index.is_complete() || !index.production_diagnostics().is_empty() {
+            return (BoundaryStatus::ExternalDeclaredUnindexed, None);
+        }
+        (BoundaryStatus::ExternalUnknown, None)
     }
 
     pub fn external_member_candidates(

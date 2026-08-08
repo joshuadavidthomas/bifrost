@@ -595,22 +595,39 @@ fn trace_completeness_for(file: &ProjectFile) -> TraceCompleteness {
 /// distinction a policy needs: is the name unknown, or is it declared by a
 /// dependency that nothing indexed?
 ///
-/// Evidence, per language family:
+/// Evidence, per language family (#1870):
 ///
-/// - JVM: the external declaration index. A hit is [`BoundaryStatus::ExternalIndexed`]
-///   and the candidate carries the resolved external type. A miss against an
-///   index that produced truncation diagnostics is
-///   [`BoundaryStatus::ExternalDeclaredUnindexed`]: the build declared artifacts
-///   the producer could not finish reading, so the name may well be there.
+/// - JVM (Java, Kotlin, Scala): the shared external declaration index, walked
+///   through each language's own import ladder. A hit is
+///   [`BoundaryStatus::ExternalIndexed`] and the candidate carries the
+///   resolved external type. A miss against an index that produced truncation
+///   diagnostics is [`BoundaryStatus::ExternalDeclaredUnindexed`]: the build
+///   declared artifacts the producer could not finish reading, so the name may
+///   well be there.
+/// - C#: the assembly declaration index, resolved with the file's namespace,
+///   usings and aliases; an index that could not read everything the build
+///   declared refines a miss the same way the JVM one does.
 /// - Python and JS/TS: the activated semantic-model overlay. A symbol of that
 ///   name is [`BoundaryStatus::ExternalIndexed`]. On an overlay miss, retained
 ///   dependency-discovery evidence (#1601): a name whose module the build
 ///   declares, or a miss against a truncated discovery, is
 ///   [`BoundaryStatus::ExternalDeclaredUnindexed`]. The trace never triggers
 ///   discovery; where none has run, nothing is retained.
+/// - Go and Rust: the same overlay-plus-evidence pair, resolved through the
+///   shared package/crate identity helpers.
+/// - Ruby: the activated overlay read through `ruby::constant_identity`, plus
+///   retained gem-discovery evidence.
+/// - PHP: the activated overlay's postings for the written segment, plus
+///   retained Composer evidence.
 ///
-/// Anything else stays [`BoundaryStatus::ExternalUnknown`]. This function never
-/// changes an outcome; it only sharpens what the trace says about one.
+/// Every index-backed family also falls back to retained discovery evidence
+/// when its index answers nothing, so a declared dependency that discovery
+/// could not read to the end never collapses into "nothing is known".
+///
+/// C++ stays [`BoundaryStatus::ExternalUnknown`]: it has no dependency-pack
+/// ecosystem and no discovery resolver yet, so there is no evidence to read.
+/// This function never changes an outcome; it only sharpens what the trace
+/// says about one.
 fn finish_boundary(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -652,14 +669,42 @@ pub(in crate::analyzer::usages) fn boundary_evidence(
     name: &str,
 ) -> (BoundaryStatus, Option<String>) {
     use crate::analyzer::common::language_for_file;
-    use crate::analyzer::{JavaAnalyzer, Language, resolve_analyzer};
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind;
+    use crate::analyzer::{
+        CSharpAnalyzer, JavaAnalyzer, KotlinAnalyzer, Language, ScalaAnalyzer, resolve_analyzer,
+    };
 
     match language_for_file(file) {
-        Language::Java => {
-            let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
-                return (BoundaryStatus::ExternalUnknown, None);
+        language @ (Language::Java | Language::Kotlin | Language::Scala | Language::CSharp) => {
+            // Each language resolves the spelling through its own import
+            // ladder against its retained external declaration index (the
+            // shared JVM jar index for the JVM family, the assembly index for
+            // C#). When the index answers nothing -- built cleanly, name not
+            // there -- retained discovery evidence still distinguishes "the
+            // build declares dependencies discovery could not read to the end"
+            // from "nothing is known".
+            let evidence = match language {
+                Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer)
+                    .map(|java| java.external_boundary_evidence(file, name)),
+                Language::Kotlin => resolve_analyzer::<KotlinAnalyzer>(analyzer)
+                    .map(|kotlin| kotlin.external_boundary_evidence(file, name)),
+                Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer)
+                    .map(|scala| scala.external_boundary_evidence(file, name)),
+                Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
+                    .map(|csharp| csharp.external_boundary_evidence(file, name)),
+                _ => unreachable!("the arm pattern admits exactly these four languages"),
             };
-            java.external_boundary_evidence(file, name)
+            match evidence {
+                Some((BoundaryStatus::ExternalUnknown, target)) => {
+                    if declared_by_retained_discovery(analyzer, language, name) {
+                        (BoundaryStatus::ExternalDeclaredUnindexed, None)
+                    } else {
+                        (BoundaryStatus::ExternalUnknown, target)
+                    }
+                }
+                Some(refined) => refined,
+                None => (BoundaryStatus::ExternalUnknown, None),
+            }
         }
         language @ (Language::Python | Language::JavaScript | Language::TypeScript) => {
             let indexed = analyzer.semantic_model_overlay().and_then(|overlay| {
@@ -739,8 +784,86 @@ pub(in crate::analyzer::usages) fn boundary_evidence(
                 (BoundaryStatus::ExternalUnknown, None)
             }
         }
-        _ => (BoundaryStatus::ExternalUnknown, None),
+        Language::Ruby => {
+            // A Ruby boundary reference is a `::`-joined constant path, and
+            // `ruby::constant_identity` is the one resolver that turns such a
+            // path into a gem-pack declaration identity, shared with Ruby's
+            // proof-gated diagnostics so both classify one path identically. A
+            // constant path is *not* a require path, so retained gem evidence
+            // is consulted only through the shared verdict helper: a truncated
+            // discovery keeps the name accountable, while gem names are never
+            // inflected into constant names.
+            let overlay = analyzer.semantic_model_overlay();
+            let constants = crate::analyzer::ruby::constant_identity::RubyOverlayConstants::new(
+                overlay.as_deref(),
+            );
+            if let Some(symbol) = constants.unique_type(name) {
+                return (BoundaryStatus::ExternalIndexed, Some(symbol.id.clone()));
+            }
+            // Two activated packs claiming one path is still an indexed name;
+            // no single target can be reported.
+            if constants.conflicts(name) {
+                return (BoundaryStatus::ExternalIndexed, None);
+            }
+            if declared_by_retained_discovery(analyzer, Language::Ruby, name) {
+                (BoundaryStatus::ExternalDeclaredUnindexed, None)
+            } else {
+                (BoundaryStatus::ExternalUnknown, None)
+            }
+        }
+        Language::Php => {
+            // PHP spells qualified names with `\`, which the reference-site
+            // scanner does not span, so the trace holds a single written
+            // segment. The overlay posts each symbol under its terminal name
+            // as well as its dotted qualified name, so the lookup matches the
+            // Python arm's strength; filtering to PHP symbols keeps another
+            // ecosystem's posting from answering, and a namespace scaffold is
+            // not a type a reference can name.
+            let indexed = analyzer.semantic_model_overlay().and_then(|overlay| {
+                overlay
+                    .symbols_named(name)
+                    .records
+                    .iter()
+                    .find(|symbol| {
+                        symbol.language == "php" && symbol.kind != SemanticModelSymbolKind::Module
+                    })
+                    .map(|symbol| symbol.id.clone())
+            });
+            if let Some(id) = indexed {
+                return (BoundaryStatus::ExternalIndexed, Some(id));
+            }
+            // Composer discovery declares dotted PSR-4 prefixes; a single
+            // written segment reaches them only as an exact identity, so the
+            // declared refinement here is truncation plus exact matches. PHP
+            // records no structured per-file import layer yet (the ImportInfo
+            // gap #1600 shares), so there is no route to walk.
+            if declared_by_retained_discovery(analyzer, Language::Php, name) {
+                (BoundaryStatus::ExternalDeclaredUnindexed, None)
+            } else {
+                (BoundaryStatus::ExternalUnknown, None)
+            }
+        }
+        // C++ has no dependency-pack ecosystem (`DependencyPackEcosystem`
+        // names none for it), no overlay producer, and no discovery resolver,
+        // so there is no evidence to refine with; unconditional
+        // `ExternalUnknown` is the honest answer until one exists.
+        Language::Cpp | Language::None => (BoundaryStatus::ExternalUnknown, None),
     }
+}
+
+/// Whether retained dependency-discovery evidence for `language` still
+/// accounts for `name`: the build declares it (or a module containing it), or
+/// discovery could not read everything the build declared. Reads what the
+/// analyzer already holds; never starts discovery.
+fn declared_by_retained_discovery(
+    analyzer: &dyn IAnalyzer,
+    language: crate::analyzer::Language,
+    name: &str,
+) -> bool {
+    crate::analyzer::semantic_model::retained_evidence_declares(
+        analyzer.dependency_discovery_evidence(language).as_deref(),
+        name,
+    )
 }
 
 /// Whether the import that binds `name`'s leading segment in `file` routes
