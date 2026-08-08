@@ -2837,6 +2837,7 @@ fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'
     use super::super::PolicyReportDiagnosticCode as Code;
     match value {
         Code::WorkspaceSnapshotDeadlineExceeded => "workspace-snapshot-deadline-exceeded",
+        Code::DiffBaseUnreliable => "diff-base-unreliable",
         Code::SuppressionLoadFailed => "suppression-load-failed",
         Code::SuppressionAuditRetentionExceeded => "suppression-audit-retention-exceeded",
         Code::ScopeLoadFailed => "scope-load-failed",

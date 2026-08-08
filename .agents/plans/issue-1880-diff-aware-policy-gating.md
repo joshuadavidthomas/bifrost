@@ -106,6 +106,18 @@ Warm base evaluation through the persisted blob-OID store (follow-up performance
 
 2026-08-08: Base evaluation reuses `diff_analysis.rs` revision materialization (temp export + `FileSetProject` + `build_ephemeral`) instead of `git worktree add`, because it exists, is checkout-safe, and avoids mutating the user's worktree list. Consequence: no cache sharing in v1; accepted, since the CLI policy path has no persistent store today anyway.
 
+2026-08-08 (implementation): Instead of raising `RevisionImage::materialize` and the `Snapshot` type to `pub`, `crates/bifrost-analysis/src/diff_analysis.rs` gained one composed public entry point, `export_revision(workspace_root, revision) -> RevisionExport`. Reason: `materialize` takes an explicit changed-path list, but the base policy evaluation needs the *entire* workspace subtree, so a tree walk had to be added anyway; composing it in `diff_analysis` keeps `git2` out of the policy crate and exposes the smallest possible surface (root, files, resolved commit id). `export_revision` also handles a workspace root that is a subdirectory of the repository work tree by descending to the matching subtree, so exported paths stay workspace-relative and identities join.
+
+2026-08-08 (implementation): The base run's options are `PolicyEvaluationOptions::new(head evaluation date)` plus the head's `require_explicit_schema_versions` flag: no diff base (which would recurse), `fail_on` Never, and the head's suppression and scope configuration deliberately not forwarded. The conventional suppression/scope loaders still run against the base image; that is harmless for identity collection (attachments never change the identity set), and a base tree whose own committed suppression or scope document is invalid degrades loudly via the ordinary reliability rules. The degraded-base tests use exactly that vector (an invalid committed `.bifrost/suppressions.json` repaired in the working tree).
+
+2026-08-08 (implementation): Clarification of the earlier degradation entry: because `report_exit_status` treats any report diagnostic as unreliable, a degraded diff run always exits 2 (never 1), whether or not the head has findings. That satisfies "an unreliable base never silently passes" and matches milestone 2's instruction that `report_exit_status` itself stays unchanged; the earlier sentence "only when the head is otherwise clean" was imprecise about the existing precedence and is superseded by this one.
+
+2026-08-08 (implementation): When a diff base is requested but the head evaluation has no runnable policy (every input became a diagnostic), the base is not evaluated; the review records `degraded: true` with a diagnostic explaining why. The run is already unreliable in that state and there is nothing to classify.
+
+2026-08-08 (implementation): `FindingDiffDisposition` and `PolicyFindingDiff` live in `crates/bifrost-policy/src/finding.rs` next to `PolicyFinding`'s suppression/scope attachment machinery rather than in `suppression.rs`; `PolicyDiffReview` and `PolicyDiffFixedFinding` live in `report.rs` next to the other review vectors. "Next to the suppression types" was read as proximity to the per-finding decision plumbing, which is what these files own.
+
+2026-08-08 (implementation): Base identities are collected from the base run's *report* runs, which is safe because report-level finding omission always marks the run's completion non-reliable (`record_omitted_finding` -> `mark_inconclusive`), which makes the base exit 2 and degrades the diff. A base whose findings exceed the retention budget therefore can never silently misclassify persisting findings as new.
+
 2026-08-08: Unreliable base degrades to full gating with a loud diagnostic rather than failing the run outright. Rationale: a broken base must not block detection of new findings, and must not be mistakable for a clean diff; the diagnostic makes the run itself exit 2 via the existing report-diagnostic rule only when the head is otherwise clean — findings still gate.
 
 2026-08-08: Fixed findings are a top-level summary, not phantom finding objects, because `PolicyRun` invariants (sorted unique ids, retention accounting) are built around findings that exist in the evaluated snapshot.
@@ -114,8 +126,19 @@ Warm base evaluation through the persisted blob-OID store (follow-up performance
 
 ## Progress
 
-- [ ] Milestone 1: options plumbing, base materialization, join, unit tests.
-- [ ] Milestone 2: report field, review vector, gate predicate, three renderers, rendering tests.
+- [x] (2026-08-08) Milestone 1: options plumbing (`with_diff_base` + accessor + retained-size), base materialization (`export_revision` in `diff_analysis.rs`), baseline evaluation (`evaluate_policy_diff_baseline`), join (`apply_policy_diff`), gate predicate, degradation diagnostic, and four coordinator unit tests (join classification, git-backed gating incl. fixed, degraded base, unresolvable base / non-git root). `cargo test -p brokk-bifrost-policy`: 301 passed. Note: the report field, gate predicate, and `DiffBaseUnreliable` diagnostic from milestone 2's report/coordinator half were implemented together with milestone 1 because the join cannot be represented without them; milestone 2's remaining scope is the three renderers and their tests.
+- [ ] Milestone 2: SARIF renderer (`baselineState`, result property, run-level review), human renderer (concise filter, verbose stanza, summary line), rendering tests in `tests/suite_bench_policy/`.
 - [ ] Milestone 3: CLI flag (four parse sites + params struct), MCP param + schema, action input.
 - [ ] Milestone 4: git-backed CLI tests, degraded-base test, docs (policy page, CLI page, CI page).
 - [ ] Full validation: suite_bench_policy green, featureless workspace clippy clean, pre-push gate before push.
+
+## Surprises & Discoveries
+
+- Observation: the milestone-1 join unit test uses two files (one shared, one added) rather than one file with a duplicated `target` function, because the match selector joins on the declared name and a same-file duplicate declaration would collide on FQN in the analyzer rather than produce a clean second finding.
+  Evidence: `diff_join_classifies_new_persisting_and_fixed_findings` in `crates/bifrost-policy/src/coordinator.rs` asserts one persisting (`app.ts`), one new (`extra.ts`), and one fixed in the reversed direction.
+- Observation: report-level finding omission implies a non-reliable run completion, so collecting base identities from the base report (rather than from pre-report runs) is loss-free: any base retention loss degrades the whole diff instead of misclassifying findings.
+  Evidence: `PolicyReportBuilder::record_omitted_finding` calls `mark_inconclusive`, and `report_exit_status` returns 2 for non-exhaustive completions.
+
+## Outcomes & Retrospective
+
+- (to be written at completion)

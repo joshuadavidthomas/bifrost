@@ -1017,6 +1017,7 @@ impl PolicyReportDiagnostic {
 #[serde(rename_all = "kebab-case")]
 pub enum PolicyReportDiagnosticCode {
     WorkspaceSnapshotDeadlineExceeded,
+    DiffBaseUnreliable,
     SuppressionLoadFailed,
     SuppressionAuditRetentionExceeded,
     ScopeLoadFailed,
@@ -1594,6 +1595,144 @@ impl fmt::Display for PolicyExecutionMetadataError {
 
 impl std::error::Error for PolicyExecutionMetadataError {}
 
+/// Upper bound on retained fixed-finding entries in one diff review.
+///
+/// The counts always stay exact; only the entry list truncates, mirroring the
+/// report's other bounded collections.
+pub(crate) const MAX_DIFF_FIXED_FINDINGS: usize = 256;
+
+/// One base-revision finding identity that no head finding matched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyDiffFixedFinding {
+    policy_id: PolicyId,
+    finding_id: PolicyFindingId,
+}
+
+impl PolicyDiffFixedFinding {
+    pub(crate) const fn new(policy_id: PolicyId, finding_id: PolicyFindingId) -> Self {
+        Self {
+            policy_id,
+            finding_id,
+        }
+    }
+
+    pub const fn policy_id(&self) -> &PolicyId {
+        &self.policy_id
+    }
+
+    pub const fn finding_id(&self) -> PolicyFindingId {
+        self.finding_id
+    }
+}
+
+impl RetainedSize for PolicyDiffFixedFinding {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>().saturating_add(retained_extra(&self.policy_id))
+    }
+}
+
+/// Top-level audit of one diff-aware evaluation against a base revision.
+///
+/// When `degraded` is true the base evaluation was unreliable: no per-finding
+/// diff decision exists, every head finding gates as if no diff base had been
+/// given, and a `diff-base-unreliable` report diagnostic states why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyDiffReview {
+    base_revision: String,
+    base_commit: String,
+    degraded: bool,
+    new_count: u64,
+    persisting_count: u64,
+    fixed_count: u64,
+    fixed: Vec<PolicyDiffFixedFinding>,
+    fixed_truncated: bool,
+}
+
+impl PolicyDiffReview {
+    pub(crate) fn new(
+        base_revision: String,
+        base_commit: String,
+        degraded: bool,
+        new_count: u64,
+        persisting_count: u64,
+        mut fixed: Vec<PolicyDiffFixedFinding>,
+        fixed_count: u64,
+    ) -> Self {
+        assert!(
+            fixed.len() <= MAX_DIFF_FIXED_FINDINGS,
+            "diff review retains at most {MAX_DIFF_FIXED_FINDINGS} fixed findings, got {}",
+            fixed.len()
+        );
+        assert!(
+            fixed_count >= u64::try_from(fixed.len()).expect("bounded list length fits u64"),
+            "diff review fixed_count {fixed_count} is below the retained list length {}",
+            fixed.len()
+        );
+        assert!(
+            !degraded || (new_count == 0 && persisting_count == 0 && fixed.is_empty()),
+            "a degraded diff review carries no classification: new {new_count}, persisting {persisting_count}, fixed {fixed:?}"
+        );
+        fixed.sort_by(|left, right| {
+            (left.policy_id.as_str(), left.finding_id)
+                .cmp(&(right.policy_id.as_str(), right.finding_id))
+        });
+        tighten_vec(&mut fixed);
+        let fixed_truncated =
+            fixed_count > u64::try_from(fixed.len()).expect("bounded list length fits u64");
+        Self {
+            base_revision,
+            base_commit,
+            degraded,
+            new_count,
+            persisting_count,
+            fixed_count,
+            fixed,
+            fixed_truncated,
+        }
+    }
+
+    pub fn base_revision(&self) -> &str {
+        &self.base_revision
+    }
+
+    pub fn base_commit(&self) -> &str {
+        &self.base_commit
+    }
+
+    pub const fn degraded(&self) -> bool {
+        self.degraded
+    }
+
+    pub const fn new_count(&self) -> u64 {
+        self.new_count
+    }
+
+    pub const fn persisting_count(&self) -> u64 {
+        self.persisting_count
+    }
+
+    pub const fn fixed_count(&self) -> u64 {
+        self.fixed_count
+    }
+
+    pub fn fixed(&self) -> &[PolicyDiffFixedFinding] {
+        &self.fixed
+    }
+
+    pub const fn fixed_truncated(&self) -> bool {
+        self.fixed_truncated
+    }
+}
+
+impl RetainedSize for PolicyDiffReview {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.base_revision.capacity())
+            .saturating_add(self.base_commit.capacity())
+            .saturating_add(retained_extra(&self.fixed))
+    }
+}
+
 /// The sole canonical input to every policy-report renderer.
 #[derive(Debug, Clone)]
 pub struct PolicyReportDocument {
@@ -1604,6 +1743,7 @@ pub struct PolicyReportDocument {
     runs: Vec<PolicyRun>,
     suppressions: Vec<PolicySuppressionReview>,
     scope: Vec<PolicyScopeReview>,
+    diff: Option<PolicyDiffReview>,
     diagnostics: Vec<PolicyReportDiagnostic>,
     diagnostics_truncated: bool,
     omitted_diagnostics_lower_bound: u64,
@@ -1663,6 +1803,7 @@ impl PolicyReportDocument {
             runs,
             suppressions,
             Vec::new(),
+            None,
             diagnostics,
             diagnostics_truncated,
             omitted_diagnostics_lower_bound,
@@ -1678,6 +1819,7 @@ impl PolicyReportDocument {
         mut runs: Vec<PolicyRun>,
         mut suppressions: Vec<PolicySuppressionReview>,
         mut scope: Vec<PolicyScopeReview>,
+        diff: Option<PolicyDiffReview>,
         mut diagnostics: Vec<PolicyReportDiagnostic>,
         diagnostics_truncated: bool,
         omitted_diagnostics_lower_bound: u64,
@@ -1702,6 +1844,7 @@ impl PolicyReportDocument {
         validate_rule_run_joins(&rules, &runs)?;
         validate_suppression_joins(&runs, &suppressions)?;
         validate_scope_joins(&runs, &scope)?;
+        validate_diff_joins(&runs, diff.as_ref())?;
 
         Ok(Self {
             schema_version: Self::SCHEMA_VERSION,
@@ -1711,6 +1854,7 @@ impl PolicyReportDocument {
             runs,
             suppressions,
             scope,
+            diff,
             diagnostics,
             diagnostics_truncated,
             omitted_diagnostics_lower_bound,
@@ -1750,6 +1894,10 @@ impl PolicyReportDocument {
         &self.scope
     }
 
+    pub const fn diff(&self) -> Option<&PolicyDiffReview> {
+        self.diff.as_ref()
+    }
+
     pub fn diagnostics(&self) -> &[PolicyReportDiagnostic] {
         &self.diagnostics
     }
@@ -1772,7 +1920,10 @@ impl Serialize for PolicyReportDocument {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PolicyReportDocument", 11)?;
+        // The `diff` field is additive and serialized only when present, so a
+        // non-diff report keeps its exact schema-version-3 shape.
+        let field_count = 11 + usize::from(self.diff.is_some());
+        let mut state = serializer.serialize_struct("PolicyReportDocument", field_count)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("evaluation", &self.evaluation)?;
         state.serialize_field("execution", &self.execution)?;
@@ -1780,6 +1931,9 @@ impl Serialize for PolicyReportDocument {
         state.serialize_field("runs", &self.runs)?;
         state.serialize_field("suppressions", &self.suppressions)?;
         state.serialize_field("scope", &self.scope)?;
+        if let Some(diff) = &self.diff {
+            state.serialize_field("diff", diff)?;
+        }
         state.serialize_field("diagnostics", &self.diagnostics)?;
         state.serialize_field("diagnostics_truncated", &self.diagnostics_truncated)?;
         state.serialize_field(
@@ -1803,6 +1957,7 @@ impl RetainedSize for PolicyReportDocument {
             .saturating_add(retained_extra(&self.runs))
             .saturating_add(retained_extra(&self.suppressions))
             .saturating_add(retained_extra(&self.scope))
+            .saturating_add(retained_extra(&self.diff))
             .saturating_add(retained_extra(&self.diagnostics))
     }
 }
@@ -1848,6 +2003,14 @@ pub enum PolicyReportDocumentError {
         finding_id: PolicyFindingId,
     },
     ScopedFindingWithoutReview {
+        policy_id: PolicyId,
+        finding_id: PolicyFindingId,
+    },
+    DiffFindingWithoutReview {
+        policy_id: PolicyId,
+        finding_id: PolicyFindingId,
+    },
+    MissingDiffFindingDecision {
         policy_id: PolicyId,
         finding_id: PolicyFindingId,
     },
@@ -1927,6 +2090,20 @@ impl fmt::Display for PolicyReportDocumentError {
                 formatter,
                 "scoped finding {policy_id} finding {finding_id} has no applied scope review"
             ),
+            Self::DiffFindingWithoutReview {
+                policy_id,
+                finding_id,
+            } => write!(
+                formatter,
+                "finding {policy_id} finding {finding_id} carries a diff decision without a classifying top-level diff review"
+            ),
+            Self::MissingDiffFindingDecision {
+                policy_id,
+                finding_id,
+            } => write!(
+                formatter,
+                "diff review classified the report but finding {policy_id} finding {finding_id} has no diff decision"
+            ),
         }
     }
 }
@@ -1950,6 +2127,7 @@ pub struct PolicyReportBuilder {
     runs: Vec<PolicyRun>,
     suppressions: Vec<PolicySuppressionReview>,
     scope: Vec<PolicyScopeReview>,
+    diff: Option<PolicyDiffReview>,
     diagnostics: Vec<PolicyReportDiagnostic>,
     diagnostics_truncated: bool,
     omitted_diagnostics_lower_bound: u64,
@@ -2069,6 +2247,7 @@ impl PolicyReportBuilder {
             runs,
             suppressions,
             scope,
+            diff: None,
             diagnostics,
             diagnostics_truncated: false,
             omitted_diagnostics_lower_bound: 0,
@@ -2259,7 +2438,8 @@ impl PolicyReportBuilder {
             &self.scope,
             &self.diagnostics,
         )
-        .checked_add(self.emergency_allowance)
+        .checked_add(self.diff_extra())
+        .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if !policy_fits || !batch_fits {
             self.record_omitted_finding(run_index, PolicyIncompleteReason::ReportRetentionBudget)?;
@@ -2308,7 +2488,8 @@ impl PolicyReportBuilder {
             &self.scope,
             &self.diagnostics,
         )
-        .checked_add(self.emergency_allowance)
+        .checked_add(self.diff_extra())
+        .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if cap_reached || !policy_fits || !batch_fits {
             let mut omitted_runs = self.runs.clone();
@@ -2343,7 +2524,8 @@ impl PolicyReportBuilder {
             &self.scope,
             &diagnostics,
         )
-        .checked_add(self.emergency_allowance)
+        .checked_add(self.diff_extra())
+        .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if !fits {
             self.diagnostics_truncated = true;
@@ -2414,6 +2596,7 @@ impl PolicyReportBuilder {
             self.runs,
             self.suppressions,
             self.scope,
+            self.diff,
             self.diagnostics,
             self.diagnostics_truncated,
             self.omitted_diagnostics_lower_bound,
@@ -2440,6 +2623,7 @@ impl PolicyReportBuilder {
             &self.scope,
             &self.diagnostics,
         )
+        .saturating_add(self.diff_extra())
         .saturating_add(retained_extra(&execution));
         if retained > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::BatchRetentionExceeded {
@@ -2449,6 +2633,36 @@ impl PolicyReportBuilder {
         }
         self.execution = execution;
         Ok(())
+    }
+
+    /// Retain the diff review that classifies this report's findings.
+    ///
+    /// The review is bounded by construction; charging it against the batch
+    /// budget keeps every later retention decision aware of its bytes.
+    pub fn set_diff(&mut self, diff: PolicyDiffReview) -> Result<(), PolicyReportBuilderError> {
+        assert!(self.diff.is_none(), "diff review is set at most once");
+        let retained = report_storage_size(
+            &self.evaluation,
+            &self.rules,
+            &self.runs,
+            &self.suppressions,
+            &self.scope,
+            &self.diagnostics,
+        )
+        .saturating_add(retained_extra(&self.execution))
+        .saturating_add(retained_extra(&diff));
+        if retained > self.budget.max_retained_report_bytes() {
+            return Err(PolicyReportBuilderError::BatchRetentionExceeded {
+                retained_bytes: retained,
+                max_bytes: self.budget.max_retained_report_bytes(),
+            });
+        }
+        self.diff = Some(diff);
+        Ok(())
+    }
+
+    fn diff_extra(&self) -> usize {
+        self.diff.as_ref().map_or(0, retained_extra)
     }
 
     fn ensure_input_slot(&self) -> Result<(), PolicyReportBuilderError> {
@@ -2493,7 +2707,8 @@ impl PolicyReportBuilder {
             &self.scope,
             diagnostics,
         )
-        .checked_add(outstanding_skeleton_allowance)
+        .checked_add(self.diff_extra())
+        .and_then(|value| value.checked_add(outstanding_skeleton_allowance))
         .and_then(|value| value.checked_add(emergency))
         .ok_or(PolicyReportBuilderError::RetainedSizeOverflow)?;
         if retained > self.budget.max_retained_report_bytes() {
@@ -2560,7 +2775,8 @@ impl PolicyReportBuilder {
             &self.suppressions,
             &self.scope,
             &self.diagnostics,
-        );
+        )
+        .saturating_add(self.diff_extra());
         if actual > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::EmergencyReservationInvariant);
         }
@@ -2991,6 +3207,34 @@ fn validate_suppression_joins(
                 policy_id: finding.policy_id().clone(),
                 finding_id: finding.id(),
             });
+        }
+    }
+    Ok(())
+}
+
+/// A classifying (non-degraded) diff review and per-finding diff decisions
+/// exist exactly together: every retained finding carries a decision when the
+/// review classified the report, and none does otherwise.
+fn validate_diff_joins(
+    runs: &[PolicyRun],
+    diff: Option<&PolicyDiffReview>,
+) -> Result<(), PolicyReportDocumentError> {
+    let classifying = diff.is_some_and(|review| !review.degraded());
+    for finding in runs.iter().flat_map(PolicyRun::findings) {
+        match (classifying, finding.diff()) {
+            (true, None) => {
+                return Err(PolicyReportDocumentError::MissingDiffFindingDecision {
+                    policy_id: finding.policy_id().clone(),
+                    finding_id: finding.id(),
+                });
+            }
+            (false, Some(_)) => {
+                return Err(PolicyReportDocumentError::DiffFindingWithoutReview {
+                    policy_id: finding.policy_id().clone(),
+                    finding_id: finding.id(),
+                });
+            }
+            (true, Some(_)) | (false, None) => {}
         }
     }
     Ok(())
