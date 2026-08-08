@@ -112,6 +112,21 @@ measurement is a separate task run after review; it is not part of this plan's a
       `d97a6ef9` (the fan-out verdict outranks a spent budget). Also corrects run 6's reading of
       the cells' system CPU. See `Outcomes & Retrospective`.
 
+- [x] (2026-08-08) **D4 FINAL: the memory half CLOSES, the latency half does not.** Measured at
+      `50666910`, on the same rustc tree and the same cells, at the quietest gate loadavg the
+      campaign has had (**4.2-12.2**). Report: `usage-graph-d4-final-v1.md` (session scratchpad).
+      **D4-2 marginal RSS: PASS and closed** -- answering-cell peak **4.69 GB**, against 10.69
+      (run 6), 15.58 (run 4) and 23.42 (run 3). **D4-1 graph phase: FAIL, for the fourth run
+      running** -- `usages::graph_find_usages` **1,086.99 s = 90.0% of the backend**, against
+      90.3%, 90.3% and 90.9%. The volume cuts show up exactly where the counts are:
+      `sql_definition_candidates.rows` calls **146,212 -> 108,323 (-25.9%)** and
+      `export_index_of_declarations` builds **3,076 -> 1,841 (-40.1%)**, worth 14.5% of the
+      phase. **The answering cell now resolves the canonical eleven hits on the plain product
+      binary**, at full scope, unnarrowed. **v2 gates: on user CPU four of four PASS; on wall
+      three of four, with cell (a) sitting on the 5 s line.** Cell (b) is **1.70 s** and returns
+      the structured `too_many_candidates[4186/200]` verdict -- the first non-`time_budget`
+      gate-cell answer in ten runs. See `Outcomes & Retrospective`.
+
 ## Surprises & Discoveries
 
 - Observation: the forward reference context is built *during a scan*, not only by
@@ -514,6 +529,88 @@ tested. See rank 2 of the report's ranked list.
 
 Nothing in run 9 changes the D4 verdicts. It is a decomposition of the gate cells, which measure how
 fast the pipeline gives up, not the answering regime the graph-phase target is about.
+
+### D4 final verdict (run 10, 2026-08-08)
+
+Measured at `50666910` -- the reader knobs (`9df5558f`), the stringly fix (`f05c0e48`), the three
+volume cuts (`39f129d7`, `d84ef353`, `0ab698a5`, `5544f6a4`) and the three run-9 fixes (`11bdc39b`,
+`ee7c68aa`, `d97a6ef9`) all landed -- on the same rustc tree and the same cells, at per-cell 1-minute
+loadavg **4.2-12.2**, the quietest gate run this campaign has had. Two binaries from clean detached
+worktrees pinned at HEAD: the subject (`32fbc2d4c5cdefbd`) and a probe carrying only the run-9 span
+skeleton re-applied plus a listing counter (`650fb262eca2b09b`). Full report:
+`usage-graph-d4-final-v1.md` (session scratchpad). **The gate verdicts are stated twice, once on
+wall and once on user CPU, because the owner has not ruled which basis governs.**
+
+| gate | bar | run-10 measurement | wall | user CPU |
+| --- | --- | --- | --- | --- |
+| v2 gate 1(a), cell (a) warm | under 5 s | 5.11 s wall / 4.65 s user (untimed median of 3) | **FAIL by 0.11 s** | **PASS by 7%** |
+| v2 gate 1(b), cell (b) warm | under 5 s | **1.70 s wall / 1.63 s user** | **PASS**, 66% inside | **PASS**, 67% inside |
+| v2 gate 2, cell (c) edited | under 10 s | 5.21 s wall / 4.90 s user | **PASS**, 48% inside | **PASS**, 51% inside |
+| v2 gate 3, gate-cell peak RSS | under 4 GB | 0.16 / 0.44 / 0.51 GB | **PASS** | **PASS** |
+| **D4-1** graph phase | "1,034 s to seconds" | `graph_find_usages` **1,086.99 s = 90.0%** of the backend | **FAIL** (~2 orders) | **FAIL** |
+| **D4-2** graph-phase marginal RSS | "~8 GB to O(bounded caches)" | answering-cell peak **4.69 GB** untimed | **PASS** | **PASS** |
+
+**D4-2 closes.** Peak RSS went 23.42 -> 15.58 -> 10.69 -> **4.69 GB** across runs 3, 4, 6 and 10.
+The whole answering process now peaks below where the graph phase's *marginal* cost alone used to
+sit, and within 17% of the 4 GB budget the gate cells are held to.
+
+**D4-1 does not close, and its share has not moved in four runs**: 90.3%, 90.3%, 90.9%, **90.0%**.
+The volume cuts are real and appear exactly where their counts are load-independent --
+`sql_definition_candidates.rows` calls **146,212 -> 108,323 (-25.9%)**,
+`export_index_of_declarations` builds **3,076 -> 1,841 (-40.1%)** -- and they are worth **14.5%** of
+the phase (1,271.99 -> 1,086.99 s), not the two orders of magnitude the target needs. That a 26%
+read cut bought 14.5% is itself evidence that the m8 profile's path/allocator/moka churn survived
+the cuts, but **no `perf` profile was taken this run, so that is inference, not measurement**, and
+the profile is the next thing to take.
+
+**Cell (b) is the run's largest single change: 5.61 s -> 1.70 s, and its answer became correct.**
+It returns `status="ambiguous"`, `incomplete_reason="resolution_candidates"`,
+`too_many_candidates={cap:200, total_candidates:4186}` in 6 of 6 repetitions -- the structured #1839
+verdict run 9 proved was unreachable. **This is the first gate cell in ten runs to return anything
+other than `time_budget`.** Run 9 modelled 2.90 s for this cell from an `include_tests`
+counterfactual; the landed fixes beat the model by 1.2 s, because `d97a6ef9` also removed the
+resolution-ordering seam the counterfactual could not.
+
+**Every item on run 9's ranked list that was actioned is measured out of the window, and the ledger
+closes to 0.12 s.** With the run-9 median beside it: `scan_usages.excluded_test_files` **2.30 s ->
+0.0 ms** (`11bdc39b`); `assemble_session.start_watcher` **0.37 s -> 0.0 ms** (`ee7c68aa`);
+`scan_usages.sibling_extensions` **0.47 s -> 16 ms**, because the second whole-workspace listing
+that `invalidate_cached_file_listing` forced is gone with the watcher. **The workspace file listing
+is now built exactly once per process** -- the probe counts 1 in 7 of 7 processes and
+`project::collect_workspace_files` is n=1 in 10 of 10 timed gate reps *and* in the answering cell,
+against run 6's 11-12 per query and run 3's 2,701. Cell (a)'s non-budget wall fell **2.12 -> 1.35 s**.
+
+**Cell (a) is now purely deadline-bound, and what keeps it on the line is deadline overshoot, not
+overhead.** Its budget window measures **3.67 s against a 3.00 s budget**, and
+`usages::candidate_discovery` -- which grew 1.62 -> 3.59 s and now owns **97.8%** of the window --
+does not poll the deadline. 1.35 s of non-budget wall plus a 3.00 s deadline honoured is **4.35 s**.
+This is the same defect run 9 recorded for the prologue, inherited by the only phase left in the
+window; it is a correctness question about a deadline rather than a cost reduction, which makes it
+the cheapest remaining lever. Rank 2 (`analyzer_construction.workspace_analyzer`, now 0.84-0.94 s
+with `reconcile.resolve_live_oids` n=5 / 1.45-1.67 s inside it, still carrying ~5-7 s of the cell's
+system CPU) is untouched and remains larger, on its own, than the gap.
+
+**One term moved against the campaign and is named here so it is not read as a silent regression.**
+Cell (a)'s *system* CPU went **7.76 s (run 6) -> 22.28 s**, on a quieter host. The ledger localises
+it: **21.65 s of 28.26 s is inside `cli.call_tool_output`**, where runs 6 and 9 had almost none, and
+construction's share is unchanged at 5.2-7.2 s. Two mechanisms fit and this run does not separate
+them: discovery simply runs 2.2x longer at high fan-out, and `9df5558f` set `mmap_size = 0` on
+reader connections, which turns page-cache hits into `pread` syscalls. **The second is a hypothesis
+with a code fact behind it, not a measurement.** No verdict here rests on system CPU; user CPU is
+4.47-4.72 s and the owner's rule still holds.
+
+**The answering cell resolves.** `resolved=1 found=1 total_hits=11 unproven_hits=0`, run 3's
+canonical set entry for entry, from the **plain product binary** at full scope with no `paths`
+narrowing -- where run 6 needed its probe build to reach eleven. Against run 6 untimed: wall
+**-25.9%**, user CPU **-13.3%**, peak RSS **-56.1%**, and three more hits. The run stayed
+`complete=false` / `time_budget`, so its CPU is still throughput inside a truncated deadline rather
+than the cost of an answer; the safe reading is directional -- **more answer for less CPU**.
+
+**Carry this framing forward: the gate cells and the answering cell no longer say the same thing.**
+For nine runs both said "the pipeline gives up". At run 10 a one-shot code-intelligence call on
+rustc is a **1.7-5.2 s** operation, and a full-scope whole-workspace usage sweep is still a
+**1,070 s** operation truncated by the 300 s clamp. Any report that quotes the gate cells as a proxy
+for scan latency should stop.
 
 ## Note on revisions
 
