@@ -1816,6 +1816,20 @@ fn bounded_scala_expression_type<'tree>(
                         if name.is_empty() {
                             return None;
                         }
+                        // `Widget(...)` constructs a `Widget` when the bare
+                        // callee name resolves to a class in scope (a
+                        // case-class companion `apply` or a universal
+                        // constructor). Only a class answers here --
+                        // `bounded_scala_resolve_segments` admits nothing
+                        // else -- so an ordinary function call falls through
+                        // to the member interpretation below.
+                        if let Some(constructed) = bounded_scala_resolve_segments(
+                            ctx,
+                            std::slice::from_ref(&name.to_string()),
+                            false,
+                        ) {
+                            break constructed;
+                        }
                         members.push(name.to_string());
                         break bounded_scala_nearest_enclosing_owner(ctx, function)?;
                     }

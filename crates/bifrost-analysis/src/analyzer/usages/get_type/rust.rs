@@ -13,10 +13,10 @@ use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use tree_sitter::{Node, Tree};
 
-/// Bounded Rust type resolution for the receiver query. The cache refuses cold
-/// parses of other files' declaration sources: a receiver query resolves many
-/// sites in one report, and an uncharged file parse per site would evade its
-/// budget.
+/// Bounded Rust type resolution for the receiver query, with the `Bounded`
+/// resolver semantics and a cache that refuses cold parses of other files'
+/// declaration sources: a receiver query resolves many sites in one report,
+/// and an uncharged file parse per site would evade its budget.
 pub(crate) fn resolve_rust_type_bounded(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -26,24 +26,29 @@ pub(crate) fn resolve_rust_type_bounded(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
-    resolve_rust_type_in_session(
-        analyzer,
-        file,
-        source,
-        tree,
-        site,
-        budget,
-        cancellation,
-        RustTypeLookupCache::bounded_for_query(),
-    )
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return session.finish(no_type(
+            "rust_analyzer_unavailable",
+            "Rust analyzer is unavailable",
+        ));
+    };
+    let support = AnalyzerRustDefinitionProvider::bounded(rust, &session);
+    let mut cache = RustTypeLookupCache::bounded_for_query();
+    let outcome =
+        resolve_rust_type_with_provider(analyzer, file, source, tree, site, &mut cache, &support);
+    session.finish(outcome)
 }
 
 /// Bounded Rust type resolution for the interactive `get_type_by_location`
-/// arm: the same session-charged resolution, with a cache that may cold-parse
-/// a declaration's file. One request resolves one location under the generous
-/// interactive budget, and reading the file that declares a field's type is
-/// what lets `receiver.field` name a type declared elsewhere -- the answer the
-/// tool has always given.
+/// arm: session-charged like the receiver query's, but with the resolution
+/// semantics the tool has always answered. `cancellable_full` keeps the Full
+/// resolver semantics under a charging session (the same pairing the
+/// cancellable definition path uses), and the default cache may cold-parse a
+/// declaration's file, which is what lets `receiver.field` name a type
+/// declared elsewhere. One request resolves one location under the generous
+/// interactive budget, so both are affordable here where the receiver query
+/// must refuse them.
 pub(crate) fn resolve_rust_type_interactive(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -53,29 +58,6 @@ pub(crate) fn resolve_rust_type_interactive(
     budget: ReceiverAnalysisBudget,
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
-    resolve_rust_type_in_session(
-        analyzer,
-        file,
-        source,
-        tree,
-        site,
-        budget,
-        cancellation,
-        RustTypeLookupCache::default(),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn resolve_rust_type_in_session(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-    budget: ReceiverAnalysisBudget,
-    cancellation: Option<&CancellationToken>,
-    mut cache: RustTypeLookupCache,
-) -> BoundedResolution<TypeLookupOutcome> {
     let session = ResolutionSession::bounded(budget, cancellation);
     let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
         return session.finish(no_type(
@@ -83,7 +65,8 @@ fn resolve_rust_type_in_session(
             "Rust analyzer is unavailable",
         ));
     };
-    let support = AnalyzerRustDefinitionProvider::bounded(rust, &session);
+    let support = AnalyzerRustDefinitionProvider::cancellable_full(rust, &session);
+    let mut cache = RustTypeLookupCache::default();
     let outcome =
         resolve_rust_type_with_provider(analyzer, file, source, tree, site, &mut cache, &support);
     session.finish(outcome)

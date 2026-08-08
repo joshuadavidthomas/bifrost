@@ -66,7 +66,7 @@ impl<'a> AnalyzerRustDefinitionProvider<'a> {
         }
     }
 
-    fn cancellable_full(rust: &'a RustAnalyzer, session: &'a ResolutionSession) -> Self {
+    pub(crate) fn cancellable_full(rust: &'a RustAnalyzer, session: &'a ResolutionSession) -> Self {
         Self {
             rust,
             session: Some(session),
