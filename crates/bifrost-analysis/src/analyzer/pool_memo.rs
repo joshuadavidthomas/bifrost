@@ -354,6 +354,16 @@ impl<T> PoolSafeMemo<T> {
         Ok(built)
     }
 
+    /// Infallible [`Self::get_or_try_build_pool_independent`], for a build that
+    /// reaches its value without any rayon worker and cannot fail.
+    pub(crate) fn get_or_build_pool_independent(&self, build: impl FnOnce() -> T) -> Arc<T> {
+        match self.get_or_try_build_pool_independent(|| Ok::<T, std::convert::Infallible>(build()))
+        {
+            Ok(value) => value,
+            Err(never) => match never {},
+        }
+    }
+
     /// Get or build a value while cooperative work is still permitted.
     ///
     /// The builders must use the same predicate for their own checkpoints.
@@ -463,6 +473,22 @@ where
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(PoolSafeMemo::new())),
         )
+    }
+
+    /// Forget `key`'s cell.
+    ///
+    /// For a memo whose *values* live somewhere else -- a bounded moka cache,
+    /// say -- the cell is in-flight coordination, not storage. Retaining it
+    /// would pin one `Arc<V>` per key ever asked and quietly defeat the bound
+    /// the value cache exists to enforce. A caller that publishes the built
+    /// value elsewhere therefore publishes first and removes second: a thread
+    /// still holding the old cell rides the completed build, and one arriving
+    /// after the removal finds the published value.
+    pub(crate) fn remove(&self, key: &K) {
+        self.cells
+            .write()
+            .expect("keyed pool memo write lock poisoned")
+            .remove(key);
     }
 }
 

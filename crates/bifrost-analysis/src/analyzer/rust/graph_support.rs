@@ -696,13 +696,41 @@ impl RustAnalyzer {
     /// immutable for the analyzer instance's lifetime, and callers ask for it
     /// once per export name per pending file, so deep-cloning the whole map on
     /// every cache hit was pure waste (#1230 item 5).
+    ///
+    /// Single-flighted per file. `export_indexes` is a bounded weighted cache,
+    /// which makes this a check-then-build-then-insert map: concurrent misses
+    /// on one file all miss the check and all build. The rustc-tree measurement
+    /// caught exactly that -- one file appears three times in the top-60 build
+    /// list, and a build is a source read, a tree-sitter parse, a fact-row read
+    /// and an owner-chain walk
+    /// (`.agents/docs/graph-read-cost-investigation-2026-08.md`).
+    ///
+    /// The claim is `pool_independent` (issue #549's rule, #1748's primitive):
+    /// a global-pool worker may park on this build because the build reaches
+    /// its value with no global-pool worker. Audited, not assumed -- the build
+    /// reads one file's source, parses it once with tree-sitter, reads its own
+    /// rows from SQLite, and walks owners through `parent_of`. It enters no
+    /// `par_iter`, spawns no rayon job and joins nothing. (`analyze_files`,
+    /// the persist pipeline and live-OID planning are the only rayon fan-outs
+    /// on this crate's read paths, and none is reachable from here; the two
+    /// that could be build their own pool anyway.)
+    ///
+    /// The value is published to the bounded cache and the cell is then
+    /// dropped, so the single-flight map holds coordination rather than a
+    /// second, unbounded copy of every index ever built.
     pub fn export_index_of(&self, file: &ProjectFile) -> Arc<ExportIndex> {
         if let Some(cached) = self.export_indexes.get(file) {
             return cached;
         }
-        let declarations = self.declarations(file);
-        let index = Arc::new(self.export_index_of_declarations(file, &declarations));
-        self.export_indexes.insert(file.clone(), index.clone());
+        let index = self
+            .export_index_builds
+            .cell(file)
+            .get_or_build_pool_independent(|| {
+                let declarations = self.declarations(file);
+                self.export_index_of_declarations(file, &declarations)
+            });
+        self.export_indexes.insert(file.clone(), Arc::clone(&index));
+        self.export_index_builds.remove(file);
         index
     }
 
@@ -712,6 +740,7 @@ impl RustAnalyzer {
         declarations: &BTreeSet<CodeUnit>,
     ) -> ExportIndex {
         let _scope = crate::profiling::scope("RustAnalyzer::export_index_of_declarations");
+        self.note_export_index_build();
         let mut index = ExportIndex::empty();
         let export_visible = self.export_visible_declarations(file, declarations);
         let owners_here = FileOwnerIndex::of(declarations);
@@ -2687,6 +2716,76 @@ mod tests {
             index.exports_by_name.contains_key("helper"),
             "the cross-file owner chain must still decide candidacy: {:?}",
             index.exports_by_name
+        );
+    }
+
+    /// #1748: `export_indexes` is a bounded weighted cache, so
+    /// `export_index_of` was a check-then-build-then-insert map. That
+    /// deduplicates sequential repeats only. A scan's parallel candidate
+    /// fan-out asks many rayon workers for the same file's index at once, they
+    /// all miss the check, and they all run the build -- a source read, a
+    /// tree-sitter parse, a fact-row read and an owner-chain walk each. The
+    /// rustc-tree measurement shows the shape directly: one file appears three
+    /// times in the top-60 build list.
+    ///
+    /// Fails before the single-flight cell: eight concurrent askers charge
+    /// eight builds (measured 8 of 8, deterministically, because the barrier
+    /// releases them into the check together). After it, one.
+    #[test]
+    fn issue_1748_concurrent_askers_build_one_file_export_index_once() {
+        const WORKERS: usize = 8;
+
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+                ),
+                ("src/lib.rs", "pub mod svc;\n"),
+                (
+                    "src/svc.rs",
+                    "pub struct Widget;\n\
+                     pub fn helper() -> Widget { Widget }\n\
+                     fn hidden() {}\n",
+                ),
+            ],
+        );
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let file = ProjectFile::new(fixture.project_root(), "src/svc.rs");
+
+        let sequential = analyzer.export_index_of(&file);
+
+        // A fresh analyzer, so the bounded cache is cold for every worker.
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        analyzer.reset_export_index_build_count_for_test();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(WORKERS)
+            .build()
+            .expect("rayon pool");
+        let start = std::sync::Barrier::new(WORKERS);
+        let concurrent = pool.broadcast(|_| {
+            start.wait();
+            analyzer.export_index_of(&file)
+        });
+        let builds = analyzer.export_index_build_count_for_test();
+
+        assert_eq!(
+            1, builds,
+            "concurrent askers for one file must run one export-index build"
+        );
+        for index in &concurrent {
+            assert_eq!(
+                sequential.exports_by_name, index.exports_by_name,
+                "single flight must not change the index"
+            );
+        }
+        // The cell is coordination, not storage: once the value is published to
+        // the bounded cache the map must not retain a second copy of it.
+        assert_eq!(
+            format!("{:?}", analyzer.export_index_builds),
+            "KeyedPoolSafeMemo { keys: 0, .. }",
+            "the published build's cell must not be retained"
         );
     }
 

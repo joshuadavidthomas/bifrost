@@ -27,9 +27,10 @@ use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, Range,
-    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    IAnalyzer, ImportAnalysisProvider, KeyedPoolSafeMemo, Language, PoolSafeMemo, Project,
+    ProjectFile, Range, SemanticDiagnostic, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
+    TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -75,6 +76,16 @@ pub struct RustAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
+    /// In-flight coordination for `export_indexes`, one cell per file.
+    ///
+    /// `export_indexes` is a bounded weighted cache, and a bounded cache is a
+    /// check-then-build-then-insert map: concurrent misses on one file all miss
+    /// the check and all build. The rustc-tree measurement caught it -- the same
+    /// file appears three times in the top-60 build list
+    /// (`.agents/docs/graph-read-cost-investigation-2026-08.md`). The cells hold
+    /// no value of their own; the bounded cache stays the storage, and a cell is
+    /// dropped once its value is published there.
+    export_index_builds: Arc<KeyedPoolSafeMemo<ProjectFile, crate::analyzer::usages::ExportIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     // PoolSafeMemo, not OnceLock: this cache is reached from inside rayon
     // workers (see `pool_memo`), where a blocking `get_or_init` can deadlock
@@ -100,6 +111,10 @@ pub struct RustAnalyzer {
     /// condition, so this count falls below the candidate count once the cap
     /// is proven.
     scanned_candidate_file_count: Arc<AtomicUsize>,
+    /// `export_index_of_declarations` executions -- builds, not cache hits.
+    /// The measure of the single flight: without one, concurrent misses on a
+    /// file each run this whole build (#1748).
+    export_index_build_count: Arc<AtomicUsize>,
     /// Files the Cargo-route build had to parse because their blob carried no
     /// persisted module-route facts. Zero is the structural claim of issue
     /// #1793: the index composes from rows, never from a workspace parse.
@@ -321,6 +336,21 @@ impl RustAnalyzer {
     pub(crate) fn note_scanned_candidate_file(&self) {
         self.scanned_candidate_file_count
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_export_index_build(&self) {
+        self.export_index_build_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn reset_export_index_build_count_for_test(&self) {
+        self.export_index_build_count.store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn export_index_build_count_for_test(&self) -> usize {
+        self.export_index_build_count.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]
@@ -576,6 +606,7 @@ impl RustAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
+            export_index_builds: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
@@ -583,6 +614,7 @@ impl RustAnalyzer {
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
             scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
+            export_index_build_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
@@ -612,6 +644,7 @@ impl RustAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
+            export_index_builds: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
@@ -619,6 +652,7 @@ impl RustAnalyzer {
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
             scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
+            export_index_build_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
@@ -860,6 +894,7 @@ impl IAnalyzer for RustAnalyzer {
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
+            export_index_builds: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
@@ -867,6 +902,7 @@ impl IAnalyzer for RustAnalyzer {
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
             scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
+            export_index_build_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
@@ -883,6 +919,7 @@ impl IAnalyzer for RustAnalyzer {
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
+            export_index_builds: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
@@ -890,6 +927,7 @@ impl IAnalyzer for RustAnalyzer {
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
             scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
+            export_index_build_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
