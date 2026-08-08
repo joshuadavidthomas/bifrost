@@ -161,12 +161,15 @@ runs:
         CATEGORY: ${{ inputs.category }}
       run: |
         set -euo pipefail
+        categorized="${RUNNER_TEMP}/bifrost-categorized.sarif"
+        jq --arg cat "${CATEGORY}" \
+          '.runs[] |= (.automationDetails = {id: ($cat + "/")})' \
+          "${SARIF_PATH}" > "${categorized}"
         gh api "repos/${GITHUB_REPOSITORY}/code-scanning/sarifs" \
           -f commit_sha="${GITHUB_SHA}" \
           -f ref="${GITHUB_REF}" \
-          -f category="${CATEGORY}" \
           -f checkout_uri="file://${GITHUB_WORKSPACE}" \
-          -f sarif="$(gzip -c "${SARIF_PATH}" | base64 -w0)"
+          -f sarif="$(gzip -c "${categorized}" | base64 -w0)"
 
     - name: Gate on the exit code
       shell: bash
