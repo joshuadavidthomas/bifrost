@@ -2,7 +2,7 @@ use super::{TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
 use crate::analyzer::kotlin::KotlinAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, KotlinDefinitionProvider, KotlinTypeLookupResolution, ResolutionSession,
-    kotlin_type_lookup_resolution, kotlin_type_lookup_resolution_in_session,
+    kotlin_type_lookup_resolution_in_session,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
@@ -10,32 +10,13 @@ use crate::analyzer::{BoundedDefinitionLookup, IAnalyzer, ProjectFile, resolve_a
 use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
 
-/// Answer `get_type_by_location` for Kotlin (issue #1238).
+/// Bounded Kotlin type resolution, serving both `get_type_by_location` and the
+/// receiver-query path (issues #1238, #1242): one resolver, so a receiver query
+/// and a type request cannot disagree about what a Kotlin expression's type is.
 ///
 /// The type itself is worked out by the definition resolver, which already
 /// knows how to type a Kotlin expression; this turns the fully-qualified name
 /// it returns into indexed declarations, or explains why there is none.
-pub(crate) fn resolve_kotlin_type(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-) -> TypeLookupOutcome {
-    let Some(tree) = tree else {
-        return no_type("kotlin_parse_failed", "Kotlin source could not be parsed");
-    };
-    let resolution =
-        kotlin_type_lookup_resolution(analyzer, support, file, source, tree.root_node(), site);
-    kotlin_type_outcome(support, site, resolution)
-}
-
-/// Bounded Kotlin type resolution for the receiver-query path (issue #1242).
-///
-/// Shares the resolver `get_type_by_location` uses, so a receiver query and a
-/// type request cannot disagree about what a Kotlin expression's type is; only
-/// the work accounting differs.
 pub(crate) fn resolve_kotlin_type_bounded(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,

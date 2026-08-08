@@ -1128,25 +1128,6 @@ pub(crate) enum ScalaTypeLookupResolution {
     InappropriateSymbolContext,
 }
 
-pub(crate) fn scala_type_lookup_resolution(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    site: &ResolvedReferenceSite,
-) -> Option<ScalaTypeLookupResolution> {
-    let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer)?;
-    let batch = ScalaDefinitionContext {
-        file: file.clone(),
-        package: Arc::from(scala_package_name_of(scala, file).unwrap_or_default()),
-        imports: Arc::new(scala.import_info_of(file)),
-    };
-    scala_type_lookup_resolution_with_context(
-        analyzer, scala, support, &batch, file, source, root, site, None,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scala_type_lookup_resolution_in_session(
     analyzer: &dyn IAnalyzer,
@@ -1161,47 +1142,6 @@ pub(crate) fn scala_type_lookup_resolution_in_session(
     let batch = bounded_scala_definition_context(scala, file, session);
     let walk = ScalaBoundedWalk::new(session);
     bounded_scala_type_lookup_resolution(scala, support, &batch, file, source, root, site, &walk)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scala_type_lookup_resolution_with_context(
-    analyzer: &dyn IAnalyzer,
-    scala: &ScalaAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    batch: &ScalaDefinitionContext,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    site: &ResolvedReferenceSite,
-    session: Option<&ResolutionSession>,
-) -> Option<ScalaTypeLookupResolution> {
-    let cache = ScalaLookupCache::default();
-    let node = scala_smallest_named_node_covering(
-        session,
-        root,
-        site.focus_start_byte,
-        site.focus_end_byte,
-    )?;
-    if !scala_charge_ancestor_path(session, node) {
-        return None;
-    }
-    let (package_prefixes, lexical_scopes) =
-        scala_lexical_context_at(session, root, source, node, site.focus_start_byte)?;
-    let resolver = ScalaNameResolver::for_batch(scala, support, batch).with_lexical_context(
-        package_prefixes,
-        lexical_scopes,
-        site.focus_start_byte,
-    );
-    let ctx = ScalaLookupCtx {
-        scala,
-        analyzer,
-        support,
-        cache: &cache,
-        file,
-        source,
-        session,
-    };
-    scala_type_lookup_node_fqn(ctx, &resolver, root, node)
 }
 
 fn bounded_scala_definition_context(
@@ -1353,6 +1293,12 @@ fn bounded_scala_type_lookup_resolution(
         site.focus_start_byte,
         site.focus_end_byte,
     )?;
+    if node
+        .parent()
+        .is_some_and(|parent| scala_is_callable_declaration_name(parent, node))
+    {
+        return Some(ScalaTypeLookupResolution::InappropriateSymbolContext);
+    }
     let (package_prefixes, lexical_scopes) =
         bounded_scala_lexical_context(walk, root, source, node, site.focus_start_byte)?;
     let ctx = BoundedScalaCtx {
@@ -1366,11 +1312,31 @@ fn bounded_scala_type_lookup_resolution(
         reference_byte: site.focus_start_byte,
         walk,
     };
+    // A name in type position denotes the type itself, not a typed value; the
+    // distinction is the target kind LSP type-hierarchy eligibility keys on.
+    if matches!(
+        node.kind(),
+        "type_identifier" | "stable_type_identifier" | "generic_type"
+    ) && scala_is_type_position(node)
+    {
+        let declaration = bounded_scala_resolve_type_node(&ctx, node)?;
+        return Some(ScalaTypeLookupResolution::Type {
+            fqn: declaration.fq_name(),
+            target_kind: TypeLookupTargetKind::TypeReference,
+        });
+    }
     let declaration = bounded_scala_expression_type(&ctx, node, site.focus_start_byte)?;
     Some(ScalaTypeLookupResolution::Type {
         fqn: declaration.fq_name(),
         target_kind: TypeLookupTargetKind::ValueExpression,
     })
+}
+
+/// A declaration's own callable name (`def create` at `create`), which names a
+/// callable rather than a type-bearing expression.
+fn scala_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
+    parent.child_by_field_name("name") == Some(name)
+        && matches!(parent.kind(), "function_definition")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1849,6 +1815,20 @@ fn bounded_scala_expression_type<'tree>(
                         let name = scala_node_text(function, ctx.source).trim();
                         if name.is_empty() {
                             return None;
+                        }
+                        // `Widget(...)` constructs a `Widget` when the bare
+                        // callee name resolves to a class in scope (a
+                        // case-class companion `apply` or a universal
+                        // constructor). Only a class answers here --
+                        // `bounded_scala_resolve_segments` admits nothing
+                        // else -- so an ordinary function call falls through
+                        // to the member interpretation below.
+                        if let Some(constructed) = bounded_scala_resolve_segments(
+                            ctx,
+                            std::slice::from_ref(&name.to_string()),
+                            false,
+                        ) {
+                            break constructed;
                         }
                         members.push(name.to_string());
                         break bounded_scala_nearest_enclosing_owner(ctx, function)?;
@@ -2368,7 +2348,8 @@ fn bounded_scala_resolve_type_node(
     node: Node<'_>,
 ) -> Option<CodeUnit> {
     let segments = bounded_scala_type_segments(ctx, node)?;
-    bounded_scala_resolve_segments(ctx, &segments, false)
+    // `X.type` denotes the singleton object's type, not the class named `X`.
+    bounded_scala_resolve_segments(ctx, &segments, node.kind() == "singleton_type")
 }
 
 fn bounded_scala_type_segments(
@@ -5780,131 +5761,6 @@ fn scala_apply_or_constructor_outcome(
             "`{reference}` has no indexed companion `apply` or universal constructor matching this call"
         ),
     )
-}
-
-fn scala_type_lookup_node_fqn(
-    ctx: ScalaLookupCtx<'_>,
-    resolver: &ScalaNameResolver,
-    root: Node<'_>,
-    node: Node<'_>,
-) -> Option<ScalaTypeLookupResolution> {
-    let node_text = scala_node_text(node, ctx.source).trim();
-    if matches!(node_text, "this" | "super") {
-        return scala_receiver_type_fqn(ctx, resolver, root, node, node.start_byte()).map(|fqn| {
-            ScalaTypeLookupResolution::Type {
-                fqn,
-                target_kind: TypeLookupTargetKind::ValueExpression,
-            }
-        });
-    }
-
-    if matches!(
-        node.kind(),
-        "type_identifier" | "stable_type_identifier" | "generic_type"
-    ) && scala_is_type_position(node)
-    {
-        return scala_resolve_visible_type_node(ctx, resolver, node).map(|fqn| {
-            ScalaTypeLookupResolution::Type {
-                fqn,
-                target_kind: TypeLookupTargetKind::TypeReference,
-            }
-        });
-    }
-
-    if node.kind() == "instance_expression" {
-        return scala_constructed_type(ctx, node, resolver).map(|fqn| {
-            ScalaTypeLookupResolution::Type {
-                fqn,
-                target_kind: TypeLookupTargetKind::ValueExpression,
-            }
-        });
-    }
-    if node.kind() == "call_expression" {
-        let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
-        return scala_call_result_type(ctx, resolver, root, node, node.start_byte(), &bindings)
-            .map(|fqn| ScalaTypeLookupResolution::Type {
-                fqn,
-                target_kind: TypeLookupTargetKind::ValueExpression,
-            });
-    }
-
-    if let Some(parent) = node.parent() {
-        if parent.kind() == "field_expression" && parent.child_by_field_name("value") == Some(node)
-        {
-            return scala_receiver_type_fqn(ctx, resolver, root, node, node.start_byte()).map(
-                |fqn| ScalaTypeLookupResolution::Type {
-                    fqn,
-                    target_kind: TypeLookupTargetKind::ValueExpression,
-                },
-            );
-        }
-        if scala_is_callable_declaration_name(parent, node) {
-            return Some(ScalaTypeLookupResolution::InappropriateSymbolContext);
-        }
-        if let Some(fqn) = scala_declaration_name_type_fqn(ctx, resolver, root, parent, node) {
-            return Some(ScalaTypeLookupResolution::Type {
-                fqn,
-                target_kind: TypeLookupTargetKind::ValueExpression,
-            });
-        }
-    }
-
-    if !matches!(
-        node.kind(),
-        "identifier" | "operator_identifier" | "type_identifier"
-    ) {
-        return None;
-    }
-
-    let name = scala_node_text(node, ctx.source).trim();
-    let bindings = scala_bindings_before(ctx, resolver, root, node.start_byte());
-    precise_scala_binding(&bindings, name)
-        .and_then(|binding| binding.receiver_type)
-        .map(|fqn| ScalaTypeLookupResolution::Type {
-            fqn,
-            target_kind: TypeLookupTargetKind::ValueExpression,
-        })
-}
-
-fn scala_declaration_name_type_fqn(
-    ctx: ScalaLookupCtx<'_>,
-    resolver: &ScalaNameResolver,
-    root: Node<'_>,
-    parent: Node<'_>,
-    name: Node<'_>,
-) -> Option<String> {
-    match parent.kind() {
-        "parameter" | "class_parameter" if parent.child_by_field_name("name") == Some(name) => {
-            parent
-                .child_by_field_name("type")
-                .and_then(|type_node| scala_resolve_visible_type_node(ctx, resolver, type_node))
-        }
-        "val_definition" | "var_definition"
-            if parent
-                .child_by_field_name("pattern")
-                .is_some_and(|pattern| {
-                    pattern.start_byte() <= name.start_byte()
-                        && name.end_byte() <= pattern.end_byte()
-                }) =>
-        {
-            parent
-                .child_by_field_name("type")
-                .and_then(|type_node| scala_resolve_visible_type_node(ctx, resolver, type_node))
-        }
-        "function_definition" if parent.child_by_field_name("name") == Some(name) => parent
-            .child_by_field_name("return_type")
-            .and_then(|type_node| scala_resolve_visible_type_node(ctx, resolver, type_node)),
-        _ => {
-            let name_text = scala_node_text(name, ctx.source).trim();
-            let bindings = scala_bindings_before(ctx, resolver, root, name.end_byte());
-            precise_scala_binding(&bindings, name_text).and_then(|binding| binding.receiver_type)
-        }
-    }
-}
-
-fn scala_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool {
-    parent.child_by_field_name("name") == Some(name)
-        && matches!(parent.kind(), "function_definition")
 }
 
 enum ScalaReferenceNode<'tree> {

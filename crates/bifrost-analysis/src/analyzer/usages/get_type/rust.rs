@@ -13,21 +13,10 @@ use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use tree_sitter::{Node, Tree};
 
-pub(crate) fn resolve_rust_type(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-    cache: &mut RustTypeLookupCache,
-) -> TypeLookupOutcome {
-    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
-        return no_type("rust_analyzer_unavailable", "Rust analyzer is unavailable");
-    };
-    let support = AnalyzerRustDefinitionProvider::new(rust, true);
-    resolve_rust_type_with_provider(analyzer, file, source, tree, site, cache, &support)
-}
-
+/// Bounded Rust type resolution for the receiver query, with the `Bounded`
+/// resolver semantics and a cache that refuses cold parses of other files'
+/// declaration sources: a receiver query resolves many sites in one report,
+/// and an uncharged file parse per site would evade its budget.
 pub(crate) fn resolve_rust_type_bounded(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -46,6 +35,38 @@ pub(crate) fn resolve_rust_type_bounded(
     };
     let support = AnalyzerRustDefinitionProvider::bounded(rust, &session);
     let mut cache = RustTypeLookupCache::bounded_for_query();
+    let outcome =
+        resolve_rust_type_with_provider(analyzer, file, source, tree, site, &mut cache, &support);
+    session.finish(outcome)
+}
+
+/// Bounded Rust type resolution for the interactive `get_type_by_location`
+/// arm: session-charged like the receiver query's, but with the resolution
+/// semantics the tool has always answered. `cancellable_full` keeps the Full
+/// resolver semantics under a charging session (the same pairing the
+/// cancellable definition path uses), and the default cache may cold-parse a
+/// declaration's file, which is what lets `receiver.field` name a type
+/// declared elsewhere. One request resolves one location under the generous
+/// interactive budget, so both are affordable here where the receiver query
+/// must refuse them.
+pub(crate) fn resolve_rust_type_interactive(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<TypeLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
+        return session.finish(no_type(
+            "rust_analyzer_unavailable",
+            "Rust analyzer is unavailable",
+        ));
+    };
+    let support = AnalyzerRustDefinitionProvider::cancellable_full(rust, &session);
+    let mut cache = RustTypeLookupCache::default();
     let outcome =
         resolve_rust_type_with_provider(analyzer, file, source, tree, site, &mut cache, &support);
     session.finish(outcome)

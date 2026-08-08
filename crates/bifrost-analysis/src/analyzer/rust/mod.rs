@@ -20,8 +20,7 @@ use crate::analyzer::languages::{
     BoundedReceiverQuery, CandidateAugmentation, CandidateCtx, DeadCodeBulkEdges,
     DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport, EdgePassId,
     EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights,
-    LanguageSupport, StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver,
-    fqn_bulk_nodes,
+    LanguageSupport, StructuralReceiverResolver, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
@@ -29,9 +28,7 @@ use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_rust_bounded,
 };
-use crate::analyzer::usages::get_type::{
-    TypeLookupOutcome, resolve_rust_type, resolve_rust_type_bounded,
-};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_rust_type_bounded};
 use crate::analyzer::usages::rust_graph::{
     RustExportUsageGraphStrategy, build_rust_usage_edge_weights, build_rust_usage_edges,
     rust_usage_candidate_files,
@@ -1067,10 +1064,6 @@ impl LanguageSupport for RustSupport {
         Some(&RustSupport)
     }
 
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
-        Some(&RustSupport)
-    }
-
     /// Protected: these are the files reached through Rust's re-export and binding graph,
     /// which the generic import-graph walk cannot see, so a truncated query that dropped
     /// them would report proven absence for a symbol used through a `pub use`.
@@ -1155,19 +1148,6 @@ impl StructuralReceiverResolver for RustSupport {
             query.site,
             query.budget,
             query.cancellation,
-        )
-    }
-}
-
-impl TypeLookupResolver for RustSupport {
-    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
-        resolve_rust_type(
-            query.analyzer,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
-            query.rust_cache,
         )
     }
 }

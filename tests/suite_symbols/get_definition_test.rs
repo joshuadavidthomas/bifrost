@@ -4724,6 +4724,171 @@ func Run() {
     );
 }
 
+/// The four languages whose bounded receiver cores predate their tool wiring
+/// (#1879): routing get_type_by_location through the bounded receiver contract
+/// is what makes each of them answer at all.
+#[test]
+fn cpp_type_lookup_resolves_explicit_local_binding_type() {
+    let header = "#pragma once\nclass Widget {\npublic:\n    void paint();\n};\n";
+    let source = r#"#include "widget.hpp"
+void run() {
+    Widget value;
+    value.paint();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("widget.hpp", header)
+        .file("use.cpp", source)
+        .build();
+
+    let line = "    value.paint();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"use.cpp","line":4,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "widget.hpp",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_type_lookup_resolves_annotated_parameter_type() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"class Widget:
+    def paint(self):
+        pass
+
+
+def render(value: Widget):
+    return value
+"#,
+        )
+        .build();
+
+    let line = "    return value";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":7,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "app.Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "app.py",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_type_lookup_resolves_typed_parameter_type() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/Caller.php",
+            r#"<?php
+namespace App;
+
+function call(Service $service): void {
+    $service->run();
+}
+"#,
+        )
+        .build();
+
+    let line = "    $service->run();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Caller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "$service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "App.Service", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "src/Service.php",
+        "{value}"
+    );
+}
+
+#[test]
+fn ruby_type_lookup_resolves_constructed_local_type() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("widget.rb", "class Widget\n  def paint\n  end\nend\n")
+        .file(
+            "app.rb",
+            r#"require_relative "widget"
+
+value = Widget.new
+value.paint
+"#,
+        )
+        .build();
+
+    let line = "value.paint";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":4,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "widget.rb",
+        "{value}"
+    );
+}
+
+/// Plain C keeps its explicit refusal: the C++ bounded core refuses `.c`
+/// files by design, and the refusal names itself instead of pretending the
+/// location has no type.
+#[test]
+fn c_type_lookup_keeps_the_explicit_plain_c_refusal() {
+    let source = "struct widget { int id; };\nvoid run(void) {\n    struct widget value;\n    value.id = 1;\n}\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.c", source)
+        .build();
+
+    let line = "    value.id = 1;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.c","line":4,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unsupported_language", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "cpp_c_receiver_unsupported",
+        "{value}"
+    );
+}
+
 #[test]
 fn type_lookup_rejects_oversized_batches() {
     let project = InlineTestProject::with_language(Language::Rust)

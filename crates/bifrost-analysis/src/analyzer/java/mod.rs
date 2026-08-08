@@ -16,12 +16,11 @@ use crate::analyzer::common::{is_unparseable_source, language_for_file as file_l
 use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
-    LanguageEdgeWeights, LanguageSupport, TypeLookupQuery, TypeLookupResolver,
-    analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns,
+    LanguageEdgeWeights, LanguageSupport, analyzable_file_count, fqn_bulk_nodes,
+    overloaded_function_fqns,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::GraphUsageAnalyzer;
-use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_java_type};
 use crate::analyzer::usages::java_graph::{
     JavaDeadCodeBulkEligibility, JavaUsageGraphStrategy, build_java_usage_edge_weights,
     build_java_usage_edges, dead_code_bulk_eligibility,
@@ -967,10 +966,6 @@ impl LanguageSupport for JavaSupport {
         }
     }
 
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
-        Some(&JavaSupport)
-    }
-
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
         tree_sitter_java::LANGUAGE.into()
     }
@@ -1001,20 +996,6 @@ impl LanguageEdgePass for JavaEdgePass {
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
         build_java_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeWeights::Fqn)
-    }
-}
-
-impl TypeLookupResolver for JavaSupport {
-    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
-        query.support.set_language(query.language);
-        resolve_java_type(
-            query.analyzer,
-            query.support,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
-        )
     }
 }
 
