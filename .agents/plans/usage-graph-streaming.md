@@ -103,6 +103,15 @@ measurement is a separate task run after review; it is not part of this plan's a
       resolution (`ProjectFile::cmp` 14.9% with children, `PathBuf::normalize` 5.3%). That
       awaits the post-cut re-measure. See `Outcomes & Retrospective`.
 
+- [x] (2026-08-08) **The gate cells decomposed from exec to exit (run 9), and three fixes landed
+      from it.** Report checked in: `.agents/docs/gate-cell-overhead-2026-08.md`. The single
+      largest item anywhere in a gate cell was an unpriced scan prologue,
+      `scan_usages.excluded_test_files`, at **66-87% of the budget window**; the #1839 gate is
+      correct but was **unreachable** behind it. Fixes: `11bdc39b` (classify test files per
+      candidate, not per workspace), `ee7c68aa` (no watcher for a one-shot invocation),
+      `d97a6ef9` (the fan-out verdict outranks a spent budget). Also corrects run 6's reading of
+      the cells' system CPU. See `Outcomes & Retrospective`.
+
 ## Surprises & Discoveries
 
 - Observation: the forward reference context is built *during a scan*, not only by
@@ -438,6 +447,73 @@ The ~940 s figure came from summing the durations of concurrent same-key spans. 
 overlapped, and the span opened before the memo, so the sum measured neither the duplicated work nor
 the phase's critical path. The counter that settled it -- reads per distinct key -- cost two lines
 of instrumentation and should have been the first measurement, not the last.
+
+### The gate cells decomposed exec-to-exit, and the three fixes it indicated (run 9, 2026-08-08)
+
+Run 6 measured gate cells (a) and (b) at 5.31 s against a 5 s bar with every cell returning
+`resolved=0` / `time_budget`, and read that as "3.0 s of scan budget plus about 2.3 s of overhead".
+Run 9 decomposed the whole wall from `exec` to exit at `f05c0e48`, on the same rustc tree and the
+same cells, with per-span process-CPU sampling. Full report, checked in:
+`.agents/docs/gate-cell-overhead-2026-08.md`.
+
+**The premise was half right.** The non-budget overhead is real at 2.12-2.25 s. The budget window is
+not 3.0 s: it ran 3.20-4.61 s, because the phase that consumes it does not poll the deadline.
+
+**One previously unpriced phase dominates the cell.** `scan_usages.excluded_test_files` cost
+2.30-2.78 s -- **66-87% of the budget window** and 40-45% of the whole process wall -- classifying
+29,748 files before any symbol work, in both cells, on every run. It has never carried a span.
+`RustAnalyzer::build_cargo_routes` (0.83-1.03 s) turned out to be *inside* it, dragged in by
+`is_test_like_file -> file_is_test_only -> cargo_routes`, not a separate resident of the overhead as
+run 6 listed it.
+
+**The cell-(b) puzzle is answered, and it is not a gate defect.** The #1839 fan-out gate is correct
+and fires perfectly when reached; at a 60 s budget cell (b) reports
+`too_many_candidates[total=4186 limit=200]` in 515 ms of resolution. At the product default it is
+unreachable: the prologue has spent 2.69 s of the 3.00 s budget before resolution starts, so
+`Cancelled` beats `TooManyCandidates`. In three of six timed repetitions the prologue consumed the
+budget outright and no symbol resolution ran at all -- which reproduces and explains run 4's
+"`scan_usages_symbol_resolution` does not appear in the cell (b) span set".
+
+**Three fixes landed from this, on `bifrost-nlp-ft`:**
+
+- `11bdc39b` -- the scan prologue no longer pre-classifies the workspace. `excluded_test_files`
+  became `TestFileExclusion`, a per-file memoized predicate consulted by the candidate filter, so a
+  scan classifies its candidates (hundreds) instead of its workspace (29,748). Per-file verdict
+  unchanged; the #1100 equivalence pin still holds it to the full classification.
+- `ee7c68aa` -- a one-shot `--tool` invocation installs no file watcher. 0.37-0.40 s outside the
+  budget, plus the second whole-workspace listing (0.45 s, inside the budget) that the watcher's
+  deliberate `invalidate_cached_file_listing` forced. The listing cache is kept without it.
+- `d97a6ef9` -- `bare_name_resolution` stops polling `keep_going` in the two in-memory loops whose
+  only product is the count the fan-out gate consumes, so a spent budget can no longer hide a
+  verdict the resolver has already reached. The reported total stays the deduplicated 4,186, not
+  the pre-dedup 22,177.
+
+**Corrections to the run-6 record, from this decomposition:**
+
+1. "3 s of scan deadline plus ~2.3 s of overhead" understates the budget window. It is 3.20-4.61 s;
+   the 3 s deadline is overshot by 0.2-1.6 s because `excluded_test_files` and
+   `candidate_discovery` do not poll it finely enough.
+2. Cargo-route composition is not part of the non-budget overhead. It is inside the scan budget,
+   inside `excluded_test_files`.
+3. **Run 6's method note "system CPU tracks host memory pressure and background I/O, not the
+   query" is wrong about the owner.** About 7 s of the cells' 7.8-9.9 s of `sys` is
+   `TreeSitterAnalyzer::resolve_live_oids` inside `analyzer_construction.workspace_analyzer`,
+   shared across the five language delegates. The directive to read user CPU rather than system CPU
+   still holds; the system CPU has a name.
+4. The rust-fact catch-up probe is not a resident of these cells at all. Zero
+   `RustAnalyzer::rust_fact_catch_up` spans in 6 of 6 timed repetitions: it sits at the head of the
+   cross-file usage walk, which no gate cell reaches.
+5. The gate cells are not "3 s of budget plus overhead". **Cell (a) is deadline-bound** and
+   overshoots its deadline; **cell (b) is prologue-bound** and never reaches its own early-exit
+   gate.
+
+**Open, not addressed by the three fixes:** `resolve_live_oids` at workspace startup carries about
+7 s of system CPU per gate cell (`analyzer_construction.workspace_analyzer`, 1.05-1.17 s wall,
+`reconcile_file_states` 948 ms of it). It is outside the scan budget and was not counterfactually
+tested. See rank 2 of the report's ranked list.
+
+Nothing in run 9 changes the D4 verdicts. It is a decomposition of the gate cells, which measure how
+fast the pipeline gives up, not the answering regime the graph-phase target is about.
 
 ## Note on revisions
 
