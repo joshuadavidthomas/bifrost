@@ -4401,6 +4401,68 @@ mod tests {
     }
 
     #[test]
+    fn baseline_decisions_require_their_review_at_document_assembly() {
+        use super::super::baseline::{PolicyFindingBaseline, parse_policy_baseline_document};
+        use super::super::suppression::PolicySuppressionPolicyHashState;
+
+        let loaded = loaded_match_policy();
+        let baseline_document = parse_policy_baseline_document(
+            &json!({
+                "schema_version": 1,
+                "reason": "Onboarding acceptance",
+                "accepted_at": "2026-08-08",
+                "policies": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut finding = report_finding(&loaded);
+        finding
+            .attach_baseline(PolicyFindingBaseline::new(
+                &baseline_document,
+                PolicySuppressionPolicyHashState::Matching,
+            ))
+            .unwrap();
+
+        // A finding carrying a baseline decision without a top-level review
+        // is rejected at assembly.
+        let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
+        builder
+            .register_policy(
+                PolicyRuleDescriptor::from_loaded(&loaded),
+                report_run(
+                    &loaded,
+                    PolicyAnalysisType::Match,
+                    PolicyRunCompletion::Complete,
+                ),
+            )
+            .unwrap();
+        builder.retain_finding(finding.clone()).unwrap();
+        assert!(matches!(
+            builder.finish(),
+            Err(PolicyReportBuilderError::Document(
+                PolicyReportDocumentError::BaselineFindingWithoutReview { .. }
+            ))
+        ));
+
+        // Clearing the decision restores the invariant.
+        finding.clear_baseline();
+        let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
+        builder
+            .register_policy(
+                PolicyRuleDescriptor::from_loaded(&loaded),
+                report_run(
+                    &loaded,
+                    PolicyAnalysisType::Match,
+                    PolicyRunCompletion::Complete,
+                ),
+            )
+            .unwrap();
+        builder.retain_finding(finding).unwrap();
+        builder.finish().unwrap();
+    }
+
+    #[test]
     fn baseline_generation_excludes_weak_identities_with_an_exact_count() {
         let loaded = loaded_match_policy();
         let descriptor = PolicyRuleDescriptor::from_loaded(&loaded);
