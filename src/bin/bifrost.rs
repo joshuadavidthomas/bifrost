@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -15,7 +16,8 @@ use brokk_bifrost::mcp_registry::{
 };
 use brokk_bifrost::policy::{
     BuiltInPolicySelection, HumanRenderColor, HumanRenderDetail, HumanRenderOptions,
-    POLICY_EXIT_UNRELIABLE, PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput,
+    POLICY_EXIT_CLEAN, POLICY_EXIT_UNRELIABLE, PolicyBaselineDocument, PolicyBaselineOptions,
+    PolicyBaselineSource, PolicyBatchOutcome, PolicyEvaluationDate, PolicyEvaluationInput,
     PolicyEvaluationOptions, PolicyFailOn, PolicyRenderError, PolicyReportDocument,
     PolicyScopeOptions, PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource,
     SarifToolIdentity, built_in_policy_catalog, escape_terminal_text, evaluate_policy_inputs,
@@ -102,6 +104,8 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--fail-on"
                 | "--suppressions-file"
                 | "--scope-file"
+                | "--baseline-file"
+                | "--accept-current"
                 | "--evaluation-date"
                 | "--diff-base"
                 | "--output"
@@ -144,6 +148,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--fail-on"
             | "--suppressions-file"
             | "--scope-file"
+            | "--baseline-file"
             | "--evaluation-date"
             | "--diff-base"
             | "--output"
@@ -190,6 +195,9 @@ fn run_inner(
     let mut policy_suppressions_seen = false;
     let mut policy_scope = PolicyScopeOptions::default();
     let mut policy_scope_seen = false;
+    let mut policy_baseline = PolicyBaselineOptions::default();
+    let mut policy_baseline_seen = false;
+    let mut accept_current = false;
     let mut policy_evaluation_date = None;
     let mut policy_diff_base: Option<String> = None;
     let mut policy_output: Option<PathBuf> = None;
@@ -397,6 +405,24 @@ fn run_inner(
                 policy_scope = PolicyScopeOptions::new(source);
                 policy_scope_seen = true;
             }
+            "--baseline-file" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--baseline-file requires a path".to_string())?;
+                if policy_baseline_seen {
+                    return Err("--baseline-file may only be provided once".to_string());
+                }
+                let source = PolicyBaselineSource::explicit_portable(&value)
+                    .map_err(|error| format!("Invalid --baseline-file path: {error}"))?;
+                policy_baseline = PolicyBaselineOptions::new(source);
+                policy_baseline_seen = true;
+            }
+            "--accept-current" => {
+                if accept_current {
+                    return Err("--accept-current may only be provided once".to_string());
+                }
+                accept_current = true;
+            }
             "--evaluation-date" => {
                 let value = args
                     .next()
@@ -513,6 +539,8 @@ fn run_inner(
                 || policy_fail_on_seen
                 || policy_suppressions_seen
                 || policy_scope_seen
+                || policy_baseline_seen
+                || accept_current
                 || policy_evaluation_date.is_some()
                 || policy_diff_base.is_some()
                 || policy_output.is_some()
@@ -541,6 +569,18 @@ fn run_inner(
         {
             return Err("--verbose and --color are only valid with --format human".to_string());
         }
+        if accept_current {
+            // Findings are the expected input of an acceptance run, so a
+            // gating threshold is meaningless; and a baseline is defined by a
+            // full run, never by a diff classification.
+            if policy_fail_on_seen {
+                return Err("--accept-current cannot be combined with --fail-on".to_string());
+            }
+            if policy_diff_base.is_some() {
+                return Err("--accept-current cannot be combined with --diff-base".to_string());
+            }
+            policy_fail_on = PolicyFailOn::Never;
+        }
         let mut policy_inputs = built_in_policy_catalog()
             .map_err(|error| error.to_string())?
             .select(&policy_selection)
@@ -563,6 +603,8 @@ fn run_inner(
                 evaluation_date: policy_evaluation_date,
                 suppressions: policy_suppressions,
                 scope: policy_scope,
+                baseline: policy_baseline,
+                accept_current,
                 diff_base: policy_diff_base,
                 output: policy_output,
                 verbose: policy_verbose,
@@ -790,6 +832,8 @@ struct PolicyModeRequest {
     evaluation_date: Option<PolicyEvaluationDate>,
     suppressions: PolicySuppressionOptions,
     scope: PolicyScopeOptions,
+    baseline: PolicyBaselineOptions,
+    accept_current: bool,
     diff_base: Option<String>,
     output: Option<PathBuf>,
     verbose: bool,
@@ -815,14 +859,15 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
         }
     };
     let mut options =
-        PolicyEvaluationOptions::with_suppressions(evaluation_date, request.suppressions)
-            .with_scope(request.scope)
+        PolicyEvaluationOptions::with_suppressions(evaluation_date, request.suppressions.clone())
+            .with_scope(request.scope.clone())
+            .with_baseline(request.baseline.clone())
             .with_required_schema_versions(request.require_explicit_schema_versions)
             .with_fail_on(request.fail_on);
-    if let Some(revision) = request.diff_base {
+    if let Some(revision) = request.diff_base.clone() {
         options = options.with_diff_base(revision);
     }
-    let outcome = match evaluate_policy_inputs(request.root, policy_inputs, &options) {
+    let outcome = match evaluate_policy_inputs(&request.root, policy_inputs, &options) {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!(
@@ -832,6 +877,24 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
             return POLICY_EXIT_UNRELIABLE;
         }
     };
+    if request.accept_current {
+        // Only a clean status (reliable, exhaustive, nothing gating under the
+        // forced fail-on Never) may define a baseline; an unreliable run is
+        // refused and nothing is written.
+        if outcome.exit_status() == POLICY_EXIT_CLEAN {
+            if let Err(error) = write_accepted_baseline(&request, &outcome, evaluation_date) {
+                eprintln!(
+                    "bifrost: baseline write failed: {}",
+                    escape_terminal_text(&error)
+                );
+                return POLICY_EXIT_UNRELIABLE;
+            }
+        } else {
+            eprintln!(
+                "bifrost: the policy run was not reliable and exhaustive; no baseline was written"
+            );
+        }
+    }
     let output_path = request.output.as_deref();
     let human_options = HumanRenderOptions::new(
         if request.verbose {
@@ -859,6 +922,67 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
         );
     }
     status
+}
+
+/// Build the baseline document from one clean run's report and atomically
+/// replace the configured baseline file beneath the analyzed root.
+fn write_accepted_baseline(
+    request: &PolicyModeRequest,
+    outcome: &PolicyBatchOutcome,
+    accepted_at: PolicyEvaluationDate,
+) -> Result<(), String> {
+    let (document, weak_excluded) = PolicyBaselineDocument::from_completed_report(
+        outcome.report(),
+        "Bulk baseline acceptance of existing findings via --accept-current",
+        None,
+        accepted_at,
+    )
+    .map_err(|error| format!("failed to build the baseline document: {error}"))?;
+    let relative = request.baseline.source().relative_path();
+    let destination = request.root.join(relative);
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
+        format!(
+            "failed to create a temporary baseline beside {}: {error}",
+            destination.display()
+        )
+    })?;
+    temporary
+        .write_all(document.to_canonical_json().as_bytes())
+        .and_then(|()| temporary.flush())
+        .map_err(|error| {
+            format!(
+                "failed to write the temporary baseline for {}: {error}",
+                destination.display()
+            )
+        })?;
+    temporary.as_file().sync_all().map_err(|error| {
+        format!(
+            "failed to sync the temporary baseline for {}: {error}",
+            destination.display()
+        )
+    })?;
+    temporary
+        .into_temp_path()
+        .persist(&destination)
+        .map_err(|error| {
+            format!(
+                "failed to atomically replace {}: {error}",
+                destination.display()
+            )
+        })?;
+    eprintln!(
+        "bifrost: baseline accepted {} findings into {} ({} weak-identity findings excluded)",
+        document.entry_count(),
+        escape_terminal_text(relative),
+        weak_excluded,
+    );
+    Ok(())
 }
 
 fn resolve_policy_color(mode: PolicyColorMode, writing_stdout: bool) -> HumanRenderColor {
@@ -1137,6 +1261,12 @@ OPTIONS:
                            (default: .bifrost/suppressions.json)
     --scope-file PATH      Load accepted directory scopes from this workspace-relative JSON file
                            (default: .bifrost/policy-scope.json)
+    --baseline-file PATH   Load bulk-accepted finding identities from this workspace-relative
+                           JSON file (default: .bifrost/baseline.json)
+    --accept-current       Run the selected policies and write the baseline document accepting
+                           every current strong unclaimed finding, then exit 0. An unreliable
+                           run refuses to define a baseline and exits 2 without writing.
+                           Cannot be combined with --fail-on or --diff-base
     --evaluation-date YYYY-MM-DD
                            Evaluate suppression expiration on this UTC date (default: today)
     --diff-base REV        Also evaluate the committed content of this git revision, classify

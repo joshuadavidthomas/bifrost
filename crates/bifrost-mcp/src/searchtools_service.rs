@@ -33,10 +33,10 @@ use crate::{
     path_normalization::NormalizePath,
     policy::{
         BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
-        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
-        PolicyId, PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource,
-        PolicySuppressionOptions, PolicySuppressionSource, built_in_policy_catalog,
-        workspace_snapshot_deadline_outcome,
+        PolicyBaselineOptions, PolicyBaselineSource, PolicyEvaluationDate, PolicyEvaluationInput,
+        PolicyEvaluationOptions, PolicyFailOn, PolicyId, PolicyReportDocument, PolicyScopeOptions,
+        PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
     },
     profiling,
     searchtools::{
@@ -739,6 +739,7 @@ struct RunPolicyParams {
     policy_ids: Vec<String>,
     suppression_file: Option<String>,
     scope_file: Option<String>,
+    baseline_file: Option<String>,
     evaluation_date: PolicyEvaluationDate,
     #[serde(default)]
     fail_on: RunPolicyFailOn,
@@ -3729,10 +3730,21 @@ impl SearchToolsService {
                 ))
             })?
             .map_or_else(PolicyScopeOptions::default, PolicyScopeOptions::new);
+        let baseline = params
+            .baseline_file
+            .map(PolicyBaselineSource::explicit_portable)
+            .transpose()
+            .map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "invalid run_policy baseline_file: {error}"
+                ))
+            })?
+            .map_or_else(PolicyBaselineOptions::default, PolicyBaselineOptions::new);
         let fail_on = PolicyFailOn::from(params.fail_on);
         let mut options =
             PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
                 .with_scope(scope)
+                .with_baseline(baseline)
                 .with_fail_on(fail_on);
         if let Some(revision) = params.diff_base {
             if revision.is_empty()

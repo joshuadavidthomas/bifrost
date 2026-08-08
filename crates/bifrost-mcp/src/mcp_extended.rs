@@ -916,6 +916,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "maxLength": crate::policy::MAX_POLICY_SCOPE_PATH_BYTES,
                         "description": "Optional workspace-relative directory-scope JSON path. Defaults to .bifrost/policy-scope.json."
                     },
+                    "baseline_file": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::policy::MAX_POLICY_BASELINE_PATH_BYTES,
+                        "description": "Optional workspace-relative bulk-acceptance baseline JSON path. Defaults to .bifrost/baseline.json."
+                    },
                     "evaluation_date": {
                         "type": "string",
                         "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
@@ -1347,6 +1353,12 @@ mod tests {
         assert_eq!(
             schema["properties"]["scope_file"]["maxLength"],
             crate::policy::MAX_POLICY_SCOPE_PATH_BYTES
+        );
+        assert_eq!(schema["properties"]["baseline_file"]["type"], "string");
+        assert_eq!(schema["properties"]["baseline_file"]["minLength"], 1);
+        assert_eq!(
+            schema["properties"]["baseline_file"]["maxLength"],
+            crate::policy::MAX_POLICY_BASELINE_PATH_BYTES
         );
         assert_eq!(
             schema["properties"]["fail_on"]["enum"],
