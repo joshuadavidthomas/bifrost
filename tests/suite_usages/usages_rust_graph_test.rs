@@ -11667,6 +11667,91 @@ mod shadowed {
 }
 
 #[test]
+fn issue_1377_cfg_alternatives_keep_both_inverse_targets() {
+    let consumer = r#"
+#[cfg(feature = "query_apply")]
+use crate::apply::apply_from_stdin;
+
+fn run() -> u8 {
+    apply_from_stdin()
+}
+
+#[cfg(not(feature = "query_apply"))]
+fn apply_from_stdin() -> u8 {
+    1
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod apply;\npub mod consumer;\n"),
+        ("src/apply.rs", "pub fn apply_from_stdin() -> u8 { 0 }\n"),
+        ("src/consumer.rs", consumer),
+    ]);
+    let candidate = project.file("src/consumer.rs");
+    let call = consumer.find("apply_from_stdin()").expect("reported call");
+
+    for target_name in ["apply.apply_from_stdin", "consumer.apply_from_stdin"] {
+        let target = definition(&analyzer, target_name);
+        let hits = UsageFinder::new()
+            .find_usages_default(&analyzer, &[target])
+            .all_hits();
+        assert!(
+            hits.iter().any(|hit| {
+                hit.file == candidate
+                    && (hit.start_offset, hit.end_offset) == (call, call + "apply_from_stdin".len())
+                    && hit.kind == UsageHitKind::Reference
+            }),
+            "{target_name} must retain the cfg-alternative call: {hits:#?}"
+        );
+    }
+}
+
+#[test]
+fn issue_1377_function_scoped_import_beats_enclosing_function_name() {
+    let consumer = r#"
+fn recognize() -> u8 {
+    use crate::combinator::recognize;
+
+    fn nested() -> u8 {
+        recognize()
+    }
+
+    nested()
+}
+"#;
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        ("src/lib.rs", "pub mod combinator;\npub mod consumer;\n"),
+        ("src/combinator.rs", "pub fn recognize() -> u8 { 0 }\n"),
+        ("src/consumer.rs", consumer),
+    ]);
+    let candidate = project.file("src/consumer.rs");
+    let call = consumer.rfind("recognize()").expect("reported nested call");
+    let imported = definition(&analyzer, "combinator.recognize");
+    let imported_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[imported])
+        .all_hits();
+    assert!(
+        imported_hits.iter().any(|hit| {
+            hit.file == candidate
+                && (hit.start_offset, hit.end_offset) == (call, call + "recognize".len())
+                && hit.kind == UsageHitKind::Reference
+        }),
+        "the function-scoped import must win: {imported_hits:#?}"
+    );
+
+    let enclosing = definition(&analyzer, "consumer.recognize");
+    let enclosing_hits = UsageFinder::new()
+        .find_usages_default(&analyzer, &[enclosing])
+        .all_hits();
+    assert!(
+        enclosing_hits.iter().all(|hit| {
+            hit.file != candidate
+                || (hit.start_offset, hit.end_offset) != (call, call + "recognize".len())
+        }),
+        "the enclosing function must not receive the imported call: {enclosing_hits:#?}"
+    );
+}
+
+#[test]
 fn rust_graph_concurrent_workspace_bare_function_queries_stay_isolated() {
     let consumer = r#"
 #[cfg(test)]
@@ -12445,4 +12530,88 @@ fn invalid_build(_: build_dep::Shared) {}
     assert!(build_hits.iter().all(|hit| {
         hit.file != project.file("app/src/lib.rs") || hit.start_offset != invalid_build
     }));
+}
+
+/// The `(file, line)` of every external usage a Rust query reports.
+fn rust_usage_sites(analyzer: &RustAnalyzer, overloads: &[CodeUnit]) -> BTreeSet<(String, usize)> {
+    let query = UsageFinder::new().query(analyzer, overloads, 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    query
+        .result
+        .all_hits()
+        .into_iter()
+        .map(|hit| {
+            (
+                hit.file.rel_path().to_string_lossy().replace('\\', "/"),
+                hit.line,
+            )
+        })
+        .collect()
+}
+
+/// #1779: two copies of one package -- a vendored crate kept beside the
+/// original, both declaring `shared-lib` -- give every item in them the same
+/// fully qualified name, so forward resolution answers with both declarations.
+/// Each copy's callers live in its own tree, so scanning only the first
+/// candidate reports one call site and silently drops the other.
+#[test]
+fn rust_duplicate_package_target_group_unions_every_candidate_scan() {
+    let package = "[package]\nname = \"shared-lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    let service = "pub struct Service;\nimpl Service {\n    pub fn run(&self) {}\n}\n";
+    let consumer = "use crate::service::Service;\npub fn go(s: &Service) { s.run(); }\n";
+    let (_project, analyzer) = rust_analyzer_with_files(&[
+        ("first/Cargo.toml", package),
+        ("first/src/lib.rs", "pub mod service;\npub mod consumer;\n"),
+        ("first/src/service.rs", service),
+        ("first/src/consumer.rs", consumer),
+        ("second/Cargo.toml", package),
+        ("second/src/lib.rs", "pub mod service;\npub mod consumer;\n"),
+        ("second/src/service.rs", service),
+        ("second/src/consumer.rs", consumer),
+    ]);
+
+    let mut definitions = analyzer.get_definitions("shared_lib.service.Service.run");
+    definitions.sort_by_key(|unit| unit.source().rel_path().to_path_buf());
+    assert_eq!(
+        definitions
+            .iter()
+            .map(|unit| unit
+                .source()
+                .rel_path()
+                .to_string_lossy()
+                .replace('\\', "/"))
+            .collect::<Vec<_>>(),
+        vec![
+            "first/src/service.rs".to_string(),
+            "second/src/service.rs".to_string()
+        ],
+        "both copies must resolve as candidates of one target group"
+    );
+
+    let first_call = ("first/src/consumer.rs".to_string(), 2);
+    let second_call = ("second/src/consumer.rs".to_string(), 2);
+    let both = BTreeSet::from([first_call.clone(), second_call.clone()]);
+
+    assert_eq!(
+        rust_usage_sites(&analyzer, &definitions),
+        both,
+        "the group's usages must include both copies' call sites"
+    );
+    let reversed: Vec<CodeUnit> = definitions.iter().rev().cloned().collect();
+    assert_eq!(
+        rust_usage_sites(&analyzer, &reversed),
+        both,
+        "candidate order must not change the reported sites"
+    );
+
+    assert_eq!(
+        rust_usage_sites(&analyzer, &definitions[..1]),
+        BTreeSet::from([first_call]),
+        "a single candidate still answers only for its own copy"
+    );
+    assert_eq!(
+        rust_usage_sites(&analyzer, &definitions[1..]),
+        BTreeSet::from([second_call]),
+        "a single candidate still answers only for its own copy"
+    );
 }

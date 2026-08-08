@@ -835,6 +835,7 @@ struct WorkspaceSession {
     snapshot: Arc<WorkspaceAnalyzer>,
     document_root: Arc<WorkspaceRoot>,
     watcher: SessionWatcher,
+    usage_index_warm: Option<JoinHandle<()>>,
     index_warmer: Arc<IndexWarmer>,
     #[cfg(feature = "nlp")]
     semantic: Option<Arc<SemanticIndexer>>,
@@ -859,6 +860,7 @@ struct WorkspaceQueryScope {
 pub(crate) struct PreparedQueryCode {
     snapshot: WorkspaceQueryScope,
     arguments: Value,
+    request_timing: PreparedQueryCodeTiming,
     workspace_generation: u64,
     query_protocols: crate::analyzer::structural::ProtocolRegistrationSet,
     query_value_flows: crate::analyzer::structural::ValueFlowPlanRegistrationSet,
@@ -866,6 +868,22 @@ pub(crate) struct PreparedQueryCode {
     typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreparedQueryCodeTiming {
+    started: Instant,
+    workspace_ready_ns: u64,
+    preparation_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueryCodeExecutionTiming {
+    input_decode_ns: u64,
+    query_execution_ns: u64,
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
 pub(crate) struct PreparedRunPolicy {
     snapshot: WorkspaceQueryScope,
     root: PathBuf,
@@ -1000,6 +1018,20 @@ impl WorkspaceSession {
         #[cfg(feature = "nlp")]
         if let Some(semantic) = &self.semantic {
             semantic.close();
+        }
+    }
+}
+
+impl Drop for WorkspaceSession {
+    fn drop(&mut self) {
+        // The warmer owns the snapshot while its thread runs. Wait for it
+        // before the session drops the project and its SQLite connections.
+        self.index_warmer.wait_until_idle();
+        let Some(handle) = self.usage_index_warm.take() else {
+            return;
+        };
+        if let Err(panic) = handle.join() {
+            eprintln!("bifrost usage-index warm thread panicked: {panic:?}");
         }
     }
 }
@@ -1415,6 +1447,27 @@ impl SearchToolsService {
         render_options: RenderOptions,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
+        self.call_tool_output_with_transport_queue_wait(
+            name,
+            arguments,
+            render_options,
+            cancellation,
+            Duration::ZERO,
+        )
+    }
+
+    /// Execute a tool after an MCP host waited for analyzer capacity.
+    ///
+    /// The host measures this phase before it enters the synchronous service.
+    /// Profiled `query_code` responses retain the delay as request timing.
+    pub(crate) fn call_tool_output_with_transport_queue_wait(
+        &self,
+        name: &str,
+        arguments: Value,
+        render_options: RenderOptions,
+        cancellation: Option<&CancellationToken>,
+        transport_queue_wait: Duration,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
         // Lifecycle tools bypass watcher delta application: refresh rebuilds
         // explicitly, activate replaces the whole workspace, and get is cheap.
         match name {
@@ -1449,7 +1502,11 @@ impl SearchToolsService {
         }
         if name == "query_code" {
             let prepared = self.prepare_query_code(arguments, cancellation)?;
-            return self.execute_prepared_query_code(prepared, cancellation);
+            return self.execute_prepared_query_code_with_transport_queue_wait(
+                prepared,
+                cancellation,
+                transport_queue_wait,
+            );
         }
         if name == "list_policies" {
             let catalog = built_in_policy_catalog().map_err(|error| {
@@ -1736,22 +1793,34 @@ impl SearchToolsService {
         let PreparedQueryCode {
             snapshot,
             arguments,
+            request_timing,
             workspace_generation,
             query_protocols,
             query_value_flows,
             query_taint_results,
             typestate_summary_lease,
         } = self.prepare_query_code(arguments, None)?;
-        let result = self.query_code_result_for_snapshot(
-            &snapshot,
-            arguments,
-            None,
-            workspace_generation,
-            &query_protocols,
-            &query_value_flows,
-            &query_taint_results,
-            typestate_summary_lease,
-        );
+        let result = self
+            .query_code_result_for_snapshot(
+                &snapshot,
+                arguments,
+                None,
+                workspace_generation,
+                &query_protocols,
+                &query_value_flows,
+                &query_taint_results,
+                typestate_summary_lease,
+            )
+            .map(|(mut response, execution_timing)| {
+                Self::attach_query_code_request_timing(
+                    &mut response,
+                    request_timing,
+                    execution_timing,
+                    0,
+                    Duration::ZERO,
+                );
+                response
+            });
         snapshot.finish("query_code", result)
     }
 
@@ -1760,6 +1829,8 @@ impl SearchToolsService {
         arguments: Value,
         cancellation: Option<&CancellationToken>,
     ) -> Result<PreparedQueryCode, SearchToolsServiceError> {
+        let started = Instant::now();
+        let mut workspace_ready = Duration::ZERO;
         loop {
             let (generation, typestate_summaries) = {
                 let typestate_summaries = self
@@ -1771,7 +1842,9 @@ impl SearchToolsService {
                     Arc::clone(&typestate_summaries),
                 )
             };
+            let snapshot_started = Instant::now();
             let snapshot = self.snapshot_for_query_with_cancellation(cancellation)?;
+            workspace_ready = workspace_ready.saturating_add(snapshot_started.elapsed());
             let query_protocols = self.query_protocol_snapshot()?;
             let query_value_flows = self.query_value_flow_snapshot()?;
             let query_taint_results = self.query_taint_result_snapshot()?;
@@ -1788,6 +1861,11 @@ impl SearchToolsService {
             return Ok(PreparedQueryCode {
                 snapshot,
                 arguments,
+                request_timing: PreparedQueryCodeTiming {
+                    started,
+                    workspace_ready_ns: duration_ns(workspace_ready),
+                    preparation_ns: duration_ns(started.elapsed().saturating_sub(workspace_ready)),
+                },
                 workspace_generation: generation,
                 query_protocols,
                 query_value_flows,
@@ -1797,14 +1875,29 @@ impl SearchToolsService {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_prepared_query_code(
         &self,
         prepared: PreparedQueryCode,
         cancellation: Option<&CancellationToken>,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
+        self.execute_prepared_query_code_with_transport_queue_wait(
+            prepared,
+            cancellation,
+            Duration::ZERO,
+        )
+    }
+
+    pub(crate) fn execute_prepared_query_code_with_transport_queue_wait(
+        &self,
+        prepared: PreparedQueryCode,
+        cancellation: Option<&CancellationToken>,
+        transport_queue_wait: Duration,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
         let PreparedQueryCode {
             snapshot,
             arguments,
+            request_timing,
             workspace_generation,
             query_protocols,
             query_value_flows,
@@ -1812,7 +1905,7 @@ impl SearchToolsService {
             typestate_summary_lease,
         } = prepared;
         let result = (|| {
-            let output = self.query_code_result_for_snapshot(
+            let (mut output, execution_timing) = self.query_code_result_for_snapshot(
                 &snapshot,
                 arguments,
                 cancellation,
@@ -1822,7 +1915,30 @@ impl SearchToolsService {
                 &query_taint_results,
                 typestate_summary_lease,
             )?;
+            let rendering_started = Instant::now();
             let rendered_text = output.render_text();
+            let rendering_ns = duration_ns(rendering_started.elapsed());
+            let serialization_ns = if matches!(
+                &output,
+                crate::analyzer::structural::CodeQueryResponse::Profile(_)
+            ) {
+                let serialization_started = Instant::now();
+                serde_json::to_value(&output).map_err(|err| {
+                    SearchToolsServiceError::internal(format!(
+                        "Failed to serialize tool result: {err}"
+                    ))
+                })?;
+                duration_ns(serialization_started.elapsed())
+            } else {
+                0
+            };
+            Self::attach_query_code_request_timing(
+                &mut output,
+                request_timing,
+                execution_timing,
+                rendering_ns.saturating_add(serialization_ns),
+                transport_queue_wait,
+            );
             let structured = serde_json::to_value(&output).map_err(|err| {
                 SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
             })?;
@@ -1845,9 +1961,18 @@ impl SearchToolsService {
         query_value_flows: &crate::analyzer::structural::ValueFlowPlanRegistrationSet,
         query_taint_results: &crate::analyzer::structural::TaintResultRegistrationSet,
         typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
-    ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
+    ) -> Result<
+        (
+            crate::analyzer::structural::CodeQueryResponse,
+            QueryCodeExecutionTiming,
+        ),
+        SearchToolsServiceError,
+    > {
+        let input_decode_started = Instant::now();
         let query = Self::decode_query_code_input(snapshot, arguments)?;
-        Ok(CodeIntelligenceRuntime::new(snapshot, cancellation)
+        let input_decode_ns = duration_ns(input_decode_started.elapsed());
+        let query_execution_started = Instant::now();
+        let response = CodeIntelligenceRuntime::new(snapshot, cancellation)
             .execute_query_with_all_analysis_registration_lease(
                 workspace_generation,
                 query_protocols,
@@ -1856,7 +1981,36 @@ impl SearchToolsService {
                 &query,
                 crate::analyzer::structural::CodeQueryExecutionLimits::default(),
                 typestate_summary_lease,
-            ))
+            );
+        Ok((
+            response,
+            QueryCodeExecutionTiming {
+                input_decode_ns,
+                query_execution_ns: duration_ns(query_execution_started.elapsed()),
+            },
+        ))
+    }
+
+    fn attach_query_code_request_timing(
+        response: &mut crate::analyzer::structural::CodeQueryResponse,
+        prepared: PreparedQueryCodeTiming,
+        execution: QueryCodeExecutionTiming,
+        rendering_serialization_ns: u64,
+        transport_queue_wait: Duration,
+    ) {
+        let crate::analyzer::structural::CodeQueryResponse::Profile(profile) = response else {
+            return;
+        };
+        profile.request_timings_ns = crate::analyzer::structural::CodeQueryProfileRequestTimings {
+            transport_queue_wait: duration_ns(transport_queue_wait),
+            workspace_ready: prepared.workspace_ready_ns,
+            preparation: prepared.preparation_ns,
+            input_decode: execution.input_decode_ns,
+            query_execution: execution.query_execution_ns,
+            rendering_serialization: rendering_serialization_ns,
+            total: duration_ns(prepared.started.elapsed())
+                .saturating_add(duration_ns(transport_queue_wait)),
+        };
     }
 
     fn decode_query_code_input(
@@ -3778,16 +3932,18 @@ fn assemble_session(
     // longer pays whole-workspace index construction inside its wall-clock
     // budget. The PoolSafeMemo backing the index keeps a failed build
     // unpublished, so any panic here resurfaces on the first query that needs it.
-    {
+    let usage_index_warm = {
         let snapshot = Arc::clone(&snapshot);
-        std::thread::Builder::new()
-            .name("bifrost-usage-index-warm".to_string())
-            .spawn(move || {
-                let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
-                snapshot.warm_usage_analysis();
-            })
-            .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?;
-    }
+        Some(
+            std::thread::Builder::new()
+                .name("bifrost-usage-index-warm".to_string())
+                .spawn(move || {
+                    let _scope = profiling::scope("mcp_cold.query_index_construction.rust_usage");
+                    snapshot.warm_usage_analysis();
+                })
+                .map_err(|error| format!("Failed to spawn usage-index warm thread: {error}"))?,
+        )
+    };
     #[cfg(feature = "nlp")]
     let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
     #[cfg(not(feature = "nlp"))]
@@ -3796,6 +3952,7 @@ fn assemble_session(
         snapshot,
         document_root,
         watcher,
+        usage_index_warm,
         index_warmer: IndexWarmer::new(),
         #[cfg(feature = "nlp")]
         semantic,
@@ -4038,6 +4195,134 @@ mod watcher_startup_tests {
             assert_watcher_error(&error);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn profiled_query_charges_deferred_workspace_readiness_to_request_timing() {
+        let (_temp, root) = workspace("Timing.java", "class Timing {}\n");
+        let (startup_started_tx, startup_started_rx) = mpsc::channel();
+        let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
+        let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
+        let starter: WatcherStarter = Arc::new(move |project| {
+            startup_started_tx
+                .send(())
+                .expect("test should observe watcher startup");
+            release_startup_rx
+                .lock()
+                .expect("release lock")
+                .recv()
+                .expect("test should release watcher startup");
+            ProjectChangeWatcher::start_polling_for_tests(project)
+        });
+        let service = Arc::new(unbound_watching_service(starter));
+        service
+            .bind_client_workspace(root)
+            .expect("client binding should start a deferred build");
+        startup_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("deferred build should wait in watcher startup");
+
+        let querying = Arc::clone(&service);
+        let query = std::thread::spawn(move || {
+            querying.call_tool_value(
+                "query_code",
+                json!({
+                    "schema_version": 1,
+                    "match": {"kind": "class", "name": "Timing"},
+                    "execution_mode": "profile",
+                }),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match service.pending_build.try_lock() {
+                Ok(pending) => {
+                    drop(pending);
+                    assert!(
+                        Instant::now() < deadline,
+                        "query should wait for the deferred workspace build"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("pending workspace build lock poisoned")
+                }
+            }
+        }
+        release_startup_tx
+            .send(())
+            .expect("test should release the deferred build");
+
+        let profile = query
+            .join()
+            .expect("query thread should not panic")
+            .expect("profiled query should succeed");
+        let timings = &profile["request_timings_ns"];
+        let workspace_ready = timings["workspace_ready"]
+            .as_u64()
+            .expect("profile should report workspace readiness");
+        let preparation = timings["preparation"]
+            .as_u64()
+            .expect("profile should report preparation");
+        let input_decode = timings["input_decode"]
+            .as_u64()
+            .expect("profile should report input decoding");
+        let query_execution = timings["query_execution"]
+            .as_u64()
+            .expect("profile should report query execution");
+        let rendering_serialization = timings["rendering_serialization"]
+            .as_u64()
+            .expect("profile should report rendering and serialization");
+        let total = timings["total"]
+            .as_u64()
+            .expect("profile should report total request time");
+
+        assert!(workspace_ready > 0, "deferred readiness must be charged");
+        assert!(
+            total
+                >= workspace_ready
+                    .saturating_add(preparation)
+                    .saturating_add(input_decode)
+                    .saturating_add(query_execution)
+                    .saturating_add(rendering_serialization),
+            "request total must cover every measured phase: {timings}"
+        );
+    }
+
+    #[test]
+    fn profiled_query_charges_transport_queue_wait_to_request_timing() {
+        let (_temp, root) = workspace("Queued.java", "class Queued {}\n");
+        let service = SearchToolsService::new_manual_without_semantic_index(root)
+            .expect("manual service should start");
+        let output = service
+            .call_tool_output_with_transport_queue_wait(
+                "query_code",
+                json!({
+                    "schema_version": 1,
+                    "match": {"kind": "class", "name": "Queued"},
+                    "execution_mode": "profile",
+                }),
+                RenderOptions::default(),
+                None,
+                Duration::from_millis(7),
+            )
+            .expect("profiled query should succeed");
+        let ToolOutput::Structured { structured, .. } = output else {
+            panic!("query_code should return structured output");
+        };
+        let timings = &structured["request_timings_ns"];
+        assert_eq!(
+            timings["transport_queue_wait"].as_u64(),
+            Some(7_000_000),
+            "profile should retain the host queue wait"
+        );
+        assert!(
+            timings["total"]
+                .as_u64()
+                .is_some_and(|total| total >= 7_000_000),
+            "request total should include the host queue wait: {timings}"
+        );
     }
 
     #[test]
@@ -4792,6 +5077,7 @@ public partial class MudDialogContainer
                 snapshot: Arc::new(workspace),
                 document_root: Arc::new(WorkspaceRoot::open(project.root()).unwrap()),
                 watcher: SessionWatcher::Disabled,
+                usage_index_warm: None,
                 index_warmer: IndexWarmer::new(),
                 #[cfg(feature = "nlp")]
                 semantic: None,
@@ -5690,6 +5976,7 @@ mod tests {
                 snapshot,
                 document_root: Arc::new(WorkspaceRoot::open(dir.path()).unwrap()),
                 watcher: SessionWatcher::Disabled,
+                usage_index_warm: None,
                 index_warmer: IndexWarmer::new(),
                 semantic: Some(indexer.clone()),
             })),

@@ -53,7 +53,7 @@ use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, Receive
 pub(crate) use crate::analyzer::usages::reference_site::byte_offset_for_character_column;
 pub(crate) use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site_with_line_starts,
-    smallest_named_node_covering,
+    simple_reference_name, smallest_named_node_covering,
 };
 use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
 // The Ruby definition route is parked on `ResolutionSession`'s siblings while
@@ -468,6 +468,33 @@ pub struct DefinitionLookupDiagnostic {
 /// Consumers must not treat the accompanying declaration as the complete target
 /// of the originally requested selector chain.
 pub const PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND: &str = "partial_selector_chain";
+
+/// The name binds to a local binder -- a `case` pattern binding, a block-local
+/// `val`/`def`, a parameter -- which no analyzer publishes as a CodeUnit.
+pub const LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND: &str = "local_variable_reference";
+
+/// The site is a declaration or import occurrence, not a reference, so there is
+/// no definition for it to reach.
+pub const DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND: &str = "declaration_or_import_site";
+
+/// Whether a diagnostic kind carries an ADJUDICATED answer: the resolver
+/// identified what the site is and answered it, rather than failing to reach a
+/// target it was looking for.
+///
+/// That distinction is what separates an answer from joint blindness, and any
+/// consumer that grades forward misses must honour it. The status alone cannot:
+/// [`DefinitionLookupStatus::NoDefinition`] carries both "the target exists and
+/// I could not reach it" and "there is no target to reach, and here is why".
+/// [`DefinitionLookupStatus::UnresolvableImportBoundary`] says it in the status;
+/// the kinds here say it in the diagnostic, because the resolver PROVED the name
+/// binds to something the declaration index deliberately does not publish
+/// (#1858).
+pub fn is_adjudicated_answer_diagnostic_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND | DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND
+    )
+}
 
 pub(crate) fn resolve_definition_batch(
     analyzer: &dyn IAnalyzer,
@@ -1142,6 +1169,11 @@ fn resolve_one<'a>(
         }
     };
 
+    let tree = {
+        let _scope = profiling::scope("get_definition::parse_tree");
+        context.tree(&request.file, language, &source)
+    };
+
     let site = {
         let _scope = profiling::scope("get_definition::reference_site");
         let line_starts = context.line_starts(&request.file, &source);
@@ -1149,6 +1181,7 @@ fn resolve_one<'a>(
             &request.as_source_location(),
             &source,
             &line_starts,
+            tree.as_ref().map(Tree::root_node),
         ) {
             Ok(site) => site,
             Err(message) => {
@@ -1160,16 +1193,13 @@ fn resolve_one<'a>(
             }
         }
     };
-    let site = if matches!(language, Language::JavaScript | Language::TypeScript) {
-        js_ts::jsts_site_for_focus(site)
-    } else {
-        site
+    let site = match tree.as_ref() {
+        Some(tree) if matches!(language, Language::JavaScript | Language::TypeScript) => {
+            js_ts::jsts_site_for_focus(site, tree.root_node(), &source, language)
+        }
+        _ => site,
     };
 
-    let tree = {
-        let _scope = profiling::scope("get_definition::parse_tree");
-        context.tree(&request.file, language, &source)
-    };
     let site = if language == Language::Ruby {
         tree.as_ref()
             .map(|tree| ruby::ruby_site_for_focus(site.clone(), tree, &source))
@@ -1447,18 +1477,24 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
     for candidate in &candidates {
         semantic_keys.insert(definition_symbol_key(candidate));
     }
-    let status = if semantic_keys.len() == 1 {
-        DefinitionLookupStatus::Resolved
-    } else {
-        DefinitionLookupStatus::Ambiguous
-    };
-    let diagnostics = if semantic_keys.len() > 1 {
-        vec![DefinitionLookupDiagnostic {
-            kind: "ambiguous_definition".to_string(),
-            message: "reference resolved to multiple workspace definitions".to_string(),
-        }]
-    } else {
-        Vec::new()
+    // Zero candidates is "nothing was found", never an ambiguity: an answer
+    // that lists nothing gives a caller nothing to choose between (#1811).
+    let (status, diagnostics) = match semantic_keys.len() {
+        0 => (
+            DefinitionLookupStatus::NoDefinition,
+            vec![DefinitionLookupDiagnostic {
+                kind: "no_indexed_definition".to_string(),
+                message: "the reference resolved to no workspace definition".to_string(),
+            }],
+        ),
+        1 => (DefinitionLookupStatus::Resolved, Vec::new()),
+        _ => (
+            DefinitionLookupStatus::Ambiguous,
+            vec![DefinitionLookupDiagnostic {
+                kind: "ambiguous_definition".to_string(),
+                message: "reference resolved to multiple workspace definitions".to_string(),
+            }],
+        ),
     };
     let outcome = DefinitionLookupOutcome {
         status,
@@ -1645,12 +1681,22 @@ fn navigation_lookup_outcome(
     }
 }
 
+/// Report `candidates` as an ambiguity the caller must decide, keeping every
+/// candidate in the answer.
+///
+/// An empty candidate set downgrades to `no_definition`, mirroring the same
+/// downgrade in [`navigation_lookup_outcome`]: ambiguity means "choose one of
+/// these", so an answer with nothing to choose from is a missing answer, not an
+/// ambiguous one (#1811).
 fn ambiguous_candidates_outcome(
     mut candidates: Vec<CodeUnit>,
     message: impl Into<String>,
 ) -> DefinitionLookupOutcome {
     sort_units(&mut candidates);
     candidates.dedup();
+    if candidates.is_empty() {
+        return no_definition("no_indexed_definition", message);
+    }
     DefinitionLookupOutcome {
         status: DefinitionLookupStatus::Ambiguous,
         reference: None,
@@ -1778,19 +1824,49 @@ fn no_definition(kind: impl Into<String>, message: impl Into<String>) -> Definit
     diagnostic_outcome(DefinitionLookupStatus::NoDefinition, kind, message)
 }
 
-fn ambiguous_definition(message: impl Into<String>) -> DefinitionLookupOutcome {
-    diagnostic_outcome(
-        DefinitionLookupStatus::Ambiguous,
-        "ambiguous_definition",
-        message,
-    )
+/// Report an ambiguity whose contenders are *not* indexed code units.
+///
+/// This is the raw emitter; it is named `_without_candidates` on purpose so
+/// that every call site is greppable and must justify why the caller is given
+/// nothing to choose between. Prefer [`ambiguous_candidates_outcome`] on any
+/// path that holds the contenders: an answer a caller can act on beats a status
+/// it can only log, and dropping a *proven* candidate here is exactly the C
+/// regression in #1811 (2008 of 2010 ambiguous census sites answered with an
+/// empty target list).
+///
+/// It is legitimate only where the ambiguity verdict genuinely arrives without
+/// units - a fail-closed `LexicalTypeResolution::Ambiguous`, competing template
+/// specialization patterns, semantic-model records, or a provider that
+/// deliberately withholds candidate evidence. Each such call site MUST carry a
+/// `// no candidates:` comment naming where the contenders were lost.
+fn ambiguous_without_candidates(message: impl Into<String>) -> DefinitionLookupOutcome {
+    DefinitionLookupOutcome {
+        status: DefinitionLookupStatus::Ambiguous,
+        reference: None,
+        definitions: Vec::new(),
+        lexical_definition: None,
+        diagnostics: vec![DefinitionLookupDiagnostic {
+            kind: "ambiguous_definition".to_string(),
+            message: message.into(),
+        }],
+    }
 }
 
+/// Build an outcome that carries a diagnostic and no definitions.
+///
+/// Ambiguity has one dedicated emitter each for the with-candidates and
+/// without-candidates cases, so this generic constructor never answers
+/// [`DefinitionLookupStatus::Ambiguous`]: an ambiguous answer that reaches a
+/// caller through an unrelated status helper is the #1811 shape defect.
 fn diagnostic_outcome(
     status: DefinitionLookupStatus,
     kind: impl Into<String>,
     message: impl Into<String>,
 ) -> DefinitionLookupOutcome {
+    debug_assert!(
+        status != DefinitionLookupStatus::Ambiguous,
+        "ambiguity is emitted by `ambiguous_candidates_outcome` or `ambiguous_without_candidates`"
+    );
     DefinitionLookupOutcome {
         status,
         reference: None,

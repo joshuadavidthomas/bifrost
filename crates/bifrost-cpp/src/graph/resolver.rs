@@ -25,6 +25,7 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::borrow::Cow;
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::hash::Hash;
 #[cfg(any(test, feature = "test-support"))]
@@ -58,6 +59,29 @@ enum TypeCandidateResolution<'a> {
     Canonical,
     PreserveAlias,
     PreserveTarget(&'a CodeUnit),
+}
+
+/// Why a name did not reduce to one indexed type declaration.
+///
+/// The two answers are not interchangeable. `Ambiguous` means the index holds
+/// several declarations and the caller must choose; `Unresolvable` means the
+/// index holds none, which is a boundary the workspace cannot see past. A
+/// `using`/`typedef` alias to a template parameter or to a standard-library
+/// type is unresolvable, and reporting it as ambiguity produced an `ambiguous`
+/// answer with an empty candidate list (#1828).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypeCandidateFailure {
+    Ambiguous,
+    Unresolvable,
+}
+
+impl TypeCandidateFailure {
+    fn lexical_resolution(self) -> LexicalTypeResolution {
+        match self {
+            Self::Ambiguous => LexicalTypeResolution::Ambiguous,
+            Self::Unresolvable => LexicalTypeResolution::Missing,
+        }
+    }
 }
 
 pub enum LexicalCallableValueResolution {
@@ -1042,7 +1066,7 @@ impl<'a> VisibilityIndex<'a> {
     ) -> Self {
         let include_targets = cpp.include_target_index();
         let VisibilityData {
-            visible_by_file,
+            mut visible_by_file,
             visible_source_files_by_root,
         } = build_visibility_data(
             roots,
@@ -1058,6 +1082,7 @@ impl<'a> VisibilityIndex<'a> {
             },
             |file| analyzer.declarations(file),
         );
+        extend_with_out_of_line_owner_bindings(cpp, &mut visible_by_file);
         let mut global_field_internal_linkage = HashMap::default();
         let visible_by_identifier = build_visible_identifier_index(
             analyzer,
@@ -1084,6 +1109,17 @@ impl<'a> VisibilityIndex<'a> {
                 .entry(metadata.primary_fq_name.clone())
                 .or_default()
                 .push(unit.clone());
+        }
+        // `cpp_template_metadata` is hash-keyed on `CodeUnit`, so the push
+        // order above is a function of those hashes. Two mirrored headers can
+        // declare one specialization; `select_template_specialization` treats
+        // them as interchangeable and returns the family's first entry, so an
+        // unsorted family made the reported declaration depend on the
+        // workspace's absolute path and on unrelated files (#1836). Order the
+        // family exactly as `build_visible_identifier_index` orders its
+        // per-identifier candidate lists.
+        for family in cpp_template_families.values_mut() {
+            sort_lookup_units(family);
         }
         Self {
             cpp,
@@ -1451,6 +1487,20 @@ impl<'a> VisibilityIndex<'a> {
             cursor.frontier = frontier;
         }
         Arc::clone(&cursor.environment)
+    }
+
+    /// Whether `name` is bound as a macro at `before_byte` in `file`,
+    /// including a binding this environment cannot pin to one replacement
+    /// (a conditional `#define`, or a function-like macro).
+    ///
+    /// [`Self::object_macro_replacement_at`] collapses every such binding to
+    /// `None`, which is indistinguishable from "not a macro at all". A caller
+    /// that must not read a macro token as an ordinary type name needs the two
+    /// apart: an unexpandable macro is an unknown, a plain identifier is not.
+    pub fn names_a_macro_at(&self, file: &ProjectFile, name: &str, before_byte: usize) -> bool {
+        self.macro_environment(file, before_byte)
+            .binding(name)
+            .is_some()
     }
 
     pub fn object_macro_replacement_at(
@@ -2021,16 +2071,22 @@ impl<'a> VisibilityIndex<'a> {
             return Vec::new();
         }
         let mut arities = Vec::with_capacity(differing_candidates.len());
+        // The activation ranges here describe the whole file rather than one
+        // reference, so there is no reference guard environment to consult.
+        let reference = CallableReferenceContext {
+            file,
+            position: None,
+        };
         for (candidate, candidate_arity) in differing_candidates {
             let declaration_activation = if candidate.source() == file {
-                callable_declaration_activation_in_file(analyzer, prepared, candidate, file)
+                callable_declaration_activation_in_file(analyzer, prepared, candidate, &reference)
             } else {
                 cpp.prepared_syntax(candidate.source()).and_then(|syntax| {
                     callable_declaration_activation_in_file(
                         analyzer,
                         syntax.as_ref(),
                         candidate,
-                        file,
+                        &reference,
                     )
                 })
             };
@@ -2254,6 +2310,7 @@ impl<'a> VisibilityIndex<'a> {
         declaration: &CodeUnit,
         reference_byte: usize,
     ) -> bool {
+        let reference_guards = OnceCell::new();
         self.visible_identifier_candidates(file, declaration.identifier())
             .filter(|candidate| {
                 same_logical_symbol(candidate, declaration)
@@ -2267,7 +2324,13 @@ impl<'a> VisibilityIndex<'a> {
                     )
             })
             .any(|candidate| {
-                self.physical_declaration_visible_at(analyzer, file, candidate, reference_byte)
+                self.physical_declaration_visible_at(
+                    analyzer,
+                    file,
+                    candidate,
+                    reference_byte,
+                    &reference_guards,
+                )
             })
     }
 
@@ -2306,17 +2369,34 @@ impl<'a> VisibilityIndex<'a> {
         file: &ProjectFile,
         declaration: &CodeUnit,
         reference_byte: usize,
+        reference_guards: &OnceCell<Option<HashSet<PreprocessorGuard>>>,
     ) -> bool {
         let Some(prepared) = self.cpp.prepared_syntax(file) else {
             return false;
+        };
+        let reference = CallableReferenceContext {
+            file,
+            position: Some(CallableReferencePosition {
+                prepared: prepared.as_ref(),
+                byte: reference_byte,
+                guards: reference_guards,
+            }),
         };
         if declaration.source() == file {
             return callable_declaration_activation_in_file(
                 analyzer,
                 prepared.as_ref(),
                 declaration,
-                file,
+                &reference,
             )
+            .or_else(|| {
+                self.exhaustive_guard_family_activation(
+                    analyzer,
+                    prepared.as_ref(),
+                    declaration,
+                    &reference,
+                )
+            })
             .is_some_and(|activation| activation < reference_byte);
         }
         let Some(donor_syntax) = self.cpp.prepared_syntax(declaration.source()) else {
@@ -2326,8 +2406,16 @@ impl<'a> VisibilityIndex<'a> {
             analyzer,
             donor_syntax.as_ref(),
             declaration,
-            file,
+            &reference,
         )
+        .or_else(|| {
+            self.exhaustive_guard_family_activation(
+                analyzer,
+                donor_syntax.as_ref(),
+                declaration,
+                &reference,
+            )
+        })
         .is_none()
         {
             return false;
@@ -2379,6 +2467,51 @@ impl<'a> VisibilityIndex<'a> {
             .is_some_and(|activation| activation <= reference_byte)
     }
 
+    /// Decide whether a declaration that lives in another file reaches a
+    /// reference in `file`.
+    ///
+    /// An external header selects its declaration branch before the reference
+    /// file is parsed. Require compatible reference guards, but do not test
+    /// the header's guard expression for stability in the reference file: a
+    /// `.c` translation unit can never satisfy the `#ifdef __cplusplus` that
+    /// wraps every declaration of a portable C header, and demanding it would
+    /// hide the whole header. Guards that the reference file imposes on its
+    /// own `#include` still have to hold, and still have to be stable.
+    fn foreign_declaration_reachable_at_reference(
+        &self,
+        file: &ProjectFile,
+        prepared: &PreparedSyntaxTree,
+        declaration_source: &ProjectFile,
+        declaration_guards: &HashSet<PreprocessorGuard>,
+        reference_guards: Option<&HashSet<PreprocessorGuard>>,
+        reference_byte: usize,
+    ) -> bool {
+        if !guards_compatible_at_reference(declaration_guards, reference_guards) {
+            return false;
+        }
+        if self
+            .include_activation_for_source(self.cpp, file, prepared, declaration_source)
+            .is_some_and(|activation| activation <= reference_byte)
+        {
+            return true;
+        }
+        self.conditional_include_projections_for_source(file, prepared, declaration_source)
+            .iter()
+            .any(|projection| {
+                projection.activation_byte <= reference_byte
+                    && guard_requirements_hold_at_reference(
+                        &projection.required_guards,
+                        reference_guards,
+                    )
+                    && self.preprocessor_guards_stable_between(
+                        file,
+                        0,
+                        reference_byte,
+                        &projection.required_guards,
+                    )
+            })
+    }
+
     pub fn external_type_candidate_visible_in_context(
         &self,
         analyzer: &CppGraphSource<'_>,
@@ -2411,54 +2544,14 @@ impl<'a> VisibilityIndex<'a> {
                                     &declaration_guards,
                                 );
                         }
-                        if self
-                            .include_activation_for_source(
-                                self.cpp,
-                                file,
-                                prepared.as_ref(),
-                                peer.source(),
-                            )
-                            .is_some_and(|activation| {
-                                activation <= reference.start_byte()
-                                    && guard_requirements_hold_at_reference(
-                                        &declaration_guards,
-                                        reference_guards.as_ref(),
-                                    )
-                                    && self.preprocessor_guards_stable_between(
-                                        file,
-                                        0,
-                                        reference.start_byte(),
-                                        &declaration_guards,
-                                    )
-                            })
-                        {
-                            return true;
-                        }
-                        self.conditional_include_projections_for_source(
+                        self.foreign_declaration_reachable_at_reference(
                             file,
                             prepared.as_ref(),
                             peer.source(),
+                            &declaration_guards,
+                            reference_guards.as_ref(),
+                            reference.start_byte(),
                         )
-                        .iter()
-                        .any(|projection| {
-                            let Some(required_guards) = merge_preprocessor_guards(
-                                &projection.required_guards,
-                                &declaration_guards,
-                            ) else {
-                                return false;
-                            };
-                            projection.activation_byte <= reference.start_byte()
-                                && guard_requirements_hold_at_reference(
-                                    &required_guards,
-                                    reference_guards.as_ref(),
-                                )
-                                && self.preprocessor_guards_stable_between(
-                                    file,
-                                    0,
-                                    reference.start_byte(),
-                                    &required_guards,
-                                )
-                        })
                     })
             });
         let complementary = self
@@ -2624,7 +2717,7 @@ impl<'a> VisibilityIndex<'a> {
         // do not test the header's guard expression for stability in the
         // reference file. Same-file aliases still require that stability.
         if !candidate_guards.iter().any(|(_, target_guards)| {
-            merge_preprocessor_guards(target_guards, &reference_guards).is_some()
+            guards_compatible_at_reference(target_guards, Some(&reference_guards))
                 && (candidate.source() != file
                     || self.preprocessor_guards_stable_between(
                         file,
@@ -2682,54 +2775,14 @@ impl<'a> VisibilityIndex<'a> {
                                 &declaration_guards,
                             );
                         }
-                        if self
-                            .include_activation_for_source(
-                                self.cpp,
-                                file,
-                                prepared.as_ref(),
-                                peer.source(),
-                            )
-                            .is_some_and(|activation| {
-                                activation <= reference.start_byte()
-                                    && guard_requirements_hold_at_reference(
-                                        &declaration_guards,
-                                        reference_guards.as_ref(),
-                                    )
-                                    && self.preprocessor_guards_stable_between(
-                                        file,
-                                        0,
-                                        reference.start_byte(),
-                                        &declaration_guards,
-                                    )
-                            })
-                        {
-                            return true;
-                        }
-                        self.conditional_include_projections_for_source(
+                        self.foreign_declaration_reachable_at_reference(
                             file,
                             prepared.as_ref(),
                             peer.source(),
+                            &declaration_guards,
+                            reference_guards.as_ref(),
+                            reference.start_byte(),
                         )
-                        .iter()
-                        .any(|projection| {
-                            let Some(required_guards) = merge_preprocessor_guards(
-                                &projection.required_guards,
-                                &declaration_guards,
-                            ) else {
-                                return false;
-                            };
-                            projection.activation_byte <= reference.start_byte()
-                                && guard_requirements_hold_at_reference(
-                                    &required_guards,
-                                    reference_guards.as_ref(),
-                                )
-                                && self.preprocessor_guards_stable_between(
-                                    file,
-                                    0,
-                                    reference.start_byte(),
-                                    &required_guards,
-                                )
-                        })
                     })
             })
     }
@@ -3192,14 +3245,16 @@ impl<'a> VisibilityIndex<'a> {
                 TypeCandidateResolution::PreserveTarget,
             )
         };
-        let Some(unit) = self.resolve_type_candidates(analyzer, file, &candidates, resolution)
-        else {
-            return LexicalTypeResolution::Ambiguous;
-        };
-        LexicalTypeResolution::Resolved {
-            unit,
-            components: target_components.to_vec(),
-            candidates: vec![target.clone()],
+        // One candidate goes in, so a failure here is never "choose one of
+        // these": it is the alias chain leaving the index, which must answer
+        // missing rather than ambiguous (#1828).
+        match self.resolve_type_candidates(analyzer, file, &candidates, resolution) {
+            Ok(unit) => LexicalTypeResolution::Resolved {
+                unit,
+                components: target_components.to_vec(),
+                candidates: vec![target.clone()],
+            },
+            Err(failure) => failure.lexical_resolution(),
         }
     }
 
@@ -3266,9 +3321,9 @@ impl<'a> VisibilityIndex<'a> {
                 }
                 continue;
             }
-            let unit = self.resolve_type_candidates(analyzer, file, &candidates, resolution);
-            let Some(unit) = unit else {
-                return LexicalTypeResolution::Ambiguous;
+            let unit = match self.resolve_type_candidates(analyzer, file, &candidates, resolution) {
+                Ok(unit) => unit,
+                Err(failure) => return failure.lexical_resolution(),
             };
             return LexicalTypeResolution::Resolved {
                 unit,
@@ -3338,14 +3393,14 @@ impl<'a> VisibilityIndex<'a> {
             return None;
         }
         let owner_components = lexical_scope[..owner_len].to_vec();
-        let resolved = self.resolve_type_candidates(analyzer, file, &matches, resolution);
-        let resolution = resolved.map_or(LexicalTypeResolution::Ambiguous, |unit| {
-            LexicalTypeResolution::Resolved {
+        let resolution = match self.resolve_type_candidates(analyzer, file, &matches, resolution) {
+            Ok(unit) => LexicalTypeResolution::Resolved {
                 unit,
                 components: owner_components,
                 candidates: matches.into_iter().cloned().collect(),
-            }
-        });
+            },
+            Err(failure) => failure.lexical_resolution(),
+        };
         Some((owner_len, resolution))
     }
 
@@ -3405,11 +3460,11 @@ impl<'a> VisibilityIndex<'a> {
                     }
                     continue;
                 }
-                let Some(unit) =
-                    self.resolve_type_candidates(analyzer, file, &candidates, resolution)
-                else {
-                    return LexicalTypeResolution::Ambiguous;
-                };
+                let unit =
+                    match self.resolve_type_candidates(analyzer, file, &candidates, resolution) {
+                        Ok(unit) => unit,
+                        Err(failure) => return failure.lexical_resolution(),
+                    };
                 level_matches.push((unit, candidates.into_iter().cloned().collect::<Vec<_>>()));
             }
             if let Some((unit, candidates)) = level_matches.first().cloned() {
@@ -3436,23 +3491,28 @@ impl<'a> VisibilityIndex<'a> {
         LexicalTypeResolution::Missing
     }
 
+    /// The one type the candidates name under `resolution`, or why they do not
+    /// name one. The two preserving modes only ever reject candidates that
+    /// disagree with each other, which is ambiguity; canonicalization can also
+    /// fail because the alias chain leaves the index (#1828).
     fn resolve_type_candidates(
         &self,
         analyzer: &CppGraphSource<'_>,
         file: &ProjectFile,
         candidates: &[&CodeUnit],
         resolution: TypeCandidateResolution<'_>,
-    ) -> Option<CodeUnit> {
+    ) -> Result<CodeUnit, TypeCandidateFailure> {
         match resolution {
             TypeCandidateResolution::Canonical => {
-                self.unique_canonical_type_candidate(analyzer, file, candidates)
+                self.canonical_type_candidate_resolution(analyzer, file, candidates)
             }
             TypeCandidateResolution::PreserveAlias => {
                 unique_type_candidate_preserving_alias(analyzer, candidates)
+                    .ok_or(TypeCandidateFailure::Ambiguous)
             }
-            TypeCandidateResolution::PreserveTarget(target) => {
-                self.unique_type_candidate_preserving_target(analyzer, file, candidates, target)
-            }
+            TypeCandidateResolution::PreserveTarget(target) => self
+                .unique_type_candidate_preserving_target(analyzer, file, candidates, target)
+                .ok_or(TypeCandidateFailure::Ambiguous),
         }
     }
 
@@ -3564,19 +3624,42 @@ impl<'a> VisibilityIndex<'a> {
         visible_from: &ProjectFile,
         unit: &CodeUnit,
     ) -> Option<CodeUnit> {
+        self.canonical_type_resolution(analyzer, visible_from, unit)
+            .ok()
+    }
+
+    /// Follow `unit`'s alias chain to the class it names, or report why the
+    /// chain does not end at one indexed class.
+    ///
+    /// A chain that leaves the index - an alias to a template parameter, to a
+    /// standard-library type, or to any other declaration the workspace does
+    /// not hold - is `Unresolvable`, not `Ambiguous` (#1828). So is a cycle:
+    /// there is still nothing to choose between.
+    fn canonical_type_resolution(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        unit: &CodeUnit,
+    ) -> Result<CodeUnit, TypeCandidateFailure> {
         let mut current = unit.clone();
         let mut seen_aliases = HashSet::default();
         loop {
             let Some(target) = self.structured_alias_target(analyzer, &current) else {
-                return current.is_class().then_some(current);
+                return current
+                    .is_class()
+                    .then_some(current)
+                    .ok_or(TypeCandidateFailure::Unresolvable);
             };
             if matches!(target, StructuredAliasTarget::Builtin) {
-                return current.is_class().then_some(current);
+                return current
+                    .is_class()
+                    .then_some(current)
+                    .ok_or(TypeCandidateFailure::Unresolvable);
             }
             if !seen_aliases.insert(current.clone()) {
-                return None;
+                return Err(TypeCandidateFailure::Unresolvable);
             }
-            current = self.resolve_structured_alias_target(visible_from, &current, &target)?;
+            current = self.structured_alias_target_resolution(visible_from, &current, &target)?;
         }
     }
 
@@ -3619,15 +3702,31 @@ impl<'a> VisibilityIndex<'a> {
         declaration: &CodeUnit,
         target: &StructuredAliasTarget,
     ) -> Option<CodeUnit> {
-        let primary = self.resolve_structured_alias_primary(visible_from, declaration, target)?;
+        self.structured_alias_target_resolution(visible_from, declaration, target)
+            .ok()
+    }
+
+    fn structured_alias_target_resolution(
+        &self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        target: &StructuredAliasTarget,
+    ) -> Result<CodeUnit, TypeCandidateFailure> {
+        let primary =
+            self.structured_alias_primary_resolution(visible_from, declaration, target)?;
         let StructuredAliasTarget::Named { arguments, .. } = target else {
-            return None;
+            return Err(TypeCandidateFailure::Unresolvable);
         };
         match arguments {
             Some(arguments) => self
                 .resolve_template_arguments(visible_from, primary, arguments)
-                .ok(),
-            None => Some(primary),
+                .map_err(|error| match error {
+                    CppTemplateResolutionError::AmbiguousSpecialization { .. } => {
+                        TypeCandidateFailure::Ambiguous
+                    }
+                    _ => TypeCandidateFailure::Unresolvable,
+                }),
+            None => Ok(primary),
         }
     }
 
@@ -3637,18 +3736,29 @@ impl<'a> VisibilityIndex<'a> {
         declaration: &CodeUnit,
         target: &StructuredAliasTarget,
     ) -> Option<CodeUnit> {
+        self.structured_alias_primary_resolution(visible_from, declaration, target)
+            .ok()
+    }
+
+    fn structured_alias_primary_resolution(
+        &self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        target: &StructuredAliasTarget,
+    ) -> Result<CodeUnit, TypeCandidateFailure> {
         let StructuredAliasTarget::Named {
             components, global, ..
         } = target
         else {
-            return None;
+            return Err(TypeCandidateFailure::Unresolvable);
         };
         let qualified = components.join("::");
-        if *global {
-            unique_logical_type_candidate(self.type_candidates(visible_from, &qualified))
+        let candidates = if *global {
+            self.type_candidates(visible_from, &qualified)
         } else {
-            self.resolve_unique_type_for_declaration(visible_from, declaration, &qualified)
-        }
+            self.type_candidates_for_declaration(visible_from, declaration, &qualified)
+        };
+        logical_type_candidate(candidates)
     }
 
     pub fn structured_alias_primary_preserves_target(
@@ -3878,9 +3988,19 @@ impl<'a> VisibilityIndex<'a> {
         visible_from: &ProjectFile,
         candidates: &[&CodeUnit],
     ) -> Option<CodeUnit> {
+        self.canonical_type_candidate_resolution(analyzer, visible_from, candidates)
+            .ok()
+    }
+
+    fn canonical_type_candidate_resolution(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        candidates: &[&CodeUnit],
+    ) -> Result<CodeUnit, TypeCandidateFailure> {
         let mut canonical = Vec::new();
         for candidate in candidates {
-            let resolved = self.canonical_type_unit(analyzer, visible_from, candidate)?;
+            let resolved = self.canonical_type_resolution(analyzer, visible_from, candidate)?;
             if canonical
                 .iter()
                 .any(|existing| same_visible_symbol(existing, &resolved))
@@ -3889,10 +4009,10 @@ impl<'a> VisibilityIndex<'a> {
             }
             canonical.push(resolved);
             if canonical.len() > 1 {
-                return None;
+                return Err(TypeCandidateFailure::Ambiguous);
             }
         }
-        canonical.pop()
+        canonical.pop().ok_or(TypeCandidateFailure::Unresolvable)
     }
 
     pub fn unique_type_candidate_preserving_target(
@@ -3926,11 +4046,65 @@ impl<'a> VisibilityIndex<'a> {
                 continue;
             }
             resolved_candidates.push(resolved);
-            if resolved_candidates.len() > 1 {
-                return None;
-            }
         }
-        resolved_candidates.pop()
+        match resolved_candidates.as_slice() {
+            [] => None,
+            [single] => Some(single.clone()),
+            // The branches disagree about what the name aliases. When they are
+            // spellings of one entity (#1845) that disagreement is a build
+            // configuration, not a choice between types, so it must not deny
+            // the requested target its reference.
+            _ => self
+                .same_fqn_type_spelling_for_target(analyzer, visible_from, candidates, target)
+                .map(|_| target.clone()),
+        }
+    }
+
+    /// The declaration a same-file same-FQN family stands for when a reference
+    /// names `target`, or `None` when the candidates are not one family or the
+    /// family does not name `target`.
+    ///
+    /// A translation unit cannot hold two different types under one qualified
+    /// name, so several same-kind declarations of one FQN in one file are
+    /// alternate spellings of one entity - the configuration branches of an
+    /// `#if` family, for example log4cxx's `logchar`, which aliases `char` in
+    /// the UTF-8 branch and `UniChar` in the unichar branch. Their alias
+    /// targets differ; canonicalizing each branch on its own and then demanding
+    /// agreement reports an ambiguity that denies every declaration in the
+    /// family its usages (#1845). The family names `target` when it declares
+    /// it, or when one branch's alias chain reaches it.
+    ///
+    /// Declarations in different files or namespaces are distinct entities and
+    /// are deliberately excluded: their disagreement is a real ambiguity.
+    pub fn same_fqn_type_spelling_for_target<'b>(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        candidates: &[&'b CodeUnit],
+        target: &CodeUnit,
+    ) -> Option<&'b CodeUnit> {
+        let [first, rest @ ..] = candidates else {
+            return None;
+        };
+        if rest.is_empty()
+            || !rest.iter().all(|candidate| {
+                candidate.kind() == first.kind()
+                    && candidate.fq_name() == first.fq_name()
+                    && candidate.source() == first.source()
+            })
+        {
+            return None;
+        }
+        candidates
+            .iter()
+            .copied()
+            .find(|candidate| same_symbol(candidate, target))
+            .or_else(|| {
+                candidates.iter().copied().find(|candidate| {
+                    self.type_candidate_preserving_target(analyzer, visible_from, candidate, target)
+                        .is_some_and(|resolved| same_visible_symbol(&resolved, target))
+                })
+            })
     }
 
     pub fn alternate_same_fqn_type_declarations(
@@ -4036,45 +4210,40 @@ impl<'a> VisibilityIndex<'a> {
         true
     }
 
+    /// The byte range of the one `#if` family with a terminal `#else` that holds
+    /// every physical declaration of every candidate, or `None` when they do not
+    /// share one such family.
+    ///
+    /// Guard terms alone cannot distinguish one `#if` family from separate blocks
+    /// whose macros changed between declarations. Require every physical range to
+    /// belong to one syntax-tree family with a terminal `#else` before the terms
+    /// can prove branch coverage.
     fn declarations_share_exhaustive_conditional_family(
         &self,
         analyzer: &CppGraphSource<'_>,
         candidates: &[&CodeUnit],
-    ) -> bool {
-        // Guard terms alone cannot distinguish one #if family from separate
-        // blocks whose macros changed between declarations. Require every
-        // physical range to belong to one syntax-tree family with a terminal
-        // #else before the terms can prove branch coverage.
+    ) -> Option<(usize, usize)> {
         let mut family_range = None;
         for candidate in candidates {
-            let Some(prepared) = self.cpp.prepared_syntax(candidate.source()) else {
-                return false;
-            };
+            let prepared = self.cpp.prepared_syntax(candidate.source())?;
             let root = prepared.tree().root_node();
             let mut candidate_family = None;
             for range in analyzer.ranges(candidate) {
-                let Some(node) = root.descendant_for_byte_range(range.start_byte, range.end_byte)
-                else {
-                    return false;
-                };
-                let Some(family) = preprocessor_conditional_family_for_declaration(node) else {
-                    return false;
-                };
+                let node = root.descendant_for_byte_range(range.start_byte, range.end_byte)?;
+                let family = preprocessor_conditional_family_for_declaration(node)?;
                 let key = (family.start_byte(), family.end_byte());
                 if candidate_family.is_some_and(|existing| existing != key) {
-                    return false;
+                    return None;
                 }
                 candidate_family = Some(key);
             }
-            let Some(candidate_family) = candidate_family else {
-                return false;
-            };
+            let candidate_family = candidate_family?;
             if family_range.is_some_and(|existing| existing != candidate_family) {
-                return false;
+                return None;
             }
             family_range = Some(candidate_family);
         }
-        family_range.is_some()
+        family_range
     }
 
     pub fn complementary_same_fqn_type_declarations(
@@ -4085,19 +4254,86 @@ impl<'a> VisibilityIndex<'a> {
     ) -> bool {
         if candidates.len() < 2
             || !self.alternate_same_fqn_type_declarations(analyzer, candidates, target)
-            || !self.declarations_share_exhaustive_conditional_family(analyzer, candidates)
+            || self
+                .declarations_share_exhaustive_conditional_family(analyzer, candidates)
+                .is_none()
         {
             return false;
         }
-        let requirements = candidates
+        Self::preprocessor_guard_terms_cover_all_paths(
+            &self.declaration_family_guard_terms(analyzer, candidates),
+        )
+    }
+
+    fn declaration_family_guard_terms(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        candidates: &[&CodeUnit],
+    ) -> Vec<HashSet<PreprocessorGuard>> {
+        candidates
             .iter()
-            .map(|candidate| declaration_guard_requirements(analyzer, self.cpp, candidate))
+            .flat_map(|candidate| declaration_guard_requirements(analyzer, self.cpp, candidate))
+            .map(|(_, guards)| guards)
+            .collect()
+    }
+
+    /// A callable name declared on every branch of one completed `#if`/`#else`
+    /// family is declared on every configuration path, so a reference below the
+    /// whole family sees one of the branches whatever the preprocessor decides.
+    /// Answer the family's end byte: only past `#endif` is every branch's
+    /// declaration behind the reference.
+    ///
+    /// This is the callable analogue of `complementary_same_fqn_type_declarations`
+    /// and shares both of its primitives. It does not require two distinct
+    /// `CodeUnit`s: branches that declare the same signature can collapse into
+    /// one unit carrying one physical range per branch.
+    ///
+    /// The branches are alternate spellings of one declaration, never competing
+    /// declarations, so only the first branch stands for the family. Reporting
+    /// every branch as visible would turn a name the source declares exactly
+    /// once into an ambiguity between build configurations.
+    fn exhaustive_guard_family_activation(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        prepared: &PreparedSyntaxTree,
+        candidate: &CodeUnit,
+        reference: &CallableReferenceContext<'_>,
+    ) -> Option<usize> {
+        // Branch coverage says nothing about scope: a block-local declaration
+        // stays invisible however many branches declare it.
+        if nameable_callable_declaration_nodes(analyzer, prepared, candidate).is_empty() {
+            return None;
+        }
+        let family = self
+            .visible_identifier_candidates(candidate.source(), candidate.identifier())
+            .filter(|peer| {
+                peer.kind() == candidate.kind()
+                    && peer.fq_name() == candidate.fq_name()
+                    && peer.source() == candidate.source()
+            })
             .collect::<Vec<_>>();
-        let terms = requirements
-            .into_iter()
-            .flat_map(|ranges| ranges.into_iter().map(|(_, guards)| guards))
-            .collect::<Vec<_>>();
-        Self::preprocessor_guard_terms_cover_all_paths(&terms)
+        let (_, family_end) =
+            self.declarations_share_exhaustive_conditional_family(analyzer, &family)?;
+        if !Self::preprocessor_guard_terms_cover_all_paths(
+            &self.declaration_family_guard_terms(analyzer, &family),
+        ) {
+            return None;
+        }
+        // A reference whose own guards pick one branch already reaches that
+        // branch through the ordinary same-guard path; the family must not
+        // resurrect the branch the reference contradicts.
+        if !declaration_guard_requirements(analyzer, self.cpp, candidate)
+            .iter()
+            .any(|(_, guards)| guards_compatible_at_reference(guards, reference.guards()))
+        {
+            return None;
+        }
+        (first_declaration_byte(analyzer, candidate)?
+            == family
+                .iter()
+                .filter_map(|peer| first_declaration_byte(analyzer, peer))
+                .min()?)
+        .then_some(family_end)
     }
 
     fn type_candidate_preserving_target(
@@ -4232,23 +4468,41 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
+    /// Every indexed type declaration `raw_name` names when it is written in
+    /// `declaration`'s namespace: the innermost enclosing namespace that holds
+    /// the name wins, otherwise the name is looked up unqualified.
+    fn type_candidates_for_declaration<'b>(
+        &'b self,
+        visible_from: &ProjectFile,
+        declaration: &CodeUnit,
+        raw_name: &str,
+    ) -> Vec<&'b CodeUnit> {
+        let Some(normalized) = normalize_reference_name(raw_name) else {
+            return Vec::new();
+        };
+        if let Some(namespace) = cpp_namespace_for(declaration) {
+            for prefix in namespace_prefixes(&namespace) {
+                let qualified = format!("{prefix}::{normalized}");
+                let candidates = self.type_candidates(visible_from, &qualified);
+                if !candidates.is_empty() {
+                    return candidates;
+                }
+            }
+        }
+        self.type_candidates(visible_from, &normalized)
+    }
+
     fn resolve_unique_type_for_declaration(
         &self,
         visible_from: &ProjectFile,
         declaration: &CodeUnit,
         raw_name: &str,
     ) -> Option<CodeUnit> {
-        let normalized = normalize_reference_name(raw_name)?;
-        if let Some(namespace) = cpp_namespace_for(declaration) {
-            for prefix in namespace_prefixes(&namespace) {
-                let qualified = format!("{prefix}::{normalized}");
-                let candidates = self.type_candidates(visible_from, &qualified);
-                if !candidates.is_empty() {
-                    return unique_logical_type_candidate(candidates);
-                }
-            }
-        }
-        unique_logical_type_candidate(self.type_candidates(visible_from, &normalized))
+        unique_logical_type_candidate(self.type_candidates_for_declaration(
+            visible_from,
+            declaration,
+            raw_name,
+        ))
     }
 
     pub fn resolves_to_type(
@@ -4274,8 +4528,8 @@ impl<'a> VisibilityIndex<'a> {
     }
 
     pub fn alias_target(&self, alias: &CodeUnit) -> Option<CodeUnit> {
-        let raw_target = type_alias_target_text(alias)?;
-        let resolved = self.resolve_type_for_declaration(alias.source(), alias, raw_target)?;
+        let raw_target = cpp_alias_declaration_target_text(alias.signature()?)?;
+        let resolved = self.resolve_type_for_declaration(alias.source(), alias, &raw_target)?;
         match resolved.kind() {
             CodeUnitType::Class => Some(resolved),
             _ if is_type_alias(&resolved) => self.alias_target(&resolved),
@@ -5064,6 +5318,52 @@ where
     }
 }
 
+/// Admit the class that an out-of-line definition proves is in scope.
+///
+/// `Owner::member(...) { ... }` in a file is structured proof that `Owner`
+/// names a class-like entity in that file's scope: a member declaration can
+/// live in a file other than its class's only when it is written out of line.
+/// A file a build concatenates rather than compiles carries no `#include` edge
+/// to the header declaring `Owner` -- google/wuffs
+/// `internal/cgen/auxiliary/image.cc` defines
+/// `DecodeImageResult::DecodeImageResult` and never includes `image.hh` -- so
+/// every unqualified member and constructor reference in it had no candidate at
+/// all (#1832).
+///
+/// The evidence is the indexed declaration's own owner name, taken from its
+/// `FqName`, so this stays a structured answer rather than a text fallback.
+/// Only an owner the file cannot already see is admitted: that is what keeps a
+/// header declaring its own class from additionally seeing every same-named
+/// class in the workspace, and it makes the pass free for the ordinary file
+/// whose owners are all visible.
+fn extend_with_out_of_line_owner_bindings(
+    cpp: &dyn CppSource,
+    visible_by_file: &mut HashMap<ProjectFile, HashSet<CodeUnit>>,
+) {
+    for (file, visible) in visible_by_file.iter_mut() {
+        // The include-closure walk seeds every root with its own declarations,
+        // so the file's members are already here; re-reading them from the
+        // analyzer would pay for the same declaration set twice.
+        let mut unseen_owners: HashSet<String> = visible
+            .iter()
+            .filter(|unit| unit.source() == file && (unit.is_function() || unit.is_field()))
+            .filter_map(brokk_bifrost_core::analyzer::default_parent_fq_name)
+            .collect();
+        if unseen_owners.is_empty() {
+            continue;
+        }
+        for unit in visible.iter().filter(|unit| unit.is_class()) {
+            unseen_owners.remove(&unit.fq_name());
+        }
+        let admitted = unseen_owners
+            .iter()
+            .flat_map(|owner| cpp.definitions(owner))
+            .filter(CodeUnit::is_class)
+            .collect::<Vec<_>>();
+        visible.extend(admitted);
+    }
+}
+
 pub enum VisibleMemberResolution {
     Callable(Vec<CodeUnit>),
     NonCallable,
@@ -5754,10 +6054,19 @@ fn find_include_activation(
     let include_targets = cpp.include_target_index();
     let mut direct_includes = Vec::new();
     let mut nodes = vec![prepared.tree().root_node()];
+    // An include activates for the whole file, so only an unconditional
+    // directive counts here.
+    let reference = CallableReferenceContext {
+        file,
+        position: None,
+    };
     while let Some(node) = nodes.pop() {
         if node.kind() == "preproc_include" {
-            if callable_preprocessor_context_is_visible_for_reference(node, prepared.source(), file)
-            {
+            if callable_preprocessor_context_is_visible_for_reference(
+                node,
+                prepared.source(),
+                &reference,
+            ) {
                 let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
                 for include in cpp_include_paths(std::slice::from_ref(&raw)) {
                     if let Some(target) = unique_include_target(resolve_include_targets_with_index(
@@ -5940,6 +6249,12 @@ fn unconditional_include_reaches(
     }
     let mut visited = HashSet::default();
     let mut files = vec![first.clone()];
+    // Only an unconditional directive extends the include reach, so the walk
+    // asks the question without a reference position.
+    let reference = CallableReferenceContext {
+        file: reference_file,
+        position: None,
+    };
     while let Some(file) = files.pop() {
         if file == *donor_source {
             cpp.cache_unconditional_include_reachability(first, donor_source, reference_is_c, true);
@@ -5957,7 +6272,7 @@ fn unconditional_include_reaches(
                 if callable_preprocessor_context_is_visible_for_reference(
                     node,
                     prepared.source(),
-                    reference_file,
+                    &reference,
                 ) {
                     let raw = normalize_cpp_whitespace(node_text(node, prepared.source()));
                     for include in cpp_include_paths(std::slice::from_ref(&raw)) {
@@ -6005,11 +6320,55 @@ fn declaration_guard_requirements(
         .collect()
 }
 
+fn first_declaration_byte(analyzer: &CppGraphSource<'_>, candidate: &CodeUnit) -> Option<usize> {
+    analyzer
+        .ranges(candidate)
+        .into_iter()
+        .map(|range| range.start_byte)
+        .min()
+}
+
 fn guard_requirements_hold_at_reference(
     required: &HashSet<PreprocessorGuard>,
     reference: Option<&HashSet<PreprocessorGuard>>,
 ) -> bool {
     reference.is_some_and(|active| required.is_subset(active))
+}
+
+/// Cross-file guard rule: two guard sets are compatible when neither one
+/// contradicts the other. Use this instead of the subset test whenever the
+/// guards come from a foreign file, which resolves its own conditionals
+/// independently of the reference.
+fn guards_compatible_at_reference(
+    declaration: &HashSet<PreprocessorGuard>,
+    reference: Option<&HashSet<PreprocessorGuard>>,
+) -> bool {
+    reference.is_some_and(|active| merge_preprocessor_guards(declaration, active).is_some())
+}
+
+/// The byte range of the `#if`/`#elif`/`#else` chain that encloses the smallest
+/// node covering `[start_byte, end_byte)`, or `None` when nothing there is
+/// conditional.
+///
+/// Two declarations of one name that report the same chain stand in different
+/// branches of it, so at most one of them is compiled in any configuration.
+/// They are alternate spellings of a single declaration, not competing
+/// declarations, and navigation must not present them as an ambiguity.
+pub fn preprocessor_conditional_family_range(
+    root: Node<'_>,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<(usize, usize)> {
+    let node = root.descendant_for_byte_range(start_byte, end_byte)?;
+    let mut ancestor = Some(node);
+    while let Some(current) = ancestor {
+        if is_preprocessor_conditional(current) {
+            let family = preprocessor_conditional_family_root(current);
+            return Some((family.start_byte(), family.end_byte()));
+        }
+        ancestor = current.parent();
+    }
+    None
 }
 
 fn preprocessor_conditional_family_for_declaration(node: Node<'_>) -> Option<Node<'_>> {
@@ -6188,12 +6547,19 @@ fn unique_include_target(mut targets: Vec<ProjectFile>) -> Option<ProjectFile> {
     }
 }
 
-fn callable_declaration_activation_in_file(
+/// The declaration nodes of `candidate` in `prepared` that stand at a scope a
+/// later reference can name.
+///
+/// A declaration inside a real function body, lambda, or nested block is block
+/// local and is dropped. A declaration inside a parser-recovery wrapper that
+/// merely looks callable -- an export macro between `class` and its name, or a
+/// namespace-opening macro token before `namespace x {` -- keeps class or
+/// namespace scope and is kept.
+fn nameable_callable_declaration_nodes<'tree>(
     analyzer: &CppGraphSource<'_>,
-    prepared: &PreparedSyntaxTree,
+    prepared: &'tree PreparedSyntaxTree,
     candidate: &CodeUnit,
-    reference_file: &ProjectFile,
-) -> Option<usize> {
+) -> Vec<Node<'tree>> {
     let root = prepared.tree().root_node();
     analyzer
         .ranges(candidate)
@@ -6209,27 +6575,15 @@ fn callable_declaration_activation_in_file(
             }
             let mut ancestor = declaration.parent();
             while let Some(node) = ancestor {
-                // An export macro between `class` and its name can make
-                // tree-sitter recover the class body as the compound body of
-                // a synthetic function_definition.  A member declaration in
-                // that body is still namespace/class scoped; do not discard
-                // its declaration activation merely because the malformed
-                // wrapper looks callable.
                 if node.kind() == "function_definition"
-                    && crate::declarations::is_recovered_exported_class_container(
-                        node,
-                        prepared.source(),
-                    )
+                    && is_recovered_declaration_scope_container(node, prepared.source())
                 {
                     ancestor = node.parent();
                     continue;
                 }
                 if node.kind() == "compound_statement"
                     && node.parent().is_some_and(|parent| {
-                        crate::declarations::is_recovered_exported_class_container(
-                            parent,
-                            prepared.source(),
-                        )
+                        is_recovered_declaration_scope_container(parent, prepared.source())
                     })
                 {
                     ancestor = node.parent().and_then(|parent| parent.parent());
@@ -6243,26 +6597,95 @@ fn callable_declaration_activation_in_file(
                 }
                 ancestor = node.parent();
             }
-            callable_preprocessor_context_is_visible_for_reference(
-                declaration,
-                prepared.source(),
-                reference_file,
-            )
-            .then_some(declaration.end_byte())
+            Some(declaration)
         })
+        .collect()
+}
+
+fn callable_declaration_activation_in_file(
+    analyzer: &CppGraphSource<'_>,
+    prepared: &PreparedSyntaxTree,
+    candidate: &CodeUnit,
+    reference: &CallableReferenceContext<'_>,
+) -> Option<usize> {
+    nameable_callable_declaration_nodes(analyzer, prepared, candidate)
+        .into_iter()
+        .filter(|declaration| {
+            callable_preprocessor_context_is_visible_for_reference(
+                *declaration,
+                prepared.source(),
+                reference,
+            )
+        })
+        .map(callable_declaration_activation_byte)
         .min()
+}
+
+/// C and C++ activate a declared name at the end of its declarator, not at the
+/// end of the whole declaration. A function definition ends at the closing
+/// brace of its body, so the declaration end byte would hide the function from
+/// its own body and make self recursion unresolvable without a prototype.
+fn callable_declaration_activation_byte(declaration: Node<'_>) -> usize {
+    if declaration.kind() != "function_definition" {
+        return declaration.end_byte();
+    }
+    declaration
+        .child_by_field_name("declarator")
+        .map_or(declaration.end_byte(), |declarator| declarator.end_byte())
+}
+
+/// The reference side of a callable visibility question.
+///
+/// An include-graph walk and a whole-file arity activation ask the question
+/// without one reference position, so they carry no `position` and therefore no
+/// guard environment.
+struct CallableReferenceContext<'a> {
+    file: &'a ProjectFile,
+    position: Option<CallableReferencePosition<'a>>,
+}
+
+/// One reference position plus its preprocessor guard environment. The
+/// environment is computed on demand because most declarations carry no
+/// non-trivial guard.
+struct CallableReferencePosition<'a> {
+    prepared: &'a PreparedSyntaxTree,
+    byte: usize,
+    guards: &'a OnceCell<Option<HashSet<PreprocessorGuard>>>,
+}
+
+impl CallableReferenceContext<'_> {
+    fn is_c(&self) -> bool {
+        self.file
+            .rel_path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("c")
+    }
+
+    fn guards(&self) -> Option<&HashSet<PreprocessorGuard>> {
+        let position = self.position.as_ref()?;
+        position
+            .guards
+            .get_or_init(|| {
+                position
+                    .prepared
+                    .tree()
+                    .root_node()
+                    .descendant_for_byte_range(position.byte, position.byte)
+                    .and_then(|node| {
+                        preprocessor_guard_environment(node, position.prepared.source())
+                    })
+            })
+            .as_ref()
+    }
 }
 
 fn callable_preprocessor_context_is_visible_for_reference(
     node: Node<'_>,
     source: &str,
-    reference_file: &ProjectFile,
+    reference: &CallableReferenceContext<'_>,
 ) -> bool {
-    let reference_is_c = reference_file
-        .rel_path()
-        .extension()
-        .and_then(|extension| extension.to_str())
-        == Some("c");
+    let reference_is_c = reference.is_c();
     let mut ancestor = node.parent();
     while let Some(conditional) = ancestor {
         if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
@@ -6285,7 +6708,20 @@ fn callable_preprocessor_context_is_visible_for_reference(
                         return false;
                     }
                 }
-                _ => return false,
+                // The declaration stands under a guard whose value this
+                // analyzer cannot decide. It is still co-active with a
+                // reference that stands under the same guard, so accept the
+                // guard when the reference already requires it. Collecting one
+                // guard per ancestor makes the whole walk a subset test of the
+                // declaration guards against the reference guards.
+                guard => {
+                    if !reference
+                        .guards()
+                        .is_some_and(|active| active.contains(&guard))
+                    {
+                        return false;
+                    }
+                }
             }
         }
         ancestor = conditional.parent();
@@ -6375,12 +6811,33 @@ fn flattened_macro_function_namespace_components(
     let body = declaration
         .parent()
         .filter(|parent| parent.kind() == "compound_statement")?;
-    let function = body
-        .parent()
-        .filter(|parent| parent.kind() == "function_definition" && parent.has_error())?;
+    let function = body.parent()?;
     if function.child_by_field_name("body") != Some(body) {
         return None;
     }
+    let namespace_name = recovered_macro_namespace_name(function, source)?;
+    let mut components = enclosing_namespace_components(declaration, source)?;
+    components.push(namespace_name);
+    Some(components)
+}
+
+/// The namespace name a namespace-opening macro token displaced into a
+/// synthetic `function_definition`, or `None` when `function` is not that
+/// recovery shape.
+///
+/// `ABSL_NAMESPACE_BEGIN` (or `FMT_BEGIN_NAMESPACE`, ...) immediately before
+/// `namespace x {` leaves tree-sitter with a `function_definition` whose type is
+/// the macro token, whose declarator is the namespace name behind an `ERROR`
+/// holding the `namespace` keyword, and whose body spans the whole namespace
+/// region. The matching `*_NAMESPACE_END` sibling is what separates the recovery
+/// artifact from a real function definition.
+fn recovered_macro_namespace_name(function: Node<'_>, source: &str) -> Option<String> {
+    if function.kind() != "function_definition" || !function.has_error() {
+        return None;
+    }
+    let body = function
+        .child_by_field_name("body")
+        .filter(|body| body.kind() == "compound_statement")?;
     let mut cursor = function.walk();
     let prefix = function
         .named_children(&mut cursor)
@@ -6389,7 +6846,7 @@ fn flattened_macro_function_namespace_components(
         .collect::<Vec<_>>();
     let begin_index = prefix.iter().rposition(|child| {
         flattened_macro_sentinel_name(*child, source)
-            .is_some_and(|name| name.ends_with("NAMESPACE_BEGIN"))
+            .is_some_and(|name| is_namespace_begin_sentinel(&name))
     })?;
     let mut identifiers = Vec::new();
     let mut stack = prefix[begin_index + 1..]
@@ -6421,14 +6878,18 @@ fn flattened_macro_function_namespace_components(
             break candidate;
         }
     };
-    if !flattened_macro_sentinel_name(next, source)
-        .is_some_and(|name| name.ends_with("NAMESPACE_END"))
-    {
-        return None;
-    }
-    let mut components = enclosing_namespace_components(declaration, source)?;
-    components.push(namespace_name.clone());
-    Some(components)
+    flattened_macro_sentinel_name(next, source)
+        .is_some_and(|name| is_namespace_end_sentinel(&name))
+        .then(|| namespace_name.clone())
+}
+
+/// A `function_definition` that exists only because tree-sitter recovered a
+/// macro-decorated class head or a namespace-opening macro token. A declaration
+/// in such a body keeps class or namespace scope, so a scope walk must step over
+/// the wrapper instead of treating the declaration as block local.
+fn is_recovered_declaration_scope_container(node: Node<'_>, source: &str) -> bool {
+    crate::declarations::is_recovered_exported_class_container(node, source)
+        || recovered_macro_namespace_name(node, source).is_some()
 }
 
 fn flattened_macro_error_namespace_components(
@@ -6445,7 +6906,7 @@ fn flattened_macro_error_namespace_components(
         .position(|candidate| same_node(*candidate, declaration))?;
     let begin_index = (0..declaration_index).rev().find(|index| {
         flattened_macro_sentinel_name(siblings[*index], source)
-            .is_some_and(|name| name.ends_with("NAMESPACE_BEGIN"))
+            .is_some_and(|name| is_namespace_begin_sentinel(&name))
     })?;
 
     let significant = siblings[begin_index + 1..declaration_index]
@@ -6462,7 +6923,7 @@ fn flattened_macro_error_namespace_components(
     let namespace_name = flattened_macro_namespace_name(*namespace_name, source)?;
     if significant[2..].iter().any(|node| {
         flattened_macro_sentinel_name(*node, source).is_some_and(|name| {
-            name.ends_with("NAMESPACE_BEGIN") || name.ends_with("NAMESPACE_END")
+            is_namespace_begin_sentinel(&name) || is_namespace_end_sentinel(&name)
         })
     }) {
         return None;
@@ -6484,7 +6945,7 @@ fn flattened_macro_error_namespace_components(
             continue;
         }
         if !flattened_macro_sentinel_name(sibling, source)
-            .is_some_and(|name| name.ends_with("NAMESPACE_END"))
+            .is_some_and(|name| is_namespace_end_sentinel(&name))
         {
             return None;
         }
@@ -6496,13 +6957,31 @@ fn flattened_macro_error_namespace_components(
 }
 
 fn flattened_macro_sentinel_name(node: Node<'_>, source: &str) -> Option<String> {
+    // At translation-unit scope the trailing `X_NAMESPACE_END` token parses as
+    // an `expression_statement` with a missing semicolon; inside a namespace
+    // body the same token stays a bare `type_identifier`.
+    let node = if node.kind() == "expression_statement" && node.named_child_count() == 1 {
+        node.named_child(0)?
+    } else {
+        node
+    };
     let candidate = direct_cpp_identifier_name(node, source).or_else(|| {
         node.child_by_field_name("type")
             .and_then(|type_node| direct_cpp_identifier_name(type_node, source))
     })?;
     (cpp_export_macro_token(&candidate)
-        && (candidate.ends_with("NAMESPACE_BEGIN") || candidate.ends_with("NAMESPACE_END")))
+        && (is_namespace_begin_sentinel(&candidate) || is_namespace_end_sentinel(&candidate)))
     .then_some(candidate)
+}
+
+/// Namespace-opening macros are spelled both ways in the wild:
+/// `ABSL_NAMESPACE_BEGIN` (abseil, nlohmann) and `FMT_BEGIN_NAMESPACE` (fmt).
+fn is_namespace_begin_sentinel(name: &str) -> bool {
+    name.ends_with("NAMESPACE_BEGIN") || name.ends_with("BEGIN_NAMESPACE")
+}
+
+fn is_namespace_end_sentinel(name: &str) -> bool {
+    name.ends_with("NAMESPACE_END") || name.ends_with("END_NAMESPACE")
 }
 
 fn flattened_macro_namespace_name(node: Node<'_>, source: &str) -> Option<String> {
@@ -6828,27 +7307,23 @@ pub fn field_declared_binding(
     ))
 }
 
-fn type_alias_target_text(alias: &CodeUnit) -> Option<&str> {
-    alias
-        .signature()?
-        .strip_prefix("using ")
-        .and_then(|rest| rest.split_once('=').map(|(_, rhs)| rhs))
-        .or_else(|| {
-            alias
-                .signature()?
-                .strip_prefix("typedef ")
-                .and_then(|rest| rest.rsplit_once(' ').map(|(lhs, _)| lhs))
-        })
-        .map(str::trim)
-        .map(|target| target.trim_end_matches(';').trim())
+/// The one logical type the candidates name, or why they do not name one.
+fn logical_type_candidate(candidates: Vec<&CodeUnit>) -> Result<CodeUnit, TypeCandidateFailure> {
+    let Some(first) = candidates.first() else {
+        return Err(TypeCandidateFailure::Unresolvable);
+    };
+    if candidates
+        .iter()
+        .all(|candidate| candidate.kind() == first.kind() && candidate.fq_name() == first.fq_name())
+    {
+        Ok((*first).clone())
+    } else {
+        Err(TypeCandidateFailure::Ambiguous)
+    }
 }
 
 fn unique_logical_type_candidate(candidates: Vec<&CodeUnit>) -> Option<CodeUnit> {
-    let first = candidates.first()?;
-    candidates
-        .iter()
-        .all(|candidate| candidate.kind() == first.kind() && candidate.fq_name() == first.fq_name())
-        .then(|| (*first).clone())
+    logical_type_candidate(candidates).ok()
 }
 
 fn unique_type_candidate_preserving_alias(
@@ -6936,6 +7411,79 @@ fn decode_field_declared_type_fact(
     None
 }
 
+/// Text of the type that a C or C++ alias declaration names, read from the
+/// `type_definition` or `alias_declaration` node's `type` field.
+///
+/// The declaration text is never scanned. A function-pointer typedef
+/// interleaves its aliased type with its declarator (`typedef R (*F)(int)`),
+/// so no prefix or suffix of the spelling isolates the target.
+///
+/// An alias whose declarator is a function declarator names a function type:
+/// `typedef R F(int)`, `typedef R (*F)(int)`, `typedef R *F(int)`, and
+/// `using F = R (*)(int)`. The analyzer's type model names declared types only,
+/// so such an alias has no canonical target. Its `type` field holds the return
+/// type `R`, which is a different type from the alias, so this returns `None`
+/// rather than that return type.
+pub fn cpp_alias_declaration_target_text(declaration: &str) -> Option<String> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(declaration, None)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        let type_node = match node.kind() {
+            "type_definition" => {
+                let mut cursor = node.walk();
+                if node
+                    .children_by_field_name("declarator", &mut cursor)
+                    .any(declarator_names_function_type)
+                {
+                    return None;
+                }
+                node.child_by_field_name("type")?
+            }
+            "alias_declaration" => {
+                let type_node = node.child_by_field_name("type")?;
+                if type_node
+                    .child_by_field_name("declarator")
+                    .is_some_and(declarator_names_function_type)
+                {
+                    return None;
+                }
+                type_node
+            }
+            _ => {
+                let mut cursor = node.walk();
+                let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                stack.extend(children.into_iter().rev());
+                continue;
+            }
+        };
+        return Some(node_text(type_node, declaration).to_string());
+    }
+    None
+}
+
+/// True when an alias declarator names a function type.
+///
+/// The declarator chain is walked through the `declarator` field, so the
+/// parameter list -- a sibling field -- is never entered and a parameter's own
+/// function declarator cannot be mistaken for the alias's.
+fn declarator_names_function_type(declarator: Node<'_>) -> bool {
+    let mut current = Some(declarator);
+    while let Some(node) = current {
+        match node.kind() {
+            "function_declarator" | "abstract_function_declarator" => return true,
+            "parenthesized_declarator" | "abstract_parenthesized_declarator" => {
+                current = node.named_child(0);
+            }
+            _ => current = node.child_by_field_name("declarator"),
+        }
+    }
+    false
+}
+
 fn decode_structured_alias_target(
     analyzer: &CppGraphSource<'_>,
     unit: &CodeUnit,
@@ -6973,13 +7521,16 @@ fn decode_structured_alias_target_source(
                     continue;
                 }
                 let mut declarator_cursor = node.walk();
-                let declares_unit = node
+                let declarator = node
                     .children_by_field_name("declarator", &mut declarator_cursor)
-                    .any(|declarator| {
-                        extract_typedef_declarator_name(declarator, declaration)
+                    .find(|declarator| {
+                        extract_typedef_declarator_name(*declarator, declaration)
                             .is_some_and(|name| name == unit.identifier())
-                    });
-                declares_unit.then(|| node.child_by_field_name("type"))??
+                    })?;
+                if declarator_names_function_type(declarator) {
+                    return None;
+                }
+                node.child_by_field_name("type")?
             }
             "alias_declaration" => {
                 if require_top_level
@@ -6992,8 +7543,17 @@ fn decode_structured_alias_target_source(
                     continue;
                 }
                 let name = node.child_by_field_name("name")?;
-                (node_text(name, declaration) == unit.identifier())
-                    .then(|| node.child_by_field_name("type"))??
+                if node_text(name, declaration) != unit.identifier() {
+                    return None;
+                }
+                let type_node = node.child_by_field_name("type")?;
+                if type_node
+                    .child_by_field_name("declarator")
+                    .is_some_and(declarator_names_function_type)
+                {
+                    return None;
+                }
+                type_node
             }
             _ => {
                 let mut cursor = node.walk();
@@ -7509,6 +8069,7 @@ pub fn is_declarator_node(node: Node<'_>) -> bool {
 pub enum RecoveredDeclaratorTypeContext {
     Declaration,
     FunctionDefinition,
+    Parameter,
 }
 
 /// Recognize a real type displaced into a qualified declarator by parser
@@ -7516,8 +8077,10 @@ pub enum RecoveredDeclaratorTypeContext {
 ///
 /// Tree-sitter parses `API Result *make(Arg);` as if `API` were the declared
 /// type and `Result` were the scope of a qualified declarator with a missing
-/// `::`. The same recovery occurs for macro-prefixed definitions and extern
-/// variables. Keep this intentionally structural: the recovered scope must
+/// `::`. The same recovery occurs for macro-prefixed definitions, extern
+/// variables, and macro-decorated parameters (`f(MACRO T* p)`, where the
+/// parameter's own `type` field takes the macro). Keep this intentionally
+/// structural: the recovered scope must
 /// have the grammar's missing separator, the qualified node must occupy the
 /// declaration's declarator chain, a separate nonempty type must occupy the
 /// normal type field, and the recovered name must unwrap to a real declarator
@@ -7582,6 +8145,18 @@ fn recovered_declarator_container(
             && has_field_child(parent, "declarator", declarator)
         {
             return Some((parent, RecoveredDeclaratorTypeContext::FunctionDefinition));
+        }
+        // `f(MACRO T* p)` recovers exactly like `MACRO T *make(...)` does, one
+        // level down: the parameter's `type` field takes the macro token and
+        // the real type `T` becomes the recovered scope of the declarator.
+        // Declining here left every xxhash `XXH_NOESCAPE` parameter with no
+        // candidate at all (#1830).
+        if matches!(
+            parent.kind(),
+            "parameter_declaration" | "optional_parameter_declaration"
+        ) && has_field_child(parent, "declarator", declarator)
+        {
+            return Some((parent, RecoveredDeclaratorTypeContext::Parameter));
         }
         if !matches!(
             parent.kind(),
@@ -8071,14 +8646,24 @@ pub fn qualified_owner_components<'tree>(
 /// Return the terminal type-name occurrence in an out-of-line destructor
 /// declarator such as `endpoint::~endpoint`.  Unlike an ordinary terminal
 /// method name, this identifier is a second reference to the owner type.
+///
+/// Every extra qualifier nests another `qualified_identifier` in the `name`
+/// field, so `zmq::pair_t::~pair_t` reaches the destructor only two levels
+/// down. Reading one level dropped the terminal occurrence for every
+/// file-scope out-of-line member libzmq writes (#1831).
 pub fn out_of_line_destructor_type_reference(node: Node<'_>) -> Option<Node<'_>> {
     if node.kind() != "qualified_identifier" {
         return None;
     }
-    let destructor = node.child_by_field_name("name")?;
-    if destructor.kind() != "destructor_name" {
-        return None;
-    }
+    let mut qualified = node;
+    let destructor = loop {
+        let name = qualified.child_by_field_name("name")?;
+        match name.kind() {
+            "qualified_identifier" => qualified = name,
+            "destructor_name" => break name,
+            _ => return None,
+        }
+    };
     (0..destructor.named_child_count())
         .filter_map(|index| destructor.named_child(index))
         .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))

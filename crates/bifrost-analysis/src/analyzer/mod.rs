@@ -84,11 +84,13 @@ pub use config::{
     JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig, JvmAnalyzerConfig,
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
-    JvmStandardLibraryDiscoveryConfig, PythonAnalyzerConfig, PythonEnvironmentConfig,
-    PythonEnvironmentLimits, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
-    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
+    JvmStandardLibraryDiscoveryConfig, PhpAnalyzerConfig, PhpDependencyApiEvidence,
+    PythonAnalyzerConfig, PythonEnvironmentConfig, PythonEnvironmentLimits, RubyAnalyzerConfig,
+    RubyDependencyApiEvidence, RubyGemApiArtifact, RustAnalyzerConfig, RustDependencyApiEvidence,
+    RustPackageApiArtifact, RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
+pub use cpp::cpp_is_constructor_or_destructor_declarator_name;
 pub(crate) use cpp::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
     cpp_callable_definitions_share_identity_evidence, cpp_header_body_files_are_related,
@@ -165,6 +167,7 @@ pub use php::{
     PhpAnalyzer, PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
+pub use php::{PhpDependencyPackAdapter, resolve_php_semantic_pack_dependencies};
 pub(crate) use pool_memo::PoolSafeMemo;
 pub use project::{
     BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,

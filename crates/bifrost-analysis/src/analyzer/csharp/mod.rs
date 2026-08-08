@@ -11,6 +11,7 @@ mod adapter;
 mod cache;
 mod clones;
 mod dependency_discovery;
+pub(crate) mod diagnostics;
 pub mod external;
 mod hierarchy_provider;
 mod imports;
@@ -211,7 +212,14 @@ impl CSharpAnalyzer {
     }
 
     pub(crate) fn workspace_namespace_exists(&self, namespace: &str) -> bool {
-        self.inner.persisted_package_exists(namespace)
+        if let Some(known) = self.memo_caches.namespace_exists.get(namespace) {
+            return known;
+        }
+        let exists = self.inner.persisted_package_exists(namespace);
+        self.memo_caches
+            .namespace_exists
+            .insert(namespace.to_string(), exists);
+        exists
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
@@ -253,6 +261,17 @@ impl CSharpAnalyzer {
                 self.inner.project(),
             )
         })
+    }
+
+    /// The assembly declaration index *if an earlier pass already built it*.
+    ///
+    /// [`Self::external_declaration_index`] builds on first access, which walks
+    /// the project for `project.assets.json` and decodes assembly metadata.
+    /// #1615 forbids that work inside a diagnostic request, so the proof-gated
+    /// ladder peeks here instead and treats an unbuilt index as an unknown
+    /// boundary rather than a reason to go and build one.
+    pub(crate) fn retained_external_index(&self) -> Option<&CSharpExternalDeclarationIndex> {
+        self.external_index.get()
     }
 
     pub fn external_type_candidates(
@@ -858,6 +877,31 @@ impl CodeUnitIndex for CSharpAnalyzer {
 impl IAnalyzer for CSharpAnalyzer {
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
+    }
+
+    /// Build the assembly-backed external declaration index off the request
+    /// path.
+    ///
+    /// #1615 forbids a diagnostic request from reading assemblies or
+    /// `project.assets.json`, so the proof-gated ladder peeks at this cell
+    /// through [`Self::retained_external_index`] and calls an unbuilt one an
+    /// unknown boundary. This is the hook that fills it: `IndexWarmer` runs it
+    /// on a background thread for the generation, and the once-lock makes it
+    /// idempotent.
+    fn warm_query_indexes(&self) {
+        self.external_declaration_index();
+    }
+
+    fn query_indexes_warm(&self) -> bool {
+        self.external_index.get().is_some()
+    }
+
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        diagnostics::collect_csharp_semantic_diagnostics(self, file, source)
     }
 
     #[cfg(any(test, feature = "test-support"))]

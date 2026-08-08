@@ -100,6 +100,566 @@ fn census_seed_stays_silent_without_a_same_file_declaration() {
     );
 }
 
+fn js_census_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::JavaScript);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "js".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline JavaScript census differential")
+}
+
+/// A Flow-typed `.js` file parsed with the plain JavaScript grammar loses its
+/// whole class declaration to tree-sitter error recovery. The census must grade
+/// nothing from that region (#1784): the Flow class-property declaration name
+/// `registries` resolves by bare name through the import binder to another
+/// module's export, which the differential would otherwise report as a missing
+/// reference. The intact part of the same file stays audited.
+#[test]
+fn census_seed_grades_nothing_from_a_misparsed_region() {
+    let install = concat!(
+        "import {registries} from './registries.js';\n",
+        "export default class Install {\n",
+        "  registries: Array<RegistryNames>;\n",
+        "  run(opts: {bailout: boolean}) {\n",
+        "    return registries(opts);\n",
+        "  }\n",
+        "}\n",
+    );
+    let census = js_census_differential(&[
+        ("src/registries.js", "export function registries() {}\n"),
+        ("src/install.js", install),
+    ]);
+
+    let misparsed_region = install
+        .find("export default")
+        .expect("start of the recovered region");
+    let graded: Vec<_> = census
+        .sites
+        .iter()
+        .filter(|site| site.path.ends_with("install.js") && site.start_byte >= misparsed_region)
+        .map(|site| (&site.text, site.start_byte, site.classification))
+        .collect();
+    assert!(
+        graded.is_empty(),
+        "no site may be graded from the ERROR region: {graded:#?}"
+    );
+
+    assert!(
+        census.summary.structured_candidates > 0,
+        "the census must still audit the file: {:#?}",
+        census.summary
+    );
+}
+
+/// A prototype/object-literal member is reachable only through a receiver, so
+/// it is not evidence that a BARE call of the same name could have bound to it
+/// (#1783). The angular.js witness: `src/ng/parse.js` declares
+/// `Lexer.prototype.isNumber` and calls a bare `isNumber(value)` that resolves
+/// to a different module's export; the census graded the unresolved bare call
+/// tier 1 purely because the terminal segment of the member's fq name matched.
+/// The bare name is not lexically bound in the file, so the site is
+/// exploration-grade (tier 3), not an actionable forward gap.
+///
+/// The positive face of this contract -- a bare call that IS lexically bound in
+/// the file yet forward cannot resolve -- has no honest inline witness after
+/// #1782 taught the resolver `var` hoisting: every in-file lexical binder the
+/// census can see is now one the forward resolver also follows, so the shape
+/// would have to be a fresh forward bug. It is pinned instead by the direct
+/// unit test on the bindability answer in
+/// `bifrost-analysis/src/analyzer/reference_candidates.rs`.
+#[test]
+fn census_bare_call_is_not_graded_from_a_member_it_cannot_bind() {
+    let parse = concat!(
+        "function Lexer() {}\n",
+        "Lexer.prototype = {\n",
+        "  isNumber: function(ch) {\n",
+        "    return ch >= '0' && ch <= '9';\n",
+        "  },\n",
+        "};\n",
+        "function parseValue(value) {\n",
+        "  return isNumber(value);\n",
+        "}\n",
+    );
+    let census = js_census_differential(&[("src/parse.js", parse)]);
+
+    let bare_call_start = parse.find("isNumber(value)").expect("bare call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == bare_call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(3),
+        "a member the bare name cannot bind is not same-file evidence: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Inconclusive,
+        "an unbindable member must not produce a missing finding: {site:#?}"
+    );
+}
+
+fn java_census_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Java);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "java".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline Java census differential")
+}
+
+/// The control for #1783: a Java bare call reaches an enclosing-class method
+/// through implicit `this`, so an OWNED same-file member is legitimate evidence
+/// there and must keep grading exactly as before -- the JS bindability answer
+/// must not become a blanket owner filter. The witness is a bare `helper()`
+/// inside a nested class, which the forward resolver misses while
+/// `Inner.helper` is indexed in the same file. It grades tier 2 rather than
+/// tier 1 because `census_site_role` reads a bare-call callee from a
+/// `function`/`callee` field, which Java's `method_invocation` spells as
+/// `name`; that is a separate grading gap and this test pins today's answer.
+#[test]
+fn census_java_bare_call_keeps_owned_member_evidence() {
+    let source = concat!(
+        "class Inner {\n",
+        "  void helper() {}\n",
+        "  class Nested {\n",
+        "    void go() { helper(); }\n",
+        "  }\n",
+        "}\n",
+    );
+    let census = java_census_differential(&[("Inner.java", source)]);
+
+    let call_start = source.find("helper();").expect("bare call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(2),
+        "an owned same-class method stays same-file evidence in Java: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Missing,
+        "Java grading must not change: {site:#?}"
+    );
+}
+
+fn cpp_census_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Cpp);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "cpp".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline C++ census differential")
+}
+
+/// A constructor or destructor declarator is a declaration occurrence, so the
+/// census must not seed it (#1834). The log4cxx/brpc/abseil witnesses all sit in
+/// a class body the parse never recovered as one: an export macro between
+/// `class` and the class name turns the class into a `function_definition` whose
+/// body is a `compound_statement`, and every constructor declaration inside it
+/// into a call of the class's own name. Graded, each became a tier-1 forward gap
+/// against its own class -- while the same site is `inconclusive` under the
+/// index seed, which never proposes it.
+///
+/// The exclusion is confined to the declarators: the recovered body is still
+/// audited, and a real call inside a method body there stays a probe.
+#[test]
+fn census_seed_skips_a_constructor_declarator_the_parse_read_as_a_call() {
+    let properties = concat!(
+        "namespace helpers {\n",
+        "\n",
+        "class SAMPLE_EXPORT Properties {\n",
+        "\tpublic:\n",
+        "\t\tProperties();\n",
+        "\t\tProperties(const Properties&&) = delete;\n",
+        "\t\tint size() const;\n",
+        "\t\tint total() { return size(); }\n",
+        "};\n",
+        "\n",
+        "}\n",
+    );
+    let census = cpp_census_differential(&[("include/properties.h", properties)]);
+
+    for (label, declarator) in [
+        (
+            "default constructor",
+            properties.find("Properties();").expect("default ctor"),
+        ),
+        (
+            "deleted move constructor",
+            properties
+                .find("Properties(const Properties&&)")
+                .expect("deleted move ctor"),
+        ),
+    ] {
+        let seeded: Vec<_> = census
+            .sites
+            .iter()
+            .filter(|site| site.start_byte == declarator)
+            .map(|site| (&site.text, site.tier, site.classification, &site.note))
+            .collect();
+        assert!(
+            seeded.is_empty(),
+            "the {label} declarator at byte {declarator} must not be seeded: {seeded:#?}"
+        );
+    }
+
+    // The parameter type is a genuine reference to the class, and so is the
+    // `size()` call in the method body the recovery left intact.
+    let parameter_type = properties
+        .find("const Properties&&")
+        .expect("parameter type reference")
+        + "const ".len();
+    let member_call = properties.find("return size();").expect("member call") + "return ".len();
+    for kept in [parameter_type, member_call] {
+        assert!(
+            census.sites.iter().any(|site| site.start_byte == kept),
+            "the recovered class body stays audited at byte {kept}: {:#?}",
+            census
+                .sites
+                .iter()
+                .map(|site| (&site.text, site.start_byte))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Constructor CALL sites are references and keep their probes: `new Foo(...)`,
+/// the direct-initialization `Foo value(...)` and the base-class member
+/// initializer are all genuine occurrences of the type name. Only the
+/// declarators -- here the out-of-line `Store::Store` definition name and the
+/// destructor name -- leave the seed.
+#[test]
+fn census_seed_keeps_constructor_call_sites_it_excludes_declarators_from() {
+    let header = concat!(
+        "struct Base {\n",
+        "  Base(int seed);\n",
+        "};\n",
+        "\n",
+        "struct Store : Base {\n",
+        "  Store(int seed);\n",
+        "  ~Store();\n",
+        "  int value_;\n",
+        "};\n",
+    );
+    let body = concat!(
+        "#include \"store.h\"\n",
+        "\n",
+        "Store::Store(int seed) : Base(seed), value_(seed) {}\n",
+        "\n",
+        "Store::~Store() {}\n",
+        "\n",
+        "Store* make(int seed) {\n",
+        "  Store direct(seed);\n",
+        "  return new Store(seed);\n",
+        "}\n",
+    );
+    let census = cpp_census_differential(&[("store.h", header), ("store.cpp", body)]);
+
+    let sites: Vec<usize> = census
+        .sites
+        .iter()
+        .filter(|site| site.path.ends_with("store.cpp"))
+        .map(|site| site.start_byte)
+        .collect();
+    let definition_name =
+        body.find("Store::Store").expect("out-of-line definition") + "Store::".len();
+    let destructor_name =
+        body.find("Store::~Store").expect("out-of-line destructor") + "Store::~".len();
+    for excluded in [definition_name, destructor_name] {
+        assert!(
+            !sites.contains(&excluded),
+            "an out-of-line declarator name at byte {excluded} must not be seeded: {sites:?}"
+        );
+    }
+
+    let owner_scope = body.find("Store::Store").expect("definition owner scope");
+    let base_initializer = body.find(": Base(seed)").expect("base initializer") + ": ".len();
+    let direct_initialization = body.find("Store direct").expect("direct initialization");
+    let new_expression = body.find("new Store(seed)").expect("new expression") + "new ".len();
+    for kept in [
+        owner_scope,
+        base_initializer,
+        direct_initialization,
+        new_expression,
+    ] {
+        assert!(
+            sites.contains(&kept),
+            "a constructor call or owner reference at byte {kept} must stay seeded: {sites:?}"
+        );
+    }
+}
+
+fn scala_census_differential(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Scala);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "scala".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline Scala census differential")
+}
+
+/// A Scala `type` member lives in the type namespace, so a BARE CALL can never
+/// bind to it (#1858). The zio-http witness: `HttpCodec.scala` declares
+/// `type Left = A1` and `type Left = A` as abstract type members of two
+/// unrelated traits, and the file calls the auto-imported `scala.Left`
+/// constructor 127 times; the Scala arm of the bindability policy answered an
+/// unconditional `true`, so every one of those calls was graded an actionable
+/// tier-1 forward gap against a type alias it cannot reach.
+#[test]
+fn census_scala_bare_call_is_not_graded_from_a_type_alias() {
+    let source = concat!(
+        "package fx\n",
+        "\n",
+        "trait Combine[A1] {\n",
+        "  type Left = A1\n",
+        "}\n",
+        "\n",
+        "object Codec {\n",
+        "  def encode(value: Int): Any = Left(value)\n",
+        "}\n",
+    );
+    let census = scala_census_differential(&[("src/main/scala/fx/Codec.scala", source)]);
+
+    let call_start = source.find("Left(value)").expect("bare call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(3),
+        "a type-namespace declaration is not bare-call evidence: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Inconclusive,
+        "a type alias must not produce a missing finding: {site:#?}"
+    );
+}
+
+/// A member of an unrelated same-file class is not bare-call evidence either
+/// (#1858): a bare name cannot reach a field of a class that does not enclose
+/// the site. The twitter/util witness is `private final class Oneshot[A](var
+/// more: ...)` 550 lines away from the `more()` it supplied the "same-file
+/// declaration" for.
+#[test]
+fn census_scala_bare_call_is_not_graded_from_an_unrelated_class_field() {
+    let source = concat!(
+        "package fx\n",
+        "\n",
+        "final class Oneshot[A](var more: () => Int)\n",
+        "\n",
+        "object Stream {\n",
+        "  def run(): Int = more()\n",
+        "}\n",
+    );
+    let census = scala_census_differential(&[("src/main/scala/fx/Stream.scala", source)]);
+
+    let call_start = source.find("more()").expect("bare call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(3),
+        "a member of a class that does not enclose the site is not evidence: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Inconclusive,
+        "an unreachable class member must not produce a missing finding: {site:#?}"
+    );
+}
+
+/// A `local_variable_reference` is an ADJUDICATED forward answer -- the
+/// resolver proved a local binder shadows the name, and Scala locals are
+/// deliberately not CodeUnits -- so the census must not grade it as a gap at
+/// all (#1858, the 366ece87 boundary precedent). The twitter/util witness:
+/// `case Cons(fa, more) => more()` binds the pattern binder, while the file's
+/// unrelated `class Oneshot[A](var more: ...)` supplied the same-file name that
+/// made it a tier-1 finding. 32 of the 35 such scala-census sites were answers
+/// like this one, not gaps.
+#[test]
+fn census_scala_adjudicated_local_binder_is_not_graded_as_a_gap() {
+    let source = concat!(
+        "package fx\n",
+        "\n",
+        "final class Oneshot[A](var more: () => Int)\n",
+        "\n",
+        "object Stream {\n",
+        "  def run(value: Any): Int = value match {\n",
+        "    case Cons(fa, more) => more()\n",
+        "    case _ => 0\n",
+        "  }\n",
+        "}\n",
+    );
+    let census = scala_census_differential(&[("src/main/scala/fx/Stream.scala", source)]);
+
+    let call_start = source.find("more()").expect("pattern-binder call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert!(
+        site.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind == "local_variable_reference"),
+        "witness requires the adjudicated local answer: {site:#?}"
+    );
+    assert_eq!(
+        site.tier, None,
+        "an adjudicated forward answer is never graded a census gap: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Inconclusive,
+        "an adjudicated local binder must not produce a missing finding: {site:#?}"
+    );
+}
+
+/// The keep side of the same contract: a bare call in an implicit-receiver
+/// language still reaches a same-file member the site's own template inherits
+/// or self-types to, so the Scala bindability answer must not degrade into a
+/// strict own-template containment test. The sangria witness (`QueryParser`'s
+/// `trait Tokens` members reached through `this: Parser with Tokens =>`) is a
+/// real forward gap the census must keep grading tier 1.
+#[test]
+fn census_scala_bare_call_keeps_self_type_member_evidence() {
+    let source = concat!(
+        "package fx\n",
+        "\n",
+        "trait Tokens {\n",
+        "  protected def ws(c: Char): Boolean = c == ' '\n",
+        "}\n",
+        "\n",
+        "trait Rules {\n",
+        "  this: Tokens =>\n",
+        "  def rule(c: Char): Boolean = ws(c)\n",
+        "}\n",
+    );
+    let census = scala_census_differential(&[("src/main/scala/fx/Rules.scala", source)]);
+
+    let call_start = source.find("ws(c)").expect("self-type member call site");
+    let site = census
+        .sites
+        .iter()
+        .find(|site| site.start_byte == call_start)
+        .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
+    assert_eq!(
+        site.forward_status, "no_definition",
+        "witness requires a forward-unresolvable bare call: {site:#?}"
+    );
+    assert_eq!(
+        site.tier,
+        Some(1),
+        "a self-type member stays actionable same-file evidence: {site:#?}"
+    );
+    assert_eq!(
+        site.classification,
+        ReferenceClassification::Missing,
+        "the self-type forward gap must keep its finding: {site:#?}"
+    );
+}
+
 fn rust_differential(
     files: &[(&str, &str)],
 ) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {

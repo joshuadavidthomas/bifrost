@@ -1,8 +1,8 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{
-    ReferenceCandidateRanges, census_identifier_ranges, reference_candidate_ranges,
-    reference_candidate_requires_point_lookup,
+    CensusBareNameBindings, ReferenceCandidateRanges, census_identifier_ranges,
+    reference_candidate_ranges, reference_candidate_requires_point_lookup,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
@@ -10,13 +10,14 @@ use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
 use crate::analyzer::usages::cpp_graph::cpp_type_owner_for_test;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND,
-    resolve_definition_batch_with_source,
+    is_adjudicated_answer_diagnostic_kind, resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
 };
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range, rust_is_field_declaration_name,
+    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range,
+    cpp_is_constructor_or_destructor_declarator_name, rust_is_field_declaration_name,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -674,6 +675,30 @@ fn collect_sampled_sites(
                     .descendant_for_byte_range(range.start_byte, range.end_byte)
                     .is_some_and(|node| {
                         rust_is_field_declaration_name(node, range.start_byte, range.end_byte)
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            // A constructor or destructor declarator is a declaration occurrence,
+            // never a reference (#1834). The indexed-name filter above misses two
+            // of them: the identifier inside a `~Foo` destructor name, whose
+            // indexed range covers the tilde too, and any declarator the parse
+            // recovered as something other than a declaration -- a macro between
+            // `class` and the class name turns the whole class body into a
+            // function body, and every constructor declaration in it into a call.
+            // Graded, they became tier-1 forward gaps against their own class.
+            if language == Language::Cpp
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && cpp_is_constructor_or_destructor_declarator_name(
+                                node,
+                                context.content(),
+                            )
                     })
             {
                 summary.declaration_sites_excluded =
@@ -1368,19 +1393,107 @@ fn census_site_role(
     CensusSiteRole::Other
 }
 
+/// Whether a same-file declaration named `name` is evidence that the BARE call
+/// at `byte` could have bound to it.
+///
+/// Same-file evidence is collected by terminal identifier, so it matches
+/// declarations a bare name can never reach (#1783): a JavaScript
+/// `Lexer.prototype.isNumber` member answered for a bare `isNumber(value)` that
+/// only a receiver could reach, promoting an exploration-grade site to an
+/// actionable tier-1 gap. Whether a bare call reaches an owned member is a
+/// per-language question, so each language answers it explicitly rather than
+/// through one blanket owner test.
+fn bare_call_reaches_same_file_declaration(
+    language: Language,
+    bindings: Option<&CensusBareNameBindings>,
+    name: &str,
+    byte: usize,
+) -> bool {
+    match language {
+        // JavaScript and TypeScript bind a bare name lexically, and nothing
+        // else: object-literal, prototype and class members need a receiver.
+        // The lexical index the forward resolver binds with answers the site
+        // directly, so the census grades against the same notion of scope --
+        // including the local and nested binders an owner test cannot see. The
+        // index models value binders (imports, `var`/`let`/`const`, functions,
+        // classes, parameters, catch clauses); a TypeScript-only binder it does
+        // not model yet, such as an ambient `declare function`, grades its bare
+        // call one tier lower rather than reporting a gap the site cannot show.
+        Language::JavaScript | Language::TypeScript => bindings
+            .expect("a JS/TS census site with a parsed tree carries a bare-name binding index")
+            .is_bound_at(name, byte),
+        // Scala is an implicit-receiver language whose scope is nonetheless
+        // decidable from the parse tree, so it answers with the declarations
+        // actually visible at the site (#1858): the members of the templates
+        // enclosing it, of their same-file supertypes and self-types, and of a
+        // same-file object one of them imports. The two answers a name set
+        // cannot give are the reason: a `type Left = A1` member lives in the
+        // type namespace, which no application expression reaches, and
+        // `class Oneshot(var more: ...)` owns `more` only inside `Oneshot`.
+        Language::Scala => bindings
+            .expect("a Scala census site with a parsed tree carries a bare-name binding index")
+            .is_bound_at(name, byte),
+        // Implicit-receiver languages: a bare call legitimately reaches a
+        // member of the enclosing type, so an owned same-file declaration is
+        // real evidence. Java, C# and Kotlin reach the enclosing class through
+        // implicit `this` (plus inherited and statically imported members);
+        // Ruby and PHP reach it through implicit `self`/`$this`.
+        Language::Java | Language::CSharp | Language::Kotlin | Language::Ruby | Language::Php => {
+            true
+        }
+        // No lexical-binding index yet, and no cheap sound approximation. An
+        // owner test would be wrong here for two independent reasons: these
+        // analyzers qualify module-scope declarations with the module or
+        // package (Python `src.mod.outer` owns `mod`), so almost nothing is
+        // owner-free, and a bare call still reaches local, nested and imported
+        // binders the declaration index does not spell as owner-free. Keeping
+        // the name-set answer preserves today's recall; the fix for these
+        // languages is a lexical index of their own, not a coarser filter.
+        Language::Python | Language::Rust | Language::Go | Language::Cpp | Language::None => true,
+    }
+}
+
+/// Whether a census site is the joint-blindness residue the tier classifier
+/// grades, or an answer the forward resolver already gave.
+///
+/// Only a site forward could not answer is a candidate gap. A resolved site
+/// flowed through the inverse comparison; an ADJUDICATED site was answered too,
+/// just negatively: the resolver named what the site is and why no indexed
+/// declaration is the target. Grading an adjudicated answer manufactures a gap
+/// nothing can close, and the same-file name it grades against is the artifact:
+/// IBM CRAIG's `const { snakeCase } = require("lazy-z")` binder doubled as the
+/// "same-file declaration" behind 203 tier-1 boundary gaps (366ece87), and
+/// twitter/util's `class Oneshot(var more: ...)` doubled as the one behind a
+/// `case Cons(fa, more) => more()` pattern binder the resolver had already
+/// proven local (#1858).
+fn census_gap_is_gradable(record: &ReferenceDifferentialSite) -> bool {
+    record.forward_status != DefinitionLookupStatus::Resolved.as_str()
+        && record.forward_status != DefinitionLookupStatus::UnresolvableImportBoundary.as_str()
+        && !record
+            .diagnostics
+            .iter()
+            .any(|diagnostic| is_adjudicated_answer_diagnostic_kind(&diagnostic.kind))
+}
+
 /// Grade forward-unresolvable census sites into deterministic evidence tiers.
 ///
 /// A census site that forward RESOLVES already flowed through the inverse
 /// comparison (a forward-adjudicated finding or consistent), so it keeps
-/// `tier == None`. This pass grades only the sites forward could not resolve --
-/// the joint-blindness residue:
+/// `tier == None`, and so does every other site forward already answered --
+/// [`census_gap_is_gradable`] decides. This pass grades only what is left, the
+/// joint-blindness residue:
 ///
 /// - tier 1: a `self`/`this`-receiver member call or a bare call of name N,
-///   whose declaration exists in the same file. Forward found nothing yet the
-///   declaration is indexed in the same file -- a high-precision forward gap.
+///   whose declaration exists in the same file AND is reachable from the site.
+///   Forward found nothing yet the declaration is indexed in the same file -- a
+///   high-precision forward gap.
 /// - tier 2: some same-file declaration of N exists, but the occurrence is a
 ///   weaker reference role (member access on another receiver, value/type use).
-/// - tier 3: no same-file declaration of N; exploration-grade.
+/// - tier 3: no same-file declaration of N reaches the site; exploration-grade.
+///
+/// Reachability is what [`bare_call_reaches_same_file_declaration`] decides: a
+/// same-file name match is not by itself evidence that a BARE call could have
+/// bound to that declaration (#1783).
 ///
 /// A selected tier-1/2 site becomes `Missing` (actionable). Tier 3 (and any
 /// unselected tier) stays `Inconclusive`. The site's `tier` is always recorded.
@@ -1392,14 +1505,7 @@ fn classify_census_gaps(
     use std::collections::BTreeMap;
     let mut by_path: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
-        // An import boundary is an adjudicated forward answer - the name
-        // resolves to a dependency outside the indexed workspace - not joint
-        // blindness. Grading it as a gap buried real findings under hundreds
-        // of external-package uses whose require/import binder doubles as the
-        // "same-file declaration" (IBM CRAIG's lazy-z destructured requires).
-        if record.forward_status != "resolved"
-            && record.forward_status != "unresolvable_import_boundary"
-        {
+        if census_gap_is_gradable(record) {
             by_path.entry(record.path.clone()).or_default().push(index);
         }
     }
@@ -1422,20 +1528,29 @@ fn classify_census_gaps(
         let context = DeclarationNameRangeContext::new(&file, source);
         let root = context.root_node();
         let content = context.content();
+        let language = language_for_file(&file);
+        let bindings = root.and_then(|root| CensusBareNameBindings::build(root, content, language));
         for index in indexes {
             let record = &mut records[index];
             let name = record.text.clone();
-            let has_same_file_decl = same_file_names.contains(&name);
             let role = root
                 .map(|root| census_site_role(root, content, record.start_byte, record.end_byte))
                 .unwrap_or(CensusSiteRole::Other);
-            let tier = if has_same_file_decl
+            let same_file_evidence = same_file_names.contains(&name)
+                && (role != CensusSiteRole::BareCall
+                    || bare_call_reaches_same_file_declaration(
+                        language,
+                        bindings.as_ref(),
+                        &name,
+                        record.start_byte,
+                    ));
+            let tier = if same_file_evidence
                 && matches!(
                     role,
                     CensusSiteRole::SelfMemberCall | CensusSiteRole::BareCall
                 ) {
                 1
-            } else if has_same_file_decl {
+            } else if same_file_evidence {
                 2
             } else {
                 3

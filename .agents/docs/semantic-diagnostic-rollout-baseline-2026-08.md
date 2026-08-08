@@ -1,0 +1,289 @@
+# Semantic diagnostic rollout baseline, August 2026 (#1628)
+
+This is the measured baseline before any decision about default enablement. It
+is evidence, not a gate. No latency threshold exists yet: #1628 reserves that
+for team review of these numbers.
+
+Unrecognized-symbol diagnostics stay opt-in. Nothing in this document changes a
+default.
+
+The campaign procedure for real projects is
+`.agents/docs/semantic-diagnostic-rollout-runbook.md`. This document is the
+offline in-repo floor that campaign starts from.
+
+## What produced these numbers
+
+Command, once per fixture:
+
+    cargo build --features release-tooling --bin bifrost_benchmark
+    ./target/debug/bifrost_benchmark rollout \
+        --fixture-id tests/fixtures/<fixture> \
+        --fixture-root tests/fixtures/<fixture> \
+        --configuration-id default-analyzer-config
+
+The harness is `src/benchmark/semantic_diagnostic_rollout_harness.rs`. It
+performs what an LSP session performs:
+
+1. Build the analyzer over the fixture.
+2. Select the ecosystems whose languages the workspace analyzes, by the same
+   rule the LSP host uses.
+3. Activate dependency packs once against a fresh ephemeral catalog. This is
+   the cold activation sample.
+4. Run one diagnostic request per analyzable file. This is the cold series.
+5. Run the same requests again against the same published proof. This is the
+   warm series.
+6. Build a fresh analyzer generation, which starts with no published proof, and
+   re-activate it against the now-populated catalog. This is the warm
+   activation sample, and the per-file requests that follow it are the refresh
+   series.
+
+The artifact is then aggregated, validated against the #1712 schema, and
+rendered. A run that produced an invalid artifact would fail rather than
+report.
+
+## Pins
+
+- Bifrost revision: `325a4ea5f30926669839952db121c59b1222cf9a`, clean tree.
+- Fixture revision: the same commit. Every fixture is in-repo, so the commit
+  that contains the harness also pins the fixture content.
+- Configuration: `default-analyzer-config`, that is `AnalyzerConfig::default()`
+  with default `DependencyPackLimits` and default `SemanticModelRuntimeLimits`.
+  Each run's configuration SHA-256 also covers the selected ecosystems and the
+  measured file list, so a fixture that gains a file produces a different
+  configuration hash rather than a silently different comparison.
+- Active packs: none, on every fixture. Under `AnalyzerConfig::default()` no
+  fixture declares dependency evidence a resolver can turn into a pack, so
+  every run activates a complete but empty model set. That is the honest state
+  of an offline in-repo fixture, and it is why these activation numbers are a
+  floor rather than a full-cost measurement.
+- Host: Linux 5.15, debug build (`cargo build`, not `--release`). Debug numbers
+  overstate wall-clock latency relative to a shipped build. Treat them as
+  relative signals across fixtures, not as absolute product latency.
+- One run per fixture, no repetition, so there is no variance estimate.
+
+## Activation
+
+| Fixture | Ecosystem | Cold host ms | Warm host ms | Result | Max catalog SQL |
+|---|---|---:|---:|---|---:|
+| `testcode-py` | Python | 0.437 | 0.263 | ready | 0 |
+| `testcode-go` | Go | 0.551 | 0.272 | ready | 0 |
+| `testcode-java` | Jvm | 15.595 | 18.141 | ready | 0 |
+| `testcode-rs` | Cargo | 0.445 | 0.269 | ready | 0 |
+| `testcode-ts` | Npm | 0.555 | 0.335 | ready | 0 |
+| `testcode-ruby` | Ruby | 0.519 | 0.294 | ready | 0 |
+| `testcode-cs` | DotNet | 0.523 | 0.445 | ready | 0 |
+
+Every activation reached `ready`, so every run published proof and requested a
+diagnostic refresh.
+
+The JVM row is the only activation costing more than a millisecond, and it does
+not improve when warm. Its cost is the default-on metadata discovery walk plus
+the `$JAVA_HOME` standard-library probe, neither of which the catalog caches.
+Every other ecosystem is sub-millisecond because its resolver finds no evidence
+to read under default configuration.
+
+Activation runs on a background worker and never on a request path, so these
+numbers bound a background cost, not a user-visible one.
+
+## Diagnostics
+
+Per-file request latency in milliseconds. Cold is the first read of each file;
+warm re-reads the same files against the same published proof; refresh is the
+first read after a fresh generation re-activates.
+
+| Fixture | Files | Cold p50 | Cold p95 | Warm p50 | Warm p95 | Refresh p50 | Refresh p95 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `testcode-py` | 43 | 1.959 | 5.792 | 0.549 | 2.997 | 1.935 | 5.798 |
+| `testcode-go` | 7 | 0.475 | 19.848 | 0.195 | 1.576 | 0.497 | 18.385 |
+| `testcode-java` | 26 | 1.374 | 3.852 | 0.304 | 1.385 | 1.367 | 3.797 |
+| `testcode-rs` | 2 | 7.756 | 16.058 | 3.438 | 6.718 | 7.058 | 14.993 |
+| `testcode-ts` | 21 | 2.512 | 10.043 | 1.536 | 7.091 | 2.569 | 10.007 |
+| `testcode-ruby` | 17 | 0.625 | 5.628 | 0.400 | 1.347 | 0.620 | 5.277 |
+| `testcode-cs` | 6 | 4.137 | 543.734 | 2.414 | 540.098 | 6.580 | 542.398 |
+
+Every measured request issued zero catalog SQL statements, which is the
+invariant that keeps a diagnostic request read-only against the pack catalog.
+
+Read the percentiles with the sample count in view. Nearest-rank p95 over two
+to seven samples is the slowest single file, not a distribution.
+
+Three observations to carry into review:
+
+- Warm is consistently two to four times faster than cold, and refresh tracks
+  cold rather than warm. This is expected, and it is why cold and warm are
+  separate series: a new analyzer generation rebuilds the per-generation
+  structures the collectors read, so the first request after any workspace
+  update pays cold cost again. Refresh, not cold, is what an editing session
+  pays repeatedly.
+- `testcode-cs` has one file at roughly 540 ms that does not improve when warm.
+  It is the largest single latency in the baseline by two orders of magnitude,
+  and it is the first thing to profile before any default-enablement decision.
+  It is below the five-second threshold that `CLAUDE.md` makes an automatic
+  product-regression report, so no issue is filed here; it is recorded as the
+  named follow-up for review.
+- `testcode-go` cold p95 of about 19 ms against a p50 of 0.5 ms is one slow
+  file out of seven, not a broad cost.
+
+## Correctness signals
+
+| Fixture | Status | Errors per pass | Absent proofs | Suppressions |
+|---|---|---:|---:|---|
+| `testcode-py` | incomplete | 19 | 57 | `missing_dependency_discovery` 213 |
+| `testcode-go` | incomplete | 0 | 0 | `missing_dependency_discovery` 9 |
+| `testcode-java` | complete | 69 | 207 | none |
+| `testcode-rs` | incomplete | 0 | 0 | `missing_dependency_discovery` 15, `unsupported_generated_surface` 9 |
+| `testcode-ts` | incomplete | 390 | 1170 | `missing_dependency_discovery` 3 |
+| `testcode-ruby` | incomplete | 0 | 0 | `missing_dependency_discovery` 12, `unsupported_semantics` 3 |
+| `testcode-cs` | incomplete | 0 | 0 | `missing_dependency_discovery` 99, `unsupported_semantics` 15 |
+
+Counts are totals across the three phases, which measure the same files three
+times; per-pass error counts are given separately.
+
+`Status: incomplete` is not a failure. It means at least one outcome carried a
+typed suppression, which is the proof system working: a name the session cannot
+prove absent produces a suppression rather than an error.
+
+Emitted errors always equal the complete-absence proof count, which the
+artifact validator enforces. No run published an error without a proof.
+
+`testcode-ts` publishes 390 errors across 21 files and `testcode-java` publishes
+69 across 26. Those counts are large because these fixtures are deliberately
+full of unresolved references. They are the highest-value input to the
+zero-confirmed-false-positive review in the runbook, not a latency concern.
+
+## What this baseline does not establish
+
+- It does not measure a workspace with real dependency packs. Every fixture
+  activates an empty model set, so pack decode, hydration, and matcher
+  construction are all near zero here. A pinned real-project campaign is
+  required before enablement; the runbook describes it.
+- It does not measure a release build.
+- It does not set or propose a p95 threshold.
+- It carries no variance estimate.
+
+## Addendum, 2026-08-08: the `testcode-cs` outlier (#1806)
+
+The numbers above stay as they are. This section records the follow-up the
+`testcode-cs` row named, and re-measures that one fixture. Nothing else in this
+document changes.
+
+### Which file, and what it was doing
+
+The 540 ms file is `GetTerminationRecordByIdHandler.cs`: 34 lines, four `using`
+directives, and a six-segment namespace
+(`ConsumerCentricityPermission.Core.Business.Handlers.TerminationRecordHandlers.Queries`).
+It is not generated, not large, and has no deep supertype chain. It is the only
+file in the fixture with a realistic .NET namespace depth; every sibling sits in
+a namespace of zero to three segments.
+
+Section timing inside the collector put the whole cost in one place. Of 536 ms
+of tree walk, `visible_type_candidates` accounted for about 450 ms across 19
+calls and the local-binding seeder for the remaining 84 ms -- and the seeder
+resolves declared types through the same search. The retained assembly index was
+never built during the run, so no external path ran at all; the cost was
+entirely the workspace-side type search.
+
+That search costs one store query per candidate short name, per namespace it
+qualifies the name with. Three things multiplied:
+
+1. **The candidate spellings were exponential.** C# writes type nesting into a
+   `short_name` with `$`, so a dotted spelling could be stored several ways.
+   `csharp_nested_owner_short_name_candidates` enumerated *every* `.`/`$` mask,
+   `2^(n-1)` per candidate, so a seven-segment probe expanded to 127 spellings
+   and each became its own SQL query. Since `csharp_normalize_full_name` maps
+   `$` back to `.`, all of them normalize to one name: they were alternate
+   lookup keys for a single target, and the mixed ones -- a spelling that
+   returns to `$` after a `.` -- match nothing the analyzer can persist.
+2. **Every namespace was probed whether or not it existed.** The search
+   qualified each name with the file's namespace, each `using`, and each
+   ancestor namespace: eleven probes for this file. The workspace declares
+   nothing in nine of them.
+3. **Nothing was reused within a request.** The type-reference ladder, the
+   member-owner ladder, the enclosing-type lookup and the supertype walk each
+   ran the search independently, so `PermissionTerminationRecord` was searched
+   for five times and `BaseClass` in `ClassUsagePatterns.cs` ten times.
+
+Multiplied out, one `Guid` lookup in this file issued about 347 store queries
+and the file issued roughly 15,000 per request. Measured cost tracked predicted
+query count at about 35 microseconds per query across every identity, which is
+why the file did not improve when warm: nothing was being populated, the work
+was simply being redone.
+
+### What changed
+
+- `csharp_nested_owner_short_name_candidates` returns one spelling per
+  nesting-run length instead of one per separator mask. The result is a subset
+  of the old set at every length, so no lookup that could match was dropped.
+- The visible-type search skips a qualifying namespace the workspace declares
+  nothing in. The `using` case was already filtered on exactly that condition
+  after the fact; the file-namespace and ancestor cases are gated only for a
+  spelling with no separators of its own, where the qualifier is provably the
+  namespace a match would sit in. `CSharpAnalyzer::workspace_namespace_exists`
+  is memoized per generation so the gate is not itself a query per probe.
+- The C# diagnostic collector answers each spelling's search once per request.
+
+### Re-measured
+
+Same command, same fixture, same `default-analyzer-config`, debug build. The
+host was busy (load average 17-19), so before and after were built as two
+binaries and run alternately, three runs each, rather than compared against the
+pinned numbers above. Milliseconds, median of three:
+
+| File | Cold before | Cold after | Cold | Warm before | Warm after | Warm |
+|---|---:|---:|---:|---:|---:|---:|
+| `GetTerminationRecordByIdHandler.cs` | 540.3 | 51.3 | 10.5x | 538.3 | 47.2 | 11.4x |
+| `ClassUsagePatterns.cs` | 22.2 | 5.4 | 4.1x | 19.2 | 2.9 | 6.6x |
+| `AssetRegistrySA.cs` | 20.8 | 5.7 | 3.6x | 17.9 | 2.7 | 6.6x |
+| `MixedScope.cs` | 4.1 | 4.0 | 1.0x | 2.5 | 2.0 | 1.2x |
+| `A.cs` | 4.2 | 4.2 | 1.0x | 0.5 | 0.5 | 1.0x |
+| `NestedNamespaces.cs` | 1.6 | 1.6 | 1.0x | 0.4 | 0.4 | 1.0x |
+
+The outlier is 10.5x faster cold and 11.4x faster warm. It is no longer two
+orders of magnitude above its siblings; it is about ten times the fixture's next
+slowest file, and the fixture's other namespace-bearing files improved by three
+to seven times as a side effect. The two files that name no type at all are
+unchanged, as expected.
+
+Outcomes are identical. Every one of the eighteen samples in all six artifacts
+matches on status, emitted errors, proof classes and suppression classes; the
+fixture still publishes 51 resolved, 114 incomplete, 99
+`missing_dependency_discovery` and 15 `unsupported_semantics`, and zero errors.
+
+### What still costs 47 ms, and why it is not fixed here
+
+Under instrumentation -- which inflates the total, so read these as shares
+rather than absolute times -- the remainder splits roughly into four parts:
+
+- **A resolved fq name searched as if it were a written spelling (largest
+  share).** For a member access through a local, the binding seeder resolves the
+  declared type to a workspace fq name, and the collector then hands that fq
+  name back to the *relative* visible-name search. The search dutifully
+  qualifies an already-absolute name with the file namespace and each ancestor,
+  producing probes like `A.B.C.A.B.C.Type`, and only reaches the absolute
+  spelling last. Trying the absolute spelling first would change C#'s
+  relative-before-absolute lookup order, which is a proof-semantics change, so
+  the fix is to stop discarding what the seeder resolved rather than to reorder
+  the ladder. Not attempted here.
+- **A non-name expression's source text used as a type spelling.** The receiver
+  of `.ConfigureAwait(false)` is an `invocation_expression`;
+  `csharp_type_node_identity` falls back to raw node text, so the resolver is
+  asked to look up
+  `` `_terminationRecordDL.GetByIdAsync(request.TerminationRecordId, new Graph` ``.
+  This is the source-text-instead-of-AST pattern `CLAUDE.md` prohibits, and it
+  is a guaranteed miss. Fixing it changes the `detail` string of an
+  `UnsupportedSemantics` suppression -- not its class, and no diagnostic -- so
+  it was left out of a change whose gate was outcome equality.
+- **The binding seeder re-walks the file per member access.** `seed_bindings_before`
+  restarts at the file root for every identifier receiver and re-resolves every
+  binding's declared type, so cost grows with member accesses times bindings.
+  Two accesses here; a real C# file has many more. The collector's per-request
+  memo does not reach inside the seeder.
+- **The file-namespace probe itself.** A six-segment namespace still expands to
+  about 28 candidate short names for one simple type name. That is the true size
+  of the set of short names a C# declaration could be stored under, so cutting it
+  further needs a store lookup keyed on the fq name rather than on the short
+  name.
+
+The first three are collector-level defects with the same shape as the ones
+fixed here. The fourth is a store schema question. None is a reason to hold the
+measured improvement.

@@ -2,6 +2,7 @@ use crate::imports::{
     CommonJsRequireBindingKind, commonjs_require_module_specifier_from_declarator,
     parse_commonjs_require_bindings_from_node,
 };
+use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinding, ImportKind};
 use brokk_bifrost_core::analyzer::{Language, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -366,18 +367,23 @@ fn direct_object_pair_receiver<'tree>(
         return None;
     }
     let object = pair.parent().filter(|parent| parent.kind() == "object")?;
-    let declarator = object
-        .parent()
-        .filter(|parent| parent.kind() == "variable_declarator")?;
-    if declarator
-        .child_by_field_name("value")
-        .is_none_or(|value| value.id() != object.id())
-    {
-        return None;
-    }
-    let receiver = declarator.child_by_field_name("name")?;
-    let receiver = static_member_receiver(receiver, source)?;
-    receiver.members.is_empty().then_some((receiver, property))
+    let bound = object.parent()?;
+    // The literal is the whole value of a binding, so its keys are properties of
+    // whatever that binding names: `const x = { key: ... }` mints `x.key`, and
+    // `x.y = { key: ... }` mints `x.y.key`. A chained receiver is kept whole --
+    // the read side compares receiver member chains element-wise.
+    let receiver = match bound.kind() {
+        "variable_declarator" => bound
+            .child_by_field_name("value")
+            .filter(|value| value.id() == object.id())
+            .and_then(|_| bound.child_by_field_name("name")),
+        "assignment_expression" => bound
+            .child_by_field_name("right")
+            .filter(|right| right.id() == object.id())
+            .and_then(|_| bound.child_by_field_name("left")),
+        _ => None,
+    }?;
+    static_member_receiver(receiver, source).map(|receiver| (receiver, property))
 }
 
 pub fn static_member_receiver<'tree>(
@@ -401,6 +407,49 @@ pub fn static_member_receiver<'tree>(
     Some(JsTsStaticMemberReceiver {
         root: current,
         members,
+    })
+}
+
+/// The identifier at the root of a static member chain (`module` in
+/// `module.exports.foo`).
+fn static_member_root(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match node.kind() {
+            "identifier" => return Some(node),
+            "member_expression" => node = node.child_by_field_name("object")?,
+            _ => return None,
+        }
+    }
+}
+
+/// Whether this program is an external module rather than a browser script:
+/// it carries an ESM import/export, a `require(...)` call, or a CommonJS
+/// `exports` / `module.exports` assignment.
+///
+/// A browser script's top-level `var` is a property of the one shared global
+/// object, so a later script sees it; a module's top-level binding is
+/// file-private. That is the whole reason an unexported `NS.Field = ...` can
+/// be read from another file at all, so the forward definition lookup
+/// (`jsts_cross_file_dotted_receiver_has_global_identity`) and the inverse
+/// usage scan must decide it the same way -- hence one function here rather
+/// than one per direction.
+pub fn js_program_is_external_module(root: Node<'_>, source: &str) -> bool {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor).any(|statement| {
+        matches!(statement.kind(), "import_statement" | "export_statement")
+            || subtree_contains(statement, |node| {
+                (node.kind() == "call_expression"
+                    && node.child_by_field_name("function").is_some_and(|callee| {
+                        callee.kind() == "identifier" && slice(callee, source) == "require"
+                    }))
+                    || (node.kind() == "assignment_expression"
+                        && node
+                            .child_by_field_name("left")
+                            .and_then(static_member_root)
+                            .is_some_and(|root| {
+                                matches!(slice(root, source), "exports" | "module")
+                            }))
+            })
     })
 }
 
@@ -441,6 +490,22 @@ fn variable_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
 }
 
 fn enclosing_var_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
+    var_binding_scope_node(node).map(node_scope)
+}
+
+/// The node a `var` binder attaches to: JavaScript hoists `var` to the nearest
+/// enclosing function-like node, or to the program. `None` for a `let`/`const`
+/// declarator, whose binder is block scoped and stays in its TDZ until its
+/// declaration.
+pub fn js_ts_var_declarator_binding_scope<'tree>(declarator: Node<'tree>) -> Option<Node<'tree>> {
+    let declaration = declarator.parent()?;
+    if declaration.kind() != "variable_declaration" {
+        return None;
+    }
+    var_binding_scope_node(declaration)
+}
+
+fn var_binding_scope_node(node: Node<'_>) -> Option<Node<'_>> {
     let mut current = node.parent();
     while let Some(parent) = current {
         if matches!(
@@ -453,7 +518,7 @@ fn enclosing_var_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope
                 | "arrow_function"
                 | "method_definition"
         ) {
-            return Some(node_scope(parent));
+            return Some(parent);
         }
         current = parent.parent();
     }

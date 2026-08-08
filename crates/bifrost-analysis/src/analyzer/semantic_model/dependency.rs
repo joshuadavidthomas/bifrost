@@ -120,6 +120,28 @@ impl ResolvedDependencyArtifact {
         }
     }
 
+    /// A source set whose ecosystem import identity is known. Composer uses this
+    /// for a PSR-4 namespace prefix, so one package's separately mapped prefixes
+    /// stay distinguishable after the files are collected.
+    pub fn module_source_set(
+        role: DependencyArtifactRole,
+        kind: ExternalArtifactKind,
+        module: String,
+        root: PathBuf,
+        relative_paths: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            role,
+            kind,
+            module: Some(module),
+            input: ResolvedDependencyArtifactInput::SourceSet {
+                root,
+                relative_paths,
+            },
+            expected_sha256: None,
+        }
+    }
+
     pub fn path(&self) -> &Path {
         match &self.input {
             ResolvedDependencyArtifactInput::File(path) => path,
@@ -405,6 +427,49 @@ impl DependencyDiscoveryEvidence {
     /// dotted module names discovery itself recorded, so segment-prefix
     /// containment is their defined structure, not a re-parse of source text.
     pub fn declares_module_path(&self, path: &str) -> bool {
+        self.declares_path_below(path, '.')
+    }
+
+    /// Whether the build declares the Go module that `import_path` routes
+    /// through: an exact declared identity, or one reached by walking the
+    /// slash-separated import path back toward its module root
+    /// (`github.com/pkg/errors/internal` is declared when the
+    /// `github.com/pkg/errors` module is).
+    ///
+    /// Go import paths are slash-separated, so [`Self::declares_module_path`]'s
+    /// dotted walk cannot answer this: `github.com/pkg/errors/internal` splits
+    /// on `.` into `github`, which names nothing. The declared identities are
+    /// the module paths discovery itself recorded, so segment-prefix
+    /// containment is their defined structure, not a re-parse of source text.
+    pub fn declares_go_import_path(&self, import_path: &str) -> bool {
+        self.declares_path_below(import_path, '/')
+    }
+
+    /// Whether the build declares the gem that a Ruby `require` argument loads:
+    /// an exact declared gem name, or one reached by walking the load path back
+    /// toward its root (`widget/core` is declared when the `widget` gem is).
+    ///
+    /// Ruby discovery records one identity per locked gem, which is the bare
+    /// gem name (`crates/bifrost-analysis/src/analyzer/ruby/dependency_discovery.rs`
+    /// puts `RubyGemApiArtifact::name` in the package coordinate and leaves the
+    /// module coordinate empty). A require argument is the slash-separated load
+    /// path a gem publishes, so this shares Go's walk rather than the dotted
+    /// one: `widget/core` splits on `.` into itself and would match nothing.
+    ///
+    /// A Ruby *constant* path is not a load path and must not be asked here.
+    /// `Widget::Config` is `::`-separated and its head, `Widget`, is a constant
+    /// name that only an inflection rule relates to the gem name `widget`.
+    /// Bifrost does not guess inflections, so a constant is classified against
+    /// the activated overlay instead (see `ruby::constant_identity`).
+    pub fn declares_ruby_require_path(&self, require_path: &str) -> bool {
+        self.declares_path_below(require_path, '/')
+    }
+
+    /// The shared containment walk behind the three `declares_*` accessors: an
+    /// exact declared identity, or one reached by removing trailing
+    /// `separator`-delimited segments. Segment removal rather than
+    /// `str::starts_with` is what keeps `requestsfoo` from matching `requests`.
+    fn declares_path_below(&self, path: &str, separator: char) -> bool {
         if path.is_empty() {
             return false;
         }
@@ -412,7 +477,7 @@ impl DependencyDiscoveryEvidence {
             return true;
         }
         let mut prefix = path;
-        while let Some((head, _)) = prefix.rsplit_once('.') {
+        while let Some((head, _)) = prefix.rsplit_once(separator) {
             if self.declared_modules.contains(head) {
                 return true;
             }
@@ -420,6 +485,66 @@ impl DependencyDiscoveryEvidence {
         }
         false
     }
+}
+
+/// What retained discovery evidence says about one module path when nothing
+/// indexed it.
+///
+/// Resolution-trace boundary refinement and proof-gated diagnostics ask the
+/// same question and must not answer it differently; they only render the
+/// answer differently. The trace collapses everything but "the build knows
+/// nothing about this" into `ExternalDeclaredUnindexed`, while diagnostics
+/// keep truncation apart from a declared-but-unindexed distribution because
+/// the two carry different typed suppression reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedDiscoveryVerdict {
+    /// No discovery has run against this analyzer, so nothing is retained.
+    NoDiscovery,
+    /// Discovery could not read everything the build declared, so a miss is
+    /// not proof that the build declares nothing.
+    Truncated,
+    /// The build declares this module, or a module containing it.
+    Declared,
+    /// Discovery ran completely and the build declares nothing containing it.
+    Undeclared,
+}
+
+/// Classify `module_path` against retained discovery evidence. This reads what
+/// the analyzer already holds; it never starts discovery.
+pub fn retained_discovery_verdict(
+    evidence: Option<&DependencyDiscoveryEvidence>,
+    module_path: &str,
+) -> RetainedDiscoveryVerdict {
+    match evidence {
+        None => RetainedDiscoveryVerdict::NoDiscovery,
+        Some(evidence) if evidence.truncated() => RetainedDiscoveryVerdict::Truncated,
+        Some(evidence) if evidence.declares_module_path(module_path) => {
+            RetainedDiscoveryVerdict::Declared
+        }
+        Some(_) => RetainedDiscoveryVerdict::Undeclared,
+    }
+}
+
+/// Whether retained discovery evidence can still account for `module_path`:
+/// the build declares it, or discovery could not read everything the build
+/// declared, so a miss is not proof of absence.
+///
+/// A caller that hits here is at [`BoundaryStatus::ExternalDeclaredUnindexed`];
+/// one that misses, with no other evidence, is at
+/// [`BoundaryStatus::ExternalUnknown`]. Where no discovery has run, nothing is
+/// retained and the honest answer is `false`. This function never starts
+/// discovery.
+///
+/// [`BoundaryStatus::ExternalDeclaredUnindexed`]: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed
+/// [`BoundaryStatus::ExternalUnknown`]: crate::analyzer::structural::BoundaryStatus::ExternalUnknown
+pub fn retained_evidence_declares(
+    evidence: Option<&DependencyDiscoveryEvidence>,
+    module_path: &str,
+) -> bool {
+    matches!(
+        retained_discovery_verdict(evidence, module_path),
+        RetainedDiscoveryVerdict::Truncated | RetainedDiscoveryVerdict::Declared
+    )
 }
 
 /// Read retained discovery evidence for a diagnostic request. A missing value
@@ -1066,6 +1191,7 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::PythonStub => "python_stub",
         ExternalArtifactKind::PythonSource => "python_source",
         ExternalArtifactKind::RubyGemArchive => "ruby_gem_archive",
+        ExternalArtifactKind::ComposerPackageSourceSet => "composer_package_source_set",
     }
 }
 

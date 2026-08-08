@@ -205,9 +205,23 @@ pub enum DependencyPackEcosystem {
     Go,
     Cargo,
     Ruby,
+    Composer,
 }
 
 impl DependencyPackEcosystem {
+    /// Every ecosystem a host can activate. Hosts iterate this to select the
+    /// ecosystems their workspace needs.
+    pub const ALL: [Self; 8] = [
+        Self::Jvm,
+        Self::DotNet,
+        Self::Npm,
+        Self::Python,
+        Self::Go,
+        Self::Cargo,
+        Self::Ruby,
+        Self::Composer,
+    ];
+
     pub fn languages(self) -> &'static [Language] {
         match self {
             Self::Jvm => &[Language::Java, Language::Kotlin, Language::Scala],
@@ -217,6 +231,50 @@ impl DependencyPackEcosystem {
             Self::Go => &[Language::Go],
             Self::Cargo => &[Language::Rust],
             Self::Ruby => &[Language::Ruby],
+            Self::Composer => &[Language::Php],
+        }
+    }
+
+    /// Base names of the files whose change can invalidate this ecosystem's
+    /// published pack proof (#1628).
+    ///
+    /// A host watches these names, calls
+    /// [`WorkspaceAnalyzer::invalidate_dependency_pack_state`] for the matching
+    /// ecosystems, and re-activates. The list covers both the files a resolver
+    /// reads directly and the conventional manifests a host names as evidence
+    /// for the evidence-driven ecosystems (Cargo, Ruby, Composer, Python),
+    /// whose exact paths are configuration rather than convention. Naming a
+    /// file that a given configuration does not read costs one redundant
+    /// activation; missing one would leave stale proof in place, so this table
+    /// errs toward invalidating.
+    ///
+    /// Reading these files is the whole of discovery: no resolver runs a
+    /// package manager and none opens a network connection.
+    pub fn dependency_inputs(self) -> &'static [&'static str] {
+        match self {
+            // `is_jvm_dependency_input` is the reader-side predicate for the
+            // same inputs; these are its base names.
+            Self::Jvm => &[
+                "pom.xml",
+                "settings.xml",
+                "build.gradle",
+                "build.gradle.kts",
+                "settings.gradle",
+                "settings.gradle.kts",
+                "gradle.properties",
+                "gradle.lockfile",
+                "libs.versions.toml",
+                "gradle-wrapper.properties",
+            ],
+            Self::DotNet => &["project.assets.json"],
+            Self::Npm => &["package.json", "package-lock.json", "npm-shrinkwrap.json"],
+            // Python discovery reads distribution metadata under the roots the
+            // host configures; there is no project-level manifest it consults.
+            Self::Python => &["METADATA", "RECORD", "top_level.txt"],
+            Self::Go => &["go.mod", "go.sum", "go.work", "go.work.sum", "modules.txt"],
+            Self::Cargo => &["Cargo.toml", "Cargo.lock"],
+            Self::Ruby => &["Gemfile", "Gemfile.lock", "gems.locked"],
+            Self::Composer => &["composer.json", "composer.lock", "installed.json"],
         }
     }
 }
@@ -286,6 +344,14 @@ impl WorkspaceAnalyzer {
                     .max_artifacts_per_dependency
                     .max(environment.limits.max_files_per_distribution);
             }
+            // Composer emits one artifact per autoload rule so a PSR-4 prefix
+            // stays bound to the files it admits. Discovery caps the rule count
+            // itself, so the artifact budget only has to admit that cap.
+            if ecosystem == DependencyPackEcosystem::Composer {
+                limits.max_artifacts_per_dependency = limits
+                    .max_artifacts_per_dependency
+                    .max(crate::analyzer::php::PHP_MAX_AUTOLOAD_RULES_PER_PACKAGE);
+            }
             let (discovery, adapter): (DependencyDiscoveryOutcome, &dyn DependencyPackAdapter) =
                 match ecosystem {
                     DependencyPackEcosystem::Jvm => (
@@ -350,6 +416,15 @@ impl WorkspaceAnalyzer {
                             Some(context.cancellation),
                         ),
                         &RubyDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Composer => (
+                        crate::analyzer::php::resolve_php_semantic_pack_dependencies(
+                            &config.php,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &crate::analyzer::php::PhpDependencyPackAdapter,
                     ),
                 };
             if discovery.cancelled || !discovery.complete {

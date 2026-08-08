@@ -11,8 +11,8 @@
 //! One tier is enough here, unlike Rust's `RustSource`/`RustUsageSource`
 //! split: no `OnceLock` in the C# memo web re-enters the cell it is filling.
 //! The deepest recursion, `visible_type_candidates_with_lookups`, was already
-//! written as a function of four injected lookups and stays that way -- it
-//! needs no source at all.
+//! written as a function of its injected lookups and stays that way -- it needs
+//! no source at all.
 //!
 //! `CSharpAnalyzer` lives in `brokk-bifrost-analysis`; this crate never names it.
 
@@ -1048,6 +1048,7 @@ fn visible_type_candidates_inner(
     let mut using_aliases = || Some(source.using_aliases_of(file));
     let mut namespace_of_file = || Some(source.namespace_of_file(file));
     let mut using_namespaces = || Some(source.using_namespaces_of(file));
+    let mut namespace_exists = |namespace: &str| source.workspace_namespace_exists(namespace);
     let mut type_candidates = |fqn: &str| Some(type_candidates_by_fqn(source, fqn, usage));
     visible_type_candidates_with_lookups(
         name,
@@ -1055,25 +1056,40 @@ fn visible_type_candidates_inner(
         &mut using_aliases,
         &mut namespace_of_file,
         &mut using_namespaces,
+        &mut namespace_exists,
         &mut type_candidates,
     )
 }
 
-/// C#'s visible-type search, as a function of the four lookups it needs. Each
-/// returns `None` when its own bounded budget ran out, which aborts the search
-/// rather than reporting a miss.
-pub fn visible_type_candidates_with_lookups<Aliases, Namespace, Usings, Candidates>(
+/// C#'s visible-type search, as a function of the lookups it needs. Each
+/// `Option`-returning one answers `None` when its own bounded budget ran out,
+/// which aborts the search rather than reporting a miss.
+///
+/// `namespace_exists` is the exception: it has no `None`, and a caller that
+/// cannot determine an answer must say `true`. It only ever *skips* a probe, so
+/// a wrong `false` would silently lose a candidate while a wrong `true` costs
+/// nothing but the probe that would have run anyway.
+#[allow(clippy::too_many_arguments)]
+pub fn visible_type_candidates_with_lookups<
+    Aliases,
+    Namespace,
+    Usings,
+    NamespaceExists,
+    Candidates,
+>(
     name: &str,
     resolve_aliases: bool,
     using_aliases: &mut Aliases,
     namespace_of_file: &mut Namespace,
     using_namespaces: &mut Usings,
+    namespace_exists: &mut NamespaceExists,
     type_candidates_by_fqn: &mut Candidates,
 ) -> Vec<CodeUnit>
 where
     Aliases: FnMut() -> Option<Arc<HashMap<String, String>>>,
     Namespace: FnMut() -> Option<String>,
     Usings: FnMut() -> Option<Vec<String>>,
+    NamespaceExists: FnMut(&str) -> bool,
     Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
 {
     let mut normalized = normalize_csharp_type_fragment(name);
@@ -1109,14 +1125,28 @@ where
             using_aliases,
             namespace_of_file,
             using_namespaces,
+            namespace_exists,
             type_candidates_by_fqn,
         );
     }
 
+    // A `{qualifier}.{normalized}` probe only ever matches a class whose own
+    // namespace is exactly `qualifier`, as long as `normalized` names a single
+    // type: `csharp_normalize_full_name` turns the whole fq name into
+    // `{namespace}.{type chain}`, so one trailing segment leaves the namespace
+    // equal to the qualifier. A qualifier the workspace declares nothing in can
+    // therefore be skipped rather than probed, which is what stops a file with
+    // a deep namespace from paying a store query per candidate spelling per
+    // ancestor namespace for a name that is plainly external (#1806).
+    //
+    // A `normalized` that carries its own separators is not gated: it can put
+    // any number of segments between the qualifier and the type, so the
+    // namespace that would hold the match is not the qualifier.
+    let qualifier_decides_namespace = !normalized.contains(['.', '$', '+']);
     let Some(mut namespace) = namespace_of_file() else {
         return Vec::new();
     };
-    if !namespace.is_empty() {
+    if !namespace.is_empty() && (!qualifier_decides_namespace || namespace_exists(&namespace)) {
         let Some(candidates) = type_candidates_by_fqn(&format!("{namespace}.{normalized}")) else {
             return Vec::new();
         };
@@ -1130,6 +1160,11 @@ where
         return Vec::new();
     };
     for using_namespace in namespaces {
+        // This one is gated whatever `normalized` looks like: the filter below
+        // already keeps only candidates whose namespace is the `using` itself.
+        if !namespace_exists(&using_namespace) {
+            continue;
+        }
         let Some(candidates) = type_candidates_by_fqn(&format!("{using_namespace}.{normalized}"))
         else {
             return Vec::new();
@@ -1146,6 +1181,9 @@ where
 
     while let Some(separator) = namespace.rfind('.') {
         namespace.truncate(separator);
+        if qualifier_decides_namespace && !namespace_exists(&namespace) {
+            continue;
+        }
         let Some(candidates) = type_candidates_by_fqn(&format!("{namespace}.{normalized}")) else {
             return Vec::new();
         };
@@ -1162,14 +1200,7 @@ pub fn resolve_visible_type(
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
-    let candidates = visible_type_candidates(source, file, name);
-    (logical_type_count(&candidates) == 1)
-        .then(|| {
-            let mut candidates = candidates;
-            sort_type_candidates(&mut candidates);
-            candidates.into_iter().next()
-        })
-        .flatten()
+    unique_logical_type(visible_type_candidates(source, file, name))
 }
 
 pub fn resolve_usage_visible_type(
@@ -1177,14 +1208,120 @@ pub fn resolve_usage_visible_type(
     file: &ProjectFile,
     name: &str,
 ) -> Option<CodeUnit> {
-    let candidates = usage_visible_type_candidates(source, file, name);
-    (logical_type_count(&candidates) == 1)
-        .then(|| {
-            let mut candidates = candidates;
-            sort_type_candidates(&mut candidates);
-            candidates.into_iter().next()
-        })
-        .flatten()
+    unique_logical_type(usage_visible_type_candidates(source, file, name))
+}
+
+/// The one declaration `candidates` names, or `None` when the spelling is
+/// ambiguous. Partial declarations of the same type count once, so a type
+/// split over several files still resolves.
+pub fn unique_logical_type(mut candidates: Vec<CodeUnit>) -> Option<CodeUnit> {
+    if logical_type_count(&candidates) != 1 {
+        return None;
+    }
+    sort_type_candidates(&mut candidates);
+    candidates.into_iter().next()
+}
+
+// ---------------------------------------------------------------------------
+// Enclosing-type scopes
+// ---------------------------------------------------------------------------
+
+/// The type scopes a spelling written inside `declaring_type_fqn` can name a
+/// type through, innermost first: the declaring type itself and then each type
+/// it is nested in. Namespace prefixes are deliberately excluded -- those are
+/// what [`visible_type_candidates_with_lookups`] already searches -- so the
+/// walk stops at the outermost nesting boundary.
+///
+/// C# writes a nesting boundary as `$` in a `CodeUnit` fq name and as `+` in
+/// reflection-style spellings, so both cut the scope.
+fn enclosing_type_scopes(declaring_type_fqn: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(
+        (!declaring_type_fqn.is_empty()).then_some(declaring_type_fqn),
+        |scope| scope.rfind(['$', '+']).map(|cut| &scope[..cut]),
+    )
+}
+
+/// C#'s enclosing-type stage of type lookup, missing from
+/// [`visible_type_candidates_with_lookups`] because that search is keyed on a
+/// `ProjectFile` and so only ever offers alias, namespace and `using` scopes.
+///
+/// A spelling written inside a type declaration -- including its base-type
+/// list -- first names a type nested in that type or in any type enclosing it,
+/// and that scope wins over every namespace scope. Supertype resolution had no
+/// such stage, so `class Derived : Base` where `Base` is a sibling nested type
+/// resolved to nothing at all and the derived type reported no ancestors
+/// (#1801).
+///
+/// `type_candidates_by_fqn` returns `None` when its own bounded budget ran out,
+/// which aborts the search rather than reporting a miss, exactly as the
+/// file-keyed search does. A `global::`- or alias-qualified spelling names an
+/// absolute scope and never reaches this stage.
+pub fn enclosing_type_candidates_with_lookups<Candidates>(
+    declaring_type_fqn: &str,
+    name: &str,
+    type_candidates_by_fqn: &mut Candidates,
+) -> Option<Vec<CodeUnit>>
+where
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+{
+    let normalized = normalize_csharp_type_fragment(name);
+    if normalized.is_empty() || normalized.contains("::") {
+        return Some(Vec::new());
+    }
+    for scope in enclosing_type_scopes(declaring_type_fqn) {
+        let candidates = type_candidates_by_fqn(&format!("{scope}.{normalized}"))?;
+        if !candidates.is_empty() {
+            return Some(candidates);
+        }
+    }
+    Some(Vec::new())
+}
+
+/// Every declaration a base-type spelling on `declaring_type_fqn` can name:
+/// the enclosing type chain first, then whatever the file-keyed search offers.
+///
+/// The four C# supertype walks -- the analyzer's `direct_ancestors`, its
+/// bounded session fork, and the two attribute-class evidence walks -- all
+/// resolve a raw supertype spelling this way, so the two stages are composed
+/// here once rather than at each of them.
+pub fn supertype_candidates_with_lookups<Candidates, Visible>(
+    declaring_type_fqn: &str,
+    raw: &str,
+    type_candidates_by_fqn: &mut Candidates,
+    visible_type_candidates: &mut Visible,
+) -> Vec<CodeUnit>
+where
+    Candidates: FnMut(&str) -> Option<Vec<CodeUnit>>,
+    Visible: FnMut(&str) -> Vec<CodeUnit>,
+{
+    let nested =
+        enclosing_type_candidates_with_lookups(declaring_type_fqn, raw, type_candidates_by_fqn)
+            .unwrap_or_default();
+    if !nested.is_empty() {
+        return nested;
+    }
+    visible_type_candidates(raw)
+}
+
+/// [`supertype_candidates_with_lookups`] over an unbounded [`CSharpSource`].
+pub fn supertype_candidates(
+    source: &dyn CSharpSource,
+    part: &CodeUnit,
+    raw: &str,
+    usage: bool,
+) -> Vec<CodeUnit> {
+    supertype_candidates_with_lookups(
+        &part.fq_name(),
+        raw,
+        &mut |fqn| Some(type_candidates_by_fqn(source, fqn, usage)),
+        &mut |name| {
+            if usage {
+                usage_visible_type_candidates(source, part.source(), name)
+            } else {
+                visible_type_candidates(source, part.source(), name)
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------

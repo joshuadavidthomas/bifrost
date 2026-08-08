@@ -9,6 +9,8 @@ pub mod report;
 pub mod runner;
 #[cfg(feature = "release-tooling")]
 pub mod semantic_diagnostic_rollout;
+#[cfg(feature = "release-tooling")]
+pub mod semantic_diagnostic_rollout_harness;
 pub mod subset_workspace;
 
 pub use artifact_lifecycle::{
@@ -26,8 +28,8 @@ pub use report::{
     BenchmarkCompareReport, BenchmarkRepoReport, BenchmarkRunReport, CompareThresholds,
     EnvironmentVarianceReport, McpFairnessTimingReport, McpTransportPhaseReport,
     QueryCodeAccessPathMetrics, QueryCodeBenchmarkMetrics, QueryCodeDerivedLayerMetrics,
-    QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics, ScenarioCompareOutcome,
-    ScenarioCompareReport, ScenarioReport, ScenarioTransport,
+    QueryCodeFactsCacheMetrics, QueryCodeProfileMetrics, QueryCodeRequestTimingMetrics,
+    ScenarioCompareOutcome, ScenarioCompareReport, ScenarioReport, ScenarioTransport,
 };
 pub use runner::{BenchmarkProfile, RunRequest, run_benchmark};
 #[cfg(feature = "release-tooling")]
@@ -40,4 +42,9 @@ pub use semantic_diagnostic_rollout::{
     SemanticDiagnosticRolloutArtifact, SemanticDiagnosticRolloutError,
     SemanticDiagnosticRolloutIdentity, SemanticDiagnosticRolloutStatus,
     aggregate_semantic_diagnostic_rollout, render_semantic_diagnostic_rollout_markdown,
+};
+#[cfg(feature = "release-tooling")]
+pub use semantic_diagnostic_rollout_harness::{
+    SemanticDiagnosticRolloutRequest, measure_semantic_diagnostic_rollout,
+    report_semantic_diagnostic_rollout,
 };
