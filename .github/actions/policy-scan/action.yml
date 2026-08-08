@@ -184,11 +184,19 @@ runs:
             end
           )
         ' "${SARIF_PATH}" > "${categorized}"
-        gh api "repos/${GITHUB_REPOSITORY}/code-scanning/sarifs" \
-          -f commit_sha="${GITHUB_SHA}" \
-          -f ref="${GITHUB_REF}" \
-          -f checkout_uri="file://${GITHUB_WORKSPACE}" \
-          -f sarif="$(gzip -c "${categorized}" | base64 -w0)"
+        # The payload can exceed the kernel argv limit, so it travels as a
+        # request-body file, never as a command-line argument.
+        encoded="${RUNNER_TEMP}/bifrost-sarif.b64"
+        gzip -c "${categorized}" | base64 -w0 > "${encoded}"
+        body="${RUNNER_TEMP}/bifrost-sarif-body.json"
+        jq -n \
+          --arg commit_sha "${GITHUB_SHA}" \
+          --arg ref "${GITHUB_REF}" \
+          --arg checkout_uri "file://${GITHUB_WORKSPACE}" \
+          --rawfile sarif "${encoded}" \
+          '{commit_sha: $commit_sha, ref: $ref, checkout_uri: $checkout_uri, sarif: $sarif}' \
+          > "${body}"
+        gh api "repos/${GITHUB_REPOSITORY}/code-scanning/sarifs" --input "${body}"
 
     - name: Gate on the exit code
       shell: bash
