@@ -9,7 +9,8 @@ inputs:
   version:
     description: >-
       Bifrost release tag to install (see BrokkAi/bifrost releases). Pin an
-      exact tag for reproducible gates.
+      exact tag for reproducible gates. The special value `local` skips the
+      install and uses the `bifrost` already on PATH.
     required: false
     default: v0.8.24
   policy-packs:
@@ -74,11 +75,21 @@ runs:
   using: composite
   steps:
     - name: Install bifrost
+      id: install
       shell: bash
       env:
         BIFROST_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
+        if [ "${BIFROST_VERSION}" = local ]; then
+          if [ -x "${GITHUB_WORKSPACE}/target/release/bifrost" ]; then
+            echo "bifrost_bin=${GITHUB_WORKSPACE}/target/release/bifrost" >> "${GITHUB_OUTPUT}"
+          else
+            command -v bifrost >/dev/null || { echo "::error::version=local but no bifrost is available"; exit 1; }
+            echo "bifrost_bin=$(command -v bifrost)" >> "${GITHUB_OUTPUT}"
+          fi
+          exit 0
+        fi
         case "${RUNNER_OS}-${RUNNER_ARCH}" in
           Linux-X64) target=x86_64-unknown-linux-gnu; archive=tar.gz ;;
           Linux-ARM64) target=aarch64-unknown-linux-gnu; archive=tar.gz ;;
@@ -108,11 +119,11 @@ runs:
         else
           tar -xzf "${stage}.tar.gz"
         fi
-        echo "${dir}/${stage}" >> "${GITHUB_PATH}"
+        echo "bifrost_bin=${dir}/${stage}" >> "${GITHUB_OUTPUT}"
 
-    - name: Restore analyzer cache
+    - name: Analyzer cache
       if: inputs.cache == 'true'
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: .bifrost/cache
         key: bifrost-policy-cache-${{ runner.os }}-${{ github.run_id }}
@@ -131,6 +142,7 @@ runs:
         POLICY_CATEGORIES: ${{ inputs.policy-categories }}
         POLICY_FILES: ${{ inputs.policy-files }}
         DIFF_BASE: ${{ inputs.diff-base }}
+        BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
       run: |
         set -uo pipefail
         cd "${WORKDIR}"
@@ -141,7 +153,7 @@ runs:
         for p in ${POLICY_FILES}; do args+=(--policy-file "${p}"); done
         if [ -n "${DIFF_BASE}" ]; then args+=(--diff-base "${DIFF_BASE}"); fi
         set +e
-        bifrost "${args[@]}"
+        "${BIFROST_BIN}" "${args[@]}"
         code=$?
         set -e
         echo "exit-code=${code}" >> "${GITHUB_OUTPUT}"
@@ -152,19 +164,39 @@ runs:
           echo "has-sarif=false" >> "${GITHUB_OUTPUT}"
         fi
 
-    - name: Save analyzer cache
-      if: inputs.cache == 'true'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-      with:
-        path: .bifrost/cache
-        key: bifrost-policy-cache-${{ runner.os }}-${{ github.run_id }}
-
     - name: Upload SARIF to code scanning
       if: inputs.upload == 'true' && steps.run.outputs.has-sarif == 'true'
-      uses: github/codeql-action/upload-sarif@c3400c2f38909e0dcf3c3a41f2030a8217be5d3e # v3
-      with:
-        sarif_file: ${{ steps.run.outputs.sarif-file }}
-        category: ${{ inputs.category }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SARIF_PATH: ${{ steps.run.outputs.sarif-file }}
+        CATEGORY: ${{ inputs.category }}
+      run: |
+        set -euo pipefail
+        categorized="${RUNNER_TEMP}/bifrost-categorized.sarif"
+        jq --arg category "${CATEGORY}" '
+          .runs |= map(
+            if (.automationDetails // {} | has("id") | not)
+            then .automationDetails = ((.automationDetails // {}) + {
+              id: (if ($category | endswith("/")) then $category else ($category + "/") end)
+            })
+            else .
+            end
+          )
+        ' "${SARIF_PATH}" > "${categorized}"
+        # The payload can exceed the kernel argv limit, so it travels as a
+        # request-body file, never as a command-line argument.
+        encoded="${RUNNER_TEMP}/bifrost-sarif.b64"
+        gzip -c "${categorized}" | base64 -w0 > "${encoded}"
+        body="${RUNNER_TEMP}/bifrost-sarif-body.json"
+        jq -n \
+          --arg commit_sha "${GITHUB_SHA}" \
+          --arg ref "${GITHUB_REF}" \
+          --arg checkout_uri "file://${GITHUB_WORKSPACE}" \
+          --rawfile sarif "${encoded}" \
+          '{commit_sha: $commit_sha, ref: $ref, checkout_uri: $checkout_uri, sarif: $sarif}' \
+          > "${body}"
+        gh api "repos/${GITHUB_REPOSITORY}/code-scanning/sarifs" --input "${body}"
 
     - name: Gate on the exit code
       shell: bash

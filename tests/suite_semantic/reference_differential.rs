@@ -33,6 +33,64 @@ fn rust_census_differential(
     .expect("run inline Rust census differential")
 }
 
+fn rust_census_differential_without_tests(
+    files: &[(&str, &str)],
+) -> brokk_bifrost::reference_differential::ReferenceDifferentialReport {
+    let mut project = InlineTestProject::with_language(Language::Rust);
+    for (path, source) in files {
+        project = project.file(path, *source);
+    }
+    let project = project.build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    run_reference_differential(
+        workspace.analyzer(),
+        &ReferenceDifferentialConfig {
+            corpus_language: "rust".to_string(),
+            max_files: 20,
+            max_sites: 1_000,
+            max_candidates_per_file: 1_000,
+            max_source_bytes: 100_000,
+            max_targets: 1_000,
+            max_usage_files: 20,
+            max_usages: 1_000,
+            include_tests: false,
+            probe_seed: ProbeSeed::Census,
+            ..ReferenceDifferentialConfig::default()
+        },
+    )
+    .expect("run inline Rust census differential without tests")
+}
+
+/// `include_tests=false` must filter references inside an inline Rust
+/// `#[cfg(test)]` module. The production file remains eligible, so a path-only
+/// filter would incorrectly forward-audit both calls.
+#[test]
+fn census_seed_excludes_inline_rust_test_regions_when_tests_are_disabled() {
+    let source = concat!(
+        "pub fn target() {}\n",
+        "pub fn production_caller() { target(); }\n",
+        "#[cfg(test)]\n",
+        "mod test {\n",
+        "    use super::target;\n",
+        "    fn helper() { target(); }\n",
+        "}\n",
+    );
+    let report = rust_census_differential_without_tests(&[("src/lib.rs", source)]);
+    let calls: Vec<usize> = source
+        .match_indices("target();")
+        .map(|(start, _)| start)
+        .collect();
+    assert_eq!(calls.len(), 2, "fixture must contain two target calls");
+    assert!(
+        report.sites.iter().any(|site| site.start_byte == calls[0]),
+        "the production call must remain in the differential scope: {report:#?}"
+    );
+    assert!(
+        report.sites.iter().all(|site| site.start_byte != calls[1]),
+        "the nested cfg(test) call must be excluded when tests are disabled: {report:#?}"
+    );
+}
+
 /// The census seed proposes an identifier occurrence inside a `macro_rules!`
 /// body -- joint-blindness territory the analyzer's index-filtered frontier
 /// never surfaces -- and every census site is tagged `seed == "census"`. This
