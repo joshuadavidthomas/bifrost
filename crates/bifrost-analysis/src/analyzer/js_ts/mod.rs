@@ -33,12 +33,10 @@ use crate::analyzer::common::language_for_target;
 use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
-    LanguageEdgeWeights, LanguageSupport, ReceiverFactsFactory, TypeLookupQuery,
-    TypeLookupResolver, analyzable_file_count,
+    LanguageEdgeWeights, LanguageSupport, ReceiverFactsFactory, analyzable_file_count,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::GraphUsageAnalyzer;
-use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_js_ts_type};
 use crate::analyzer::usages::inverted_edges::{NodeKey, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::{
     JsTsExportUsageGraphStrategy, JsTsReceiverFacts, build_jsts_scoped_usage_edges,
@@ -174,10 +172,6 @@ impl LanguageSupport for JavascriptSupport {
         Some(&JsTsReceiverFacts)
     }
 
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
-        Some(&JsTsTypeLookup)
-    }
-
     fn parser_language(&self, _flavor: ParserFlavor) -> tree_sitter::Language {
         tree_sitter_javascript::LANGUAGE.into()
     }
@@ -258,10 +252,6 @@ impl LanguageSupport for TypescriptSupport {
         Some(&JsTsReceiverFacts)
     }
 
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
-        Some(&JsTsTypeLookup)
-    }
-
     /// The one language whose grammar depends on the flavor: `.tsx` files parse under
     /// the TSX grammar while sharing the TypeScript adapter and structural spec.
     fn parser_language(&self, flavor: ParserFlavor) -> tree_sitter::Language {
@@ -299,25 +289,6 @@ impl LanguageEdgePass for JsTsEdgePass {
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
         build_jsts_scoped_usage_edges(ctx.analyzer, ctx.scoped_nodes, ctx.keep_file)
             .map(LanguageEdgeWeights::Scoped)
-    }
-}
-
-/// One resolver for both dialects, as with `JS_TS_USAGE_STRATEGY`: the JS/TS type
-/// resolver takes the dialect as an argument rather than being specialized on it.
-struct JsTsTypeLookup;
-
-impl TypeLookupResolver for JsTsTypeLookup {
-    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
-        query.support.set_language(query.language);
-        resolve_js_ts_type(
-            query.analyzer,
-            query.support,
-            query.file,
-            query.language,
-            query.source,
-            query.tree,
-            query.site,
-        )
     }
 }
 

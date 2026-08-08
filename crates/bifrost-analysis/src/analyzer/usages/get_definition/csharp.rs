@@ -455,17 +455,6 @@ pub(crate) enum CSharpTypeLookupResolution {
     InappropriateSymbolContext,
 }
 
-pub(crate) fn csharp_type_lookup_resolution(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    site: &ResolvedReferenceSite,
-) -> Option<CSharpTypeLookupResolution> {
-    let session = ResolutionSession::unbounded();
-    csharp_type_lookup_resolution_in_session(analyzer, file, source, root, site, &session)
-}
-
 pub(crate) fn csharp_type_lookup_resolution_in_session(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,

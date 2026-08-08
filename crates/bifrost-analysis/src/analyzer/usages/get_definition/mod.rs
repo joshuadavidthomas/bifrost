@@ -140,17 +140,16 @@ pub(crate) use call_sites::{
 };
 pub(crate) use cpp::{cpp_type_lookup_resolution_in_session, resolve_cpp_bounded};
 pub(crate) use csharp::{
-    CSharpTypeLookupResolution, csharp_type_lookup_resolution,
-    csharp_type_lookup_resolution_in_session, resolve_csharp_bounded,
+    CSharpTypeLookupResolution, csharp_type_lookup_resolution_in_session, resolve_csharp_bounded,
 };
 pub(crate) use go::{
     AnalyzerGoDefinitionProvider, GoDefinitionProvider, GoTypeLookupResolutionKind,
     go_type_lookup_resolution, resolve_go_bounded,
 };
-pub(crate) use java::{JavaTypeLookupResolution, java_type_lookup_resolution};
+pub(crate) use java::JavaTypeLookupResolution;
 pub(crate) use kotlin::{
-    KotlinDefinitionProvider, KotlinTypeLookupResolution, kotlin_type_lookup_resolution,
-    kotlin_type_lookup_resolution_in_session, resolve_kotlin_bounded,
+    KotlinDefinitionProvider, KotlinTypeLookupResolution, kotlin_type_lookup_resolution_in_session,
+    resolve_kotlin_bounded,
 };
 pub(crate) use php::{
     PhpDefinitionProvider, php_type_lookup_resolution_bounded, resolve_php_bounded,
@@ -164,7 +163,7 @@ pub(crate) use ruby::{
 };
 pub(crate) use scala::{
     ScalaDefinitionProvider, ScalaTypeLookupResolution, resolve_scala_bounded,
-    scala_type_lookup_resolution, scala_type_lookup_resolution_in_session,
+    scala_type_lookup_resolution_in_session,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use scala::{

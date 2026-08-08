@@ -74,16 +74,14 @@ use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver,
+    StructuralReceiverResolver,
 };
 use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_kotlin_bounded,
 };
-use crate::analyzer::usages::get_type::{
-    TypeLookupOutcome, resolve_kotlin_type, resolve_kotlin_type_bounded,
-};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_kotlin_type_bounded};
 use crate::analyzer::usages::kotlin_graph::{
     KotlinUsageGraphStrategy, build_kotlin_usage_edge_weights, build_kotlin_usage_edges,
 };
@@ -851,10 +849,6 @@ impl LanguageSupport for KotlinSupport {
         Some(&KotlinSupport)
     }
 
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
-        Some(&KotlinSupport)
-    }
-
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
         language::LANGUAGE.into()
     }
@@ -916,20 +910,6 @@ impl StructuralReceiverResolver for KotlinSupport {
             query.site,
             query.budget,
             query.cancellation,
-        )
-    }
-}
-
-impl TypeLookupResolver for KotlinSupport {
-    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
-        query.support.set_language(query.language);
-        resolve_kotlin_type(
-            query.analyzer,
-            query.support,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
         )
     }
 }

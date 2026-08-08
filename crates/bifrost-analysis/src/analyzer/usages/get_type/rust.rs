@@ -13,21 +13,6 @@ use crate::analyzer::{IAnalyzer, ProjectFile, RustAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use tree_sitter::{Node, Tree};
 
-pub(crate) fn resolve_rust_type(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-    cache: &mut RustTypeLookupCache,
-) -> TypeLookupOutcome {
-    let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {
-        return no_type("rust_analyzer_unavailable", "Rust analyzer is unavailable");
-    };
-    let support = AnalyzerRustDefinitionProvider::new(rust, true);
-    resolve_rust_type_with_provider(analyzer, file, source, tree, site, cache, &support)
-}
-
 pub(crate) fn resolve_rust_type_bounded(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,

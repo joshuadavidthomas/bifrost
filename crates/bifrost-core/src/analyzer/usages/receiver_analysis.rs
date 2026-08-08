@@ -16,6 +16,21 @@ pub const DEFAULT_RECEIVER_MAX_TARGETS: usize = 4;
 pub const DEFAULT_RECEIVER_MAX_SUMMARY_EXPANSIONS: usize = 64;
 pub const DEFAULT_RECEIVER_MAX_SCOPE_NODES: usize = 20_000;
 
+/// Budget for one interactive `get_type_by_location` request.
+///
+/// The receiver-query default above is sized for one receiver among many inside
+/// a larger graph analysis, where an expensive site must not starve its
+/// neighbors. An interactive type lookup is the user's whole request: it runs
+/// once, for one location, and a wrong "no type" from an early cutoff costs
+/// more than the extra work. Each axis is therefore several times the default,
+/// while still bounding a pathological site to a fixed amount of work.
+pub const INTERACTIVE_TYPE_LOOKUP_BUDGET: ReceiverAnalysisBudget = ReceiverAnalysisBudget {
+    context_depth: 2,
+    max_targets: 32,
+    max_summary_expansions: 256,
+    max_scope_nodes: 200_000,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ReceiverAnalysisOutcome<T> {
     Precise(Vec<T>),

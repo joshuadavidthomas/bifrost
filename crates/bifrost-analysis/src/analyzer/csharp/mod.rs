@@ -46,8 +46,7 @@ use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver, analyzable_file_count,
-    fqn_bulk_nodes, overloaded_function_fqns,
+    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::GraphUsageAnalyzer;
@@ -57,9 +56,7 @@ use crate::analyzer::usages::csharp_graph::{
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_csharp_bounded,
 };
-use crate::analyzer::usages::get_type::{
-    TypeLookupOutcome, resolve_csharp_type, resolve_csharp_type_bounded,
-};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_csharp_type_bounded};
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BoundedDefinitionLookup, BuildProgress,
@@ -1241,10 +1238,6 @@ impl LanguageSupport for CSharpSupport {
         Some(&CSharpSupport)
     }
 
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
-        Some(&CSharpSupport)
-    }
-
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
         tree_sitter_c_sharp::LANGUAGE.into()
     }
@@ -1303,18 +1296,6 @@ impl StructuralReceiverResolver for CSharpSupport {
             query.site,
             query.budget,
             query.cancellation,
-        )
-    }
-}
-
-impl TypeLookupResolver for CSharpSupport {
-    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
-        resolve_csharp_type(
-            query.analyzer,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
         )
     }
 }
