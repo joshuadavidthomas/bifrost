@@ -271,8 +271,14 @@ impl PythonArtifactPackProducer {
         };
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
         let (types, members) = {
-            let mut collector =
-                PythonApiCollector::new(module, artifact.path(), source, limits, &mut diagnostics);
+            let mut collector = PythonApiCollector::new(
+                module,
+                artifact.path(),
+                python_locator_file_name(artifact.path()),
+                source,
+                limits,
+                &mut diagnostics,
+            );
             collector.collect(tree.root_node(), cancellation);
             (collector.types, collector.members)
         };
@@ -283,6 +289,143 @@ impl PythonArtifactPackProducer {
                 "Python artifact production was cancelled",
             );
         }
+        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        };
+        let mut activation = request.activation.clone();
+        for selector in &mut activation {
+            selector.artifact_sha256 = Some(artifact.sha256().to_owned());
+        }
+        ArtifactProduction {
+            artifact_sha256: Some(artifact.sha256().to_owned()),
+            pack: Some(AuthoredSemanticModelPack {
+                schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+                pack_id: request.pack_id.clone(),
+                version: request.pack_version.clone(),
+                producer: Producer {
+                    name: "bifrost-python-stub".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                },
+                language: "python".to_owned(),
+                ecosystem: request.ecosystem.clone(),
+                compatibility: request.compatibility.clone(),
+                provenance: request.provenance.clone(),
+                license: request.license.clone(),
+                completeness,
+                safety: request.safety.clone(),
+                shards: vec![AuthoredShard {
+                    id: "declarations.external".to_owned(),
+                    activation,
+                    payload: AuthoredPayload::DeclarationFacts {
+                        types,
+                        members,
+                        relations: Vec::new(),
+                    },
+                }],
+            }),
+            completeness,
+            diagnostics,
+            suppressed_diagnostics,
+        }
+    }
+
+    /// Produce one pack from an exact source set of Python stub files.
+    ///
+    /// Each entry's import-module identity comes from its relative path under
+    /// the set root, exactly as an installed package tree derives it. Entries
+    /// without a module identity, with invalid encoding, or with source the
+    /// pinned parser rejects become bounded reject diagnostics and make the
+    /// pack honestly partial.
+    pub fn produce_loaded_source_set(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::PythonStub {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.kind".to_owned(),
+                    location: None,
+                    message: "Python stub source-set producer requires a python_stub artifact"
+                        .to_owned(),
+                },
+                limits,
+            );
+        }
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        let mut types = Vec::new();
+        let mut members = Vec::new();
+        for entry in artifact.source_entries() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                diagnostics.error(
+                    "artifact.cancelled",
+                    None,
+                    "Python stub source-set production was cancelled",
+                );
+                break;
+            }
+            let relative = Path::new(entry.relative_path());
+            let Some(module) = python_module_name_from_relative(relative) else {
+                diagnostics.warning(
+                    "python.artifact_module",
+                    Some(entry.relative_path().to_owned()),
+                    "Python stub entry has no import-module identity",
+                );
+                continue;
+            };
+            let Ok(source) = std::str::from_utf8(entry.bytes()) else {
+                diagnostics.warning(
+                    "python.source.encoding",
+                    Some(entry.relative_path().to_owned()),
+                    "Python stub entry is not UTF-8",
+                );
+                continue;
+            };
+            let Some(tree) = brokk_bifrost_python::declarations::parse_python_tree(source) else {
+                diagnostics.warning(
+                    "python.source.parse",
+                    Some(entry.relative_path().to_owned()),
+                    "Python parser did not produce a syntax tree",
+                );
+                continue;
+            };
+            let mut collector = PythonApiCollector::new(
+                &module,
+                relative,
+                entry.relative_path().to_owned(),
+                source,
+                limits,
+                &mut diagnostics,
+            );
+            collector.collect(tree.root_node(), cancellation);
+            types.extend(collector.types);
+            members.extend(collector.members);
+        }
+        if types.is_empty() {
+            diagnostics.error(
+                "python.source_set.no_external_declarations",
+                None,
+                "stub source set contains no externally visible Python declarations",
+            );
+            let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+            return ArtifactProduction {
+                artifact_sha256: Some(artifact.sha256().to_owned()),
+                pack: None,
+                completeness: Completeness::Partial,
+                diagnostics,
+                suppressed_diagnostics,
+            };
+        }
+        types.sort_by(|left, right| left.id.cmp(&right.id));
+        types.dedup_by(|left, right| left.id == right.id);
+        members.sort_by(|left, right| left.id.cmp(&right.id));
+        members.dedup_by(|left, right| left.id == right.id);
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
         let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
             Completeness::Complete
@@ -435,7 +578,10 @@ fn python_module_name_for_artifact(path: &Path) -> String {
 }
 
 fn python_module_name_from_import_root(import_root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(import_root).ok()?;
+    python_module_name_from_relative(path.strip_prefix(import_root).ok()?)
+}
+
+fn python_module_name_from_relative(relative: &Path) -> Option<String> {
     let mut components = relative
         .components()
         .map(|component| component.as_os_str().to_str().map(str::to_owned))
@@ -446,6 +592,14 @@ fn python_module_name_from_import_root(import_root: &Path, path: &Path) -> Optio
         components.push(stem.to_owned());
     }
     (!components.is_empty()).then(|| components.join("."))
+}
+
+fn python_locator_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("__external__.pyi")
+        .to_owned()
 }
 
 fn python_artifact_precedence(
@@ -491,6 +645,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
     fn new(
         module: &'a str,
         path: &'a Path,
+        locator_path: String,
         source: &'a str,
         limits: &'a ArtifactProducerLimits,
         diagnostics: &'d mut BoundedProducerDiagnostics,
@@ -498,12 +653,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         let mut collector = Self {
             module,
             path,
-            locator_path: path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty())
-                .unwrap_or("__external__.pyi")
-                .to_owned(),
+            locator_path,
             source,
             limits,
             diagnostics,

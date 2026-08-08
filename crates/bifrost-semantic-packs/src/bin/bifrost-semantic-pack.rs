@@ -15,7 +15,8 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     semantic_model_inventory, validate_semantic_model_source, write_compiled_semantic_model_pack,
 };
 use brokk_bifrost_semantic_packs::release_bundle::{
-    BundleInput, generate_release_bundle, install_release_bundle, verify_release_bundle,
+    BundleInput, ReleaseBundleRejects, generate_release_bundle, install_release_bundle,
+    verify_release_bundle,
 };
 use semver::{Version, VersionReq};
 use serde::Deserialize;
@@ -285,13 +286,14 @@ fn generate_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8
             artifact_path: PathBuf::from(&pair[1]),
         })
         .collect::<Vec<_>>();
-    let index = generate_release_bundle(&output_root, &inputs)
+    let bundle = generate_release_bundle(&output_root, &inputs)
         .map_err(|error_value| failure(2, error_value.to_string(), format))?;
     println!(
         "generated {} pinned semantic packs in {}",
-        index.packs.len(),
+        bundle.index.packs.len(),
         output_root.display()
     );
+    print_release_rejects(&bundle.rejects);
     Ok(0)
 }
 
@@ -301,14 +303,38 @@ fn verify_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8, 
         return Err(failure(2, usage(), format));
     };
     let output_root = PathBuf::from(output_root);
-    let index = verify_release_bundle(&output_root)
+    let bundle = verify_release_bundle(&output_root)
         .map_err(|error_value| failure(2, error_value.to_string(), format))?;
     println!(
         "verified {} pinned semantic packs in {}",
-        index.packs.len(),
+        bundle.index.packs.len(),
         output_root.display()
     );
+    print_release_rejects(&bundle.rejects);
     Ok(0)
+}
+
+/// Print the structured extraction burn-down report: one summary line per
+/// pack, then every rejected entry with its reject reason.
+fn print_release_rejects(rejects: &ReleaseBundleRejects) {
+    for pack in &rejects.packs {
+        println!(
+            "rejects {}@{}: {} rejected entries, {} suppressed",
+            pack.pack_id,
+            pack.pack_version,
+            pack.rejects.len(),
+            pack.suppressed_rejects
+        );
+        for reject in &pack.rejects {
+            println!(
+                "  {} {} {}: {}",
+                reject.severity,
+                reject.code,
+                reject.location.as_deref().unwrap_or("<pack>"),
+                reject.message
+            );
+        }
+    }
 }
 
 fn install_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8, CommandFailure> {
