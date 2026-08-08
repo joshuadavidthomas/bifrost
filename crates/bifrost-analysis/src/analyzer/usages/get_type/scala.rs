@@ -63,7 +63,20 @@ fn scala_type_resolution_outcome(
     };
     match resolution {
         ScalaTypeLookupResolution::Type { fqn, target_kind } => {
-            let candidates = support.fqn(&fqn);
+            let mut candidates = support.fqn(&fqn);
+            // The provider's lookup also answers relaxed spellings, which for a
+            // singleton fq name (`app.Settings$`) includes the class it is the
+            // companion of. The resolver named this exact fq name, so when the
+            // index holds it exactly, the relaxed spellings are not
+            // alternatives.
+            let exact: Vec<_> = candidates
+                .iter()
+                .filter(|unit| unit.fq_name() == fqn)
+                .cloned()
+                .collect();
+            if !exact.is_empty() {
+                candidates = exact;
+            }
             if candidates.is_empty() {
                 return no_type(
                     "no_indexed_type_definition",

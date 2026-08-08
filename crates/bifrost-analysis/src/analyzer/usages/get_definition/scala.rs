@@ -2334,7 +2334,8 @@ fn bounded_scala_resolve_type_node(
     node: Node<'_>,
 ) -> Option<CodeUnit> {
     let segments = bounded_scala_type_segments(ctx, node)?;
-    bounded_scala_resolve_segments(ctx, &segments, false)
+    // `X.type` denotes the singleton object's type, not the class named `X`.
+    bounded_scala_resolve_segments(ctx, &segments, node.kind() == "singleton_type")
 }
 
 fn bounded_scala_type_segments(

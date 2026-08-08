@@ -229,9 +229,11 @@ fn resolve_one<'a>(
 ///
 /// The structural-receiver resolver is the primary route: the same bounded core
 /// the receiver query dispatches through answers here under the caller's
-/// budget. Java and JS/TS run their receiver analysis elsewhere (a Java
-/// resolution session, the JS/TS syntax index), so they keep their own arms --
-/// but those arms take the same budget, and no arm runs unbounded.
+/// budget. Three languages keep their own bounded arms -- Java and JS/TS
+/// because their receiver analysis runs elsewhere (a Java resolution session,
+/// the JS/TS syntax index), and Rust because the interactive arm may cold-parse
+/// a declaration's file where the receiver query's cache refuses to. Every arm
+/// takes the same budget; no arm runs unbounded.
 #[allow(clippy::too_many_arguments)]
 fn bounded_type_resolution(
     analyzer: &dyn IAnalyzer,
@@ -243,34 +245,37 @@ fn bounded_type_resolution(
     site: &ResolvedReferenceSite,
     budget: ReceiverAnalysisBudget,
 ) -> Option<BoundedResolution<TypeLookupOutcome>> {
-    let language_support = language_support(language)?;
-    if let Some(resolver) = language_support.structural_receiver() {
-        return Some(resolver.resolve_type_bounded(BoundedReceiverQuery {
-            analyzer,
-            file,
-            source,
-            tree,
-            site,
-            budget,
-            cancellation: None,
-        }));
-    }
     match language {
+        Language::Rust => {
+            return Some(rust::resolve_rust_type_interactive(
+                analyzer, file, source, tree, site, budget, None,
+            ));
+        }
         Language::Java => {
             support.set_language(language);
             let session = JavaResolutionSession::bounded(support, budget, None);
-            Some(java::resolve_java_type_bounded(
+            return Some(java::resolve_java_type_bounded(
                 analyzer, &session, file, source, tree, site,
-            ))
+            ));
         }
         Language::JavaScript | Language::TypeScript => {
             support.set_language(language);
-            Some(js_ts::resolve_js_ts_type_bounded(
+            return Some(js_ts::resolve_js_ts_type_bounded(
                 analyzer, support, file, language, source, tree, site, budget, None,
-            ))
+            ));
         }
-        _ => None,
+        _ => {}
     }
+    let resolver = language_support(language)?.structural_receiver()?;
+    Some(resolver.resolve_type_bounded(BoundedReceiverQuery {
+        analyzer,
+        file,
+        source,
+        tree,
+        site,
+        budget,
+        cancellation: None,
+    }))
 }
 
 fn finish_lookup_outcome(
@@ -384,4 +389,73 @@ pub(super) fn sort_units(units: &mut [CodeUnit]) {
             .cmp(&right.fq_name())
             .then_with(|| left.source().cmp(right.source()))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::AnalyzerFixture;
+
+    const SOURCE: &str = r#"
+namespace Demo;
+public class Product {}
+public class Consumer
+{
+    public void Run(Product product) { product.ToString(); }
+}
+"#;
+
+    fn lookup_with_budget(budget: ReceiverAnalysisBudget) -> TypeLookupOutcome {
+        let fixture = AnalyzerFixture::new_for_language(Language::CSharp, &[("Budget.cs", SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "Budget.cs");
+        let start = SOURCE.find("product.ToString()").expect("expression");
+        let mut outcomes = resolve_type_batch_with_budget(
+            fixture.analyzer.analyzer(),
+            vec![TypeLookupRequest {
+                file,
+                source: None,
+                line: None,
+                column: None,
+                start_byte: Some(start),
+                end_byte: Some(start + "product".len()),
+            }],
+            budget,
+        );
+        assert_eq!(outcomes.len(), 1);
+        outcomes.pop().unwrap()
+    }
+
+    /// Exhausting a budget axis is a typed incomplete outcome that names the
+    /// axis, not a silent "no type": the caller can tell an unfinished lookup
+    /// apart from a proven absence.
+    #[test]
+    fn budget_exhaustion_is_a_typed_outcome_naming_the_axis() {
+        let outcome = lookup_with_budget(ReceiverAnalysisBudget::tiny());
+        assert_eq!(
+            outcome.status,
+            TypeLookupStatus::ExceededBudget(ReceiverBudgetLimit::ScopeNodes),
+            "{outcome:#?}"
+        );
+        assert_eq!(outcome.status.as_str(), "exceeded_budget");
+        assert!(outcome.types.is_empty(), "{outcome:#?}");
+        assert_eq!(outcome.diagnostics.len(), 1, "{outcome:#?}");
+        assert_eq!(
+            outcome.diagnostics[0].kind, "resolution_budget_exhausted",
+            "{outcome:#?}"
+        );
+        assert!(
+            outcome.diagnostics[0].message.contains("scope_nodes"),
+            "{outcome:#?}"
+        );
+    }
+
+    /// The same lookup the tiny budget cuts off completes under the interactive
+    /// budget: exhaustion above is a property of the budget, not the fixture.
+    #[test]
+    fn the_interactive_budget_completes_what_the_tiny_budget_cannot() {
+        let outcome = lookup_with_budget(INTERACTIVE_TYPE_LOOKUP_BUDGET);
+        assert_eq!(outcome.status, TypeLookupStatus::Resolved, "{outcome:#?}");
+        assert_eq!(outcome.types.len(), 1, "{outcome:#?}");
+        assert_eq!(outcome.types[0].fqn, "Demo.Product", "{outcome:#?}");
+    }
 }
