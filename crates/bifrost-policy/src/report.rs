@@ -1022,6 +1022,8 @@ pub enum PolicyReportDiagnosticCode {
     SuppressionAuditRetentionExceeded,
     ScopeLoadFailed,
     ScopeAuditRetentionExceeded,
+    PacksLoadFailed,
+    PackActivationFailed,
     PolicyLoadFailed,
     PolicyParseFailed,
     PolicyValidationFailed,
@@ -1733,6 +1735,144 @@ impl RetainedSize for PolicyDiffReview {
     }
 }
 
+/// Upper bound on retained pack-activation decisions in one review.
+///
+/// The truncation flag stays exact; only the entry list truncates, mirroring
+/// the report's other bounded collections.
+pub(crate) const MAX_PACK_ACTIVATION_DECISIONS: usize = 128;
+
+/// How one pack or discovered dependency fared at activation (#1868, #1884).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyPackDecisionStatus {
+    /// The pack activated for this run.
+    Selected,
+    /// A pack names the dependency but pins another exact version; the
+    /// reason names the installed and required versions.
+    VersionMismatch,
+    /// No pack exists for the dependency.
+    Missing,
+    /// A pack was found but its compatibility or selector rejected the
+    /// workspace evidence.
+    Incompatible,
+    /// A pack was rejected for another stated reason, for example a disable
+    /// control or a required review.
+    Rejected,
+}
+
+/// One pack-activation decision retained for attribution.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct PolicyPackDecision {
+    pack: String,
+    status: PolicyPackDecisionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl PolicyPackDecision {
+    pub(crate) const fn new(
+        pack: String,
+        status: PolicyPackDecisionStatus,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            pack,
+            status,
+            reason,
+        }
+    }
+
+    pub fn pack(&self) -> &str {
+        &self.pack
+    }
+
+    pub const fn status(&self) -> PolicyPackDecisionStatus {
+        self.status
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+}
+
+impl RetainedSize for PolicyPackDecision {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.pack.capacity())
+            .saturating_add(self.reason.as_ref().map_or(0, String::capacity))
+    }
+}
+
+/// Top-level audit of the document-driven pack activation for one evaluation
+/// (#1868). Present only when a `.bifrost/packs.json` document configured
+/// activation, so a run without one keeps its exact schema-version-3 shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PolicyPackActivationReview {
+    document_path: String,
+    ecosystems: Vec<String>,
+    complete: bool,
+    decisions: Vec<PolicyPackDecision>,
+    decisions_truncated: bool,
+}
+
+impl PolicyPackActivationReview {
+    pub(crate) fn new(
+        document_path: String,
+        ecosystems: Vec<String>,
+        complete: bool,
+        mut decisions: Vec<PolicyPackDecision>,
+    ) -> Self {
+        decisions.sort();
+        decisions.dedup();
+        let decisions_truncated = decisions.len() > MAX_PACK_ACTIVATION_DECISIONS;
+        decisions.truncate(MAX_PACK_ACTIVATION_DECISIONS);
+        tighten_vec(&mut decisions);
+        Self {
+            document_path,
+            ecosystems,
+            complete,
+            decisions,
+            decisions_truncated,
+        }
+    }
+
+    pub fn document_path(&self) -> &str {
+        &self.document_path
+    }
+
+    /// The activated ecosystem labels, in stable order.
+    pub fn ecosystems(&self) -> &[String] {
+        &self.ecosystems
+    }
+
+    /// Whether discovery, preparation, and publication all completed.
+    pub const fn complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn decisions(&self) -> &[PolicyPackDecision] {
+        &self.decisions
+    }
+
+    pub const fn decisions_truncated(&self) -> bool {
+        self.decisions_truncated
+    }
+}
+
+impl RetainedSize for PolicyPackActivationReview {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.document_path.capacity())
+            .saturating_add(
+                self.ecosystems
+                    .iter()
+                    .map(|ecosystem| size_of::<String>().saturating_add(ecosystem.capacity()))
+                    .fold(0_usize, usize::saturating_add),
+            )
+            .saturating_add(retained_extra(&self.decisions))
+    }
+}
+
 /// The sole canonical input to every policy-report renderer.
 #[derive(Debug, Clone)]
 pub struct PolicyReportDocument {
@@ -1744,6 +1884,7 @@ pub struct PolicyReportDocument {
     suppressions: Vec<PolicySuppressionReview>,
     scope: Vec<PolicyScopeReview>,
     diff: Option<PolicyDiffReview>,
+    packs: Option<PolicyPackActivationReview>,
     diagnostics: Vec<PolicyReportDiagnostic>,
     diagnostics_truncated: bool,
     omitted_diagnostics_lower_bound: u64,
@@ -1804,6 +1945,7 @@ impl PolicyReportDocument {
             suppressions,
             Vec::new(),
             None,
+            None,
             diagnostics,
             diagnostics_truncated,
             omitted_diagnostics_lower_bound,
@@ -1820,6 +1962,7 @@ impl PolicyReportDocument {
         mut suppressions: Vec<PolicySuppressionReview>,
         mut scope: Vec<PolicyScopeReview>,
         diff: Option<PolicyDiffReview>,
+        packs: Option<PolicyPackActivationReview>,
         mut diagnostics: Vec<PolicyReportDiagnostic>,
         diagnostics_truncated: bool,
         omitted_diagnostics_lower_bound: u64,
@@ -1855,6 +1998,7 @@ impl PolicyReportDocument {
             suppressions,
             scope,
             diff,
+            packs,
             diagnostics,
             diagnostics_truncated,
             omitted_diagnostics_lower_bound,
@@ -1898,6 +2042,10 @@ impl PolicyReportDocument {
         self.diff.as_ref()
     }
 
+    pub const fn packs(&self) -> Option<&PolicyPackActivationReview> {
+        self.packs.as_ref()
+    }
+
     pub fn diagnostics(&self) -> &[PolicyReportDiagnostic] {
         &self.diagnostics
     }
@@ -1920,9 +2068,10 @@ impl Serialize for PolicyReportDocument {
     where
         S: Serializer,
     {
-        // The `diff` field is additive and serialized only when present, so a
-        // non-diff report keeps its exact schema-version-3 shape.
-        let field_count = 11 + usize::from(self.diff.is_some());
+        // The `diff` and `packs` fields are additive and serialized only when
+        // present, so a report without them keeps its exact schema-version-3
+        // shape.
+        let field_count = 11 + usize::from(self.diff.is_some()) + usize::from(self.packs.is_some());
         let mut state = serializer.serialize_struct("PolicyReportDocument", field_count)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("evaluation", &self.evaluation)?;
@@ -1933,6 +2082,9 @@ impl Serialize for PolicyReportDocument {
         state.serialize_field("scope", &self.scope)?;
         if let Some(diff) = &self.diff {
             state.serialize_field("diff", diff)?;
+        }
+        if let Some(packs) = &self.packs {
+            state.serialize_field("packs", packs)?;
         }
         state.serialize_field("diagnostics", &self.diagnostics)?;
         state.serialize_field("diagnostics_truncated", &self.diagnostics_truncated)?;
@@ -1958,6 +2110,7 @@ impl RetainedSize for PolicyReportDocument {
             .saturating_add(retained_extra(&self.suppressions))
             .saturating_add(retained_extra(&self.scope))
             .saturating_add(retained_extra(&self.diff))
+            .saturating_add(retained_extra(&self.packs))
             .saturating_add(retained_extra(&self.diagnostics))
     }
 }
@@ -2128,6 +2281,7 @@ pub struct PolicyReportBuilder {
     suppressions: Vec<PolicySuppressionReview>,
     scope: Vec<PolicyScopeReview>,
     diff: Option<PolicyDiffReview>,
+    packs: Option<PolicyPackActivationReview>,
     diagnostics: Vec<PolicyReportDiagnostic>,
     diagnostics_truncated: bool,
     omitted_diagnostics_lower_bound: u64,
@@ -2248,6 +2402,7 @@ impl PolicyReportBuilder {
             suppressions,
             scope,
             diff: None,
+            packs: None,
             diagnostics,
             diagnostics_truncated: false,
             omitted_diagnostics_lower_bound: 0,
@@ -2439,6 +2594,7 @@ impl PolicyReportBuilder {
             &self.diagnostics,
         )
         .checked_add(self.diff_extra())
+        .and_then(|bytes| bytes.checked_add(self.packs_extra()))
         .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if !policy_fits || !batch_fits {
@@ -2489,6 +2645,7 @@ impl PolicyReportBuilder {
             &self.diagnostics,
         )
         .checked_add(self.diff_extra())
+        .and_then(|bytes| bytes.checked_add(self.packs_extra()))
         .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if cap_reached || !policy_fits || !batch_fits {
@@ -2525,6 +2682,7 @@ impl PolicyReportBuilder {
             &diagnostics,
         )
         .checked_add(self.diff_extra())
+        .and_then(|bytes| bytes.checked_add(self.packs_extra()))
         .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if !fits {
@@ -2597,6 +2755,7 @@ impl PolicyReportBuilder {
             self.suppressions,
             self.scope,
             self.diff,
+            self.packs,
             self.diagnostics,
             self.diagnostics_truncated,
             self.omitted_diagnostics_lower_bound,
@@ -2624,6 +2783,7 @@ impl PolicyReportBuilder {
             &self.diagnostics,
         )
         .saturating_add(self.diff_extra())
+        .saturating_add(self.packs_extra())
         .saturating_add(retained_extra(&execution));
         if retained > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::BatchRetentionExceeded {
@@ -2650,6 +2810,7 @@ impl PolicyReportBuilder {
             &self.diagnostics,
         )
         .saturating_add(retained_extra(&self.execution))
+        .saturating_add(self.packs_extra())
         .saturating_add(retained_extra(&diff));
         if retained > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::BatchRetentionExceeded {
@@ -2661,8 +2822,45 @@ impl PolicyReportBuilder {
         Ok(())
     }
 
+    /// Retain the pack-activation review for this report.
+    ///
+    /// The review is bounded by construction; charging it against the batch
+    /// budget keeps every later retention decision aware of its bytes.
+    pub fn set_packs(
+        &mut self,
+        packs: PolicyPackActivationReview,
+    ) -> Result<(), PolicyReportBuilderError> {
+        assert!(
+            self.packs.is_none(),
+            "pack-activation review is set at most once"
+        );
+        let retained = report_storage_size(
+            &self.evaluation,
+            &self.rules,
+            &self.runs,
+            &self.suppressions,
+            &self.scope,
+            &self.diagnostics,
+        )
+        .saturating_add(retained_extra(&self.execution))
+        .saturating_add(self.diff_extra())
+        .saturating_add(retained_extra(&packs));
+        if retained > self.budget.max_retained_report_bytes() {
+            return Err(PolicyReportBuilderError::BatchRetentionExceeded {
+                retained_bytes: retained,
+                max_bytes: self.budget.max_retained_report_bytes(),
+            });
+        }
+        self.packs = Some(packs);
+        Ok(())
+    }
+
     fn diff_extra(&self) -> usize {
         self.diff.as_ref().map_or(0, retained_extra)
+    }
+
+    fn packs_extra(&self) -> usize {
+        self.packs.as_ref().map_or(0, retained_extra)
     }
 
     fn ensure_input_slot(&self) -> Result<(), PolicyReportBuilderError> {
@@ -2708,6 +2906,7 @@ impl PolicyReportBuilder {
             diagnostics,
         )
         .checked_add(self.diff_extra())
+        .and_then(|value| value.checked_add(self.packs_extra()))
         .and_then(|value| value.checked_add(outstanding_skeleton_allowance))
         .and_then(|value| value.checked_add(emergency))
         .ok_or(PolicyReportBuilderError::RetainedSizeOverflow)?;
@@ -2776,7 +2975,8 @@ impl PolicyReportBuilder {
             &self.scope,
             &self.diagnostics,
         )
-        .saturating_add(self.diff_extra());
+        .saturating_add(self.diff_extra())
+        .saturating_add(self.packs_extra());
         if actual > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::EmergencyReservationInvariant);
         }
@@ -3507,6 +3707,14 @@ mod tests {
             serde_json::to_value(PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded)
                 .unwrap(),
             json!("workspace-snapshot-deadline-exceeded")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::PacksLoadFailed).unwrap(),
+            json!("packs-load-failed")
+        );
+        assert_eq!(
+            serde_json::to_value(PolicyReportDiagnosticCode::PackActivationFailed).unwrap(),
+            json!("pack-activation-failed")
         );
     }
 

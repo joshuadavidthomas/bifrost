@@ -14,9 +14,15 @@ use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::FileSetProject;
+use brokk_bifrost_analysis::analyzer::packs_document::{
+    WORKSPACE_PACKS_DOCUMENT_PATH, WorkspacePacksActivation, WorkspacePacksConfig,
+    activate_workspace_packs, load_workspace_packs_config, load_workspace_packs_config_at,
+};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
+    ActiveSemanticModelShard, SemanticModelActivationExplanation,
     SemanticModelActivationPersistence, SemanticModelActivationRequest,
-    SemanticModelRuntimeOutcome, SemanticPackCatalog, acquire_active_semantic_models,
+    SemanticModelActivationStatus, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+    acquire_active_semantic_models,
 };
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
@@ -38,10 +44,10 @@ use super::loading::{PolicyDocumentLoadError, read_rqlp_document};
 use super::registry::{PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits};
 use super::report::{
     MAX_DIFF_FIXED_FINDINGS, PolicyDiffFixedFinding, PolicyDiffReview, PolicyExecutionMetadata,
-    PolicyExecutionStage, PolicyExecutionTermination, PolicyReportBuilder,
-    PolicyReportBuilderError, PolicyReportDiagnostic, PolicyReportDiagnosticCode,
-    PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange,
-    PolicyStageTiming,
+    PolicyExecutionStage, PolicyExecutionTermination, PolicyPackActivationReview,
+    PolicyPackDecision, PolicyPackDecisionStatus, PolicyReportBuilder, PolicyReportBuilderError,
+    PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
+    PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange, PolicyStageTiming,
 };
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
@@ -579,6 +585,7 @@ fn deadline_before_evaluation_outcome(
         Vec::new(),
         Vec::new(),
         None,
+        None,
         diagnostics,
         false,
         0,
@@ -706,6 +713,128 @@ fn analyzed_source_volume(workspace: &WorkspaceAnalyzer) -> (u64, usize) {
     (bytes, files.len())
 }
 
+/// Project one document-driven activation transaction into the report's
+/// pack-activation review (#1868, #1884).
+///
+/// `None` activation means the document named no ecosystem that serves a
+/// language present in the workspace; the review still records the document
+/// so the opt-in is auditable.
+fn pack_activation_review(
+    config: &WorkspacePacksConfig,
+    activation: Option<&WorkspacePacksActivation>,
+) -> PolicyPackActivationReview {
+    let Some(activation) = activation else {
+        return PolicyPackActivationReview::new(
+            WORKSPACE_PACKS_DOCUMENT_PATH.to_owned(),
+            config
+                .ecosystems()
+                .iter()
+                .map(|ecosystem| ecosystem.label().to_owned())
+                .collect(),
+            true,
+            Vec::new(),
+        );
+    };
+    let mut decisions = Vec::new();
+    for ecosystem in &activation.outcome.ecosystems {
+        let Some(preparation) = &ecosystem.preparation else {
+            continue;
+        };
+        for pack in &preparation.packs {
+            decisions.push(PolicyPackDecision::new(
+                pack.dependency_id.clone(),
+                PolicyPackDecisionStatus::Selected,
+                None,
+            ));
+        }
+        for pack in &preparation.installed_packs {
+            decisions.push(PolicyPackDecision::new(
+                pack.dependency_id.clone(),
+                PolicyPackDecisionStatus::Selected,
+                None,
+            ));
+        }
+        for diagnostic in &preparation.diagnostics {
+            let status = match diagnostic.code.as_str() {
+                "dependency.pack_version_mismatch" => PolicyPackDecisionStatus::VersionMismatch,
+                "dependency.pack_unavailable" => PolicyPackDecisionStatus::Missing,
+                _ => continue,
+            };
+            decisions.push(PolicyPackDecision::new(
+                diagnostic
+                    .dependency_id
+                    .clone()
+                    .unwrap_or_else(|| diagnostic.code.clone()),
+                status,
+                Some(diagnostic.message.clone()),
+            ));
+        }
+    }
+    match &activation.outcome.runtime {
+        Some(SemanticModelRuntimeOutcome::Ready { active, .. }) => {
+            record_active_shards(&mut decisions, active.shards());
+            record_explanations(&mut decisions, &active.activation_report().explanations);
+        }
+        Some(SemanticModelRuntimeOutcome::Incomplete { usable, report }) => {
+            if let Some(active) = usable {
+                record_active_shards(&mut decisions, active.shards());
+            }
+            record_explanations(&mut decisions, &report.explanations);
+        }
+        Some(
+            SemanticModelRuntimeOutcome::Cancelled(report)
+            | SemanticModelRuntimeOutcome::Unavailable(report),
+        ) => record_explanations(&mut decisions, &report.explanations),
+        None => {}
+    }
+    PolicyPackActivationReview::new(
+        WORKSPACE_PACKS_DOCUMENT_PATH.to_owned(),
+        activation
+            .ecosystems
+            .iter()
+            .map(|ecosystem| ecosystem.label().to_owned())
+            .collect(),
+        activation.outcome.complete(),
+        decisions,
+    )
+}
+
+fn record_active_shards(
+    decisions: &mut Vec<PolicyPackDecision>,
+    shards: &[ActiveSemanticModelShard],
+) {
+    for shard in shards {
+        decisions.push(PolicyPackDecision::new(
+            format!("{}@{}", shard.manifest.pack_id, shard.manifest.version),
+            PolicyPackDecisionStatus::Selected,
+            None,
+        ));
+    }
+}
+
+fn record_explanations(
+    decisions: &mut Vec<PolicyPackDecision>,
+    explanations: &[SemanticModelActivationExplanation],
+) {
+    for explanation in explanations {
+        let status = match explanation.status {
+            SemanticModelActivationStatus::Active => PolicyPackDecisionStatus::Selected,
+            SemanticModelActivationStatus::Incompatible => PolicyPackDecisionStatus::Incompatible,
+            _ => PolicyPackDecisionStatus::Rejected,
+        };
+        let reason =
+            (status != PolicyPackDecisionStatus::Selected).then(|| explanation.reason.clone());
+        decisions.push(PolicyPackDecision::new(
+            explanation
+                .pack_id
+                .clone()
+                .unwrap_or_else(|| explanation.manifest_digest.clone()),
+            status,
+            reason,
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_prepared_policy_inputs(
     root: &Path,
@@ -796,6 +925,23 @@ fn evaluate_prepared_policy_inputs(
                 (None, PolicyScopeDocumentState::Invalid)
             }
         };
+    // The workspace packs document opts this evaluation into dependency and
+    // stdlib semantic-pack activation (#1868). A malformed document is loud:
+    // its diagnostic makes the run unreliable rather than silently evaluating
+    // without the configured packs.
+    let packs_config = match load_workspace_packs_config(read_root) {
+        Ok(config) => config,
+        Err(error) => {
+            secondary_diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::PacksLoadFailed,
+                format!("failed to load the workspace packs document: {error}"),
+                Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
+                None,
+                Vec::new(),
+            )?);
+            None
+        }
+    };
     if policy_deadline_reached(cancellation)? {
         return deadline_before_evaluation_outcome(
             options,
@@ -994,6 +1140,35 @@ fn evaluate_prepared_policy_inputs(
     };
     let uncancelled = CancellationToken::default();
     let semantic_cancellation = cancellation.unwrap_or(&uncancelled);
+    // Document-driven pack activation runs only on the coordinator's own
+    // analyzer: a supplied workspace belongs to a host that owns its own
+    // activation lifecycle (LSP, MCP), and re-activating here would race it.
+    // The diff-base run activates against its exported base tree inside
+    // `evaluate_policy_diff_baseline` for the same ownership reason.
+    let packs_review = match (&packs_config, owned_analyzer.as_ref()) {
+        (Some(config), Some(analyzer_workspace)) => {
+            match activate_workspace_packs(
+                analyzer_workspace,
+                &AnalyzerConfig::default(),
+                root,
+                config,
+                semantic_cancellation,
+            ) {
+                Ok(activation) => Some(pack_activation_review(config, activation.as_ref())),
+                Err(error) => {
+                    secondary_diagnostics.push(report_diagnostic(
+                        PolicyReportDiagnosticCode::PackActivationFailed,
+                        format!("failed to activate workspace packs: {error}"),
+                        Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
+                        None,
+                        Vec::new(),
+                    )?);
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let active_semantic_models = match semantic_models {
         None => Ok(None),
         Some(context) => {
@@ -1239,6 +1414,13 @@ fn evaluate_prepared_policy_inputs(
             PolicyCoordinatorError::new(format!("failed to retain the policy diff review: {error}"))
         })?;
     }
+    if let Some(review) = packs_review {
+        builder.set_packs(review).map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to retain the pack-activation review: {error}"
+            ))
+        })?;
+    }
     let mut retained_findings = Vec::new();
     for input in inputs {
         if policy_deadline_reached(cancellation)? {
@@ -1471,6 +1653,34 @@ fn evaluate_policy_diff_baseline(
                 "failed to build the diff base analyzer for `{revision}`: {error}"
             ))
         })?;
+    // The base activates the packs its own committed document names, the same
+    // way it loads its own committed suppressions (#1868). The catalog is
+    // machine-local infrastructure, not revision state, so its configured
+    // path resolves beneath the head workspace, where installed packs and
+    // generated productions already live. A malformed base document is not
+    // handled here: the base evaluation loads the same document, reports
+    // `packs-load-failed`, and the baseline degrades through the standard
+    // unreliability path.
+    if let Ok(Some(base_packs)) = load_workspace_packs_config_at(export.root()) {
+        let uncancelled = CancellationToken::default();
+        if let Err(error) = activate_workspace_packs(
+            &base_workspace,
+            &AnalyzerConfig::default(),
+            head_root,
+            &base_packs,
+            cancellation.unwrap_or(&uncancelled),
+        ) {
+            return Ok(PolicyDiffBaseline {
+                requested_revision: revision.to_string(),
+                resolved_commit: export.commit_id().to_string(),
+                identities: HashMap::new(),
+                unreliable_detail: Some(format!(
+                    "base pack activation failed, so base findings would misstate the configured \
+                     external surface: {error}"
+                )),
+            });
+        }
+    }
     // The base run needs raw identities only: no diff base (which would
     // recurse), no gating threshold, and the head's suppression and scope
     // configuration deliberately not forwarded.

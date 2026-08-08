@@ -15,10 +15,11 @@ use crate::{
     FindingIdentityStability, FindingSeverity, OrganizationalRiskAssessment, PolicyAnalysisType,
     PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyDiffReview, PolicyDisplayRegion,
     PolicyEvaluationDate, PolicyFinding, PolicyFindingEvidence, PolicyFindingSuppression,
-    PolicyLevel, PolicyReportDiagnostic, PolicyReportDocument, PolicyReportEvaluationContext,
-    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec,
-    PolicySourceLocation, PolicySuppressionPolicyHashState, PolicySuppressionReview,
-    PolicyWorkReport, ProofMetadata, RelatedPolicyLocation, WitnessStep, WitnessStepKind,
+    PolicyLevel, PolicyPackActivationReview, PolicyReportDiagnostic, PolicyReportDocument,
+    PolicyReportEvaluationContext, PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion,
+    PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation, PolicySuppressionPolicyHashState,
+    PolicySuppressionReview, PolicyWorkReport, ProofMetadata, RelatedPolicyLocation, WitnessStep,
+    WitnessStepKind,
 };
 
 const SARIF_SCHEMA_URI: &str =
@@ -941,6 +942,11 @@ struct SarifRunProperties<'a> {
         skip_serializing_if = "Option::is_none"
     )]
     diff_baseline: Option<&'a PolicyDiffReview>,
+    #[serde(
+        rename = "bifrost.packActivation",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pack_activation: Option<&'a PolicyPackActivationReview>,
     #[serde(rename = "bifrost.reportDiagnostics")]
     report_diagnostics: &'a [PolicyReportDiagnostic],
     #[serde(rename = "bifrost.reportDiagnosticsTruncated")]
@@ -962,6 +968,7 @@ impl<'a> SarifRunProperties<'a> {
             policy_runs: SarifPolicyRuns(report.runs()),
             suppressions: report.suppressions(),
             diff_baseline: report.diff(),
+            pack_activation: report.packs(),
             report_diagnostics: report.diagnostics(),
             diagnostics_truncated: report.diagnostics_truncated(),
             omitted_diagnostics_lower_bound: report.omitted_diagnostics_lower_bound(),
