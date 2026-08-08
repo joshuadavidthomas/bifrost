@@ -27,8 +27,7 @@ use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver, analyzable_file_count,
-    fqn_bulk_nodes, overloaded_function_fqns,
+    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
@@ -36,9 +35,7 @@ use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_scala_bounded,
 };
-use crate::analyzer::usages::get_type::{
-    TypeLookupOutcome, resolve_scala_type, resolve_scala_type_bounded,
-};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_scala_type_bounded};
 use crate::analyzer::usages::scala_graph::{
     ScalaDeadCodeBulkContext, ScalaDeadCodeBulkEligibility, ScalaUsageGraphStrategy,
     build_full_scala_usage_edges, build_scala_usage_edge_weights, build_scala_usage_edges,
@@ -1463,10 +1460,6 @@ impl LanguageSupport for ScalaSupport {
         Some(&ScalaSupport)
     }
 
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
-        Some(&ScalaSupport)
-    }
-
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
         language::LANGUAGE.into()
     }
@@ -1528,20 +1521,6 @@ impl StructuralReceiverResolver for ScalaSupport {
             query.site,
             query.budget,
             query.cancellation,
-        )
-    }
-}
-
-impl TypeLookupResolver for ScalaSupport {
-    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
-        query.support.set_language(query.language);
-        resolve_scala_type(
-            query.analyzer,
-            query.support,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
         )
     }
 }

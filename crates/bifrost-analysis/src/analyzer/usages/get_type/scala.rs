@@ -1,7 +1,7 @@
 use super::{TypeLookupOutcome, candidates_outcome_with_target_kind, no_type};
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, ResolutionSession, ScalaDefinitionProvider, ScalaTypeLookupResolution,
-    scala_type_lookup_resolution, scala_type_lookup_resolution_in_session,
+    scala_type_lookup_resolution_in_session,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
@@ -10,17 +10,6 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
-
-pub(crate) fn resolve_scala_type(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-) -> TypeLookupOutcome {
-    resolve_scala_type_with_support(analyzer, support, file, source, tree, site)
-}
 
 pub(crate) fn resolve_scala_type_bounded(
     analyzer: &dyn IAnalyzer,
@@ -58,28 +47,6 @@ pub(crate) fn resolve_scala_type_bounded(
     session.finish(outcome)
 }
 
-fn resolve_scala_type_with_support(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-) -> TypeLookupOutcome {
-    let Some(_scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
-        return no_type(
-            "scala_analyzer_unavailable",
-            "Scala analyzer is unavailable",
-        );
-    };
-    let Some(tree) = tree else {
-        return no_type("scala_parse_failed", "Scala source could not be parsed");
-    };
-    let resolution =
-        scala_type_lookup_resolution(analyzer, support, file, source, tree.root_node(), site);
-    scala_type_resolution_outcome(support, site, resolution)
-}
-
 fn scala_type_resolution_outcome(
     support: &dyn BoundedDefinitionLookup,
     site: &ResolvedReferenceSite,
@@ -96,7 +63,20 @@ fn scala_type_resolution_outcome(
     };
     match resolution {
         ScalaTypeLookupResolution::Type { fqn, target_kind } => {
-            let candidates = support.fqn(&fqn);
+            let mut candidates = support.fqn(&fqn);
+            // The provider's lookup also answers relaxed spellings, which for a
+            // singleton fq name (`app.Settings$`) includes the class it is the
+            // companion of. The resolver named this exact fq name, so when the
+            // index holds it exactly, the relaxed spellings are not
+            // alternatives.
+            let exact: Vec<_> = candidates
+                .iter()
+                .filter(|unit| unit.fq_name() == fqn)
+                .cloned()
+                .collect();
+            if !exact.is_empty() {
+                candidates = exact;
+            }
             if candidates.is_empty() {
                 return no_type(
                     "no_indexed_type_definition",

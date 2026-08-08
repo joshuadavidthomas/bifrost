@@ -1697,6 +1697,16 @@ fn policy_mode_is_exclusive_and_output_failures_use_status_two_without_clobberin
         vec![
             "--policy-file",
             "policies/dynamic-eval.rqlp",
+            "--diff-base",
+            "HEAD",
+            "--diff-base",
+            "HEAD~1",
+        ],
+        vec!["--policy-file", "policies/dynamic-eval.rqlp", "--diff-base"],
+        vec!["--list-policies", "--diff-base", "HEAD"],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
             "--format",
             "json",
             "--verbose",
@@ -1842,5 +1852,269 @@ fn output_path_may_be_outside_the_analyzed_workspace() {
         String::from_utf8(file_output)
             .unwrap()
             .contains("Dynamic evaluation is forbidden")
+    );
+}
+
+const DIFF_GATE_POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "test.diff-gate"
+  :name "Diff gate"
+  :message "Avoid target"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql :schema-version 1
+          (language typescript (function :name "target")))))"#;
+
+const DIFF_GATE_ARGS: &[&str] = &[
+    "--policy-file",
+    "policies/diff-gate.rqlp",
+    "--evaluation-date",
+    "2026-07-27",
+    "--fail-on",
+    "warning",
+];
+
+/// One committed finding in `app.ts`; the policy file itself is committed too.
+fn committed_diff_project() -> BuiltInlineTestProject {
+    let project = InlineTestProject::new()
+        .file("app.ts", "export function target() { return 1; }\n")
+        .file("policies/diff-gate.rqlp", DIFF_GATE_POLICY)
+        .build();
+    crate::common::init_git_repo_with_identity(project.root());
+    crate::common::run_git(project.root(), &["add", "."]);
+    crate::common::run_git(project.root(), &["commit", "-m", "base"]);
+    project
+}
+
+fn diff_args<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = DIFF_GATE_ARGS.to_vec();
+    args.extend_from_slice(extra);
+    args
+}
+
+#[test]
+fn diff_base_narrows_the_gate_to_new_findings_across_formats() {
+    let project = committed_diff_project();
+
+    // Committed-only worktree: the persisting finding gates without the flag
+    // and stops gating with it.
+    let full = run(project.root(), &diff_args(&["--format", "json"]));
+    assert_status(&full, 1);
+    let full = json_stdout(&full);
+    assert!(full.get("diff").is_none());
+    assert!(full["runs"][0]["findings"][0].get("diff").is_none());
+    let clean = run(project.root(), &diff_args(&["--diff-base", "HEAD"]));
+    assert_status(&clean, 0);
+    assert!(
+        String::from_utf8_lossy(&clean.stdout)
+            .contains("; diff: 0 new, 1 persisting, 0 fixed against HEAD")
+    );
+
+    // One new uncommitted finding gates, and all three formats agree on the
+    // classification.
+    fs::write(
+        project.root().join("extra.ts"),
+        "export function target() { return 2; }\n",
+    )
+    .expect("new offending source");
+    let json = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "json"]),
+    );
+    assert_status(&json, 1);
+    let report = json_stdout(&json);
+    assert_eq!(report["diff"]["new_count"], 1);
+    assert_eq!(report["diff"]["persisting_count"], 1);
+    assert_eq!(report["diff"]["fixed_count"], 0);
+    assert_eq!(report["diff"]["degraded"], false);
+    for finding in report["runs"][0]["findings"].as_array().expect("findings") {
+        let expected = match finding["primary"]["path"].as_str().expect("path") {
+            "app.ts" => "persisting",
+            "extra.ts" => "new",
+            other => panic!("unexpected finding path {other}"),
+        };
+        assert_eq!(finding["diff"]["disposition"], expected);
+    }
+
+    let sarif = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "sarif"]),
+    );
+    assert_status(&sarif, 1);
+    let sarif = json_stdout(&sarif);
+    for result in sarif["runs"][0]["results"].as_array().expect("results") {
+        let uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            .as_str()
+            .expect("uri");
+        let expected = match uri {
+            "app.ts" => "unchanged",
+            "extra.ts" => "new",
+            other => panic!("unexpected result uri {other}"),
+        };
+        assert_eq!(result["baselineState"], expected, "{result:#}");
+    }
+    assert_eq!(
+        sarif["runs"][0]["properties"]["bifrost.diffBaseline"]["new_count"],
+        1
+    );
+
+    let human = run(project.root(), &diff_args(&["--diff-base", "HEAD"]));
+    assert_status(&human, 1);
+    let human = String::from_utf8(human.stdout).expect("UTF-8 human output");
+    assert!(human.contains("extra.ts"), "{human}");
+    assert!(!human.contains("app.ts"), "{human}");
+    assert!(
+        human.contains("; diff: 1 new, 1 persisting, 0 fixed against HEAD"),
+        "{human}"
+    );
+}
+
+#[test]
+fn suppressed_new_finding_does_not_gate_in_diff_mode() {
+    let project = committed_diff_project();
+    fs::write(
+        project.root().join("extra.ts"),
+        "export function target() { return 2; }\n",
+    )
+    .expect("new offending source");
+    let baseline = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "json"]),
+    );
+    assert_status(&baseline, 1);
+    let baseline = json_stdout(&baseline);
+    let new_finding = baseline["runs"][0]["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|finding| finding["diff"]["disposition"] == "new")
+        .expect("one new finding");
+    let suppression_path = project.root().join(".bifrost/suppressions.json");
+    fs::create_dir_all(suppression_path.parent().unwrap()).unwrap();
+    fs::write(
+        &suppression_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "suppressions": [{
+                "policy_id": "test.diff-gate",
+                "finding_id": new_finding["id"],
+                "identity_stability": "strong",
+                "status": "accepted",
+                "reason": "Reviewed compatibility boundary",
+                "policy_hash_at_acceptance": baseline["rules"][0]["policy_hash"],
+                "accepted_by": "security-review",
+                "accepted_at": "2026-07-01",
+                "expires_at": "2026-07-27"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let suppressed = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "json"]),
+    );
+    assert_status(&suppressed, 0);
+    let suppressed = json_stdout(&suppressed);
+    // The classification is unchanged; only the gate is.
+    assert_eq!(suppressed["diff"]["new_count"], 1);
+    assert_eq!(suppressed["diff"]["persisting_count"], 1);
+}
+
+#[test]
+fn unreliable_diff_base_degrades_to_full_gating_with_a_loud_diagnostic() {
+    // The committed suppressions document is invalid, so the base evaluation
+    // is unreliable; the repaired working tree keeps the head reliable.
+    let project = InlineTestProject::new()
+        .file("app.ts", "export function target() { return 1; }\n")
+        .file("policies/diff-gate.rqlp", DIFF_GATE_POLICY)
+        .file(".bifrost/suppressions.json", "{ not json")
+        .build();
+    crate::common::init_git_repo_with_identity(project.root());
+    crate::common::run_git(project.root(), &["add", "."]);
+    crate::common::run_git(project.root(), &["commit", "-m", "base"]);
+    fs::remove_file(project.root().join(".bifrost/suppressions.json"))
+        .expect("repair working tree");
+
+    let output = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "json"]),
+    );
+    assert_status(&output, 2);
+    let report = json_stdout(&output);
+    assert_eq!(report["diff"]["degraded"], true);
+    assert_eq!(report["diff"]["new_count"], 0);
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "diff-base-unreliable"),
+        "{report:#}"
+    );
+    // Full gating: the finding carries no diff decision and still counts.
+    assert!(report["runs"][0]["findings"][0].get("diff").is_none());
+}
+
+#[test]
+fn unresolvable_diff_base_and_non_git_root_exit_two() {
+    let project = committed_diff_project();
+    let unresolvable = run(
+        project.root(),
+        &diff_args(&["--diff-base", "does-not-exist"]),
+    );
+    assert_status(&unresolvable, 2);
+    assert!(unresolvable.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&unresolvable.stderr).contains("does-not-exist"),
+        "{}",
+        String::from_utf8_lossy(&unresolvable.stderr)
+    );
+
+    let plain = InlineTestProject::new()
+        .file("app.ts", "export function target() { return 1; }\n")
+        .file("policies/diff-gate.rqlp", DIFF_GATE_POLICY)
+        .build();
+    let non_git = run(plain.root(), &diff_args(&["--diff-base", "HEAD"]));
+    assert_status(&non_git, 2);
+    assert!(
+        String::from_utf8_lossy(&non_git.stderr).contains("not inside a git repository"),
+        "{}",
+        String::from_utf8_lossy(&non_git.stderr)
+    );
+}
+
+/// Documents the accepted rename limitation: a pure rename re-keys every
+/// finding in the file, so the diff reports one fixed plus one new pair. A
+/// future rename-tracking improvement must change this test deliberately.
+#[test]
+fn pure_rename_currently_reports_fixed_plus_new() {
+    let project = committed_diff_project();
+    fs::rename(
+        project.root().join("app.ts"),
+        project.root().join("renamed.ts"),
+    )
+    .expect("rename tracked source");
+
+    let output = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "json"]),
+    );
+    assert_status(&output, 1);
+    let report = json_stdout(&output);
+    assert_eq!(report["diff"]["new_count"], 1);
+    assert_eq!(report["diff"]["persisting_count"], 0);
+    assert_eq!(report["diff"]["fixed_count"], 1);
+    assert_eq!(
+        report["runs"][0]["findings"][0]["primary"]["path"],
+        "renamed.ts"
+    );
+    assert_eq!(
+        report["runs"][0]["findings"][0]["diff"]["disposition"],
+        "new"
     );
 }

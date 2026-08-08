@@ -9,14 +9,14 @@ use super::super::{
     CvssEvidenceScope, CvssMetricEvidence, CvssNomenclature, CvssSeverity, CvssSystemScope,
     CvssUnscoredReason, CvssVersion, DirectoryScope, EndpointDefinitionSchemaResolution,
     EndpointObservationPhase, EndpointOrigin, EndpointRole, EndpointTaintSemantics, EvidenceRef,
-    FindingCertainty, FindingClassification, FindingCompleteness, FindingIdentityStability,
-    FindingIncompleteReason, FindingSeverity, MatchFindingAnchor, MatchResultDomain,
-    OrganizationalRiskAssessment, PolicyAnalysisType, PolicyCapability, PolicyDiagnosticImpact,
-    PolicyDiagnosticSeverity, PolicyEndpointBinding, PolicyFailureReason, PolicyFinding,
-    PolicyFindingEvidence, PolicyIncompleteReason, PolicyLevel, PolicyLocationRelationship,
-    PolicyMessageSpec, PolicyOverlayScope, PolicyQueryProof, PolicyQueryProvenance,
-    PolicyQueryResultRef, PolicyReportDocument, PolicyRuleDescriptor, PolicyRun,
-    PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec, PolicySourceLocation,
+    FindingCertainty, FindingClassification, FindingCompleteness, FindingDiffDisposition,
+    FindingIdentityStability, FindingIncompleteReason, FindingSeverity, MatchFindingAnchor,
+    MatchResultDomain, OrganizationalRiskAssessment, PolicyAnalysisType, PolicyCapability,
+    PolicyDiagnosticImpact, PolicyDiagnosticSeverity, PolicyEndpointBinding, PolicyFailureReason,
+    PolicyFinding, PolicyFindingEvidence, PolicyIncompleteReason, PolicyLevel,
+    PolicyLocationRelationship, PolicyMessageSpec, PolicyOverlayScope, PolicyQueryProof,
+    PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument, PolicyRuleDescriptor,
+    PolicyRun, PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec, PolicySourceLocation,
     PolicySuppressionDecision, PolicySuppressionMatchState, PolicySuppressionPolicyHashState,
     PolicySuppressionReview, PolicySuppressionTemporalState, ProofMetadata, ProofReason,
     ProofState, ResolvedEndpointDependency, ResolvedEndpointIdentity,
@@ -128,11 +128,18 @@ pub fn write_policy_human<W: Write>(
         .map_err(map_io_error)?;
     }
 
+    // In non-degraded diff mode the concise view shows only what this change
+    // introduced; persisting findings stay visible in the verbose audit view.
+    let diff_hides_persisting = report.diff().is_some_and(|review| !review.degraded());
     for run in report.runs() {
         for finding in run.findings() {
             match options.detail() {
                 HumanRenderDetail::Concise => {
-                    if finding.suppression().is_none() && finding.scope().is_none() {
+                    let persisting = diff_hides_persisting
+                        && finding.diff().is_some_and(|diff| {
+                            diff.disposition() == FindingDiffDisposition::Persisting
+                        });
+                    if finding.suppression().is_none() && finding.scope().is_none() && !persisting {
                         write_concise_finding(&mut output, finding, options.color())?;
                     }
                 }
@@ -269,6 +276,19 @@ fn write_finding<W: Write>(
             output,
             "  scope reason: {}",
             escape_terminal_text(scope.reason()),
+        )
+        .map_err(map_io_error)?;
+    }
+    if let Some(diff) = finding.diff() {
+        writeln!(
+            output,
+            "  diff: {}{}",
+            diff_disposition(diff.disposition()),
+            if diff.weak_identity() {
+                " (weak identity)"
+            } else {
+                ""
+            },
         )
         .map_err(map_io_error)?;
     }
@@ -2413,6 +2433,26 @@ fn write_summary<W: Write>(
     )?;
     write_summary_count(output, unproven_count, "unproven suppression review")?;
     write_summary_count(output, result_omitted_count, "suppression result omitted")?;
+    if let Some(review) = report.diff() {
+        if review.degraded() {
+            write!(
+                output,
+                "; diff base {} unreliable: full gating applied",
+                escape_terminal_text(review.base_revision()),
+            )
+            .map_err(map_io_error)?;
+        } else {
+            write!(
+                output,
+                "; diff: {} new, {} persisting, {} fixed against {}",
+                review.new_count(),
+                review.persisting_count(),
+                review.fixed_count(),
+                escape_terminal_text(review.base_revision()),
+            )
+            .map_err(map_io_error)?;
+        }
+    }
     if report.runs().is_empty() {
         write!(output, "; 0 policy runs").map_err(map_io_error)?;
     } else {
@@ -2833,10 +2873,18 @@ const fn finding_incomplete_reason(value: FindingIncompleteReason) -> &'static s
     }
 }
 
+fn diff_disposition(value: FindingDiffDisposition) -> &'static str {
+    match value {
+        FindingDiffDisposition::New => "new",
+        FindingDiffDisposition::Persisting => "persisting",
+    }
+}
+
 fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'static str {
     use super::super::PolicyReportDiagnosticCode as Code;
     match value {
         Code::WorkspaceSnapshotDeadlineExceeded => "workspace-snapshot-deadline-exceeded",
+        Code::DiffBaseUnreliable => "diff-base-unreliable",
         Code::SuppressionLoadFailed => "suppression-load-failed",
         Code::SuppressionAuditRetentionExceeded => "suppression-audit-retention-exceeded",
         Code::ScopeLoadFailed => "scope-load-failed",

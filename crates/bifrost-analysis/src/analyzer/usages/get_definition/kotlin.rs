@@ -2596,25 +2596,6 @@ pub(crate) enum KotlinTypeLookupResolution {
     InappropriateSymbolContext,
 }
 
-pub(crate) fn kotlin_type_lookup_resolution(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    site: &ResolvedReferenceSite,
-) -> Option<KotlinTypeLookupResolution> {
-    kotlin_type_lookup_resolution_in_session(
-        analyzer,
-        support,
-        &ResolutionSession::unbounded(),
-        file,
-        source,
-        root,
-        site,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn kotlin_type_lookup_resolution_in_session(
     analyzer: &dyn IAnalyzer,

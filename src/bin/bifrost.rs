@@ -103,6 +103,7 @@ fn has_policy_syntax(args: &[String]) -> bool {
                 | "--suppressions-file"
                 | "--scope-file"
                 | "--evaluation-date"
+                | "--diff-base"
                 | "--output"
                 | "--color"
                 | "--verbose"
@@ -144,6 +145,7 @@ fn option_requires_value(argument: &str) -> bool {
             | "--suppressions-file"
             | "--scope-file"
             | "--evaluation-date"
+            | "--diff-base"
             | "--output"
             | "--color"
     )
@@ -189,6 +191,7 @@ fn run_inner(
     let mut policy_scope = PolicyScopeOptions::default();
     let mut policy_scope_seen = false;
     let mut policy_evaluation_date = None;
+    let mut policy_diff_base: Option<String> = None;
     let mut policy_output: Option<PathBuf> = None;
     let mut policy_verbose = false;
     let mut policy_verbose_seen = false;
@@ -406,6 +409,14 @@ fn run_inner(
                         format!("Invalid --evaluation-date value: {value}. {error}.")
                     })?);
             }
+            "--diff-base" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--diff-base requires a git revision".to_string())?;
+                if policy_diff_base.replace(value).is_some() {
+                    return Err("--diff-base may only be provided once".to_string());
+                }
+            }
             "--output" => {
                 let value = args
                     .next()
@@ -503,6 +514,7 @@ fn run_inner(
                 || policy_suppressions_seen
                 || policy_scope_seen
                 || policy_evaluation_date.is_some()
+                || policy_diff_base.is_some()
                 || policy_output.is_some()
                 || policy_verbose_seen
                 || policy_color_seen
@@ -544,17 +556,20 @@ fn run_inner(
                 .map(PolicyEvaluationInput::workspace_file),
         );
         let status = run_policy_mode(
-            root,
+            PolicyModeRequest {
+                root,
+                format: policy_format,
+                fail_on: policy_fail_on,
+                evaluation_date: policy_evaluation_date,
+                suppressions: policy_suppressions,
+                scope: policy_scope,
+                diff_base: policy_diff_base,
+                output: policy_output,
+                verbose: policy_verbose,
+                color: policy_color,
+                require_explicit_schema_versions,
+            },
             &policy_inputs,
-            policy_format,
-            policy_fail_on,
-            policy_evaluation_date,
-            policy_suppressions,
-            policy_scope,
-            policy_output.as_deref(),
-            policy_verbose,
-            policy_color,
-            require_explicit_schema_versions,
         );
         return Ok(CliRunResult::PolicyStatus(status));
     }
@@ -767,21 +782,23 @@ fn parse_policy_color(value: &str) -> Result<PolicyColorMode, String> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_policy_mode(
+/// Resolved policy-mode invocation state, beyond the policy inputs themselves.
+struct PolicyModeRequest {
     root: PathBuf,
-    policy_inputs: &[PolicyEvaluationInput],
     format: PolicyOutputFormat,
     fail_on: PolicyFailOn,
     evaluation_date: Option<PolicyEvaluationDate>,
     suppressions: PolicySuppressionOptions,
     scope: PolicyScopeOptions,
-    output_path: Option<&Path>,
+    diff_base: Option<String>,
+    output: Option<PathBuf>,
     verbose: bool,
-    color_mode: PolicyColorMode,
+    color: PolicyColorMode,
     require_explicit_schema_versions: bool,
-) -> u8 {
-    let evaluation_date = match evaluation_date {
+}
+
+fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluationInput]) -> u8 {
+    let evaluation_date = match request.evaluation_date {
         Some(date) => date,
         None => {
             let today = Utc::now().date_naive();
@@ -797,11 +814,15 @@ fn run_policy_mode(
             }
         }
     };
-    let options = PolicyEvaluationOptions::with_suppressions(evaluation_date, suppressions)
-        .with_scope(scope)
-        .with_required_schema_versions(require_explicit_schema_versions)
-        .with_fail_on(fail_on);
-    let outcome = match evaluate_policy_inputs(root, policy_inputs, &options) {
+    let mut options =
+        PolicyEvaluationOptions::with_suppressions(evaluation_date, request.suppressions)
+            .with_scope(request.scope)
+            .with_required_schema_versions(request.require_explicit_schema_versions)
+            .with_fail_on(request.fail_on);
+    if let Some(revision) = request.diff_base {
+        options = options.with_diff_base(revision);
+    }
+    let outcome = match evaluate_policy_inputs(request.root, policy_inputs, &options) {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!(
@@ -811,18 +832,19 @@ fn run_policy_mode(
             return POLICY_EXIT_UNRELIABLE;
         }
     };
+    let output_path = request.output.as_deref();
     let human_options = HumanRenderOptions::new(
-        if verbose {
+        if request.verbose {
             HumanRenderDetail::Verbose
         } else {
             HumanRenderDetail::Concise
         },
-        resolve_policy_color(color_mode, output_path.is_none()),
+        resolve_policy_color(request.color, output_path.is_none()),
     );
     let status = outcome.exit_status();
     let write_result = match output_path {
-        Some(path) => write_policy_output_file(path, format, &human_options, &outcome),
-        None => write_policy_stdout(format, &human_options, &outcome),
+        Some(path) => write_policy_output_file(path, request.format, &human_options, &outcome),
+        None => write_policy_stdout(request.format, &human_options, &outcome),
     };
     if let Err(error) = write_result {
         eprintln!(
@@ -1117,6 +1139,10 @@ OPTIONS:
                            (default: .bifrost/policy-scope.json)
     --evaluation-date YYYY-MM-DD
                            Evaluate suppression expiration on this UTC date (default: today)
+    --diff-base REV        Also evaluate the committed content of this git revision, classify
+                           each finding as new or persisting against it, and fail only on new
+                           findings. REV is any revision git rev-parse accepts; pass the pull
+                           request's merge base in CI. An unresolvable base is unreliable (exit 2)
     --require-explicit-schema-versions
                            Reject inferred policy and RQL schema versions
     --output PATH          Atomically write policy output to PATH instead of stdout

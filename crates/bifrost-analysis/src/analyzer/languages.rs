@@ -12,9 +12,7 @@
 
 use crate::analyzer::common::language_for_target;
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::usages::get_definition::{
-    BoundedResolution, DefinitionLookupOutcome, RustTypeLookupCache,
-};
+use crate::analyzer::usages::get_definition::{BoundedResolution, DefinitionLookupOutcome};
 use crate::analyzer::usages::get_type::TypeLookupOutcome;
 use crate::analyzer::usages::inverted_edges::{
     JsTsScopedUsageEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey,
@@ -26,9 +24,9 @@ use crate::analyzer::usages::reference_site::{ResolvedReferenceSite, node_range}
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{GraphUsageAnalyzer, UsageAnalyzer};
 use crate::analyzer::{
-    AnalyzerDefinitionLookup, BoundedDefinitionLookup, CodeUnit, ForwardQueryProvider, IAnalyzer,
-    Language, ParserFlavor, ProjectFile, Range, SignatureMetadata, cpp, csharp, go, java, js_ts,
-    kotlin, php, python, ruby, rust, scala, structural,
+    BoundedDefinitionLookup, CodeUnit, ForwardQueryProvider, IAnalyzer, Language, ParserFlavor,
+    ProjectFile, Range, SignatureMetadata, cpp, csharp, go, java, js_ts, kotlin, php, python, ruby,
+    rust, scala, structural,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -122,6 +120,10 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// gate admits exactly the languages that answer `Some` here, so an absent resolver
     /// yields the `receiver_analysis_language_unsupported` report rather than reaching a
     /// dispatch that cannot serve it.
+    ///
+    /// `get_type_by_location` dispatches through the same resolver (with its own, more
+    /// generous budget), so one bounded core answers both the receiver query and the
+    /// interactive type lookup; Java and JS/TS take their other routes there too.
     fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
         None
     }
@@ -133,13 +135,6 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// [`StructuralReceiverResolver`] is one trait: a language answering only half of it
     /// would strand the query between preparing a file and querying it.
     fn receiver_facts(&self) -> Option<&'static dyn ReceiverFactsFactory> {
-        None
-    }
-
-    /// Unbounded `get_type_by_location` resolution, or `None` when the language has no
-    /// type lookup implementation. Absence is reported to the caller as
-    /// `TypeLookupStatus::UnsupportedLanguage`, not as a silent empty result.
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
         None
     }
 
@@ -582,26 +577,6 @@ pub(crate) trait ReceiverFactsFactory: Send + Sync {
     ) -> Box<dyn ReceiverFacts<'tree> + 'a>;
 }
 
-pub(crate) trait TypeLookupResolver: Send + Sync {
-    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome;
-}
-
-/// Every input the per-language type resolvers draw on. They consume different subsets:
-/// the JVM, Scala and JS/TS resolvers need the batch's definition lookup (and set its
-/// language first), Rust needs the batch's type cache, JS/TS needs the dialect. Passing
-/// the whole batch state keeps that a property of each resolver rather than a mode the
-/// caller has to select.
-pub(crate) struct TypeLookupQuery<'a> {
-    pub(crate) analyzer: &'a dyn IAnalyzer,
-    pub(crate) support: &'a AnalyzerDefinitionLookup<'a>,
-    pub(crate) file: &'a ProjectFile,
-    pub(crate) language: Language,
-    pub(crate) source: &'a str,
-    pub(crate) tree: Option<&'a tree_sitter::Tree>,
-    pub(crate) site: &'a ResolvedReferenceSite,
-    pub(crate) rust_cache: &'a mut RustTypeLookupCache,
-}
-
 pub(crate) struct CandidateCtx<'a> {
     pub(crate) analyzer: &'a dyn IAnalyzer,
     pub(crate) target: &'a CodeUnit,
@@ -754,9 +729,12 @@ mod tests {
     /// candidates are always proven in bulk, and Kotlin has no bulk proof because every
     /// Kotlin candidate takes the per-symbol path; Java and JS/TS answer no structural
     /// receiver because their receiver analysis runs another route entirely (a resolution
-    /// session, and the JS/TS syntax index reached through `facts`); and C++, PHP, Python
-    /// and Ruby have a bounded receiver resolver but no unbounded type lookup, so every
-    /// location query against them still reports `TypeLookupStatus::UnsupportedLanguage`.
+    /// session, and the JS/TS syntax index reached through `facts`).
+    ///
+    /// There is no type-lookup column: `get_type_by_location` dispatches through the
+    /// same bounded receiver contract this table's `recv` column records, with Java and
+    /// JS/TS served by the same other routes `recv`/`facts` name, so every registered
+    /// language answers it and a separate column would restate those three.
     ///
     /// Deliberately observable-only. Behind `dyn` there is no way to distinguish an
     /// inherited default from an identical override, and a hand-maintained
@@ -768,19 +746,19 @@ mod tests {
     /// `declaration_ranges_limited` need an analyzer and a `CodeUnit`. Each is pinned by its
     /// own behavior test instead.
     const CAPABILITY_MATRIX: &str = "\
-language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | type | hl
-Java       | Jvm                  | Java   | .   | yes      | Java   | -    | -     | yes  | yes
-Go         | Go                   | Go     | /   | yes      | Go     | yes  | -     | yes  | yes
-Cpp        | Cpp                  | Cpp    | ::  | -        | Cpp    | yes  | -     | -    | yes
-JavaScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes  | yes
-TypeScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes  | yes
-Python     | Python               | Python | .   | -        | Python | yes  | -     | -    | yes
-Rust       | Rust                 | Rust   | .   | yes      | Rust   | yes  | -     | yes  | yes
-Php        | Php                  | Php    | .   | yes      | Php    | yes  | -     | -    | yes
-Scala      | Jvm                  | Scala  | .   | yes      | Scala  | yes  | -     | yes  | yes
-CSharp     | CSharp               | CSharp | .   | yes      | CSharp | yes  | -     | yes  | yes
-Ruby       | Ruby                 | Ruby   | .   | yes      | Ruby   | yes  | -     | -    | yes
-Kotlin     | Jvm                  | Kotlin | .   | yes      | -      | yes  | -     | yes  | yes
+language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | hl
+Java       | Jvm                  | Java   | .   | yes      | Java   | -    | -     | yes
+Go         | Go                   | Go     | /   | yes      | Go     | yes  | -     | yes
+Cpp        | Cpp                  | Cpp    | ::  | -        | Cpp    | yes  | -     | yes
+JavaScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes
+TypeScript | JavaScriptTypeScript | JsTs   | .   | yes      | JsTs   | -    | yes   | yes
+Python     | Python               | Python | .   | -        | Python | yes  | -     | yes
+Rust       | Rust                 | Rust   | .   | yes      | Rust   | yes  | -     | yes
+Php        | Php                  | Php    | .   | yes      | Php    | yes  | -     | yes
+Scala      | Jvm                  | Scala  | .   | yes      | Scala  | yes  | -     | yes
+CSharp     | CSharp               | CSharp | .   | yes      | CSharp | yes  | -     | yes
+Ruby       | Ruby                 | Ruby   | .   | yes      | Ruby   | yes  | -     | yes
+Kotlin     | Jvm                  | Kotlin | .   | yes      | -      | yes  | -     | yes
 ";
 
     fn mark(present: bool) -> &'static str {
@@ -789,13 +767,13 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | -      | yes  | - 
 
     fn capability_matrix() -> String {
         let mut rendered = String::from(
-            "language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | type | hl\n",
+            "language   | ecosystem            | pass   | sep | strategy | bulk   | recv | facts | hl\n",
         );
         for language in ANALYZABLE {
             let support = support_of(language);
             let dead_code = support.dead_code();
             rendered.push_str(&format!(
-                "{:<10} | {:<20} | {:<6} | {:<3} | {:<8} | {:<6} | {:<4} | {:<5} | {:<4} | {}\n",
+                "{:<10} | {:<20} | {:<6} | {:<3} | {:<8} | {:<6} | {:<4} | {:<5} | {}\n",
                 format!("{language:?}"),
                 format!("{:?}", support.ecosystem()),
                 support
@@ -808,7 +786,6 @@ Kotlin     | Jvm                  | Kotlin | .   | yes      | -      | yes  | - 
                     .map_or_else(|| "-".to_string(), |bulk| format!("{:?}", bulk.id())),
                 mark(support.structural_receiver().is_some()),
                 mark(support.receiver_facts().is_some()),
-                mark(support.type_lookup().is_some()),
                 mark(support.highlight_query().is_some()),
             ));
         }

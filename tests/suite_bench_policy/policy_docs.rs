@@ -215,6 +215,30 @@ fn documented_match_policy_executes_and_semantic_analysis_boundary_is_explicit()
 }
 
 #[test]
+fn diff_gating_documentation_states_the_contract_and_limitations() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs = read(root.join(POLICY_DOC));
+    assert!(docs.contains("## Gate Only On What The Change Introduced"));
+    let normalized = docs.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in [
+        // The asymmetric reliability contract.
+        "an unresolvable base is an unreliable diff request, never a silent full run",
+        "degrades to full gating",
+        "`diff-base-unreliable` report diagnostic",
+        // The two accepted identity limitations.
+        "A pure file rename re-keys every finding in the file",
+        "can shift the ordinals and misclassify one pair",
+        // The gate interaction with suppressions and scope.
+        "a suppressed or scoped new finding does not gate",
+    ] {
+        assert!(
+            normalized.contains(required),
+            "policy docs must state the diff-gating contract: {required}"
+        );
+    }
+}
+
+#[test]
 fn ten_minute_match_policy_runs_through_the_current_cli() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let docs = read(root.join(EVALUATION_DOC));

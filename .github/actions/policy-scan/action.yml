@@ -1,0 +1,190 @@
+name: Bifrost Policy Scan
+description: >-
+  Run Bifrost static-analysis policies and upload the SARIF report to GitHub
+  code scanning. Exit-code contract: 0 is clean, 1 is findings at or above the
+  fail-on threshold, 2 is unreliable. An unreliable result could not prove its
+  own completeness and must never be treated as clean.
+
+inputs:
+  version:
+    description: >-
+      Bifrost release tag to install (see BrokkAi/bifrost releases). Pin an
+      exact tag for reproducible gates.
+    required: false
+    default: v0.8.24
+  policy-packs:
+    description: Space-separated built-in pack IDs to run.
+    required: false
+    default: bifrost.code-smells
+  policy-ids:
+    description: Space-separated policy IDs to run.
+    required: false
+    default: ''
+  policy-categories:
+    description: Space-separated policy categories to run.
+    required: false
+    default: ''
+  policy-files:
+    description: Space-separated workspace-relative .rqlp files to run.
+    required: false
+    default: ''
+  fail-on:
+    description: 'Severity gate: never, finding, note, warning, or error.'
+    required: false
+    default: warning
+  diff-base:
+    description: >-
+      Git revision to diff against. When set, the same policies also evaluate
+      that commit's content, every finding is classified new or persisting,
+      and only new findings gate. Pass the pull request's base SHA for a
+      changed-code-only gate. Requires a checkout deep enough to contain the
+      revision.
+    required: false
+    default: ''
+  sarif-file:
+    description: SARIF output path, relative to working-directory.
+    required: false
+    default: bifrost-policy.sarif
+  upload:
+    description: Upload the SARIF file to GitHub code scanning.
+    required: false
+    default: 'true'
+  category:
+    description: Code-scanning category that isolates this scan's alerts.
+    required: false
+    default: bifrost-policy
+  cache:
+    description: Restore and save the .bifrost/cache analyzer database.
+    required: false
+    default: 'true'
+  working-directory:
+    description: Workspace root to analyze, relative to the checkout.
+    required: false
+    default: '.'
+
+outputs:
+  exit-code:
+    description: Raw bifrost policy exit code (0, 1, or 2).
+    value: ${{ steps.run.outputs.exit-code }}
+  sarif-file:
+    description: Path of the SARIF report, relative to the checkout.
+    value: ${{ steps.run.outputs.sarif-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install bifrost
+      shell: bash
+      env:
+        BIFROST_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64) target=x86_64-unknown-linux-gnu; archive=tar.gz ;;
+          Linux-ARM64) target=aarch64-unknown-linux-gnu; archive=tar.gz ;;
+          macOS-X64|macOS-ARM64) target=universal-apple-darwin; archive=tar.gz ;;
+          Windows-X64) target=x86_64-pc-windows-msvc; archive=zip ;;
+          Windows-ARM64) target=aarch64-pc-windows-msvc; archive=zip ;;
+          *) echo "::error::unsupported runner: ${RUNNER_OS}-${RUNNER_ARCH}"; exit 1 ;;
+        esac
+        stage="bifrost-${BIFROST_VERSION}-${target}"
+        url="https://github.com/BrokkAi/bifrost/releases/download/${BIFROST_VERSION}"
+        dir="${RUNNER_TEMP}/bifrost-install"
+        mkdir -p "${dir}"
+        cd "${dir}"
+        curl -fsSL -O "${url}/${stage}.${archive}"
+        curl -fsSL -O "${url}/${stage}.${archive}.sha256"
+        if command -v sha256sum >/dev/null 2>&1; then
+          sha256sum -c "${stage}.${archive}.sha256"
+        else
+          shasum -a 256 -c "${stage}.${archive}.sha256"
+        fi
+        if [ "${archive}" = zip ]; then
+          if command -v unzip >/dev/null 2>&1; then
+            unzip -q "${stage}.zip"
+          else
+            python3 -m zipfile -e "${stage}.zip" .
+          fi
+        else
+          tar -xzf "${stage}.tar.gz"
+        fi
+        echo "${dir}/${stage}" >> "${GITHUB_PATH}"
+
+    - name: Restore analyzer cache
+      if: inputs.cache == 'true'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: .bifrost/cache
+        key: bifrost-policy-cache-${{ runner.os }}-${{ github.run_id }}
+        restore-keys: |
+          bifrost-policy-cache-${{ runner.os }}-
+
+    - name: Run policies
+      id: run
+      shell: bash
+      env:
+        WORKDIR: ${{ inputs.working-directory }}
+        SARIF_FILE: ${{ inputs.sarif-file }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        POLICY_PACKS: ${{ inputs.policy-packs }}
+        POLICY_IDS: ${{ inputs.policy-ids }}
+        POLICY_CATEGORIES: ${{ inputs.policy-categories }}
+        POLICY_FILES: ${{ inputs.policy-files }}
+        DIFF_BASE: ${{ inputs.diff-base }}
+      run: |
+        set -uo pipefail
+        cd "${WORKDIR}"
+        args=(--root . --format sarif --output "${SARIF_FILE}" --fail-on "${FAIL_ON}")
+        for p in ${POLICY_PACKS}; do args+=(--policy-pack "${p}"); done
+        for p in ${POLICY_IDS}; do args+=(--policy-id "${p}"); done
+        for p in ${POLICY_CATEGORIES}; do args+=(--policy-category "${p}"); done
+        for p in ${POLICY_FILES}; do args+=(--policy-file "${p}"); done
+        if [ -n "${DIFF_BASE}" ]; then args+=(--diff-base "${DIFF_BASE}"); fi
+        set +e
+        bifrost "${args[@]}"
+        code=$?
+        set -e
+        echo "exit-code=${code}" >> "${GITHUB_OUTPUT}"
+        echo "sarif-file=${WORKDIR}/${SARIF_FILE}" >> "${GITHUB_OUTPUT}"
+        if [ -f "${SARIF_FILE}" ]; then
+          echo "has-sarif=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "has-sarif=false" >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Save analyzer cache
+      if: inputs.cache == 'true'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: .bifrost/cache
+        key: bifrost-policy-cache-${{ runner.os }}-${{ github.run_id }}
+
+    - name: Upload SARIF to code scanning
+      if: inputs.upload == 'true' && steps.run.outputs.has-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@c3400c2f38909e0dcf3c3a41f2030a8217be5d3e # v3
+      with:
+        sarif_file: ${{ steps.run.outputs.sarif-file }}
+        category: ${{ inputs.category }}
+
+    - name: Gate on the exit code
+      shell: bash
+      env:
+        CODE: ${{ steps.run.outputs.exit-code }}
+      run: |
+        case "${CODE}" in
+          0)
+            echo "Bifrost policy scan is clean."
+            ;;
+          1)
+            echo "::error::Bifrost policy scan found findings at or above the fail-on threshold. See the code-scanning alerts or the SARIF report."
+            exit 1
+            ;;
+          2)
+            echo "::error::Bifrost policy scan is UNRELIABLE. The run could not prove its own completeness. Read the report diagnostics. Do not treat this result as clean."
+            exit 2
+            ;;
+          *)
+            echo "::error::bifrost exited with unexpected status ${CODE}."
+            exit 1
+            ;;
+        esac

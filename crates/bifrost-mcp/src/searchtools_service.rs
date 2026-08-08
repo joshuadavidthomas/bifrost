@@ -660,6 +660,7 @@ struct RunPolicyParams {
     evaluation_date: PolicyEvaluationDate,
     #[serde(default)]
     fail_on: RunPolicyFailOn,
+    diff_base: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -895,7 +896,9 @@ pub(crate) struct PreparedRunPolicy {
 
 pub(crate) enum RunPolicyPreparation {
     Ready(PreparedRunPolicy),
-    Deadline(RunPolicyToolResult),
+    // Boxed: the ready payload is a slim handle while the deadline payload
+    // carries a whole report document.
+    Deadline(Box<RunPolicyToolResult>),
 }
 
 impl WorkspaceQueryScope {
@@ -3645,10 +3648,21 @@ impl SearchToolsService {
             })?
             .map_or_else(PolicyScopeOptions::default, PolicyScopeOptions::new);
         let fail_on = PolicyFailOn::from(params.fail_on);
-        let options =
+        let mut options =
             PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
                 .with_scope(scope)
                 .with_fail_on(fail_on);
+        if let Some(revision) = params.diff_base {
+            if revision.is_empty()
+                || revision.len() > crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
+            {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "run_policy diff_base must contain between 1 and {} bytes",
+                    crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
+                )));
+            }
+            options = options.with_diff_base(revision);
+        }
         let selection_elapsed = preparation_started.elapsed();
         let snapshot_started = Instant::now();
 
@@ -3680,7 +3694,7 @@ impl SearchToolsService {
                         exit_status: outcome.exit_status(),
                         report: outcome.into_report(),
                     };
-                    return Ok(RunPolicyPreparation::Deadline(result));
+                    return Ok(RunPolicyPreparation::Deadline(Box::new(result)));
                 }
                 Err(error) => return Err(error),
             };

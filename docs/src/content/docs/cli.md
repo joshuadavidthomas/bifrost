@@ -175,6 +175,33 @@ run. `--require-explicit-schema-versions` rejects compatible inference for the
 root and every loaded endpoint or RQL dependency. Omitted versions otherwise
 select only the newest compiled-in compatible lineage.
 
+### Gate only on new findings (`--diff-base`)
+
+`--diff-base REV` evaluates the same policies twice: once against the committed
+content of `REV` (any revision `git rev-parse` accepts, peeled to a commit) and
+once against the working tree. Findings are joined by their stable identities,
+each head finding is classified `new` or `persisting`, fixed base findings are
+summarized, and the `--fail-on` threshold counts only the new findings. A pull
+request that introduces one finding into a repository with hundreds of
+pre-existing ones fails with exactly that one finding gating.
+
+```bash
+bifrost --root . \
+  --policy-pack bifrost.code-smells \
+  --format sarif --output out.sarif \
+  --diff-base origin/main
+```
+
+The CLI does not compute merge bases; pass the pull request's merge base
+explicitly (`git merge-base HEAD origin/main`, or the base SHA GitHub
+provides). If the workspace root is not inside a git repository or the
+revision does not resolve, the run exits 2. If the base revision resolves but
+its evaluation is unreliable, the run degrades to full gating with a
+`diff-base-unreliable` diagnostic, so a broken base can never hide new
+findings. See [Static-Analysis Policies](/static-analysis-policies/) for the
+join semantics and [CI Gating with GitHub Actions](/ci-github-actions/) for
+the pull-request recipe.
+
 `match`, `taint`, query-local `typestate`, and `assertion` evaluation are
 available now. Typestate
 compiles resolved subject/event selectors into the semantic protocol engine and

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::FileSetProject;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     SemanticModelActivationPersistence, SemanticModelActivationRequest,
     SemanticModelRuntimeOutcome, SemanticPackCatalog, acquire_active_semantic_models,
@@ -20,21 +21,24 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
 };
+use brokk_bifrost_analysis::diff_analysis::export_revision;
 use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
 
 use super::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
 use super::definition::{FindingSeverity, PolicyCategoryId, PolicyId, RqlpDocument};
 use super::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
+use super::finding::{FindingDiffDisposition, PolicyFindingDiff};
 use super::finding::{
     PolicyDiagnostic, PolicyDiagnosticCode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
     PolicyFailureReason, PolicyIncompleteReason, PolicyRun, PolicyRunCompletion, PolicyWorkReport,
 };
-use super::finding_identity::FindingIdentityStability;
+use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::loading::{PolicyDocumentLoadError, read_rqlp_document};
 use super::registry::{PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits};
 use super::report::{
-    PolicyExecutionMetadata, PolicyExecutionStage, PolicyExecutionTermination, PolicyReportBuilder,
+    MAX_DIFF_FIXED_FINDINGS, PolicyDiffFixedFinding, PolicyDiffReview, PolicyExecutionMetadata,
+    PolicyExecutionStage, PolicyExecutionTermination, PolicyReportBuilder,
     PolicyReportBuilderError, PolicyReportDiagnostic, PolicyReportDiagnosticCode,
     PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange,
     PolicyStageTiming,
@@ -101,6 +105,7 @@ pub struct PolicyEvaluationOptions {
     scope: PolicyScopeOptions,
     require_explicit_schema_versions: bool,
     fail_on: PolicyFailOn,
+    diff_base: Option<String>,
 }
 
 impl PolicyEvaluationOptions {
@@ -111,6 +116,7 @@ impl PolicyEvaluationOptions {
             scope: PolicyScopeOptions::default(),
             require_explicit_schema_versions: false,
             fail_on: PolicyFailOn::Never,
+            diff_base: None,
         }
     }
 
@@ -124,11 +130,22 @@ impl PolicyEvaluationOptions {
             scope: PolicyScopeOptions::new(PolicyScopeSource::Conventional),
             require_explicit_schema_versions: false,
             fail_on: PolicyFailOn::Never,
+            diff_base: None,
         }
     }
 
     pub fn with_scope(mut self, scope: PolicyScopeOptions) -> Self {
         self.scope = scope;
+        self
+    }
+
+    /// Evaluate the same policies against `revision` too, classify every head
+    /// finding as new or persisting, and gate only on the new ones.
+    ///
+    /// `revision` is any spelling `git rev-parse` accepts; it must peel to a
+    /// commit in the repository that contains the workspace root.
+    pub fn with_diff_base(mut self, revision: String) -> Self {
+        self.diff_base = Some(revision);
         self
     }
 
@@ -161,6 +178,10 @@ impl PolicyEvaluationOptions {
     pub const fn fail_on(&self) -> PolicyFailOn {
         self.fail_on
     }
+
+    pub fn diff_base(&self) -> Option<&str> {
+        self.diff_base.as_deref()
+    }
 }
 
 impl RetainedSize for PolicyEvaluationOptions {
@@ -168,6 +189,7 @@ impl RetainedSize for PolicyEvaluationOptions {
         std::mem::size_of::<Self>()
             .saturating_add(retained_extra(&self.suppressions))
             .saturating_add(retained_extra(&self.scope))
+            .saturating_add(retained_extra(&self.diff_base))
     }
 }
 
@@ -556,6 +578,7 @@ fn deadline_before_evaluation_outcome(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        None,
         diagnostics,
         false,
         0,
@@ -704,6 +727,25 @@ fn evaluate_prepared_policy_inputs(
             InputOutcome::Diagnostic(_) => None,
         })
         .collect::<Vec<_>>();
+    // The diff base evaluates exactly the head's policy sources as embedded
+    // inputs, so its registry resolves referenced selectors, endpoints, and
+    // catalogs beneath the base image rather than the checkout. Registration
+    // consumes the pending bytes, so capture them first.
+    let diff_base_sources = if options.diff_base().is_some() {
+        inputs
+            .iter()
+            .filter_map(|input| match input {
+                InputOutcome::Pending(prepared) => Some((
+                    prepared.policy_id.clone(),
+                    prepared.source.clone(),
+                    prepared.bytes.clone(),
+                )),
+                InputOutcome::Runnable(_) | InputOutcome::Diagnostic(_) => None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     if policy_deadline_reached(cancellation)? {
         return deadline_before_evaluation_outcome(
             options,
@@ -1074,10 +1116,50 @@ fn evaluate_prepared_policy_inputs(
         }
         runs.insert(policy.definition().metadata.id.clone(), run);
     }
+    let diff_baseline = match options.diff_base() {
+        Some(revision) => {
+            let base_inputs = diff_base_sources
+                .iter()
+                .filter(|(policy_id, _, _)| runnable_ids.contains(policy_id))
+                .map(|(_, source, bytes)| {
+                    PolicyEvaluationInput::embedded(source.clone(), bytes.as_str())
+                })
+                .collect::<Vec<_>>();
+            Some(evaluate_policy_diff_baseline(
+                root,
+                revision,
+                options,
+                base_inputs,
+                batch_budget,
+                registry_limits,
+                cancellation,
+            )?)
+        }
+        None => None,
+    };
     let evaluation_elapsed = evaluation_started.elapsed();
     let report_started = Instant::now();
     if policy_deadline_reached(cancellation)? {
         deadline_stage.get_or_insert(PolicyExecutionStage::ReportConstruction);
+    }
+
+    let diff_review = match &diff_baseline {
+        Some(baseline) => Some(apply_policy_diff(baseline, &mut runs)?),
+        None => None,
+    };
+    if let Some(baseline) = &diff_baseline
+        && let Some(detail) = &baseline.unreliable_detail
+    {
+        secondary_diagnostics.push(report_diagnostic(
+            PolicyReportDiagnosticCode::DiffBaseUnreliable,
+            format!(
+                "diff base `{}` ({}) was unreliable, so every head finding gates as if --diff-base had not been given: {detail}",
+                baseline.requested_revision, baseline.resolved_commit
+            ),
+            None,
+            None,
+            Vec::new(),
+        )?);
     }
 
     let suppression_reviews = match suppression_document.as_ref() {
@@ -1138,11 +1220,25 @@ fn evaluate_prepared_policy_inputs(
             )));
         }
     };
+    // A degraded diff review does not narrow the gate: every finding gates as
+    // if no diff base had been given.
+    let diff_gating = diff_review
+        .as_ref()
+        .is_some_and(|review| !review.degraded());
     let threshold_exceeded = runs.values().flat_map(PolicyRun::findings).any(|finding| {
         finding.suppression().is_none()
             && finding.scope().is_none()
             && options.fail_on().matches(finding.severity())
+            && (!diff_gating
+                || finding
+                    .diff()
+                    .is_some_and(|diff| diff.disposition() == FindingDiffDisposition::New))
     });
+    if let Some(review) = diff_review {
+        builder.set_diff(review).map_err(|error| {
+            PolicyCoordinatorError::new(format!("failed to retain the policy diff review: {error}"))
+        })?;
+    }
     let mut retained_findings = Vec::new();
     for input in inputs {
         if policy_deadline_reached(cancellation)? {
@@ -1317,6 +1413,214 @@ fn evaluate_prepared_policy_inputs(
         max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
         max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
     })
+}
+
+/// Base-revision evaluation summary consumed by the diff join.
+///
+/// `identities` holds the strong finding identities present at the base
+/// revision, keyed by policy so the per-run join is one set lookup. When
+/// `unreliable_detail` is present the base evaluation was unreliable, the
+/// identity map is empty, and diff gating degrades to full gating.
+struct PolicyDiffBaseline {
+    requested_revision: String,
+    resolved_commit: String,
+    identities: HashMap<PolicyId, HashSet<PolicyFindingId>>,
+    unreliable_detail: Option<String>,
+}
+
+/// Materialize the base revision and evaluate the head's policy sources
+/// against it, collecting the strong finding identities and the base run's
+/// reliability verdict.
+///
+/// An unresolvable revision or a workspace outside a git repository is an
+/// error: an unresolvable base is an unreliable diff request, never a silent
+/// full run. An unreliable base *evaluation* instead degrades, so a broken
+/// base cannot mask new findings.
+fn evaluate_policy_diff_baseline(
+    head_root: &Path,
+    revision: &str,
+    head_options: &PolicyEvaluationOptions,
+    base_inputs: Vec<PolicyEvaluationInput>,
+    batch_budget: PolicyBatchBudget,
+    registry_limits: PolicyRegistryLimits,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyDiffBaseline, PolicyCoordinatorError> {
+    let export = export_revision(head_root, revision).map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to materialize diff base `{revision}`: {error}"
+        ))
+    })?;
+    if base_inputs.is_empty() {
+        return Ok(PolicyDiffBaseline {
+            requested_revision: revision.to_string(),
+            resolved_commit: export.commit_id().to_string(),
+            identities: HashMap::new(),
+            unreliable_detail: Some(
+                "the head evaluation has no runnable policy, so the base revision was not evaluated"
+                    .to_string(),
+            ),
+        });
+    }
+    let project = Arc::new(FileSetProject::new(
+        export.root().to_path_buf(),
+        export.files().iter().cloned(),
+    ));
+    let base_workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+        .map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to build the diff base analyzer for `{revision}`: {error}"
+            ))
+        })?;
+    // The base run needs raw identities only: no diff base (which would
+    // recurse), no gating threshold, and the head's suppression and scope
+    // configuration deliberately not forwarded.
+    let base_options = PolicyEvaluationOptions::new(head_options.evaluation_date())
+        .with_required_schema_versions(head_options.require_explicit_schema_versions());
+    let outcome = evaluate_policy_inputs_with_limits(
+        export.root(),
+        &base_inputs,
+        &base_options,
+        batch_budget,
+        registry_limits,
+        Some(&base_workspace),
+        None,
+        cancellation,
+    )?;
+    let report = outcome.report();
+    if outcome.exit_status() == POLICY_EXIT_UNRELIABLE {
+        return Ok(PolicyDiffBaseline {
+            requested_revision: revision.to_string(),
+            resolved_commit: export.commit_id().to_string(),
+            identities: HashMap::new(),
+            unreliable_detail: Some(diff_base_unreliable_detail(report)),
+        });
+    }
+    let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
+    for run in report.runs() {
+        for finding in run.findings() {
+            // Weak identities are snapshot-local by construction and can never
+            // equal a head identity, so only strong ones enter the join set.
+            if finding.identity_stability() == FindingIdentityStability::Strong {
+                identities
+                    .entry(run.policy_id().clone())
+                    .or_default()
+                    .insert(finding.id());
+            }
+        }
+    }
+    Ok(PolicyDiffBaseline {
+        requested_revision: revision.to_string(),
+        resolved_commit: export.commit_id().to_string(),
+        identities,
+        unreliable_detail: None,
+    })
+}
+
+/// Summarize why a base evaluation was unreliable, for the degradation
+/// diagnostic. The composed text is bounded later by `safe_report_text`.
+fn diff_base_unreliable_detail(report: &PolicyReportDocument) -> String {
+    let mut parts = Vec::new();
+    if let Some(termination) = report.execution().termination() {
+        parts.push(format!("execution terminated ({termination:?})"));
+    }
+    if !report.diagnostics().is_empty() {
+        let codes = report
+            .diagnostics()
+            .iter()
+            .map(PolicyReportDiagnostic::code)
+            .collect::<Vec<_>>();
+        parts.push(format!("base report diagnostics {codes:?}"));
+    }
+    if report.diagnostics_truncated() {
+        parts.push("base report diagnostics were truncated".to_string());
+    }
+    for run in report.runs() {
+        if !run.completion().is_reliable() || !run.completion().is_exhaustive() {
+            parts.push(format!(
+                "policy {} completed {:?}",
+                run.policy_id(),
+                run.completion()
+            ));
+        }
+    }
+    assert!(
+        !parts.is_empty(),
+        "an unreliable base evaluation always has a termination, diagnostic, or non-exhaustive run"
+    );
+    parts.join("; ")
+}
+
+/// Join the head runs against the base identities and attach a diff decision
+/// to every retained finding. A degraded baseline attaches nothing.
+///
+/// This is the diff sibling of [`apply_policy_suppressions`]: same
+/// `(policy_id, finding_id)` key, same attachment pattern, one top-level
+/// review. Base identities no head finding consumed become the fixed list.
+fn apply_policy_diff(
+    baseline: &PolicyDiffBaseline,
+    runs: &mut HashMap<PolicyId, PolicyRun>,
+) -> Result<PolicyDiffReview, PolicyCoordinatorError> {
+    if baseline.unreliable_detail.is_some() {
+        return Ok(PolicyDiffReview::new(
+            baseline.requested_revision.clone(),
+            baseline.resolved_commit.clone(),
+            true,
+            0,
+            0,
+            Vec::new(),
+            0,
+        ));
+    }
+    let mut matched: HashMap<&PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
+    let mut new_count = 0_u64;
+    let mut persisting_count = 0_u64;
+    for (policy_id, run) in runs.iter_mut() {
+        let base_ids = baseline.identities.get(policy_id);
+        for finding in run.findings_mut() {
+            let weak_identity = finding.identity_stability() != FindingIdentityStability::Strong;
+            let persisting = !weak_identity
+                && base_ids.is_some_and(|identities| identities.contains(&finding.id()));
+            let disposition = if persisting {
+                matched.entry(policy_id).or_default().insert(finding.id());
+                persisting_count = persisting_count.saturating_add(1);
+                FindingDiffDisposition::Persisting
+            } else {
+                new_count = new_count.saturating_add(1);
+                FindingDiffDisposition::New
+            };
+            finding
+                .attach_diff(PolicyFindingDiff::new(disposition, weak_identity))
+                .map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to attach the diff decision for policy {policy_id} finding {}: {error}",
+                        finding.id()
+                    ))
+                })?;
+        }
+    }
+    let mut fixed_count = 0_u64;
+    let mut fixed = Vec::new();
+    for (policy_id, identities) in &baseline.identities {
+        let consumed = matched.get(policy_id);
+        for finding_id in identities {
+            if consumed.is_some_and(|ids| ids.contains(finding_id)) {
+                continue;
+            }
+            fixed_count = fixed_count.saturating_add(1);
+            if fixed.len() < MAX_DIFF_FIXED_FINDINGS {
+                fixed.push(PolicyDiffFixedFinding::new(policy_id.clone(), *finding_id));
+            }
+        }
+    }
+    Ok(PolicyDiffReview::new(
+        baseline.requested_revision.clone(),
+        baseline.resolved_commit.clone(),
+        false,
+        new_count,
+        persisting_count,
+        fixed,
+        fixed_count,
+    ))
 }
 
 fn apply_policy_suppressions(
@@ -2686,5 +2990,345 @@ mod tests {
         assert!(omitted.report().diagnostics().iter().any(|diagnostic| {
             diagnostic.code() == PolicyReportDiagnosticCode::SuppressionAuditRetentionExceeded
         }));
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["-c", "commit.gpgSign=false"])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    fn init_git_workspace(root: &Path) {
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test User"]);
+    }
+
+    fn commit_everything(root: &Path, message: &str) {
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", message]);
+    }
+
+    fn identity_map(report: &PolicyReportDocument) -> HashMap<PolicyId, HashSet<PolicyFindingId>> {
+        let mut identities: HashMap<PolicyId, HashSet<PolicyFindingId>> = HashMap::new();
+        for run in report.runs() {
+            for finding in run.findings() {
+                identities
+                    .entry(run.policy_id().clone())
+                    .or_default()
+                    .insert(finding.id());
+            }
+        }
+        identities
+    }
+
+    #[test]
+    fn diff_join_classifies_new_persisting_and_fixed_findings() {
+        let policy = match_policy("test.diff", "Diff test");
+        let base = tempfile::tempdir().expect("base workspace");
+        fs::write(base.path().join("app.ts"), "export function target() {}\n")
+            .expect("base source");
+        write_policy(base.path(), "policies/diff.rqlp", &policy);
+        let base_outcome = evaluate_policy_files(
+            base.path(),
+            &[PathBuf::from("policies/diff.rqlp")],
+            &evaluation_options(),
+        )
+        .expect("base evaluation");
+        assert_eq!(base_outcome.report().runs()[0].findings().len(), 1);
+
+        let head = tempfile::tempdir().expect("head workspace");
+        fs::write(head.path().join("app.ts"), "export function target() {}\n")
+            .expect("head source");
+        fs::write(
+            head.path().join("extra.ts"),
+            "export function target() { return 2; }\n",
+        )
+        .expect("head extra source");
+        write_policy(head.path(), "policies/diff.rqlp", &policy);
+        let head_outcome = evaluate_policy_files(
+            head.path(),
+            &[PathBuf::from("policies/diff.rqlp")],
+            &evaluation_options(),
+        )
+        .expect("head evaluation");
+
+        let baseline = PolicyDiffBaseline {
+            requested_revision: "HEAD".to_string(),
+            resolved_commit: "0".repeat(40),
+            identities: identity_map(base_outcome.report()),
+            unreliable_detail: None,
+        };
+        let mut runs = head_outcome
+            .report()
+            .runs()
+            .iter()
+            .map(|run| (run.policy_id().clone(), run.clone()))
+            .collect::<HashMap<_, _>>();
+        let review = apply_policy_diff(&baseline, &mut runs).expect("diff join");
+
+        assert!(!review.degraded());
+        assert_eq!(review.new_count(), 1);
+        assert_eq!(review.persisting_count(), 1);
+        assert_eq!(review.fixed_count(), 0);
+        assert!(review.fixed().is_empty());
+        let policy_id = PolicyId::new("test.diff").expect("policy id");
+        for finding in runs[&policy_id].findings() {
+            let diff = finding.diff().expect("attached diff decision");
+            assert!(!diff.weak_identity());
+            match finding.primary().path() {
+                "app.ts" => assert_eq!(diff.disposition(), FindingDiffDisposition::Persisting),
+                "extra.ts" => assert_eq!(diff.disposition(), FindingDiffDisposition::New),
+                other => panic!("unexpected finding path {other}"),
+            }
+        }
+        let mut cleared = runs[&policy_id].findings()[0].clone();
+        cleared.clear_diff();
+        assert!(cleared.diff().is_none());
+
+        // Reverse the direction: the extra.ts identity becomes fixed.
+        let reversed_baseline = PolicyDiffBaseline {
+            requested_revision: "HEAD".to_string(),
+            resolved_commit: "0".repeat(40),
+            identities: identity_map(head_outcome.report()),
+            unreliable_detail: None,
+        };
+        let mut reversed_runs = base_outcome
+            .report()
+            .runs()
+            .iter()
+            .map(|run| (run.policy_id().clone(), run.clone()))
+            .collect::<HashMap<_, _>>();
+        let reversed = apply_policy_diff(&reversed_baseline, &mut reversed_runs).expect("join");
+        assert_eq!(reversed.new_count(), 0);
+        assert_eq!(reversed.persisting_count(), 1);
+        assert_eq!(reversed.fixed_count(), 1);
+        assert_eq!(reversed.fixed().len(), 1);
+        assert_eq!(reversed.fixed()[0].policy_id().as_str(), "test.diff");
+        assert!(!reversed.fixed_truncated());
+    }
+
+    #[test]
+    fn diff_base_gates_only_new_findings_and_reports_fixed() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        init_git_workspace(workspace.path());
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/diff.rqlp",
+            &match_policy("test.diff", "Diff test"),
+        );
+        commit_everything(workspace.path(), "base");
+
+        let gating_date = PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date");
+        let diff_options = PolicyEvaluationOptions::new(gating_date)
+            .with_fail_on(PolicyFailOn::Warning)
+            .with_diff_base("HEAD".to_string());
+        let full_options =
+            PolicyEvaluationOptions::new(gating_date).with_fail_on(PolicyFailOn::Warning);
+        let paths = [PathBuf::from("policies/diff.rqlp")];
+
+        // The committed finding persists and does not gate in diff mode.
+        let clean = evaluate_policy_files(workspace.path(), &paths, &diff_options)
+            .expect("diff evaluation");
+        assert_eq!(clean.exit_status(), POLICY_EXIT_CLEAN);
+        let review = clean.report().diff().expect("diff review");
+        assert!(!review.degraded());
+        assert_eq!(
+            (
+                review.new_count(),
+                review.persisting_count(),
+                review.fixed_count()
+            ),
+            (0, 1, 0)
+        );
+        assert_eq!(review.base_revision(), "HEAD");
+        assert_eq!(review.base_commit().len(), 40);
+        let encoded = serde_json::to_value(clean.report()).expect("encode diff report");
+        assert_eq!(encoded["diff"]["persisting_count"], 1);
+        assert_eq!(
+            encoded["runs"][0]["findings"][0]["diff"]["disposition"],
+            "persisting"
+        );
+
+        // The identical finding gates without the diff base, and its report
+        // has no diff field at all.
+        let full = evaluate_policy_files(workspace.path(), &paths, &full_options)
+            .expect("full evaluation");
+        assert_eq!(full.exit_status(), POLICY_EXIT_FINDING);
+        assert!(full.report().diff().is_none());
+        let encoded = serde_json::to_value(full.report()).expect("encode full report");
+        assert!(encoded.get("diff").is_none());
+        assert!(
+            encoded["runs"][0]["findings"][0].get("diff").is_none(),
+            "{encoded:#}"
+        );
+
+        // One new uncommitted finding gates with exactly itself as new.
+        fs::write(
+            workspace.path().join("extra.ts"),
+            "export function target() { return 2; }\n",
+        )
+        .expect("new offending source");
+        let gated = evaluate_policy_files(workspace.path(), &paths, &diff_options)
+            .expect("diff evaluation with a new finding");
+        assert_eq!(gated.exit_status(), POLICY_EXIT_FINDING);
+        let review = gated.report().diff().expect("diff review");
+        assert_eq!(
+            (
+                review.new_count(),
+                review.persisting_count(),
+                review.fixed_count()
+            ),
+            (1, 1, 0)
+        );
+
+        // Repairing every finding reports the committed one as fixed.
+        fs::remove_file(workspace.path().join("extra.ts")).expect("remove new source");
+        fs::write(workspace.path().join("app.ts"), "export const value = 1;\n")
+            .expect("repaired source");
+        let repaired = evaluate_policy_files(workspace.path(), &paths, &diff_options)
+            .expect("diff evaluation after repair");
+        assert_eq!(repaired.exit_status(), POLICY_EXIT_CLEAN);
+        let review = repaired.report().diff().expect("diff review");
+        assert_eq!(
+            (
+                review.new_count(),
+                review.persisting_count(),
+                review.fixed_count()
+            ),
+            (0, 0, 1)
+        );
+        assert_eq!(review.fixed().len(), 1);
+        assert_eq!(review.fixed()[0].policy_id().as_str(), "test.diff");
+    }
+
+    #[test]
+    fn unreliable_diff_base_degrades_to_full_gating_with_a_loud_diagnostic() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        init_git_workspace(workspace.path());
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/diff.rqlp",
+            &match_policy("test.diff", "Diff test"),
+        );
+        // The committed suppressions document is invalid, so the base
+        // evaluation is unreliable by the ordinary reliability rules. The
+        // working tree removes it, so the head evaluation stays reliable.
+        let suppressions = workspace.path().join(".bifrost/suppressions.json");
+        fs::create_dir_all(suppressions.parent().expect("suppressions parent"))
+            .expect("suppressions directory");
+        fs::write(&suppressions, "{ not json").expect("invalid suppressions");
+        commit_everything(workspace.path(), "base with broken suppressions");
+        fs::remove_file(&suppressions).expect("repair working tree");
+
+        let gating_date = PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date");
+        let diff_options = PolicyEvaluationOptions::new(gating_date)
+            .with_fail_on(PolicyFailOn::Warning)
+            .with_diff_base("HEAD".to_string());
+        let outcome = evaluate_policy_files(
+            workspace.path(),
+            &[PathBuf::from("policies/diff.rqlp")],
+            &diff_options,
+        )
+        .expect("degraded diff evaluation");
+
+        // The degradation diagnostic makes the run itself unreliable, so the
+        // broken base can never be mistaken for a clean diff run.
+        assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE);
+        let review = outcome.report().diff().expect("diff review");
+        assert!(review.degraded());
+        assert_eq!(review.new_count(), 0);
+        assert_eq!(review.persisting_count(), 0);
+        assert_eq!(review.fixed_count(), 0);
+        let diagnostic = outcome
+            .report()
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code() == PolicyReportDiagnosticCode::DiffBaseUnreliable)
+            .expect("degradation diagnostic");
+        assert!(
+            diagnostic.message().contains("SuppressionLoadFailed"),
+            "{}",
+            diagnostic.message()
+        );
+        // No finding carries a diff decision under degraded gating.
+        assert!(
+            outcome
+                .report()
+                .runs()
+                .iter()
+                .flat_map(PolicyRun::findings)
+                .all(|finding| finding.diff().is_none())
+        );
+    }
+
+    #[test]
+    fn unresolvable_diff_base_and_non_git_root_fail_the_run() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        init_git_workspace(workspace.path());
+        fs::write(
+            workspace.path().join("app.ts"),
+            "export function target() {}\n",
+        )
+        .expect("source fixture");
+        write_policy(
+            workspace.path(),
+            "policies/diff.rqlp",
+            &match_policy("test.diff", "Diff test"),
+        );
+        commit_everything(workspace.path(), "base");
+
+        let gating_date = PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date");
+        let unresolvable =
+            PolicyEvaluationOptions::new(gating_date).with_diff_base("does-not-exist".to_string());
+        let Err(error) = evaluate_policy_files(
+            workspace.path(),
+            &[PathBuf::from("policies/diff.rqlp")],
+            &unresolvable,
+        ) else {
+            panic!("unresolvable diff base must fail the run");
+        };
+        assert!(error.to_string().contains("does-not-exist"), "{error}");
+
+        let plain = tempfile::tempdir().expect("non-git workspace");
+        fs::write(plain.path().join("app.ts"), "export function target() {}\n")
+            .expect("source fixture");
+        write_policy(
+            plain.path(),
+            "policies/diff.rqlp",
+            &match_policy("test.diff", "Diff test"),
+        );
+        let head_options =
+            PolicyEvaluationOptions::new(gating_date).with_diff_base("HEAD".to_string());
+        let Err(error) = evaluate_policy_files(
+            plain.path(),
+            &[PathBuf::from("policies/diff.rqlp")],
+            &head_options,
+        ) else {
+            panic!("a non-git root must fail the diff run");
+        };
+        assert!(
+            error.to_string().contains("not inside a git repository"),
+            "{error}"
+        );
     }
 }

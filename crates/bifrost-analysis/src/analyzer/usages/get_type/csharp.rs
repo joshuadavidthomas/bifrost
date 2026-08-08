@@ -4,24 +4,13 @@ use super::{
 use crate::analyzer::csharp::graph_support;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, CSharpTypeLookupResolution, ResolutionSession,
-    csharp_type_lookup_resolution, csharp_type_lookup_resolution_in_session,
+    csharp_type_lookup_resolution_in_session,
 };
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{CSharpAnalyzer, CodeUnit, IAnalyzer, ProjectFile, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
-
-pub(crate) fn resolve_csharp_type(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-) -> TypeLookupOutcome {
-    let session = ResolutionSession::unbounded();
-    resolve_csharp_type_in_session(analyzer, file, source, tree, site, &session, false)
-}
 
 pub(crate) fn resolve_csharp_type_bounded(
     analyzer: &dyn IAnalyzer,
@@ -33,8 +22,7 @@ pub(crate) fn resolve_csharp_type_bounded(
     cancellation: Option<&CancellationToken>,
 ) -> BoundedResolution<TypeLookupOutcome> {
     let session = ResolutionSession::bounded(budget, cancellation);
-    let outcome =
-        resolve_csharp_type_in_session(analyzer, file, source, tree, site, &session, true);
+    let outcome = resolve_csharp_type_in_session(analyzer, file, source, tree, site, &session);
     session.finish(outcome)
 }
 
@@ -45,7 +33,6 @@ fn resolve_csharp_type_in_session(
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
     session: &ResolutionSession,
-    bounded_lookup: bool,
 ) -> TypeLookupOutcome {
     let Some(tree) = tree else {
         return no_type("csharp_parse_failed", "C# source could not be parsed");
@@ -53,18 +40,14 @@ fn resolve_csharp_type_in_session(
     let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) else {
         return no_type("csharp_analyzer_unavailable", "C# analyzer is unavailable");
     };
-    let resolution = if bounded_lookup {
-        csharp_type_lookup_resolution_in_session(
-            analyzer,
-            file,
-            source,
-            tree.root_node(),
-            site,
-            session,
-        )
-    } else {
-        csharp_type_lookup_resolution(analyzer, file, source, tree.root_node(), site)
-    };
+    let resolution = csharp_type_lookup_resolution_in_session(
+        analyzer,
+        file,
+        source,
+        tree.root_node(),
+        site,
+        session,
+    );
     let Some(resolution) = resolution else {
         return no_type(
             "no_explicit_type",
@@ -218,6 +201,29 @@ mod tests {
         }
     }
 
+    /// The default-budget bounded lookup, unwrapped: these tests assert on the
+    /// resolved outcome and their fixtures fit the default budget comfortably.
+    fn complete_csharp_type(
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        tree: Option<&Tree>,
+        site: &ResolvedReferenceSite,
+    ) -> TypeLookupOutcome {
+        match resolve_csharp_type_bounded(
+            analyzer,
+            file,
+            source,
+            tree,
+            site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        ) {
+            BoundedResolution::Complete { value, .. } => value,
+            other => panic!("bounded C# lookup did not complete: {other:#?}"),
+        }
+    }
+
     fn bounded_expression_lookup(
         file_name: &str,
         source: &str,
@@ -275,7 +281,7 @@ public class Consumer
             "factory.Value",
             "factory?.Value",
         ] {
-            let outcome = resolve_csharp_type(
+            let outcome = complete_csharp_type(
                 fixture.analyzer.analyzer(),
                 &file,
                 source,
@@ -711,7 +717,7 @@ public class Consumer
         );
         let file = ProjectFile::new(fixture.project_root(), "App/Consumer.cs");
         let tree = parse_tree_for_language(&file, Language::CSharp, source).expect("C# tree");
-        let outcome = resolve_csharp_type(
+        let outcome = complete_csharp_type(
             fixture.analyzer.analyzer(),
             &file,
             source,

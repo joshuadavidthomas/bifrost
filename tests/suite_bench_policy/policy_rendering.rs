@@ -419,3 +419,85 @@ fn encoded_bounds_apply_after_terminal_and_json_escaping() {
     ));
     assert!(bounded_json.len() <= json_limit);
 }
+
+#[test]
+fn diff_mode_agrees_across_concise_verbose_and_json() {
+    let workspace = workspace(
+        "export function target() { return 1; }\n",
+        "render.rqlp",
+        MATCH_POLICY,
+    );
+    crate::common::init_git_repo_with_identity(workspace.path());
+    crate::common::run_git(workspace.path(), &["add", "."]);
+    crate::common::run_git(workspace.path(), &["commit", "-m", "base"]);
+    fs::write(
+        workspace.path().join("extra.ts"),
+        "export function target() { return 2; }\n",
+    )
+    .expect("new offending source");
+
+    let options = evaluation_options().with_diff_base("HEAD".to_string());
+    let outcome = evaluate_policy_files(
+        workspace.path(),
+        &[PathBuf::from("policies/render.rqlp")],
+        &options,
+    )
+    .expect("diff evaluation");
+
+    // Concise: only the new finding is shown; the summary carries the counts.
+    let mut concise = Vec::new();
+    write_policy_human(
+        outcome.report(),
+        &HumanRenderOptions::default(),
+        &mut concise,
+        usize::MAX,
+    )
+    .unwrap();
+    let concise = String::from_utf8(concise).unwrap();
+    assert!(concise.contains("extra.ts"), "{concise}");
+    assert!(!concise.contains("app.ts"), "{concise}");
+    assert!(
+        concise.contains("; diff: 1 new, 1 persisting, 0 fixed against HEAD"),
+        "{concise}"
+    );
+
+    // Verbose: both findings appear, each with its diff stanza.
+    let mut verbose = Vec::new();
+    write_policy_human(
+        outcome.report(),
+        &HumanRenderOptions::new(HumanRenderDetail::Verbose, HumanRenderColor::Plain),
+        &mut verbose,
+        usize::MAX,
+    )
+    .unwrap();
+    let verbose = String::from_utf8(verbose).unwrap();
+    assert!(verbose.contains("app.ts"), "{verbose}");
+    assert!(verbose.contains("extra.ts"), "{verbose}");
+    assert!(verbose.contains("\n  diff: new\n"), "{verbose}");
+    assert!(verbose.contains("\n  diff: persisting\n"), "{verbose}");
+
+    // JSON: the top-level review and per-finding dispositions agree with the
+    // human output.
+    let mut json_bytes = Vec::new();
+    write_policy_json(outcome.report(), &mut json_bytes, usize::MAX).unwrap();
+    let json: Value = serde_json::from_slice(&json_bytes).unwrap();
+    assert_eq!(json["diff"]["new_count"], 1);
+    assert_eq!(json["diff"]["persisting_count"], 1);
+    assert_eq!(json["diff"]["fixed_count"], 0);
+    assert_eq!(json["diff"]["degraded"], false);
+    assert_eq!(json["diff"]["base_revision"], "HEAD");
+    let findings = json["runs"][0]["findings"].as_array().expect("findings");
+    assert_eq!(findings.len(), 2);
+    for finding in findings {
+        let path = finding["primary"]["path"].as_str().expect("finding path");
+        let disposition = finding["diff"]["disposition"]
+            .as_str()
+            .expect("disposition");
+        match path {
+            "app.ts" => assert_eq!(disposition, "persisting"),
+            "extra.ts" => assert_eq!(disposition, "new"),
+            other => panic!("unexpected finding path {other}"),
+        }
+        assert_eq!(finding["diff"]["weak_identity"], false);
+    }
+}
