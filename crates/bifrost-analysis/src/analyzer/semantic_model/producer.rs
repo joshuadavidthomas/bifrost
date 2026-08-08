@@ -182,6 +182,28 @@ pub fn read_exact_artifact(
     read_exact_artifact_while(path, limits, || false)
 }
 
+/// Read an explicitly selected set of files under one root as a single exact
+/// artifact with a canonical, enumeration-independent digest.
+///
+/// Release tooling uses this to pin source-tree inputs such as a Python stub
+/// tree the same way a single archive file is pinned.
+pub fn read_exact_source_set(
+    root: &Path,
+    relative_paths: &[PathBuf],
+    max_files: usize,
+    max_path_depth: usize,
+    limits: &ArtifactProducerLimits,
+) -> Result<ExactArtifact, ProducerDiagnostic> {
+    read_exact_source_set_while(
+        root,
+        relative_paths,
+        max_files,
+        max_path_depth,
+        limits,
+        || false,
+    )
+}
+
 pub(crate) fn read_exact_artifact_while(
     path: &Path,
     limits: &ArtifactProducerLimits,
