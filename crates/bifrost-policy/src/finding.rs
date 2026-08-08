@@ -12,6 +12,7 @@ use serde::{Serialize, Serializer};
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::structural::CodeQueryDiagnosticCode;
 
+use super::baseline::PolicyFindingBaseline;
 use super::budget::PolicyBudget;
 use super::classification::{
     ClassificationProvenance, FindingClassification, OrganizationalRiskAssessment,
@@ -1960,6 +1961,8 @@ pub struct PolicyFinding {
     scope: Option<PolicyFindingScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     diff: Option<PolicyFindingDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline: Option<PolicyFindingBaseline>,
 }
 
 impl PolicyFinding {
@@ -2111,6 +2114,7 @@ impl PolicyFinding {
             suppression: None,
             scope: None,
             diff: None,
+            baseline: None,
         };
         finding.validate_against_budget(budget)?;
         Ok(finding)
@@ -2244,6 +2248,29 @@ impl PolicyFinding {
     #[cfg(test)]
     pub(crate) fn clear_diff(&mut self) {
         self.diff = None;
+    }
+
+    pub const fn baseline(&self) -> Option<&PolicyFindingBaseline> {
+        self.baseline.as_ref()
+    }
+
+    pub(crate) fn attach_baseline(
+        &mut self,
+        baseline: PolicyFindingBaseline,
+    ) -> Result<(), PolicyFindingError> {
+        if self.identity_stability != FindingIdentityStability::Strong {
+            return Err(PolicyFindingError::BaselineRequiresStrongIdentity);
+        }
+        if self.baseline.is_some() {
+            return Err(PolicyFindingError::DuplicateBaselineAttachment);
+        }
+        self.baseline = Some(baseline);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_baseline(&mut self) {
+        self.baseline = None;
     }
 
     pub(crate) fn validate_against_budget(
@@ -2385,6 +2412,7 @@ impl RetainedSize for PolicyFinding {
             .saturating_add(retained_extra(&self.suppression))
             .saturating_add(retained_extra(&self.scope))
             .saturating_add(retained_extra(&self.diff))
+            .saturating_add(retained_extra(&self.baseline))
     }
 }
 
@@ -2404,6 +2432,8 @@ pub enum PolicyFindingError {
     DuplicateSuppressionAttachment,
     DuplicateScopeAttachment,
     DuplicateDiffAttachment,
+    BaselineRequiresStrongIdentity,
+    DuplicateBaselineAttachment,
 }
 
 impl PolicyFindingError {
@@ -2464,6 +2494,12 @@ impl fmt::Display for PolicyFindingError {
             }
             Self::DuplicateDiffAttachment => {
                 formatter.write_str("finding already carries a diff decision")
+            }
+            Self::BaselineRequiresStrongIdentity => {
+                formatter.write_str("only a strong finding identity can carry a baseline decision")
+            }
+            Self::DuplicateBaselineAttachment => {
+                formatter.write_str("finding already carries a baseline decision")
             }
         }
     }

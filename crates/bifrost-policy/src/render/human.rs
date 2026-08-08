@@ -2889,6 +2889,8 @@ fn report_diagnostic_code(value: super::super::PolicyReportDiagnosticCode) -> &'
         Code::SuppressionAuditRetentionExceeded => "suppression-audit-retention-exceeded",
         Code::ScopeLoadFailed => "scope-load-failed",
         Code::ScopeAuditRetentionExceeded => "scope-audit-retention-exceeded",
+        Code::BaselineLoadFailed => "baseline-load-failed",
+        Code::BaselineAuditRetentionExceeded => "baseline-audit-retention-exceeded",
         Code::PacksLoadFailed => "packs-load-failed",
         Code::PackActivationFailed => "pack-activation-failed",
         Code::PolicyLoadFailed => "policy-load-failed",

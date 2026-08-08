@@ -9,6 +9,7 @@ use serde::{Serialize, Serializer};
 
 use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
 
+use super::baseline::PolicyBaselineReview;
 use super::budget::PolicyBatchBudget;
 use super::definition::{
     CategoryPredicate, DirectoryScope, EndpointRole, EndpointTaintSemantics, MatchSetManifestHash,
@@ -1022,6 +1023,8 @@ pub enum PolicyReportDiagnosticCode {
     SuppressionAuditRetentionExceeded,
     ScopeLoadFailed,
     ScopeAuditRetentionExceeded,
+    BaselineLoadFailed,
+    BaselineAuditRetentionExceeded,
     PacksLoadFailed,
     PackActivationFailed,
     PolicyLoadFailed,
@@ -1885,6 +1888,7 @@ pub struct PolicyReportDocument {
     scope: Vec<PolicyScopeReview>,
     diff: Option<PolicyDiffReview>,
     packs: Option<PolicyPackActivationReview>,
+    baseline: Option<PolicyBaselineReview>,
     diagnostics: Vec<PolicyReportDiagnostic>,
     diagnostics_truncated: bool,
     omitted_diagnostics_lower_bound: u64,
@@ -1946,6 +1950,7 @@ impl PolicyReportDocument {
             Vec::new(),
             None,
             None,
+            None,
             diagnostics,
             diagnostics_truncated,
             omitted_diagnostics_lower_bound,
@@ -1963,6 +1968,7 @@ impl PolicyReportDocument {
         mut scope: Vec<PolicyScopeReview>,
         diff: Option<PolicyDiffReview>,
         packs: Option<PolicyPackActivationReview>,
+        baseline: Option<PolicyBaselineReview>,
         mut diagnostics: Vec<PolicyReportDiagnostic>,
         diagnostics_truncated: bool,
         omitted_diagnostics_lower_bound: u64,
@@ -1988,6 +1994,7 @@ impl PolicyReportDocument {
         validate_suppression_joins(&runs, &suppressions)?;
         validate_scope_joins(&runs, &scope)?;
         validate_diff_joins(&runs, diff.as_ref())?;
+        validate_baseline_joins(&runs, baseline.as_ref())?;
 
         Ok(Self {
             schema_version: Self::SCHEMA_VERSION,
@@ -1999,6 +2006,7 @@ impl PolicyReportDocument {
             scope,
             diff,
             packs,
+            baseline,
             diagnostics,
             diagnostics_truncated,
             omitted_diagnostics_lower_bound,
@@ -2046,6 +2054,10 @@ impl PolicyReportDocument {
         self.packs.as_ref()
     }
 
+    pub const fn baseline(&self) -> Option<&PolicyBaselineReview> {
+        self.baseline.as_ref()
+    }
+
     pub fn diagnostics(&self) -> &[PolicyReportDiagnostic] {
         &self.diagnostics
     }
@@ -2068,10 +2080,13 @@ impl Serialize for PolicyReportDocument {
     where
         S: Serializer,
     {
-        // The `diff` and `packs` fields are additive and serialized only when
-        // present, so a report without them keeps its exact schema-version-3
-        // shape.
-        let field_count = 11 + usize::from(self.diff.is_some()) + usize::from(self.packs.is_some());
+        // The `diff`, `packs`, and `baseline` fields are additive and
+        // serialized only when present, so a report without them keeps its
+        // exact schema-version-3 shape.
+        let field_count = 11
+            + usize::from(self.diff.is_some())
+            + usize::from(self.packs.is_some())
+            + usize::from(self.baseline.is_some());
         let mut state = serializer.serialize_struct("PolicyReportDocument", field_count)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("evaluation", &self.evaluation)?;
@@ -2085,6 +2100,9 @@ impl Serialize for PolicyReportDocument {
         }
         if let Some(packs) = &self.packs {
             state.serialize_field("packs", packs)?;
+        }
+        if let Some(baseline) = &self.baseline {
+            state.serialize_field("baseline", baseline)?;
         }
         state.serialize_field("diagnostics", &self.diagnostics)?;
         state.serialize_field("diagnostics_truncated", &self.diagnostics_truncated)?;
@@ -2111,6 +2129,7 @@ impl RetainedSize for PolicyReportDocument {
             .saturating_add(retained_extra(&self.scope))
             .saturating_add(retained_extra(&self.diff))
             .saturating_add(retained_extra(&self.packs))
+            .saturating_add(retained_extra(&self.baseline))
             .saturating_add(retained_extra(&self.diagnostics))
     }
 }
@@ -2166,6 +2185,15 @@ pub enum PolicyReportDocumentError {
     MissingDiffFindingDecision {
         policy_id: PolicyId,
         finding_id: PolicyFindingId,
+    },
+    BaselineFindingWithoutReview {
+        policy_id: PolicyId,
+        finding_id: PolicyFindingId,
+    },
+    BaselineAppliedJoinMismatch {
+        attached: u64,
+        applied_count: u64,
+        result_omitted_count: u64,
     },
 }
 
@@ -2257,6 +2285,21 @@ impl fmt::Display for PolicyReportDocumentError {
                 formatter,
                 "diff review classified the report but finding {policy_id} finding {finding_id} has no diff decision"
             ),
+            Self::BaselineFindingWithoutReview {
+                policy_id,
+                finding_id,
+            } => write!(
+                formatter,
+                "finding {policy_id} finding {finding_id} carries a baseline decision without a top-level baseline review"
+            ),
+            Self::BaselineAppliedJoinMismatch {
+                attached,
+                applied_count,
+                result_omitted_count,
+            } => write!(
+                formatter,
+                "report retains {attached} baselined findings but the baseline review applied {applied_count} entries with {result_omitted_count} results omitted"
+            ),
         }
     }
 }
@@ -2282,6 +2325,7 @@ pub struct PolicyReportBuilder {
     scope: Vec<PolicyScopeReview>,
     diff: Option<PolicyDiffReview>,
     packs: Option<PolicyPackActivationReview>,
+    baseline: Option<PolicyBaselineReview>,
     diagnostics: Vec<PolicyReportDiagnostic>,
     diagnostics_truncated: bool,
     omitted_diagnostics_lower_bound: u64,
@@ -2403,6 +2447,7 @@ impl PolicyReportBuilder {
             scope,
             diff: None,
             packs: None,
+            baseline: None,
             diagnostics,
             diagnostics_truncated: false,
             omitted_diagnostics_lower_bound: 0,
@@ -2595,6 +2640,7 @@ impl PolicyReportBuilder {
         )
         .checked_add(self.diff_extra())
         .and_then(|bytes| bytes.checked_add(self.packs_extra()))
+        .and_then(|bytes| bytes.checked_add(self.baseline_extra()))
         .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if !policy_fits || !batch_fits {
@@ -2646,6 +2692,7 @@ impl PolicyReportBuilder {
         )
         .checked_add(self.diff_extra())
         .and_then(|bytes| bytes.checked_add(self.packs_extra()))
+        .and_then(|bytes| bytes.checked_add(self.baseline_extra()))
         .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if cap_reached || !policy_fits || !batch_fits {
@@ -2683,6 +2730,7 @@ impl PolicyReportBuilder {
         )
         .checked_add(self.diff_extra())
         .and_then(|bytes| bytes.checked_add(self.packs_extra()))
+        .and_then(|bytes| bytes.checked_add(self.baseline_extra()))
         .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if !fits {
@@ -2756,6 +2804,7 @@ impl PolicyReportBuilder {
             self.scope,
             self.diff,
             self.packs,
+            self.baseline,
             self.diagnostics,
             self.diagnostics_truncated,
             self.omitted_diagnostics_lower_bound,
@@ -2784,6 +2833,7 @@ impl PolicyReportBuilder {
         )
         .saturating_add(self.diff_extra())
         .saturating_add(self.packs_extra())
+        .saturating_add(self.baseline_extra())
         .saturating_add(retained_extra(&execution));
         if retained > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::BatchRetentionExceeded {
@@ -2811,6 +2861,7 @@ impl PolicyReportBuilder {
         )
         .saturating_add(retained_extra(&self.execution))
         .saturating_add(self.packs_extra())
+        .saturating_add(self.baseline_extra())
         .saturating_add(retained_extra(&diff));
         if retained > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::BatchRetentionExceeded {
@@ -2844,6 +2895,7 @@ impl PolicyReportBuilder {
         )
         .saturating_add(retained_extra(&self.execution))
         .saturating_add(self.diff_extra())
+        .saturating_add(self.baseline_extra())
         .saturating_add(retained_extra(&packs));
         if retained > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::BatchRetentionExceeded {
@@ -2855,12 +2907,65 @@ impl PolicyReportBuilder {
         Ok(())
     }
 
+    /// Retain the baseline review that audits this report's accepted findings.
+    ///
+    /// The review is bounded by construction; charging it against the batch
+    /// budget keeps every later retention decision aware of its bytes.
+    pub fn set_baseline(
+        &mut self,
+        baseline: PolicyBaselineReview,
+    ) -> Result<(), PolicyReportBuilderError> {
+        assert!(
+            self.baseline.is_none(),
+            "baseline review is set at most once"
+        );
+        let retained = report_storage_size(
+            &self.evaluation,
+            &self.rules,
+            &self.runs,
+            &self.suppressions,
+            &self.scope,
+            &self.diagnostics,
+        )
+        .saturating_add(retained_extra(&self.execution))
+        .saturating_add(self.diff_extra())
+        .saturating_add(self.packs_extra())
+        .saturating_add(retained_extra(&baseline));
+        if retained > self.budget.max_retained_report_bytes() {
+            return Err(PolicyReportBuilderError::BatchRetentionExceeded {
+                retained_bytes: retained,
+                max_bytes: self.budget.max_retained_report_bytes(),
+            });
+        }
+        self.baseline = Some(baseline);
+        Ok(())
+    }
+
+    /// Record that a baselined finding's result was dropped by the retention
+    /// budget. Only counts change, so no budget re-check is needed.
+    pub fn mark_baseline_result_omitted(
+        &mut self,
+        policy_id: &PolicyId,
+        finding_id: PolicyFindingId,
+    ) -> Result<(), PolicyReportBuilderError> {
+        let baseline = self
+            .baseline
+            .as_mut()
+            .ok_or(PolicyReportBuilderError::UnknownBaselineReview)?;
+        baseline.mark_result_omitted(policy_id, finding_id);
+        Ok(())
+    }
+
     fn diff_extra(&self) -> usize {
         self.diff.as_ref().map_or(0, retained_extra)
     }
 
     fn packs_extra(&self) -> usize {
         self.packs.as_ref().map_or(0, retained_extra)
+    }
+
+    fn baseline_extra(&self) -> usize {
+        self.baseline.as_ref().map_or(0, retained_extra)
     }
 
     fn ensure_input_slot(&self) -> Result<(), PolicyReportBuilderError> {
@@ -2907,6 +3012,7 @@ impl PolicyReportBuilder {
         )
         .checked_add(self.diff_extra())
         .and_then(|value| value.checked_add(self.packs_extra()))
+        .and_then(|value| value.checked_add(self.baseline_extra()))
         .and_then(|value| value.checked_add(outstanding_skeleton_allowance))
         .and_then(|value| value.checked_add(emergency))
         .ok_or(PolicyReportBuilderError::RetainedSizeOverflow)?;
@@ -2976,7 +3082,8 @@ impl PolicyReportBuilder {
             &self.diagnostics,
         )
         .saturating_add(self.diff_extra())
-        .saturating_add(self.packs_extra());
+        .saturating_add(self.packs_extra())
+        .saturating_add(self.baseline_extra());
         if actual > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::EmergencyReservationInvariant);
         }
@@ -3050,6 +3157,7 @@ pub enum PolicyReportBuilderError {
     AmbiguousSuppressionReview,
     SuppressionReviewNotApplied,
     UnknownScopeReview,
+    UnknownBaselineReview,
     DiagnosticCompletionMismatch,
     RunBudgetViolation(PolicyRunError),
     FindingBudgetViolation(PolicyFindingError),
@@ -3161,6 +3269,9 @@ impl fmt::Display for PolicyReportBuilderError {
             }
             Self::UnknownScopeReview => {
                 formatter.write_str("no scope review matches this finding's scope decision")
+            }
+            Self::UnknownBaselineReview => {
+                formatter.write_str("no baseline review is set for this report")
             }
             Self::DiagnosticCompletionMismatch => {
                 formatter.write_str("diagnostic impact is not reflected by run completion")
@@ -3436,6 +3547,41 @@ fn validate_diff_joins(
             }
             (true, Some(_)) | (false, None) => {}
         }
+    }
+    Ok(())
+}
+
+/// A baseline review and per-finding baseline decisions exist exactly
+/// together: without the review no finding carries a decision, and with it the
+/// retained decision count equals the applied entries minus omitted results.
+fn validate_baseline_joins(
+    runs: &[PolicyRun],
+    baseline: Option<&PolicyBaselineReview>,
+) -> Result<(), PolicyReportDocumentError> {
+    let mut attached = 0_u64;
+    for finding in runs.iter().flat_map(PolicyRun::findings) {
+        if finding.baseline().is_none() {
+            continue;
+        }
+        if baseline.is_none() {
+            return Err(PolicyReportDocumentError::BaselineFindingWithoutReview {
+                policy_id: finding.policy_id().clone(),
+                finding_id: finding.id(),
+            });
+        }
+        attached = attached.saturating_add(1);
+    }
+    if let Some(review) = baseline
+        && attached
+            != review
+                .applied_count()
+                .saturating_sub(review.result_omitted_count())
+    {
+        return Err(PolicyReportDocumentError::BaselineAppliedJoinMismatch {
+            attached,
+            applied_count: review.applied_count(),
+            result_omitted_count: review.result_omitted_count(),
+        });
     }
     Ok(())
 }

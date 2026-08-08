@@ -31,6 +31,11 @@ use brokk_bifrost_analysis::diff_analysis::export_revision;
 use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
 use brokk_bifrost_analysis::workspace_document::WorkspaceRoot;
 
+use super::baseline::{
+    PolicyBaselineDocument, PolicyBaselineEntryReview, PolicyBaselineMatchState,
+    PolicyBaselineOptions, PolicyBaselineReview, PolicyFindingBaseline,
+    load_policy_baseline_from_root,
+};
 use super::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
 use super::definition::{FindingSeverity, PolicyCategoryId, PolicyId, RqlpDocument};
 use super::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
@@ -109,6 +114,7 @@ pub struct PolicyEvaluationOptions {
     evaluation_date: PolicyEvaluationDate,
     suppressions: PolicySuppressionOptions,
     scope: PolicyScopeOptions,
+    baseline: PolicyBaselineOptions,
     require_explicit_schema_versions: bool,
     fail_on: PolicyFailOn,
     diff_base: Option<String>,
@@ -120,6 +126,7 @@ impl PolicyEvaluationOptions {
             evaluation_date,
             suppressions: PolicySuppressionOptions::default(),
             scope: PolicyScopeOptions::default(),
+            baseline: PolicyBaselineOptions::default(),
             require_explicit_schema_versions: false,
             fail_on: PolicyFailOn::Never,
             diff_base: None,
@@ -134,6 +141,9 @@ impl PolicyEvaluationOptions {
             evaluation_date,
             suppressions,
             scope: PolicyScopeOptions::new(PolicyScopeSource::Conventional),
+            baseline: PolicyBaselineOptions::new(
+                super::baseline::PolicyBaselineSource::Conventional,
+            ),
             require_explicit_schema_versions: false,
             fail_on: PolicyFailOn::Never,
             diff_base: None,
@@ -142,6 +152,11 @@ impl PolicyEvaluationOptions {
 
     pub fn with_scope(mut self, scope: PolicyScopeOptions) -> Self {
         self.scope = scope;
+        self
+    }
+
+    pub fn with_baseline(mut self, baseline: PolicyBaselineOptions) -> Self {
+        self.baseline = baseline;
         self
     }
 
@@ -177,6 +192,10 @@ impl PolicyEvaluationOptions {
         &self.scope
     }
 
+    pub const fn baseline(&self) -> &PolicyBaselineOptions {
+        &self.baseline
+    }
+
     pub const fn require_explicit_schema_versions(&self) -> bool {
         self.require_explicit_schema_versions
     }
@@ -195,6 +214,7 @@ impl RetainedSize for PolicyEvaluationOptions {
         std::mem::size_of::<Self>()
             .saturating_add(retained_extra(&self.suppressions))
             .saturating_add(retained_extra(&self.scope))
+            .saturating_add(retained_extra(&self.baseline))
             .saturating_add(retained_extra(&self.diff_base))
     }
 }
@@ -586,6 +606,7 @@ fn deadline_before_evaluation_outcome(
         Vec::new(),
         None,
         None,
+        None,
         diagnostics,
         false,
         0,
@@ -925,6 +946,23 @@ fn evaluate_prepared_policy_inputs(
                 (None, PolicyScopeDocumentState::Invalid)
             }
         };
+    // A malformed baseline document is loud: its diagnostic alone makes the
+    // run unreliable, so a broken bulk acceptance can never look clean.
+    let baseline_document = match load_policy_baseline_from_root(read_root, options.baseline()) {
+        Ok(document) => document,
+        Err(error) => {
+            secondary_diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::BaselineLoadFailed,
+                format!("failed to load the policy baseline: {error}"),
+                Some(PolicySourceIdentity::new(
+                    options.baseline().source().relative_path(),
+                )),
+                None,
+                Vec::new(),
+            )?);
+            None
+        }
+    };
     // The workspace packs document opts this evaluation into dependency and
     // stdlib semantic-pack activation (#1868). A malformed document is loud:
     // its diagnostic makes the run unreliable rather than silently evaluating
@@ -1395,6 +1433,21 @@ fn evaluate_prepared_policy_inputs(
             )));
         }
     };
+    // The baseline claims only findings that suppressions and scope left
+    // unclaimed, so it joins after the builder preflight settled those
+    // attachments (a preflight rollback clears them, and the baseline must
+    // see the final claim state).
+    let baseline_review = match baseline_document.as_ref() {
+        Some(document) => {
+            let entries = apply_policy_baseline(document, &registry, &mut runs)?;
+            Some(PolicyBaselineReview::new(
+                options.baseline().source().relative_path(),
+                document,
+                entries,
+            ))
+        }
+        None => None,
+    };
     // A degraded diff review does not narrow the gate: every finding gates as
     // if no diff base had been given.
     let diff_gating = diff_review
@@ -1403,6 +1456,7 @@ fn evaluate_prepared_policy_inputs(
     let threshold_exceeded = runs.values().flat_map(PolicyRun::findings).any(|finding| {
         finding.suppression().is_none()
             && finding.scope().is_none()
+            && finding.baseline().is_none()
             && options.fail_on().matches(finding.severity())
             && (!diff_gating
                 || finding
@@ -1418,6 +1472,13 @@ fn evaluate_prepared_policy_inputs(
         builder.set_packs(review).map_err(|error| {
             PolicyCoordinatorError::new(format!(
                 "failed to retain the pack-activation review: {error}"
+            ))
+        })?;
+    }
+    if let Some(review) = baseline_review {
+        builder.set_baseline(review).map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to retain the policy baseline review: {error}"
             ))
         })?;
     }
@@ -1465,18 +1526,28 @@ fn evaluate_prepared_policy_inputs(
         }
     }
 
+    // Retention priority: suppressed/scoped findings first (their omission is
+    // a loud audit failure), then unclaimed gating findings, then baselined
+    // findings last — their identities are already durably recorded in the
+    // baseline review counts, so under pressure they are dropped first.
     retained_findings.sort_by_key(|finding| {
-        (
-            finding.suppression().is_none() && finding.scope().is_none(),
-            finding.id(),
-        )
+        let priority: u8 = if finding.suppression().is_some() || finding.scope().is_some() {
+            0
+        } else if finding.baseline().is_none() {
+            1
+        } else {
+            2
+        };
+        (priority, finding.id())
     });
     let mut suppression_result_omitted = false;
     let mut scope_result_omitted = false;
+    let mut baseline_result_omitted = false;
     for finding in retained_findings {
         let policy_id = finding.policy_id().clone();
         let finding_id = finding.id();
         let suppressed = finding.suppression().is_some();
+        let baselined = finding.baseline().is_some();
         let finding_scope = finding.scope().cloned();
         let outcome = builder.retain_finding(finding).map_err(|error| {
             PolicyCoordinatorError::new(format!("failed to retain a policy finding: {error}"))
@@ -1491,6 +1562,16 @@ fn evaluate_prepared_policy_inputs(
                         ))
                     })?;
                 suppression_result_omitted = true;
+            }
+            if baselined {
+                builder
+                    .mark_baseline_result_omitted(&policy_id, finding_id)
+                    .map_err(|error| {
+                        PolicyCoordinatorError::new(format!(
+                            "failed to record an omitted baselined finding: {error}"
+                        ))
+                    })?;
+                baseline_result_omitted = true;
             }
             if let Some(finding_scope) = finding_scope.as_ref() {
                 builder
@@ -1521,6 +1602,17 @@ fn evaluate_prepared_policy_inputs(
             "one or more applied suppression results exceeded the report retention budget",
             Some(PolicySourceIdentity::new(
                 options.suppressions().source().relative_path(),
+            )),
+            None,
+            Vec::new(),
+        )?);
+    }
+    if baseline_result_omitted {
+        secondary_diagnostics.push(report_diagnostic(
+            PolicyReportDiagnosticCode::BaselineAuditRetentionExceeded,
+            "one or more baselined finding results exceeded the report retention budget",
+            Some(PolicySourceIdentity::new(
+                options.baseline().source().relative_path(),
             )),
             None,
             Vec::new(),
@@ -1950,6 +2042,89 @@ fn apply_policy_scope(
             }
         }
         reviews.push(PolicyScopeReview::new(entry, matched_findings));
+    }
+    Ok(reviews)
+}
+
+/// Join the baseline document against the head runs and attach an accepted
+/// decision to every strong finding not already claimed by a suppression or
+/// scope decision.
+///
+/// This is the bulk sibling of [`apply_policy_suppressions`]: the same
+/// `(policy_id, finding_id)` key and attachment pattern, but the join builds
+/// one id index per policy so a 100k-entry document stays linear, and the
+/// full entry-review vector is folded into bounded counts by the caller.
+fn apply_policy_baseline(
+    document: &PolicyBaselineDocument,
+    registry: &PolicyRegistry,
+    runs: &mut HashMap<PolicyId, PolicyRun>,
+) -> Result<Vec<PolicyBaselineEntryReview>, PolicyCoordinatorError> {
+    let policy_hashes = registry
+        .policies()
+        .map(|policy| {
+            (
+                policy.definition().metadata.id.clone(),
+                policy.semantic_hash(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut reviews = Vec::with_capacity(document.entry_count());
+    for record in document.policies() {
+        let policy_hash_state = PolicySuppressionPolicyHashState::compare(
+            record.policy_hash_at_acceptance(),
+            policy_hashes.get(record.policy_id()).copied(),
+        );
+        let Some(run) = runs.get_mut(record.policy_id()) else {
+            reviews.extend(record.finding_ids().iter().map(|finding_id| {
+                PolicyBaselineEntryReview::new(
+                    record.policy_id().clone(),
+                    *finding_id,
+                    PolicyBaselineMatchState::PolicyNotEvaluated,
+                    policy_hash_state,
+                )
+            }));
+            continue;
+        };
+        let index_by_id = run
+            .findings()
+            .iter()
+            .enumerate()
+            .map(|(index, finding)| (finding.id(), index))
+            .collect::<HashMap<_, _>>();
+        let exhaustive = run.completion().is_exhaustive();
+        for finding_id in record.finding_ids() {
+            let match_state = match index_by_id.get(finding_id) {
+                Some(&index) => {
+                    let finding = &run.findings()[index];
+                    if finding.identity_stability() != FindingIdentityStability::Strong {
+                        PolicyBaselineMatchState::CurrentFindingNotStrong
+                    } else if finding.suppression().is_some() || finding.scope().is_some() {
+                        PolicyBaselineMatchState::FindingClaimed
+                    } else {
+                        run.findings_mut()[index]
+                            .attach_baseline(PolicyFindingBaseline::new(
+                                document,
+                                policy_hash_state,
+                            ))
+                            .map_err(|error| {
+                                PolicyCoordinatorError::new(format!(
+                                    "failed to attach the baseline decision for policy {} finding {finding_id}: {error}",
+                                    record.policy_id()
+                                ))
+                            })?;
+                        PolicyBaselineMatchState::StrongFinding
+                    }
+                }
+                None if exhaustive => PolicyBaselineMatchState::FindingAbsent,
+                None => PolicyBaselineMatchState::PolicyIncomplete,
+            };
+            reviews.push(PolicyBaselineEntryReview::new(
+                record.policy_id().clone(),
+                *finding_id,
+                match_state,
+                policy_hash_state,
+            ));
+        }
     }
     Ok(reviews)
 }

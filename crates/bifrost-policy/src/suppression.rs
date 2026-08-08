@@ -135,6 +135,10 @@ impl std::error::Error for PolicyDateError {}
 pub struct AcceptedPolicyHash([u8; 32]);
 
 impl AcceptedPolicyHash {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -636,7 +640,7 @@ pub fn parse_policy_suppression_document(
     }
     let wire = serde_json::from_str::<WireSuppressionDocument>(source).map_err(|error| {
         PolicySuppressionDocumentError::JsonDecode {
-            message: bounded_error_message(&error.to_string()),
+            message: bounded_json_error_message(&error.to_string()),
             line: error.line(),
             column: error.column(),
         }
@@ -768,7 +772,7 @@ fn compare_suppression_key(
         .then_with(|| left.finding_id.cmp(&right.finding_id))
 }
 
-fn workspace_error_is_not_found(error: &WorkspaceDocumentError) -> bool {
+pub(crate) fn workspace_error_is_not_found(error: &WorkspaceDocumentError) -> bool {
     matches!(
         error,
         WorkspaceDocumentError::OpenFile { source, .. }
@@ -776,7 +780,9 @@ fn workspace_error_is_not_found(error: &WorkspaceDocumentError) -> bool {
     )
 }
 
-fn bounded_error_message(message: &str) -> Box<str> {
+/// Truncate one serde_json decode message to a bounded, char-safe prefix for
+/// report diagnostics. Shared by the suppression and baseline document kinds.
+pub(crate) fn bounded_json_error_message(message: &str) -> Box<str> {
     if message.len() <= MAX_JSON_ERROR_BYTES {
         return message.into();
     }
