@@ -868,3 +868,122 @@ fn sarif_preserves_broken_pipe_as_an_output_error() {
             if error.kind() == io::ErrorKind::BrokenPipe
     ));
 }
+
+#[test]
+fn baseline_findings_emit_suppressions_and_run_level_review() {
+    let policy_source = r#"(policy
+      :id "test.sarif-baseline"
+      :name "SARIF baseline"
+      :message "Selected target is reportable"
+      :severity warning
+      :analysis (analysis :type match :selector
+        (rql (language typescript (function :name "target")))))"#;
+    let project = crate::common::InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", "export function target() { return 1; }\n")
+        .file("policies/baseline.rqlp", policy_source)
+        .build();
+    let options = PolicyEvaluationOptions::new(
+        PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+    );
+    let onboarding = evaluate_policy_files(
+        project.root(),
+        &[PathBuf::from("policies/baseline.rqlp")],
+        &options,
+    )
+    .expect("onboarding evaluation");
+    let (document, weak_excluded) =
+        brokk_bifrost::policy::PolicyBaselineDocument::from_completed_report(
+            onboarding.report(),
+            "Onboarding acceptance",
+            Some("platform-team"),
+            PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed acceptance date"),
+        )
+        .expect("baseline generation");
+    assert_eq!(weak_excluded, 0);
+    let baseline_path = project.root().join(".bifrost/baseline.json");
+    fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+    fs::write(baseline_path, document.to_canonical_json()).unwrap();
+    fs::write(
+        project.root().join("extra.ts"),
+        "export function target() { return 2; }\n",
+    )
+    .expect("new offending source");
+
+    let report = evaluate_policy_files(
+        project.root(),
+        &[PathBuf::from("policies/baseline.rqlp")],
+        &options,
+    )
+    .expect("baseline evaluation")
+    .into_report();
+
+    let (_, value) = render(&report);
+    let schema: Value = serde_json::from_slice(SCHEMA_BYTES).unwrap();
+    let validator = schema_validator(&schema);
+    let errors = validator
+        .iter_errors(&value)
+        .map(|error| format!("{} at {}", error, error.instance_path()))
+        .collect::<Vec<_>>();
+    assert!(
+        errors.is_empty(),
+        "SARIF validation errors:\n{}",
+        errors.join("\n")
+    );
+
+    let run = &value["runs"][0];
+    let results = run["results"].as_array().expect("results");
+    assert_eq!(results.len(), 2);
+    for result in results {
+        let uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            .as_str()
+            .expect("result uri");
+        match uri {
+            "app.ts" => {
+                // A baselined finding renders as a standard SARIF suppression
+                // entry so consumers exclude it from gating; the property bag
+                // names the mechanism.
+                let suppression = &result["suppressions"][0];
+                assert_eq!(suppression["kind"], "external", "{result:#}");
+                assert_eq!(suppression["status"], "accepted", "{result:#}");
+                assert_eq!(
+                    suppression["justification"], "Onboarding acceptance",
+                    "{result:#}"
+                );
+                assert_eq!(
+                    suppression["properties"]["bifrost.decision"], "baseline",
+                    "{result:#}"
+                );
+                assert_eq!(
+                    suppression["properties"]["bifrost.acceptedBy"], "platform-team",
+                    "{result:#}"
+                );
+                assert_eq!(
+                    suppression["properties"]["bifrost.policyHashState"], "matching",
+                    "{result:#}"
+                );
+            }
+            "extra.ts" => assert!(result.get("suppressions").is_none(), "{result:#}"),
+            other => panic!("unexpected result uri {other}"),
+        }
+    }
+    let review = &run["properties"]["bifrost.baseline"];
+    assert_eq!(review["document_path"], ".bifrost/baseline.json");
+    assert_eq!(review["entry_count"], 1);
+    assert_eq!(review["applied_count"], 1);
+    assert_eq!(review["result_omitted_count"], 0);
+    assert_eq!(review["entries_truncated"], false);
+
+    // A report without a baseline document emits neither the run property nor
+    // suppression entries for unclaimed findings.
+    let (_, ordinary) = render(&ordinary_report());
+    assert!(
+        ordinary["runs"][0]["properties"]
+            .get("bifrost.baseline")
+            .is_none()
+    );
+    assert!(
+        ordinary["runs"][0]["results"][0]
+            .get("suppressions")
+            .is_none()
+    );
+}

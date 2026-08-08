@@ -13,13 +13,13 @@ use super::{
 use crate::{
     BoundedWitness, FindingCertainty, FindingCompleteness, FindingDiffDisposition,
     FindingIdentityStability, FindingSeverity, OrganizationalRiskAssessment, PolicyAnalysisType,
-    PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyDiffReview, PolicyDisplayRegion,
-    PolicyEvaluationDate, PolicyFinding, PolicyFindingEvidence, PolicyFindingSuppression,
-    PolicyLevel, PolicyPackActivationReview, PolicyReportDiagnostic, PolicyReportDocument,
-    PolicyReportEvaluationContext, PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion,
-    PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation, PolicySuppressionPolicyHashState,
-    PolicySuppressionReview, PolicyWorkReport, ProofMetadata, RelatedPolicyLocation, WitnessStep,
-    WitnessStepKind,
+    PolicyBaselineReview, PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyDiffReview,
+    PolicyDisplayRegion, PolicyEvaluationDate, PolicyFinding, PolicyFindingBaseline,
+    PolicyFindingEvidence, PolicyFindingSuppression, PolicyLevel, PolicyPackActivationReview,
+    PolicyReportDiagnostic, PolicyReportDocument, PolicyReportEvaluationContext,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec,
+    PolicySourceLocation, PolicySuppressionPolicyHashState, PolicySuppressionReview,
+    PolicyWorkReport, ProofMetadata, RelatedPolicyLocation, WitnessStep, WitnessStepKind,
 };
 
 const SARIF_SCHEMA_URI: &str =
@@ -369,9 +369,17 @@ impl<'a> SarifResult<'a> {
                 .then(|| SarifPartialFingerprints {
                     finding_id: finding.id(),
                 }),
+            // A finding is claimed by at most one mechanism (suppressions and
+            // scope claim before the baseline), so this array stays one
+            // element.
             suppressions: finding
                 .suppression()
-                .map(|suppression| [SarifSuppression::from_suppression(suppression)]),
+                .map(|suppression| [SarifSuppression::from_suppression(suppression)])
+                .or_else(|| {
+                    finding
+                        .baseline()
+                        .map(|baseline| [SarifSuppression::from_baseline(baseline)])
+                }),
             properties: SarifResultProperties {
                 finding_id: finding.id(),
                 policy_hash: finding.policy_hash(),
@@ -405,7 +413,7 @@ struct SarifSuppression<'a> {
     kind: &'static str,
     status: &'static str,
     justification: &'a str,
-    properties: SarifSuppressionProperties<'a>,
+    properties: SarifSuppressionPropertySet<'a>,
 }
 
 impl<'a> SarifSuppression<'a> {
@@ -415,16 +423,55 @@ impl<'a> SarifSuppression<'a> {
             kind: "external",
             status: "accepted",
             justification: decision.reason(),
-            properties: SarifSuppressionProperties {
+            properties: SarifSuppressionPropertySet::Suppression(SarifSuppressionProperties {
                 identity_stability: decision.identity_stability(),
                 accepted_by: decision.accepted_by(),
                 accepted_at: decision.accepted_at(),
                 expires_at: decision.expires_at(),
                 policy_hash_at_acceptance: decision.policy_hash_at_acceptance(),
                 policy_hash_state: suppression.policy_hash_state(),
-            },
+            }),
         }
     }
+
+    /// A baselined finding renders as the same suppressions-entry shape a
+    /// reviewed suppression uses, because SARIF consumers exclude suppressed
+    /// results from gating and that matches the baseline's semantics. The
+    /// `bifrost.decision` property distinguishes the mechanism.
+    fn from_baseline(baseline: &'a PolicyFindingBaseline) -> Self {
+        Self {
+            kind: "external",
+            status: "accepted",
+            justification: baseline.reason(),
+            properties: SarifSuppressionPropertySet::Baseline(SarifBaselineProperties {
+                decision: "baseline",
+                accepted_by: baseline.accepted_by(),
+                accepted_at: baseline.accepted_at(),
+                policy_hash_state: baseline.policy_hash_state(),
+            }),
+        }
+    }
+}
+
+/// One-element `suppressions` entries share a struct type, so the property
+/// bag is an untagged union of the two decision shapes.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SarifSuppressionPropertySet<'a> {
+    Suppression(SarifSuppressionProperties<'a>),
+    Baseline(SarifBaselineProperties<'a>),
+}
+
+#[derive(Serialize)]
+struct SarifBaselineProperties<'a> {
+    #[serde(rename = "bifrost.decision")]
+    decision: &'static str,
+    #[serde(rename = "bifrost.acceptedBy", skip_serializing_if = "Option::is_none")]
+    accepted_by: Option<&'a str>,
+    #[serde(rename = "bifrost.acceptedAt")]
+    accepted_at: PolicyEvaluationDate,
+    #[serde(rename = "bifrost.policyHashState")]
+    policy_hash_state: PolicySuppressionPolicyHashState,
 }
 
 #[derive(Serialize)]
@@ -947,6 +994,8 @@ struct SarifRunProperties<'a> {
         skip_serializing_if = "Option::is_none"
     )]
     pack_activation: Option<&'a PolicyPackActivationReview>,
+    #[serde(rename = "bifrost.baseline", skip_serializing_if = "Option::is_none")]
+    baseline: Option<&'a PolicyBaselineReview>,
     #[serde(rename = "bifrost.reportDiagnostics")]
     report_diagnostics: &'a [PolicyReportDiagnostic],
     #[serde(rename = "bifrost.reportDiagnosticsTruncated")]
@@ -969,6 +1018,7 @@ impl<'a> SarifRunProperties<'a> {
             suppressions: report.suppressions(),
             diff_baseline: report.diff(),
             pack_activation: report.packs(),
+            baseline: report.baseline(),
             report_diagnostics: report.diagnostics(),
             diagnostics_truncated: report.diagnostics_truncated(),
             omitted_diagnostics_lower_bound: report.omitted_diagnostics_lower_bound(),

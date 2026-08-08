@@ -139,7 +139,11 @@ pub fn write_policy_human<W: Write>(
                         && finding.diff().is_some_and(|diff| {
                             diff.disposition() == FindingDiffDisposition::Persisting
                         });
-                    if finding.suppression().is_none() && finding.scope().is_none() && !persisting {
+                    if finding.suppression().is_none()
+                        && finding.scope().is_none()
+                        && finding.baseline().is_none()
+                        && !persisting
+                    {
                         write_concise_finding(&mut output, finding, options.color())?;
                     }
                 }
@@ -183,6 +187,9 @@ pub fn write_policy_human<W: Write>(
             .filter(|review| !review.applied() || review.result_omitted())
         {
             write_scope_review(&mut output, review)?;
+        }
+        if let Some(review) = report.baseline() {
+            write_baseline_review(&mut output, review)?;
         }
     }
 
@@ -278,6 +285,29 @@ fn write_finding<W: Write>(
             escape_terminal_text(scope.reason()),
         )
         .map_err(map_io_error)?;
+    }
+    if let Some(baseline) = finding.baseline() {
+        writeln!(
+            output,
+            "  baseline: accepted {} (policy hash {})",
+            baseline.accepted_at(),
+            suppression_policy_hash_state(baseline.policy_hash_state()),
+        )
+        .map_err(map_io_error)?;
+        writeln!(
+            output,
+            "  baseline reason: {}",
+            escape_terminal_text(baseline.reason()),
+        )
+        .map_err(map_io_error)?;
+        if let Some(accepted_by) = baseline.accepted_by() {
+            writeln!(
+                output,
+                "  baseline accepted by: {}",
+                escape_terminal_text(accepted_by),
+            )
+            .map_err(map_io_error)?;
+        }
     }
     if let Some(diff) = finding.diff() {
         writeln!(
@@ -520,6 +550,74 @@ fn write_scope_review<W: Write>(
         escape_terminal_text(review.entry().reason()),
     )
     .map_err(map_io_error)
+}
+
+fn write_baseline_review<W: Write>(
+    output: &mut BoundedWriter<W>,
+    review: &crate::PolicyBaselineReview,
+) -> Result<(), PolicyRenderError> {
+    writeln!(
+        output,
+        "baseline review: {}",
+        escape_terminal_text(review.document_path()),
+    )
+    .map_err(map_io_error)?;
+    writeln!(
+        output,
+        "  disposition: {} entries; applied {}; claimed {}; not strong {}; stale {}; not evaluated {}; incomplete {}; drifted {}; results omitted {}",
+        review.entry_count(),
+        review.applied_count(),
+        review.claimed_count(),
+        review.not_strong_count(),
+        review.stale_count(),
+        review.policy_not_evaluated_count(),
+        review.policy_incomplete_count(),
+        review.drifted_count(),
+        review.result_omitted_count(),
+    )
+    .map_err(map_io_error)?;
+    writeln!(
+        output,
+        "  baseline reason: {}",
+        escape_terminal_text(review.reason()),
+    )
+    .map_err(map_io_error)?;
+    write!(output, "  accepted: {}", review.accepted_at()).map_err(map_io_error)?;
+    if let Some(accepted_by) = review.accepted_by() {
+        write!(output, " by {}", escape_terminal_text(accepted_by)).map_err(map_io_error)?;
+    }
+    writeln!(output).map_err(map_io_error)?;
+    for entry in review.entries() {
+        writeln!(
+            output,
+            "  entry: {} finding {} ({}, policy hash {})",
+            escape_terminal_text(entry.policy_id().as_str()),
+            entry.finding_id(),
+            baseline_match_state(entry.match_state()),
+            suppression_policy_hash_state(entry.policy_hash_state()),
+        )
+        .map_err(map_io_error)?;
+    }
+    if review.entries_truncated() {
+        writeln!(
+            output,
+            "  entries truncated: the counts above stay exact over the complete document"
+        )
+        .map_err(map_io_error)?;
+    }
+    Ok(())
+}
+
+fn baseline_match_state(value: crate::PolicyBaselineMatchState) -> &'static str {
+    use crate::PolicyBaselineMatchState as State;
+    match value {
+        State::StrongFinding => "strong finding",
+        State::FindingClaimed => "claimed by suppression or scope",
+        State::CurrentFindingNotStrong => "current finding not strong",
+        State::FindingAbsent => "finding absent (stale)",
+        State::PolicyNotEvaluated => "policy not evaluated",
+        State::PolicyIncomplete => "policy incomplete",
+    }
 }
 
 fn write_suppression_decision<W: Write>(
@@ -2340,12 +2438,19 @@ fn write_summary<W: Write>(
         .flat_map(PolicyRun::findings)
         .filter(|finding| finding.scope().is_some())
         .count();
+    let retained_baselined_count = report
+        .runs()
+        .iter()
+        .flat_map(PolicyRun::findings)
+        .filter(|finding| finding.baseline().is_some())
+        .count();
     let retained_finding_count = report.runs().iter().fold(0_usize, |total, run| {
         total.saturating_add(run.findings().len())
     });
     let active_finding_count = retained_finding_count
         .saturating_sub(retained_suppressed_count)
-        .saturating_sub(retained_scoped_count);
+        .saturating_sub(retained_scoped_count)
+        .saturating_sub(retained_baselined_count);
     let suppressed_finding_count = report
         .suppressions()
         .iter()
@@ -2433,6 +2538,31 @@ fn write_summary<W: Write>(
     )?;
     write_summary_count(output, unproven_count, "unproven suppression review")?;
     write_summary_count(output, result_omitted_count, "suppression result omitted")?;
+    if let Some(review) = report.baseline() {
+        write!(
+            output,
+            "; baseline: {} accepted of {} entries via {}",
+            review.applied_count(),
+            review.entry_count(),
+            escape_terminal_text(review.document_path()),
+        )
+        .map_err(map_io_error)?;
+        write_summary_count(
+            output,
+            usize::try_from(review.drifted_count()).unwrap_or(usize::MAX),
+            "policy-hash-drifted baseline entry",
+        )?;
+        write_summary_count(
+            output,
+            usize::try_from(review.stale_count()).unwrap_or(usize::MAX),
+            "stale baseline entry",
+        )?;
+        write_summary_count(
+            output,
+            usize::try_from(review.result_omitted_count()).unwrap_or(usize::MAX),
+            "baseline result omitted",
+        )?;
+    }
     if let Some(review) = report.diff() {
         if review.degraded() {
             write!(
