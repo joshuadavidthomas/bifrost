@@ -2088,6 +2088,45 @@ impl SearchToolsService {
         )
     }
 
+    /// A one-shot `--tool` process: build the workspace, answer one call, exit.
+    ///
+    /// No file watcher. Nothing in the process consumes a watch event before it
+    /// exits, and installing one is not free: `start_watcher` cost 0.37-0.40 s
+    /// of wall clock on the rustc tree, and its deliberate
+    /// `invalidate_cached_file_listing` then forced a **second** whole-workspace
+    /// walk (0.45 s) inside the tool call's own budget, because the listing the
+    /// build had just filled was dropped
+    /// (`.agents/docs/gate-cell-overhead-2026-08.md`).
+    ///
+    /// The listing cache stays, which is the part that is not about watching: a
+    /// process that exits cannot observe a change it would need to invalidate
+    /// for, so one walk serves every consumer. `Manual` is the honest strategy
+    /// here for the same reason the scoped one-shot constructors already use it
+    /// -- nothing updates this workspace after construction.
+    pub fn new_one_shot(root: PathBuf) -> Result<Self, String> {
+        Self::new_one_shot_with_watcher_starter(
+            root,
+            semantic_indexing_enabled(),
+            production_watcher_starter(),
+        )
+    }
+
+    fn new_one_shot_with_watcher_starter(
+        root: PathBuf,
+        semantic_indexing: bool,
+        watcher_starter: WatcherStarter,
+    ) -> Result<Self, String> {
+        let canonical = canonical_service_root(root)?;
+        let file_listing = Some(Arc::new(WorkspaceFileListingCache::new(canonical.clone())));
+        Self::new_synchronous(
+            canonical,
+            file_listing,
+            UpdateStrategy::Manual,
+            semantic_indexing,
+            watcher_starter,
+        )
+    }
+
     fn new_with_strategy_and_watcher_starter(
         root: PathBuf,
         update_strategy: UpdateStrategy,
@@ -2096,6 +2135,26 @@ impl SearchToolsService {
     ) -> Result<Self, String> {
         let canonical = canonical_service_root(root)?;
         let file_listing = listing_cache_for(update_strategy, &canonical);
+        Self::new_synchronous(
+            canonical,
+            file_listing,
+            update_strategy,
+            semantic_indexing,
+            watcher_starter,
+        )
+    }
+
+    /// Build a persisted workspace and its session synchronously. The listing
+    /// cache is a parameter rather than a function of `update_strategy`: a
+    /// one-shot process wants the cache without the watcher that normally
+    /// invalidates it.
+    fn new_synchronous(
+        canonical: PathBuf,
+        file_listing: Option<Arc<WorkspaceFileListingCache>>,
+        update_strategy: UpdateStrategy,
+        semantic_indexing: bool,
+        watcher_starter: WatcherStarter,
+    ) -> Result<Self, String> {
         let (project, workspace) = build_persisted_workspace(canonical, file_listing.clone())?;
         let root = project.root().to_path_buf();
         let session = assemble_session(
@@ -3967,6 +4026,67 @@ mod watcher_startup_tests {
         assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
         assert!(error.message.contains("Failed to start project watcher"));
         assert!(error.message.contains(WATCHER_FAILURE));
+    }
+
+    /// A one-shot `--tool` process installs no watcher and walks the workspace
+    /// exactly once.
+    ///
+    /// Both halves were measured on the rustc tree
+    /// (`.agents/docs/gate-cell-overhead-2026-08.md`): `start_watcher` cost
+    /// 0.37-0.40 s of wall clock outside the tool's budget, and the
+    /// `invalidate_cached_file_listing` it performs to close its own event-
+    /// coverage gap threw away the listing the build had just filled, so the
+    /// next consumer re-walked the whole tree (0.45 s) *inside* the budget.
+    /// Neither buys a process that exits anything: nothing consumes a watch
+    /// event before exit.
+    #[test]
+    fn a_one_shot_service_starts_no_watcher_and_walks_the_workspace_once() {
+        let (_temp, root) = workspace("OneShot.java", "class OneShot {}\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let starter: WatcherStarter = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |project| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                ProjectChangeWatcher::start_polling_for_tests(project)
+            })
+        };
+
+        let service =
+            SearchToolsService::new_one_shot_with_watcher_starter(root, false, starter).unwrap();
+
+        assert_eq!(
+            0,
+            calls.load(Ordering::SeqCst),
+            "a one-shot process must not install a file watcher"
+        );
+        {
+            let guard = service.session.read().unwrap();
+            let session = guard.as_ref().expect("a one-shot service is built eagerly");
+            assert!(
+                matches!(session.watcher, SessionWatcher::Disabled),
+                "the session must carry no watcher"
+            );
+            // Stand in for the request path's listing consumers (the scan's
+            // sibling-extension probe is the one that paid for the re-walk).
+            session
+                .snapshot
+                .analyzer()
+                .project()
+                .all_files_shared()
+                .expect("workspace listing");
+        }
+
+        let listing = service
+            .file_listing
+            .read()
+            .unwrap()
+            .clone()
+            .expect("a one-shot service shares one listing cache");
+        assert_eq!(
+            1,
+            listing.walk_count(),
+            "the workspace must be walked once for the whole process"
+        );
     }
 
     #[test]

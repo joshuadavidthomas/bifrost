@@ -85,7 +85,10 @@ pub fn create_cli_tool_service(
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
     if overlays.is_empty() && sources.is_empty() {
-        return SearchToolsService::new(root);
+        // A one-shot `--tool` call over the whole root. Every other branch here
+        // already builds a manual, watcher-free service; this one used to
+        // install a whole-tree watcher the process exits without ever polling.
+        return SearchToolsService::new_one_shot(root);
     }
     if overlays.is_empty() {
         let rel_paths = resolve_sources(&root, sources)?;
