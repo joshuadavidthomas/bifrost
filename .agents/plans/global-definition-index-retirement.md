@@ -140,6 +140,58 @@ the store's normal per-blob row replacement.
   three **1.30 GB**. So **6.87 GB of the 8.17 GB peak is per-connection SQLite state**, and the
   analyzer owns the remaining 1.30 GB.
 
+- **FIXED (2026-08-08): the three knobs are now the product defaults, and the knob the ladder
+  could not separate has been separated.** The open question was which knob produced the 124 live
+  connections -- idle capacity or burst lifetime -- because `ReaderPool`'s capacity bounds only
+  idle retention while checkout is unbounded by design. **It is retention.** Measured on a
+  176 MB cache over a repeat of this workload shape (m7 cell: `scan_usages_by_location` on
+  `CodeUnit::fq_name`, 1,106-file Rust snapshot, cache-DB mappings and `smaps_rollup` sampled at
+  2 Hz):
+
+  | binary | peak db mappings | steady-state mappings | mapped address space |
+  | --- | ---: | ---: | ---: |
+  | baseline | 115-125 | **115, flat for 166 of 176 s** | 20.0 GB |
+  | retention cap 16 only (mmap left on) | **41** (one 0.5 s sample, in discovery) | **20, for 352 of 357 samples** | 7.2 GB peak |
+  | all three knobs | 1 (the writer) | 1 | 0.18 GB |
+
+  Peak *concurrency* on this cell is ~41 readers; the ~120 was the pool accumulating burst
+  connections up to `available_parallelism()` and never releasing them. Capping retention leaves
+  the burst untouched -- it still ran at 41 -- and drops the resident set to 20.
+
+  Values shipped, with the judgment behind each:
+  - `mmap_size` **256 MiB -> 0** (`configure_readonly_page_cache`). Not free here, and the
+    ladder's "zero CPU cost" does not reproduce on this cell: isolated, it costs **+7% CPU, all
+    `sys`** (212.2 against 197.6 CPU-seconds; `sys` 79.6 against 70.1), with wall clock unmoved.
+    It buys 20.0 GB of address space and 2.3 GB of RSS, and removes a ceiling that scales with
+    DB size *and* core count. No env escape hatch: `open_streaming_readonly_connection` already
+    ships `mmap_size = 0` with the same reasoning, and mmap's one unique benefit (avoiding a copy
+    out of the page cache) applies exactly when the DB is too big for the connection cache, which
+    is the case where the mapping cost is worst.
+  - `cache_size` **64 MiB -> 8 MiB**. 2 MiB was too aggressive (+20-30% CPU on the ladder's
+    tree). 8 MiB is measured **free** against 64 MiB with the other knobs held fixed (225.3
+    against 218.4 CPU-seconds, `sys` 85.4 against 86.1) and carries 131 MB less private memory.
+  - `ReaderPool` capacity **`available_parallelism()` -> `min(parallelism, 16)`, floor 4.**
+    Retention should not be a function of the core count. Re-opening above-cap readers costs
+    about 3% CPU in `sys`, which is why 16 and not the ladder's 8. Pinned by
+    `reader_pool_runs_a_wide_burst_but_retains_a_bounded_idle_set`, which checks both halves: a
+    64-wide burst runs concurrently (it barriers, so a throttled checkout would deadlock) and
+    leaves exactly 16 readers resident.
+
+  Before/after on the m7 cell, baseline n=4 steady-state runs against fix n=4, interleaved:
+
+  | | peak RSS | peak PSS | peak Private_Dirty | CPU-seconds | wall |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | baseline | 2.85-3.05 GB | 0.710 GB | 0.497 GB | 197.6 mean | 2:52-3:06 |
+  | all three knobs | **0.56-0.58 GB** | **0.622 GB** | 0.586 GB | 218.2 mean | 2:45-3:33 |
+
+  Read honestly: the **RSS** win is 5.2x and the address-space win is 113x, but in **PSS** -- the
+  meter the correction below argues for -- it is only 12%, and Private_Dirty rises 89 MB, because
+  pages move from a shared file mapping into private per-connection page cache. The structural
+  win is larger than either number: the post-fix ceiling is 3 pools x 16 readers x 8 MiB = 384 MiB
+  regardless of DB size or host core count, against 3 x 120 x (64 MiB + min(256 MiB, DB)) before.
+  The price is **+10% CPU (+20 CPU-seconds), entirely `sys`**, of which ~7 points are the mmap
+  removal and ~3 the retention cap; user time and wall clock are unchanged.
+
 - **Correction: peak RSS is the wrong meter for this workload, by 1.3x-3.5x.** Measured
   simultaneously on live processes: v3 at its mmap peak is **17.30 GB RSS against 4.88 GB PSS**
   (the DB mapping alone is 12.37 GB RSS but only 38.9 MB private); HEAD at the same instant is
@@ -294,6 +346,13 @@ label is wrong**: `max_duration_secs` is clamped to 300 s
 (`SCAN_USAGES_MAX_DURATION_CEILING`), and the deadline is wall-clock, so under load the same
 budget buys different amounts of work; per the owner's 2026-08-08 directive, comparisons should
 be stated in CPU-seconds (user+sys) with loadavg as a label.
+
+**(d) The 15.58 GB baseline is now also stale in the code, not only in the meter.** The three
+reader knobs shipped on 2026-08-08 (see `FIXED` in `Surprises & Discoveries`) remove the
+per-connection mmap outright and cut the page-cache ceiling from 22.5 GiB to 384 MiB, so any
+Milestone 4 gate must be re-baselined against a binary that carries them. Re-baseline in **PSS**,
+and expect the gate's 0.35 GB of shards to be a *larger* share of the new peak than it was of the
+old one -- which makes the gate more measurable, not less.
 
 ## Validation and Acceptance
 

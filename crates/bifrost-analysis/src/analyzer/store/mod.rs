@@ -293,6 +293,9 @@ pub struct AnalyzerStore {
 /// `capacity` idle connections and drops the rest (transient burst readers), so
 /// the steady-state resident pool is bounded by `capacity`.
 ///
+/// `capacity` is therefore an *idle-retention* bound, not a concurrency limit,
+/// and `MAX_IDLE_READERS` explains why it is a small constant.
+///
 /// When `source` is `None` the store has no separate readable file (the
 /// in-memory single-connection fallback); reads then route back through the
 /// writer connection so correctness is preserved at the cost of read
@@ -308,12 +311,34 @@ thread_local! {
         RefCell::new(HashMap::default());
 }
 
+/// Upper bound on the idle readers one pool retains between checkouts.
+///
+/// A retained reader is not free: each one holds its own SQLite page cache (see
+/// `READER_PAGE_CACHE_KIB`) and its own prepared-statement cache for the
+/// process's lifetime. Sizing retention at `available_parallelism()` conflated
+/// "cores this host has" with "readers worth keeping warm", and it was measured
+/// on 2026-08-08. A single `scan_usages` on a 120-CPU host reached 115 live
+/// cache-DB connections within 10 s and then held that number flat for the
+/// remaining 166 s of the query. The same cell with retention capped at 16 shows
+/// what was actually concurrent: one transient 0.5 s sample at 41 connections
+/// during discovery, then 352 consecutive samples at 20. So the ~120 was
+/// retention accumulating every burst connection and never releasing it, not
+/// 120 readers doing work.
+///
+/// A burst wider than this still runs at full width -- checkout never blocks --
+/// it just does not leave its connections resident afterwards. Re-opening the
+/// above-cap readers is not free (about 3% CPU on that cell, in `sys`), which is
+/// why the cap is 16 rather than the ladder's 8: 16 covers the concurrent tool
+/// calls an MCP or LSP host realistically keeps in flight with margin, and,
+/// unlike `available_parallelism()`, it does not grow with the core count.
+const MAX_IDLE_READERS: usize = 16;
+
 impl ReaderPool {
     fn new(source: Option<PathBuf>) -> Self {
         let capacity = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .max(4);
+            .clamp(4, MAX_IDLE_READERS);
         Self {
             source,
             capacity,
@@ -338,6 +363,14 @@ impl ReaderPool {
             .lock()
             .expect("analyzer store reader pool poisoned")
             .clear();
+    }
+
+    #[cfg(test)]
+    fn idle_len(&self) -> usize {
+        self.idle
+            .lock()
+            .expect("analyzer store reader pool poisoned")
+            .len()
     }
 }
 
@@ -10802,6 +10835,43 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// A burst wider than the pool runs at full width, and the pool keeps only
+    /// `MAX_IDLE_READERS` of those connections afterwards. Both halves matter:
+    /// the first barrier would deadlock if checkout throttled a burst, and the
+    /// idle count is what a live process pays for the rest of its lifetime.
+    #[test]
+    fn reader_pool_runs_a_wide_burst_but_retains_a_bounded_idle_set() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap());
+        let burst = MAX_IDLE_READERS * 4;
+        let all_checked_out = Arc::new(std::sync::Barrier::new(burst));
+        let all_queried = Arc::new(std::sync::Barrier::new(burst));
+
+        std::thread::scope(|scope| {
+            for _ in 0..burst {
+                let store = Arc::clone(&store);
+                let all_checked_out = Arc::clone(&all_checked_out);
+                let all_queried = Arc::clone(&all_queried);
+                scope.spawn(move || {
+                    let reader = store.read_conn().unwrap();
+                    all_checked_out.wait();
+                    let tables: i64 = reader
+                        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+                        .unwrap();
+                    assert!(tables > 0);
+                    all_queried.wait();
+                });
+            }
+        });
+
+        assert_eq!(
+            store.readers.idle_len(),
+            MAX_IDLE_READERS,
+            "a {burst}-wide burst must leave only {MAX_IDLE_READERS} readers resident"
+        );
     }
 
     #[test]

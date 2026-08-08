@@ -414,12 +414,48 @@ fn configure_readonly_connection(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Page cache for one interactive reader connection, in KiB (negative = KiB,
+/// SQLite's convention). Every pooled reader pays this, so the resident cost is
+/// this value times the number of retained connections, not once per process.
+///
+/// 8 MiB is four times SQLite's ~2 MB default and holds the b-tree interior
+/// pages and index roots that the post-campaign read mix (indexed point seeks
+/// into `code_units` and the parsed-blob tables) touches repeatedly. The
+/// previous value, 64 MiB, was chosen as if there were one reader; measured on
+/// 2026-08-08 against 120 pooled readers it contributed 1.32-2.82 GB with a
+/// 7.68 GB ceiling.
+///
+/// Both directions are measured on the same cell (2026-08-08). Holding the
+/// other two knobs fixed, 64 MiB against 8 MiB is 225.3 against 218.4
+/// CPU-seconds (`sys` 85.4 against 86.1) -- i.e. free -- and 8 MiB carries
+/// 131 MB less private memory. Going further, to the streaming path's 2 MiB,
+/// cost 20-30% more CPU on the larger tree the earlier ladder used (248.9
+/// against 187.1 CPU-seconds), nearly all `sys`, from re-reading evicted pages.
+const READER_PAGE_CACHE_KIB: i64 = -8192;
+
 fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
-    conn.pragma_update(None, "cache_size", -65536)
+    conn.pragma_update(None, "cache_size", READER_PAGE_CACHE_KIB)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
-    conn.pragma_update(None, "mmap_size", 268435456i64)
+    // No memory-mapped I/O. `mmap_size` is per connection, so a pool of readers
+    // maps the same file once each, and the mapped bytes scale with the host's
+    // core count as well as the DB: measured 2026-08-08, 115-125 mappings of one
+    // 176 MB cache DB held 20.0 GB of mapped address space for a whole query.
+    // mmap's only unique benefit is avoiding a copy out of the OS page cache,
+    // which matters when the DB does not fit the connection's own cache --
+    // exactly the case where the mapping cost is largest.
+    //
+    // This is a priced trade, not a free win. Isolated on the same cell,
+    // removing the mapping costs about 7% CPU, all of it `sys` (212.2 against
+    // 197.6 CPU-seconds; `sys` 79.6 against 70.1) from read syscalls replacing
+    // mapped loads, and wall clock does not move. It buys 20.0 GB of address
+    // space and 2.3 GB of RSS back, and it removes a ceiling that grows with
+    // both the DB size and the core count (5.55-12.3 GB on the 848 MB rustc
+    // cache, ~30 GB worst case on a 120-CPU host).
+    // `open_streaming_readonly_connection` already reached this conclusion for
+    // scans; it holds for interactive readers too.
+    conn.pragma_update(None, "mmap_size", 0)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     Ok(())
