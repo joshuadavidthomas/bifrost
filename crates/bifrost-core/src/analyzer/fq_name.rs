@@ -370,8 +370,7 @@ pub fn absent_segment_separators(lang: Language) -> &'static [&'static str] {
     TABLE
         .get_or_init(|| {
             let mut table = HashMap::default();
-            for language in std::iter::once(Language::None).chain(Language::ANALYZABLE.into_iter())
-            {
+            for language in std::iter::once(Language::None).chain(Language::ANALYZABLE) {
                 let emitted: Vec<&'static str> = SegmentKind::ALL
                     .iter()
                     .flat_map(|&prev| {
