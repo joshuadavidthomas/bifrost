@@ -24,6 +24,7 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
 
 pub(crate) const MAX_RUN_POLICY_PATH_BYTES: usize = 1_024;
 pub(crate) const MAX_RUN_POLICY_SELECTOR_BYTES: usize = 256;
+pub(crate) const MAX_RUN_POLICY_DIFF_BASE_BYTES: usize = 256;
 
 pub fn run_extended_stdio_server(
     root: PathBuf,
@@ -925,6 +926,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "enum": ["never", "finding", "note", "warning", "error"],
                         "default": "warning",
                         "description": "Finding threshold used to compute the returned policy status."
+                    },
+                    "diff_base": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_RUN_POLICY_DIFF_BASE_BYTES,
+                        "description": "Optional git revision to diff against: the same policies also evaluate that commit's content, each finding is classified new or persisting, and only new findings gate. Any revision git rev-parse accepts."
                     }
                 },
                 "required": ["evaluation_date"],
@@ -1346,5 +1353,11 @@ mod tests {
             json!(["never", "finding", "note", "warning", "error"])
         );
         assert_eq!(schema["properties"]["fail_on"]["default"], "warning");
+        assert_eq!(schema["properties"]["diff_base"]["type"], "string");
+        assert_eq!(schema["properties"]["diff_base"]["minLength"], 1);
+        assert_eq!(
+            schema["properties"]["diff_base"]["maxLength"],
+            MAX_RUN_POLICY_DIFF_BASE_BYTES
+        );
     }
 }

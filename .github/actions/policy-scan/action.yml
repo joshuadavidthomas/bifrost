@@ -32,6 +32,15 @@ inputs:
     description: 'Severity gate: never, finding, note, warning, or error.'
     required: false
     default: warning
+  diff-base:
+    description: >-
+      Git revision to diff against. When set, the same policies also evaluate
+      that commit's content, every finding is classified new or persisting,
+      and only new findings gate. Pass the pull request's base SHA for a
+      changed-code-only gate. Requires a checkout deep enough to contain the
+      revision.
+    required: false
+    default: ''
   sarif-file:
     description: SARIF output path, relative to working-directory.
     required: false
@@ -121,6 +130,7 @@ runs:
         POLICY_IDS: ${{ inputs.policy-ids }}
         POLICY_CATEGORIES: ${{ inputs.policy-categories }}
         POLICY_FILES: ${{ inputs.policy-files }}
+        DIFF_BASE: ${{ inputs.diff-base }}
       run: |
         set -uo pipefail
         cd "${WORKDIR}"
@@ -129,6 +139,7 @@ runs:
         for p in ${POLICY_IDS}; do args+=(--policy-id "${p}"); done
         for p in ${POLICY_CATEGORIES}; do args+=(--policy-category "${p}"); done
         for p in ${POLICY_FILES}; do args+=(--policy-file "${p}"); done
+        if [ -n "${DIFF_BASE}" ]; then args+=(--diff-base "${DIFF_BASE}"); fi
         set +e
         bifrost "${args[@]}"
         code=$?

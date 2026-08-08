@@ -51,6 +51,7 @@ The gate distinguishes three results:
 | `policy-categories` | empty | Space-separated categories. |
 | `policy-files` | empty | Space-separated workspace-relative `.rqlp` files. |
 | `fail-on` | `warning` | Severity gate: `never`, `finding`, `note`, `warning`, or `error`. |
+| `diff-base` | empty | Git revision to diff against. Only findings absent from that revision gate. |
 | `sarif-file` | `bifrost-policy.sarif` | SARIF output path, relative to `working-directory`. |
 | `upload` | `true` | Upload the SARIF file to code scanning. |
 | `category` | `bifrost-policy` | Code-scanning category. Use one category per scan configuration. |
@@ -66,6 +67,27 @@ The action caches `.bifrost/cache` at the checkout root. The database keys rows 
 ## New findings on pull requests
 
 Code scanning compares the alerts from the pull-request analysis with the base branch and marks new alerts on the pull request. Upload from both the default branch and pull requests, with the same `category`, to get that comparison.
+
+## Gate only on findings the pull request introduced
+
+By default the gate fails on every finding, including pre-existing debt. To fail a pull request only on the findings it introduced, pass the pull request's base commit as `diff-base`. Bifrost then evaluates the same policies against that commit's content, classifies every finding as `new` or `persisting` by its stable finding identity, and computes the exit code from the new findings only. Each SARIF result carries the standard `baselineState` field (`new` or `unchanged`).
+
+```yaml
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: BrokkAi/bifrost/.github/actions/policy-scan@v0.8.24
+        with:
+          diff-base: ${{ github.event.pull_request.base.sha }}
+```
+
+The checkout must contain the base revision: `fetch-depth: 0` is the simple form, or fetch the base SHA explicitly. If the base revision does not resolve, the run exits `2` (unreliable) rather than silently gating on everything. If the base revision resolves but its evaluation cannot prove its own completeness, the run degrades to full gating and reports a `diff-base-unreliable` diagnostic, so a broken base can never hide new findings.
+
+Two identity limitations are accepted: a pure file rename re-keys every finding in the file (one `fixed` plus one `new`), and inserting an identical duplicate of an existing source slice above it under the same owner can shift the ordinal that distinguishes the duplicates and misclassify one pair.
 
 ## Suppressions and scope
 
