@@ -448,8 +448,21 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn preferred_type_candidate<'a>(&self, candidates: &'a [CodeUnit]) -> Option<&'a CodeUnit> {
         candidates.first()
     }
+    /// The separators this adapter's lookup spellings are peeled on -- and, by
+    /// the same declaration, the separators it treats as a *join* wherever one
+    /// appears in a spelling.
+    ///
+    /// That second reading is what lets `definition_candidate_short_names` drop
+    /// a spelling as a structurally guaranteed miss. A language whose
+    /// identifiers can themselves contain a separator must not list it: scala's
+    /// cons class is named `::`, so scala peels on `.` alone and `::` in a
+    /// scala spelling is a declaration's name rather than a join. The one
+    /// declaration answers both questions, so the two cannot drift apart.
+    fn lookup_candidate_separators(&self) -> &'static [&'static str] {
+        &[".", "::"]
+    }
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
-        lookup_suffix_candidates(normalized_fq_name, &[".", "::"])
+        lookup_suffix_candidates(normalized_fq_name, self.lookup_candidate_separators())
     }
     fn is_anonymous_structure(&self, _fq_name: &str) -> bool {
         false
@@ -6252,7 +6265,7 @@ where
     /// This is where the suffix expansion is minted -- 4.41 spellings per fq
     /// name on the rustc tree, each one a memo op and, on a miss, a pooled
     /// connection checkout plus an index probe. A spelling that carries a
-    /// separator [`absent_segment_separators`] reports for this adapter's
+    /// separator join [`absent_segment_separators`] reports for this adapter's
     /// language cannot match any stored `short_name` for it, so it is dropped
     /// here rather than seeking for a row the storage contract says is not
     /// there (issue #1748;
@@ -6270,10 +6283,17 @@ where
         if normalized != fq_name {
             names.extend(self.adapter.lookup_candidate_short_names(&normalized));
         }
-        let absent = absent_segment_separators(self.adapter.language());
-        if !absent.is_empty() {
+        // A separator is droppable only when both declarations agree: the
+        // renderer never emits it for this language, and the adapter's own
+        // lookup vocabulary treats it as a join rather than as name text.
+        let joins = self.adapter.lookup_candidate_separators();
+        let droppable = absent_segment_separators(self.adapter.language())
+            .iter()
+            .filter(|separator| joins.contains(*separator))
+            .collect::<Vec<_>>();
+        if !droppable.is_empty() {
             let before = names.len();
-            names.retain(|name| !absent.iter().any(|separator| name.contains(separator)));
+            names.retain(|name| !droppable.iter().any(|separator| name.contains(**separator)));
             self.structural_miss_spelling_count
                 .fetch_add(before - names.len(), Ordering::Relaxed);
         }
@@ -9272,6 +9292,7 @@ mod tests {
     use crate::analyzer::javascript::JavascriptAdapter;
     use crate::analyzer::python::PythonAdapter;
     use crate::analyzer::rust::RustAdapter;
+    use crate::analyzer::scala::ScalaAdapter;
     use crate::analyzer::store::AnalyzerStore;
     use crate::analyzer::typescript::TypescriptAdapter;
     use crate::analyzer::{
@@ -10421,6 +10442,47 @@ mod tests {
         // The declaration itself is reachable, by the dotted name it is
         // actually stored under -- see the sibling test. This is the
         // difference the filter must not blur.
+    }
+
+    /// #1748: the filter drops a spelling only when *both* declarations agree
+    /// -- the renderer never emits the separator for this language, and the
+    /// adapter's own lookup vocabulary treats it as a join. Scala satisfies the
+    /// first and not the second: its cons class is named `::`, so `::` and
+    /// `Foo.::` are ordinary scala short names and `List.:::` is an ordinary
+    /// scala method.
+    ///
+    /// Caught by the parity run rather than by review:
+    /// `scala_colon_infix_dispatch_uses_the_right_receiver` and
+    /// `scala_infix_right_associative_and_postfix_calls_have_icfg_and_source_order`
+    /// both broke on an earlier substring-only filter that used
+    /// `absent_segment_separators` alone. Scala's declining to peel on `::` is
+    /// the same fact stated once, which is why the two can no longer drift.
+    #[test]
+    fn issue_1748_scala_colon_named_declarations_are_never_dropped() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("src/Cons.scala"),
+            "package coll\n\
+             class ::[A](head: A, tail: List[A]) {\n\
+             \x20 def :::(other: List[A]): List[A] = other\n\
+             }\n",
+        )
+        .expect("write scala source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Scala));
+        let analyzer = TreeSitterAnalyzer::new(project, ScalaAdapter);
+
+        analyzer.reset_structural_miss_spelling_count_for_test();
+        for name in ["coll.::", "::", "coll.::.:::", "::.head"] {
+            let _ = IAnalyzer::definitions(&analyzer, name).count();
+        }
+
+        assert_eq!(
+            0,
+            analyzer.structural_miss_spelling_count_for_test(),
+            "scala declares `::` as name text, not as a join, so nothing may be dropped"
+        );
     }
 
     /// The other side of the filter: a dotted rust lookup carries no excluded

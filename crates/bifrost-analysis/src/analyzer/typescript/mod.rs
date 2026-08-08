@@ -89,8 +89,12 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         !code_unit.is_file_scope() && !code_unit.is_module()
     }
 
+    fn lookup_candidate_separators(&self) -> &'static [&'static str] {
+        &["."]
+    }
+
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
-        lookup_suffix_candidates(normalized_fq_name, &["."])
+        lookup_suffix_candidates(normalized_fq_name, self.lookup_candidate_separators())
     }
 
     fn storage_contains_tests(

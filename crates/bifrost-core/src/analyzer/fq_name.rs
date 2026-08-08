@@ -357,12 +357,14 @@ const ALL_SEGMENT_SEPARATORS: [&str; 4] = ["/", "$", "::", "."];
 /// that renders `::`, and it is excluded from nothing here for exactly that
 /// reason.
 ///
-/// The contract bounds what a *separator* can be, not what a segment's own text
-/// can be. `pkg::sub` interned as one `Package` segment renders `::` inside the
-/// segment; that lives in the package prefix, ahead of `short_name`'s start.
-/// The store-side pin
-/// (`short_name_vocabulary_excludes_separators_absent_from_the_renderer`)
-/// asserts the property end to end against persisted rows.
+/// The contract bounds what a *separator* can be, never what a segment's own
+/// text can be. Scala's cons class is literally named `::`, so `::` and
+/// `::.head` are ordinary scala short names whose `::` is a segment's text.
+/// This answer alone therefore does not license dropping a spelling: the
+/// caller must also know that the separator is one its own lookup vocabulary
+/// treats as a join. See `LanguageAdapter::lookup_candidate_separators`, which
+/// is where a language declares that -- and scala's declines `::` for exactly
+/// this reason.
 pub fn absent_segment_separators(lang: Language) -> &'static [&'static str] {
     static TABLE: OnceLock<HashMap<Language, Vec<&'static str>>> = OnceLock::new();
     TABLE

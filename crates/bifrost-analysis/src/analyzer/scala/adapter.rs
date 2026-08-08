@@ -46,8 +46,15 @@ impl LanguageAdapter for ScalaAdapter {
         scala_normalize_full_name(fq_name)
     }
 
+    /// Scala peels on `.` alone: its cons class is named `::`, so a `::` in a
+    /// scala spelling is a declaration's own name and never a join.
+    fn lookup_candidate_separators(&self) -> &'static [&'static str] {
+        &["."]
+    }
+
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
-        let mut candidates = lookup_suffix_candidates(normalized_fq_name, &["."]);
+        let mut candidates =
+            lookup_suffix_candidates(normalized_fq_name, self.lookup_candidate_separators());
         let base_candidates = candidates.clone();
         for candidate in base_candidates {
             candidates.extend(scala_object_encoded_short_name_candidates(&candidate));

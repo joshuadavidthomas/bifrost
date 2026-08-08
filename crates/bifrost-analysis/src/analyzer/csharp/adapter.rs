@@ -126,13 +126,14 @@ impl LanguageAdapter for CSharpAdapter {
     }
 
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
-        let mut candidates = lookup_suffix_candidates(normalized_fq_name, &[".", "::"]);
+        let separators = self.lookup_candidate_separators();
+        let mut candidates = lookup_suffix_candidates(normalized_fq_name, separators);
         if let Some((owner, leaf)) = normalized_fq_name.rsplit_once('.') {
             let source_leaf = strip_csharp_generic_arity(leaf);
             if source_leaf != leaf {
                 candidates.extend(lookup_suffix_candidates(
                     &format!("{owner}.{source_leaf}"),
-                    &[".", "::"],
+                    separators,
                 ));
             }
         }
