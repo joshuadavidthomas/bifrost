@@ -9,7 +9,8 @@ inputs:
   version:
     description: >-
       Bifrost release tag to install (see BrokkAi/bifrost releases). Pin an
-      exact tag for reproducible gates.
+      exact tag for reproducible gates. The special value `local` skips the
+      install and uses the `bifrost` already on PATH.
     required: false
     default: v0.8.24
   policy-packs:
@@ -79,6 +80,10 @@ runs:
         BIFROST_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
+        if [ "${BIFROST_VERSION}" = local ]; then
+          command -v bifrost >/dev/null || { echo "::error::version=local but no bifrost on PATH"; exit 1; }
+          exit 0
+        fi
         case "${RUNNER_OS}-${RUNNER_ARCH}" in
           Linux-X64) target=x86_64-unknown-linux-gnu; archive=tar.gz ;;
           Linux-ARM64) target=aarch64-unknown-linux-gnu; archive=tar.gz ;;
