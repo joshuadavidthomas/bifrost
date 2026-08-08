@@ -568,6 +568,35 @@ mod workspace_semantic_model_configuration_tests {
     }
 
     #[test]
+    fn packs_document_activates_for_a_bound_workspace_without_environment_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub struct Local;\n").unwrap();
+        std::fs::create_dir_all(temp.path().join(".bifrost")).unwrap();
+        std::fs::write(
+            temp.path().join(".bifrost/packs.json"),
+            r#"{ "schema_version": 1, "ecosystems": ["cargo"] }"#,
+        )
+        .unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root.clone()).unwrap());
+        let analyzer = WorkspaceAnalyzer::build_for_service(project, AnalyzerConfig::default());
+
+        // No environment variables, no host options: the document alone is
+        // the opt-in, so a bound MCP session activates the same packs the LSP
+        // and the CLI would (#1868).
+        activate_configured_semantic_models(&root, &analyzer, None).unwrap();
+
+        assert!(
+            analyzer
+                .analyzer()
+                .dependency_discovery_evidence(Language::Rust)
+                .is_some(),
+            "the packs document must drive dependency activation on workspace bind"
+        );
+    }
+
+    #[test]
     fn workspace_setting_requires_an_explicit_supported_value() {
         assert!(!parse_workspace_semantic_models_setting(None).unwrap());
         assert!(parse_workspace_semantic_models_setting(Some(std::ffi::OsStr::new("on"))).unwrap());
