@@ -2118,3 +2118,232 @@ fn pure_rename_currently_reports_fixed_plus_new() {
         "new"
     );
 }
+
+/// A minimal JDK stdlib pack pinned to exactly 21.0.2, installable into a
+/// workspace-configured catalog so a CI-shaped run can activate it (#1868).
+const JDK_21_FIXTURE_PACK: &str = r#"{
+  "schema_version": 1,
+  "pack_id": "fixture.jdk",
+  "version": "21.0.2",
+  "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "jdk", "requirement": "=21.0.2" }]
+  },
+  "provenance": { "source": "checked-in test source", "revision": "fixture-v1" },
+  "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "jdk.core",
+    "activation": [{
+      "toolchain": { "name": "jdk", "version": "=21.0.2" },
+      "targets": ["jvm"]
+    }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "jdk.java-util-arraylist",
+        "name": "java.util.ArrayList",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/ArrayList.java",
+          "symbol": "java.util.ArrayList"
+        }
+      }],
+      "members": [],
+      "relations": []
+    }
+  }]
+}"#;
+
+/// One Java workspace whose packs document opts into the jvm ecosystem and
+/// names a catalog pre-loaded with the JDK 21 fixture pack.
+fn packs_document_project() -> BuiltInlineTestProject {
+    use brokk_bifrost::analyzer::semantic_model::{
+        CatalogOpenMode, CatalogOptions, CompilerOptions, DurablePackSource, DurablePackSourceKind,
+        SemanticPackCatalog, SourceFormat, compile_source,
+    };
+    let project = InlineTestProject::new()
+        .file("src/Main.java", JAVA_RESOURCE_SOURCE)
+        .file(
+            ".bifrost/packs.json",
+            r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#,
+        )
+        .build();
+    let compiled = compile_source(
+        SourceFormat::Json,
+        JDK_21_FIXTURE_PACK.as_bytes(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("fixture pack compilation failed: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open(
+        &project.root().join(".bifrost/packs-catalog"),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .expect("open the workspace-configured catalog");
+    catalog
+        .install(
+            &compiled,
+            &DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: "test:fixture.jdk@21.0.2".to_owned(),
+            },
+        )
+        .expect("install the fixture pack");
+    project
+}
+
+/// One fake JDK home: a `release` file with the exact version and no
+/// `src.zip`, so discovery must select an installed pack or reject loudly.
+fn fake_jdk_home(root: &Path, version: &str) -> PathBuf {
+    let home = root.join(format!("jdk-{version}"));
+    fs::create_dir_all(&home).expect("create fake JDK home");
+    fs::write(
+        home.join("release"),
+        format!("JAVA_VERSION=\"{version}\"\n"),
+    )
+    .expect("write JDK release file");
+    home
+}
+
+fn run_with_java_home(root: &Path, home: &Path, args: &[&str]) -> Output {
+    bifrost(root)
+        .env("JAVA_HOME", home)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run bifrost {args:?}: {error}"))
+}
+
+const PACKS_RUN_ARGS: &[&str] = &[
+    "--policy-id",
+    "bifrost.correctness.dynamic-evaluation",
+    "--evaluation-date",
+    "2026-07-28",
+    "--fail-on",
+    "never",
+    "--format",
+    "json",
+];
+
+#[test]
+fn packs_document_activation_decisions_appear_in_the_policy_report() {
+    let project = packs_document_project();
+    let homes = tempfile::tempdir().expect("fake JDK home root");
+
+    // Exact toolchain match: the installed pack is selected and the report
+    // says so.
+    let matched = run_with_java_home(
+        project.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        PACKS_RUN_ARGS,
+    );
+    assert_status(&matched, 0);
+    let report = json_stdout(&matched);
+    assert_eq!(report["packs"]["document_path"], ".bifrost/packs.json");
+    assert_eq!(report["packs"]["ecosystems"], serde_json::json!(["jvm"]));
+    assert_eq!(report["packs"]["complete"], true);
+    let decisions = report["packs"]["decisions"].as_array().expect("decisions");
+    assert!(
+        decisions.iter().any(|decision| {
+            decision["pack"] == "fixture.jdk@21.0.2" && decision["status"] == "selected"
+        }),
+        "{decisions:#?}"
+    );
+
+    // Near miss: a JDK 17 workspace against the JDK 21 pack never activates
+    // silently; the decision names the installed and required versions.
+    let near_miss = run_with_java_home(
+        project.root(),
+        &fake_jdk_home(homes.path(), "17.0.10"),
+        PACKS_RUN_ARGS,
+    );
+    let report = json_stdout(&near_miss);
+    assert_eq!(report["packs"]["complete"], false);
+    let decisions = report["packs"]["decisions"].as_array().expect("decisions");
+    let mismatch = decisions
+        .iter()
+        .find(|decision| decision["status"] == "version_mismatch")
+        .unwrap_or_else(|| panic!("{decisions:#?}"));
+    let reason = mismatch["reason"].as_str().expect("mismatch reason");
+    assert!(
+        reason.contains("17.0.10") && reason.contains("=21.0.2"),
+        "the decision must name the installed and required versions: {reason}"
+    );
+    assert!(
+        !decisions
+            .iter()
+            .any(|decision| decision["status"] == "selected"),
+        "a near miss must not select any pack: {decisions:#?}"
+    );
+
+    // SARIF surfaces the same review as a run property.
+    let sarif = run_with_java_home(
+        project.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        &[
+            "--policy-id",
+            "bifrost.correctness.dynamic-evaluation",
+            "--evaluation-date",
+            "2026-07-28",
+            "--fail-on",
+            "never",
+            "--format",
+            "sarif",
+        ],
+    );
+    assert_status(&sarif, 0);
+    let log = json_stdout(&sarif);
+    let properties = &log["runs"][0]["properties"];
+    assert_eq!(
+        properties["bifrost.packActivation"]["ecosystems"],
+        serde_json::json!(["jvm"])
+    );
+    assert_eq!(properties["bifrost.packActivation"]["complete"], true);
+}
+
+#[test]
+fn a_run_without_a_packs_document_reports_no_packs_field() {
+    let project = policy_project(&[]);
+    let output = run(project.root(), PACKS_RUN_ARGS);
+    assert_status(&output, 0);
+    let report = json_stdout(&output);
+    assert!(
+        report.get("packs").is_none(),
+        "a run without a packs document keeps the exact schema-version-3 shape"
+    );
+}
+
+#[test]
+fn a_malformed_packs_document_is_loud_and_makes_the_run_unreliable() {
+    let project = InlineTestProject::new()
+        .file("src/app.py", APP)
+        .file(
+            ".bifrost/packs.json",
+            r#"{ "schema_version": 1, "ecosystems": ["jdk"] }"#,
+        )
+        .build();
+    let output = run(project.root(), PACKS_RUN_ARGS);
+    assert_status(&output, 2);
+    let report = json_stdout(&output);
+    let diagnostics = report["diagnostics"].as_array().expect("diagnostics");
+    let failure = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "packs-load-failed")
+        .unwrap_or_else(|| panic!("{diagnostics:#?}"));
+    let message = failure["message"].as_str().expect("diagnostic message");
+    assert!(
+        message.contains("unknown ecosystem") && message.contains("jdk"),
+        "the diagnostic must name the invalid ecosystem: {message}"
+    );
+    assert!(report.get("packs").is_none());
+}
