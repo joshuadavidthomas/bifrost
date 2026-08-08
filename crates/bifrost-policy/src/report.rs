@@ -4401,6 +4401,45 @@ mod tests {
     }
 
     #[test]
+    fn baseline_generation_excludes_weak_identities_with_an_exact_count() {
+        let loaded = loaded_match_policy();
+        let descriptor = PolicyRuleDescriptor::from_loaded(&loaded);
+        let run = report_run(
+            &loaded,
+            PolicyAnalysisType::Match,
+            PolicyRunCompletion::Complete,
+        );
+        let mut builder = PolicyReportBuilder::new(PolicyBatchBudget::default(), 1).unwrap();
+        builder.register_policy(descriptor, run).unwrap();
+        let strong = report_finding(&loaded);
+        let strong_id = strong.id();
+        builder.retain_finding(strong).unwrap();
+        builder
+            .retain_finding(weak_report_finding(&loaded))
+            .unwrap();
+        let document = builder.finish().unwrap();
+
+        let (baseline, weak_excluded) =
+            super::super::baseline::PolicyBaselineDocument::from_completed_report(
+                &document,
+                "Onboarding acceptance",
+                None,
+                super::super::suppression::PolicyEvaluationDate::from_ymd(2026, 8, 8).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(weak_excluded, 1);
+        assert_eq!(baseline.entry_count(), 1);
+        assert_eq!(baseline.policies()[0].finding_ids(), [strong_id]);
+        assert_eq!(
+            baseline.policies()[0]
+                .policy_hash_at_acceptance()
+                .unwrap()
+                .as_bytes(),
+            loaded.semantic_hash().as_bytes(),
+        );
+    }
+
+    #[test]
     fn secondary_diagnostic_omission_tracks_count_and_worst_severity() {
         let per_policy = super::super::budget::PolicyBudget::builder()
             .with_max_retained_report_bytes(5_000)

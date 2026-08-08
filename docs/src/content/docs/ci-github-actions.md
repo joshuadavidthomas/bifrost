@@ -89,6 +89,20 @@ The checkout must contain the base revision: `fetch-depth: 0` is the simple form
 
 Two identity limitations are accepted: a pure file rename re-keys every finding in the file (one `fixed` plus one `new`), and inserting an identical duplicate of an existing source slice above it under the same owner can shift the ordinal that distinguishes the duplicates and misclassify one pair.
 
-## Suppressions and scope
+## Onboard a legacy repository with a committed baseline
 
-The run honors `.bifrost/suppressions.json` and `.bifrost/policy-scope.json` from the workspace, exactly as the CLI does. Accepted suppressions appear in the SARIF report as suppressed results. See [Static-Analysis Policies](/static-analysis-policies/) for the document formats.
+`diff-base` narrows pull-request gates, but scheduled full runs and release gates still fail on every pre-existing finding. To accept the existing debt once and gate only on what appears afterwards, generate a baseline locally and commit it:
+
+```bash
+bifrost --root . --policy-pack bifrost.code-smells --accept-current
+git add .bifrost/baseline.json
+git commit -m "Accept existing bifrost.code-smells findings as the baseline"
+```
+
+`--accept-current` writes `.bifrost/baseline.json` from a completed run's strong finding identities under one batch-level reason; an unreliable run refuses to write and exits `2`. Every later CI run — full or `diff-base` — honors the committed document exactly as the CLI does: baselined findings stay in the report and the SARIF upload as accepted suppressions, stop gating, and are audited for drift (a policy edit) and staleness (a finding proven fixed). Keep the same selection (`policy-packs`, `policy-ids`, `policy-files`) in CI that you accepted locally, and regenerate explicitly when you intend to re-accept — the baseline never refreshes itself.
+
+A recommended split for a legacy repository: pull requests gate with `diff-base` (findings the change introduced), while the scheduled full run and the release gate rely on the committed baseline (everything new since acceptance), burning the baseline down by fixing findings, which the audit then reports as stale entries to prune.
+
+## Suppressions, scope, and baseline
+
+The run honors `.bifrost/suppressions.json`, `.bifrost/policy-scope.json`, and `.bifrost/baseline.json` from the workspace, exactly as the CLI does. Accepted suppressions and baselined findings appear in the SARIF report as suppressed results. See [Static-Analysis Policies](/static-analysis-policies/) for the document formats.

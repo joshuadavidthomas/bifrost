@@ -202,6 +202,38 @@ findings. See [Static-Analysis Policies](/static-analysis-policies/) for the
 join semantics and [CI Gating with GitHub Actions](/ci-github-actions/) for
 the pull-request recipe.
 
+### Accept every existing finding (`--accept-current`, `--baseline-file`)
+
+`--accept-current` runs the selected policies and writes a bulk-acceptance
+baseline document containing every current strong finding identity, so later
+runs of the same selection gate only on findings introduced afterwards:
+
+```bash
+bifrost --root . \
+  --policy-pack bifrost.code-smells \
+  --accept-current
+```
+
+The document is written to `.bifrost/baseline.json` (or the workspace-relative
+path given by `--baseline-file`, which also selects the document every
+evaluation reads). Acceptance forces `--fail-on never` internally and writes
+only on a clean status: an unreliable or non-exhaustive run exits 2 and writes
+nothing, because an identity the run could not prove cannot be accepted.
+Weak-identity findings are never written and their count is reported on
+stderr. Findings already claimed by a suppression or directory scope are not
+written either; they stay governed by their own mechanism. `--accept-current`
+cannot be combined with `--fail-on` or `--diff-base`, and regeneration is
+always an explicit re-run — the baseline never refreshes itself.
+
+On later runs, baselined findings stay in the report with a `baseline`
+decision, stop counting toward `--fail-on`, and are audited like suppressions:
+a malformed or oversized document is a diagnostic and status 2, a policy edit
+marks its entries drifted without reactivating them, and an entry whose
+finding an exhaustive run proves absent is reported stale. See
+[Static-Analysis Policies](/static-analysis-policies/) for the semantics and
+[CI Gating with GitHub Actions](/ci-github-actions/) for the onboarding
+recipe.
+
 `match`, `taint`, query-local `typestate`, and `assertion` evaluation are
 available now. Typestate
 compiles resolved subject/event selectors into the semantic protocol engine and

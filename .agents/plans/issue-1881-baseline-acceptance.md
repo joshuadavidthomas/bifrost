@@ -117,13 +117,19 @@ Replacing reviewed suppressions (the two coexist with distinct semantics). Autom
 
 2026-08-08 (implementation): `apply_policy_baseline` runs after the report builder is constructed so the suppression-audit preflight rollback (which clears suppression and scope attachments) settles before the baseline decides what is claimed.
 
+2026-08-08 (implementation): All baseline types including `PolicyBaselineReview` live in `crates/bifrost-policy/src/baseline.rs`, matching how `suppression.rs` owns `PolicySuppressionReview`; the milestone-1 sentence placing the review in `report.rs` followed the diff exemplar and was superseded by module cohesion.
+
+2026-08-08 (implementation): The weak-identity exclusion count is proven by a unit test in `report.rs` that assembles a report with one strong and one weak finding through the builder, because ordinary match evaluation on the CLI fixtures never produces a weak anchor; the CLI test asserts the count's presence in the stderr acceptance line.
+
+2026-08-08 (implementation): The shared JSON-decode message truncation helper `bounded_error_message` in `suppression.rs` was renamed `bounded_json_error_message` and made `pub(crate)` for reuse by the baseline loader, and `AcceptedPolicyHash` gained `from_bytes` so generation can record `PolicySemanticHash` values.
+
 ## Progress
 
 - [x] (2026-08-08) ExecPlan written.
-- [ ] Milestone 1: document module, attachment, review, coordinator join, library tests.
-- [ ] Milestone 2: renderers and rendering tests.
-- [ ] Milestone 3: CLI and MCP surfaces.
-- [ ] Milestone 4: end-to-end tests, documentation, full validation.
+- [x] (2026-08-08) Milestone 1: `baseline.rs` document module (caps, typed errors, canonical load, review types, generation constructor, unit tests), `PolicyFinding.baseline` attachment, `PolicyBaselineReview` + builder charging (`set_baseline`, `baseline_extra`, `mark_baseline_result_omitted`) + `validate_baseline_joins`, coordinator load/join/gate/retention wiring with the two new diagnostic codes, and the `policy_baseline_evaluation.rs` suite (8 tests: accept-then-clean, new-finding gating, drift without reactivation, stale on source edit, suppression precedence, malformed and unselected documents, diff-mode composition, deterministic JSON shape). `cargo test -p brokk-bifrost-policy`: 304 passed.
+- [x] (2026-08-08) Milestone 2: SARIF result-level suppressions entries from the baseline attachment (untagged property union, `bifrost.decision: "baseline"`), run-level `bifrost.baseline` property; human concise filter, verbose baseline stanza, verbose review section with per-state counts and bounded entries, summary counts. Tests: `policy_rendering::baseline_mode_agrees_across_concise_verbose_and_json`, `policy_sarif_rendering::baseline_findings_emit_suppressions_and_run_level_review` (offline SARIF 2.1.0 schema-validated).
+- [x] (2026-08-08) Milestone 3: CLI `--baseline-file` and `--accept-current` in all parse sites plus help; acceptance forces fail-on Never, writes atomically only on a clean status, reports the stderr acceptance line with the weak-exclusion count, and rejects `--fail-on`/`--diff-base`; MCP `run_policy.baseline_file` (params, bounded schema property, pinned schema test). Verified end to end on a scratch fixture (gate 1 -> accept 0 -> gate 0).
+- [x] (2026-08-08) Milestone 4: CLI end-to-end tests (600-finding onboarding beyond the 512 suppression cap with idempotent regeneration and post-acceptance gating; JSON/SARIF cross-format agreement on the review plus drift without reactivation; malformed document exit 2 with `baseline-load-failed` and acceptance refusal that leaves the document untouched; an unreliable run writing nothing; eight exclusivity-table rows), the weak-exclusion unit test, docs sections in `static-analysis-policies.md` (enforced by `policy_docs::baseline_documentation_states_the_contract`), `cli.md`, and `ci-github-actions.md`. Validation: `cargo test -p brokk-bifrost-policy` 305 passed; `cargo test --test suite_bench_policy` 346 passed; `cargo test -p brokk-bifrost-mcp` 148 passed across targets; `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Surprises & Discoveries
 
@@ -133,4 +139,8 @@ Replacing reviewed suppressions (the two coexist with distinct semantics). Autom
 
 ## Outcomes & Retrospective
 
-(To be written at completion.)
+2026-08-08: All four milestones are implemented and validated on this branch. A user can onboard a legacy repository in one `--accept-current` step — demonstrated end to end with 600 findings, beyond the 512-record suppression cap — after which the same selection exits 0 with every accepted finding still visible and audited; a new finding gates; a policy edit surfaces as drift without reactivation; a fixed finding surfaces as a stale entry; and the document obeys the suppression store's trust rules (malformed = diagnostic + exit 2; an unreliable run can neither define a baseline nor be turned clean by one). The issue's four acceptance criteria each have a dedicated test.
+
+What deviated from the plan's letter (each recorded in the decision log): the review types live in `baseline.rs` rather than `report.rs`; the weak-exclusion count is proven by a crafted-report unit test rather than a CLI fixture, because match evaluation does not produce weak anchors on these fixtures; two small shared-helper changes in `suppression.rs` (renamed `bounded_json_error_message`, new `AcceptedPolicyHash::from_bytes`).
+
+Lesson learned: the additive-report-field pattern is now three deep (`diff`, `packs`, `baseline`) and each field must be charged in five builder fit paths plus the emergency-reservation recalculation; a future fourth field should probably fold the optional reviews into one accounted collection.

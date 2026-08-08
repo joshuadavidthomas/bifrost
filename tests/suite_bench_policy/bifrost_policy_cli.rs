@@ -1707,6 +1707,47 @@ fn policy_mode_is_exclusive_and_output_failures_use_status_two_without_clobberin
         vec![
             "--policy-file",
             "policies/dynamic-eval.rqlp",
+            "--accept-current",
+            "--fail-on",
+            "warning",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--accept-current",
+            "--diff-base",
+            "HEAD",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--accept-current",
+            "--accept-current",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--baseline-file",
+            "reviews/one.json",
+            "--baseline-file",
+            "reviews/two.json",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--baseline-file",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--baseline-file",
+            "/outside/baseline.json",
+        ],
+        vec!["--list-policies", "--accept-current"],
+        vec!["--list-policies", "--baseline-file", "reviews/one.json"],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
             "--format",
             "json",
             "--verbose",
@@ -2116,6 +2157,262 @@ fn pure_rename_currently_reports_fixed_plus_new() {
     assert_eq!(
         report["runs"][0]["findings"][0]["diff"]["disposition"],
         "new"
+    );
+}
+
+const BASELINE_GATE_ARGS: &[&str] = &[
+    "--policy-file",
+    "policies/dynamic-eval.rqlp",
+    "--evaluation-date",
+    "2026-08-08",
+    "--fail-on",
+    "warning",
+];
+
+/// One Python workspace with `count` distinct offending call sites.
+fn bulk_finding_project(count: usize) -> BuiltInlineTestProject {
+    let mut source = String::new();
+    for index in 0..count {
+        source.push_str(&format!(
+            "def run_{index}(value):\n    return eval(value)\n\n"
+        ));
+    }
+    InlineTestProject::new()
+        .file("src/bulk.py", source)
+        .file("policies/dynamic-eval.rqlp", DYNAMIC)
+        .build()
+}
+
+#[test]
+fn accept_current_onboards_beyond_the_suppression_cap_and_new_findings_still_gate() {
+    // 600 findings: beyond the 512-record suppression cap, within the
+    // 1000-findings-per-policy retention budget.
+    let project = bulk_finding_project(600);
+    let gating = run(project.root(), BASELINE_GATE_ARGS);
+    assert_status(&gating, 1);
+
+    let accepted = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-08-08",
+            "--accept-current",
+        ],
+    );
+    assert_status(&accepted, 0);
+    let stderr = String::from_utf8_lossy(&accepted.stderr);
+    assert!(
+        stderr.contains(
+            "baseline accepted 600 findings into .bifrost/baseline.json \
+             (0 weak-identity findings excluded)"
+        ),
+        "{stderr}"
+    );
+    let document: Value = serde_json::from_str(
+        &fs::read_to_string(project.root().join(".bifrost/baseline.json"))
+            .expect("baseline document written"),
+    )
+    .expect("baseline document is JSON");
+    assert_eq!(document["schema_version"], 1);
+    let finding_ids = document["policies"][0]["finding_ids"]
+        .as_array()
+        .expect("finding ids");
+    assert_eq!(finding_ids.len(), 600);
+
+    let clean = run(project.root(), BASELINE_GATE_ARGS);
+    assert_status(&clean, 0);
+    let summary = String::from_utf8_lossy(&clean.stdout).to_string();
+    assert!(
+        summary.contains("; baseline: 600 accepted of 600 entries via .bifrost/baseline.json"),
+        "{summary}"
+    );
+    assert!(summary.contains("0 active findings"), "{summary}");
+
+    // Regeneration is explicit and idempotent: a second acceptance rewrites
+    // the same document.
+    let reaccepted = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-08-08",
+            "--accept-current",
+        ],
+    );
+    assert_status(&reaccepted, 0);
+    let rewritten: Value = serde_json::from_str(
+        &fs::read_to_string(project.root().join(".bifrost/baseline.json"))
+            .expect("baseline document rewritten"),
+    )
+    .expect("rewritten baseline is JSON");
+    assert_eq!(rewritten, document);
+
+    // A finding introduced after acceptance still gates.
+    fs::write(
+        project.root().join("src/regression.py"),
+        "def run_more(value):\n    return eval(value)\n",
+    )
+    .expect("new offending source");
+    let regressed = run(
+        project.root(),
+        &extended_args(BASELINE_GATE_ARGS, &["--format", "json"]),
+    );
+    assert_status(&regressed, 1);
+    let report = json_stdout(&regressed);
+    assert_eq!(report["baseline"]["entry_count"], 600);
+    assert_eq!(report["baseline"]["applied_count"], 600);
+    assert_eq!(report["baseline"]["result_omitted_count"], 0);
+}
+
+fn extended_args<'a>(base: &[&'a str], extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = base.to_vec();
+    args.extend_from_slice(extra);
+    args
+}
+
+#[test]
+fn baseline_review_agrees_across_json_and_sarif_and_drift_does_not_reactivate() {
+    let project = bulk_finding_project(1);
+    let accepted = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-08-08",
+            "--accept-current",
+        ],
+    );
+    assert_status(&accepted, 0);
+
+    // Edit the policy's presentation: the semantic hash changes, the entries
+    // drift, and the accepted finding stays accepted.
+    let changed_policy = DYNAMIC
+        .replace(
+            ":message \"Dynamic evaluation is forbidden\"",
+            ":message \"Dynamic evaluation requires review\"",
+        )
+        .replace(":severity warning", ":severity error");
+    assert_ne!(changed_policy, DYNAMIC);
+    fs::write(
+        project.root().join("policies/dynamic-eval.rqlp"),
+        changed_policy,
+    )
+    .expect("edit policy presentation");
+
+    let json = run(
+        project.root(),
+        &extended_args(BASELINE_GATE_ARGS, &["--format", "json"]),
+    );
+    assert_status(&json, 0);
+    let json = json_stdout(&json);
+    assert_eq!(json["baseline"]["entry_count"], 1);
+    assert_eq!(json["baseline"]["applied_count"], 1);
+    assert_eq!(json["baseline"]["drifted_count"], 1);
+    assert_eq!(
+        json["baseline"]["entries"][0]["policy_hash_state"],
+        "drifted"
+    );
+    assert_eq!(json["baseline"]["entries"][0]["applied"], true);
+    assert_eq!(
+        json["runs"][0]["findings"][0]["baseline"]["policy_hash_state"],
+        "drifted"
+    );
+
+    let sarif = run(
+        project.root(),
+        &extended_args(BASELINE_GATE_ARGS, &["--format", "sarif"]),
+    );
+    assert_status(&sarif, 0);
+    let sarif = json_stdout(&sarif);
+    // Cross-format agreement: the SARIF run property is the same canonical
+    // review object the JSON report carries.
+    assert_eq!(
+        sarif["runs"][0]["properties"]["bifrost.baseline"],
+        json["baseline"]
+    );
+    let suppression = &sarif["runs"][0]["results"][0]["suppressions"][0];
+    assert_eq!(suppression["kind"], "external");
+    assert_eq!(suppression["status"], "accepted");
+    assert_eq!(suppression["properties"]["bifrost.decision"], "baseline");
+    assert_eq!(
+        suppression["properties"]["bifrost.policyHashState"],
+        "drifted"
+    );
+}
+
+#[test]
+fn malformed_baseline_is_exit_two_and_an_unreliable_run_refuses_acceptance() {
+    // A malformed baseline document is a diagnostic and exit 2 on every run,
+    // including an acceptance run, which must not overwrite it.
+    let project = bulk_finding_project(1);
+    let baseline_path = project.root().join(".bifrost/baseline.json");
+    fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+    fs::write(&baseline_path, "{ not json").unwrap();
+
+    let gating = run(
+        project.root(),
+        &extended_args(BASELINE_GATE_ARGS, &["--format", "json"]),
+    );
+    assert_status(&gating, 2);
+    let report = json_stdout(&gating);
+    assert!(report.get("baseline").is_none());
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "baseline-load-failed"),
+        "{report:#}"
+    );
+
+    let refused = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-08-08",
+            "--accept-current",
+        ],
+    );
+    assert_status(&refused, 2);
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("no baseline was written"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&baseline_path).unwrap(),
+        "{ not json",
+        "a refused acceptance must not touch the document"
+    );
+
+    // Any other unreliability refuses acceptance the same way and writes
+    // nothing at all.
+    fs::remove_file(&baseline_path).unwrap();
+    fs::write(
+        project.root().join(".bifrost/suppressions.json"),
+        "{ not json",
+    )
+    .unwrap();
+    let unreliable = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-08-08",
+            "--accept-current",
+        ],
+    );
+    assert_status(&unreliable, 2);
+    assert!(
+        !baseline_path.exists(),
+        "an unreliable run cannot define a baseline"
     );
 }
 

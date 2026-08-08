@@ -927,6 +927,61 @@ shares no analyzer cache in this version. For the GitHub Actions recipe that
 passes the pull request's base SHA, see
 [CI Gating with GitHub Actions](/ci-github-actions/).
 
+## Accept Today's Findings, Gate Tomorrow's
+
+A repository adopting Bifrost can carry hundreds to thousands of pre-existing
+findings. The suppression store is deliberately the wrong tool for that scale:
+it caps at 512 identity-exact records and demands a reviewed reason for each,
+which is right for governed waivers and wrong for onboarding. `--diff-base`
+removes the pressure from pull-request gates, but scheduled full runs and
+release gates still need "accept everything that exists today, gate everything
+new." That is the baseline document:
+
+```bash
+bifrost --root . --policy-pack bifrost.code-smells --accept-current
+```
+
+`--accept-current` runs the selected policies and writes
+`.bifrost/baseline.json` (override with `--baseline-file`) from the completed
+run: per policy, the sorted strong finding-id hashes plus the policy's
+semantic hash at acceptance, under one batch-level reason and acceptance date.
+Entries are identity-only — no per-record prose — so the document holds up to
+100,000 entries in at most 16 MiB, two decimal orders beyond the suppression
+cap. Acceptance is written only by a clean run: an unreliable run refuses to
+define a baseline and exits 2 without writing, because an identity the run
+could not prove cannot be accepted. Weak-identity findings are never written
+(their identities are snapshot-local), and their excluded count is reported.
+Regeneration is always an explicit re-run; the baseline never refreshes
+itself.
+
+On every later run the document joins by `(policy_id, finding_id)` after
+suppressions and directory scope claim their findings; a finding already
+suppressed or scoped is not claimed by the baseline, and its entry is audited
+as `finding_claimed`. Claimed findings stay in the report with a `baseline`
+decision and stop counting toward `--fail-on`, in full and in `--diff-base`
+runs alike: gating counts findings that are new and unclaimed by suppression,
+scope, and baseline. The report gains one top-level `baseline` review with the
+document path, the batch metadata, exact per-state counts, and a bounded
+needs-attention entry list (anything other than applied-with-matching-hash;
+the counts stay exact when the list truncates). SARIF renders each baselined
+finding as an external accepted suppression entry whose property bag carries
+`bifrost.decision: "baseline"`, and concise human output hides baselined
+findings while the summary reports the counts.
+
+The audit rules mirror suppressions. A malformed or oversized document is a
+diagnostic and exit 2; a baseline never turns an unreliable run clean. Editing
+a policy marks its entries drifted without reactivating them — a drifted entry
+still applies, and the drift count in the review is the signal to re-review.
+An entry is stale only when an exhaustive completed run proves the finding
+absent; an incomplete run reports `policy_incomplete` instead of guessing. The
+`--diff-base` identity limitations apply unchanged: a rename or an edited
+source slice re-keys the finding, so the old entry goes stale and the re-keyed
+finding gates until it is re-accepted or fixed.
+
+For the onboarding recipe that commits the baseline once and keeps
+pull-request gates on `--diff-base`, see
+[CI Gating with GitHub Actions](/ci-github-actions/).
+
 ## Classification And CVSS v4.0
 
 A policy can declare one broad fallback taxonomy classification plus typed

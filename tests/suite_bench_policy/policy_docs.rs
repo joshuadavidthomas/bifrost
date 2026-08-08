@@ -239,6 +239,43 @@ fn diff_gating_documentation_states_the_contract_and_limitations() {
 }
 
 #[test]
+fn baseline_documentation_states_the_contract() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs = read(root.join(POLICY_DOC));
+    assert!(docs.contains("## Accept Today's Findings, Gate Tomorrow's"));
+    let normalized = docs.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in [
+        // The trust rules that make the bulk mechanism safe.
+        "an unreliable run refuses to define a baseline and exits 2 without writing",
+        "A malformed or oversized document is a diagnostic and exit 2",
+        "a baseline never turns an unreliable run clean",
+        // The claim ordering and the composed gate.
+        "a finding already suppressed or scoped is not claimed by the baseline",
+        "gating counts findings that are new and unclaimed by suppression, scope, and baseline",
+        // The audit-state semantics.
+        "marks its entries drifted without reactivating them",
+        "stale only when an exhaustive completed run proves the finding absent",
+        // The size contract and the SARIF representation.
+        "100,000 entries in at most 16 MiB",
+        "`bifrost.decision: \"baseline\"`",
+        // Regeneration discipline.
+        "the baseline never refreshes itself",
+    ] {
+        assert!(
+            normalized.contains(required),
+            "policy docs must state the baseline contract: {required}"
+        );
+    }
+
+    let ci_docs = read(root.join("docs/src/content/docs/ci-github-actions.md"));
+    assert!(ci_docs.contains("--accept-current"));
+    assert!(ci_docs.contains("git add .bifrost/baseline.json"));
+
+    let cli_docs = read(root.join("docs/src/content/docs/cli.md"));
+    assert!(cli_docs.contains("`--accept-current`, `--baseline-file`"));
+}
+
+#[test]
 fn ten_minute_match_policy_runs_through_the_current_cli() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let docs = read(root.join(EVALUATION_DOC));
