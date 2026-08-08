@@ -235,6 +235,29 @@ impl DependencyPackEcosystem {
         }
     }
 
+    /// Stable lowercase label used by workspace configuration documents
+    /// (`.bifrost/packs.json`) and activation reporting.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Jvm => "jvm",
+            Self::DotNet => "dotnet",
+            Self::Npm => "npm",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::Cargo => "cargo",
+            Self::Ruby => "ruby",
+            Self::Composer => "composer",
+        }
+    }
+
+    /// Parse one configuration-document label back into its ecosystem.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|ecosystem| ecosystem.label() == label)
+    }
+
     /// Base names of the files whose change can invalidate this ecosystem's
     /// published pack proof (#1628).
     ///
