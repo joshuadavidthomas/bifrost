@@ -871,6 +871,62 @@ findings. Use `--scope-file PATH` on the CLI or `scope_file` on the MCP
 `run_policy` tool for one workspace-relative override; both default to
 `.bifrost/policy-scope.json`.
 
+## Gate Only On What The Change Introduced
+
+A full policy run fails a repository for every finding, including debt that
+predates the change under review. `--diff-base REV` turns the same run into a
+changed-code gate: the identical policies also evaluate the committed content
+of `REV`, findings are joined across the two revisions by `(policy_id,
+finding_id)`, and the failure threshold counts only the findings whose
+identity is absent from the base.
+
+```bash
+bifrost --root . \
+  --policy-pack bifrost.code-smells \
+  --format sarif --output out.sarif \
+  --diff-base origin/main
+```
+
+The join works because a strong finding identity hashes only content-derived
+facts: the workspace-relative path, the semantic owner key, a digest of the
+matched source bytes, and a small ordinal for identical slices under one
+owner. It contains no absolute path, revision, timestamp, or run-local
+handle, so the same finding in unchanged content produces the same identity
+at both revisions. The base revision is exported into a private temporary
+directory and analyzed there; the checkout is never touched.
+
+Each retained finding gains a `diff` decision (`new` or `persisting`, plus a
+`weak_identity` marker), and the report gains one top-level `diff` review
+with the requested revision, the resolved commit, the three counts, and the
+fixed identities the head no longer produces. Weak identities are
+snapshot-local by construction, so a weak finding never joins and always
+classifies as new. Suppressions and scope still apply first: a suppressed or
+scoped new finding does not gate, exactly as in a full run. SARIF results
+carry the standard `baselineState` field (`new` or `unchanged`; fixed base
+findings are not emitted as results), and concise human output hides
+persisting findings while the summary reports all three counts.
+
+The reliability contract is asymmetric on purpose. An unresolvable base -- a
+workspace outside a git repository, or a revision `git rev-parse` cannot
+resolve -- fails the run with status 2: an unresolvable base is an unreliable
+diff request, never a silent full run. A base that resolves but whose
+evaluation cannot prove its own completeness instead degrades to full gating:
+every head finding gates as if `--diff-base` had not been given, the review
+records `degraded: true`, and a `diff-base-unreliable` report diagnostic
+states why, so a broken base can never hide new findings and can never be
+mistaken for a clean diff run.
+
+Two identity limitations are accepted rather than solved. A pure file rename
+re-keys every finding in the file (the path is part of the identity), so a
+rename reports one `fixed` plus one `new` pair. Identical source slices under
+one owner are distinguished by an ordinal, so inserting an exact duplicate
+above an existing one can shift the ordinals and misclassify one pair.
+
+The base evaluation is a full second in-memory analysis of the base tree; it
+shares no analyzer cache in this version. For the GitHub Actions recipe that
+passes the pull request's base SHA, see
+[CI Gating with GitHub Actions](/ci-github-actions/).
+
 ## Classification And CVSS v4.0
 
 A policy can declare one broad fallback taxonomy classification plus typed

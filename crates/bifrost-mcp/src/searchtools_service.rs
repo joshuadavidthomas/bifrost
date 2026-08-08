@@ -896,7 +896,9 @@ pub(crate) struct PreparedRunPolicy {
 
 pub(crate) enum RunPolicyPreparation {
     Ready(PreparedRunPolicy),
-    Deadline(RunPolicyToolResult),
+    // Boxed: the ready payload is a slim handle while the deadline payload
+    // carries a whole report document.
+    Deadline(Box<RunPolicyToolResult>),
 }
 
 impl WorkspaceQueryScope {
@@ -3692,7 +3694,7 @@ impl SearchToolsService {
                         exit_status: outcome.exit_status(),
                         report: outcome.into_report(),
                     };
-                    return Ok(RunPolicyPreparation::Deadline(result));
+                    return Ok(RunPolicyPreparation::Deadline(Box::new(result)));
                 }
                 Err(error) => return Err(error),
             };
