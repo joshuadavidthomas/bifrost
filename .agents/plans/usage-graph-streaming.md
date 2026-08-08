@@ -80,6 +80,29 @@ measurement is a separate task run after review; it is not part of this plan's a
       hot short name (5-11 s each) times a 100,847-distinct-name fan-out. See
       `Outcomes & Retrospective`.
 
+- [x] (2026-08-08) **The read-cost anatomy is settled, and three volume cuts landed from it.**
+      Report checked in: `.agents/docs/graph-read-cost-investigation-2026-08.md`. **The store
+      reads are 0.44% of the query's CPU** -- 25.6 CPU-seconds of 5,873, plus 26.0 s for the
+      whole export index. Two campaign figures are corrected as blocked wall, not work: run 6's
+      **10.97 s for `main`** is 650 ms of CPU, and run 6's **533.85 s for
+      `export_index_of_declarations`** is 14.5 s of CPU over 2,759 builds (5.2 ms each), a
+      thread-summed span on a loaded host that also double-counted the reads nested inside it.
+      `sqlite3_step` is 52.5% of read CPU but 80.7% of read wall; the process runs ~11 of 120
+      cores with 122 threads. What is real is **volume**: 456,452 `definitions(fq)` calls,
+      128,873 spellings, 87.2% of distinct names seeking zero rows, 99.02% of candidate rows
+      discarded, 67.9% of resolved owners living in the asking file, and export-index builds not
+      single-flighted. Cuts landed: `39f129d7` + `5544f6a4` (drop spellings the storage contract
+      cannot hold), `d84ef353` (own-file owner chains answered from the file's own
+      declarations), `0ab698a5` (single-flight the per-file export-index build). Fixture
+      measurement, cold `UsageFinder` query over 51 rust files, same 48 hits before and after:
+      `definitions` calls **606 -> 506**, candidate misses **146 -> 50**, distinct-name store
+      reads **244 -> 50**, export builds **51-55 (nondeterministic) -> 51 (deterministic)**;
+      user CPU **51.2 s -> 48.1 s** over 3 repetitions a side. **The umbrella's remaining open
+      item is the one the profile names and none of these cuts touches**: ~22% path
+      compare/iterate/hash, ~28% allocator churn feeding it and ~12% moka inside Rust module
+      resolution (`ProjectFile::cmp` 14.9% with children, `PathBuf::normalize` 5.3%). That
+      awaits the post-cut re-measure. See `Outcomes & Retrospective`.
+
 ## Surprises & Discoveries
 
 - Observation: the forward reference context is built *during a scan*, not only by
