@@ -110,9 +110,9 @@ runs:
         fi
         echo "${dir}/${stage}" >> "${GITHUB_PATH}"
 
-    - name: Restore analyzer cache
+    - name: Analyzer cache
       if: inputs.cache == 'true'
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: .bifrost/cache
         key: bifrost-policy-cache-${{ runner.os }}-${{ github.run_id }}
@@ -152,19 +152,21 @@ runs:
           echo "has-sarif=false" >> "${GITHUB_OUTPUT}"
         fi
 
-    - name: Save analyzer cache
-      if: inputs.cache == 'true'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-      with:
-        path: .bifrost/cache
-        key: bifrost-policy-cache-${{ runner.os }}-${{ github.run_id }}
-
     - name: Upload SARIF to code scanning
       if: inputs.upload == 'true' && steps.run.outputs.has-sarif == 'true'
-      uses: github/codeql-action/upload-sarif@c3400c2f38909e0dcf3c3a41f2030a8217be5d3e # v3
-      with:
-        sarif_file: ${{ steps.run.outputs.sarif-file }}
-        category: ${{ inputs.category }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SARIF_PATH: ${{ steps.run.outputs.sarif-file }}
+        CATEGORY: ${{ inputs.category }}
+      run: |
+        set -euo pipefail
+        gh api "repos/${GITHUB_REPOSITORY}/code-scanning/sarifs" \
+          -f commit_sha="${GITHUB_SHA}" \
+          -f ref="${GITHUB_REF}" \
+          -f category="${CATEGORY}" \
+          -f checkout_uri="file://${GITHUB_WORKSPACE}" \
+          -f sarif="$(gzip -c "${SARIF_PATH}" | base64 -w0)"
 
     - name: Gate on the exit code
       shell: bash
