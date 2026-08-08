@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
@@ -31,7 +33,6 @@ jobs:
       - name: Build bifrost
         run: |
           cargo build --release --bin bifrost
-          echo "${GITHUB_WORKSPACE}/target/release" >> "${GITHUB_PATH}"
 
       - name: Scan with the built-in pack
         uses: ./.github/actions/policy-scan

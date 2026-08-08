@@ -75,13 +75,19 @@ runs:
   using: composite
   steps:
     - name: Install bifrost
+      id: install
       shell: bash
       env:
         BIFROST_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
         if [ "${BIFROST_VERSION}" = local ]; then
-          command -v bifrost >/dev/null || { echo "::error::version=local but no bifrost on PATH"; exit 1; }
+          if [ -x "${GITHUB_WORKSPACE}/target/release/bifrost" ]; then
+            echo "bifrost_bin=${GITHUB_WORKSPACE}/target/release/bifrost" >> "${GITHUB_OUTPUT}"
+          else
+            command -v bifrost >/dev/null || { echo "::error::version=local but no bifrost is available"; exit 1; }
+            echo "bifrost_bin=$(command -v bifrost)" >> "${GITHUB_OUTPUT}"
+          fi
           exit 0
         fi
         case "${RUNNER_OS}-${RUNNER_ARCH}" in
@@ -113,7 +119,7 @@ runs:
         else
           tar -xzf "${stage}.tar.gz"
         fi
-        echo "${dir}/${stage}" >> "${GITHUB_PATH}"
+        echo "bifrost_bin=${dir}/${stage}" >> "${GITHUB_OUTPUT}"
 
     - name: Analyzer cache
       if: inputs.cache == 'true'
@@ -136,6 +142,7 @@ runs:
         POLICY_CATEGORIES: ${{ inputs.policy-categories }}
         POLICY_FILES: ${{ inputs.policy-files }}
         DIFF_BASE: ${{ inputs.diff-base }}
+        BIFROST_BIN: ${{ steps.install.outputs.bifrost_bin }}
       run: |
         set -uo pipefail
         cd "${WORKDIR}"
@@ -146,7 +153,7 @@ runs:
         for p in ${POLICY_FILES}; do args+=(--policy-file "${p}"); done
         if [ -n "${DIFF_BASE}" ]; then args+=(--diff-base "${DIFF_BASE}"); fi
         set +e
-        bifrost "${args[@]}"
+        "${BIFROST_BIN}" "${args[@]}"
         code=$?
         set -e
         echo "exit-code=${code}" >> "${GITHUB_OUTPUT}"
@@ -167,9 +174,16 @@ runs:
       run: |
         set -euo pipefail
         categorized="${RUNNER_TEMP}/bifrost-categorized.sarif"
-        jq --arg cat "${CATEGORY}" \
-          '.runs[] |= (.automationDetails = {id: ($cat + "/")})' \
-          "${SARIF_PATH}" > "${categorized}"
+        jq --arg category "${CATEGORY}" '
+          .runs |= map(
+            if (.automationDetails // {} | has("id") | not)
+            then .automationDetails = ((.automationDetails // {}) + {
+              id: (if ($category | endswith("/")) then $category else ($category + "/") end)
+            })
+            else .
+            end
+          )
+        ' "${SARIF_PATH}" > "${categorized}"
         gh api "repos/${GITHUB_REPOSITORY}/code-scanning/sarifs" \
           -f commit_sha="${GITHUB_SHA}" \
           -f ref="${GITHUB_REF}" \
