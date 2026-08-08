@@ -1935,20 +1935,20 @@ fn strict_activation_mismatch_reason(
             {
                 continue;
             }
-            if !(selector.targets.is_empty()
+            let non_version_predicates_pass = (selector.targets.is_empty()
                 || row
                     .target
                     .as_ref()
                     .is_some_and(|target| selector.targets.contains(target)))
-                || !(selector.configurations.is_empty()
+                && (selector.configurations.is_empty()
                     || row.configuration.as_ref().is_some_and(|configuration| {
                         selector.configurations.contains(configuration)
                     }))
-                || !selector
+                && selector
                     .artifact_sha256
                     .as_ref()
-                    .is_none_or(|expected| row.artifact_sha256.as_ref() == Some(expected))
-            {
+                    .is_none_or(|expected| row.artifact_sha256.as_ref() == Some(expected));
+            if !non_version_predicates_pass {
                 continue;
             }
             for (axis, coordinate_selector, coordinate_evidence) in [
