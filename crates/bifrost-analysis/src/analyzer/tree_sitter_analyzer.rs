@@ -4,6 +4,7 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::common::{
     IdentifierSeek, decorated_identifier_seeks, identifier_addresses_target,
 };
+use crate::analyzer::fq_name::absent_segment_separators;
 use crate::analyzer::pool_memo::KeyedPoolSafeMemo;
 use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
@@ -1983,6 +1984,11 @@ pub struct TreeSitterAnalyzer<A> {
     definition_candidates_query_count: Arc<AtomicUsize>,
     definition_prefetch_batch_count: Arc<AtomicUsize>,
     definition_candidate_row_read_count: Arc<AtomicUsize>,
+    /// Candidate spellings dropped by `definition_candidate_short_names`
+    /// because the persisted `short_name` vocabulary for this adapter's
+    /// language cannot contain a separator they carry. Each one is a store seek
+    /// that did not happen (issue #1748).
+    structural_miss_spelling_count: Arc<AtomicUsize>,
     enclosing_code_unit_query_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
     /// Persisted declarations that a `search_symbols` request hydrated into
@@ -2044,6 +2050,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             definition_candidate_row_read_count: Arc::clone(
                 &self.definition_candidate_row_read_count,
             ),
+            structural_miss_spelling_count: Arc::clone(&self.structural_miss_spelling_count),
             enclosing_code_unit_query_count: Arc::clone(&self.enclosing_code_unit_query_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
             search_candidate_hydration_count: Arc::clone(&self.search_candidate_hydration_count),
@@ -2240,6 +2247,7 @@ where
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
             definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
+            structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
@@ -2439,6 +2447,7 @@ where
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
             definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
             definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
+            structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
@@ -5780,6 +5789,20 @@ where
             .load(Ordering::Relaxed)
     }
 
+    /// Candidate spellings the structural-miss filter dropped, paired with the
+    /// row-read count so a test can show that N dropped spellings cost N fewer
+    /// seeks rather than merely being counted (#1748).
+    #[doc(hidden)]
+    pub fn reset_structural_miss_spelling_count_for_test(&self) {
+        self.structural_miss_spelling_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn structural_miss_spelling_count_for_test(&self) -> usize {
+        self.structural_miss_spelling_count.load(Ordering::Relaxed)
+    }
+
     #[doc(hidden)]
     pub fn reset_package_declaration_scan_count_for_test(&self) {
         self.package_declaration_scan_count
@@ -6223,11 +6246,36 @@ where
         Some(())
     }
 
+    /// The spellings one fq name is looked up under in the `(lang, short_name)`
+    /// index.
+    ///
+    /// This is where the suffix expansion is minted -- 4.41 spellings per fq
+    /// name on the rustc tree, each one a memo op and, on a miss, a pooled
+    /// connection checkout plus an index probe. A spelling that carries a
+    /// separator [`absent_segment_separators`] reports for this adapter's
+    /// language cannot match any stored `short_name` for it, so it is dropped
+    /// here rather than seeking for a row the storage contract says is not
+    /// there (issue #1748;
+    /// `.agents/docs/graph-read-cost-investigation-2026-08.md`).
+    ///
+    /// Dropping is sound in exactly one direction: it removes probes that
+    /// return no rows. It cannot remove a candidate, because a candidate is a
+    /// row and there are none to return. The normalized spellings are minted
+    /// first and filtered with the rest, so an adapter whose
+    /// `normalize_full_name` rewrites `::` into its own vocabulary keeps every
+    /// spelling that can match.
     fn definition_candidate_short_names(&self, fq_name: &str) -> Vec<String> {
         let mut names = self.adapter.lookup_candidate_short_names(fq_name);
         let normalized = self.adapter.normalize_full_name(fq_name);
         if normalized != fq_name {
             names.extend(self.adapter.lookup_candidate_short_names(&normalized));
+        }
+        let absent = absent_segment_separators(self.adapter.language());
+        if !absent.is_empty() {
+            let before = names.len();
+            names.retain(|name| !absent.iter().any(|separator| name.contains(separator)));
+            self.structural_miss_spelling_count
+                .fetch_add(before - names.len(), Ordering::Relaxed);
         }
         names.sort();
         names.dedup();
@@ -10299,6 +10347,107 @@ mod tests {
         }
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
         (temp, project)
+    }
+
+    /// One rust crate whose declarations live behind a module, so a scoped
+    /// lookup expands into `::`-bearing spellings.
+    fn rust_scoped_lookup_project() -> (tempfile::TempDir, Arc<dyn Project>) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub mod inner;\npub struct Outer;\n",
+        )
+        .expect("write lib");
+        std::fs::write(
+            root.join("src/inner.rs"),
+            "pub struct Widget;\n\nimpl Widget {\n    pub fn make() -> Self {\n        Widget\n    }\n}\n",
+        )
+        .expect("write module");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        (temp, project)
+    }
+
+    /// #1748: `lookup_suffix_candidates` peels a rust lookup path on both `.`
+    /// and `::`, so a `::`-spelled input mints spellings that carry `::` --
+    /// and no rust `short_name` can contain one, because the FqName renderer
+    /// emits `::` only between two C++ namespace segments. Every such spelling
+    /// was still paying a pooled connection checkout, a generation check, a
+    /// `prepare_cached` and an index probe to be told what the storage
+    /// contract already says.
+    ///
+    /// Fails before the filter: all three spellings seek, so `row_reads` is 3
+    /// and `dropped` is 0. After it, the two `::`-bearing spellings are
+    /// dropped and only the one that can match seeks.
+    #[test]
+    fn issue_1748_double_colon_spellings_do_not_seek_for_rust() {
+        let (_temp, project) = rust_scoped_lookup_project();
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+
+        analyzer.reset_definition_candidate_row_read_count_for_test();
+        analyzer.reset_structural_miss_spelling_count_for_test();
+        // Spellings: `probe::inner::Widget`, `inner::Widget`, `Widget`. Only
+        // the last can match a stored rust short name.
+        let scoped: Vec<CodeUnit> =
+            IAnalyzer::definitions(&analyzer, "probe::inner::Widget").collect();
+        let row_reads = analyzer.definition_candidate_row_read_count_for_test();
+        let dropped = analyzer.structural_miss_spelling_count_for_test();
+
+        assert_eq!(
+            2, dropped,
+            "both `::`-bearing spellings are structurally guaranteed misses"
+        );
+        assert_eq!(
+            1, row_reads,
+            "only the spelling the persisted vocabulary can hold may seek"
+        );
+        // The drop removes probes, never answers. Measured before the filter,
+        // this lookup resolved to nothing too, and structurally it cannot
+        // resolve to anything: `assemble_definition_candidates` keeps a row
+        // only on an exact or normalized fq match against the *input*
+        // spelling, rust's `normalize_full_name` is the identity, and no
+        // stored rust fq name carries `::`. The three spellings were three
+        // seeks for an answer the storage contract had already refused.
+        assert!(
+            scoped.is_empty(),
+            "a `::`-spelled rust fq name resolved to {scoped:?} before the filter too"
+        );
+        // The declaration itself is reachable, by the dotted name it is
+        // actually stored under -- see the sibling test. This is the
+        // difference the filter must not blur.
+    }
+
+    /// The other side of the filter: a dotted rust lookup carries no excluded
+    /// separator, so nothing is dropped and every spelling still seeks. This is
+    /// what keeps the cut from being a blanket reduction in probes.
+    #[test]
+    fn issue_1748_dotted_rust_spellings_are_all_still_sought() {
+        let (_temp, project) = rust_scoped_lookup_project();
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+
+        analyzer.reset_definition_candidate_row_read_count_for_test();
+        analyzer.reset_structural_miss_spelling_count_for_test();
+        let dotted: Vec<CodeUnit> = IAnalyzer::definitions(&analyzer, "inner.Widget").collect();
+
+        assert_eq!(0, analyzer.structural_miss_spelling_count_for_test());
+        assert_eq!(
+            2,
+            analyzer.definition_candidate_row_read_count_for_test(),
+            "`inner.Widget` and `Widget` both remain seekable spellings"
+        );
+        assert_eq!(
+            vec!["inner.Widget"],
+            dotted
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<Vec<String>>()
+        );
     }
 
     /// #1774: every caller of the non-persisted workspace declaration scan used

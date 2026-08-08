@@ -14971,4 +14971,115 @@ replay! { mod replayed; }
     fn oid_for(contents: &[u8]) -> Oid {
         Oid::hash_object(ObjectType::Blob, contents).unwrap()
     }
+
+    /// Every `short_name` the store holds for one parsed blob.
+    fn persisted_short_names<A: LanguageAdapter>(
+        adapter: &A,
+        lang: &str,
+        file: &ProjectFile,
+    ) -> Vec<String> {
+        let state = parse_state(adapter, file);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value(lang, "short-name-vocabulary-pin-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, lang, generation, adapter, &state)
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT short_name FROM code_units WHERE blob_oid = ?1 AND lang = ?2")
+            .unwrap();
+        let names: Vec<String> = statement
+            .query_map(params![oid.to_string(), lang], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(
+            !names.is_empty(),
+            "the {lang} fixture must persist declarations for the pin to mean anything"
+        );
+        names
+    }
+
+    /// The storage contract issue #1748's structural-miss filter rests on,
+    /// pinned end to end rather than inferred from the renderer.
+    ///
+    /// `definition_candidate_short_names` drops a lookup spelling that carries
+    /// a separator `absent_segment_separators` reports for the adapter's
+    /// language, on the ground that no stored `short_name` for that language
+    /// can contain one. `.agents/docs/graph-read-cost-investigation-2026-08.md`
+    /// measured that property over 324,891 rustc rows (0 containing `::`);
+    /// this asserts it against rows the store actually wrote, over the rust
+    /// shapes most likely to smuggle a path separator into a name -- nested
+    /// inline modules, a generic inherent impl, a qualified trait impl, and an
+    /// associated const.
+    ///
+    /// If a future extractor or schema change starts persisting `::`-bearing
+    /// rust short names, the filter would begin dropping spellings that can
+    /// match. This fails first, and says so.
+    #[test]
+    fn short_name_vocabulary_excludes_separators_absent_from_the_renderer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "src/lib.rs",
+            "pub mod outer {\n\
+             \x20   pub mod inner {\n\
+             \x20       pub struct Widget<T> { pub value: T }\n\
+             \x20       impl<T: core::fmt::Debug> Widget<T> {\n\
+             \x20           pub const LIMIT: usize = 4;\n\
+             \x20           pub fn make(value: T) -> Self { Widget { value } }\n\
+             \x20       }\n\
+             \x20       impl<T> core::default::Default for Widget<T>\n\
+             \x20       where T: core::default::Default {\n\
+             \x20           fn default() -> Self { Widget { value: T::default() } }\n\
+             \x20       }\n\
+             \x20   }\n\
+             }\n\
+             pub fn top() -> usize { outer::inner::Widget::<usize>::LIMIT }\n",
+        );
+
+        let names = persisted_short_names(&RustAdapter, "rust", &file);
+        let absent = crate::analyzer::fq_name::absent_segment_separators(Language::Rust);
+        assert_eq!(
+            &["::"],
+            absent,
+            "rust has no `::` rendering rule, so `::` is the separator the filter drops"
+        );
+        let offenders: Vec<&String> = names
+            .iter()
+            .filter(|name| absent.iter().any(|separator| name.contains(separator)))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "persisted rust short names must not contain {absent:?}; offenders: {offenders:?} \
+             out of {names:?}"
+        );
+    }
+
+    /// The contract is per language, not global. C++ renders `::` between
+    /// namespace segments, so nothing may be dropped for it -- and its
+    /// persisted vocabulary is free to carry `::`.
+    #[test]
+    fn cpp_short_name_vocabulary_is_not_narrowed_by_the_filter() {
+        assert!(
+            crate::analyzer::fq_name::absent_segment_separators(Language::Cpp).is_empty(),
+            "cpp renders every separator the lookup vocabulary can carry"
+        );
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "sample.cpp",
+            "namespace ns1 { namespace ns2 { struct Outer { void method(); }; } }\n\
+             void ns1::ns2::Outer::method() {}\n",
+        );
+        let names = persisted_short_names(&CppAdapter, "cpp", &file);
+        assert!(
+            names.iter().any(|name| name.contains("Outer")),
+            "cpp fixture should persist the nested type: {names:?}"
+        );
+    }
 }
