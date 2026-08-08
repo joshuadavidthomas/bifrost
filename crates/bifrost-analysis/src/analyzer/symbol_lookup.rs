@@ -30,9 +30,13 @@ pub(crate) enum FuzzyResolveStop {
 /// One caller's limits on one fuzzy resolution.
 ///
 /// `keep_going` is the caller's budget or cancellation predicate. Every loop
-/// here whose length is proportional to the workspace polls it, so a caller
-/// whose budget already expired stops paying for an answer it would discard
-/// (#1839; the same rule 575c2ffb applied to the Rust usage walks).
+/// here that charges a store read per iteration polls it, so a caller whose
+/// budget already expired stops paying for an answer it would discard (#1839;
+/// the same rule 575c2ffb applied to the Rust usage walks). The in-memory
+/// filter loops that only *count* matches deliberately do not poll: their
+/// product is the input to `admits`, and cancelling there would report the
+/// caller's clock in place of a verdict already reached. See
+/// [`bare_name_resolution`].
 ///
 /// `max_candidates` bounds how many distinct declarations one selector may
 /// name before the resolver reports the count instead of building the list.
@@ -400,9 +404,22 @@ fn bare_name_resolution(
     include: impl Copy + Fn(&CodeUnit) -> bool,
     budget: FuzzyResolveBudget<'_>,
 ) -> Result<Option<CodeUnitResolution>, FuzzyResolveStop> {
+    // Neither accumulation loop below polls `keep_going`, and that is the
+    // point. Both are cheap in-memory filters over rows two indexed store
+    // reads have already produced (306 ms for 22,177 rows on the rustc tree;
+    // 11.7 ms to filter them), and what they produce is the deduplicated match
+    // count -- the input to the fan-out gate at the top of
+    // `resolution_from_matches`. Polling here meant a caller whose budget
+    // expired during those two reads got a bare `Cancelled` instead of the
+    // structured `TooManyCandidates` the count was about to justify, because
+    // `keep_going` is asked before `admits` is ever reached. Measured on the
+    // rustc tree: the `main` cell returned `time_budget` and never evaluated
+    // its own gate (`.agents/docs/gate-cell-overhead-2026-08.md`). The budget
+    // still governs everything expensive: the per-match `definitions` reads in
+    // `resolution_from_matches` poll it per match, and the caller polls it
+    // again on entry to the next resolution stage.
     let mut matches = BTreeMap::new();
     for definition in analyzer.definitions(trimmed) {
-        budget.keep_going()?;
         if include(&definition) {
             insert_match(&mut matches, &definition);
         }
@@ -413,7 +430,6 @@ fn bare_name_resolution(
     // `resolution_from_matches` below -- so the count has to be taken here,
     // before that phase, not discovered by paying for it (#1839).
     for candidate in analyzer.lookup_candidates_by_identifier(leaf) {
-        budget.keep_going()?;
         // `identifier_addresses_target`, not `identifier() == leaf`: the
         // indexed lookup is keyed on the spelling a caller can address, and a
         // C# generic type or a TypeScript static member is addressed by a
@@ -1415,6 +1431,50 @@ mod tests {
             "an over-cap selector must skip the per-candidate expansion: \
              {over_reads} reads against {complete_reads}"
         );
+    }
+
+    /// #1839 seam 2: the fan-out verdict beats the caller's clock.
+    ///
+    /// The count that the gate exists to report is fully determined once the
+    /// two indexed reads in `bare_name_resolution` return. A caller whose
+    /// budget expires during those reads used to get a bare `Cancelled` --
+    /// `keep_going` was polled per candidate, before `admits` was ever reached
+    /// -- so the tool reported the caller's own clock instead of the answer it
+    /// already had. Measured on the rustc tree: the `main` cell reported
+    /// `time_budget` and never evaluated its own gate, in every repetition
+    /// where resolution ran at all
+    /// (`.agents/docs/gate-cell-overhead-2026-08.md`).
+    ///
+    /// `budget_spent_after(1)` leaves exactly the entry poll in
+    /// `resolve_codeunit_fuzzy_bounded_with` alive, so the budget is spent by
+    /// the time the accumulation loops run -- deterministically, without a
+    /// wall clock.
+    #[test]
+    fn issue_1839_an_over_cap_selector_reports_its_count_even_on_a_spent_budget() {
+        let (_temp, analyzer) = same_named_declarations(6);
+        let warm = resolve_codeunit_fuzzy(&analyzer, "Shared");
+        assert!(
+            matches!(&warm, CodeUnitResolution::Ambiguous(units) if units.len() == 6),
+            "fixture must offer six same-named declarations: {warm:?}"
+        );
+
+        let keep_going = budget_spent_after(1);
+        let outcome = resolve_codeunit_fuzzy_bounded(
+            &analyzer,
+            "Shared",
+            FuzzyResolveBudget::new(&keep_going, 5),
+        );
+
+        match outcome {
+            Err(FuzzyResolveStop::TooManyCandidates { total, limit }) => {
+                assert_eq!(
+                    6, total,
+                    "the deduplicated match count, not the pre-dedup row count"
+                );
+                assert_eq!(5, limit);
+            }
+            other => panic!("a spent budget must not hide the fan-out verdict: {other:?}"),
+        }
     }
 
     /// The same selector one candidate under the cap is untouched: the whole
