@@ -494,8 +494,8 @@ fn eligible_files_with_inventory(
         .filter(|file| corpus_file_matches(file, &config.corpus_language, requested_language))
         .filter(|file| {
             config.include_tests
-                || (!test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
-                    && !(requested_language == Language::Rust && analyzer.file_is_test_only(file)))
+                || !(test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
+                    || requested_language == Language::Rust && analyzer.file_is_test_only(file))
         })
         .collect();
     eligible.sort();
