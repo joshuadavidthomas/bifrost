@@ -609,6 +609,65 @@ fn rust_declaration_targets_in_files_with_progress(
     Ok(targets)
 }
 
+/// The owner chain answered from one file's own declaration set.
+///
+/// `IAnalyzer::definitions(owner_fq)` is a *workspace* question: it probes the
+/// `(lang, short_name)` index for every declaration anywhere that shares the
+/// owner's short name, then discards all but the exact fq match. On the rustc
+/// tree that global question was asked 456,452 times in one scan, and 67.9% of
+/// the resolutions that found an owner found it **in the file that asked**
+/// (`.agents/docs/graph-read-cost-investigation-2026-08.md`, Q2).
+///
+/// `export_index_of_declarations` is handed that file's whole declaration set
+/// before it starts walking owner chains, so for those two thirds the answer is
+/// already in hand and the global probe is pure volume. This index is that
+/// answer: fq name -> the declaration in this file carrying it.
+///
+/// Two rules keep it from being a different answer rather than a cheaper one.
+///
+/// It never loads anything. It is built from the declarations the caller
+/// already holds, so a file whose facts are not in hand keeps the global path.
+///
+/// An fq name declared more than once in the file resolves to `None`, not to an
+/// arbitrary winner. Duplicate spellings in one file are real (`#[cfg(unix)] mod
+/// imp;` beside `#[cfg(windows)] mod imp;`), and which one wins is decided by
+/// `definition_sort_key`'s ordering, not by iteration order here. Those defer to
+/// the global lookup that owns that rule.
+///
+/// Where a single local declaration does carry the owner's fq name, it *is* the
+/// lexical owner: a declaration nested in file F is nested in F's copy of its
+/// owner. The global lookup can disagree only when another file declares the
+/// same fq name and sorts ahead of this one -- which for rust means two Cargo
+/// targets sharing a path-derived package name, where the global answer is the
+/// wrong file's unit and this one is the right one.
+///
+/// The fq-keyed `parent_units` memo is deliberately neither read nor written
+/// here: this answer is file-scoped, and publishing it under a global key would
+/// hand one file's owner to another file asking the same name.
+struct FileOwnerIndex<'a> {
+    by_fq_name: HashMap<String, Option<&'a CodeUnit>>,
+}
+
+impl<'a> FileOwnerIndex<'a> {
+    fn of(declarations: &'a BTreeSet<CodeUnit>) -> Self {
+        let mut by_fq_name: HashMap<String, Option<&'a CodeUnit>> =
+            HashMap::with_capacity_and_hasher(declarations.len(), Default::default());
+        for declaration in declarations {
+            by_fq_name
+                .entry(declaration.fq_name())
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(declaration));
+        }
+        Self { by_fq_name }
+    }
+
+    /// `code_unit`'s owner, when this file declares it exactly once.
+    fn owner_of(&self, code_unit: &CodeUnit) -> Option<&'a CodeUnit> {
+        let owner_fq_name = crate::analyzer::i_analyzer::default_parent_fq_name(code_unit)?;
+        *self.by_fq_name.get(&owner_fq_name)?
+    }
+}
+
 impl RustAnalyzer {
     pub(crate) fn resolve_visible_import_targets_forward(
         &self,
@@ -655,6 +714,7 @@ impl RustAnalyzer {
         let _scope = crate::profiling::scope("RustAnalyzer::export_index_of_declarations");
         let mut index = ExportIndex::empty();
         let export_visible = self.export_visible_declarations(file, declarations);
+        let owners_here = FileOwnerIndex::of(declarations);
         let mut external_visibility = HashMap::default();
 
         for code_unit in declarations {
@@ -666,6 +726,7 @@ impl RustAnalyzer {
                 file,
                 code_unit,
                 &export_visible,
+                &owners_here,
                 &mut external_visibility,
             ) {
                 continue;
@@ -1422,6 +1483,7 @@ impl RustAnalyzer {
         file: &ProjectFile,
         code_unit: &CodeUnit,
         export_visible: &HashSet<CodeUnit>,
+        owners_here: &FileOwnerIndex<'_>,
         external_visibility: &mut HashMap<CodeUnit, bool>,
     ) -> bool {
         if !export_visible.contains(code_unit) {
@@ -1436,7 +1498,11 @@ impl RustAnalyzer {
         // merely existing rejected every free function declared in a named
         // submodule -- the whole point of `pub mod x;` (#1341).
         let mut current = code_unit.clone();
-        while let Some(parent) = self.parent_of(&current) {
+        while let Some(parent) = owners_here
+            .owner_of(&current)
+            .cloned()
+            .or_else(|| self.parent_of(&current))
+        {
             let parent_is_export_visible = if parent.source() == file {
                 export_visible.contains(&parent)
             } else if let Some(visible) = external_visibility.get(&parent) {
@@ -2529,6 +2595,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #1748: two thirds of the owner lookups an export-index build makes
+    /// resolve to a unit in the file that asked, and the build already holds
+    /// that file's whole declaration set. Asking
+    /// `IAnalyzer::definitions(owner_fq)` for those is a workspace-wide
+    /// `(lang, short_name)` probe answering a question the caller can answer
+    /// from memory.
+    ///
+    /// This fixture puts the whole owner chain inside one file -- a nested
+    /// inline module, a type inside it, and members on the type -- so every
+    /// owner an export-index build needs is a local one. The build must reach
+    /// the store for none of them.
+    ///
+    /// Fails before the local index at 6 global `definitions` calls, for the
+    /// same four exported names.
+    #[test]
+    fn issue_1748_own_file_owners_cost_no_global_definition_lookup() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+                ),
+                (
+                    "src/lib.rs",
+                    "pub mod outer {\n\
+                     \x20   pub mod inner {\n\
+                     \x20       pub struct Widget;\n\
+                     \x20       impl Widget {\n\
+                     \x20           pub fn make() -> Self { Widget }\n\
+                     \x20       }\n\
+                     \x20       pub fn helper() {}\n\
+                     \x20   }\n\
+                     }\n",
+                ),
+            ],
+        );
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+
+        analyzer
+            .inner
+            .reset_enclosing_parent_query_counts_for_test();
+        let index = analyzer.export_index_of(&file);
+        let definition_lookups = analyzer.inner.sql_definitions_query_count_for_test();
+
+        assert_eq!(
+            0, definition_lookups,
+            "every owner in this file's chains is declared in this file"
+        );
+        // The answers themselves are the point of the cut, not a side effect
+        // of it: the same names are exported as before.
+        let mut exported: Vec<&String> = index.exports_by_name.keys().collect();
+        exported.sort();
+        assert_eq!(vec!["Widget", "helper", "inner", "outer"], exported);
+    }
+
+    /// The other side: an owner that genuinely lives in another file still
+    /// costs the global lookup. `helper`'s owner chain leaves `src/svc.rs` at
+    /// `probe.svc`, whose `mod svc;` declaration is in `src/lib.rs`, so the
+    /// local index must miss and the store must be asked.
+    #[test]
+    fn issue_1748_cross_file_owners_still_reach_the_store() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+                ),
+                ("src/lib.rs", "pub mod svc;\n"),
+                ("src/svc.rs", "pub fn helper() {}\n"),
+            ],
+        );
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let file = ProjectFile::new(fixture.project_root(), "src/svc.rs");
+
+        analyzer
+            .inner
+            .reset_enclosing_parent_query_counts_for_test();
+        let index = analyzer.export_index_of(&file);
+
+        assert!(
+            analyzer.inner.sql_definitions_query_count_for_test() > 0,
+            "an owner declared in another file cannot be answered locally"
+        );
+        assert!(
+            index.exports_by_name.contains_key("helper"),
+            "the cross-file owner chain must still decide candidacy: {:?}",
+            index.exports_by_name
+        );
     }
 
     /// The export index is still shared by handle across a no-op update
