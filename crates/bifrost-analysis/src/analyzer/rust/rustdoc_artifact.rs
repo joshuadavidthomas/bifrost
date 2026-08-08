@@ -73,7 +73,7 @@ fn produce(
 }
 
 impl RustdocJsonPackProducer {
-    pub(crate) fn produce_loaded_artifact(
+    pub fn produce_loaded_artifact(
         &self,
         request: &ArtifactProductionRequest,
         limits: &ArtifactProducerLimits,

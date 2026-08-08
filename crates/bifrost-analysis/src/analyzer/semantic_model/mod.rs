@@ -37,7 +37,7 @@ pub use producer::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     BoundedProducerDiagnostics, ExactArtifact, ExactSourceEntry, ExternalArtifactKind,
     ExternalArtifactPackProducer, ProducerDiagnostic, ProducerDiagnosticSeverity,
-    read_exact_artifact,
+    read_exact_artifact, read_exact_source_set,
 };
 pub use runtime::*;
 pub use source::SourceFormat;
