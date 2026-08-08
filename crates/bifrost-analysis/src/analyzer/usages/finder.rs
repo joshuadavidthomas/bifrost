@@ -21,7 +21,11 @@ use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
 
-type FileFilter = Box<dyn Fn(&ProjectFile) -> bool + Send + Sync>;
+/// A caller-supplied candidate-file predicate. Borrowing (`'a`) rather than
+/// `'static`: `scan_usages`' filter classifies test files on demand against
+/// the live analyzer, instead of pre-classifying the whole workspace into an
+/// owned set before the query starts (see `searchtools::scan_usages`).
+type FileFilter<'a> = Box<dyn Fn(&ProjectFile) -> bool + Send + Sync + 'a>;
 
 pub const DEFAULT_MAX_FILES: usize = 1000;
 pub const DEFAULT_MAX_USAGES: usize = 1000;
@@ -61,13 +65,13 @@ pub struct CandidateFilesSample {
 /// - Targets without a graph strategy surface a structured unsupported-language failure.
 ///
 /// JDT-based Java analysis is intentionally omitted; bifrost is tree-sitter only.
-pub struct UsageFinder {
-    file_filter: Option<FileFilter>,
+pub struct UsageFinder<'a> {
+    file_filter: Option<FileFilter<'a>>,
     authoritative_scope: bool,
     cancellation: CancellationToken,
 }
 
-impl UsageFinder {
+impl<'a> UsageFinder<'a> {
     pub fn new() -> Self {
         let cancellation = CancellationToken::default();
         Self {
@@ -84,7 +88,7 @@ impl UsageFinder {
 
     pub fn with_file_filter<F>(mut self, filter: F) -> Self
     where
-        F: Fn(&ProjectFile) -> bool + Send + Sync + 'static,
+        F: Fn(&ProjectFile) -> bool + Send + Sync + 'a,
     {
         self.file_filter = Some(Box::new(filter));
         self
@@ -353,7 +357,7 @@ fn admit_candidates_by_source_bytes(
     (admitted, scanned_source_bytes, truncated, false)
 }
 
-impl Default for UsageFinder {
+impl Default for UsageFinder<'_> {
     fn default() -> Self {
         Self::new()
     }

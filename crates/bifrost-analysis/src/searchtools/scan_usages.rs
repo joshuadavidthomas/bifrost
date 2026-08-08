@@ -452,46 +452,100 @@ pub struct TooManyCallsitesInfo {
     pub note: Option<String>,
 }
 
-/// Pre-compute the set of detected test files to exclude, or `None` when test
-/// files should be kept. Both `scan_usages` and `usage_graph` filter at the
-/// source (before the regex scan and the call-site cap) rather than dropping
-/// test hits after the fact: filtering post-hoc would let test hits eat into
-/// the cap and turn production-only queries into `TooManyCallsites` errors.
-pub(super) fn excluded_test_files(
+/// The detected-test-file exclusion for one request, or `None` when test files
+/// should be kept. Both `scan_usages` and `usage_graph` filter at the source
+/// (before the regex scan and the call-site cap) rather than dropping test hits
+/// after the fact: filtering post-hoc would let test hits eat into the cap and
+/// turn production-only queries into `TooManyCallsites` errors.
+pub(super) fn test_file_exclusion(
     analyzer: &dyn IAnalyzer,
     include_tests: bool,
-) -> Option<Arc<HashSet<ProjectFile>>> {
-    if include_tests {
-        return None;
+) -> Option<Arc<TestFileExclusion<'_>>> {
+    (!include_tests).then(|| Arc::new(TestFileExclusion::new(analyzer)))
+}
+
+/// Answers "is this file excluded from a non-test scan?" one file at a time,
+/// memoized for the life of the request.
+///
+/// A file is excluded exactly when its classification is `Test` or
+/// `TestSupport`. Both kinds require — and are fully determined by — the
+/// `test_like` predicate in `classify_resolved_test_file`: a `Test` file is
+/// `test_like && contains_test_code`, a `TestSupport` file is
+/// `test_like && !contains_test_code`, and every non-`test_like` file lands in
+/// `Production`/`Ambiguous`. So membership is decided by [`is_test_like_file`]
+/// alone; the `contains_test_code` signal only splits `Test` from
+/// `TestSupport`, and both are excluded. That avoids hydrating a file's
+/// `FileState` (a full store read + decode of all declarations) solely to read
+/// a boolean that cannot change the verdict.
+///
+/// The per-file verdict is exactly what it was when this was a pre-built set
+/// over `analyzer.analyzed_files()`. What changed is *who* gets classified.
+/// Pre-classifying the workspace cost 2.30-2.78 s on the rustc tree — 66-87 %
+/// of a 3 s scan budget, 29,748 files classified before any symbol work, with
+/// `file_is_test_only` dragging `RustAnalyzer::build_cargo_routes` (0.83-1.03 s)
+/// into the budget with it (`.agents/docs/gate-cell-overhead-2026-08.md`). The
+/// consumers only ever ask about files they are about to read: the scan's
+/// candidate files, hundreds at most, and the usage-graph walk's caller files.
+/// Every one of those comes from analyzer-indexed declarations, which is the
+/// same population the pre-built set was drawn from.
+pub(super) struct TestFileExclusion<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    /// `file -> is_test_like`. A scan asks about the same candidate file once
+    /// per overload and once per requested symbol, so the memo is what keeps
+    /// the classification O(distinct candidates) rather than O(asks).
+    verdicts: std::sync::Mutex<HashMap<ProjectFile, bool>>,
+    classified: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> TestFileExclusion<'a> {
+    fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self {
+            analyzer,
+            verdicts: std::sync::Mutex::new(HashMap::default()),
+            classified: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
-    // A file is excluded from a non-test scan exactly when its classification is
-    // `Test` or `TestSupport`. Both kinds require — and are fully determined by —
-    // the `test_like` predicate in `classify_resolved_test_file`: a `Test` file
-    // is `test_like && contains_test_code`, a `TestSupport` file is
-    // `test_like && !contains_test_code`, and every non-`test_like` file lands in
-    // `Production`/`Ambiguous`. So membership here is decided by `test_like`
-    // alone; the `contains_test_code` signal only splits `Test` from
-    // `TestSupport`, and both are excluded. That still avoids hydrating every
-    // workspace file's `FileState` (a full store read + decode of all
-    // declarations) solely to read a boolean that cannot change the set — the
-    // dominant per-call cost of a scan on a large workspace.
-    let set: HashSet<ProjectFile> = analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| {
-            is_test_like_file(
-                analyzer,
-                file,
-                &rel_path_string(file),
-                language_for_file(file),
-            )
-        })
-        .collect();
-    Some(Arc::new(set))
+
+    /// Whether `file` is dropped from a non-test scan.
+    pub(super) fn excludes(&self, file: &ProjectFile) -> bool {
+        if let Some(verdict) = self
+            .verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(file)
+        {
+            return *verdict;
+        }
+        // Classify with the lock released: `file_is_test_only` can build a
+        // language's route index, and holding the memo lock across it would
+        // serialize the whole-workspace usage-graph walk behind one file.
+        // A racing duplicate classification is harmless — the predicate is
+        // pure — and is counted, so `classified_count` stays an upper bound.
+        self.classified
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let verdict = is_test_like_file(
+            self.analyzer,
+            file,
+            &rel_path_string(file),
+            language_for_file(file),
+        );
+        self.verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(file.clone(), verdict);
+        verdict
+    }
+
+    /// How many files this request has classified. The observable complexity
+    /// signal: a scan must classify its candidates, not its workspace.
+    #[cfg(test)]
+    pub(super) fn classified_count(&self) -> usize {
+        self.classified.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// The `test_like` predicate shared by [`classify_resolved_test_file`] and
-/// [`excluded_test_files`]: a file rooted under a test directory, carrying a
+/// [`TestFileExclusion`]: a file rooted under a test directory, carrying a
 /// test filename convention, or reachable only from test-gated code.
 ///
 /// The third disjunct is the structural one (#1546): Rust's sibling test module
@@ -512,16 +566,19 @@ fn is_test_like_file(
 /// Build a [`UsageFinder`] whose file filter drops the excluded test files and
 /// applies the optional path filter — the workspace scoping that both
 /// `scan_usages` and `usage_graph` run before querying call sites.
-pub(super) fn scoped_usage_finder(
-    test_files: Option<&Arc<HashSet<ProjectFile>>>,
+pub(super) fn scoped_usage_finder<'a>(
+    test_files: Option<&Arc<TestFileExclusion<'a>>>,
     path_filter: Option<&Arc<ScanUsagesPathFilter>>,
-) -> UsageFinder {
+) -> UsageFinder<'a> {
     let mut finder = UsageFinder::new();
     if let Some(test_files) = test_files {
         let test_files = Arc::clone(test_files);
         let path_filter = path_filter.map(Arc::clone);
+        // The candidate files reaching this filter are the only files the scan
+        // will read, so this is where the test classification is paid for --
+        // per candidate, not per workspace file.
         finder = finder.with_file_filter(move |file| {
-            !test_files.contains(file)
+            !test_files.excludes(file)
                 && path_filter
                     .as_ref()
                     .map(|filter| filter.matches(file))
@@ -1974,7 +2031,7 @@ pub(super) fn scan_usages_backend(
         return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
     }
 
-    let test_files = excluded_test_files(analyzer, include_tests);
+    let test_files = test_file_exclusion(analyzer, include_tests);
     if context.cancellation.is_cancelled() {
         let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
@@ -2616,7 +2673,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     let _scope = profiling::scope("searchtools::usage_graph");
 
     let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref()).filter;
-    let test_files = excluded_test_files(analyzer, params.include_tests);
+    let test_files = test_file_exclusion(analyzer, params.include_tests);
 
     // Build node identity once and share it with the internal relevance graph.
     // The catalog collapses overloads, keeps JS/TS declarations file-scoped, and
@@ -2657,7 +2714,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     let keep_file = |file: &ProjectFile| {
         test_files
             .as_ref()
-            .map(|excluded| !excluded.contains(file))
+            .map(|exclusion| !exclusion.excludes(file))
             .unwrap_or(true)
             && path_filter
                 .as_ref()

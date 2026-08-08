@@ -1023,14 +1023,14 @@ fn issue_1228_time_budget_is_explicit_and_never_reports_verified_absence() {
     assert_eq!(json["results"][0]["reason_kind"], "time_budget");
 }
 
-/// #1100: `excluded_test_files` decides membership from paths alone instead of
+/// #1100: `TestFileExclusion` decides membership from paths alone instead of
 /// hydrating every file's FileState. This pins the equivalence argument: the
 /// path-only predicate must produce exactly the set the full classification
 /// would exclude (Test and TestSupport are both excluded and both require
 /// `test_like`; Production/Ambiguous are never test_like), across fixtures
 /// covering all classification shapes.
 #[test]
-fn excluded_test_files_path_predicate_matches_full_classification() {
+fn test_file_exclusion_path_predicate_matches_full_classification() {
     let temp = tempfile::TempDir::new().unwrap();
     let root = temp.path();
     for (path, content) in [
@@ -1056,7 +1056,13 @@ fn excluded_test_files_path_predicate_matches_full_classification() {
     let project = crate::analyzer::TestProject::new(root.to_path_buf(), Language::TypeScript);
     let analyzer = crate::analyzer::TypescriptAnalyzer::from_project(project);
 
-    let by_path = super::scan_usages::excluded_test_files(&analyzer, false).expect("excluded set");
+    let exclusion =
+        super::scan_usages::test_file_exclusion(&analyzer, false).expect("an exclusion");
+    let by_path: crate::hash::HashSet<ProjectFile> = analyzer
+        .analyzed_files()
+        .into_iter()
+        .filter(|file| exclusion.excludes(file))
+        .collect();
     let by_classification: crate::hash::HashSet<ProjectFile> = analyzer
         .analyzed_files()
         .into_iter()
@@ -1069,12 +1075,95 @@ fn excluded_test_files_path_predicate_matches_full_classification() {
         })
         .collect();
     assert_eq!(
-        *by_path, by_classification,
+        by_path, by_classification,
         "path-only exclusion must equal full-classification exclusion"
     );
     assert!(
         !by_path.is_empty(),
         "fixture must actually produce excluded files or the equivalence is vacuous"
+    );
+}
+
+/// The scan prologue must not pre-classify the workspace. `excluded_test_files`
+/// used to build its exclusion set by asking `is_test_like_file` about every
+/// analyzed file before any symbol work: 29,748 files and 2.30-2.78 s of a 3 s
+/// budget on the rustc tree, with `file_is_test_only` pulling the Rust
+/// cargo-route index in behind it
+/// (`.agents/docs/gate-cell-overhead-2026-08.md`). The classification is now
+/// driven by the candidate filter, so a scan whose target has a handful of
+/// candidate files classifies a handful of files.
+///
+/// The pin is the ratio, not a constant: the fixture's workspace is an order of
+/// magnitude larger than the candidate set, and the count has to track the
+/// candidates. Under the pre-classifying shape this assertion reads the
+/// workspace size and fails.
+#[test]
+fn a_scan_classifies_its_candidate_files_not_its_workspace() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let root = temp.path();
+    // One production file the scan resolves in, one caller that references it,
+    // and a large unrelated remainder — half of it under `tests/`, so the
+    // eager set-build had real work to do on every one of them.
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(
+        root.join("src/target.ts"),
+        "export function scanned_target() { return 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/caller.ts"),
+        "import { scanned_target } from './target';\nexport const used = scanned_target();\n",
+    )
+    .unwrap();
+    const UNRELATED: usize = 200;
+    for index in 0..UNRELATED {
+        std::fs::write(
+            root.join(format!("src/unrelated_{index}.ts")),
+            format!("export function unrelated_{index}() {{ return {index}; }}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(format!("tests/unrelated_{index}.test.ts")),
+            format!("test('u{index}', () => {{ expect({index}).toBe({index}); }});\n"),
+        )
+        .unwrap();
+    }
+    let project = crate::analyzer::TestProject::new(root.to_path_buf(), Language::TypeScript);
+    let analyzer = crate::analyzer::TypescriptAnalyzer::from_project(project);
+    let workspace_files = analyzer.analyzed_files().len();
+    assert!(
+        workspace_files >= 2 * UNRELATED,
+        "fixture must be workspace-scale: {workspace_files} files"
+    );
+
+    let exclusion =
+        super::scan_usages::test_file_exclusion(&analyzer, false).expect("an exclusion");
+    assert_eq!(
+        0,
+        exclusion.classified_count(),
+        "building the exclusion must classify nothing"
+    );
+
+    let overloads: Vec<CodeUnit> = analyzer.definitions("scanned_target").collect();
+    assert!(!overloads.is_empty(), "fixture target must resolve");
+    let query = super::scan_usages::scoped_usage_finder(Some(&exclusion), None).query(
+        &analyzer,
+        &overloads,
+        crate::analyzer::usages::DEFAULT_MAX_FILES,
+        crate::analyzer::usages::DEFAULT_MAX_USAGES,
+    );
+    assert!(
+        !query.candidate_files.is_empty(),
+        "the scan must have read candidate files: {:?}",
+        query.candidate_files
+    );
+    let classified = exclusion.classified_count();
+    assert!(
+        classified <= 4 * query.candidate_files.len(),
+        "classification must track the candidate set ({} files), not the workspace \
+         ({workspace_files} files): {classified} classified",
+        query.candidate_files.len()
     );
 }
 
