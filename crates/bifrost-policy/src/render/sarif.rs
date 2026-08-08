@@ -11,14 +11,14 @@ use super::{
     map_io_error, map_json_error,
 };
 use crate::{
-    BoundedWitness, FindingCertainty, FindingCompleteness, FindingIdentityStability,
-    FindingSeverity, OrganizationalRiskAssessment, PolicyAnalysisType, PolicyDiagnostic,
-    PolicyDiagnosticSeverity, PolicyDisplayRegion, PolicyEvaluationDate, PolicyFinding,
-    PolicyFindingEvidence, PolicyFindingSuppression, PolicyLevel, PolicyReportDiagnostic,
-    PolicyReportDocument, PolicyReportEvaluationContext, PolicyRuleDescriptor, PolicyRun,
-    PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec, PolicySourceLocation,
-    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicyWorkReport, ProofMetadata,
-    RelatedPolicyLocation, WitnessStep, WitnessStepKind,
+    BoundedWitness, FindingCertainty, FindingCompleteness, FindingDiffDisposition,
+    FindingIdentityStability, FindingSeverity, OrganizationalRiskAssessment, PolicyAnalysisType,
+    PolicyDiagnostic, PolicyDiagnosticSeverity, PolicyDiffReview, PolicyDisplayRegion,
+    PolicyEvaluationDate, PolicyFinding, PolicyFindingEvidence, PolicyFindingSuppression,
+    PolicyLevel, PolicyReportDiagnostic, PolicyReportDocument, PolicyReportEvaluationContext,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticHash, PolicySeveritySpec,
+    PolicySourceLocation, PolicySuppressionPolicyHashState, PolicySuppressionReview,
+    PolicyWorkReport, ProofMetadata, RelatedPolicyLocation, WitnessStep, WitnessStepKind,
 };
 
 const SARIF_SCHEMA_URI: &str =
@@ -326,6 +326,12 @@ struct SarifResult<'a> {
     level: SarifLevel,
     #[serde(skip_serializing_if = "Option::is_none")]
     kind: Option<&'static str>,
+    /// Standard SARIF baseline classification, present only in diff mode:
+    /// `new` for a finding absent from the base, `unchanged` for a persisting
+    /// one. Fixed base findings are not emitted as results, so `absent` never
+    /// appears.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline_state: Option<&'static str>,
     locations: [SarifLocation<'a>; 1],
     #[serde(skip_serializing_if = "SarifRelatedLocations::is_empty")]
     related_locations: SarifRelatedLocations<'a>,
@@ -350,6 +356,10 @@ impl<'a> SarifResult<'a> {
             },
             level,
             kind: unrated.then_some("informational"),
+            baseline_state: finding.diff().map(|diff| match diff.disposition() {
+                FindingDiffDisposition::New => "new",
+                FindingDiffDisposition::Persisting => "unchanged",
+            }),
             locations: [SarifLocation::primary(finding.primary())],
             related_locations: SarifRelatedLocations(finding.related()),
             code_flows: SarifCodeFlows(finding.witnesses()),
@@ -383,6 +393,7 @@ impl<'a> SarifResult<'a> {
                 proof: finding.proof(),
                 witnesses_truncated: finding.witnesses_truncated(),
                 omitted_witnesses_lower_bound: finding.omitted_witnesses_lower_bound(),
+                diff_disposition: finding.diff().map(|diff| diff.disposition()),
             },
         }
     }
@@ -527,6 +538,11 @@ struct SarifResultProperties<'a> {
     witnesses_truncated: bool,
     #[serde(rename = "bifrost.omittedWitnessesLowerBound")]
     omitted_witnesses_lower_bound: u64,
+    #[serde(
+        rename = "bifrost.diffDisposition",
+        skip_serializing_if = "Option::is_none"
+    )]
+    diff_disposition: Option<FindingDiffDisposition>,
 }
 
 #[derive(Serialize)]
@@ -920,6 +936,11 @@ struct SarifRunProperties<'a> {
     policy_runs: SarifPolicyRuns<'a>,
     #[serde(rename = "bifrost.suppressionReviews")]
     suppressions: &'a [PolicySuppressionReview],
+    #[serde(
+        rename = "bifrost.diffBaseline",
+        skip_serializing_if = "Option::is_none"
+    )]
+    diff_baseline: Option<&'a PolicyDiffReview>,
     #[serde(rename = "bifrost.reportDiagnostics")]
     report_diagnostics: &'a [PolicyReportDiagnostic],
     #[serde(rename = "bifrost.reportDiagnosticsTruncated")]
@@ -940,6 +961,7 @@ impl<'a> SarifRunProperties<'a> {
             evaluation: report.evaluation(),
             policy_runs: SarifPolicyRuns(report.runs()),
             suppressions: report.suppressions(),
+            diff_baseline: report.diff(),
             report_diagnostics: report.diagnostics(),
             diagnostics_truncated: report.diagnostics_truncated(),
             omitted_diagnostics_lower_bound: report.omitted_diagnostics_lower_bound(),

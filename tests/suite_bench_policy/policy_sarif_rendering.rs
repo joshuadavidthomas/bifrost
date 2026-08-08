@@ -752,6 +752,96 @@ fn invalid_tool_identity_is_rejected_before_any_sarif_bytes_are_written() {
 }
 
 #[test]
+fn diff_mode_emits_baseline_state_and_run_level_diff_baseline() {
+    // Unlike `fixed_policy`, this selector is not path-scoped, so the new
+    // file's finding matches too.
+    let policy_source = r#"(policy
+      :id "test.sarif-diff"
+      :name "SARIF diff"
+      :message "Selected target is reportable"
+      :severity warning
+      :analysis (analysis :type match :selector
+        (rql (language typescript (function :name "target")))))"#;
+    let project = crate::common::InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", "export function target() { return 1; }\n")
+        .file("policies/diff.rqlp", policy_source)
+        .build();
+    crate::common::init_git_repo_with_identity(project.root());
+    crate::common::run_git(project.root(), &["add", "."]);
+    crate::common::run_git(project.root(), &["commit", "-m", "base"]);
+    fs::write(
+        project.root().join("extra.ts"),
+        "export function target() { return 2; }\n",
+    )
+    .expect("new offending source");
+
+    let options = PolicyEvaluationOptions::new(
+        PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
+    )
+    .with_diff_base("HEAD".to_string());
+    let report = evaluate_policy_files(
+        project.root(),
+        &[PathBuf::from("policies/diff.rqlp")],
+        &options,
+    )
+    .expect("diff evaluation")
+    .into_report();
+
+    let (_, value) = render(&report);
+    let schema: Value = serde_json::from_slice(SCHEMA_BYTES).unwrap();
+    let validator = schema_validator(&schema);
+    let errors = validator
+        .iter_errors(&value)
+        .map(|error| format!("{} at {}", error, error.instance_path()))
+        .collect::<Vec<_>>();
+    assert!(
+        errors.is_empty(),
+        "SARIF validation errors:\n{}",
+        errors.join("\n")
+    );
+
+    let run = &value["runs"][0];
+    let results = run["results"].as_array().expect("results");
+    assert_eq!(results.len(), 2);
+    for result in results {
+        let uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            .as_str()
+            .expect("result uri");
+        let (expected_state, expected_disposition) = match uri {
+            "app.ts" => ("unchanged", "persisting"),
+            "extra.ts" => ("new", "new"),
+            other => panic!("unexpected result uri {other}"),
+        };
+        assert_eq!(result["baselineState"], expected_state, "{result:#}");
+        assert_eq!(
+            result["properties"]["bifrost.diffDisposition"], expected_disposition,
+            "{result:#}"
+        );
+    }
+    let baseline = &run["properties"]["bifrost.diffBaseline"];
+    assert_eq!(baseline["base_revision"], "HEAD");
+    assert_eq!(baseline["degraded"], false);
+    assert_eq!(baseline["new_count"], 1);
+    assert_eq!(baseline["persisting_count"], 1);
+    assert_eq!(baseline["fixed_count"], 0);
+
+    // A non-diff report emits neither the field nor the property.
+    let (_, ordinary) = render(&ordinary_report());
+    let ordinary_result = &ordinary["runs"][0]["results"][0];
+    assert!(ordinary_result.get("baselineState").is_none());
+    assert!(
+        ordinary_result["properties"]
+            .get("bifrost.diffDisposition")
+            .is_none()
+    );
+    assert!(
+        ordinary["runs"][0]["properties"]
+            .get("bifrost.diffBaseline")
+            .is_none()
+    );
+}
+
+#[test]
 fn sarif_preserves_broken_pipe_as_an_output_error() {
     struct BrokenPipe;
 
