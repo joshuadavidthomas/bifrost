@@ -389,15 +389,6 @@ impl GlobalUsageDefinitionIndex {
     {
         let fqn = unit.fq_name();
         let normalized_fqn = normalize(&fqn);
-        let parent_fqn = fqn.rsplit_once('.').map(|(parent, _)| parent.to_string());
-        let normalized_parent_fqn = parent_fqn.as_deref().map(normalize);
-        if normalized_fqn != fqn || normalized_parent_fqn != parent_fqn {
-            // Ask the normalizer, not a language list.  Promote before this
-            // unit reaches the exact maps so the seeded copy holds exactly the
-            // units whose normalized key was still their exact key; this unit
-            // then lands under its own normalized keys below.
-            self.materialize_normalized_views();
-        }
         let package = unit.package_name();
         let language = language_for_file(unit.source());
         self.packages.insert(package.to_string());
@@ -426,19 +417,6 @@ impl GlobalUsageDefinitionIndex {
                 child = parent;
             }
         }
-        if let Some(normalized) = self.normalized.as_mut() {
-            normalized
-                .by_fqn
-                .entry(normalized_fqn)
-                .or_default()
-                .push(unit.clone());
-        }
-        if unit.is_class() {
-            self.types_by_package_simple
-                .entry((unit.package_name().to_string(), simple_type_name(unit)))
-                .or_default()
-                .push(unit.clone());
-        }
         // fqname-M4: intentionally NOT `default_parent_fq_name` (a true segment
         // pop). Verified by mutation (issue #1168 batch 3): switching to the
         // segment pop regresses `usage_graph_csharp_test::
@@ -452,6 +430,34 @@ impl GlobalUsageDefinitionIndex {
         // type visibility resolution; switching to the immediate-owner cut is
         // a real behavior change there, not merely a representation change.
         // Revisit together with that consumer if this file is touched again.
+        //
+        // Keep this cut, the promotion predicate that consults it and the two
+        // children pushes it keys in one block: the cut is the ONE sanctioned
+        // occurrence of this shape in the file, and hoisting it away from this
+        // rationale (as the normalized-view dedup first did) strands the
+        // exemption and reopens the guard that pins it.
+        let parent_fqn = fqn.rsplit_once('.').map(|(parent, _)| parent.to_string());
+        let normalized_parent_fqn = parent_fqn.as_deref().map(normalize);
+        if normalized_fqn != fqn || normalized_parent_fqn != parent_fqn {
+            // Ask the normalizer, not a language list.  Promote before this
+            // unit reaches any map the seeded copy clones, so that copy holds
+            // exactly the units whose normalized key was still their exact
+            // key; this unit then lands under its own normalized keys below.
+            self.materialize_normalized_views();
+        }
+        if let Some(normalized) = self.normalized.as_mut() {
+            normalized
+                .by_fqn
+                .entry(normalized_fqn)
+                .or_default()
+                .push(unit.clone());
+        }
+        if unit.is_class() {
+            self.types_by_package_simple
+                .entry((unit.package_name().to_string(), simple_type_name(unit)))
+                .or_default()
+                .push(unit.clone());
+        }
         if let (Some(parent_fqn), Some(normalized_parent_fqn)) = (parent_fqn, normalized_parent_fqn)
         {
             self.direct_children_by_fqn
