@@ -472,7 +472,8 @@ fn eligible_files_with_inventory(
             ));
         }
         if !config.include_tests
-            && test_paths::is_test_like_path(&rel_path_string(&file), language_for_file(&file))
+            && (test_paths::is_test_like_path(&rel_path_string(&file), language_for_file(&file))
+                || (requested_language == Language::Rust && analyzer.file_is_test_only(&file)))
         {
             return Err(format!(
                 "exact site path `{}` is excluded because test paths are disabled",
@@ -493,7 +494,8 @@ fn eligible_files_with_inventory(
         .filter(|file| corpus_file_matches(file, &config.corpus_language, requested_language))
         .filter(|file| {
             config.include_tests
-                || !test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
+                || (!test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
+                    && !(requested_language == Language::Rust && analyzer.file_is_test_only(file)))
         })
         .collect();
     eligible.sort();
@@ -657,17 +659,39 @@ fn collect_sampled_sites(
                 continue;
             }
         };
-        let declaration_ranges: HashSet<(usize, usize)> = analyzer
-            .declarations(file)
-            .into_iter()
-            .flat_map(|unit| context.name_ranges(analyzer, &unit))
+        let declarations = analyzer.declarations(file);
+        let declaration_ranges: HashSet<(usize, usize)> = declarations
+            .iter()
+            .flat_map(|unit| context.name_ranges(analyzer, unit))
             .map(|range| (range.start_byte, range.end_byte))
             .collect();
+        // `include_tests=false` is a source-scope filter, not only a file-path
+        // filter. Rust commonly keeps production code and an inline
+        // `#[cfg(test)] mod tests` in one file. The analyzer records the full
+        // declaration range for each test-region unit, so use those structured
+        // ranges to drop every census/index occurrence inside the nested test
+        // module while retaining production occurrences in the same file.
+        let test_region_ranges: Vec<Range> = if !config.include_tests && language == Language::Rust
+        {
+            declarations
+                .iter()
+                .filter(|unit| analyzer.in_test_region(unit))
+                .flat_map(|unit| analyzer.ranges(unit))
+                .collect()
+        } else {
+            Vec::new()
+        };
         for range in ranges {
             summary.structured_candidates = summary.structured_candidates.saturating_add(1);
             if declaration_ranges.contains(&(range.start_byte, range.end_byte)) {
                 summary.declaration_sites_excluded =
                     summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            if test_region_ranges
+                .iter()
+                .any(|test_region| test_region.contains(&range))
+            {
                 continue;
             }
             if language == Language::Rust
