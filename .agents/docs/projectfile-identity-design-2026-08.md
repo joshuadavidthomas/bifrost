@@ -1,0 +1,83 @@
+# Design: ProjectFile identity cost - staged repair
+
+Status: DESIGN FOR OWNER REVIEW. No implementation until approved. Author: Fable, 2026-08-09.
+Substrate: `.agents/docs/` companions (graph-read-cost-investigation, gate-cell-overhead) and the
+fresh profile `graph-churn-profile-v1.md` (session scratchpad; check in with the first
+implementation commit). Governing rule: AGENTS.md Implementation details - "Do not use reference
+counting by default. In graph domains, prefer explicit IDs and arena allocation."
+
+## The measured target
+
+Post-volume-cuts profile of the rustc answering cell (two windows, m8-comparable method):
+path handling holds 21.9-22.2% self, `ProjectFile::cmp` 16.3-18.0% with children,
+`ProjectFile` own impls ~5%, allocator churn provably fed by path construction ~12.3%
+(`PathBuf::_push`, `Path::_join`, `rust_crate_root_package`). Combined lower bound: **~38% of
+graph-phase CPU**. Moka+crossbeam (~20%) are cache machinery serving the same lookups and are
+expected to shrink with them. SQLite and tree-sitter are non-factors (<1.5%).
+
+Call-site facts (read at HEAD `c2592c3f`):
+1. `ProjectFile` is `Arc<{root: PathBuf, rel_path: PathBuf}>`; `cmp`/`eq`/`hash` walk both
+   paths. Every file in a workspace shares the identical root, so half of every comparison is
+   known-equal by construction, and `hash` re-walks the path on every moka/HashMap touch.
+2. `RustPackageFileIndex::contains` = `files.binary_search` over 35,370 entries = ~15.1 `cmp`
+   calls per membership test, called from `is_analyzed` and `resolve_module_files`.
+3. `rust_module_files_from_segments` builds 4 `ProjectFile::new` + 4 `.exists()` per specifier;
+   `rust_package_components`/`rust_crate_root_package`/`ModuleKey::new` allocate one heap
+   `String` per path component per call.
+
+Caveat carried from the profile: `cmp`'s caller split is source-reading (release stacks
+truncate); the aggregate share is measured.
+
+## Stage 1 - mechanical, semantics-identical (recommended to ship first)
+
+No identity model change; every item preserves `Ord`/`Eq`/`Hash` semantics byte-for-byte.
+
+1. **Precomputed hash.** `ProjectFileInner` gains a `path_hash: u64` computed once at
+   construction (hash of root+rel_path exactly as `Hash` produces today); `Hash::hash` writes
+   the cached value. Kills the per-touch path walk under moka/HashMap keys.
+2. **Comparison fast paths.** `eq`: `Arc::ptr_eq` first (clones abound). `cmp`/`eq` slow path:
+   compare `root` by `Arc`/pointer identity of the shared root where roots are shared (verify
+   how roots are stored - if each inner holds its own `PathBuf` root, intern the root as
+   `Arc<Path>` at listing construction so pointer equality applies), then compare `rel_path`
+   only. Public ordering (path order) unchanged.
+3. **Membership by hash.** `RustPackageFileIndex` gains a `HashSet<ProjectFile>` (cheap now
+   that hash is precomputed) for `contains`; the sorted `Vec` stays for ordered iteration.
+4. **Per-specifier construction memo.** `rust_module_files_from_segments`' 4-candidate probe
+   memoized per (dir, name) in the existing walk-cache mechanism; component-String allocation
+   in `rust_package_components`-family replaced with borrow/`SmallVec` iteration where the
+   consumer does not retain.
+
+Expected yield: the hash and comparison shares (~21-23%) compress toward the rel_path-only
+cost; membership tests drop ~15x in comparisons. Gate: re-profile the same cell; Stage 2
+proceeds only if path handling still holds a double-digit share.
+
+## Stage 2 - interned file IDs (only if Stage 1's re-profile says so)
+
+Per-generation interner: the workspace listing is already a sorted `BTreeSet`; assign
+sequential `u32` IDs in sorted order at listing construction, so **ID order equals path order
+within a generation** and ordered containers can key by ID without changing iteration
+semantics. `ProjectFile` carries `{id, generation, inner}`; `cmp`/`eq` fast-path on matching
+generation via IDs, fall back to paths across generations (content-stability and
+cross-snapshot comparisons keep today's meaning). Hot per-file maps in the walk layer migrate
+to dense `Vec`-indexed-by-ID arenas per the AGENTS.md rule. This is the full IDs+arena answer;
+it is deliberately gated because Stage 1 may capture most of the win at a tenth of the blast
+radius - `ProjectFile` is the codebase's central identity type and Stage 2 touches its
+representation.
+
+## Rides along with Stage 1 (measured, designless)
+
+**The canonicalize storm**: `liveness.rs:273` `rel_path_from_workdir` calls
+`abs_path.canonicalize()` once per workspace file - 352,494 always-`EINVAL` `readlink`
+syscalls per process, the largest syscall count observed, inside the construction sys floor.
+Canonicalize the workspace root once and join rel paths; per-file canonicalize only on the
+rare non-prefix fallback path (read the function; preserve symlink correctness - the watcher
+plan's probe repo and the #1793 symlink test are the guards). Pin with a syscall-count or
+call-count counter.
+
+## Pins and validation (both stages)
+
+Equivalence: `Ord`/`Eq`/`Hash` property tests (same total order, same equality classes, same
+hashes pre/post for Stage 1; cross-generation semantics tests for Stage 2). The usual ladder;
+EQP untouched (no store changes). Measured acceptance: re-profile delta table against
+`graph-churn-profile-v1.md`, same windows, same method. Fail-before via reverting the specific
+mechanism per the house idiom.
