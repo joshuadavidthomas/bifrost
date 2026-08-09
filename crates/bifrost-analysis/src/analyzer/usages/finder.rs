@@ -1,10 +1,12 @@
 use crate::analyzer::languages::{CandidateCtx, candidate_augmentation, language_support};
-use crate::analyzer::usages::candidates::find_default_candidates_with_cancellation;
+use crate::analyzer::usages::candidates::find_default_candidates_within;
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{CandidateFileProvider, GraphUsageAnalyzer, UsageScanScope};
-use crate::analyzer::{AnalyzerQueryScope, CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{
+    AnalyzerQueryScope, CodeUnit, DescendantIndexScope, IAnalyzer, Language, ProjectFile,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use std::collections::BTreeSet;
@@ -55,6 +57,17 @@ pub struct CandidateFilesSample {
 /// JDT-based Java analysis is intentionally omitted; bifrost is tree-sitter only.
 pub struct UsageFinder<'a> {
     file_filter: Option<FileFilter<'a>>,
+    /// The request's test-file exclusion on its own, when it asked to drop
+    /// test files.
+    ///
+    /// `file_filter` is that exclusion *and* the request's optional path
+    /// filter, and the two cannot travel together into candidate discovery.
+    /// A path filter is arbitrary per-request scoping, so it must never key a
+    /// cross-request shared index; the test verdict is a pure function of the
+    /// analyzer and the file, so it can. Pushing it down is what stops the
+    /// type-hierarchy build from inverting classes the answer would throw
+    /// away seconds later (#1748).
+    excluded_test_files: Option<FileFilter<'a>>,
     authoritative_scope: bool,
     cancellation: CancellationToken,
 }
@@ -64,6 +77,7 @@ impl<'a> UsageFinder<'a> {
         let cancellation = CancellationToken::default();
         Self {
             file_filter: None,
+            excluded_test_files: None,
             authoritative_scope: false,
             cancellation,
         }
@@ -79,6 +93,23 @@ impl<'a> UsageFinder<'a> {
         F: Fn(&ProjectFile) -> bool + Send + Sync + 'a,
     {
         self.file_filter = Some(Box::new(filter));
+        self
+    }
+
+    /// Declare which files the request already knows it will discard, so
+    /// candidate discovery can skip building over them. `excludes` answers
+    /// `true` for a file that is dropped; it must be a pure function of the
+    /// analyzer and the file, because the index it prunes is shared across
+    /// requests and keyed only by "was anything excluded".
+    ///
+    /// This does not replace [`Self::with_file_filter`], which stays the
+    /// correctness backstop: several providers legitimately keep a
+    /// whole-workspace index and let the retain do the work.
+    pub fn with_test_file_exclusion<F>(mut self, excludes: F) -> Self
+    where
+        F: Fn(&ProjectFile) -> bool + Send + Sync + 'a,
+    {
+        self.excluded_test_files = Some(Box::new(excludes));
         self
     }
 
@@ -167,6 +198,10 @@ impl<'a> UsageFinder<'a> {
         }
 
         let target = &overloads[0];
+        let hierarchy_scope = match self.excluded_test_files.as_deref() {
+            Some(excluded) => DescendantIndexScope::excluding_sources(&self.cancellation, excluded),
+            None => DescendantIndexScope::whole_workspace(&self.cancellation),
+        };
         let _cand_scope = crate::profiling::scope("usages::candidate_discovery");
         let mut candidates = HashSet::default();
         let mut supplemental = HashSet::default();
@@ -174,10 +209,10 @@ impl<'a> UsageFinder<'a> {
             match explicit_provider {
                 Some(provider) => candidates.extend(provider.find_candidates(overload, analyzer)),
                 None => {
-                    candidates.extend(find_default_candidates_with_cancellation(
+                    candidates.extend(find_default_candidates_within(
                         overload,
                         analyzer,
-                        &self.cancellation,
+                        &hierarchy_scope,
                     ));
                     if let Some(augmentation) = candidate_augmentation(&CandidateCtx {
                         analyzer,
@@ -656,7 +691,12 @@ mod tests {
         analyzer: &dyn IAnalyzer,
         target: &CodeUnit,
     ) -> HashSet<ProjectFile> {
-        find_default_candidates_with_cancellation(target, analyzer, &CancellationToken::default())
+        let uncancelled = CancellationToken::default();
+        find_default_candidates_within(
+            target,
+            analyzer,
+            &DescendantIndexScope::whole_workspace(&uncancelled),
+        )
     }
 
     /// A protected augmentation competes with the generic candidates for the file-count

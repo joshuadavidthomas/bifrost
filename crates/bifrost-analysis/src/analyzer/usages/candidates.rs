@@ -4,8 +4,8 @@ use crate::analyzer::usages::common::{
 };
 use crate::analyzer::usages::traits::CandidateFileProvider;
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportReachability, Language, ProjectFile,
-    cpp_callable_definitions_share_identity_evidence,
+    CodeUnit, DescendantIndexScope, IAnalyzer, ImportAnalysisProvider, ImportReachability,
+    Language, ProjectFile, cpp_callable_definitions_share_identity_evidence,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
@@ -41,11 +41,16 @@ impl CandidateFileProvider for ImportGraphCandidateProvider {
     }
 }
 
+/// `scope` is the request's view of the type hierarchy: the deadline the
+/// polymorphic expansion below must respect, and the slice of the workspace its
+/// descendant index is allowed to cover. `None` is the no-deadline caller
+/// (`CandidateFileProvider::find_candidates`, which takes no request state).
 fn find_import_graph_candidates(
     target: &CodeUnit,
     analyzer: &dyn IAnalyzer,
-    cancellation: Option<&CancellationToken>,
+    scope: Option<&DescendantIndexScope<'_>>,
 ) -> HashSet<ProjectFile> {
+    let cancellation = scope.map(DescendantIndexScope::cancellation);
     let mut candidates: HashSet<ProjectFile> = set_with_capacity(16);
 
     // (1) Polymorphic expansion: target + descendants of its parent type.
@@ -64,7 +69,19 @@ fn find_import_graph_candidates(
         && let Some(parent) = analyzer.parent_of(target)
         && parent.is_class()
     {
-        for descendant in provider.get_descendants(&parent) {
+        // The index build behind this call is the one that used to run past
+        // the request's whole budget without ever looking at it (#1748). A
+        // `None` means it stopped: everything discovered so far is real, and
+        // the finder reports the incompleteness through the completion it
+        // already has, so return rather than inventing a second channel.
+        let descendants = match scope {
+            Some(scope) => match provider.get_descendants_within(&parent, scope) {
+                Some(descendants) => descendants,
+                None => return candidates,
+            },
+            None => provider.get_descendants(&parent),
+        };
+        for descendant in descendants {
             if is_cancelled(cancellation) {
                 return candidates;
             }
@@ -674,15 +691,16 @@ pub fn default_provider()
     )
 }
 
-pub(crate) fn find_default_candidates_with_cancellation(
+pub(crate) fn find_default_candidates_within(
     target: &CodeUnit,
     analyzer: &dyn IAnalyzer,
-    cancellation: &CancellationToken,
+    scope: &DescendantIndexScope<'_>,
 ) -> HashSet<ProjectFile> {
+    let cancellation = scope.cancellation();
     apply_fallback_policy(
         target,
         analyzer,
-        || find_import_graph_candidates(target, analyzer, Some(cancellation)),
+        || find_import_graph_candidates(target, analyzer, Some(scope)),
         || find_text_candidates(target, analyzer, Some(cancellation)),
         || cancellation.is_cancelled(),
     )

@@ -119,15 +119,26 @@ only from test-gated code.
   it travels down its own channel.
 
 - Observation (fail-before, Fix A): with the scope plumbed all the way to
-  `build_cpp_visible_type_units` but its `while let Some(current) = pending.pop()` poll
-  commented out, `issue_1748_a_cpp_descendant_index_build_stops_at_the_scan_deadline` fails
-  on assertion (b): the build counter reaches the full class count instead of stopping short.
+  `build_cpp_visible_type_units` but its per-pop poll deleted, the build counter goes from
+  8 to 38 include-closure builds under the same 40-check budget, and
+  `issue_1748_a_cpp_descendant_index_build_stops_at_the_scan_deadline` fails its build-count
+  assertion. The 38 is the per-candidate poll in the core builder working alone: it stops
+  after roughly one check per class, which is 63% of the fixture's classes rather than 13%.
   Transcript in `Artifacts and Notes`.
 
 - Observation (fail-before, Fix B): with the variant-keyed memo in place but
-  `DescendantIndexScope::admits` hardwired to `true`,
-  `issue_1748_b_excluding_tests_never_builds_the_test_classes` fails: the production-only
-  build charges the test classes' include closures too.
+  `DescendantIndexScope::admits` hardwired to `true`, the production-only build charges
+  85 include-closure builds instead of 65 -- exactly the 20 excluded test headers -- and
+  `issue_1748_b_excluding_tests_never_builds_the_test_classes` fails.
+
+- Observation: Rust and Go still build their whole-workspace hierarchy index behind a plain
+  `OnceLock` (`RustHierarchyIndex::build`, `GoHierarchyIndex::build`), so they keep the
+  trait's bounded-by-construction default and their builds remain unpolled. Neither was
+  implicated by the trace and neither has the per-class-times-per-file shape that made the
+  C++ build unbounded -- each is a single pass. Making them cancellable means changing their
+  memo from `OnceLock` to a `PoolSafeMemo`, which is a separate change with its own
+  worker-parking argument to make. Recorded here so it is a known gap rather than an
+  oversight.
 
 ## Decision Log
 
@@ -580,4 +591,35 @@ dependency: `CancellationToken`, `CodeUnit` and `ProjectFile` all already live t
 
 ## Artifacts and Notes
 
-Filled in as the work proceeds; see below.
+The five new tests live in `tests/suite_usages/issue_1748_hierarchy_deadline.rs`, registered
+from `tests/suite_usages/main.rs`. The fixture is 60 production subclasses of one base class,
+each in its own header over a four-link `#include` chain, plus 20 subclasses under `tests/`
+for the Fix B half.
+
+Passing, from the repository root:
+
+    cargo nextest run --test suite_usages issue_1748 --no-fail-fast
+
+    PASS issue_1748_hierarchy_deadline::issue_1748_a_cpp_descendant_index_build_stops_at_the_scan_deadline
+    PASS issue_1748_hierarchy_deadline::issue_1748_a_scan_reports_time_budget_when_the_hierarchy_build_runs_out
+    PASS issue_1748_hierarchy_deadline::issue_1748_b_excluding_tests_never_builds_the_test_classes
+    PASS issue_1748_hierarchy_deadline::issue_1748_b_including_tests_still_sees_test_descendants_on_the_same_analyzer
+    PASS issue_1748_hierarchy_deadline::issue_1748_b_test_exclusion_still_decides_which_files_a_scan_answers_from
+    Summary 12 tests run: 12 passed
+
+Fix A fail-before. The poll inside `build_cpp_visible_type_units` was deleted, leaving the
+scope plumbed everywhere else, and the same test re-run:
+
+    FAIL issue_1748_a_cpp_descendant_index_build_stops_at_the_scan_deadline
+    the build must stop well short of walking every class: 38 include-closure builds for 60 subclasses
+
+With the poll restored the same counter reads 8. Both numbers are from an instrumented run
+of the identical fixture and the identical 40-check budget; only the poll differed.
+
+Fix B fail-before. `DescendantIndexScope::admits` was replaced by an unconditional `true`:
+
+    FAIL issue_1748_b_excluding_tests_never_builds_the_test_classes
+    production_builds = 85   (65 with the prune)
+
+65 is exactly one build per production class header: 60 subclass headers, `base.h`, and the
+four chain headers. 85 adds the 20 excluded test headers, one each.
