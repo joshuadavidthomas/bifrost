@@ -501,9 +501,19 @@ fn join_rust_fqn(package: &str, name: &str) -> String {
 /// what a resolution answers.
 #[derive(Debug, Default)]
 pub(super) struct RustPackageFileIndex {
-    /// Every analyzed file, in `get_analyzed_files` (sorted) order so membership
-    /// is a binary search rather than a second owned copy of each file.
+    /// Every analyzed file, in `get_analyzed_files` (sorted) order. This is the
+    /// ordered view: `files_in_package` projects through it, and callers that
+    /// iterate get path order.
     files: Vec<ProjectFile>,
+    /// The same files, for membership.
+    ///
+    /// `contains` used to binary-search `files`, which on the rustc tree is
+    /// ~15 `ProjectFile::cmp` calls per test, and `is_analyzed` /
+    /// `resolve_module_files` ask it constantly. A `ProjectFile` hash is
+    /// precomputed at construction, so a set probe is one `u64` and typically
+    /// one `Arc::ptr_eq`. The second copy is one `Arc` clone per file, which
+    /// buys back the whole comparison chain.
+    membership: HashSet<ProjectFile>,
     /// Package name -> indices into `files`, ascending.
     by_package: HashMap<String, Vec<u32>>,
 }
@@ -511,6 +521,7 @@ pub(super) struct RustPackageFileIndex {
 impl RustPackageFileIndex {
     fn build(files: BTreeSet<ProjectFile>) -> Self {
         let files: Vec<ProjectFile> = files.into_iter().collect();
+        let membership: HashSet<ProjectFile> = files.iter().cloned().collect();
         let mut by_package: HashMap<String, Vec<u32>> = HashMap::default();
         for (index, file) in files.iter().enumerate() {
             by_package
@@ -518,11 +529,15 @@ impl RustPackageFileIndex {
                 .or_default()
                 .push(u32::try_from(index).unwrap_or(u32::MAX));
         }
-        Self { files, by_package }
+        Self {
+            files,
+            membership,
+            by_package,
+        }
     }
 
     pub(super) fn contains(&self, file: &ProjectFile) -> bool {
-        self.files.binary_search(file).is_ok()
+        self.membership.contains(file)
     }
 
     pub(super) fn files_in_package(&self, package: &str) -> impl Iterator<Item = &ProjectFile> {
@@ -531,6 +546,114 @@ impl RustPackageFileIndex {
             .into_iter()
             .flatten()
             .filter_map(|index| self.files.get(*index as usize))
+    }
+}
+
+/// Pins for the membership set.
+///
+/// There is no cheap production seam for a comparison counter: the only place
+/// `ProjectFile` comparisons could be counted is `Ord for ProjectFile` itself,
+/// and an atomic in that function would be a shared cache line under every
+/// analyzer thread on the hottest comparison in the profile. So the mechanism
+/// is pinned structurally instead -- membership must not depend on `files`
+/// being sorted -- and the answer is pinned against the pre-change definition.
+#[cfg(test)]
+mod package_file_index_tests {
+    use super::*;
+
+    fn corpus_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\package-file-index")
+        } else {
+            PathBuf::from("/package-file-index")
+        }
+    }
+
+    const MEMBERS: [&str; 6] = [
+        "src/lib.rs",
+        "src/a.rs",
+        "src/a/mod.rs",
+        "src/a/b.rs",
+        "src/z.rs",
+        "build.rs",
+    ];
+
+    const NON_MEMBERS: [&str; 4] = [
+        // Near misses: a sibling that was never analyzed, a prefix of a member,
+        // a member's directory, and a member spelled under a second workspace.
+        "src/a/c.rs",
+        "src/a",
+        "src",
+        "src/lib.rs.bak",
+    ];
+
+    fn index() -> RustPackageFileIndex {
+        RustPackageFileIndex::build(
+            MEMBERS
+                .iter()
+                .map(|rel| ProjectFile::new(corpus_root(), rel))
+                .collect(),
+        )
+    }
+
+    /// `contains` as it read before the membership set.
+    fn reference_contains(index: &RustPackageFileIndex, file: &ProjectFile) -> bool {
+        index.files.binary_search(file).is_ok()
+    }
+
+    #[test]
+    fn membership_answers_exactly_what_the_binary_search_answered() {
+        let index = index();
+        for rel in MEMBERS.iter().chain(NON_MEMBERS.iter()) {
+            let file = ProjectFile::new(corpus_root(), rel);
+            assert_eq!(
+                index.contains(&file),
+                reference_contains(&index, &file),
+                "membership drifted for {rel}"
+            );
+        }
+        for rel in MEMBERS {
+            assert!(index.contains(&ProjectFile::new(corpus_root(), rel)));
+        }
+        for rel in NON_MEMBERS {
+            assert!(!index.contains(&ProjectFile::new(corpus_root(), rel)));
+        }
+    }
+
+    #[test]
+    fn a_file_from_another_workspace_is_not_a_member() {
+        let index = index();
+        let other_root = corpus_root().join("elsewhere");
+        for rel in MEMBERS {
+            assert!(!index.contains(&ProjectFile::new(&other_root, rel)));
+        }
+    }
+
+    /// Mechanism pin: membership is a set probe, so it survives a `files`
+    /// vector that is not in path order. Reverting `contains` to
+    /// `self.files.binary_search(file).is_ok()` makes this miss real members.
+    #[test]
+    fn membership_does_not_ride_on_the_ordered_vector() {
+        let mut scrambled = index();
+        scrambled.files.reverse();
+        for rel in MEMBERS {
+            let file = ProjectFile::new(corpus_root(), rel);
+            assert!(
+                scrambled.contains(&file),
+                "membership lost {rel} when the ordered vector was shuffled"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_iteration_still_comes_from_the_sorted_vector() {
+        let index = index();
+        let mut expected: Vec<ProjectFile> = MEMBERS
+            .iter()
+            .map(|rel| ProjectFile::new(corpus_root(), rel))
+            .collect();
+        expected.sort();
+        assert_eq!(index.files, expected);
     }
 }
 
