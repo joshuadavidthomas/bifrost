@@ -1333,11 +1333,13 @@ fn visible_namespace_module_routes(
                 let mut module_item = false;
                 let mut type_item = false;
                 let mut value_or_macro_item = false;
+                // One indexed short-name lookup for the whole route set: the
+                // answer does not depend on the route, only the filter does.
+                let named = queries.identities_named(imported_name);
                 for route in &base_routes {
-                    let mut candidate_identities = queries
-                        .identities_named(imported_name)
-                        .into_iter()
-                        .map(|(identity, _)| identity)
+                    let mut candidate_identities = named
+                        .iter()
+                        .map(|(identity, _)| identity.clone())
                         .filter(|identity| {
                             (identity.file == route.target_file
                                 || walks.owners_intersect(&identity.file, &route.target_file)
