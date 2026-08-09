@@ -4,6 +4,7 @@ use crate::analyzer::{
     StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
 };
 use crate::hash::HashSet;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::sync::Arc;
 use tree_sitter::Node;
@@ -805,11 +806,17 @@ pub(super) fn rust_external_module_segments(segments: &[String]) -> Option<(&str
     Some((root, (!nested.is_empty()).then_some(nested)))
 }
 
+/// The package of the crate root that owns `file`: everything up to and
+/// including the last `src` component.
+///
+/// The caller retains the joined `String` (it becomes `ModuleKey::crate_root`),
+/// so that allocation stays; the per-component `String`s it used to build on
+/// the way there do not. The components borrow from the relative path.
 pub(crate) fn rust_crate_root_package(file: &ProjectFile) -> String {
     let rel = file.rel_path();
-    let mut components: Vec<_> = rel
+    let mut components: SmallVec<[Cow<'_, str>; 8]> = rel
         .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .map(|component| component.as_os_str().to_string_lossy())
         .collect();
     let Some(src_index) = components.iter().rposition(|component| component == "src") else {
         return rust_package_name(file);

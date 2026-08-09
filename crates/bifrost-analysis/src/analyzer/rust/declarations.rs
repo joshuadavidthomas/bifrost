@@ -7,7 +7,8 @@ use crate::analyzer::{
     StructuredTypeIdentity, StructuredTypeName,
 };
 use crate::hash::{HashMap, HashSet};
-use std::path::Path;
+use smallvec::SmallVec;
+use std::borrow::Cow;
 use tree_sitter::{Node, Tree};
 
 /// The synthetic module-scope segment Rust uses in `short_name` for
@@ -228,11 +229,18 @@ pub(crate) fn rust_package_name(file: &ProjectFile) -> String {
     rust_package_components(file).join(".")
 }
 
-fn rust_package_components(file: &ProjectFile) -> Vec<String> {
+/// The dotted package a Rust file's path spells, one component at a time.
+///
+/// The components borrow from the file's relative path: `to_string_lossy`
+/// returns `Cow::Borrowed` for the UTF-8 paths that are the whole corpus in
+/// practice, so a call allocates nothing at all when it fits inline. It used to
+/// build one heap `String` per path component, per call, and the profile names
+/// this family in the allocator churn that path construction feeds.
+fn rust_package_components(file: &ProjectFile) -> SmallVec<[Cow<'_, str>; 8]> {
     let rel = file.rel_path();
-    let mut components: Vec<_> = rel
+    let mut components: SmallVec<[Cow<'_, str>; 8]> = rel
         .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .map(|component| component.as_os_str().to_string_lossy())
         .collect();
 
     let source_root = components.iter().rposition(|component| component == "src");
@@ -240,23 +248,25 @@ fn rust_package_components(file: &ProjectFile) -> Vec<String> {
         components.remove(0);
     }
     if components.is_empty() {
-        return Vec::new();
+        return SmallVec::new();
     }
 
-    let file_name = components.pop().unwrap_or_default();
-    let stem = Path::new(&file_name)
+    // The stem comes from `rel` rather than from the popped component, because
+    // a lossily-converted component owns its bytes and the stem would borrow
+    // from a local. `rel`'s last component IS what was popped, so its file stem
+    // is the same string.
+    components.pop();
+    let stem = rel
         .file_stem()
-        .and_then(|stem| stem.to_str())
+        .map(std::ffi::OsStr::to_string_lossy)
         .unwrap_or_default();
 
     if stem == "lib" || stem == "main" || stem == "mod" {
         components
     } else if source_root.is_some() {
+        components.push(stem);
+        components.retain(|component| !component.is_empty());
         components
-            .into_iter()
-            .chain(std::iter::once(stem.to_string()))
-            .filter(|component| !component.is_empty())
-            .collect()
     } else {
         components
     }

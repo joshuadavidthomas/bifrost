@@ -58,6 +58,7 @@ strsim = "0.11.1"
 json-spanned-value = "0.2.2"
 sha2 = "0.10.8"
 shlex = "2.0.1"
+smallvec = "1"
 toml = "0.8.23"
 tempfile = "3.23.0"
 uuid = { version = "1.23.0", features = ["v4"] }

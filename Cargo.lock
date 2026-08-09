@@ -376,6 +376,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shlex",
+ "smallvec",
  "spdx",
  "strsim",
  "tar",

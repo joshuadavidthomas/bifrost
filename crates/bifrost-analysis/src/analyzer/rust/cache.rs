@@ -3,6 +3,7 @@ use crate::analyzer::usages::{ExportEntry, ExportIndex};
 use crate::analyzer::{CodeUnit, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use std::mem::size_of;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub(super) fn weight_export_index(_key: &ProjectFile, value: &Arc<ExportIndex>) -> u32 {
@@ -154,6 +155,22 @@ pub(super) fn weight_project_file_list<K>(_key: &K, value: &Arc<Vec<ProjectFile>
         .sum::<usize>()
         + size_of::<Vec<ProjectFile>>();
     size.min(u32::MAX as usize) as u32
+}
+
+/// Byte weight of one memoized module probe.
+///
+/// The key carries the cost here, not the value: most probes find nothing, and
+/// memoizing "nothing" is the point, so a weigher that only counted the file
+/// list would let unbounded distinct module paths accumulate for free.
+// The signature is moka's: a weigher is `Fn(&K, &V)`, and the key type is
+// `PathBuf`.
+#[allow(clippy::ptr_arg)]
+pub(super) fn weight_module_probe(key: &PathBuf, value: &Arc<Vec<ProjectFile>>) -> u32 {
+    let files = value
+        .iter()
+        .map(|file| file.rel_path().to_string_lossy().len() + size_of::<ProjectFile>())
+        .sum::<usize>();
+    (key.as_os_str().len() + files + size_of::<Vec<ProjectFile>>()).min(u32::MAX as usize) as u32
 }
 
 /// Byte weight of one module's effective visibility domains. A `None` value is

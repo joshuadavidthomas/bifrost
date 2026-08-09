@@ -1898,55 +1898,44 @@ fn rust_impl_member_node_matches(
             .is_some_and(|name| node_text(name, source) == member_name)
 }
 
+/// Where a module path can physically live: `m.rs`, `m/mod.rs`, and both again
+/// under a `src/` prefix.
+///
+/// Four `ProjectFile` constructions and four `exists()` calls, and the callers
+/// ask per import specifier per file, so `RustWalkCaches::module_probes`
+/// memoizes the answer for the analyzer generation. The probe depends on the
+/// asking file only through its workspace root, which is why the memo can be
+/// keyed by `relative_module` alone -- the same assumption every other walk
+/// cache already makes about an analyzer having one root.
+pub(super) fn rust_module_files_at(file: &ProjectFile, relative_module: &Path) -> Vec<ProjectFile> {
+    let mut files = Vec::new();
+    for rel_path in [
+        relative_module.with_extension("rs"),
+        relative_module.join("mod.rs"),
+        Path::new("src").join(relative_module).with_extension("rs"),
+        Path::new("src").join(relative_module).join("mod.rs"),
+    ] {
+        let candidate = file.with_rel_path(rel_path);
+        if candidate.exists() {
+            files.push(candidate);
+        }
+    }
+    files
+}
+
 pub(super) fn rust_module_files_from_path(
     file: &ProjectFile,
     module_specifier: &str,
 ) -> Vec<ProjectFile> {
-    let Some(relative_module) = rust_relative_module_path(file, module_specifier) else {
-        return Vec::new();
-    };
-    let mut files = Vec::new();
-    for rel_path in [
-        relative_module.with_extension("rs"),
-        relative_module.join("mod.rs"),
-        PathBuf::from("src")
-            .join(&relative_module)
-            .with_extension("rs"),
-        PathBuf::from("src").join(&relative_module).join("mod.rs"),
-    ] {
-        let candidate = ProjectFile::new(file.root().to_path_buf(), rel_path);
-        if candidate.exists() {
-            files.push(candidate);
-        }
-    }
-    files
+    rust_relative_module_path(file, module_specifier)
+        .map(|relative_module| rust_module_files_at(file, &relative_module))
+        .unwrap_or_default()
 }
 
-pub(super) fn rust_module_files_from_segments(
+pub(super) fn rust_relative_module_segments(
     file: &ProjectFile,
     segments: &[String],
-) -> Vec<ProjectFile> {
-    let Some(relative_module) = rust_relative_module_segments(file, segments) else {
-        return Vec::new();
-    };
-    let mut files = Vec::new();
-    for rel_path in [
-        relative_module.with_extension("rs"),
-        relative_module.join("mod.rs"),
-        PathBuf::from("src")
-            .join(&relative_module)
-            .with_extension("rs"),
-        PathBuf::from("src").join(&relative_module).join("mod.rs"),
-    ] {
-        let candidate = ProjectFile::new(file.root().to_path_buf(), rel_path);
-        if candidate.exists() {
-            files.push(candidate);
-        }
-    }
-    files
-}
-
-fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) -> Option<PathBuf> {
+) -> Option<PathBuf> {
     let (first, rest) = segments.split_first()?;
     let append = |base: &mut PathBuf, parts: &[String]| {
         for part in parts {
@@ -1993,7 +1982,10 @@ fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) -> Opt
     (!module.as_os_str().is_empty()).then_some(std::mem::take(&mut module))
 }
 
-fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Option<PathBuf> {
+pub(super) fn rust_relative_module_path(
+    file: &ProjectFile,
+    module_specifier: &str,
+) -> Option<PathBuf> {
     let module = module_specifier
         .strip_prefix("crate::")
         .or_else(|| module_specifier.strip_prefix("self::"))

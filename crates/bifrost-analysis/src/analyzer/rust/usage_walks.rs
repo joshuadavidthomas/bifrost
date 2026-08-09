@@ -22,6 +22,7 @@ use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::hash::{HashMap, HashSet};
@@ -30,13 +31,16 @@ use super::RustAnalyzer;
 use super::cache::{
     build_weighted_cache, weight_alias_routes, weight_forward_import_edges,
     weight_macro_scope_edges, weight_macro_visible_ranges, weight_module_bindings,
-    weight_module_domains, weight_origin_routes, weight_project_file_list,
+    weight_module_domains, weight_module_probe, weight_origin_routes, weight_project_file_list,
 };
 use super::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 use super::declarations::rust_package_name;
 use super::facts::RUST_OCCURRENCE_CODE;
+#[cfg(test)]
+use super::graph_support::rust_module_files_from_path;
 use super::graph_support::{
-    RustPackageFileIndex, rust_module_files_from_path, rust_module_files_from_segments,
+    RustPackageFileIndex, rust_module_files_at, rust_relative_module_path,
+    rust_relative_module_segments,
 };
 use super::imports::{
     resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
@@ -72,6 +76,13 @@ pub(super) type RustModuleBindingKey = (ProjectFile, ModuleKey);
 /// argument the Milestone 2b Decision Log records for `declaration_facts`.
 pub(super) struct RustWalkCaches {
     module_files: Cache<String, Arc<Vec<ProjectFile>>>,
+    /// The four-candidate filesystem probe, per candidate module path. Not a
+    /// fourth concern: it is the leaf of `module_resolution`, split out only
+    /// because its key is a path rather than a package name.
+    module_probes: Cache<PathBuf, Arc<Vec<ProjectFile>>>,
+    /// Probe executions, for the memo's pin. On the analyzer's own hot path the
+    /// increment happens once per miss, not once per lookup.
+    module_probe_computations: AtomicU64,
     owner_roots: Cache<ProjectFile, Arc<Vec<ProjectFile>>>,
     module_domains: Cache<ModuleKey, Option<Arc<Vec<Domain>>>>,
     alias_routes: Cache<ModuleKey, Arc<Vec<RustModuleAliasRoute>>>,
@@ -95,7 +106,16 @@ impl RustWalkCaches {
             origin_routes: build_weighted_cache(share, weight_origin_routes),
             macro_scope_edges: build_weighted_cache(share, weight_macro_scope_edges),
             macro_visible_ranges: build_weighted_cache(share, weight_macro_visible_ranges),
+            module_probes: build_weighted_cache(share, weight_module_probe),
+            module_probe_computations: AtomicU64::new(0),
         }
+    }
+
+    /// How many times the four-candidate filesystem probe actually ran, for the
+    /// memo's regression pin.
+    #[cfg(test)]
+    pub(super) fn module_probe_computations(&self) -> u64 {
+        self.module_probe_computations.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -367,9 +387,9 @@ impl<'a> RustUsageWalks<'a> {
     }
 
     /// Membership in the analyzed-file set. The v1 index carried its own `files`
-    /// vector for exactly this test; the package index already holds the same
-    /// listing in sorted order, so this is a binary search rather than a
-    /// second copy.
+    /// vector for exactly this test; the package index answers it from its own
+    /// membership set, which is one precomputed hash rather than the ~15
+    /// `ProjectFile::cmp` calls a binary search over the sorted listing cost.
     pub(super) fn is_analyzed(&self, file: &ProjectFile) -> bool {
         self.files.contains(file)
     }
@@ -420,6 +440,55 @@ impl<'a> RustUsageWalks<'a> {
         self.files_in_module_package(&module.package())
     }
 
+    /// `rust_module_files_from_path`, memoized.
+    fn probed_module_files_from_path(
+        &self,
+        file: &ProjectFile,
+        module_specifier: &str,
+    ) -> Arc<Vec<ProjectFile>> {
+        match rust_relative_module_path(file, module_specifier) {
+            Some(relative_module) => self.probe_module_files(file, relative_module),
+            None => Arc::new(Vec::new()),
+        }
+    }
+
+    /// `rust_module_files_from_segments`, memoized.
+    fn probed_module_files_from_segments(
+        &self,
+        file: &ProjectFile,
+        segments: &[String],
+    ) -> Arc<Vec<ProjectFile>> {
+        match rust_relative_module_segments(file, segments) {
+            Some(relative_module) => self.probe_module_files(file, relative_module),
+            None => Arc::new(Vec::new()),
+        }
+    }
+
+    /// The four-candidate filesystem probe for one module path.
+    ///
+    /// Every import specifier in every file asks for one of these, and the
+    /// answers repeat heavily: a crate's modules are named by many of its
+    /// files. Uncached this is four `ProjectFile` constructions and four
+    /// `exists()` syscalls per ask. The empty answer is memoized too -- most
+    /// probes find nothing, so that is the case worth keeping.
+    fn probe_module_files(
+        &self,
+        file: &ProjectFile,
+        relative_module: PathBuf,
+    ) -> Arc<Vec<ProjectFile>> {
+        if let Some(cached) = self.caches.module_probes.get(&relative_module) {
+            return cached;
+        }
+        let files = Arc::new(rust_module_files_at(file, &relative_module));
+        self.caches
+            .module_probe_computations
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.caches
+            .module_probes
+            .insert(relative_module, Arc::clone(&files));
+        files
+    }
+
     /// `RustModuleFiles::resolve`, verbatim over the lazy lookups.
     ///
     /// Deliberately not `RustAnalyzer::resolve_module_files`: that look-alike
@@ -449,17 +518,21 @@ impl<'a> RustUsageWalks<'a> {
                 resolve_rust_module_path_with_crate(&package, &crate_package, module_specifier)
             })
         else {
-            return rust_module_files_from_path(importing_file, module_specifier);
+            return self
+                .probed_module_files_from_path(importing_file, module_specifier)
+                .as_ref()
+                .clone();
         };
 
         let mut files = self
             .files_in_module_package(&resolved_module)
             .as_ref()
             .clone();
-        files.extend(rust_module_files_from_path(
-            importing_file,
-            module_specifier,
-        ));
+        files.extend(
+            self.probed_module_files_from_path(importing_file, module_specifier)
+                .iter()
+                .cloned(),
+        );
         files.sort();
         files.dedup();
         files
@@ -533,7 +606,11 @@ impl<'a> RustUsageWalks<'a> {
             .files_in_module_package(&resolved_module)
             .as_ref()
             .clone();
-        files.extend(rust_module_files_from_segments(importing_file, segments));
+        files.extend(
+            self.probed_module_files_from_segments(importing_file, segments)
+                .iter()
+                .cloned(),
+        );
         files.sort();
         files.dedup();
         files.retain(|file| {
@@ -773,9 +850,10 @@ impl<'a> RustUsageWalks<'a> {
                 .strip_prefix(physical_root.components.as_slice())
         {
             children.extend(
-                rust_module_files_from_segments(declaring_file, relative)
-                    .into_iter()
-                    .filter(|file| file != declaring_file && self.is_analyzed(file)),
+                self.probed_module_files_from_segments(declaring_file, relative)
+                    .iter()
+                    .filter(|file| *file != declaring_file && self.is_analyzed(file))
+                    .cloned(),
             );
         }
         children.sort();
@@ -1719,7 +1797,7 @@ fn sort_routes(routes: &mut [RustResolvedModuleRoute]) {
 
 /// Declaring-file candidates derived from `file`'s own path.
 ///
-/// `rust_module_files_from_segments` builds a child path as
+/// `probed_module_files_from_segments` builds a child path as
 /// `module_root / segments`, where `module_root` is the declaring file's
 /// directory when its stem is `lib`, `main` or `mod` and its directory plus
 /// stem otherwise, optionally under a `src` prefix. Inverting that for one
@@ -1920,6 +1998,95 @@ mod tests {
             "a generation bump must not serve the previous generation's entry"
         );
         assert_eq!(*after, *first, "the answer itself is unchanged");
+    }
+
+    /// The four-candidate filesystem probe is memoized per module path.
+    ///
+    /// Uncached it is four `ProjectFile` constructions and four `exists()`
+    /// calls, asked once per import specifier per file. `module_probe_
+    /// computations` counts the executions, so the pin is a count and not a
+    /// timing: reverting `probe_module_files` to compute unconditionally makes
+    /// the repeat loop bump the counter once per ask.
+    #[test]
+    fn the_module_probe_runs_once_per_module_path_per_generation() {
+        let (_temp, analyzer) = project(&[
+            ("src/lib.rs", "pub mod service;\n"),
+            ("src/service.rs", "pub struct Widget;\n"),
+        ]);
+        let walks = RustUsageWalks::new(&analyzer);
+        let importer = file(&analyzer, "lib.rs");
+
+        let before = walks.caches.module_probe_computations();
+        let first = walks.probed_module_files_from_path(&importer, "crate::service");
+        assert_eq!(
+            walks.caches.module_probe_computations(),
+            before + 1,
+            "the first ask must run the probe"
+        );
+        assert_eq!(
+            *first,
+            rust_module_files_from_path(&importer, "crate::service"),
+            "the memo must answer what the unmemoized probe answers"
+        );
+
+        for _ in 0..8 {
+            let again = walks.probed_module_files_from_path(&importer, "crate::service");
+            assert!(
+                Arc::ptr_eq(&first, &again),
+                "a repeat ask must hit the memo"
+            );
+        }
+        // A second walker in the same generation shares the analyzer's caches.
+        let sibling = RustUsageWalks::new(&analyzer)
+            .probed_module_files_from_path(&importer, "crate::service");
+        assert!(Arc::ptr_eq(&first, &sibling));
+        assert_eq!(
+            walks.caches.module_probe_computations(),
+            before + 1,
+            "no ask after the first may run the probe again"
+        );
+
+        // A miss is memoized too: most probes find nothing, and that is the
+        // case the caches exist for.
+        let missing = walks.probed_module_files_from_path(&importer, "crate::absent");
+        assert!(missing.is_empty());
+        let after_miss = walks.caches.module_probe_computations();
+        let missing_again = walks.probed_module_files_from_path(&importer, "crate::absent");
+        assert!(Arc::ptr_eq(&missing, &missing_again));
+        assert_eq!(walks.caches.module_probe_computations(), after_miss);
+
+        // The generation is the invalidation, exactly as for every other walk
+        // cache: a fresh analyzer probes the filesystem again.
+        let updated = analyzer.update_all();
+        let next = RustUsageWalks::new(&updated);
+        let importer = file(&updated, "lib.rs");
+        let fresh = next.probed_module_files_from_path(&importer, "crate::service");
+        assert_eq!(next.caches.module_probe_computations(), 1);
+        assert_eq!(*fresh, *first, "the answer itself is unchanged");
+    }
+
+    /// The segment form resolves to the same candidate path as the specifier
+    /// form, so the two share one memo entry.
+    #[test]
+    fn the_segment_and_specifier_probes_share_one_memo_entry() {
+        let (_temp, analyzer) = project(&[
+            ("src/lib.rs", "pub mod service;\n"),
+            ("src/service.rs", "pub struct Widget;\n"),
+        ]);
+        let walks = RustUsageWalks::new(&analyzer);
+        let importer = file(&analyzer, "lib.rs");
+        let segments = vec!["crate".to_string(), "service".to_string()];
+
+        let by_segments = walks.probed_module_files_from_segments(&importer, &segments);
+        let unmemoized = rust_relative_module_segments(&importer, &segments)
+            .map(|relative| rust_module_files_at(&importer, &relative))
+            .unwrap_or_default();
+        assert_eq!(*by_segments, unmemoized);
+
+        let count = walks.caches.module_probe_computations();
+        let by_specifier = walks.probed_module_files_from_path(&importer, "crate::service");
+        assert!(Arc::ptr_eq(&by_segments, &by_specifier));
+        assert_eq!(walks.caches.module_probe_computations(), count);
     }
 
     /// The export-chain walk replaced a global worklist with recursion, so it
