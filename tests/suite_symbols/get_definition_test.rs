@@ -15915,6 +15915,7 @@ public class Consumer extends pkg.Base {
         return collision + inheritedCollision + importedOnly;
     }
 }
+
 "#;
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -15951,6 +15952,250 @@ public class ImportedFields {
         assert_eq!(result["definitions"][0]["fqn"], expected, "{name}: {value}");
         assert_eq!(result["definitions"][0]["kind"], "field", "{name}: {value}");
     }
+}
+
+#[test]
+fn java_nested_class_resolves_inherited_field() {
+    let source = r#"
+class Outer {
+    static class Base {
+        protected int data;
+    }
+
+    static class Child extends Base {
+        int read() {
+            return data;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source.rfind("data;").expect("inherited field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Outer.Base.data",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_nested_class_resolves_enclosing_type_method() {
+    let source = r#"
+class Outer {
+    static void helper() {}
+
+    static class Child {
+        void run() {
+            helper();
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source.rfind("helper();").expect("enclosing method call");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Outer.helper", "{value}");
+}
+
+#[test]
+fn java_non_static_inner_class_resolves_enclosing_instance_field() {
+    let source = r#"
+class Outer {
+    int value;
+
+    class Child {
+        int read() {
+            return value;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source
+        .rfind("value;")
+        .expect("enclosing instance field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Outer.value", "{value}");
+}
+
+#[test]
+fn java_static_nested_class_does_not_resolve_enclosing_instance_field() {
+    let source = r#"
+class Outer {
+    int value;
+
+    static class Child {
+        int read() {
+            return value;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source
+        .rfind("value;")
+        .expect("illegal enclosing instance field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn java_static_inner_method_does_not_resolve_outer_instance_field() {
+    let source = r#"
+class Outer {
+    int value;
+
+    class Child {
+        static int read() {
+            return value;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source.rfind("value;").expect("illegal outer field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn java_static_initializer_does_not_resolve_outer_instance_field() {
+    let source = r#"
+class Outer {
+    int value;
+
+    class Child {
+        static {
+            int copy = value;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source.rfind("value;").expect("illegal outer field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn java_interface_field_is_static_in_nested_static_context() {
+    let source = r#"
+interface Outer {
+    int VALUE = 1;
+
+    class Child {
+        static int read() {
+            return VALUE;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source.rfind("VALUE;").expect("implicit static field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(value["results"][0]["definitions"][0]["fqn"], "Outer.VALUE");
+}
+
+#[test]
+fn java_enum_constant_is_static_in_static_method() {
+    let source = r#"
+enum Choice {
+    YES;
+
+    static int read() {
+        return YES.ordinal();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Choice.java", source)
+        .build();
+
+    let start = source.rfind("YES.ordinal").expect("enum constant read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Choice.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(value["results"][0]["definitions"][0]["fqn"], "Choice.YES");
+}
+
+#[test]
+fn java_inner_member_name_obscures_outer_method_when_arity_is_wrong() {
+    let source = r#"
+class Outer {
+    static void helper() {}
+
+    class Child {
+        void helper(int value) {}
+
+        void run() {
+            helper();
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source
+        .rfind("helper();")
+        .expect("obscured outer method call");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]
@@ -18203,6 +18448,143 @@ fn python_builtin_call_does_not_resolve_to_same_class_method() {
     );
 
     assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn python_builtin_annotation_does_not_resolve_to_later_class_method() {
+    let source = concat!(
+        "from __future__ import annotations\n",
+        "\n",
+        "class Packages:\n",
+        "    def remove(self, values: list[str]) -> None:\n",
+        "        pass\n",
+        "\n",
+        "    def list(self):\n",
+        "        return []\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("packages.py", source)
+        .build();
+    let reference = source.find("list[str]").expect("built-in list annotation");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("packages.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn python_direct_call_excludes_same_named_file_module() {
+    let source = concat!(
+        "def worker():\n",
+        "    return 1\n",
+        "\n",
+        "result = worker()\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "")
+        .file("pkg/worker.py", source)
+        .build();
+    let reference = source.rfind("worker()").expect("worker call");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("pkg/worker.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"].as_array().unwrap().len(),
+        1,
+        "{value}"
+    );
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "pkg.worker.worker",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_nested_function_honors_outer_parameter_shadow() {
+    let source = concat!(
+        "import service as mo\n",
+        "\n",
+        "def shadow(mo):\n",
+        "    def nested():\n",
+        "        return mo.target()  # shadowed\n",
+        "    return nested\n",
+        "\n",
+        "def visible():\n",
+        "    def nested():\n",
+        "        return mo.target()  # visible\n",
+        "    return nested\n",
+        "\n",
+        "def global_visible(mo):\n",
+        "    def nested():\n",
+        "        global mo\n",
+        "        return mo.target()  # global\n",
+        "    return nested\n",
+        "\n",
+        "def nonlocal_shadow(mo):\n",
+        "    def nested():\n",
+        "        nonlocal mo\n",
+        "        return mo.target()  # nonlocal\n",
+        "    return nested\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "def target():\n    return 1\n")
+        .file("consumer.py", source)
+        .build();
+
+    let shadowed = source
+        .find("target()  # shadowed")
+        .expect("shadowed target");
+    let shadowed_value = lookup(
+        project.root(),
+        &location_reference("consumer.py", source, shadowed),
+    );
+    assert_eq!(
+        shadowed_value["results"][0]["status"], "no_definition",
+        "{shadowed_value}"
+    );
+
+    let visible = source.find("target()  # visible").expect("visible target");
+    let visible_value = lookup(
+        project.root(),
+        &location_reference("consumer.py", source, visible),
+    );
+    assert_eq!(
+        visible_value["results"][0]["status"], "resolved",
+        "{visible_value}"
+    );
+    assert_eq!(
+        visible_value["results"][0]["definitions"][0]["fqn"], "service.target",
+        "{visible_value}"
+    );
+
+    let global = source.find("target()  # global").expect("global target");
+    let global_value = lookup(
+        project.root(),
+        &location_reference("consumer.py", source, global),
+    );
+    assert_eq!(
+        global_value["results"][0]["status"], "resolved",
+        "{global_value}"
+    );
+
+    let nonlocal = source
+        .find("target()  # nonlocal")
+        .expect("nonlocal target");
+    let nonlocal_value = lookup(
+        project.root(),
+        &location_reference("consumer.py", source, nonlocal),
+    );
+    assert_eq!(
+        nonlocal_value["results"][0]["status"], "no_definition",
+        "{nonlocal_value}"
+    );
 }
 
 #[test]

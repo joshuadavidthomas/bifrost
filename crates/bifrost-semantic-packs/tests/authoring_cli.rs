@@ -29,12 +29,17 @@ fn summary_corpus_join_writes_a_deterministic_report_over_the_in_tree_slices() {
     let codeql_models = testdata.join("codeql");
     let joern_source = testdata.join("joern/DefaultSemantics.scala");
 
+    // The pinned source root is optional. Passing it turns the derived slot on,
+    // which is the only difference between the two runs below.
+    let jvm_sources = manifest_dir.join("testdata/summary-sources/temurin-jdk-21.0.8+9");
+
     let arguments = [
         "summary-corpus-join",
         pins.to_str().unwrap(),
         codeql_models.to_str().unwrap(),
         joern_source.to_str().unwrap(),
         report_path.to_str().unwrap(),
+        jvm_sources.to_str().unwrap(),
     ];
     let first = run(&arguments);
     assert!(first.status.success(), "{first:#?}");
@@ -55,6 +60,25 @@ fn summary_corpus_join_writes_a_deterministic_report_over_the_in_tree_slices() {
         assert_eq!(round_trip["diagnostics"].as_array().unwrap().len(), 0);
         assert!(round_trip["entries"].as_u64().unwrap() > 0);
     }
+    assert!(report["derivation"]["entries"].as_u64().unwrap() > 0);
+    assert_eq!(
+        report["derivation"]["boundaries_by_kind"]["native_callee"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+
+    let without_sources = run(&arguments[..arguments.len() - 1]);
+    assert!(without_sources.status.success(), "{without_sources:#?}");
+    let report: Value = serde_json::from_str(&fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert!(report["derivation"].is_null());
+    let derived_slot = report["join"]["slots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|slot| slot["corpus"] == "derived")
+        .unwrap();
+    assert_eq!(derived_slot["populated"], false);
 }
 
 fn run(arguments: &[&str]) -> Output {

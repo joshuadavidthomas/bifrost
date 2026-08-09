@@ -13,6 +13,26 @@ use brokk_bifrost_core::analyzer::common::node_ident_text;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use tree_sitter::Node;
 
+pub fn is_rust_declaration_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    matches!(
+        parent.kind(),
+        "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "type_item"
+            | "const_item"
+            | "static_item"
+            | "mod_item"
+            | "field_declaration"
+            | "enum_variant"
+            | "function_signature_item"
+    ) && parent.child_by_field_name("name") == Some(node)
+}
+
 pub fn rust_reference_namespace(node: Node<'_>) -> RustReferenceNamespace {
     let mut ancestor = Some(node);
     while let Some(current) = ancestor {

@@ -1,6 +1,6 @@
 //! Compact exact-identity usage graph shared by relevance ranking and graph APIs.
 
-use super::common::language_for_target;
+use super::common::{language_for_file, language_for_target};
 use super::inverted_edges::{UsageEdgeWeights, UsageNodeKey, UsageReferenceCounts};
 use crate::analyzer::languages::{
     EdgeWeightScanCtx, LanguageEdgeWeights, LanguageSupport, edge_passes, language_support,
@@ -9,6 +9,7 @@ use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 
 /// The name universe a declaration's identity belongs to.
 ///
@@ -150,13 +151,42 @@ impl WorkspaceUsageCatalog {
             if cancellation.is_cancelled() {
                 return None;
             }
-            if unit.is_synthetic() || !(unit.is_class() || unit.is_callable()) {
+            let is_java_module_descriptor_scope = unit.is_file_scope()
+                && language_for_target(&unit) == Language::Java
+                && unit.source().rel_path().file_name() == Some(OsStr::new("module-info.java"));
+            if (unit.is_synthetic() && !is_java_module_descriptor_scope)
+                || !(unit.is_class() || unit.is_callable() || is_java_module_descriptor_scope)
+            {
                 continue;
             }
             declarations
                 .entry(WorkspaceUsageNodeKey::for_declaration(&unit))
                 .or_default()
                 .push((unit, range));
+        }
+
+        // The public declaration inventory intentionally excludes synthetic
+        // file scopes. Java module descriptors need one graph caller, however,
+        // so add the existing `module-info.java` file scope through this
+        // graph-only catalog path. This avoids turning the named module into a
+        // package Module CodeUnit, which can collide with a package of the same
+        // name.
+        for file in analyzer.analyzed_files() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            if !is_java_module_descriptor_file(&file) {
+                continue;
+            }
+            let file_scope = CodeUnit::file_scope(file.clone());
+            let range = analyzer
+                .ranges(&file_scope)
+                .into_iter()
+                .min_by_key(|range| (range.start_line, range.start_byte));
+            declarations
+                .entry(WorkspaceUsageNodeKey::for_declaration(&file_scope))
+                .or_default()
+                .push((file_scope, range));
         }
 
         let mut nodes = Vec::with_capacity(declarations.len());
@@ -258,6 +288,11 @@ impl WorkspaceUsageCatalog {
     fn index_of(&self, key: &WorkspaceUsageNodeKey) -> Option<usize> {
         self.indices.get(key).copied()
     }
+}
+
+fn is_java_module_descriptor_file(file: &ProjectFile) -> bool {
+    language_for_file(file) == Language::Java
+        && file.rel_path().file_name() == Some(OsStr::new("module-info.java"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

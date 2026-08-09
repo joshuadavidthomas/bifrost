@@ -262,6 +262,68 @@ fn resolves_direct_ancestors() {
 }
 
 #[test]
+fn resolves_nested_class_direct_ancestors() {
+    let analyzer = analyzer_for(&[(
+        "AllInOne.java",
+        "class Outer { static class Base {} static class Child extends Base {} }",
+    )])
+    .update_all();
+
+    let child = analyzer
+        .get_definitions("Outer.Child")
+        .into_iter()
+        .next()
+        .unwrap();
+    let ancestors: Vec<_> = analyzer
+        .get_direct_ancestors(&child)
+        .into_iter()
+        .map(|code_unit| code_unit.fq_name())
+        .collect();
+
+    assert_eq!(vec!["Outer.Base".to_string()], ancestors);
+
+    let base = analyzer
+        .get_definitions("Outer.Base")
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        BTreeSet::from([child]),
+        analyzer.get_direct_descendants(&base).into_iter().collect()
+    );
+}
+
+#[test]
+fn explicit_import_beats_same_package_type_for_nested_hierarchy() {
+    let analyzer = analyzer_for(&[
+        ("same/Base.java", "package same; public class Base {}"),
+        (
+            "imported/Base.java",
+            "package imported; public class Base {}",
+        ),
+        (
+            "same/Outer.java",
+            "package same; import imported.Base; public class Outer { public class Child extends Base {} }",
+        ),
+    ]);
+
+    let child = analyzer
+        .get_definitions("same.Outer.Child")
+        .into_iter()
+        .next()
+        .unwrap();
+    let ancestors = analyzer.get_direct_ancestors(&child);
+
+    assert_eq!(
+        BTreeSet::from(["imported.Base".to_string()]),
+        ancestors
+            .into_iter()
+            .map(|ancestor| ancestor.fq_name())
+            .collect()
+    );
+}
+
+#[test]
 fn resolves_direct_and_transitive_descendants() {
     let analyzer = analyzer_for(&[(
         "Hierarchy.java",

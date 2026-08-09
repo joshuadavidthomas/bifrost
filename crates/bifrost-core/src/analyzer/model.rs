@@ -509,9 +509,26 @@ pub struct SignatureMetadata {
     /// bounded candidate set, never as an identity.
     #[serde(default)]
     callable_parameter_types: Option<Vec<String>>,
+    /// Whether the declaration carries a `native`-style modifier: the callable
+    /// is declared here and implemented outside every source this workspace
+    /// can read.
+    ///
+    /// A body-less declaration alone does not answer this. An abstract method,
+    /// an interface method, and a native method all produce no body, and a
+    /// consumer that must not guess past the boundary needs to tell them
+    /// apart. Only meaningful when [`Self::callable_modifiers_recorded`] is
+    /// true.
+    #[serde(default)]
+    callable_is_native: bool,
     /// Whether this class-like declaration is an interface.
     #[serde(default)]
     class_like_is_interface: bool,
+    /// Whether this class-like declaration has the Java `static` modifier.
+    ///
+    /// Java uses this fact to determine whether an unqualified reference in a
+    /// nested class can reach an instance member of an enclosing class.
+    #[serde(default)]
+    class_like_is_static: bool,
 }
 
 /// A parser-derived nominal type name, including the lexical scope in which an
@@ -1692,7 +1709,9 @@ impl SignatureMetadata {
             callable_declared_visibility: None,
             callable_modifiers_recorded: false,
             callable_parameter_types: None,
+            callable_is_native: false,
             class_like_is_interface: false,
+            class_like_is_static: false,
         }
     }
 
@@ -1750,8 +1769,22 @@ impl SignatureMetadata {
         self
     }
 
+    /// Record whether the declaration carries a `native`-style modifier.
+    ///
+    /// Pair this with [`Self::with_callable_modifiers`], which is what states
+    /// that the adapter read the modifier nodes at all.
+    pub fn with_callable_native(mut self, is_native: bool) -> Self {
+        self.callable_is_native = is_native;
+        self
+    }
+
     pub fn with_class_like_interface(mut self, is_interface: bool) -> Self {
         self.class_like_is_interface = is_interface;
+        self
+    }
+
+    pub fn with_class_like_static(mut self, is_static: bool) -> Self {
+        self.class_like_is_static = is_static;
         self
     }
 
@@ -1775,8 +1808,16 @@ impl SignatureMetadata {
         self.callable_parameter_types.as_deref()
     }
 
+    pub fn callable_is_native(&self) -> bool {
+        self.callable_is_native
+    }
+
     pub fn class_like_is_interface(&self) -> bool {
         self.class_like_is_interface
+    }
+
+    pub fn class_like_is_static(&self) -> bool {
+        self.class_like_is_static
     }
 
     pub fn with_return_type_text(mut self, return_type_text: Option<impl Into<String>>) -> Self {

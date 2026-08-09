@@ -14,8 +14,8 @@
 # extracts. Bump a pin there and both this script and the join tool follow.
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "usage: $0 WORK_DIR [REPORT_JSON]" >&2
+if [[ $# -lt 1 || $# -gt 3 ]]; then
+  echo "usage: $0 WORK_DIR [REPORT_JSON] [PINNED_JVM_SOURCES]" >&2
   exit 2
 fi
 
@@ -67,6 +67,17 @@ fetch_corpus() {
 codeql_models=$(fetch_corpus codeql) || exit 1
 joern_source=$(fetch_corpus joern) || exit 1
 
+# The derived slot needs the pinned standard-library sources, which
+# scripts/build-pinned-jvm-semantic-packs.sh already downloads and checksums.
+# Pass the package root of an extracted src.zip module (for example
+# "<extract>/java.base") as the third argument to this script; without it the
+# run reports the derived slot as unpopulated instead of guessing.
+jvm_sources=${3:-}
+if [[ -n "${jvm_sources}" && ! -d "${jvm_sources}" ]]; then
+  echo "error: ${jvm_sources} is not a directory of pinned Java sources" >&2
+  exit 1
+fi
+
 cargo run --locked --release --features release-tooling \
   -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- summary-corpus-join \
-  "${pins_path}" "${codeql_models}" "${joern_source}" "${report_path}"
+  "${pins_path}" "${codeql_models}" "${joern_source}" "${report_path}" ${jvm_sources:+"${jvm_sources}"}

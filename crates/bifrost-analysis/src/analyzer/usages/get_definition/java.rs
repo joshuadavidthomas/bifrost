@@ -100,6 +100,20 @@ impl<'a> JavaResolutionSession<'a> {
         file: &ProjectFile,
         byte: usize,
     ) -> Option<CodeUnit> {
+        self.enclosing_units(analyzer, file, byte)
+            .into_iter()
+            .next()
+    }
+
+    /// Every class that lexically encloses `byte`, from the innermost class
+    /// outward. Java simple-name lookup must exhaust each class's own and
+    /// inherited members before it checks the next enclosing class (#1905).
+    fn enclosing_units(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        byte: usize,
+    ) -> Vec<CodeUnit> {
         let start = self.query_optional_row(|| {
             analyzer.enclosing_code_unit(
                 file,
@@ -110,11 +124,76 @@ impl<'a> JavaResolutionSession<'a> {
                     end_line: 0,
                 },
             )
-        })?;
+        });
+        let Some(start) = start else {
+            return Vec::new();
+        };
         crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
             self.parent_of(analyzer, unit)
         })
-        .find(CodeUnit::is_class)
+        .filter(CodeUnit::is_class)
+        .collect()
+    }
+
+    fn enclosing_static_context(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        node: Node<'_>,
+    ) -> (bool, bool) {
+        let byte = node.start_byte();
+        let start = self.query_optional_row(|| {
+            analyzer.enclosing_code_unit(
+                file,
+                &Range {
+                    start_byte: byte,
+                    end_byte: byte.saturating_add(1),
+                    start_line: 0,
+                    end_line: 0,
+                },
+            )
+        });
+        let Some(start) = start else {
+            return (false, false);
+        };
+        let mut saw_class = false;
+        let mut ancestor = Some(node);
+        let mut current_static = false;
+        while let Some(current) = ancestor {
+            if current.kind() == "static_initializer" {
+                current_static = true;
+                break;
+            }
+            ancestor = current.parent();
+        }
+        let mut outer_static = false;
+        for unit in crate::analyzer::usages::common::enclosing_owner_chain(start, |unit| {
+            self.parent_of(analyzer, unit)
+        }) {
+            if unit.is_class() {
+                saw_class = true;
+                continue;
+            }
+            if (unit.is_function() || unit.is_field())
+                && self
+                    .signature_metadata(analyzer, &unit)
+                    .iter()
+                    .any(|metadata| {
+                        if unit.is_function() {
+                            metadata.callable_is_static()
+                        } else {
+                            metadata.field_is_static()
+                        }
+                    })
+            {
+                if saw_class {
+                    outer_static = true;
+                } else {
+                    current_static = true;
+                }
+            }
+        }
+        (current_static, outer_static)
     }
 
     fn structured_query<T>(&self, query: impl FnOnce() -> T) -> Option<T> {
@@ -882,18 +961,20 @@ fn resolve_java_method_invocation(
         return static_import;
     }
 
-    if let Some(owner) = session.enclosing_unit(analyzer, file, name_node.start_byte()) {
-        let outcome = java_member_candidates(
-            analyzer,
-            session,
-            &owner,
-            name,
-            JavaMemberLookupKind::Method,
-            Some(arity),
-        );
-        if outcome.status != DefinitionLookupStatus::NoDefinition {
-            return outcome;
-        }
+    let (initial_static_context, outer_static_context) =
+        session.enclosing_static_context(analyzer, file, name_node);
+    let outcome = java_member_candidates_in_enclosing_chain(
+        analyzer,
+        session,
+        session.enclosing_units(analyzer, file, name_node.start_byte()),
+        initial_static_context,
+        outer_static_context,
+        name,
+        JavaMemberLookupKind::Method,
+        Some(arity),
+    );
+    if outcome.status != DefinitionLookupStatus::NoDefinition {
+        return outcome;
     }
 
     no_definition(
@@ -1358,12 +1439,15 @@ fn resolve_java_bare_identifier(
         name,
         node.start_byte(),
     );
-    if !locally_bound && let Some(owner) = session.enclosing_unit(analyzer, file, node.start_byte())
-    {
-        let outcome = java_member_candidates(
+    if !locally_bound {
+        let (initial_static_context, outer_static_context) =
+            session.enclosing_static_context(analyzer, file, node);
+        let outcome = java_member_candidates_in_enclosing_chain(
             analyzer,
             session,
-            &owner,
+            session.enclosing_units(analyzer, file, node.start_byte()),
+            initial_static_context,
+            outer_static_context,
             name,
             JavaMemberLookupKind::Field,
             None,
@@ -2679,6 +2763,144 @@ impl JavaMemberTrace {
                 .collect(),
         );
     }
+}
+
+/// Resolve a bare Java member through each lexical class scope, from the
+/// innermost class outward. Each scope runs its complete member and ancestor
+/// walk before the next scope starts (#1905).
+#[allow(clippy::too_many_arguments)]
+fn java_member_candidates_in_enclosing_chain(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owners: Vec<CodeUnit>,
+    initial_static_context: bool,
+    outer_static_context: bool,
+    member: &str,
+    kind: JavaMemberLookupKind,
+    arity: Option<usize>,
+) -> DefinitionLookupOutcome {
+    let mut innermost_failure = None;
+    let mut static_context = initial_static_context;
+    for (owner_index, owner) in owners.into_iter().enumerate() {
+        if owner_index > 0 {
+            static_context |= outer_static_context;
+        }
+        if !session.charge_scope_step() {
+            return no_definition(
+                "java_resolution_stopped",
+                "Java member resolution stopped before completion",
+            );
+        }
+        let outcome = java_member_candidates(analyzer, session, &owner, member, kind, arity);
+        let outcome = if static_context {
+            java_static_context_member_outcome(analyzer, session, outcome, kind, member)
+        } else {
+            outcome
+        };
+        if outcome.status != DefinitionLookupStatus::NoDefinition {
+            return outcome;
+        }
+        if java_member_declared_in_hierarchy(analyzer, session, &owner, member, kind) {
+            return outcome;
+        }
+        innermost_failure.get_or_insert(outcome);
+        static_context |= java_class_is_static(analyzer, session, &owner);
+    }
+    innermost_failure.unwrap_or_else(|| {
+        no_definition(
+            "no_enclosing_class",
+            format!("`{member}` has no enclosing indexed Java class"),
+        )
+    })
+}
+
+fn java_class_is_static(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: &CodeUnit,
+) -> bool {
+    session
+        .signature_metadata(analyzer, owner)
+        .iter()
+        .any(|metadata| metadata.class_like_is_static())
+}
+
+fn java_member_is_static(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    member: &CodeUnit,
+    kind: JavaMemberLookupKind,
+) -> bool {
+    session
+        .signature_metadata(analyzer, member)
+        .iter()
+        .any(|metadata| match kind {
+            JavaMemberLookupKind::Field => metadata.field_is_static(),
+            JavaMemberLookupKind::Method => metadata.callable_is_static(),
+            JavaMemberLookupKind::Type => false,
+        })
+}
+
+fn java_static_context_member_outcome(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    outcome: DefinitionLookupOutcome,
+    kind: JavaMemberLookupKind,
+    member: &str,
+) -> DefinitionLookupOutcome {
+    if outcome.definitions.is_empty() {
+        return outcome;
+    }
+    let definitions: Vec<_> = outcome
+        .definitions
+        .iter()
+        .filter(|candidate| java_member_is_static(analyzer, session, candidate, kind))
+        .cloned()
+        .collect();
+    if definitions.is_empty() {
+        return no_definition(
+            "java_static_context",
+            format!("`{member}` is an instance Java member outside a static context"),
+        );
+    }
+    if definitions.len() == outcome.definitions.len() {
+        outcome
+    } else {
+        candidates_outcome(definitions)
+    }
+}
+
+fn java_member_declared_in_hierarchy(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: &CodeUnit,
+    member: &str,
+    kind: JavaMemberLookupKind,
+) -> bool {
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return false;
+    };
+    let mut seen = HashSet::default();
+    let mut level = vec![owner.clone()];
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for current in level {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            if !java_filter_member_candidates(
+                session.fqn(&format!("{}.{}", current.fq_name(), member)),
+                kind,
+            )
+            .is_empty()
+            {
+                return true;
+            }
+            next.extend(session.direct_ancestors(provider, &current));
+        }
+        level = next;
+    }
+    false
 }
 
 fn java_member_candidates(

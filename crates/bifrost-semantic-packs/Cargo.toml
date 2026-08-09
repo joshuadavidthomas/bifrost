@@ -9,7 +9,10 @@ repository.workspace = true
 homepage.workspace = true
 publish = true
 autobins = false
-exclude = ["tests/**"]
+# The JDK source slices under testdata/summary-sources are GPL-2.0 WITH
+# Classpath-exception-2.0. They are derivation test fixtures and are never
+# distributed with this crate.
+exclude = ["tests/**", "testdata/summary-sources/**"]
 
 [lib]
 name = "brokk_bifrost_semantic_packs"

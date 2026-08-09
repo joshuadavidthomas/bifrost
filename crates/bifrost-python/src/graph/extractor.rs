@@ -738,8 +738,10 @@ fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) 
 
     // An attribute annotation the resolver could not turn into a candidate is
     // not consumed here: the namespace-attribute path still has to see it, and
-    // so do the node's children. `inverted.rs` always fell through this way.
-    if node.kind() == "attribute" && candidates.is_empty() {
+    // so do the node's children. A module target also needs that path because
+    // annotation resolution names the terminal declaration, not its qualifier.
+    // `inverted.rs` always falls through for these module qualifier references.
+    if node.kind() == "attribute" && (candidates.is_empty() || ctx.target_is_module) {
         return false;
     }
 

@@ -1839,7 +1839,8 @@ fn record_bare_enum_variant_value_hit(name: Node<'_>, ctx: &mut MemberScanCtx<'_
         return;
     };
     let pattern_binding = lexical_scope::is_pattern_binding_identifier(name);
-    if token_tree_ancestor(name).is_some()
+    if brokk_bifrost_rust::graph::ast::is_rust_declaration_name(name)
+        || token_tree_ancestor(name).is_some()
         || node_in_use_declaration(name)
         || identifier_is_scoped_path_part(name)
         || ctx

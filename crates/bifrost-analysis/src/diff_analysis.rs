@@ -190,6 +190,15 @@ pub struct MovedSymbol {
     pub added_calls: Vec<CalleeChange>,
     /// See [`EditedSymbolPair::removed_calls`].
     pub removed_calls: Vec<CalleeChange>,
+    /// Present only when the pairing was *inferred* by body similarity (the
+    /// fuzzy third rule of [`pair_endpoints`]) rather than established by an
+    /// identity key or a Git-reported rename: the diff-local-IDF-weighted
+    /// token-similarity score in `[threshold, 1.0]` (see [`body_similarity`]),
+    /// rounded to two decimals. A consumer can use it to weigh these
+    /// lower-confidence relocations accordingly. Identity and rename-bucket
+    /// moves omit the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -475,12 +484,14 @@ pub fn analyze_diff_at_root(
             || pre.symbol.path != post.symbol.path
             || (pre.symbol.start_line != post.symbol.start_line
                 && !is_pure_line_shift(&pre.symbol, &post.symbol, &changed_lines));
+        let fallback_score = endpoint_pairing.fallback_paired.get(&pre.key).copied();
         if relocated {
             moved.push(MovedSymbol {
                 before: pre.symbol.clone(),
                 after: post.symbol.clone(),
                 added_calls: Vec::new(),
                 removed_calls: Vec::new(),
+                similarity: fallback_score.map(|score| (score * 100.0).round() / 100.0),
             });
         }
         // A pair matched by the body-similarity rule (rather than by identity or
@@ -490,7 +501,7 @@ pub fn analyze_diff_at_root(
         // after symbols, so also reporting it as an edit -- with every cut line
         // "deleted" and every pasted line "inserted" -- or as a signature change
         // would be double-counting noise. Suppress both for those pairs.
-        let relocated_by_body = endpoint_pairing.fallback_paired.contains(&pre.key);
+        let relocated_by_body = fallback_score.is_some();
         if !relocated_by_body && pre.symbol.signature != post.symbol.signature {
             signature_changes.push(SignatureChange {
                 before: pre.symbol.clone(),
@@ -1307,17 +1318,21 @@ struct EndpointPairing<'a> {
     pairs: Vec<(&'a SymbolSnapshot, &'a SymbolSnapshot)>,
     postimage_only: Vec<&'a SymbolSnapshot>,
     preimage_only: Vec<&'a SymbolSnapshot>,
-    /// Keys of the symbols paired by the body-similarity rule rather than by
-    /// identity or a Git rename. These relocated (and possibly were renamed or
-    /// lightly edited), but the hunks that deleted them from one place and
-    /// inserted them at another are not edits to report -- see the classifier.
-    fallback_paired: HashSet<&'a SymbolKey>,
+    /// Symbols paired by the body-similarity rule rather than by identity or a
+    /// Git rename, keyed on BOTH endpoints' keys, each mapped to the pair's
+    /// similarity score. These relocated (and possibly were renamed or lightly
+    /// edited), but the hunks that deleted them from one place and inserted
+    /// them at another are not edits to report -- see the classifier, which
+    /// also surfaces the score on the resulting [`MovedSymbol`].
+    fallback_paired: HashMap<&'a SymbolKey, f64>,
 }
 
 /// Match preimage symbols to postimage symbols.
 ///
 /// Two symbols pair when their key -- fqn, kind and language -- is identical,
-/// which covers everything a patch leaves in place. The second rule exists
+/// which covers everything a patch leaves in place (an unqualified fqn -- a
+/// bare name, as flat-namespace languages produce -- must additionally keep
+/// its path; see the guard below). The second rule exists
 /// because a fully-qualified name derived from a path does not survive a file
 /// move: when Git reports a rename, a preimage symbol under the old path pairs
 /// with a postimage symbol under the new one, provided the name, kind and
@@ -1341,18 +1356,35 @@ fn pair_endpoints<'a>(
     after: &'a BTreeMap<SymbolKey, SymbolSnapshot>,
     file_changes: &[FileChange],
 ) -> EndpointPairing<'a> {
+    // First rule: identity of the key (fqn, kind, language) -- with one guard.
+    // In flat-namespace languages (JavaScript most prominently) a symbol's fqn
+    // can be its bare unqualified name, so two UNRELATED same-name functions in
+    // different files share an identity key: a deleted `updateConfig` in a.js
+    // would identity-pair with a brand-new `updateConfig` in b.js, fabricating
+    // a "moved" symbol and suppressing the real delete+introduce. When the fqn
+    // carries no qualifier (fqn == bare name), identity across DIFFERENT paths
+    // is no evidence at all, so such a pair must also agree on the path.
+    // Refused pairs fall through to the leftover sets, where the rename bucket
+    // (rule 2) or body similarity (rule 3, which also tags a similarity score)
+    // can legitimately claim a genuine cross-file move; this guard only
+    // refuses suspect identity pairs, it never creates new ones.
+    let flat_identity_conflict = |pre: &SymbolSnapshot, post: &SymbolSnapshot| {
+        (pre.symbol.fqn == pre.symbol.name || post.symbol.fqn == post.symbol.name)
+            && pre.symbol.path != post.symbol.path
+    };
     let mut pairs = Vec::new();
     let mut preimage_only = Vec::new();
     let mut postimage_only = Vec::new();
     for (key, post) in after {
         match before.get(key) {
-            Some(pre) => pairs.push((pre, post)),
-            None => postimage_only.push(post),
+            Some(pre) if !flat_identity_conflict(pre, post) => pairs.push((pre, post)),
+            _ => postimage_only.push(post),
         }
     }
     for (key, pre) in before {
-        if !after.contains_key(key) {
-            preimage_only.push(pre);
+        match after.get(key) {
+            Some(post) if !flat_identity_conflict(pre, post) => {}
+            _ => preimage_only.push(pre),
         }
     }
 
@@ -1415,43 +1447,86 @@ fn pair_endpoints<'a>(
     // shares no identity key and lands in no rename bucket, so it would
     // otherwise surface as delete+introduce plus the very call-edge churn
     // `fqn_renames` exists to cancel. Score every leftover preimage against
-    // every leftover postimage by token similarity and greedily accept the
-    // best mutual matches above the threshold, one-to-one. Greedy-by-descending
-    // score means the most confident relocation claims its counterpart first;
-    // ties break on fqn so the result is deterministic. Trivial bodies carry
-    // `token_sig == None` and never participate.
-    let mut scored: Vec<(f64, &'a SymbolSnapshot, &'a SymbolSnapshot)> = Vec::new();
-    for pre in preimage_only.iter().copied() {
-        let Some(pre_sig) = pre.token_sig.as_deref() else {
-            continue;
+    // every leftover postimage by IDF-weighted token similarity and greedily
+    // accept the best mutual matches above the threshold, one-to-one.
+    // Greedy-by-descending score means the most confident relocation claims its
+    // counterpart first; ties break on fqn so the result is deterministic.
+    // Trivial bodies carry `token_sig == None` and never participate.
+    //
+    // The df pool spans EVERY tokenizable body on both endpoints -- leftovers
+    // and identity-paired symbols alike -- so a token's weight reflects how
+    // ordinary it is across the whole change, not just among the leftovers.
+    let pre_candidates: Vec<(&'a SymbolSnapshot, &'a [String])> = preimage_only
+        .iter()
+        .filter_map(|pre| Some((*pre, pre.token_sig.as_deref()?)))
+        .collect();
+    let post_candidates: Vec<(&'a SymbolSnapshot, &'a [String])> = postimage_only
+        .iter()
+        .filter_map(|post| Some((*post, post.token_sig.as_deref()?)))
+        .collect();
+    let mut fallback_paired: HashMap<&SymbolKey, f64> = HashMap::new();
+    // Hard cap: scoring is O(P x Q) over the leftover candidates, and a
+    // mass-churn commit (a vendored tree drop, a generated-code rewrite) could
+    // otherwise blow up analyze_diff latency. Past the cap, skip the rule
+    // entirely for this diff: bounded latency beats unbounded matching on
+    // pathological commits, and the fallback is the pre-feature baseline --
+    // every leftover reports as plain delete+introduce -- never worse.
+    let candidate_products = pre_candidates.len().saturating_mul(post_candidates.len());
+    if candidate_products > 0 && candidate_products <= FUZZY_PAIRING_CANDIDATE_CAP {
+        let idf = diff_local_idf(
+            before
+                .values()
+                .chain(after.values())
+                .filter_map(|snapshot| snapshot.token_sig.as_deref()),
+        );
+        let bag_weight = |sig: &[String]| -> f64 {
+            sig.iter()
+                .map(|t| {
+                    idf.get(t.as_str())
+                        .copied()
+                        .unwrap_or(std::f64::consts::LN_2)
+                })
+                .sum()
         };
-        for post in postimage_only.iter().copied() {
-            let Some(post_sig) = post.token_sig.as_deref() else {
-                continue;
-            };
-            let score = body_similarity(pre_sig, post_sig);
-            if score >= BODY_MOVE_SIMILARITY_THRESHOLD {
-                scored.push((score, pre, post));
+        let pre_weights: Vec<f64> = pre_candidates
+            .iter()
+            .map(|(_, sig)| bag_weight(sig))
+            .collect();
+        let post_weights: Vec<f64> = post_candidates
+            .iter()
+            .map(|(_, sig)| bag_weight(sig))
+            .collect();
+        let mut scored: Vec<(f64, &'a SymbolSnapshot, &'a SymbolSnapshot)> = Vec::new();
+        for (pre_idx, (pre, pre_sig)) in pre_candidates.iter().enumerate() {
+            for (post_idx, (post, post_sig)) in post_candidates.iter().enumerate() {
+                // Size-ratio prefilter -- a pure fast-path, not a behavior
+                // change: see `within_fuzzy_weight_ratio`.
+                if !within_fuzzy_weight_ratio(pre_weights[pre_idx], post_weights[post_idx]) {
+                    continue;
+                }
+                let score = body_similarity(pre_sig, post_sig, &idf);
+                if score >= BODY_MOVE_SIMILARITY_THRESHOLD {
+                    scored.push((score, pre, post));
+                }
             }
         }
-    }
-    scored.sort_by(|(sa, pa, qa), (sb, pb, qb)| {
-        sb.partial_cmp(sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| pa.symbol.fqn.cmp(&pb.symbol.fqn))
-            .then_with(|| qa.symbol.fqn.cmp(&qb.symbol.fqn))
-    });
-    let mut fallback_paired: HashSet<&SymbolKey> = HashSet::new();
-    for (_, pre, post) in scored {
-        if fallback_paired.contains(&pre.key) || fallback_paired.contains(&post.key) {
-            continue;
+        scored.sort_by(|(sa, pa, qa), (sb, pb, qb)| {
+            sb.partial_cmp(sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| pa.symbol.fqn.cmp(&pb.symbol.fqn))
+                .then_with(|| qa.symbol.fqn.cmp(&qb.symbol.fqn))
+        });
+        for (score, pre, post) in scored {
+            if fallback_paired.contains_key(&pre.key) || fallback_paired.contains_key(&post.key) {
+                continue;
+            }
+            fallback_paired.insert(&pre.key, score);
+            fallback_paired.insert(&post.key, score);
+            pairs.push((pre, post));
         }
-        fallback_paired.insert(&pre.key);
-        fallback_paired.insert(&post.key);
-        pairs.push((pre, post));
     }
-    preimage_only.retain(|snapshot| !fallback_paired.contains(&snapshot.key));
-    postimage_only.retain(|snapshot| !fallback_paired.contains(&snapshot.key));
+    preimage_only.retain(|snapshot| !fallback_paired.contains_key(&snapshot.key));
+    postimage_only.retain(|snapshot| !fallback_paired.contains_key(&snapshot.key));
 
     EndpointPairing {
         pairs,
@@ -1497,11 +1572,46 @@ fn blank_identifier<'a>(line: &'a str, name: &str) -> Cow<'a, str> {
     }
 }
 
-/// The minimum body token similarity for two leftover symbols to be paired as
-/// the same symbol relocated. Chosen to accept a renamed method whose body also
-/// saw a few internal renames or a small edit, while rejecting merely
-/// structurally-similar but unrelated code.
-const BODY_MOVE_SIMILARITY_THRESHOLD: f64 = 0.70;
+/// The minimum IDF-weighted body token similarity for two leftover symbols to
+/// be paired as the same symbol relocated. Chosen to accept a renamed method
+/// whose body also saw a few internal renames or a small edit, while rejecting
+/// merely structurally-similar but unrelated code.
+///
+/// Tuned on the RefactoringMiner oracle via `tools/rename-eval` (641 real
+/// move/rename pairs, ~330k negatives): at 0.40 the diff-local-IDF-weighted
+/// metric reaches whole-commit precision 0.896 / recall 0.815, vs 0.865 /
+/// 0.712 for the previous unweighted bag Jaccard at its 0.70 threshold --
+/// higher precision AND recall simultaneously. Unrelated pairs score ~0.03-0.05
+/// on this scale. See `tools/rename-eval/RESULTS.md`.
+const BODY_MOVE_SIMILARITY_THRESHOLD: f64 = 0.40;
+
+/// The most leftover preimage x postimage candidate pairs the fuzzy third rule
+/// of [`pair_endpoints`] will score. Scoring is O(P x Q); past this cap the
+/// rule is skipped for the whole diff and leftovers report as plain
+/// delete+introduce -- the pre-feature baseline, never worse than it.
+const FUZZY_PAIRING_CANDIDATE_CAP: usize = 250_000;
+
+/// The largest total-bag-weight mismatch [`pair_endpoints`] will bother
+/// scoring: the larger side may outweigh the smaller by at most this factor.
+const FUZZY_WEIGHT_RATIO_LIMIT: f64 = 3.0;
+
+// The prefilter is sound only while a maximally-mismatched pair still cannot
+// reach the acceptance threshold: 1 / limit must stay below it.
+const _: () = assert!(1.0 / FUZZY_WEIGHT_RATIO_LIMIT < BODY_MOVE_SIMILARITY_THRESHOLD);
+
+/// Whether two token bags' total IDF weights are close enough in size that
+/// [`body_similarity`] could reach [`BODY_MOVE_SIMILARITY_THRESHOLD`].
+///
+/// A pure fast-path, not a behavior change: weighted bag Jaccard is bounded by
+/// the ratio of the two bags' total weights -- the intersection sums
+/// `w * min(ca, cb)`, at most the smaller bag's total, while the union sums
+/// `w * max(ca, cb)`, at least the larger bag's total -- so a pair whose
+/// totals differ by more than [`FUZZY_WEIGHT_RATIO_LIMIT`] scores below
+/// `1 / limit = 0.33..`, under the 0.40 threshold, and skipping it cannot
+/// change the outcome.
+fn within_fuzzy_weight_ratio(weight_a: f64, weight_b: f64) -> bool {
+    weight_a.max(weight_b) <= FUZZY_WEIGHT_RATIO_LIMIT * weight_a.min(weight_b)
+}
 
 /// A normalized token sequence for a symbol's body, or `None` when the body is
 /// too trivial to identify a move by content alone.
@@ -1566,34 +1676,68 @@ fn tokenize_into(line: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Multiset (bag) Jaccard similarity of two token sequences, in `[0.0, 1.0]`.
+/// Per-token IDF weights over a diff-local document-frequency pool.
 ///
-/// Frequency-weighted: the shared size sums `min(count_a, count_b)` per token
-/// and the total sums `max`, so a token used three times on one side and once
-/// on the other counts as two mismatches, not one. Bag Jaccard tolerates the
-/// scattered token changes a rename introduces -- a variable renamed a handful
-/// of times barely moves the score -- which matters because a relocated symbol
-/// is usually renamed too. The deliberate cost is order-blindness: two bodies
-/// built from the same token bag in a different arrangement score alike. For a
-/// move-pairing heuristic guarded by a threshold and one-to-one assignment that
-/// is an acceptable trade; distinct real functions carry distinct token bags.
-fn body_similarity(a: &[String], b: &[String]) -> f64 {
+/// Each item of `pool` is one symbol body's token sequence; the pool should
+/// hold EVERY tokenizable body on both endpoints of the diff (including
+/// identity-paired ones), so the weights reflect what is common *in this
+/// change*. With `N` bodies and `df(t)` = the number of bodies whose token
+/// multiset contains `t` (each body counted once per distinct token), the
+/// weight is `ln((N + 1) / (df(t) + 0.5))`: boilerplate every body shares
+/// (braces, keywords, common type names) weighs near zero, while tokens unique
+/// to one body dominate. Computed per diff -- no shipped background table.
+fn diff_local_idf<'a>(pool: impl Iterator<Item = &'a [String]>) -> HashMap<&'a str, f64> {
+    let mut df: HashMap<&str, usize> = HashMap::new();
+    let mut n = 0usize;
+    for sig in pool {
+        n += 1;
+        let distinct: HashSet<&str> = sig.iter().map(String::as_str).collect();
+        for token in distinct {
+            *df.entry(token).or_default() += 1;
+        }
+    }
+    let n = n as f64;
+    df.into_iter()
+        .map(|(token, count)| (token, ((n + 1.0) / (count as f64 + 0.5)).ln()))
+        .collect()
+}
+
+/// IDF-weighted multiset (bag) Jaccard similarity of two token sequences, in
+/// `[0.0, 1.0]`.
+///
+/// Per token `t` with counts `ca`/`cb` in the two bags, the shared size sums
+/// `w(t) * min(ca, cb)` and the total sums `w(t) * max(ca, cb)`, with `w`
+/// taken from `idf` (see [`diff_local_idf`]). Weighting by rarity is what
+/// separates a genuine relocation from structural coincidence: two bodies that
+/// agree only on braces, keywords and common calls share almost no weight,
+/// while agreement on rare identifiers -- the tokens that actually identify
+/// the logic -- counts heavily. Both bags are drawn from the df pool, so every
+/// token has an entry; the `ln 2` fallback (a body absent from the pool, e.g.
+/// in a unit test) mirrors an unseen token's `df = 0` weight at `N = 1`.
+///
+/// The tolerated costs are unchanged from the unweighted version: bag
+/// semantics forgive the scattered token changes a rename introduces, and
+/// order-blindness means two arrangements of one token bag score alike --
+/// acceptable for a move-pairing heuristic guarded by a threshold and
+/// one-to-one assignment.
+fn body_similarity(a: &[String], b: &[String], idf: &HashMap<&str, f64>) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-    let mut counts: HashMap<&str, i32> = HashMap::new();
+    let mut counts: HashMap<&str, (u32, u32)> = HashMap::new();
     for token in a {
-        *counts.entry(token).or_default() += 1;
+        counts.entry(token).or_default().0 += 1;
     }
     for token in b {
-        *counts.entry(token).or_default() -= 1;
+        counts.entry(token).or_default().1 += 1;
     }
-    // Sum of |count| is the symmetric difference of the two bags; each bag has
-    // `a.len()`/`b.len()` elements, so intersection = (|a|+|b|-symdiff)/2.
-    let symmetric_difference: i32 = counts.values().map(|c| c.abs()).sum();
-    let total = a.len() + b.len();
-    let intersection = (total as i32 - symmetric_difference) as f64 / 2.0;
-    let union = total as f64 - intersection;
+    let mut intersection = 0.0;
+    let mut union = 0.0;
+    for (token, (ca, cb)) in counts {
+        let weight = idf.get(token).copied().unwrap_or(std::f64::consts::LN_2);
+        intersection += weight * f64::from(ca.min(cb));
+        union += weight * f64::from(ca.max(cb));
+    }
     if union == 0.0 {
         0.0
     } else {
@@ -2026,20 +2170,58 @@ mod tests {
     use super::{
         BODY_MOVE_SIMILARITY_THRESHOLD, ChangedLines, CommitSymbol, FileChange, RevisionTempDir,
         SymbolKey, SymbolSnapshot, body_similarity, body_token_signature, create_private_dirs,
-        is_pure_line_shift, pair_endpoints, write_private_file,
+        diff_local_idf, is_pure_line_shift, pair_endpoints, within_fuzzy_weight_ratio,
+        write_private_file,
     };
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
     /// Tokenize with the production normalizer, then score -- the path a real
-    /// symbol body takes.
+    /// symbol body takes. The df pool is just the two bodies, the smallest
+    /// diff-local pool a scored pair can occur in.
     fn similarity(a_name: &str, a_src: &str, b_name: &str, b_src: &str) -> f64 {
         let lines_a = a_src.lines().count();
         let lines_b = b_src.lines().count();
         let a = body_token_signature(a_src, a_name, 1, lines_a).unwrap();
         let b = body_token_signature(b_src, b_name, 1, lines_b).unwrap();
-        body_similarity(&a, &b)
+        let idf = diff_local_idf([a.as_slice(), b.as_slice()].into_iter());
+        body_similarity(&a, &b, &idf)
+    }
+
+    /// The weighted-Jaccard arithmetic against a value computed by hand.
+    ///
+    /// Pool of N = 3 bodies: A = [a, a, b, x], B = [a, b, y], C = [b].
+    /// df: a -> 2, b -> 3, x -> 1, y -> 1. Weights w(t) = ln((N+1)/(df+0.5)):
+    ///   w(a) = ln(4/2.5) = ln 1.6,  w(b) = ln(4/3.5) = ln(8/7),
+    ///   w(x) = w(y) = ln(4/1.5) = ln(8/3).
+    /// Score(A, B) = [w(a)*min(2,1) + w(b)*min(1,1)]
+    ///             / [w(a)*max(2,1) + w(b)*max(1,1) + w(x)*1 + w(y)*1]
+    ///   = (0.4700036 + 0.1335314)
+    ///   / (0.9400073 + 0.1335314 + 0.9808293 + 0.9808293)
+    ///   = 0.6035350 / 3.0351972 = 0.1988454...
+    #[test]
+    fn body_similarity_matches_hand_computed_idf_weighted_score() {
+        let bag =
+            |tokens: &[&str]| -> Vec<String> { tokens.iter().map(|t| t.to_string()).collect() };
+        let a = bag(&["a", "a", "b", "x"]);
+        let b = bag(&["a", "b", "y"]);
+        let c = bag(&["b"]);
+        let idf = diff_local_idf([a.as_slice(), b.as_slice(), c.as_slice()].into_iter());
+
+        let w_a = (4.0f64 / 2.5).ln();
+        let w_b = (4.0f64 / 3.5).ln();
+        let w_xy = (4.0f64 / 1.5).ln();
+        assert_eq!(idf.get("a").copied(), Some(w_a));
+        assert_eq!(idf.get("b").copied(), Some(w_b));
+        assert_eq!(idf.get("x").copied(), Some(w_xy));
+        assert_eq!(idf.get("y").copied(), Some(w_xy));
+
+        let score = body_similarity(&a, &b, &idf);
+        assert!(
+            (score - 0.198_845_409_580_926_95).abs() < 1e-12,
+            "hand-computed weighted Jaccard mismatch: got {score}"
+        );
     }
 
     fn symbol_at(path: &str, start_line: usize) -> CommitSymbol {
@@ -2146,8 +2328,10 @@ mod tests {
             1.0
         );
 
-        // Move + rename + an internal variable rename (sum -> total): still well
-        // above the pairing threshold.
+        // Move + rename + an internal variable rename (sum -> total): still
+        // above the pairing threshold on the IDF-weighted scale (~0.58 with
+        // this two-body pool: the differing accumulator names are the rarest
+        // tokens, so they weigh heaviest).
         let edited = accumulate_body("sum_all", "total");
         let score = similarity("compute_total", &foo, "sum_all", &edited);
         assert!(
@@ -2155,7 +2339,8 @@ mod tests {
             "renamed move with an internal rename scored {score}, below threshold"
         );
 
-        // Unrelated function: must fall well below the threshold.
+        // Unrelated function: must fall well below the threshold (~0.10 here;
+        // the bodies agree mostly on low-weight punctuation and keywords).
         let unrelated = "pub fn greet(name: &str) -> String {\n    let mut out = String::new();\n    out.push_str(name);\n    out.push('!');\n    out\n}\n";
         let score = similarity("compute_total", &foo, "greet", unrelated);
         assert!(
@@ -2222,7 +2407,23 @@ mod tests {
         assert_eq!(pairing.pairs.len(), 1, "the renamed move should pair");
         assert_eq!(pairing.pairs[0].0.symbol.fqn, "a::compute_total");
         assert_eq!(pairing.pairs[0].1.symbol.fqn, "b::sum_all");
-        assert!(pairing.fallback_paired.contains(&pairing.pairs[0].0.key));
+        let score = pairing
+            .fallback_paired
+            .get(&pairing.pairs[0].0.key)
+            .copied()
+            .expect("fuzzy pair records its similarity score");
+        assert!(
+            score >= BODY_MOVE_SIMILARITY_THRESHOLD,
+            "recorded score {score} must clear the threshold"
+        );
+        assert_eq!(
+            pairing
+                .fallback_paired
+                .get(&pairing.pairs[0].1.key)
+                .copied(),
+            Some(score),
+            "both endpoints map to the pair's score"
+        );
         // greet stayed unpaired -- not a false-positive move.
         assert_eq!(pairing.preimage_only.len(), 1);
         assert_eq!(pairing.preimage_only[0].symbol.fqn, "a::greet");
@@ -2274,6 +2475,144 @@ mod tests {
             vec![("a::compute_total", "b::sum_all"), ("a::render", "b::draw")],
             "each move claimed its own twin"
         );
+    }
+
+    /// The flat-fqn identity guard: an unqualified fqn (fqn == bare name, as
+    /// flat-namespace languages produce) may identity-pair only within one
+    /// path. Unrelated same-name functions in different files must not pair;
+    /// a genuine cross-file move is recovered by the body-similarity rule.
+    #[test]
+    fn unqualified_identity_requires_a_matching_path() {
+        // Two unrelated same-name `updateConfig` functions, a.js deleted,
+        // b.js added, dissimilar bodies: refuse the identity pair AND the
+        // fuzzy pair -- report delete+introduce.
+        let before = BTreeMap::from([{
+            let src = "pub fn updateConfig(c: &mut Config) {\n    c.retries = 3;\n    c.verbose = true;\n    c.apply();\n}\n";
+            let s = snap_src("updateConfig", "updateConfig", "src/a.js", src);
+            (s.key.clone(), s)
+        }]);
+        let after = BTreeMap::from([{
+            let src = "pub fn updateConfig(db: &Db) -> Row {\n    let row = db.fetch(\"config\");\n    db.write(&row);\n    row\n}\n";
+            let s = snap_src("updateConfig", "updateConfig", "src/b.js", src);
+            (s.key.clone(), s)
+        }]);
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert!(
+            pairing.pairs.is_empty(),
+            "unrelated same-name flat symbols must not pair"
+        );
+        assert_eq!(pairing.preimage_only.len(), 1);
+        assert_eq!(pairing.postimage_only.len(), 1);
+        assert!(pairing.fallback_paired.is_empty());
+
+        // A true cross-file move of an unqualified symbol with an identical
+        // body: rule 1 refuses it, but body similarity pairs it and records
+        // the score a MovedSymbol will surface.
+        let src = "pub fn updateConfig(c: &mut Config) {\n    c.retries = 3;\n    c.verbose = true;\n    c.apply();\n}\n";
+        let before = BTreeMap::from([{
+            let s = snap_src("updateConfig", "updateConfig", "src/a.js", src);
+            (s.key.clone(), s)
+        }]);
+        let after = BTreeMap::from([{
+            let s = snap_src("updateConfig", "updateConfig", "src/b.js", src);
+            (s.key.clone(), s)
+        }]);
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert_eq!(
+            pairing.pairs.len(),
+            1,
+            "an identical body pairs the true move"
+        );
+        let score = pairing
+            .fallback_paired
+            .get(&pairing.pairs[0].0.key)
+            .copied()
+            .expect("the recovered move is a fuzzy pair and carries a score");
+        assert!(score >= BODY_MOVE_SIMILARITY_THRESHOLD);
+
+        // A qualified fqn (fqn != bare name) still identity-pairs across a
+        // path change exactly as before the guard.
+        let before = BTreeMap::from([{
+            let s = snap_src("a.Foo.bar", "bar", "src/Foo.java", src);
+            (s.key.clone(), s)
+        }]);
+        let after = BTreeMap::from([{
+            let s = snap_src("a.Foo.bar", "bar", "src/other/Foo.java", src);
+            (s.key.clone(), s)
+        }]);
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert_eq!(
+            pairing.pairs.len(),
+            1,
+            "qualified fqns keep identity pairing"
+        );
+        assert!(
+            pairing.fallback_paired.is_empty(),
+            "an identity pair is not a fuzzy pair"
+        );
+    }
+
+    /// The size-ratio prefilter: candidate enumeration must skip pairs whose
+    /// total bag weights differ by more than the limit -- they provably cannot
+    /// reach the threshold -- and keep everything at or under it.
+    #[test]
+    fn fuzzy_prefilter_skips_pairs_beyond_the_weight_ratio_limit() {
+        assert!(within_fuzzy_weight_ratio(1.0, 1.0));
+        assert!(within_fuzzy_weight_ratio(1.0, 2.0));
+        assert!(
+            within_fuzzy_weight_ratio(1.0, 3.0),
+            "the boundary is inclusive"
+        );
+        assert!(!within_fuzzy_weight_ratio(1.0, 3.01));
+        assert!(
+            !within_fuzzy_weight_ratio(4.0, 1.0),
+            "symmetric in its arguments"
+        );
+
+        // Behavior level: a body that is an identical prefix of a ~4x-larger
+        // one never pairs -- the weight mismatch alone rules the pair out.
+        let small = "pub fn part(a: u32) -> u32 {\n    let alpha = a + 1;\n    alpha * 2\n}\n";
+        let large = "pub fn whole(a: u32) -> u32 {\n    let alpha = a + 1;\n    let beta = alpha * 2;\n    let gamma = beta ^ 0x5f;\n    let delta = gamma.rotate_left(7);\n    let epsilon = delta.wrapping_mul(31);\n    let zeta = epsilon | 0b1010;\n    let eta = zeta >> 3;\n    let theta = eta + 0o17;\n    let iota = theta.count_ones();\n    let kappa = iota.pow(2);\n    kappa\n}\n";
+        let before = BTreeMap::from([{
+            let s = snap_src("a::part", "part", "src/a.rs", small);
+            (s.key.clone(), s)
+        }]);
+        let after = BTreeMap::from([{
+            let s = snap_src("b::whole", "whole", "src/b.rs", large);
+            (s.key.clone(), s)
+        }]);
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert!(pairing.pairs.is_empty());
+        assert!(pairing.fallback_paired.is_empty());
+        assert_eq!(pairing.preimage_only.len(), 1);
+        assert_eq!(pairing.postimage_only.len(), 1);
+    }
+
+    /// The hard candidate cap: past `FUZZY_PAIRING_CANDIDATE_CAP` leftover
+    /// pre x post combinations, the fuzzy rule is skipped wholesale and every
+    /// leftover reports as plain delete+introduce -- even identical bodies
+    /// that would otherwise pair at score 1.0.
+    #[test]
+    fn fuzzy_pairing_is_skipped_past_the_candidate_cap() {
+        // 501 x 500 = 250_500 > 250_000. All bodies identical and substantial;
+        // the symbol names do not occur in the body, so every token signature
+        // is identical and every pair would score 1.0 if scored.
+        let body = accumulate_body("worker", "sum");
+        let mut before = BTreeMap::new();
+        for i in 0..501 {
+            let s = snap_src(&format!("a::sym{i}"), &format!("sym{i}"), "src/a.rs", &body);
+            before.insert(s.key.clone(), s);
+        }
+        let mut after = BTreeMap::new();
+        for i in 0..500 {
+            let s = snap_src(&format!("b::sym{i}"), &format!("sym{i}"), "src/b.rs", &body);
+            after.insert(s.key.clone(), s);
+        }
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert!(pairing.pairs.is_empty(), "past the cap nothing may pair");
+        assert!(pairing.fallback_paired.is_empty());
+        assert_eq!(pairing.preimage_only.len(), 501);
+        assert_eq!(pairing.postimage_only.len(), 500);
     }
 
     #[test]
@@ -2366,6 +2705,111 @@ mod entry_point_tests {
                 .collect::<Vec<_>>(),
             vec!["Existing"],
             "the analyzer's project root is the repository that gets diffed"
+        );
+    }
+
+    /// End-to-end over a real repository: a fuzzy-paired move (relocated AND
+    /// renamed, so only body similarity lines it up) carries `similarity:
+    /// Some(score >= threshold)`, while a move paired by identity or a Git
+    /// rename reports `similarity: None`.
+    #[test]
+    fn analyze_diff_reports_similarity_only_for_fuzzy_moved_pairs() {
+        let temp = RevisionTempDir::new("fuzzy-move-entry").unwrap();
+        let root = temp.path();
+        let repo = Repository::init(root).unwrap();
+        let signature = git2::Signature::now("Tester", "tester@example.com").unwrap();
+        let accumulate = |name: &str, acc: &str| {
+            format!(
+                "func {name}(xs []int) int {{\n\t{acc} := 0\n\tfor _, x := range xs {{\n\t\t{acc} += x\n\t\tif x > 10 {{\n\t\t\t{acc} += 2\n\t\t}}\n\t}}\n\treturn {acc}\n}}\n"
+            )
+        };
+        let keep = "func Keep() int {\n\tv := 3\n\tv *= 7\n\treturn v\n}\n";
+        let commit = |parent: Option<Oid>, message: &str, files: &[&str]| {
+            let mut index = repo.index().unwrap();
+            index.clear().unwrap();
+            for file in files {
+                index.add_path(Path::new(file)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = parent
+                .into_iter()
+                .map(|oid| repo.find_commit(oid).unwrap())
+                .collect();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents.iter().collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+
+        // Base: ComputeTotal lives in lib.go, Keep in keep.go.
+        fs::write(
+            root.join("lib.go"),
+            format!("package sample\n\n{}", accumulate("ComputeTotal", "sum")),
+        )
+        .unwrap();
+        fs::write(root.join("keep.go"), format!("package sample\n\n{keep}")).unwrap();
+        let base = commit(None, "base", &["lib.go", "keep.go"]);
+
+        // Target: ComputeTotal moves to other.go as SumAll with a renamed
+        // accumulator -- only the fuzzy third rule can pair it -- while keep.go
+        // is renamed wholesale with Keep untouched, which pairs by identity or
+        // the Git-rename bucket.
+        fs::write(root.join("lib.go"), "package sample\n").unwrap();
+        fs::write(
+            root.join("other.go"),
+            format!("package sample\n\n{}", accumulate("SumAll", "total")),
+        )
+        .unwrap();
+        fs::remove_file(root.join("keep.go")).unwrap();
+        fs::write(root.join("kept.go"), format!("package sample\n\n{keep}")).unwrap();
+        let head = commit(Some(base), "move", &["lib.go", "other.go", "kept.go"]);
+
+        let analyzer = build_analyzer(
+            root,
+            &[
+                PathBuf::from("lib.go"),
+                PathBuf::from("other.go"),
+                PathBuf::from("kept.go"),
+            ],
+        )
+        .unwrap();
+        let result = analyze_diff(
+            analyzer.analyzer(),
+            AnalyzeDiffParams {
+                base: Some(base.to_string()),
+                target: Some(head.to_string()),
+                include_tests: true,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .unwrap();
+
+        let moved = &result.patch_symbols.moved;
+        let fuzzy = moved
+            .iter()
+            .find(|entry| entry.after.name == "SumAll")
+            .expect("the renamed move should be reported as moved");
+        assert_eq!(fuzzy.before.name, "ComputeTotal");
+        let score = fuzzy
+            .similarity
+            .expect("a fuzzy-paired move carries its similarity score");
+        assert!(
+            score >= BODY_MOVE_SIMILARITY_THRESHOLD,
+            "reported similarity {score} must clear the threshold"
+        );
+        let exact = moved
+            .iter()
+            .find(|entry| entry.after.name == "Keep")
+            .expect("the renamed-file move should be reported as moved");
+        assert_eq!(
+            exact.similarity, None,
+            "a move paired by identity or Git rename must not report a score"
         );
     }
 

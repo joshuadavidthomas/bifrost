@@ -1852,6 +1852,11 @@ fn rust_visible_import_resolution(
             match binding.kind {
                 ImportKind::Named => {
                     let imported = binding.imported_name.as_deref().unwrap_or(reference);
+                    targets.extend(
+                        resolve_module_files(rust, file, &binding.module_specifier)
+                            .into_iter()
+                            .map(|target_file| (target_file, imported.to_string())),
+                    );
                     if import_package_resolves_to_file(
                         file,
                         source,
@@ -1862,6 +1867,11 @@ fn rust_visible_import_resolution(
                     }
                 }
                 ImportKind::Namespace => {
+                    targets.extend(rust_namespace_import_parent_targets(
+                        rust,
+                        file,
+                        &binding.module_specifier,
+                    ));
                     if let Some(name) = import_path_resolves_within_file(
                         file,
                         source,
@@ -1885,9 +1895,11 @@ fn rust_visible_import_resolution(
                 },
             );
         candidates.extend(routed_glob_candidates);
+        let mut resolved_through_import_chain = false;
         for (target_file, target_name) in targets {
             let resolved =
                 rust_import_target_candidates(rust, support, target_file, target_name, role);
+            resolved_through_import_chain |= resolved.resolved_through_import_chain;
             candidates.extend(resolved.candidates);
             crossed_unindexed_explicit_binding |= resolved.crossed_unindexed_explicit_binding;
         }
@@ -1921,7 +1933,14 @@ fn rust_visible_import_resolution(
                     .collect();
                 if !expected.is_empty() {
                     candidates = expected;
-                } else if !preserve_unqualified_namespace_candidates {
+                } else if !preserve_unqualified_namespace_candidates
+                    && (!resolved_through_import_chain || role == RustBareReferenceRole::Value)
+                {
+                    // A structured import chain can prove a renamed type,
+                    // owner, callable, or macro. It cannot make a mismatched
+                    // value candidate exact: Rust's value namespace also
+                    // contains enum variants and constructors with the same
+                    // terminal name.
                     candidates.clear();
                 }
             }
@@ -2127,6 +2146,7 @@ fn rust_scoped_glob_forward_import_candidates(
     saw_scoped_glob.then_some(RustImportTargetCandidates {
         candidates,
         crossed_unindexed_explicit_binding,
+        resolved_through_import_chain: false,
     })
 }
 
@@ -2198,9 +2218,36 @@ fn import_path_resolves_within_file(
     (parent == file_package).then(|| name.clone())
 }
 
+/// Preserve the physical parent-module route for a namespace-shaped import.
+///
+/// `use super::Error` can name a private import in the parent module. Public
+/// export traversal correctly omits that binding, but Rust makes it visible to
+/// child modules. Return the parent module files and terminal name so
+/// `rust_import_target_candidates` can follow the parent's lexical binder.
+fn rust_namespace_import_parent_targets(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    module_specifier: &str,
+) -> Vec<(ProjectFile, String)> {
+    let segments =
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, module_specifier);
+    let Some((terminal, parent_segments)) = segments.split_last() else {
+        return Vec::new();
+    };
+    if parent_segments.is_empty() {
+        return Vec::new();
+    }
+    let parent_specifier = parent_segments.join("::");
+    resolve_module_files(rust, file, &parent_specifier)
+        .into_iter()
+        .map(|parent_file| (parent_file, terminal.clone()))
+        .collect()
+}
+
 struct RustImportTargetCandidates {
     candidates: Vec<CodeUnit>,
     crossed_unindexed_explicit_binding: bool,
+    resolved_through_import_chain: bool,
 }
 
 fn rust_import_target_candidates(
@@ -2212,6 +2259,7 @@ fn rust_import_target_candidates(
 ) -> RustImportTargetCandidates {
     let mut candidates = Vec::new();
     let mut crossed_explicit_binding = false;
+    let mut followed_import_chain = false;
     let mut pending = vec![(target_file, target_name)];
     let mut visited = HashSet::default();
     while let Some((file, name)) = pending.pop() {
@@ -2234,17 +2282,11 @@ fn rust_import_target_candidates(
         let Ok(source) = file.read_to_string() else {
             continue;
         };
-        let binder = lexical_scope::visible_import_binder_at(&source, 0);
+        let binder = lexical_scope::visible_import_binder_at(&source, source.len());
         if rust_binder_has_external_binding(&binder, &name) {
             crossed_explicit_binding = true;
-            if let Some(fqn) = rust.reference_context_of(&file).resolve_bare(&name) {
-                candidates.extend(
-                    support
-                        .fqn(fqn)
-                        .into_iter()
-                        .filter(|candidate| rust_role_accepts_imported(rust, role, candidate)),
-                );
-            }
+            followed_import_chain = true;
+            pending.extend(rust_forward_import_targets(rust, &file, &binder, &name));
             continue;
         }
         pending.extend(rust_forward_import_targets(rust, &file, &binder, &name));
@@ -2253,6 +2295,7 @@ fn rust_import_target_candidates(
     candidates.dedup();
     RustImportTargetCandidates {
         crossed_unindexed_explicit_binding: crossed_explicit_binding && candidates.is_empty(),
+        resolved_through_import_chain: followed_import_chain && !candidates.is_empty(),
         candidates,
     }
 }
