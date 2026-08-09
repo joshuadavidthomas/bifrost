@@ -1,6 +1,7 @@
 # Design: ProjectFile identity cost - staged repair
 
-Status: DESIGN FOR OWNER REVIEW. No implementation until approved. Author: Fable, 2026-08-09.
+Status: Stage 1 APPROVED, IMPLEMENTING. Stage 2 remains unapproved and is gated on the Stage 1
+re-profile; see the OWNER REVIEW NOTE below. Author: Fable, 2026-08-09.
 Substrate: `.agents/docs/` companions (graph-read-cost-investigation, gate-cell-overhead) and the
 fresh profile `graph-churn-profile-v1.md` (session scratchpad; check in with the first
 implementation commit). Governing rule: AGENTS.md Implementation details - "Do not use reference
