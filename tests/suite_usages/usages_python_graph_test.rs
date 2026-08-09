@@ -3793,6 +3793,30 @@ fn module_qualified_annotation_resolves_module_function_target() {
 }
 
 #[test]
+fn union_annotation_records_each_bare_class_reference() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "style.py",
+            "class Selected:\n    pass\n\nclass Ignored:\n    pass\n\nclass Decision:\n    Selected = 'selected'\n    Ignored = 'ignored'\n\nclass Engine:\n    def choose(self) -> Selected | Ignored:\n        return Selected()\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "style.Ignored");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve each member of a union annotation");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("Selected | Ignored")),
+        "{hits:#?}"
+    );
+}
+
+#[test]
 fn module_qualified_value_reference_resolves_module_field_target() {
     // Control: the value position always worked and must keep working.
     let source = "import op_tree\n\nvalue = op_tree.OP_TREE\n";

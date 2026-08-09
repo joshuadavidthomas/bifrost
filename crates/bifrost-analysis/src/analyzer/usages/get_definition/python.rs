@@ -1731,12 +1731,17 @@ fn python_visible_same_file_candidates(
     candidates
         .iter()
         .filter(|candidate| {
-            analyzer.parent_of(candidate).is_some_and(|parent| {
-                parent.is_module()
-                    || enclosing_class
-                        .as_ref()
-                        .is_some_and(|scope| scope == &parent)
-            })
+            !candidate.is_module()
+                && analyzer.parent_of(candidate).is_some_and(|parent| {
+                    parent.is_module()
+                        || enclosing_class
+                            .as_ref()
+                            .is_some_and(|scope| scope == &parent)
+                            && analyzer
+                                .ranges(candidate)
+                                .iter()
+                                .any(|range| range.end_byte <= node.start_byte())
+                })
         })
         .cloned()
         .collect()
