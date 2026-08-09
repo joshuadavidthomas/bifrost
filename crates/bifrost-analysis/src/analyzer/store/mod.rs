@@ -29,11 +29,12 @@ use brokk_bifrost_core::cache_db::{
 };
 
 use brokk_bifrost_core::analyzer::rust_facts::{
-    RustExportFact, RustIdentifierOccurrence, RustImportTargetFact, RustIncludeEdgeFact,
-    RustIncludeHostBindingFact, RustMacroGateFact, RustModuleFact, RustModuleRouteFact,
-    RustModuleRouteFacts, RustModuleScopeFact, RustRulesItemMacroDefinition, RustUsageFacts,
-    RustVisibility, decode_rust_include_binding_kind, decode_rust_visibility,
-    encode_rust_include_binding_kind, encode_rust_visibility,
+    RustCfgCondition, RustExportFact, RustIdentifierOccurrence, RustImportTargetFact,
+    RustIncludeEdgeFact, RustIncludeHostBindingFact, RustMacroGateFact, RustModuleFact,
+    RustModuleRouteFact, RustModuleRouteFacts, RustModuleScopeFact, RustRulesItemMacroDefinition,
+    RustUsageFacts, RustVisibility, decode_rust_cfg_condition, decode_rust_include_binding_kind,
+    decode_rust_visibility, encode_rust_cfg_condition, encode_rust_include_binding_kind,
+    encode_rust_visibility,
 };
 
 use crate::CancellationToken;
@@ -4400,7 +4401,7 @@ struct RustModuleRow {
 }
 
 /// One `rust_import_targets` row. Named fields rather than positional columns
-/// because there are eleven of them at the binding site.
+/// because there are twelve of them at the binding site.
 #[derive(Debug)]
 struct RustImportTargetRow {
     ordinal: i64,
@@ -4408,7 +4409,9 @@ struct RustImportTargetRow {
     bound_name: Option<String>,
     imported_name: Option<String>,
     is_glob: i64,
+    is_extern_crate: i64,
     visibility: String,
+    cfg_condition: String,
     owner_module: String,
     owner_start: i64,
     owner_end: i64,
@@ -4447,7 +4450,9 @@ impl RustFactRows {
                     bound_name: target.bound_name.clone(),
                     imported_name: target.imported_name.clone(),
                     is_glob: bool_to_i64(target.is_glob),
+                    is_extern_crate: bool_to_i64(target.is_extern_crate),
                     visibility: encode_rust_visibility(&target.visibility),
+                    cfg_condition: encode_rust_cfg_condition(&target.cfg_condition),
                     owner_module: target.owner_module.clone(),
                     owner_start: usize_to_i64(target.owner_start)?,
                     owner_end: usize_to_i64(target.owner_end)?,
@@ -4702,8 +4707,9 @@ fn insert_rust_fact_rows(
         let mut stmt = tx.prepare(
             "INSERT OR IGNORE INTO rust_import_targets(
                blob_oid, lang, ordinal, module_path, bound_name, imported_name, is_glob,
-               visibility, owner_module, owner_start, owner_end, local_start, local_end
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+               is_extern_crate, visibility, cfg_condition, owner_module, owner_start,
+               owner_end, local_start, local_end
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )?;
         for row in &rows.import_targets {
             stmt.execute(params![
@@ -4714,7 +4720,9 @@ fn insert_rust_fact_rows(
                 row.bound_name,
                 row.imported_name,
                 row.is_glob,
+                row.is_extern_crate,
                 row.visibility,
+                row.cfg_condition,
                 row.owner_module,
                 row.owner_start,
                 row.owner_end,
@@ -4902,7 +4910,8 @@ fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<Rus
     {
         let mut stmt = conn.prepare_cached(
             "SELECT module_path, bound_name, imported_name, is_glob, visibility,
-                    owner_module, owner_start, owner_end, local_start, local_end
+                    owner_module, owner_start, owner_end, local_start, local_end,
+                    cfg_condition, is_extern_crate
              FROM rust_import_targets
              WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
         )?;
@@ -4913,7 +4922,9 @@ fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<Rus
                     bound_name: row.get(1)?,
                     imported_name: row.get(2)?,
                     is_glob: row.get::<_, i64>(3)? != 0,
+                    is_extern_crate: row.get::<_, i64>(11)? != 0,
                     visibility: RustVisibility::Private,
+                    cfg_condition: RustCfgCondition::Always,
                     owner_module: row.get(5)?,
                     owner_start: 0,
                     owner_end: 0,
@@ -4924,12 +4935,23 @@ fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<Rus
                 row.get::<_, i64>(7)?,
                 row.get::<_, Option<i64>>(8)?,
                 row.get::<_, Option<i64>>(9)?,
+                row.get::<_, String>(10)?,
             ))
         })?;
         for row in rows {
-            let (mut target, visibility, owner_start, owner_end, local_start, local_end) = row?;
+            let (
+                mut target,
+                visibility,
+                owner_start,
+                owner_end,
+                local_start,
+                local_end,
+                cfg_condition,
+            ) = row?;
             target.visibility = decode_rust_visibility(&visibility)
                 .unwrap_or_else(|| panic!("unknown persisted Rust visibility: {visibility}"));
+            target.cfg_condition = decode_rust_cfg_condition(&cfg_condition)
+                .unwrap_or_else(|| panic!("unknown persisted Rust cfg condition: {cfg_condition}"));
             target.owner_start = i64_to_usize(owner_start)?;
             target.owner_end = i64_to_usize(owner_end)?;
             target.local_extent = match (local_start, local_end) {

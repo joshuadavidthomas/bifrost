@@ -22,7 +22,7 @@
 //! implementations read retained analyzer state only.
 
 use crate::graph::ast::is_rust_declaration_name;
-use crate::graph_support::RustUsageSource;
+use crate::graph_support::RustFactSource;
 use crate::proof::{RustNameProof, RustProofGap, record_rust_name_proof};
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
@@ -131,7 +131,7 @@ impl RustExternalEvidence for UnindexedRustDependencies {
 /// `external` answers for crates outside the workspace. The caller produces all
 /// three -- see the analysis-side entry point of the same name.
 pub fn collect_rust_semantic_diagnostics(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn BoundedDefinitionLookup,
     external: &dyn RustExternalEvidence,
     file: &ProjectFile,
@@ -187,7 +187,7 @@ pub fn collect_rust_semantic_diagnostics(
 }
 
 struct RustDiagnosticCollector<'a, 'tree> {
-    rust: &'a dyn RustUsageSource,
+    rust: &'a dyn RustFactSource,
     support: &'a dyn BoundedDefinitionLookup,
     external: &'a dyn RustExternalEvidence,
     file: &'a ProjectFile,

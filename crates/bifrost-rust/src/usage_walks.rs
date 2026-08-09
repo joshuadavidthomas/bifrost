@@ -42,8 +42,9 @@ use crate::graph_support::{
 };
 use crate::imports::{
     resolve_rust_module_path_with_crate, resolve_rust_module_segments_with_crate,
-    rust_crate_root_package,
+    rust_crate_root_package, rust_target_kind_root_package,
 };
+use crate::lexical_scope::RustCfgCondition;
 use crate::usage::{
     Domain, ModuleKey, RustImportEdge, RustImportEdgeKind, RustImportExtent, RustMacroScopeEdge,
     RustMacroScopeKey, RustMacroScopeRanges, RustModuleAliasRoute, RustOriginRoute,
@@ -615,18 +616,49 @@ impl<'a> RustUsageWalks<'a> {
         );
         files.sort();
         files.dedup();
-        files.retain(|file| {
-            self.cargo_routes.target_relation(importing_file, file)
-                != RustCargoTargetRelation::Disjoint
-        });
-        files
+        let mut routes = files
             .into_iter()
             .map(|file| RustResolvedModuleRoute {
                 target_module: ModuleKey::new(&file, &resolved_module),
                 target_file: file,
                 provenance: RustRouteProvenance::Local,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // Second candidate for a target root file: the same name spelled under
+        // the kind root, where the modules shared with sibling targets live.
+        // Appended, so the target's own route still comes first.
+        if let Some(alternative) = self.kind_root_alternative(importing_file, &resolved_module) {
+            for file in self.files_in_module_package(&alternative).iter() {
+                if routes.iter().all(|route| route.target_file != *file) {
+                    routes.push(RustResolvedModuleRoute {
+                        target_module: ModuleKey::new(file, &alternative),
+                        target_file: file.clone(),
+                        provenance: RustRouteProvenance::Local,
+                    });
+                }
+            }
+        }
+        routes.retain(|route| {
+            self.cargo_routes
+                .target_relation(importing_file, &route.target_file)
+                != RustCargoTargetRelation::Disjoint
+        });
+        routes
+    }
+
+    /// Re-spell `package` -- a name resolved against `importing_file`'s own
+    /// `crate::` root -- under the kind root shared with its sibling targets,
+    /// when that names files and the own-root spelling did not.
+    ///
+    /// This is the second half of the target-root chain: `crate::common::x` and
+    /// `common::x` in `benches/b.rs` first mean this bench's own `common`, and
+    /// only then the `benches/common/mod.rs` every bench shares.
+    fn kind_root_alternative(&self, importing_file: &ProjectFile, package: &str) -> Option<String> {
+        let kind_root = rust_target_kind_root_package(importing_file)?;
+        let own_root = rust_crate_root_package(importing_file);
+        let suffix = package.strip_prefix(&own_root)?;
+        let alternative = format!("{kind_root}{suffix}");
+        (!self.files_in_module_package(&alternative).is_empty()).then_some(alternative)
     }
 
     // ---------------------------------------------------------------- layer 2
@@ -688,6 +720,7 @@ impl<'a> RustUsageWalks<'a> {
                     file,
                     &owner_package,
                     binding.visibility.clone(),
+                    self.cargo_routes.target_roots_for_file(file).contains(file),
                 ) else {
                     continue;
                 };
@@ -750,6 +783,21 @@ impl<'a> RustUsageWalks<'a> {
         importing_module: &str,
         segments: &[String],
     ) -> Vec<RustResolvedModuleRoute> {
+        // Resolve bare paths against the physical module graph first. A child
+        // module with the same name as an ancestor alias owns that path in
+        // Rust's module namespace, so the ancestor walk below must not reach
+        // past it. Cargo paths keep their routed provenance.
+        if !segments.is_empty()
+            && !matches!(
+                segments.first().map(String::as_str),
+                Some("crate" | "self" | "super")
+            )
+        {
+            let direct = self.resolve_segments_plain(importing_file, importing_module, segments);
+            if !direct.is_empty() {
+                return direct;
+            }
+        }
         let crate_package = rust_crate_root_package(importing_file);
         let owner_relative = if segments.is_empty() {
             Some(importing_module.to_string())
@@ -759,15 +807,31 @@ impl<'a> RustUsageWalks<'a> {
         ) {
             resolve_rust_module_segments_with_crate(importing_module, &crate_package, segments)
         } else {
-            Some(if importing_module.is_empty() {
-                segments.join(".")
-            } else {
-                format!("{importing_module}.{}", segments.join("."))
-            })
+            None
         };
-        if let Some(owner_relative) = owner_relative {
-            let candidate = ModuleKey::new(importing_file, &owner_relative);
-            let importing_key = ModuleKey::new(importing_file, importing_module);
+        let importing_key = ModuleKey::new(importing_file, importing_module);
+        // A module alias is visible in its declaring module and in every child
+        // module, so a relative path is tried against the current module first
+        // and then against each lexical ancestor. Without the ancestor walk an
+        // `extern crate dep as alias;` at a crate root is invisible to any
+        // nested module, which is where test modules write it. A rooted path
+        // (`crate::`, `self::`, `super::`) names exactly one owner and takes no
+        // ancestors.
+        let owner_candidates = match owner_relative {
+            Some(owner_relative) => vec![ModuleKey::new(importing_file, &owner_relative)],
+            None => (0..=importing_key.components.len())
+                .rev()
+                .map(|length| ModuleKey {
+                    crate_root: importing_key.crate_root.clone(),
+                    components: importing_key.components[..length]
+                        .iter()
+                        .cloned()
+                        .chain(segments.iter().cloned())
+                        .collect(),
+                })
+                .collect(),
+        };
+        for candidate in owner_candidates {
             let longest = (1..=candidate.components.len()).rev().find_map(|length| {
                 let prefix = ModuleKey {
                     crate_root: candidate.crate_root.clone(),
@@ -1018,6 +1082,7 @@ impl<'a> RustUsageWalks<'a> {
                 &declaration.declaring_file,
                 &declaration.declaring_module,
                 declaration.visibility.clone(),
+                self.is_actual_crate_root(&declaration.declaring_file),
             ) {
                 domains.push(domain);
             }
@@ -1074,9 +1139,12 @@ impl<'a> RustUsageWalks<'a> {
             }
             let owner = &binding.owner_module;
             let propagate_alias = matches!(binding.extent, RustImportExtent::Module { .. });
-            let Some(edge_domain) =
-                direct_import_scope_for_module(file, owner, binding.visibility.clone())
-            else {
+            let Some(edge_domain) = direct_import_scope_for_module(
+                file,
+                owner,
+                binding.visibility.clone(),
+                self.cargo_routes.target_roots_for_file(file).contains(file),
+            ) else {
                 continue;
             };
             let template = |target: RustResolvedModuleRoute,
@@ -1093,6 +1161,7 @@ impl<'a> RustUsageWalks<'a> {
                 domain: edge_domain.clone(),
                 namespace: None,
                 provenance: target.provenance,
+                cfg_condition: binding.cfg_condition.clone(),
             };
             if binding.is_glob {
                 for resolved in self.resolve_segments(file, owner, &binding.path) {
@@ -1106,17 +1175,22 @@ impl<'a> RustUsageWalks<'a> {
             let Some(imported_name) = binding.path.last().cloned() else {
                 continue;
             };
-            for resolved in
-                self.resolve_segments(file, owner, &binding.path[..binding.path.len() - 1])
-            {
-                self.admit_import_edge(
-                    &mut edges,
-                    template(
-                        resolved,
-                        binding.local_name.clone(),
-                        RustImportEdgeKind::Named(imported_name.clone()),
-                    ),
-                );
+            // `extern crate dep as tk;` binds only the crate namespace. Giving
+            // it a named edge would also bind whatever `dep` names in this
+            // module, so `tk::Item` would reach a same-named local `mod dep`.
+            if !binding.is_extern_crate {
+                for resolved in
+                    self.resolve_segments(file, owner, &binding.path[..binding.path.len() - 1])
+                {
+                    self.admit_import_edge(
+                        &mut edges,
+                        template(
+                            resolved,
+                            binding.local_name.clone(),
+                            RustImportEdgeKind::Named(imported_name.clone()),
+                        ),
+                    );
+                }
             }
             for resolved in self.resolve_segments(file, owner, &binding.path) {
                 self.admit_import_edge(
@@ -1465,6 +1539,7 @@ impl<'a> RustUsageWalks<'a> {
                         origin: binding.origin,
                         domain: effective,
                         provenance: edge.provenance,
+                        cfg_condition: edge.cfg_condition.clone(),
                     });
             }
         }
@@ -1741,6 +1816,24 @@ impl<'a> RustUsageWalks<'a> {
             .iter()
             .find(|(candidate, _)| candidate == identity)
             .map(|(_, domains)| domains.clone())
+    }
+
+    /// `declaration_cfg_conditions` for one identity: the `#[cfg(...)]`
+    /// predicates the declaring file's items for it were written under.
+    ///
+    /// An identity the declaring file does not carry proves nothing about its
+    /// guard, so the caller reads the absent answer as `Unknown` rather than as
+    /// `Always`.
+    pub fn declared_cfg_conditions_of(
+        &self,
+        identity: &RustSymbolIdentity,
+    ) -> Option<Vec<RustCfgCondition>> {
+        self.queries
+            .declaration_facts_of(&identity.file)
+            .cfg_conditions
+            .iter()
+            .find(|(candidate, _)| candidate == identity)
+            .map(|(_, conditions)| conditions.clone())
     }
 
     /// Macro declarations in the workspace named `name`. The v1 lookup scanned

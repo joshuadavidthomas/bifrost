@@ -1,12 +1,12 @@
 use crate::declarations::rust_node_text;
 use crate::graph_support::{
-    RustUsageSource, is_rust_enum_declaration, is_rust_struct_declaration,
+    RustFactSource, is_rust_enum_declaration, is_rust_struct_declaration,
     is_rust_trait_declaration, is_rust_type_alias_declaration, resolve_imported_export_from_binder,
     resolve_module_files, rust_named_declaration_node,
 };
 use crate::imports::{resolve_rust_module_path_with_crate, rust_crate_root_package};
 use crate::lexical_scope::{parse_rust_tree, visible_import_binder_at};
-use crate::usage_index::exported_targets_from_files;
+use crate::usage::exported_targets_from_files;
 use brokk_bifrost_core::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
@@ -20,7 +20,7 @@ pub struct RustHierarchyIndex {
 }
 
 pub fn rust_trait_for_impl_member(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     member: &CodeUnit,
 ) -> Option<CodeUnit> {
     let source = rust.project().read_source(member.source()).ok()?;
@@ -48,7 +48,7 @@ pub fn rust_trait_for_impl_member(
 }
 
 pub fn resolve_rust_hierarchy_trait_ref(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     source: &str,
     impl_item: Node<'_>,
@@ -61,7 +61,7 @@ pub fn resolve_rust_hierarchy_trait_ref(
 }
 
 pub fn resolve_rust_hierarchy_type_ref(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     source: &str,
     impl_item: Node<'_>,
@@ -76,7 +76,7 @@ pub fn resolve_rust_hierarchy_type_ref(
 }
 
 pub fn resolve_rust_hierarchy_ref<F>(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     source: &str,
     impl_item: Node<'_>,
@@ -121,7 +121,7 @@ where
 }
 
 pub fn resolve_units_in_module(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     binder: &ImportBinder,
     lexical_package: &str,
@@ -188,7 +188,7 @@ fn resolve_scoped_module_package(
 }
 
 pub fn same_module_declarations(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     source: &str,
     impl_item: Node<'_>,
@@ -202,7 +202,7 @@ pub fn same_module_declarations(
 }
 
 pub fn imported_units(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
@@ -212,7 +212,7 @@ pub fn imported_units(
 }
 
 pub fn units_from_export_targets(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     targets: impl Iterator<Item = (ProjectFile, String)>,
 ) -> Vec<CodeUnit> {
     let mut units: Vec<_> = targets
@@ -228,7 +228,7 @@ pub fn units_from_export_targets(
 }
 
 impl RustHierarchyIndex {
-    pub fn build(rust: &dyn RustUsageSource) -> Self {
+    pub fn build(rust: &dyn RustFactSource) -> Self {
         let mut direct_ancestors: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
         let mut direct_descendants: HashMap<CodeUnit, HashSet<CodeUnit>> = HashMap::default();
         let mut relations = Vec::new();
@@ -288,7 +288,7 @@ impl RustHierarchyIndex {
 }
 
 pub fn canonical_rust_hierarchy_type(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     unit: CodeUnit,
 ) -> Option<CodeUnit> {
     if !is_rust_type_alias_declaration(rust.code_units(), &unit) {

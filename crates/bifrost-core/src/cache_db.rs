@@ -25,7 +25,7 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 20;
+const CURRENT_MIGRATION_VERSION: i64 = 21;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -69,6 +69,8 @@ const RUST_MODULE_ROUTES_SQL: &str =
 const IMPORT_BINDINGS_SQL: &str = include_str!("../migrations/cache/0019-import-bindings.sql");
 const RUST_INCLUDE_EDGES_SQL: &str =
     include_str!("../migrations/cache/0020-rust-include-edges.sql");
+const RUST_IMPORT_CFG_AND_EXTERN_CRATE_SQL: &str =
+    include_str!("../migrations/cache/0021-rust-import-cfg-and-extern-crate.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -90,6 +92,7 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     RUST_MODULE_ROUTES_SQL,
     IMPORT_BINDINGS_SQL,
     RUST_INCLUDE_EDGES_SQL,
+    RUST_IMPORT_CFG_AND_EXTERN_CRATE_SQL,
 ];
 // The store file is named for the schema version that wrote it, and that
 // version is the migration count. Tie the two at compile time so a migration
@@ -150,6 +153,8 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply import bindings migration");
     conn.execute_batch(RUST_INCLUDE_EDGES_SQL)
         .expect("apply Rust include edges migration");
+    conn.execute_batch(RUST_IMPORT_CFG_AND_EXTERN_CRATE_SQL)
+        .expect("apply Rust import cfg and extern-crate migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);

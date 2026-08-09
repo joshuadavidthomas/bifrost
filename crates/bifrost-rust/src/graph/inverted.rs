@@ -31,13 +31,13 @@ use crate::graph::resolver::{
     rust_unique_nominal_reference_namespace, token_tree_ancestor,
 };
 use crate::graph_support::{
-    RustReferenceContext, RustUsageSource, is_rust_const_or_static_declaration,
+    RustFactSource, RustReferenceContext, is_rust_const_or_static_declaration,
     is_rust_trait_declaration,
 };
 use crate::hierarchy::canonical_rust_hierarchy_type;
 use crate::imports::{resolve_rust_import_package_scoped, rust_focused_use_path};
 use crate::lexical_scope::RustLexicalScopeIndex;
-use crate::usage_index::{
+use crate::usage::{
     RustBindingSeeds, RustReferenceNamespace, usage_binding_seeds, usage_exact_root_for_resolution,
     usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
 };
@@ -66,7 +66,7 @@ pub struct RustSeedsCache {
 impl RustSeedsCache {
     fn seeds(
         &self,
-        rust: &dyn RustUsageSource,
+        rust: &dyn RustFactSource,
         roots: &BTreeSet<CodeUnit>,
     ) -> Arc<RustBindingSeeds> {
         if let Some(seeds) = self.by_roots.lock().unwrap().get(roots) {
@@ -91,7 +91,7 @@ impl RustSeedsCache {
 /// this per file, so the Rust half is a pure function of a parsed file, the
 /// file's cached reference context, and the two sources.
 pub fn scan_file(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     seeds_cache: &RustSeedsCache,
     file: &ProjectFile,
@@ -134,7 +134,7 @@ pub fn scan_file(
 }
 
 struct RustScan<'a> {
-    rust: &'a dyn RustUsageSource,
+    rust: &'a dyn RustFactSource,
     support: &'a dyn RustDefinitionProvider,
     seeds_cache: &'a RustSeedsCache,
     file: &'a ProjectFile,

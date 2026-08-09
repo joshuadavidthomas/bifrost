@@ -15,7 +15,7 @@
 //! take [`graph_support::CSharpSource`] -- a core
 //! [`brokk_bifrost_core::analyzer::CodeUnitIndex`] plus the memoized per-file
 //! products C# resolves through. One tier is enough, unlike Rust's
-//! `RustSource`/`RustUsageSource` split: no `OnceLock` in the C# memo
+//! `RustSource`/`RustFactSource` split: no `OnceLock` in the C# memo
 //! web re-enters the cell it is filling. `analyzer/csharp/` in
 //! `brokk-bifrost-analysis` keeps the shim: the `CSharpAnalyzer` struct with its
 //! six moka caches, six `OnceLock`s and two `PoolSafeMemo`s, the accessors that

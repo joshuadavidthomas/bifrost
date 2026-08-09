@@ -89,7 +89,7 @@ mod tests {
     }
 
     #[test]
-    fn warm_query_indexes_builds_hierarchy_and_usage_indexes_ahead_of_demand() {
+    fn warm_query_indexes_builds_the_hierarchy_and_catches_up_the_usage_facts() {
         let (_fixture, analyzer) = analyzer_with_files(&[(
             "src/lib.rs",
             r#"
@@ -101,13 +101,13 @@ impl Runnable for Worker {}
 
         assert!(!analyzer.query_indexes_warm());
         assert!(analyzer.hierarchy_index.get().is_none());
-        assert!(!analyzer.usage_index.is_ready());
+        assert!(!analyzer.rust_usage_facts_warm());
 
         analyzer.warm_query_indexes();
 
         assert!(analyzer.query_indexes_warm());
         assert!(analyzer.hierarchy_index.get().is_some());
-        assert!(analyzer.usage_index.is_ready());
+        assert!(analyzer.rust_usage_facts_warm());
 
         let runnable = definition(&analyzer, "Runnable");
         let worker = definition(&analyzer, "Worker");

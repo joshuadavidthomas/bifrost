@@ -352,12 +352,15 @@ mod tests {
             "cancelled cold discovery must not return partial candidates"
         );
         assert!(cancellation.is_cancelled());
+        // Cargo routes are the whole-workspace structure a cold discovery has
+        // to build, and the only one it can publish half-finished. The usage
+        // index used to be the other one; under usage v2 the candidate walk
+        // composes from rows and there is no index whose readiness could say
+        // anything about this path.
         assert!(!analyzer.cargo_routes_ready_for_test());
-        assert!(!analyzer.usage_index_ready_for_test());
 
         let candidates = rust_usage_candidate_files(&analyzer, &target, &CancellationToken::new());
         assert!(candidates.contains(&source));
         assert!(analyzer.cargo_routes_ready_for_test());
-        assert!(analyzer.usage_index_ready_for_test());
     }
 }

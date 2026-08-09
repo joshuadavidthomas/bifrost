@@ -1,6 +1,6 @@
 use crate::declarations::rust_package_name;
 use crate::graph_support::{
-    RustReferenceContext, RustUsageSource, exact_member, is_rust_enum_declaration,
+    RustFactSource, RustReferenceContext, exact_member, is_rust_enum_declaration,
     is_rust_export_visible_declaration, is_rust_public_like_declaration, is_rust_trait_declaration,
     is_rust_trait_impl_member_declaration, resolve_imported_export_from_binder_forward,
     resolve_module_files, resolve_module_package, resolve_visible_import_targets_forward,
@@ -8,7 +8,7 @@ use crate::graph_support::{
 use crate::hierarchy::{canonical_rust_hierarchy_type, rust_trait_for_impl_member};
 use crate::imports::resolve_rust_import_package_scoped;
 use crate::lexical_scope::{self, RustLexicalScopeIndex};
-use crate::usage_index::{
+use crate::usage::{
     usage_binding_local_names, usage_binding_seeds, usage_binding_seeds_while,
     usage_crate_export_targets, usage_exact_root_for_resolution,
     usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
@@ -47,7 +47,7 @@ pub trait RustDefinitionProvider {
 
     fn forward_reference_context(
         &self,
-        rust: &dyn RustUsageSource,
+        rust: &dyn RustFactSource,
         file: &ProjectFile,
     ) -> Option<Arc<RustReferenceContext>> {
         Some(rust.forward_reference_context_of(file))
@@ -114,7 +114,7 @@ pub struct RustGraphSeeds {
 }
 
 pub fn resolve_rust_path_fqn(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     refs: &RustReferenceContext,
     file: &ProjectFile,
     full_path: &str,
@@ -146,7 +146,7 @@ pub struct ResolvedRustTokenPathSegment<'tree> {
 /// and source ranges between those nodes. This deliberately does not interpret
 /// delimiters or split source text.
 pub fn resolve_rust_token_tree_paths<'tree>(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -166,7 +166,7 @@ pub fn resolve_rust_token_tree_paths<'tree>(
 /// segments resolves relative to the previous segment's owner, so skipping one
 /// would change what the next segment resolves to.
 pub fn resolve_rust_token_tree_paths_admitting<'tree>(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -201,7 +201,7 @@ pub fn resolve_rust_token_tree_paths_admitting<'tree>(
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_token_tree_path_container<'tree>(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -328,7 +328,7 @@ fn resolve_token_tree_path_container<'tree>(
 }
 
 fn resolve_crate_exported_token_path_child(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -369,7 +369,7 @@ fn resolve_direct_token_path_child(
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_token_path_segment_fqn(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -442,7 +442,7 @@ fn resolve_token_path_segment_fqn(
 }
 
 pub fn lexical_import_fqn(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -459,7 +459,7 @@ pub fn lexical_import_fqn(
 }
 
 pub fn lexical_explicit_import_fqn(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
     source: &str,
@@ -533,7 +533,7 @@ pub fn lexical_explicit_import_fqn(
 }
 
 fn resolve_lexical_import_target_fqns(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     mut pending: Vec<(ProjectFile, String)>,
 ) -> BTreeSet<String> {
@@ -871,11 +871,11 @@ fn parsed_identifier_is_direct_pattern(node: Node<'_>) -> bool {
 }
 
 pub fn rust_unique_nominal_reference_namespace(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     fqn: &str,
-) -> Option<crate::usage_index::RustReferenceNamespace> {
-    use crate::usage_index::RustReferenceNamespace;
+) -> Option<crate::usage::RustReferenceNamespace> {
+    use crate::usage::RustReferenceNamespace;
 
     let declarations = support.fqn(fqn);
     let has_type = declarations
@@ -908,7 +908,7 @@ fn rust_token_call_arguments(node: &Node<'_>) -> bool {
     node.kind() == "token_tree" && node.child(0).is_some_and(|open| open.kind() == "(")
 }
 
-pub fn is_member_target(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> bool {
+pub fn is_member_target(analyzer: &dyn RustFactSource, target: &CodeUnit) -> bool {
     // A member is referenced through a value of its owning type (`receiver.member`).
     // Free items belong on the top-level scan path even if a same-FQN module/macro
     // collision gives one a non-module hierarchy parent.
@@ -922,19 +922,19 @@ pub fn is_member_target(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> bo
         })
 }
 
-pub fn is_trait_owner(rust: &dyn RustUsageSource, owner: &CodeUnit) -> bool {
+pub fn is_trait_owner(rust: &dyn RustFactSource, owner: &CodeUnit) -> bool {
     is_rust_trait_declaration(rust, owner)
 }
 
-fn is_public_like_declaration(rust: &dyn RustUsageSource, code_unit: &CodeUnit) -> bool {
+fn is_public_like_declaration(rust: &dyn RustFactSource, code_unit: &CodeUnit) -> bool {
     is_rust_public_like_declaration(rust, code_unit)
 }
 
-fn is_export_visible_declaration(rust: &dyn RustUsageSource, code_unit: &CodeUnit) -> bool {
+fn is_export_visible_declaration(rust: &dyn RustFactSource, code_unit: &CodeUnit) -> bool {
     is_rust_export_visible_declaration(rust, code_unit)
 }
 
-pub fn is_graph_visible_member_target(rust: &dyn RustUsageSource, target: &CodeUnit) -> bool {
+pub fn is_graph_visible_member_target(rust: &dyn RustFactSource, target: &CodeUnit) -> bool {
     if is_public_like_declaration(rust, target) {
         return true;
     }
@@ -952,7 +952,7 @@ pub fn is_graph_visible_member_target(rust: &dyn RustUsageSource, target: &CodeU
 }
 
 pub fn trait_member_for_impl_member(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     target: &CodeUnit,
 ) -> Option<CodeUnit> {
     let owner = rust.parent_of(target)?;
@@ -968,7 +968,7 @@ pub fn trait_member_for_impl_member(
 }
 
 fn is_trait_impl_member_target(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     target: &CodeUnit,
     owner: &CodeUnit,
 ) -> bool {
@@ -979,7 +979,7 @@ fn is_trait_impl_member_target(
 }
 
 fn trait_member(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     trait_unit: &CodeUnit,
     impl_member: &CodeUnit,
 ) -> Option<CodeUnit> {
@@ -995,7 +995,7 @@ fn trait_member(
 }
 
 fn rust_member_roles_match(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     impl_member: &CodeUnit,
     trait_member: &CodeUnit,
 ) -> bool {
@@ -1006,7 +1006,7 @@ fn rust_member_roles_match(
 }
 
 pub fn resolve_scoped_associated_item(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -1028,7 +1028,7 @@ pub fn resolve_scoped_associated_item(
 
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_scoped_associated_item_matching(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -1065,7 +1065,7 @@ pub fn resolve_scoped_associated_item_matching(
 
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_owner_associated_item_matching(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -1102,7 +1102,7 @@ pub fn resolve_owner_associated_item_matching(
 
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_exact_owner_associated_item_matching(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -1146,7 +1146,7 @@ pub fn resolve_exact_owner_associated_item_matching(
 /// [`resolve_scoped_associated_item`] so `Self::assoc` (where the owner fqn
 /// comes from the enclosing impl, not from a scoped path) shares one resolver.
 pub fn resolve_trait_associated_item(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -1168,7 +1168,7 @@ pub fn resolve_trait_associated_item(
 
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_trait_associated_item_matching(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -1211,7 +1211,7 @@ pub fn resolve_trait_associated_item_matching(
 
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_trait_associated_item_for_owner_matching(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
     _refs: &RustReferenceContext,
     file: &ProjectFile,
@@ -1243,7 +1243,7 @@ pub fn resolve_trait_associated_item_for_owner_matching(
 }
 
 fn trait_visible_at_call_site(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     trait_unit: &CodeUnit,
     reference_byte: usize,
@@ -1273,7 +1273,7 @@ fn trait_visible_at_call_site(
             &seeds,
             &[name.as_str()],
             reference_byte,
-            crate::usage_index::RustReferenceNamespace::Type,
+            crate::usage::RustReferenceNamespace::Type,
             root_shadowed,
             false,
         );
@@ -1282,12 +1282,12 @@ fn trait_visible_at_call_site(
     })
 }
 
-pub fn canonical_usage_target(rust: &dyn RustUsageSource, target: &CodeUnit) -> CodeUnit {
+pub fn canonical_usage_target(rust: &dyn RustFactSource, target: &CodeUnit) -> CodeUnit {
     canonical_imported_impl_target(rust, target).unwrap_or_else(|| target.clone())
 }
 
 pub fn local_impl_target_importer_files(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     target: &CodeUnit,
 ) -> HashSet<ProjectFile> {
     let Some(resolved_fqn) = imported_impl_target_fqn(rust, target) else {
@@ -1307,7 +1307,7 @@ pub fn local_impl_target_importer_files(
         .collect()
 }
 
-pub fn infer_graph_seeds(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> RustGraphSeeds {
+pub fn infer_graph_seeds(analyzer: &dyn RustFactSource, target: &CodeUnit) -> RustGraphSeeds {
     infer_graph_seeds_while(analyzer, target, &|| true)
         .expect("uninterrupted Rust graph-seed inference")
 }
@@ -1316,7 +1316,7 @@ pub fn infer_graph_seeds(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> R
 /// it. The re-export fallback below can force a cold usage-index build, so seed
 /// inference has to be cancellable alongside it.
 pub fn infer_graph_seeds_while(
-    analyzer: &dyn RustUsageSource,
+    analyzer: &dyn RustFactSource,
     target: &CodeUnit,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Option<RustGraphSeeds> {
@@ -1337,7 +1337,7 @@ pub fn infer_graph_seeds_while(
 }
 
 fn infer_export_graph_seeds_while(
-    analyzer: &dyn RustUsageSource,
+    analyzer: &dyn RustFactSource,
     target: &CodeUnit,
     keep_going: &(impl Fn() -> bool + Sync),
 ) -> Option<BTreeSet<CodeUnit>> {
@@ -1388,7 +1388,7 @@ fn infer_export_graph_seeds_while(
 }
 
 fn local_declaration_graph_seeds(
-    analyzer: &dyn RustUsageSource,
+    analyzer: &dyn RustFactSource,
     target: &CodeUnit,
 ) -> BTreeSet<CodeUnit> {
     let member_target = is_member_target(analyzer, target);
@@ -1408,7 +1408,7 @@ fn local_declaration_graph_seeds(
     [seed_target].into_iter().collect()
 }
 
-fn graph_seed_target(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> Option<CodeUnit> {
+fn graph_seed_target(analyzer: &dyn RustFactSource, target: &CodeUnit) -> Option<CodeUnit> {
     let seed_target = if is_member_target(analyzer, target) {
         analyzer.parent_of(target)?
     } else {
@@ -1417,7 +1417,7 @@ fn graph_seed_target(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> Optio
     Some(canonical_imported_impl_target(analyzer, &seed_target).unwrap_or(seed_target))
 }
 
-fn is_local_declaration(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> bool {
+fn is_local_declaration(analyzer: &dyn RustFactSource, target: &CodeUnit) -> bool {
     analyzer
         .declarations(target.source())
         .into_iter()
@@ -1425,7 +1425,7 @@ fn is_local_declaration(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> bo
 }
 
 pub fn canonical_imported_impl_target(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     target: &CodeUnit,
 ) -> Option<CodeUnit> {
     let resolved_fqn = imported_impl_target_fqn(rust, target)?;
@@ -1436,7 +1436,7 @@ pub fn canonical_imported_impl_target(
     definitions.next().is_none().then_some(first)
 }
 
-fn imported_impl_target_fqn(rust: &dyn RustUsageSource, target: &CodeUnit) -> Option<String> {
+fn imported_impl_target_fqn(rust: &dyn RustFactSource, target: &CodeUnit) -> Option<String> {
     if !target.is_class()
         || rust
             .definitions(&target.fq_name())
@@ -1449,7 +1449,7 @@ fn imported_impl_target_fqn(rust: &dyn RustUsageSource, target: &CodeUnit) -> Op
     Some(resolved.to_string())
 }
 
-fn infer_export_names(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> BTreeSet<String> {
+fn infer_export_names(analyzer: &dyn RustFactSource, target: &CodeUnit) -> BTreeSet<String> {
     if (target.is_function() || target.is_field())
         && let Some(owner) = analyzer.parent_of(target)
     {
@@ -1495,7 +1495,7 @@ fn infer_export_names(analyzer: &dyn RustUsageSource, target: &CodeUnit) -> BTre
 /// whether the re-export chain exists, so an export-visible-but-never-re-exported
 /// item still resolves to no seeds.
 fn reexport_fallback_export_names(
-    analyzer: &dyn RustUsageSource,
+    analyzer: &dyn RustFactSource,
     target: &CodeUnit,
 ) -> BTreeSet<String> {
     if !is_export_visible_declaration(analyzer, target) {
@@ -1512,7 +1512,7 @@ fn reexport_fallback_export_names(
 }
 
 fn infer_export_names_for_local(
-    analyzer: &dyn RustUsageSource,
+    analyzer: &dyn RustFactSource,
     file: &ProjectFile,
     local_name: &str,
 ) -> BTreeSet<String> {
@@ -1531,7 +1531,7 @@ fn infer_export_names_for_local(
 }
 
 pub fn unresolved_external_frontier_specifiers(
-    analyzer: &dyn RustUsageSource,
+    analyzer: &dyn RustFactSource,
     defining_file: &ProjectFile,
     export_name: &str,
 ) -> BTreeSet<String> {
