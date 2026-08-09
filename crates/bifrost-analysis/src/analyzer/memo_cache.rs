@@ -24,18 +24,28 @@
 //!   housekeeper, no epoch pinning.
 //! * The **same weigher arithmetic**, run once per insert (never per hit), so
 //!   the byte budgets the callers already chose keep their meaning.
-//! * A **crude cap**: when a shard's inserted weight would exceed its share of
-//!   the budget, the whole shard is dropped and refills. This is not LRU and
-//!   makes no pretence of being LRU -- it is a memory bound, and the values it
-//!   drops are all recomputable from the analyzer that owns them. The tradeoff
-//!   is deliberate: a policy good enough to keep is a policy that costs
-//!   something per hit, and per-hit cost is the thing being removed.
+//! * A **FIFO cap**: an insert that would take a shard over its share of the
+//!   budget evicts the shard's oldest entries, one at a time, until the insert
+//!   fits. Insertion order is a `VecDeque<K>` maintained at insert only, so a
+//!   hit still records nothing. This is not LRU and makes no pretence of being
+//!   LRU; it is a memory bound with an eviction order cheap enough to keep.
+//!
+//!   The first draft of this cap dropped the **whole shard** on overflow, on
+//!   the theory that everything it drops is recomputable and a crude flush was
+//!   therefore acceptable. **It is not, and the measurement said so plainly.**
+//!   On the rustc-tree answering cell a 16 MiB cache over 35,370 files holds a
+//!   few thousand entries, so a shard-wide flush destroys the working set on
+//!   every overflow and the walk recomputes it: moka fell from 38.05 % of the
+//!   window to 0.03 % exactly as intended, and `path` + `ProjectFile` rose
+//!   6.27 % -> 23.33 % taking wall from 781 s to 1,299 s. Evicting one entry at
+//!   a time is what moka was doing that actually mattered.
 //!
 //! Use [`build_flight_cache`] instead when a cache genuinely needs concurrent
 //! single-flight (`get_with`): those callers depend on exactly one thread
 //! running the init closure per key, which a plain map does not provide.
 
 use std::borrow::Borrow;
+use std::collections::VecDeque;
 use std::hash::{BuildHasher, Hash};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -70,8 +80,8 @@ struct Inner<K, V> {
     /// One shard's share of the caller's byte budget.
     shard_budget_bytes: u64,
     weigher: Box<dyn Fn(&K, &V) -> u32 + Send + Sync>,
-    /// Shard flushes so far, for the cap's regression pin.
-    flushes: AtomicU64,
+    /// Entries evicted by the cap so far, for its regression pin.
+    evictions: AtomicU64,
     hasher: FxBuildHasher,
 }
 
@@ -79,6 +89,10 @@ struct Shard<K, V> {
     /// Each entry keeps the weight it was inserted with, so replacing a key
     /// corrects the running total instead of double-counting it.
     entries: HashMap<K, (u32, V)>,
+    /// Keys in insertion order, one per live entry: a rewrite updates the
+    /// entry in place and does not re-queue the key, so this stays the same
+    /// length as `entries` and eviction never has to skip a stale name.
+    order: VecDeque<K>,
     weight: u64,
 }
 
@@ -86,6 +100,7 @@ impl<K, V> Default for Shard<K, V> {
     fn default() -> Self {
         Self {
             entries: HashMap::default(),
+            order: VecDeque::new(),
             weight: 0,
         }
     }
@@ -131,13 +146,17 @@ where
         shard.entries.get(key).map(|(_, value)| value.clone())
     }
 
-    /// Memoize `value` under `key`, flushing the shard first when the insert
-    /// would take it over budget.
-    pub(crate) fn insert(&self, key: K, value: V) {
+    /// Memoize `value` under `key`, evicting the shard's oldest entries first
+    /// when the insert would take it over budget.
+    pub(crate) fn insert(&self, key: K, value: V)
+    where
+        K: Clone,
+    {
         // Outside the lock: the weigher walks the value, and a panic inside it
         // must not poison a shard.
         let weight = u64::from((self.inner.weigher)(&key, &value));
-        let (flushed, replaced) = {
+        let mut discarded: Vec<(u32, V)> = Vec::new();
+        {
             let mut shard = self
                 .shard_of(&key)
                 .write()
@@ -145,26 +164,41 @@ where
             // Rewriting a key trades its old weight for the new one, so the
             // budget question is about the total this insert leaves behind,
             // not about the total plus the new value.
-            let displaced = shard
-                .entries
-                .get(&key)
-                .map_or(0, |(weight, _)| u64::from(*weight));
-            let flushed = if shard.weight - displaced + weight > self.inner.shard_budget_bytes {
-                self.inner.flushes.fetch_add(1, Ordering::Relaxed);
-                shard.weight = 0;
-                Some(std::mem::take(&mut shard.entries))
-            } else {
-                shard.weight -= displaced;
-                None
+            let rewrite = match shard.entries.get(&key) {
+                Some((displaced, _)) => {
+                    shard.weight -= u64::from(*displaced);
+                    true
+                }
+                None => false,
             };
-            let replaced = shard.entries.insert(key, (weight as u32, value));
+            while shard.weight + weight > self.inner.shard_budget_bytes {
+                let Some(oldest) = shard.order.pop_front() else {
+                    // The shard is empty and this one value is still over
+                    // budget. Admit it anyway: refusing would turn a cache
+                    // into a permanent miss for that key.
+                    break;
+                };
+                let evicted = shard
+                    .entries
+                    .remove(&oldest)
+                    .expect("the order queue holds exactly the live keys");
+                shard.weight -= u64::from(evicted.0);
+                discarded.push(evicted);
+            }
+            self.inner
+                .evictions
+                .fetch_add(discarded.len() as u64, Ordering::Relaxed);
+            if !rewrite {
+                shard.order.push_back(key.clone());
+            }
+            if let Some(previous) = shard.entries.insert(key, (weight as u32, value)) {
+                discarded.push(previous);
+            }
             shard.weight += weight;
-            (flushed, replaced)
-        };
-        // Deallocating a flushed shard, or the value a key just replaced, is
-        // the caller's own time and does not belong inside the lock.
-        drop(flushed);
-        drop(replaced);
+        }
+        // Deallocating what the cap dropped, or the value a key just replaced,
+        // is the caller's own time and does not belong inside the lock.
+        drop(discarded);
     }
 
     /// Entries currently memoized, across all shards.
@@ -183,10 +217,10 @@ where
             .sum()
     }
 
-    /// How many times a shard was dropped for being over budget.
+    /// How many entries the cap has evicted.
     #[cfg(test)]
-    pub(crate) fn flushes(&self) -> u64 {
-        self.inner.flushes.load(Ordering::Relaxed)
+    pub(crate) fn evictions(&self) -> u64 {
+        self.inner.evictions.load(Ordering::Relaxed)
     }
 }
 
@@ -211,7 +245,7 @@ where
             shards,
             shard_budget_bytes: (budget_bytes / SHARD_COUNT as u64).max(1),
             weigher: Box::new(weigher),
-            flushes: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
             hasher: FxBuildHasher,
         }),
     }
@@ -259,12 +293,12 @@ mod tests {
     #[test]
     fn replacing_a_key_does_not_double_count_its_weight() {
         // One shard's budget is 10 bytes, so a key rewritten eleven times would
-        // flush if each rewrite were charged again.
+        // evict itself if each rewrite were charged again.
         let cache = build_weighted_cache::<String, Arc<String>>(10 * SHARD_COUNT as u64, ten_bytes);
         for round in 0..11 {
             cache.insert("alpha".to_string(), Arc::new(round.to_string()));
         }
-        assert_eq!(cache.flushes(), 0);
+        assert_eq!(cache.evictions(), 0);
         assert_eq!(cache.len(), 1);
         assert_eq!(
             cache.get("alpha").as_deref().map(String::as_str),
@@ -273,24 +307,58 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_flushes_the_shard_and_the_cache_keeps_answering() {
-        // Every key lands in one shard's 10-byte budget only if it hashes
-        // there, so drive enough distinct keys that some shard must overflow.
+    fn the_cap_evicts_the_oldest_entry_and_keeps_the_rest() {
+        // 100 bytes per shard, 10 bytes an entry: each shard holds ten, and the
+        // eleventh evicts the first -- not the other nine. That distinction is
+        // the whole point of the policy; a shard-wide flush destroys the
+        // working set and the walk recomputes it.
+        let cache =
+            build_weighted_cache::<String, Arc<String>>(100 * SHARD_COUNT as u64, ten_bytes);
+        // Keys that share one shard, found by construction rather than by luck.
+        let mut same_shard: Vec<String> = Vec::new();
+        let mut candidate = 0;
+        while same_shard.len() < 12 {
+            let key = format!("key-{candidate}");
+            if std::ptr::eq(cache.shard_of(key.as_str()), cache.shard_of("key-0")) {
+                same_shard.push(key);
+            }
+            candidate += 1;
+        }
+        for key in &same_shard {
+            cache.insert(key.clone(), Arc::new(key.clone()));
+        }
+        assert_eq!(
+            cache.evictions(),
+            2,
+            "twelve 10-byte entries in a 100-byte shard evict exactly the two oldest"
+        );
+        assert_eq!(cache.get(same_shard[0].as_str()), None, "the oldest went");
+        assert_eq!(cache.get(same_shard[1].as_str()), None, "and the next");
+        for key in &same_shard[2..] {
+            assert_eq!(
+                cache.get(key.as_str()).as_deref().map(String::as_str),
+                Some(key.as_str()),
+                "everything younger than the evicted pair survives"
+            );
+        }
+        assert_eq!(cache.len(), 10);
+    }
+
+    #[test]
+    fn the_cap_bounds_a_flood_of_distinct_keys() {
         let cache = build_weighted_cache::<String, Arc<String>>(10 * SHARD_COUNT as u64, ten_bytes);
         for key in 0..4_000 {
             cache.insert(format!("key-{key}"), Arc::new(key.to_string()));
         }
         assert!(
-            cache.flushes() > 0,
-            "a 10-byte-per-shard budget must flush under 4,000 inserts"
+            cache.evictions() > 0,
+            "a 10-byte-per-shard budget must evict under 4,000 inserts"
         );
-        // The bound holds: at most one entry over budget per shard survives.
         assert!(
-            cache.len() <= 2 * SHARD_COUNT,
+            cache.len() <= SHARD_COUNT,
             "entries retained: {}",
             cache.len()
         );
-        // A flushed cache is still a working cache.
         cache.insert("fresh".to_string(), Arc::new("value".to_string()));
         assert_eq!(
             cache.get("fresh").as_deref().map(String::as_str),
@@ -299,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_value_is_still_readable_after_its_own_flush() {
+    fn an_oversized_value_is_admitted_rather_than_permanently_missed() {
         let cache = build_weighted_cache::<String, Arc<String>>(
             SHARD_COUNT as u64,
             |_key: &String, _value: &Arc<String>| 1_000,

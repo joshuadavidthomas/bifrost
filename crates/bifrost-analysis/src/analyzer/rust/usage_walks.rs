@@ -1858,7 +1858,7 @@ mod tests {
     }
 
     /// The same fixture under a memo budget too small to hold anything, so
-    /// every walk cache flushes its shard on nearly every insert.
+    /// every walk cache evicts on nearly every insert.
     fn project_with_starved_memo(files: &[(&str, &str)]) -> (tempfile::TempDir, RustAnalyzer) {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -2014,11 +2014,10 @@ mod tests {
         assert_eq!(*after, *first, "the answer itself is unchanged");
     }
 
-    /// The walk caches are bounded by a crude policy: an insert that would take
-    /// a shard over budget drops the whole shard. That is a memory bound, not
-    /// an answer, and this pins the difference -- a workspace analyzed under a
-    /// one-byte memo budget, where every insert flushes, must give the same
-    /// answers as one analyzed under the product budget.
+    /// The walk caches are bounded by a FIFO cap, not by an LRU policy. The
+    /// bound is a memory bound, never an answer, and this pins the difference:
+    /// a workspace analyzed under a one-byte memo budget, where every insert
+    /// evicts, must give the same answers as one at the product budget.
     #[test]
     fn a_starved_memo_budget_changes_nothing_but_the_memory() {
         const FILES: &[(&str, &str)] = &[
@@ -2060,7 +2059,7 @@ mod tests {
         );
         assert_eq!(
             starved, budgeted,
-            "a flushing cache and a retaining cache must answer identically"
+            "an evicting cache and a retaining cache must answer identically"
         );
     }
 
