@@ -32,12 +32,16 @@ use serde_json::{Value, json};
 /// conformance claim below is a claim about rows, and rows from an incomplete
 /// run prove nothing either way.
 fn complete(files: &[(&str, &str)], query: Value) -> Value {
+    complete_with_config(files, query, AnalyzerConfig::default())
+}
+
+fn complete_with_config(files: &[(&str, &str)], query: Value, config: AnalyzerConfig) -> Value {
     let mut project = InlineTestProject::new();
     for (path, source) in files {
         project = project.file(*path, *source);
     }
     let project = project.build();
-    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), AnalyzerConfig::default());
+    let workspace = WorkspaceAnalyzer::build(project.project_dyn(), config);
     let query = CodeQuery::from_json(&query).expect("query should parse");
     let result: CodeQueryResult = execute_workspace(&workspace, &query);
     assert_eq!(
@@ -353,23 +357,27 @@ fn one_file_carries_occurrences_in_both_namespaces_and_binds_only_in_the_value_o
 }
 
 // ---------------------------------------------------------------------------
-// Scenario 6 -- an unindexed declared dependency (Java).
+// Scenario 6 -- an unknown external import (Java).
 // ---------------------------------------------------------------------------
 
-const HOST_EXTERNAL_DEPENDENCY: &str = "package app;\n\nimport java.util.Collections;\nimport java.util.List;\n\nclass Host {\n    void run(List<String> rows) {\n        Collections.sort(rows);\n    }\n}\n";
+const HOST_UNKNOWN_EXTERNAL_IMPORT: &str = "package app;\n\nimport fixture.missing.Collections;\nimport fixture.missing.List;\n\nclass Host {\n    void run(List<String> rows) {\n        Collections.sort(rows);\n    }\n}\n";
 
-/// `java.util` is declared by the import and absent from the workspace, so the
-/// resolver reaches an authoritative boundary. The row states the boundary and
-/// the refusal; it is never a clean empty answer, and it is never a selection.
+/// The imported names are absent from the workspace and every external index,
+/// so the resolver reaches an unknown external boundary. The row states the
+/// boundary and the refusal; it is never a clean empty answer or a selection.
 #[test]
-fn an_unindexed_declared_dependency_is_a_boundary_row_rather_than_an_empty_answer() {
-    let external = complete(
-        &[("app/Host.java", HOST_EXTERNAL_DEPENDENCY)],
+fn an_unknown_external_import_is_a_boundary_row_rather_than_an_empty_answer() {
+    let mut config = AnalyzerConfig::default();
+    config.jvm.dependency_discovery.mode = brokk_bifrost::JvmDependencyDiscoveryMode::Disabled;
+    config.jvm.standard_library_discovery.discover_java_home = false;
+    let external = complete_with_config(
+        &[("app/Host.java", HOST_UNKNOWN_EXTERNAL_IMPORT)],
         json!({
             "languages": ["java"],
             "occurrences": { "role": ["type_operand", "receiver_position"] },
             "steps": [{ "op": "candidates_of", "boundary": ["external_unknown"] }]
         }),
+        config,
     );
     assert!(
         !rows(&external).is_empty(),
@@ -511,7 +519,7 @@ fn colliding_wildcard_routes_record_every_peer_on_the_trace() {
 fn no_candidate_row_in_any_claimed_language_selects_at_the_name_only_fallback_tier() {
     let candidates = complete(
         &[
-            ("app/Host.java", HOST_EXTERNAL_DEPENDENCY),
+            ("app/Host.java", HOST_UNKNOWN_EXTERNAL_IMPORT),
             ("src/render.rs", RUST_INNER_NAMESAKE),
             (
                 "pkg/widget.py",
