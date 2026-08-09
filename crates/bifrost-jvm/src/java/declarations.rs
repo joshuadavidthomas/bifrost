@@ -435,7 +435,8 @@ fn visit_callable(
                 node.child_by_field_name("parameters")
                     .map(|parameters| canonical_parameter_type_texts(parameters, source))
                     .unwrap_or_default(),
-            ),
+            )
+            .with_callable_native(modifiers.is_native),
     );
 
     if let Some(body) = node.child_by_field_name("body") {
@@ -1117,6 +1118,10 @@ fn canonical_parameter_type_texts(parameters: Node<'_>, source: &str) -> Vec<Str
 /// node rather than from its rendered header text.
 struct JavaCallableModifiers {
     is_static: bool,
+    /// The declaration is implemented outside every source the workspace can
+    /// read. A consumer that must not guess past a body-less callee needs this
+    /// to tell `native` from `abstract`.
+    is_native: bool,
     visibility: DeclaredVisibility,
 }
 
@@ -1128,6 +1133,7 @@ fn java_callable_modifiers(node: Node<'_>) -> JavaCallableModifiers {
     // never made.
     let mut modifiers = JavaCallableModifiers {
         is_static: false,
+        is_native: false,
         visibility: DeclaredVisibility::PackagePrivate,
     };
     let mut cursor = node.walk();
@@ -1139,6 +1145,7 @@ fn java_callable_modifiers(node: Node<'_>) -> JavaCallableModifiers {
         for modifier in child.children(&mut inner) {
             match modifier.kind() {
                 "static" => modifiers.is_static = true,
+                "native" => modifiers.is_native = true,
                 "public" => modifiers.visibility = DeclaredVisibility::Public,
                 "protected" => modifiers.visibility = DeclaredVisibility::Protected,
                 "private" => modifiers.visibility = DeclaredVisibility::Private,
