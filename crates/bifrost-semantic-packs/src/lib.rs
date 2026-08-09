@@ -7,6 +7,8 @@
 
 #[cfg(feature = "release-tooling")]
 pub mod release_bundle;
+#[cfg(feature = "release-tooling")]
+pub mod summary_foundry;
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};

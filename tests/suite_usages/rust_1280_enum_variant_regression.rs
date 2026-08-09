@@ -111,9 +111,8 @@ impl CasingStyle {
         .exact_member(&file, "CasingStyle", "ScreamingSnake", false)
         .expect("CasingStyle::ScreamingSnake target");
 
-    let hits = UsageFinder::new()
-        .find_usages_default(&analyzer, std::slice::from_ref(&target))
-        .all_hits();
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let hits = result.all_hits();
     let reference_offsets = hits
         .iter()
         .filter(|hit| hit.file == file && hit.kind == UsageHitKind::Reference)
@@ -138,6 +137,21 @@ impl CasingStyle {
     })
     .collect::<Vec<_>>();
     assert_eq!(reference_offsets, positives, "hits={hits:#?}");
+
+    let grouped_import = "use self::CasingStyle::{ScreamingSnake};";
+    let grouped_import_offset = source.find(grouped_import).expect("grouped import")
+        + grouped_import
+            .find("ScreamingSnake")
+            .expect("variant binder");
+    assert!(
+        result.all_hits_including_imports().iter().any(|hit| {
+            hit.file == file
+                && hit.kind == UsageHitKind::Import
+                && hit.start_offset == grouped_import_offset
+        }),
+        "the exact grouped variant binder must be an import hit: {:#?}",
+        result.all_hits_including_imports()
+    );
 
     for marker in [
         "let _ = ScreamingSnake; // local-shadow",

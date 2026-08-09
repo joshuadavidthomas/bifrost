@@ -1,6 +1,8 @@
 use crate::common::InlineTestProject;
 use brokk_bifrost::hash::HashSet;
-use brokk_bifrost::usages::{ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit};
+use brokk_bifrost::usages::{
+    ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
+};
 use brokk_bifrost::{CodeUnit, CodeUnitIndex, IAnalyzer, Language, ProjectFile, RustAnalyzer};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -54,6 +56,50 @@ fn authoritative_hits(
             .collect(),
         other => panic!("expected authoritative Rust usage success, got {other:#?}"),
     }
+}
+
+#[test]
+fn rust_exported_macro_import_terminal_is_an_inverse_hit() {
+    let (project, analyzer) = rust_analyzer_with_files(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"primitives\", \"consumer\"]\nresolver = \"2\"\n",
+        ),
+        (
+            "primitives/Cargo.toml",
+            "[package]\nname = \"spacetimedb-primitives\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        ),
+        ("primitives/src/lib.rs", "mod col_list;\n"),
+        (
+            "primitives/src/col_list.rs",
+            "#[macro_export]\nmacro_rules! col_list { ($($value:expr),*) => { () }; }\n",
+        ),
+        (
+            "consumer/Cargo.toml",
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nspacetimedb-primitives = { path = \"../primitives\" }\n",
+        ),
+        (
+            "consumer/src/lib.rs",
+            "use spacetimedb_primitives::col_list;\nfn run() { col_list![1, 2]; }\n",
+        ),
+    ]);
+    let target = analyzer
+        .get_definitions("spacetimedb_primitives.col_list.col_list")
+        .into_iter()
+        .find(CodeUnit::is_macro)
+        .expect("exported macro target");
+    let file = project.file("consumer/src/lib.rs");
+    let mut files = HashSet::default();
+    files.insert(file.clone());
+    let hits = authoritative_hits(&analyzer, &target, files);
+    assert!(
+        hits.iter().any(|hit| {
+            hit.file == file
+                && hit.kind == UsageHitKind::Import
+                && hit.snippet.contains("use spacetimedb_primitives::col_list")
+        }),
+        "exported macro import hit: {hits:#?}"
+    );
 }
 
 #[test]

@@ -113,6 +113,15 @@ fn included_file_imported_free_function_is_an_inverse_hit() {
         }),
         "included free-function call must be an inverse hit: {rows:#?}"
     );
+    assert!(
+        rows.iter().any(|hit| {
+            hit.file == project.file("tools/benchmarks/spec.rs")
+                && hit.start_offset == 27
+                && hit.end_offset == 56
+                && hit.kind == UsageHitKind::Import
+        }),
+        "included import terminal must be an inverse hit: {rows:#?}"
+    );
     for included in [
         "tools/benchmarks/leaf.rs",
         "tools/benchmarks/glob.rs",
@@ -132,8 +141,10 @@ fn included_file_imported_free_function_is_an_inverse_hit() {
         "tools/benchmarks/standalone.rs",
     ] {
         assert!(
-            rows.iter().all(|hit| hit.file != project.file(near_miss)),
-            "near-miss file must not hit target in {near_miss}: {rows:#?}"
+            rows.iter().all(|hit| {
+                hit.file != project.file(near_miss) || hit.kind != UsageHitKind::Reference
+            }),
+            "near-miss file must not contain a target reference in {near_miss}: {rows:#?}"
         );
     }
 
