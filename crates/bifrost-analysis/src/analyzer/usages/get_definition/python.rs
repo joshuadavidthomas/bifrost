@@ -1647,9 +1647,17 @@ fn python_visible_module_binding_candidates(
                     };
                     resolved = true;
                     let fqn = format!("{module_fqn}.{imported_name}");
-                    candidates.extend(resolve_fqn_candidates(py, &fqn, |candidate| {
-                        support.fqn(candidate)
-                    }));
+                    if let Some(module) = resolve_module_code_unit(py, &fqn)
+                        && module.fq_name() == fqn
+                    {
+                        candidates.push(module);
+                        continue;
+                    }
+                    let mut imported =
+                        resolve_fqn_candidates(py, &fqn, |candidate| support.fqn(candidate));
+                    imported
+                        .retain(|candidate| !candidate.is_module() || candidate.fq_name() == fqn);
+                    candidates.extend(imported);
                 }
                 if !resolved {
                     let fqn = if module.ends_with('.') {
