@@ -1456,41 +1456,74 @@ fn pair_endpoints<'a>(
     // The df pool spans EVERY tokenizable body on both endpoints -- leftovers
     // and identity-paired symbols alike -- so a token's weight reflects how
     // ordinary it is across the whole change, not just among the leftovers.
-    let idf = diff_local_idf(
-        before
-            .values()
-            .chain(after.values())
-            .filter_map(|snapshot| snapshot.token_sig.as_deref()),
-    );
-    let mut scored: Vec<(f64, &'a SymbolSnapshot, &'a SymbolSnapshot)> = Vec::new();
-    for pre in preimage_only.iter().copied() {
-        let Some(pre_sig) = pre.token_sig.as_deref() else {
-            continue;
+    let pre_candidates: Vec<(&'a SymbolSnapshot, &'a [String])> = preimage_only
+        .iter()
+        .filter_map(|pre| Some((*pre, pre.token_sig.as_deref()?)))
+        .collect();
+    let post_candidates: Vec<(&'a SymbolSnapshot, &'a [String])> = postimage_only
+        .iter()
+        .filter_map(|post| Some((*post, post.token_sig.as_deref()?)))
+        .collect();
+    let mut fallback_paired: HashMap<&SymbolKey, f64> = HashMap::new();
+    // Hard cap: scoring is O(P x Q) over the leftover candidates, and a
+    // mass-churn commit (a vendored tree drop, a generated-code rewrite) could
+    // otherwise blow up analyze_diff latency. Past the cap, skip the rule
+    // entirely for this diff: bounded latency beats unbounded matching on
+    // pathological commits, and the fallback is the pre-feature baseline --
+    // every leftover reports as plain delete+introduce -- never worse.
+    let candidate_products = pre_candidates.len().saturating_mul(post_candidates.len());
+    if candidate_products > 0 && candidate_products <= FUZZY_PAIRING_CANDIDATE_CAP {
+        let idf = diff_local_idf(
+            before
+                .values()
+                .chain(after.values())
+                .filter_map(|snapshot| snapshot.token_sig.as_deref()),
+        );
+        let bag_weight = |sig: &[String]| -> f64 {
+            sig.iter()
+                .map(|t| {
+                    idf.get(t.as_str())
+                        .copied()
+                        .unwrap_or(std::f64::consts::LN_2)
+                })
+                .sum()
         };
-        for post in postimage_only.iter().copied() {
-            let Some(post_sig) = post.token_sig.as_deref() else {
-                continue;
-            };
-            let score = body_similarity(pre_sig, post_sig, &idf);
-            if score >= BODY_MOVE_SIMILARITY_THRESHOLD {
-                scored.push((score, pre, post));
+        let pre_weights: Vec<f64> = pre_candidates
+            .iter()
+            .map(|(_, sig)| bag_weight(sig))
+            .collect();
+        let post_weights: Vec<f64> = post_candidates
+            .iter()
+            .map(|(_, sig)| bag_weight(sig))
+            .collect();
+        let mut scored: Vec<(f64, &'a SymbolSnapshot, &'a SymbolSnapshot)> = Vec::new();
+        for (pre_idx, (pre, pre_sig)) in pre_candidates.iter().enumerate() {
+            for (post_idx, (post, post_sig)) in post_candidates.iter().enumerate() {
+                // Size-ratio prefilter -- a pure fast-path, not a behavior
+                // change: see `within_fuzzy_weight_ratio`.
+                if !within_fuzzy_weight_ratio(pre_weights[pre_idx], post_weights[post_idx]) {
+                    continue;
+                }
+                let score = body_similarity(pre_sig, post_sig, &idf);
+                if score >= BODY_MOVE_SIMILARITY_THRESHOLD {
+                    scored.push((score, pre, post));
+                }
             }
         }
-    }
-    scored.sort_by(|(sa, pa, qa), (sb, pb, qb)| {
-        sb.partial_cmp(sa)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| pa.symbol.fqn.cmp(&pb.symbol.fqn))
-            .then_with(|| qa.symbol.fqn.cmp(&qb.symbol.fqn))
-    });
-    let mut fallback_paired: HashMap<&SymbolKey, f64> = HashMap::new();
-    for (score, pre, post) in scored {
-        if fallback_paired.contains_key(&pre.key) || fallback_paired.contains_key(&post.key) {
-            continue;
+        scored.sort_by(|(sa, pa, qa), (sb, pb, qb)| {
+            sb.partial_cmp(sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| pa.symbol.fqn.cmp(&pb.symbol.fqn))
+                .then_with(|| qa.symbol.fqn.cmp(&qb.symbol.fqn))
+        });
+        for (score, pre, post) in scored {
+            if fallback_paired.contains_key(&pre.key) || fallback_paired.contains_key(&post.key) {
+                continue;
+            }
+            fallback_paired.insert(&pre.key, score);
+            fallback_paired.insert(&post.key, score);
+            pairs.push((pre, post));
         }
-        fallback_paired.insert(&pre.key, score);
-        fallback_paired.insert(&post.key, score);
-        pairs.push((pre, post));
     }
     preimage_only.retain(|snapshot| !fallback_paired.contains_key(&snapshot.key));
     postimage_only.retain(|snapshot| !fallback_paired.contains_key(&snapshot.key));
@@ -1551,6 +1584,34 @@ fn blank_identifier<'a>(line: &'a str, name: &str) -> Cow<'a, str> {
 /// higher precision AND recall simultaneously. Unrelated pairs score ~0.03-0.05
 /// on this scale. See `tools/rename-eval/RESULTS.md`.
 const BODY_MOVE_SIMILARITY_THRESHOLD: f64 = 0.40;
+
+/// The most leftover preimage x postimage candidate pairs the fuzzy third rule
+/// of [`pair_endpoints`] will score. Scoring is O(P x Q); past this cap the
+/// rule is skipped for the whole diff and leftovers report as plain
+/// delete+introduce -- the pre-feature baseline, never worse than it.
+const FUZZY_PAIRING_CANDIDATE_CAP: usize = 250_000;
+
+/// The largest total-bag-weight mismatch [`pair_endpoints`] will bother
+/// scoring: the larger side may outweigh the smaller by at most this factor.
+const FUZZY_WEIGHT_RATIO_LIMIT: f64 = 3.0;
+
+// The prefilter is sound only while a maximally-mismatched pair still cannot
+// reach the acceptance threshold: 1 / limit must stay below it.
+const _: () = assert!(1.0 / FUZZY_WEIGHT_RATIO_LIMIT < BODY_MOVE_SIMILARITY_THRESHOLD);
+
+/// Whether two token bags' total IDF weights are close enough in size that
+/// [`body_similarity`] could reach [`BODY_MOVE_SIMILARITY_THRESHOLD`].
+///
+/// A pure fast-path, not a behavior change: weighted bag Jaccard is bounded by
+/// the ratio of the two bags' total weights -- the intersection sums
+/// `w * min(ca, cb)`, at most the smaller bag's total, while the union sums
+/// `w * max(ca, cb)`, at least the larger bag's total -- so a pair whose
+/// totals differ by more than [`FUZZY_WEIGHT_RATIO_LIMIT`] scores below
+/// `1 / limit = 0.33..`, under the 0.40 threshold, and skipping it cannot
+/// change the outcome.
+fn within_fuzzy_weight_ratio(weight_a: f64, weight_b: f64) -> bool {
+    weight_a.max(weight_b) <= FUZZY_WEIGHT_RATIO_LIMIT * weight_a.min(weight_b)
+}
 
 /// A normalized token sequence for a symbol's body, or `None` when the body is
 /// too trivial to identify a move by content alone.
@@ -2109,7 +2170,8 @@ mod tests {
     use super::{
         BODY_MOVE_SIMILARITY_THRESHOLD, ChangedLines, CommitSymbol, FileChange, RevisionTempDir,
         SymbolKey, SymbolSnapshot, body_similarity, body_token_signature, create_private_dirs,
-        diff_local_idf, is_pure_line_shift, pair_endpoints, write_private_file,
+        diff_local_idf, is_pure_line_shift, pair_endpoints, within_fuzzy_weight_ratio,
+        write_private_file,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -2488,6 +2550,69 @@ mod tests {
             pairing.fallback_paired.is_empty(),
             "an identity pair is not a fuzzy pair"
         );
+    }
+
+    /// The size-ratio prefilter: candidate enumeration must skip pairs whose
+    /// total bag weights differ by more than the limit -- they provably cannot
+    /// reach the threshold -- and keep everything at or under it.
+    #[test]
+    fn fuzzy_prefilter_skips_pairs_beyond_the_weight_ratio_limit() {
+        assert!(within_fuzzy_weight_ratio(1.0, 1.0));
+        assert!(within_fuzzy_weight_ratio(1.0, 2.0));
+        assert!(
+            within_fuzzy_weight_ratio(1.0, 3.0),
+            "the boundary is inclusive"
+        );
+        assert!(!within_fuzzy_weight_ratio(1.0, 3.01));
+        assert!(
+            !within_fuzzy_weight_ratio(4.0, 1.0),
+            "symmetric in its arguments"
+        );
+
+        // Behavior level: a body that is an identical prefix of a ~4x-larger
+        // one never pairs -- the weight mismatch alone rules the pair out.
+        let small = "pub fn part(a: u32) -> u32 {\n    let alpha = a + 1;\n    alpha * 2\n}\n";
+        let large = "pub fn whole(a: u32) -> u32 {\n    let alpha = a + 1;\n    let beta = alpha * 2;\n    let gamma = beta ^ 0x5f;\n    let delta = gamma.rotate_left(7);\n    let epsilon = delta.wrapping_mul(31);\n    let zeta = epsilon | 0b1010;\n    let eta = zeta >> 3;\n    let theta = eta + 0o17;\n    let iota = theta.count_ones();\n    let kappa = iota.pow(2);\n    kappa\n}\n";
+        let before = BTreeMap::from([{
+            let s = snap_src("a::part", "part", "src/a.rs", small);
+            (s.key.clone(), s)
+        }]);
+        let after = BTreeMap::from([{
+            let s = snap_src("b::whole", "whole", "src/b.rs", large);
+            (s.key.clone(), s)
+        }]);
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert!(pairing.pairs.is_empty());
+        assert!(pairing.fallback_paired.is_empty());
+        assert_eq!(pairing.preimage_only.len(), 1);
+        assert_eq!(pairing.postimage_only.len(), 1);
+    }
+
+    /// The hard candidate cap: past `FUZZY_PAIRING_CANDIDATE_CAP` leftover
+    /// pre x post combinations, the fuzzy rule is skipped wholesale and every
+    /// leftover reports as plain delete+introduce -- even identical bodies
+    /// that would otherwise pair at score 1.0.
+    #[test]
+    fn fuzzy_pairing_is_skipped_past_the_candidate_cap() {
+        // 501 x 500 = 250_500 > 250_000. All bodies identical and substantial;
+        // the symbol names do not occur in the body, so every token signature
+        // is identical and every pair would score 1.0 if scored.
+        let body = accumulate_body("worker", "sum");
+        let mut before = BTreeMap::new();
+        for i in 0..501 {
+            let s = snap_src(&format!("a::sym{i}"), &format!("sym{i}"), "src/a.rs", &body);
+            before.insert(s.key.clone(), s);
+        }
+        let mut after = BTreeMap::new();
+        for i in 0..500 {
+            let s = snap_src(&format!("b::sym{i}"), &format!("sym{i}"), "src/b.rs", &body);
+            after.insert(s.key.clone(), s);
+        }
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert!(pairing.pairs.is_empty(), "past the cap nothing may pair");
+        assert!(pairing.fallback_paired.is_empty());
+        assert_eq!(pairing.preimage_only.len(), 501);
+        assert_eq!(pairing.postimage_only.len(), 500);
     }
 
     #[test]
