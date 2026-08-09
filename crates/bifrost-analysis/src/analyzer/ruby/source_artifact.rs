@@ -1,6 +1,5 @@
 use tree_sitter::Node;
 
-use super::declarations::ruby_node_text;
 use super::rbs_artifact::RubyMemberAlias;
 use super::{extract_name_segments, parse_ruby_tree, ruby_call_arguments, ruby_symbol_name};
 use crate::CancellationToken;
@@ -9,6 +8,7 @@ use crate::analyzer::semantic_model::{
     MemberFact, MemberIdentity, MemberKind, Parameter, ProducerDiagnostic, Signature, TypeFact,
     TypeIdentity, TypeKind, TypeRef, Visibility, member_declaration_id, type_declaration_id,
 };
+use brokk_bifrost_ruby::declarations::ruby_node_text;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RubySourceProjection {
@@ -291,6 +291,7 @@ fn project_constant_assignment(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        guard: None,
         locator: locator(archive_sha256, entry_path, name),
     });
 }
@@ -388,6 +389,7 @@ fn project_type<'tree>(
         hierarchy,
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
+        guard: None,
         locator: locator(archive_sha256, entry_path, &namespace.join("::")),
     });
     if let Some(body) = work.node.child_by_field_name("body") {
@@ -471,6 +473,7 @@ fn project_method(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        guard: None,
         locator: locator(archive_sha256, entry_path, name),
     })
 }
@@ -575,6 +578,7 @@ fn project_call(
                 extension_receiver: None,
                 extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
+                guard: None,
                 locator: locator(archive_sha256, entry_path, &name),
             });
         }

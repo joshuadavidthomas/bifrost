@@ -1,26 +1,17 @@
+//! The `LanguageAdapter` forwarding shell for Go.
+//!
+//! Every answer below comes from [`brokk_bifrost_go`]; this file exists only
+//! because `LanguageAdapter` and `ParsedFile` are analysis-owned types the Go
+//! crate cannot name.
+
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
-use std::sync::LazyLock;
+use brokk_bifrost_go::adapter::{GO_COGNITIVE_CONFIG, GO_FILE_EXTENSION, go_extract_call_receiver};
+use brokk_bifrost_go::declarations::{go_package_fq, parse_go_file};
+use brokk_bifrost_go::packages::canonical_go_package_name;
+use brokk_bifrost_go::queries::GO_QUERY_DIRECTORY;
+use brokk_bifrost_go::test_detection::go_contains_tests;
 use tree_sitter::Tree;
-
-use super::declarations::{go_package_fq, parse_go_file};
-use super::packages::canonical_go_package_name;
-use super::tests::go_contains_tests;
-
-static GO_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
-    LazyLock::new(|| cognitive_complexity::Config {
-        if_types: &["if_statement"],
-        loop_types: &["for_statement"],
-        case_types: &["expression_case", "type_case", "communication_case"],
-        default_case_types: &["default_case"],
-        binary_types: &["binary_expression"],
-        logical_operators: &["&&", "||"],
-        jump_types: &["break_statement", "continue_statement"],
-        named_function_boundary_types: &["function_declaration", "method_declaration"],
-        anonymous_function_types: &["func_literal"],
-        else_clause_types: &["else_clause"],
-        ..cognitive_complexity::Config::empty()
-    });
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GoAdapter;
@@ -30,12 +21,14 @@ impl LanguageAdapter for GoAdapter {
         Language::Go
     }
 
+    /// Relative to `brokk-bifrost-go`'s crate root: the `.scm` assets moved with
+    /// the language knowledge and are embedded there.
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/go"
+        GO_QUERY_DIRECTORY
     }
 
     fn file_extension(&self) -> &'static str {
-        "go"
+        GO_FILE_EXTENSION
     }
 
     fn storage_content_qualifier(
@@ -58,15 +51,27 @@ impl LanguageAdapter for GoAdapter {
         canonical_go_package_name(file, content_qualifier)
     }
 
-    fn path_derived_package_fq(
+    fn default_package_anchor(&self) -> Option<crate::analyzer::PackageAnchor> {
+        Some(crate::analyzer::PackageAnchor::OwnModule { pop: 0 })
+    }
+
+    /// A Go declaration always sits in its file's own package, so the file's
+    /// own module is the only anchor this adapter can place. The declared
+    /// `package` clause travels in the content qualifier because the live
+    /// import path alone cannot recover a `_test` suffix or the module-less
+    /// fallback name.
+    fn resolve_package_anchor(
         &self,
+        anchor: crate::analyzer::PackageAnchor,
         content_qualifier: &str,
         file: &ProjectFile,
     ) -> Option<crate::analyzer::FqName> {
-        Some(go_package_fq(&canonical_go_package_name(
-            file,
-            content_qualifier,
-        )))
+        match anchor {
+            crate::analyzer::PackageAnchor::OwnModule { pop: 0 } => Some(go_package_fq(
+                &canonical_go_package_name(file, content_qualifier),
+            )),
+            _ => None,
+        }
     }
 
     fn contains_tests(
@@ -80,14 +85,7 @@ impl LanguageAdapter for GoAdapter {
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        let trimmed = reference.trim();
-        let before_args = trimmed
-            .split_once('(')
-            .map(|(head, _)| head)
-            .unwrap_or(trimmed);
-        before_args
-            .rsplit_once('.')
-            .map(|(receiver, _)| receiver.to_string())
+        go_extract_call_receiver(reference)
     }
 
     fn parse_file(

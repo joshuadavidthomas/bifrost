@@ -1233,8 +1233,8 @@ fn bifrost_lsp_server_validates_and_hovers_unsaved_rqlp_source() {
             "inline RQL selector omits",
         ),
         (
-            r#"(rql :schema-version 2 (call :callee (name "run")))"#,
-            "explicitly pins RQL schema version `2`",
+            r#"(rql :schema-version 1 (call :callee (name "run")))"#,
+            "explicitly pins RQL schema version `1`",
         ),
         (
             r#"(rql-file :path "queries/run.rql")"#,
@@ -1279,7 +1279,7 @@ export function leak_resource(): object {
     fs::create_dir(root.join("queries")).expect("create query directory");
     fs::write(
         root.join("queries/target.rql"),
-        r#"(rql :schema-version 2 (language typescript (function :name "target")))"#,
+        r#"(rql :schema-version 1 (language typescript (function :name "target")))"#,
     )
     .expect("write selector dependency");
     let policy_path = root.join("policies/live.rqlp");
@@ -1295,7 +1295,7 @@ export function leak_resource(): object {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language typescript (function :name "other")))))"#,
     )
     .expect("write saved policy");
@@ -1309,7 +1309,7 @@ export function leak_resource(): object {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language typescript (function :name "target")))))"#;
     let mut server = LspServer::start(&root);
 
@@ -1677,7 +1677,7 @@ fn bifrost_lsp_server_runs_policy_from_symlinked_workspace_uri() {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language python (call :callee (name "eval"))))))"#;
     let mut server = LspServer::start(&real_root);
 
@@ -1721,7 +1721,7 @@ fn bifrost_lsp_server_derives_policy_identity_from_configured_root() {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language typescript (function :name "target")))))"#;
     let mut server = LspServer::start_with_params(
         &parent,
@@ -1776,7 +1776,7 @@ fn bifrost_lsp_server_returns_multi_root_finding_paths_in_report_coordinates() {
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language typescript (function :name "target")))))"#;
     let mut server = LspServer::start_with_params(
         &parent,
@@ -7767,7 +7767,22 @@ func Run() {
 }
 
 #[test]
-fn bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in() {
+/// The runtime toggle still gates Scala's semantic pass, and #1619 adds a
+/// second gate on top of it: the pass may publish an unrecognized symbol only
+/// where structured analysis proved the name absent.
+///
+/// A bare workspace has no configured classpath and no activated dependency
+/// model, so nothing past the workspace has been read and `MissingType` may
+/// well be a JDK or dependency type. Publishing it would be exactly the false
+/// positive #1615 exists to prevent, so an enabled pass correctly publishes
+/// nothing here.
+///
+/// The positive case -- a proved absence reaching a client -- needs activated
+/// dependency packs. The LSP host does not activate them yet; the MCP service
+/// does, through `acquire_active_semantic_models`. Until the LSP does too, the
+/// error-producing half is pinned in process by
+/// `tests/suite_semantic/jvm_diagnostic_proof.rs`.
+fn bifrost_lsp_server_scala_unproved_symbols_are_never_published() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(
@@ -7816,11 +7831,11 @@ fn bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in() {
         published["params"]["diagnostics"]
             .as_array()
             .is_some_and(|items| {
-                items.iter().any(|item| {
-                    item["source"] == "bifrost-scala" && item["code"] == "scala_unrecognized_symbol"
-                })
+                items
+                    .iter()
+                    .all(|item| item["code"] != "scala_unrecognized_symbol")
             }),
-        "expected Scala unknown-type publish diagnostic: {published}"
+        "an enabled pass must still not publish a name it cannot prove absent: {published}"
     );
 
     server.notify_value(json!({
@@ -7829,15 +7844,18 @@ fn bifrost_lsp_server_scala_semantic_diagnostics_are_runtime_opt_in() {
         "method": "textDocument/diagnostic",
         "params": {"textDocument": {"uri": uri}}
     }));
-    let enabled = server.read_message();
-    let items = enabled["result"]["items"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected diagnostics after enabling Scala linting: {enabled}"));
+    // Matched by id: with the opt-in enabled the host activates dependency
+    // packs in the background, and its refresh notification may arrive between
+    // this request and its response (#1628).
+    let enabled = server.read_response_for_id(3);
+    let items = enabled["result"]["items"].as_array().unwrap_or_else(|| {
+        panic!("expected an items array after enabling Scala linting: {enabled}")
+    });
     assert!(
-        items.iter().any(|item| {
-            item["source"] == "bifrost-scala" && item["code"] == "scala_unrecognized_symbol"
-        }),
-        "expected Scala unknown-type diagnostic: {enabled}"
+        items
+            .iter()
+            .all(|item| item["code"] != "scala_unrecognized_symbol"),
+        "the pull route must agree with the push route: {enabled}"
     );
 }
 
@@ -7882,16 +7900,10 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
-    let enabled_publish = server.read_notification("textDocument/publishDiagnostics");
-    assert!(
-        enabled_publish["params"]["diagnostics"]
-            .as_array()
-            .is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item["code"] == "python_unrecognized_symbol")
-            }),
-        "enabling the opt-in must refresh existing push diagnostics: {enabled_publish}"
+    published_diagnostics_settle(
+        &mut server,
+        |items| has_code(items, "python_unrecognized_symbol"),
+        "enabling the opt-in must refresh existing push diagnostics",
     );
 
     server.notify_value(json!({
@@ -7900,7 +7912,9 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
         "method": "textDocument/diagnostic",
         "params": {"textDocument": {"uri": app_uri}}
     }));
-    let enabled_response = server.read_message();
+    // Matched by id: background dependency-pack activation can publish a
+    // refresh notification between this request and its response (#1628).
+    let enabled_response = server.read_response_for_id(3);
     assert!(
         enabled_response["result"]["items"]
             .as_array()
@@ -7921,16 +7935,10 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
         "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": app_uri}}
     }));
-    let published = server.read_notification("textDocument/publishDiagnostics");
-    assert!(
-        published["params"]["diagnostics"]
-            .as_array()
-            .is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item["code"] == "python_unrecognized_symbol")
-            }),
-        "the opt-in must apply to push diagnostics: {published}"
+    published_diagnostics_settle(
+        &mut server,
+        |items| has_code(items, "python_unrecognized_symbol"),
+        "the opt-in must apply to push diagnostics",
     );
 
     server.notify_value(json!({
@@ -7938,12 +7946,10 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": false}}
     }));
-    let cleared = server.read_notification("textDocument/publishDiagnostics");
-    assert!(
-        cleared["params"]["diagnostics"]
-            .as_array()
-            .is_some_and(Vec::is_empty),
-        "disabling the opt-in must clear previously published lints: {cleared}"
+    published_diagnostics_settle(
+        &mut server,
+        <[serde_json::Value]>::is_empty,
+        "disabling the opt-in must clear previously published lints",
     );
 
     server.notify_value(json!({
@@ -7952,7 +7958,7 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
         "method": "textDocument/diagnostic",
         "params": {"textDocument": {"uri": app_uri}}
     }));
-    let re_disabled_response = server.read_message();
+    let re_disabled_response = server.read_response_for_id(4);
     assert!(
         re_disabled_response["result"]["items"]
             .as_array()
@@ -7965,16 +7971,10 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
-    let re_enabled_publish = server.read_notification("textDocument/publishDiagnostics");
-    assert!(
-        re_enabled_publish["params"]["diagnostics"]
-            .as_array()
-            .is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item["code"] == "python_unrecognized_symbol")
-            }),
-        "re-enabling the opt-in must refresh existing push diagnostics: {re_enabled_publish}"
+    published_diagnostics_settle(
+        &mut server,
+        |items| has_code(items, "python_unrecognized_symbol"),
+        "re-enabling the opt-in must refresh existing push diagnostics",
     );
 
     fs::write(temp_root.join("app.py"), "def run(\n    missing_value\n")
@@ -7984,16 +7984,14 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
         "method": "textDocument/didSave",
         "params": {"textDocument": {"uri": app_uri}}
     }));
-    let parse_error = server.read_notification("textDocument/publishDiagnostics");
-    assert!(
-        parse_error["params"]["diagnostics"]
-            .as_array()
-            .is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item["source"] == "bifrost-tree-sitter")
-            }),
-        "expected a parse diagnostic before disabling the semantic lint: {parse_error}"
+    published_diagnostics_settle(
+        &mut server,
+        |items| {
+            items
+                .iter()
+                .any(|item| item["source"] == "bifrost-tree-sitter")
+        },
+        "a parse diagnostic before disabling the semantic lint",
     );
 
     server.notify_value(json!({
@@ -8001,17 +7999,299 @@ fn bifrost_lsp_server_unrecognized_symbol_diagnostics_are_runtime_opt_in() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": false}}
     }));
-    let retained_parse_error = server.read_notification("textDocument/publishDiagnostics");
-    assert!(
-        retained_parse_error["params"]["diagnostics"]
-            .as_array()
-            .is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item["source"] == "bifrost-tree-sitter")
-            }),
-        "disabling the semantic lint must retain parser diagnostics: {retained_parse_error}"
+    published_diagnostics_settle(
+        &mut server,
+        |items| {
+            items
+                .iter()
+                .any(|item| item["source"] == "bifrost-tree-sitter")
+        },
+        "disabling the semantic lint must retain parser diagnostics",
     );
+}
+
+/// One line per completed dependency-pack activation (#1628). The host writes
+/// it to stderr, so a test can count activations without a protocol channel
+/// for them.
+const ACTIVATION_LOG_PREFIX: &str = "[bifrost-lsp] dependency-pack activation";
+
+fn activation_count(stderr: &str) -> usize {
+    stderr.matches(ACTIVATION_LOG_PREFIX).count()
+}
+
+/// Read `publishDiagnostics` notifications until the published set for a URI
+/// satisfies `settled`.
+///
+/// LSP diagnostics are level-triggered state, not events: the server may
+/// republish the same document more than once for one cause — a configuration
+/// flip refreshes synchronously and the background dependency-pack activation
+/// it schedules refreshes again (#1628). A test that asserts on "the next
+/// notification" is therefore asserting on scheduling order rather than on
+/// behavior. This waits for the state the step is supposed to produce.
+fn published_diagnostics_settle(
+    server: &mut LspServer,
+    settled: impl Fn(&[serde_json::Value]) -> bool,
+    what: &str,
+) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..16 {
+        let note = server.read_notification("textDocument/publishDiagnostics");
+        let items = note["params"]["diagnostics"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if settled(&items) {
+            return note;
+        }
+        last = note;
+    }
+    panic!("published diagnostics never settled on {what}; last was {last}");
+}
+
+fn has_code(items: &[serde_json::Value], code: &str) -> bool {
+    items.iter().any(|item| item["code"] == code)
+}
+
+#[test]
+fn bifrost_lsp_server_opt_in_activates_dependency_packs_off_the_request_path() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n").expect("write app.py");
+
+    let mut server = LspServer::start(&temp_root);
+    let app_uri = uri_for(&temp_root.join("app.py"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "the opt-in is off, so nothing may publish yet: {published}"
+    );
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
+    }));
+    // The configuration flip refreshes synchronously on the main loop; the
+    // activation it schedules refreshes again once it has published its proof.
+    let flip_refresh = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(flip_refresh["params"]["uri"], app_uri);
+    let activation_refresh = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(
+        activation_refresh["params"]["uri"], app_uri,
+        "a completed activation must refresh every published document: {activation_refresh}"
+    );
+
+    let stderr = server.shutdown_with_stderr();
+    assert_eq!(
+        activation_count(&stderr),
+        1,
+        "expected exactly one background activation: {stderr}"
+    );
+    assert!(
+        stderr.contains("ecosystems=[Python]"),
+        "activation must cover only the ecosystems whose languages are present: {stderr}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_packs_document_opts_the_session_into_its_named_ecosystems() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n").expect("write app.py");
+    fs::write(temp_root.join("go.mod"), "module example.com/app\n").expect("write go.mod");
+    fs::write(
+        temp_root.join("main.go"),
+        "package main\n\nfunc main() {}\n",
+    )
+    .expect("write main.go");
+    fs::create_dir_all(temp_root.join(".bifrost")).expect("create .bifrost");
+    // The document is the opt-in (#1868): no client diagnostic setting is
+    // required, and activation covers only the document's ecosystems even
+    // though Python source is present too.
+    fs::write(
+        temp_root.join(".bifrost/packs.json"),
+        r#"{ "schema_version": 1, "ecosystems": ["go"] }"#,
+    )
+    .expect("write packs document");
+
+    let mut server = LspServer::start(&temp_root);
+    let go_uri = uri_for(&temp_root.join("main.go"));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": go_uri}}
+    }));
+    let published = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(published["params"]["uri"], go_uri);
+    // The activation the save superseded-or-scheduled refreshes the published
+    // document once it lands, which makes worker completion observable before
+    // shutdown can race it.
+    let activation_refresh = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(
+        activation_refresh["params"]["uri"], go_uri,
+        "a completed activation must refresh the published document: {activation_refresh}"
+    );
+
+    let stderr = server.shutdown_with_stderr();
+    assert!(
+        activation_count(&stderr) >= 1,
+        "the packs document must activate without any client diagnostic opt-in: {stderr}"
+    );
+    assert!(
+        stderr.contains("ecosystems=[Go]"),
+        "activation must cover exactly the document's ecosystems: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ecosystems=[Go, Python]") && !stderr.contains("Python"),
+        "the document must narrow activation to its named ecosystems: {stderr}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_opted_out_session_never_activates_dependency_packs() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n").expect("write app.py");
+    fs::write(temp_root.join("go.mod"), "module example.com/app\n").expect("write go.mod");
+
+    let mut server = LspServer::start(&temp_root);
+    let app_uri = uri_for(&temp_root.join("app.py"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let published = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        published["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "a default session publishes no semantic diagnostics: {published}"
+    );
+
+    let stderr = server.shutdown_with_stderr();
+    assert_eq!(
+        activation_count(&stderr),
+        0,
+        "a session that never opted in must never discover dependencies: {stderr}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_dependency_input_change_invalidates_and_reactivates() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(
+        temp_root.join("main.go"),
+        "package main\n\nfunc main() {\n\tprintln(1)\n}\n",
+    )
+    .expect("write main.go");
+    fs::write(
+        temp_root.join("go.mod"),
+        "module example.com/app\n\ngo 1.22\n",
+    )
+    .expect("write go.mod");
+
+    let mut server = LspServer::start(&temp_root);
+    let main_uri = uri_for(&temp_root.join("main.go"));
+    let go_mod_uri = uri_for(&temp_root.join("go.mod"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": main_uri}}
+    }));
+    let _ = server.read_notification("textDocument/publishDiagnostics");
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
+    }));
+    let _flip_refresh = server.read_notification("textDocument/publishDiagnostics");
+    // Reading the activation's own refresh proves the first activation finished
+    // before the dependency input changes, so the second schedule cannot
+    // coalesce into it.
+    let _first_activation_refresh = server.read_notification("textDocument/publishDiagnostics");
+
+    fs::write(
+        temp_root.join("go.mod"),
+        "module example.com/app\n\ngo 1.23\n",
+    )
+    .expect("rewrite go.mod");
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeWatchedFiles",
+        "params": {"changes": [{"uri": go_mod_uri, "type": 2}]}
+    }));
+    let _watched_refresh = server.read_notification("textDocument/publishDiagnostics");
+    let second_activation_refresh = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(
+        second_activation_refresh["params"]["uri"], main_uri,
+        "a changed dependency input must re-activate and refresh: {second_activation_refresh}"
+    );
+
+    let stderr = server.shutdown_with_stderr();
+    assert_eq!(
+        activation_count(&stderr),
+        2,
+        "the changed go.mod must schedule a second activation: {stderr}"
+    );
+    assert!(
+        stderr.contains("ecosystems=[Go]"),
+        "Go sources select the Go ecosystem: {stderr}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_dependency_pack_activation_stops_cleanly_on_opt_out() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n").expect("write app.py");
+
+    let mut server = LspServer::start(&temp_root);
+    let app_uri = uri_for(&temp_root.join("app.py"));
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": app_uri}}
+    }));
+    let _ = server.read_notification("textDocument/publishDiagnostics");
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
+    }));
+    let _flip_refresh = server.read_notification("textDocument/publishDiagnostics");
+    let _activation_refresh = server.read_notification("textDocument/publishDiagnostics");
+
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "workspace/didChangeConfiguration",
+        "params": {"settings": {"unrecognizedSymbolDiagnostics": false}}
+    }));
+    let cleared = server.read_notification("textDocument/publishDiagnostics");
+    assert!(
+        cleared["params"]["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "opting out must clear the published lints: {cleared}"
+    );
+
+    // `shutdown` asserts a successful exit status, which the server can only
+    // reach after it has cancelled and joined the activation worker.
+    server.shutdown();
 }
 
 #[test]
@@ -8077,7 +8357,7 @@ fn bifrost_lsp_server_cpp_semantic_diagnostics_require_context_and_opt_in() {
         "method": "textDocument/diagnostic",
         "params": {"textDocument": {"uri": source_uri}}
     }));
-    let enabled_response = server.read_message();
+    let enabled_response = server.read_response_for_id(3);
     assert!(
         enabled_response["result"]["items"]
             .as_array()
@@ -8246,7 +8526,7 @@ fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
         "method": "textDocument/diagnostic",
         "params": {"textDocument": {"uri": app_uri}}
     }));
-    let enabled_response = server.read_message();
+    let enabled_response = server.read_response_for_id(3);
     let items = enabled_response["result"]["items"]
         .as_array()
         .unwrap_or_else(|| panic!("expected Ruby diagnostic items, got {enabled_response}"));
@@ -8273,7 +8553,7 @@ fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
         "method": "textDocument/diagnostic",
         "params": {"textDocument": {"uri": dynamic_uri}}
     }));
-    let dynamic_response = server.read_message();
+    let dynamic_response = server.read_response_for_id(4);
     assert!(
         dynamic_response["result"]["items"]
             .as_array()
@@ -8282,12 +8562,14 @@ fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
     );
 
     server.notify_value(json!({"jsonrpc": "2.0", "id": 5, "method": "shutdown"}));
-    let _ = server.read_message();
+    let _ = server.read_response_for_id(5);
     server.exit();
 }
 
 #[test]
-fn bifrost_lsp_server_kotlin_semantic_diagnostics_are_runtime_opt_in() {
+/// Kotlin's half of the same contract. See
+/// [`bifrost_lsp_server_scala_unproved_symbols_are_never_published`].
+fn bifrost_lsp_server_kotlin_unproved_symbols_are_never_published() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(
@@ -8336,12 +8618,11 @@ fn bifrost_lsp_server_kotlin_semantic_diagnostics_are_runtime_opt_in() {
         published["params"]["diagnostics"]
             .as_array()
             .is_some_and(|items| {
-                items.iter().any(|item| {
-                    item["source"] == "bifrost-kotlin"
-                        && item["code"] == "kotlin_unrecognized_symbol"
-                })
+                items
+                    .iter()
+                    .all(|item| item["code"] != "kotlin_unrecognized_symbol")
             }),
-        "expected Kotlin unknown-type publish diagnostic: {published}"
+        "an enabled pass must still not publish a name it cannot prove absent: {published}"
     );
 
     server.notify_value(json!({
@@ -8350,23 +8631,19 @@ fn bifrost_lsp_server_kotlin_semantic_diagnostics_are_runtime_opt_in() {
         "method": "textDocument/diagnostic",
         "params": {"textDocument": {"uri": uri}}
     }));
-    let enabled = server.read_message();
-    let items = enabled["result"]["items"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected diagnostics after enabling Kotlin linting: {enabled}"));
+    let enabled = server.read_response_for_id(3);
+    let items = enabled["result"]["items"].as_array().unwrap_or_else(|| {
+        panic!("expected an items array after enabling Kotlin linting: {enabled}")
+    });
     assert!(
-        items.iter().any(|item| {
-            item["source"] == "bifrost-kotlin"
-                && item["code"] == "kotlin_unrecognized_symbol"
-                && item["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("MissingType"))
-        }),
-        "expected Kotlin unknown-type diagnostic: {enabled}"
+        items
+            .iter()
+            .all(|item| item["code"] != "kotlin_unrecognized_symbol"),
+        "the pull route must agree with the push route: {enabled}"
     );
 
     server.notify_value(json!({"jsonrpc": "2.0", "id": 4, "method": "shutdown"}));
-    let _ = server.read_message();
+    let _ = server.read_response_for_id(4);
     server.exit();
 }
 

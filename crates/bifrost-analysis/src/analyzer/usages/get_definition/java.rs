@@ -4,33 +4,9 @@ use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisWork, ReceiverBudgetLimit,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_jvm::java::graph_support::JavaSource;
 use std::cell::RefCell;
 use std::collections::VecDeque;
-
-#[derive(Debug, Clone)]
-pub(crate) enum BoundedJavaResolution<T> {
-    Complete {
-        value: T,
-        work: ReceiverAnalysisWork,
-    },
-    Exceeded {
-        work: ReceiverAnalysisWork,
-        limit: ReceiverBudgetLimit,
-    },
-    Cancelled {
-        work: ReceiverAnalysisWork,
-    },
-}
-
-impl<T> BoundedJavaResolution<T> {
-    pub(crate) fn work(&self) -> ReceiverAnalysisWork {
-        match self {
-            Self::Complete { work, .. }
-            | Self::Exceeded { work, .. }
-            | Self::Cancelled { work } => *work,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 enum JavaResolutionStop {
@@ -76,18 +52,18 @@ impl<'a> JavaResolutionSession<'a> {
         }
     }
 
-    pub(crate) fn finish<T>(&self, value: T) -> BoundedJavaResolution<T> {
+    pub(crate) fn finish<T>(&self, value: T) -> BoundedResolution<T> {
         self.observe_cancellation();
         let state = *self.state.borrow();
         match state.stop {
-            Some(JavaResolutionStop::Exceeded(limit)) => BoundedJavaResolution::Exceeded {
+            Some(JavaResolutionStop::Exceeded(limit)) => BoundedResolution::Exceeded {
                 work: state.work,
                 limit,
             },
             Some(JavaResolutionStop::Cancelled) => {
-                BoundedJavaResolution::Cancelled { work: state.work }
+                BoundedResolution::Cancelled { work: state.work }
             }
-            None => BoundedJavaResolution::Complete {
+            None => BoundedResolution::Complete {
                 value,
                 work: state.work,
             },
@@ -195,14 +171,20 @@ impl<'a> JavaResolutionSession<'a> {
         self.query_rows(|| java.resolve_type_name_candidates_in_file(file, name))
     }
 
+    /// Whether `name` resolves once the external surface is consulted. The
+    /// activated packs come from the dispatching analyzer, which is the only
+    /// one activation publishes onto (#1893).
     fn type_name_resolves_with_external(
         &self,
+        analyzer: &dyn IAnalyzer,
         java: &JavaAnalyzer,
         file: &ProjectFile,
         name: &str,
     ) -> bool {
-        self.query_optional_row(|| java.resolve_type_name_with_external(file, name))
-            .is_some()
+        self.query_optional_row(|| {
+            java.resolve_type_name_with_external(analyzer.semantic_model_overlay(), file, name)
+        })
+        .is_some()
     }
 
     fn import_infos(
@@ -383,18 +365,6 @@ enum JavaMemberLookupKind {
     Type,
 }
 
-pub(crate) fn java_type_lookup_resolution(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    site: &ResolvedReferenceSite,
-) -> Option<JavaTypeLookupResolution> {
-    let session = JavaResolutionSession::unbounded(support);
-    java_type_lookup_resolution_in_session(analyzer, &session, file, source, root, site)
-}
-
 pub(crate) fn java_type_lookup_resolution_in_session(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,
@@ -422,8 +392,8 @@ pub(crate) fn resolve_java(
 ) -> DefinitionLookupOutcome {
     let session = JavaResolutionSession::unbounded(support);
     match resolve_java_in_session(analyzer, &session, file, source, tree, site) {
-        BoundedJavaResolution::Complete { value, .. } => value,
-        BoundedJavaResolution::Exceeded { .. } | BoundedJavaResolution::Cancelled { .. } => {
+        BoundedResolution::Complete { value, .. } => value,
+        BoundedResolution::Exceeded { .. } | BoundedResolution::Cancelled { .. } => {
             unreachable!("unbounded Java resolution cannot be interrupted")
         }
     }
@@ -436,7 +406,7 @@ pub(crate) fn resolve_java_bounded(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
-) -> BoundedJavaResolution<DefinitionLookupOutcome> {
+) -> BoundedResolution<DefinitionLookupOutcome> {
     resolve_java_in_session(analyzer, session, file, source, tree, site)
 }
 
@@ -447,7 +417,7 @@ fn resolve_java_in_session(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
-) -> BoundedJavaResolution<DefinitionLookupOutcome> {
+) -> BoundedResolution<DefinitionLookupOutcome> {
     // Java's tier ladder resolves the reference this site names, so the deep
     // scope covers the whole dispatch: the type-name tiers in
     // `java::imports::resolve_type_name_with`, the member tier, the
@@ -827,7 +797,7 @@ fn java_explicit_scoped_type_reference(
     if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
         return Some(candidates_outcome(vec![unit]));
     }
-    if session.type_name_resolves_with_external(java, file, normalized) {
+    if session.type_name_resolves_with_external(analyzer, java, file, normalized) {
         // gated upstream: `resolve_type_name_in_file` and `java_qualified_nested_type`
         // above return early for any workspace-internal type; reaching here means
         // the name only resolves once external imports are considered.
@@ -886,8 +856,13 @@ fn resolve_java_method_invocation(
                 Some(arity),
             );
         }
-        return no_definition(
-            "unsupported_java_receiver",
+        return java_unresolved_receiver_outcome(
+            analyzer,
+            session,
+            file,
+            source,
+            object,
+            name,
             format!("receiver for Java method `{name}` is not resolved"),
         );
     }
@@ -900,12 +875,10 @@ fn resolve_java_method_invocation(
         JavaMemberLookupKind::Method,
         Some(arity),
     );
-    if static_import.status != DefinitionLookupStatus::NoDefinition
-        && static_import
-            .definitions
-            .iter()
-            .any(|unit| java_callable_accepts_arity(analyzer, Some(session), unit, arity))
-    {
+    // The tier took the call's arity, so anything it names already accepts the
+    // argument list. A static-import boundary claim does not short-circuit: the
+    // enclosing class below can still declare the method (#1126's invariant).
+    if !static_import.definitions.is_empty() {
         return static_import;
     }
 
@@ -918,11 +891,7 @@ fn resolve_java_method_invocation(
             JavaMemberLookupKind::Method,
             Some(arity),
         );
-        if outcome
-            .definitions
-            .iter()
-            .any(|unit| java_callable_accepts_arity(analyzer, Some(session), unit, arity))
-        {
+        if outcome.status != DefinitionLookupStatus::NoDefinition {
             return outcome;
         }
     }
@@ -1294,9 +1263,56 @@ fn resolve_java_field_access(
             None,
         );
     }
-    no_definition(
-        "unsupported_java_receiver",
+    java_unresolved_receiver_outcome(
+        analyzer,
+        session,
+        file,
+        source,
+        object,
+        field,
         format!("receiver for Java field `{field}` is not resolved"),
+    )
+}
+
+/// What a member reference reports when its receiver is not a type this
+/// workspace indexes.
+///
+/// A receiver whose written spelling resolves to an *external* type, on which
+/// the external declaration surface declares `member`, is a reference the
+/// workspace cannot index rather than one nothing declares. That is the import
+/// boundary the resolver actually crossed, and reporting it is what lets the
+/// trace name the external declaration the reference landed on (#1900).
+/// Anything else keeps the plain unresolved-receiver miss, so a receiver of
+/// unknown type and a member no surface declares are both unchanged.
+fn java_unresolved_receiver_outcome(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    object: Node<'_>,
+    member: &str,
+    unresolved_message: String,
+) -> DefinitionLookupOutcome {
+    let spelling = format!("{}.{}", java_node_text(object, source), member);
+    gated_boundary(
+        || {
+            resolve_analyzer::<JavaAnalyzer>(analyzer).is_none_or(|java| {
+                session
+                    .query_optional_row(|| {
+                        java.resolve_member_name_with_external(
+                            analyzer.semantic_model_overlay(),
+                            file,
+                            &spelling,
+                        )
+                    })
+                    .is_none()
+            })
+        },
+        format!(
+            "`{spelling}` appears to cross a Java import boundary not indexed in this workspace"
+        ),
+        "unsupported_java_receiver",
+        unresolved_message,
     )
 }
 
@@ -1318,14 +1334,20 @@ fn resolve_java_bare_identifier(
     node: Node<'_>,
 ) -> DefinitionLookupOutcome {
     let name = java_node_text(node, source);
-    if let Some(unit) = session.resolve_type_name_in_file(java, file, name) {
-        return candidates_outcome(vec![unit]);
+    if java_identifier_is_annotation_name(node) {
+        if let Some(unit) = session.resolve_type_name_in_file(java, file, name) {
+            return candidates_outcome(vec![unit]);
+        }
+        return java_bare_name_static_import_or_boundary(analyzer, java, session, file, name);
     }
-    // A bare identifier can be an unqualified field access — resolve it to a
-    // field of the enclosing class (or an inherited one), unless the name is
-    // bound in the active lexical path. Java resolves these members before
-    // considering static imports, including on-demand imports with the same
-    // simple name.
+    // JLS 6.4.2 (obscuring) and 6.5.2 (ambiguous names): outside a type context
+    // a simple name denotes a variable whenever one is in scope -- a local, a
+    // parameter, or a field of the enclosing class, inherited ones included --
+    // and the same-named type only when none is. A qualifier head
+    // (`Widget.CONST`, `Widget.of()`, `Widget::run`) is an ambiguous name and
+    // takes the same order. The inverse usage scan already refuses such a site
+    // as a type reference, so resolving the type first made the two surfaces
+    // disagree (#1754).
     let locally_bound = java_local_binding_before(
         analyzer,
         java,
@@ -1356,6 +1378,35 @@ fn resolve_java_bare_identifier(
             format!("`{name}` resolves to a local Java binding"),
         );
     }
+    if let Some(unit) = session.resolve_type_name_in_file(java, file, name) {
+        return candidates_outcome(vec![unit]);
+    }
+    java_bare_name_static_import_or_boundary(analyzer, java, session, file, name)
+}
+
+/// tree-sitter-java spells every Java type reference as `type_identifier`,
+/// `scoped_type_identifier` or `generic_type` -- except an annotation name,
+/// which is a plain `identifier`. So this is the complete set of type contexts
+/// a bare-identifier reference site can sit in; everything else that reaches
+/// [`resolve_java_bare_identifier`] is an expression name or an ambiguous-name
+/// qualifier, where a variable in scope wins over a same-named type.
+fn java_identifier_is_annotation_name(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        matches!(parent.kind(), "annotation" | "marker_annotation")
+            && parent.child_by_field_name("name") == Some(node)
+    })
+}
+
+/// The last two tiers a bare Java name falls through to once neither a
+/// variable, a member of the enclosing class, nor a type name claimed it:
+/// static imports, then the import-boundary gate.
+fn java_bare_name_static_import_or_boundary(
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    name: &str,
+) -> DefinitionLookupOutcome {
     let static_import = java_static_import_candidates(
         analyzer,
         session,
@@ -2485,6 +2536,151 @@ fn java_terminal_segment(path: &str) -> Option<String> {
         .filter(|segment| !segment.is_empty())
 }
 
+/// The per-candidate attribution the Java member walk records while it runs,
+/// built only when a trace is being recorded (#1477). The walk itself decides
+/// nothing from it; it is an emission of facts the walk already holds: which
+/// hierarchy type each candidate was found on, at which BFS depth, and through
+/// which first-discovery parent chain.
+#[derive(Default)]
+struct JavaMemberTrace {
+    /// First-discovery parent of each ancestor the walk expanded, which makes
+    /// the route reconstruction a bounded walk back to the receiver's owner.
+    parents: HashMap<CodeUnit, CodeUnit>,
+    /// Candidate declaration -> (hierarchy type it was found on, BFS depth).
+    found: HashMap<CodeUnit, (CodeUnit, usize)>,
+}
+
+impl JavaMemberTrace {
+    fn record_found(&mut self, candidates: &[CodeUnit], found_on: &CodeUnit, depth: usize) {
+        for candidate in candidates {
+            self.found
+                .entry(candidate.clone())
+                .or_insert_with(|| (found_on.clone(), depth));
+        }
+    }
+
+    /// The exact hierarchy route from `base` to the type `candidate` was found
+    /// on, as first-discovery hops. The provider reports undifferentiated
+    /// ancestors, so every hop is [`HierarchyRelation::Supertype`].
+    fn route(&self, base: &CodeUnit, candidate: &CodeUnit) -> Vec<trace::HierarchyHopRecord> {
+        use crate::analyzer::structural::HierarchyRelation;
+
+        let Some((found_on, depth)) = self.found.get(candidate) else {
+            return Vec::new();
+        };
+        let mut chain = vec![found_on.clone()];
+        while chain.last() != Some(base) {
+            let Some(parent) = self
+                .parents
+                .get(chain.last().expect("chain is never empty"))
+            else {
+                break;
+            };
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+        debug_assert_eq!(
+            chain.len(),
+            depth + 1,
+            "the first-discovery chain must be exactly the BFS depth"
+        );
+        chain
+            .windows(2)
+            .enumerate()
+            .map(|(hop, pair)| trace::HierarchyHopRecord {
+                hop,
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                relation: HierarchyRelation::Supertype,
+            })
+            .collect()
+    }
+
+    fn enrichment(
+        &self,
+        base: &CodeUnit,
+        candidate: &CodeUnit,
+        applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
+    ) -> Option<trace::MemberEnrichment> {
+        use crate::analyzer::structural::MemberDispatchTier;
+
+        let (found_on, depth) = self.found.get(candidate)?;
+        let dispatch_tier = if *depth == 0 {
+            MemberDispatchTier::InherentOrDirect
+        } else {
+            MemberDispatchTier::InheritedOrPromoted
+        };
+        Some(trace::MemberEnrichment {
+            owner: found_on.clone(),
+            hierarchy_depth: *depth,
+            dispatch_tier,
+            applicability,
+            route: self.route(base, candidate),
+        })
+    }
+
+    /// Stage attribution for `winners` on the outcome the caller is about to
+    /// construct, and record every member of `considered` that is not a winner
+    /// as a rejected row. Java's losers here always lost the arity check, whose
+    /// structured story belongs to the callable axis (#1478), so the rejection
+    /// reason defers to it.
+    fn stage_selection(
+        &self,
+        base: &CodeUnit,
+        winners: &[CodeUnit],
+        considered: &[CodeUnit],
+        winner_applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
+    ) {
+        use crate::analyzer::structural::{PrecedenceTier, RejectionReason};
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        for loser in considered.iter().filter(|unit| !winners.contains(unit)) {
+            let tier = self.found.get(loser).map(|(_, depth)| {
+                if *depth == 0 {
+                    PrecedenceTier::OwnMember
+                } else {
+                    PrecedenceTier::InheritedMember
+                }
+            });
+            let mut row = trace::TraceCandidate::rejected(
+                trace::TraceCandidateRef::Unit(loser.clone()),
+                tier,
+                RejectionReason::CallableApplicabilityDeferred,
+            );
+            if let Some(enrichment) =
+                self.enrichment(base, loser, ApplicabilityVerdict::Inapplicable)
+            {
+                row = row.with_member(enrichment);
+            }
+            trace::record(row);
+        }
+        let winner_tier = winners
+            .iter()
+            .filter_map(|unit| self.found.get(unit))
+            .map(|(_, depth)| *depth)
+            .min()
+            .map(|depth| {
+                if depth == 0 {
+                    PrecedenceTier::OwnMember
+                } else {
+                    PrecedenceTier::InheritedMember
+                }
+            });
+        if let Some(tier) = winner_tier {
+            trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
+        }
+        trace::stage_member_context(
+            winners
+                .iter()
+                .filter_map(|unit| {
+                    self.enrichment(base, unit, winner_applicability)
+                        .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+    }
+}
+
 fn java_member_candidates(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,
@@ -2493,26 +2689,64 @@ fn java_member_candidates(
     kind: JavaMemberLookupKind,
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
+    use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
     let support: &dyn BoundedDefinitionLookup = session;
     let owner_fqn = owner.fq_name();
+    let mut member_trace = trace::recording().then(JavaMemberTrace::default);
     let mut candidates =
         java_filter_member_candidates(support.fqn(&format!("{owner_fqn}.{member}")), kind);
     sort_units(&mut candidates);
     candidates.dedup();
+    if let Some(state) = member_trace.as_mut() {
+        state.record_found(&candidates, owner, 0);
+    }
     if let Some(filtered_candidates) = java_arity_candidates(analyzer, session, &candidates, arity)
     {
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_selection(
+                owner,
+                &filtered_candidates,
+                &candidates,
+                ApplicabilityVerdict::Applicable,
+            );
+        }
         return candidates_outcome(filtered_candidates);
     }
     if !candidates.is_empty() && arity.is_none() {
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_selection(
+                owner,
+                &candidates,
+                &candidates,
+                ApplicabilityVerdict::Unknown,
+            );
+        }
         return candidates_outcome(candidates);
     }
-    let mut fallback_candidates = (!candidates.is_empty()).then_some(candidates);
+    if !candidates.is_empty() {
+        // Arity is known and nothing accepted (#1755): the direct set is
+        // discarded, never bound. Record the discard as rejected rows.
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_selection(owner, &[], &candidates, ApplicabilityVerdict::Inapplicable);
+        }
+    }
 
     if let Some(provider) = analyzer.type_hierarchy_provider() {
         let mut seen = HashSet::default();
         let mut level = session.direct_ancestors(provider, owner);
+        if let Some(state) = member_trace.as_mut() {
+            for ancestor in &level {
+                state
+                    .parents
+                    .entry(ancestor.clone())
+                    .or_insert_with(|| owner.clone());
+            }
+        }
         seen.insert(owner.clone());
+        let mut depth = 0usize;
         while !level.is_empty() {
+            depth += 1;
             let mut level_candidates = Vec::new();
             let mut next_level = Vec::new();
             for ancestor in level {
@@ -2525,35 +2759,129 @@ fn java_member_candidates(
                 if !seen.insert(ancestor.clone()) {
                     continue;
                 }
-                level_candidates.extend(java_filter_member_candidates(
+                let found = java_filter_member_candidates(
                     support.fqn(&format!("{}.{}", ancestor.fq_name(), member)),
                     kind,
-                ));
-                next_level.extend(session.direct_ancestors(provider, &ancestor));
+                );
+                if let Some(state) = member_trace.as_mut() {
+                    state.record_found(&found, &ancestor, depth);
+                }
+                level_candidates.extend(found);
+                let expanded = session.direct_ancestors(provider, &ancestor);
+                if let Some(state) = member_trace.as_mut() {
+                    for next in &expanded {
+                        state
+                            .parents
+                            .entry(next.clone())
+                            .or_insert_with(|| ancestor.clone());
+                    }
+                }
+                next_level.extend(expanded);
             }
             sort_units(&mut level_candidates);
             level_candidates.dedup();
             if let Some(filtered_level_candidates) =
                 java_arity_candidates(analyzer, session, &level_candidates, arity)
             {
+                if let Some(state) = member_trace.as_ref() {
+                    state.stage_selection(
+                        owner,
+                        &filtered_level_candidates,
+                        &level_candidates,
+                        ApplicabilityVerdict::Applicable,
+                    );
+                }
                 return candidates_outcome(filtered_level_candidates);
             }
             if !level_candidates.is_empty() {
                 if arity.is_none() {
+                    if let Some(state) = member_trace.as_ref() {
+                        state.stage_selection(
+                            owner,
+                            &level_candidates,
+                            &level_candidates,
+                            ApplicabilityVerdict::Unknown,
+                        );
+                    }
                     return candidates_outcome(level_candidates);
                 }
-                fallback_candidates.get_or_insert(level_candidates);
+                // JLS 15.12.2 applicability (#1755): a level set with no
+                // accepting overload is discarded, never bound. Record the
+                // discard as rejected rows while the walk still knows them.
+                if let Some(state) = member_trace.as_ref() {
+                    state.stage_selection(
+                        owner,
+                        &[],
+                        &level_candidates,
+                        ApplicabilityVerdict::Inapplicable,
+                    );
+                }
             }
             level = next_level;
         }
     }
-    if let Some(candidates) = fallback_candidates {
-        return candidates_outcome(candidates);
-    }
-    no_definition(
-        "no_indexed_definition",
-        format!("`{owner_fqn}.{member}` is not indexed as a Java definition"),
+    let Some(expected) = arity else {
+        return no_definition(
+            "no_indexed_definition",
+            format!("`{owner_fqn}.{member}` is not indexed as a Java definition"),
+        );
+    };
+    // JLS 15.12.2 applicability: an overload whose parameter list cannot accept
+    // this argument list is not the target, and the inverse usage scan already
+    // refuses such a site (`callable_arity_matches_target`). Binding it anyway
+    // was the forward side's #1755 defect. When the owner's hierarchy leaves the
+    // indexed workspace, the accepting declaration is on the far side of that
+    // boundary, which is what the site must report.
+    gated_boundary(
+        || !java_hierarchy_crosses_unindexed_supertype(analyzer, session, owner),
+        format!(
+            "`{owner_fqn}.{member}` is inherited from a Java supertype not indexed in this workspace"
+        ),
+        "no_accepting_overload",
+        format!("no indexed `{owner_fqn}.{member}` overload accepts {expected} arguments"),
     )
+}
+
+/// Whether `owner`'s supertype closure names a type this workspace does not
+/// index.
+///
+/// `java_direct_ancestors` drops a supertype spelling it cannot resolve, so the
+/// resolved ancestors alone cannot tell a complete hierarchy from a truncated
+/// one. The raw `extends`/`implements` spellings can, put through the very same
+/// forward type-name tiers that dropped them.
+fn java_hierarchy_crosses_unindexed_supertype(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: &CodeUnit,
+) -> bool {
+    let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
+        return false;
+    };
+    let Some(provider) = analyzer.type_hierarchy_provider() else {
+        return false;
+    };
+    let mut seen = HashSet::default();
+    seen.insert(owner.clone());
+    let mut queue = VecDeque::from([owner.clone()]);
+    while let Some(unit) = queue.pop_front() {
+        if !session.observe_cancellation() {
+            return false;
+        }
+        for raw in java.raw_supertypes_of(&unit) {
+            if session
+                .resolve_type_name_in_file(java, unit.source(), normalize_java_type_text(&raw))
+                .is_none()
+            {
+                return true;
+            }
+        }
+        for ancestor in session.direct_ancestors(provider, &unit) {
+            if seen.insert(ancestor.clone()) {
+                queue.push_back(ancestor);
+            }
+        }
+    }
+    false
 }
 
 fn java_filter_member_candidates(
@@ -2655,7 +2983,9 @@ fn java_static_import_candidates(
     {
         return candidates_outcome(filtered_candidates);
     }
-    if !candidates.is_empty() {
+    // A statically imported overload that cannot accept the call's argument list
+    // is not the target (#1755), so it never stands in for one that can.
+    if !candidates.is_empty() && arity.is_none() {
         return candidates_outcome(candidates);
     }
     // `saw_external` is set only when an import target is both unindexed and

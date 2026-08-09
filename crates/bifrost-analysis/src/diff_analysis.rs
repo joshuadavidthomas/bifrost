@@ -4,9 +4,13 @@ use crate::searchtools::{
     UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
 };
 use crate::{FileSetProject, WorkspaceAnalyzer};
-use git2::{Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository};
+use git2::{
+    Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository, TreeWalkMode,
+    TreeWalkResult,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -53,7 +57,11 @@ pub struct DiffAnalysisResult {
     pub patch_symbols: PatchSymbols,
     pub dependency_symbols: Vec<CommitSymbol>,
     pub import_changes: Vec<ImportChange>,
-    pub call_edge_changes: Vec<CallEdgeChange>,
+    /// The call-edge changes left over after every patch symbol took the edges
+    /// it calls, such as an untouched function in a changed file whose callee
+    /// resolution moved under it. A caller that appears anywhere in
+    /// `patch_symbols` reports its callee deltas there instead.
+    pub unattributed_call_edge_changes: Vec<CallEdgeChange>,
     pub large_callsite_symbols: Vec<LargeCallsiteSymbol>,
 }
 
@@ -115,6 +123,19 @@ pub struct PatchSymbols {
     pub signature_changes: Vec<SignatureChange>,
 }
 
+/// One outgoing call edge a patch symbol gained or lost.
+///
+/// This is [`CallEdgeChange`] without `from` and `change`, because both are
+/// implied by position: the caller is the record holding the list, and the
+/// direction is which of the record's two lists it lands in.
+#[derive(Debug, Clone, Serialize)]
+pub struct CalleeChange {
+    pub to: String,
+    pub language: String,
+    pub weight: usize,
+    pub sites: Vec<UsageGraphCallSite>,
+}
+
 /// A symbol present at both endpoints that some hunk touched.
 ///
 /// The two line lists are the whole story about *how* it was touched, which is
@@ -128,6 +149,11 @@ pub struct EditedSymbolPair {
     pub after: CommitSymbol,
     pub touched_old_lines: Vec<usize>,
     pub touched_new_lines: Vec<usize>,
+    /// Callees this symbol reaches in the postimage and did not reach in the
+    /// preimage.
+    pub added_calls: Vec<CalleeChange>,
+    /// Callees this symbol reached in the preimage and no longer reaches.
+    pub removed_calls: Vec<CalleeChange>,
 }
 
 /// A symbol the postimage has and the preimage does not.
@@ -135,6 +161,9 @@ pub struct EditedSymbolPair {
 pub struct IntroducedSymbol {
     pub after: CommitSymbol,
     pub touched_new_lines: Vec<usize>,
+    /// Everything the new symbol calls. One list rather than a pair, because a
+    /// symbol the preimage does not have can only add edges.
+    pub calls: Vec<CalleeChange>,
 }
 
 /// A symbol the preimage has and the postimage does not.
@@ -142,12 +171,25 @@ pub struct IntroducedSymbol {
 pub struct DeletedSymbol {
     pub before: CommitSymbol,
     pub touched_old_lines: Vec<usize>,
+    /// Everything the symbol used to call. One list rather than a pair, for the
+    /// mirror of [`IntroducedSymbol::calls`]'s reason.
+    pub called: Vec<CalleeChange>,
 }
 
+/// A symbol both endpoints hold at different locations, or under different
+/// fully-qualified names because its file moved.
+///
+/// A pure move reports both call lists empty: the preimage graph is rewritten
+/// through these very pairs before the two graphs are compared, so relocating a
+/// symbol is not by itself a call-edge change. See [`fqn_renames`].
 #[derive(Debug, Clone, Serialize)]
 pub struct MovedSymbol {
     pub before: CommitSymbol,
     pub after: CommitSymbol,
+    /// See [`EditedSymbolPair::added_calls`].
+    pub added_calls: Vec<CalleeChange>,
+    /// See [`EditedSymbolPair::removed_calls`].
+    pub removed_calls: Vec<CalleeChange>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,11 +205,12 @@ pub struct ImportChange {
     pub removed: Vec<String>,
 }
 
+/// A call edge the patch added or removed whose caller no patch symbol claims.
 #[derive(Debug, Clone, Serialize)]
 pub struct CallEdgeChange {
-    /// Closed set, produced by [`call_edge_changes_and_dependencies`]: `added`
-    /// for an edge only the postimage graph has, `removed` for one only the
-    /// preimage graph has. An edge present in both is not reported.
+    /// Closed set, produced by [`diff_call_edges`]: `added` for an edge only the
+    /// postimage graph has, `removed` for one only the preimage graph has. An
+    /// edge present in both is not reported.
     pub change: String,
     pub from: String,
     pub to: String,
@@ -202,9 +245,14 @@ struct FileLineCounts {
 struct SymbolSnapshot {
     symbol: CommitSymbol,
     key: SymbolKey,
+    /// Normalized token sequence of the symbol's body, or `None` when the body
+    /// is too trivial to identify a move by content alone. Used only to pair
+    /// leftovers that shared no identity key, by token similarity -- see
+    /// [`pair_endpoints`] and [`body_similarity`].
+    token_sig: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct SymbolKey {
     fqn: String,
     kind: String,
@@ -403,35 +451,47 @@ pub fn analyze_diff_at_root(
     let mut moved = Vec::new();
     let mut signature_changes = Vec::new();
 
-    // A key present at both endpoints yields at most one `edited` record, which
-    // carries both endpoint descriptors and both line lists. A hunk touching
-    // either side edits the symbol, so the record exists whenever either
-    // overlap is non-empty; a lopsided hunk simply leaves the untouched side's
-    // list empty. `introduced` and `deleted` stay one-sided because only one
-    // endpoint has the symbol at all.
+    // A pair yields at most one `edited` record, which carries both endpoint
+    // descriptors and both line lists. A hunk touching either side edits the
+    // symbol, so the record exists whenever either overlap is non-empty; a
+    // lopsided hunk simply leaves the untouched side's list empty. `introduced`
+    // and `deleted` stay one-sided because only one endpoint has the symbol.
     //
-    // Boundary, deliberately left as is: a matched symbol whose own lines see no
-    // hunk is not reported even when the patch changed its meaning from above
-    // (an enclosing scope or an import shifting parse context), and an unmatched
-    // symbol with no overlap is likewise dropped rather than reported.
-    for (key, post) in &after {
-        let Some(pre) = before.get(key) else {
-            let touched_new_lines = new_overlap(&post.symbol, &changed_lines);
-            if !touched_new_lines.is_empty() {
-                introduced.push(IntroducedSymbol {
-                    after: post.symbol.clone(),
-                    touched_new_lines,
-                });
-            }
-            continue;
-        };
-        if pre.symbol.path != post.symbol.path || pre.symbol.start_line != post.symbol.start_line {
+    // Boundary, deliberately left as is: a paired symbol whose own lines see no
+    // hunk is not reported edited even when the patch changed its meaning from
+    // above (an enclosing scope or an import shifting parse context), and an
+    // unpaired symbol with no overlap is likewise dropped rather than reported.
+    let endpoint_pairing = pair_endpoints(&before, &after, &file_changes);
+    for (pre, post) in &endpoint_pairing.pairs {
+        // A paired symbol is only *moved* when it genuinely relocated -- its
+        // name changed (body-identity pairing matched it under a new fqn), its
+        // file changed, or its position changed by more than the patch's own
+        // line offset accounts for. A symbol whose start line merely shifted
+        // because lines were inserted/deleted ELSEWHERE in the file has not
+        // moved; reporting it as such floods the result with one entry per
+        // symbol below any early edit (a single insert near the top of a large
+        // file otherwise yields hundreds of spurious "moved" rows).
+        let relocated = pre.symbol.fqn != post.symbol.fqn
+            || pre.symbol.path != post.symbol.path
+            || (pre.symbol.start_line != post.symbol.start_line
+                && !is_pure_line_shift(&pre.symbol, &post.symbol, &changed_lines));
+        if relocated {
             moved.push(MovedSymbol {
                 before: pre.symbol.clone(),
                 after: post.symbol.clone(),
+                added_calls: Vec::new(),
+                removed_calls: Vec::new(),
             });
         }
-        if pre.symbol.signature != post.symbol.signature {
+        // A pair matched by the body-similarity rule (rather than by identity or
+        // a Git rename) relocated -- and may have been renamed or lightly
+        // edited -- but its touched lines are dominated by the relocation, not a
+        // real edit. The `moved` entry above already carries the full before and
+        // after symbols, so also reporting it as an edit -- with every cut line
+        // "deleted" and every pasted line "inserted" -- or as a signature change
+        // would be double-counting noise. Suppress both for those pairs.
+        let relocated_by_body = endpoint_pairing.fallback_paired.contains(&pre.key);
+        if !relocated_by_body && pre.symbol.signature != post.symbol.signature {
             signature_changes.push(SignatureChange {
                 before: pre.symbol.clone(),
                 after: post.symbol.clone(),
@@ -439,7 +499,7 @@ pub fn analyze_diff_at_root(
         }
         let touched_old_lines = old_overlap(&pre.symbol, &changed_lines);
         let touched_new_lines = new_overlap(&post.symbol, &changed_lines);
-        if touched_old_lines.is_empty() && touched_new_lines.is_empty() {
+        if relocated_by_body || (touched_old_lines.is_empty() && touched_new_lines.is_empty()) {
             continue;
         }
         edited.push(EditedSymbolPair {
@@ -447,17 +507,27 @@ pub fn analyze_diff_at_root(
             after: post.symbol.clone(),
             touched_old_lines,
             touched_new_lines,
+            added_calls: Vec::new(),
+            removed_calls: Vec::new(),
         });
     }
-    for (key, pre) in &before {
-        if after.contains_key(key) {
-            continue;
+    for post in &endpoint_pairing.postimage_only {
+        let touched_new_lines = new_overlap(&post.symbol, &changed_lines);
+        if !touched_new_lines.is_empty() {
+            introduced.push(IntroducedSymbol {
+                after: post.symbol.clone(),
+                touched_new_lines,
+                calls: Vec::new(),
+            });
         }
+    }
+    for pre in &endpoint_pairing.preimage_only {
         let touched_old_lines = old_overlap(&pre.symbol, &changed_lines);
         if !touched_old_lines.is_empty() {
             deleted.push(DeletedSymbol {
                 before: pre.symbol.clone(),
                 touched_old_lines,
+                called: Vec::new(),
             });
         }
     }
@@ -467,14 +537,6 @@ pub fn analyze_diff_at_root(
     deleted.sort_by(|a, b| a.before.cmp(&b.before));
     moved.sort_by(|a, b| a.after.cmp(&b.after));
     signature_changes.sort_by(|a, b| a.after.cmp(&b.after));
-
-    let patch_symbols = PatchSymbols {
-        edited,
-        introduced,
-        deleted,
-        moved,
-        signature_changes,
-    };
 
     let import_changes = import_changes(
         base_analyzer.analyzer(),
@@ -495,8 +557,69 @@ pub fn analyze_diff_at_root(
             paths: Some(changed_paths),
         },
     );
-    let (call_edge_changes, dependency_symbols) =
-        call_edge_changes_and_dependencies(&graph_before.edges, &graph_after.edges, &after);
+    let CallEdgeDiff {
+        deltas,
+        dependency_symbols,
+    } = diff_call_edges(
+        &graph_before.edges,
+        &graph_after.edges,
+        &fqn_renames(&moved),
+        &after,
+    );
+
+    // Hand each patch symbol the callee delta recorded under its name, so the
+    // consumer never has to join a flat edge list against the symbol lists. A
+    // symbol that was both edited and moved appears in two lists and takes the
+    // same delta twice, which is why this reads the map instead of draining it.
+    //
+    // Claims are per direction, not per symbol: a one-sided record claims only
+    // the direction it can express. An fqn that names a function at one endpoint
+    // and a class at the other is introduced and deleted at once, and each
+    // record then still reports its own half rather than swallowing both.
+    let mut claimed_added: HashSet<CallerKey> = HashSet::new();
+    let mut claimed_removed: HashSet<CallerKey> = HashSet::new();
+    for pair in &mut edited {
+        let key = symbol_edge_key(&pair.after);
+        if let Some(delta) = deltas.get(&key) {
+            pair.added_calls.clone_from(&delta.added);
+            pair.removed_calls.clone_from(&delta.removed);
+        }
+        claimed_added.insert(key.clone());
+        claimed_removed.insert(key);
+    }
+    for record in &mut moved {
+        let key = symbol_edge_key(&record.after);
+        if let Some(delta) = deltas.get(&key) {
+            record.added_calls.clone_from(&delta.added);
+            record.removed_calls.clone_from(&delta.removed);
+        }
+        claimed_added.insert(key.clone());
+        claimed_removed.insert(key);
+    }
+    for record in &mut introduced {
+        let key = symbol_edge_key(&record.after);
+        if let Some(delta) = deltas.get(&key) {
+            record.calls.clone_from(&delta.added);
+        }
+        claimed_added.insert(key);
+    }
+    for record in &mut deleted {
+        let key = symbol_edge_key(&record.before);
+        if let Some(delta) = deltas.get(&key) {
+            record.called.clone_from(&delta.removed);
+        }
+        claimed_removed.insert(key);
+    }
+    let unattributed_call_edge_changes =
+        flatten_unattributed(deltas, &claimed_added, &claimed_removed);
+
+    let patch_symbols = PatchSymbols {
+        edited,
+        introduced,
+        deleted,
+        moved,
+        signature_changes,
+    };
     let large_callsite_symbols = large_callsite_symbols(
         graph_before.truncated_symbols,
         graph_after.truncated_symbols,
@@ -511,7 +634,7 @@ pub fn analyze_diff_at_root(
         patch_symbols,
         dependency_symbols,
         import_changes,
-        call_edge_changes,
+        unattributed_call_edge_changes,
         large_callsite_symbols,
     })
 }
@@ -775,6 +898,127 @@ impl RevisionImage {
     }
 }
 
+/// A complete private on-disk export of one committed revision's workspace
+/// subtree, plus the resolved commit id.
+///
+/// Diff-aware policy gating evaluates policies against this image instead of
+/// the checkout. The export directory lives under the process temp directory
+/// with owner-only permissions and is deleted when this value drops.
+pub struct RevisionExport {
+    image: RevisionImage,
+    commit_id: String,
+}
+
+impl RevisionExport {
+    /// Root directory containing the exported files.
+    pub fn root(&self) -> &Path {
+        self.image.root()
+    }
+
+    /// Workspace-relative paths of every exported regular file.
+    pub fn files(&self) -> &[PathBuf] {
+        self.image.files()
+    }
+
+    /// Full hex id of the commit the requested revision resolved to.
+    pub fn commit_id(&self) -> &str {
+        &self.commit_id
+    }
+}
+
+/// Resolve `revision` in the repository that contains `workspace_root`, peel it
+/// to a commit, and export that commit's workspace subtree into a private
+/// temporary directory.
+///
+/// `workspace_root` may be the repository work-tree root or a subdirectory of
+/// it. The export always contains paths relative to `workspace_root`, so a
+/// finding identity computed over the export joins with one computed over the
+/// live workspace.
+pub fn export_revision(workspace_root: &Path, revision: &str) -> Result<RevisionExport, String> {
+    let repo = Repository::discover(workspace_root).map_err(|err| {
+        format!(
+            "workspace root {} is not inside a git repository: {err}",
+            workspace_root.display()
+        )
+    })?;
+    let commit_id = match resolve_snapshot(&repo, revision)? {
+        Snapshot::Commit(oid) => oid,
+        Snapshot::Tree(_) => {
+            return Err(format!("revision `{revision}` is a tree, not a commit"));
+        }
+        Snapshot::Worktree => unreachable!("explicit revisions never resolve to worktree"),
+    };
+    let workdir = repo.workdir().ok_or_else(|| {
+        format!(
+            "repository for {} has no working tree",
+            workspace_root.display()
+        )
+    })?;
+    let workdir = workdir.canonicalize().map_err(|err| {
+        format!(
+            "unable to resolve repository work tree {}: {err}",
+            workdir.display()
+        )
+    })?;
+    let workspace_root = workspace_root.canonicalize().map_err(|err| {
+        format!(
+            "unable to resolve workspace root {}: {err}",
+            workspace_root.display()
+        )
+    })?;
+    let prefix = workspace_root.strip_prefix(&workdir).map_err(|_| {
+        format!(
+            "workspace root {} is outside the repository work tree {}",
+            workspace_root.display(),
+            workdir.display()
+        )
+    })?;
+    let commit_tree = repo
+        .find_commit(commit_id)
+        .and_then(|commit| commit.tree())
+        .map_err(|err| format!("unable to read tree for commit {commit_id}: {err}"))?;
+    let tree = if prefix.as_os_str().is_empty() {
+        commit_tree
+    } else {
+        commit_tree
+            .get_path(prefix)
+            .map_err(|err| {
+                format!(
+                    "revision `{revision}` has no entry for workspace directory `{}`: {err}",
+                    prefix.display()
+                )
+            })?
+            .to_object(&repo)
+            .and_then(|object| object.peel_to_tree())
+            .map_err(|err| {
+                format!(
+                    "workspace directory `{}` at revision `{revision}` is not a directory: {err}",
+                    prefix.display()
+                )
+            })?
+    };
+    let subtree = Snapshot::Tree(tree.id());
+    let mut paths = Vec::new();
+    tree.walk(TreeWalkMode::PreOrder, |parent, entry| {
+        // Entries with non-UTF-8 names are skipped: every workspace-relative
+        // path in the analyzer and the policy report is a UTF-8 string, so
+        // such a file can never join a head finding anyway.
+        if entry.kind() == Some(ObjectType::Blob)
+            && is_regular_file_mode(entry.filemode())
+            && let Some(name) = entry.name()
+        {
+            paths.push(format!("{parent}{name}"));
+        }
+        TreeWalkResult::Ok
+    })
+    .map_err(|err| format!("unable to enumerate tree for revision `{revision}`: {err}"))?;
+    let image = RevisionImage::materialize(&repo, subtree, &paths)?;
+    Ok(RevisionExport {
+        image,
+        commit_id: commit_id.to_string(),
+    })
+}
+
 /// Collect the changed paths that actually exist as regular files on disk.
 ///
 /// A path deleted in the working tree still appears in the diff but has no file
@@ -997,6 +1241,9 @@ fn symbol_snapshot_map(
     include_tests: bool,
 ) -> BTreeMap<SymbolKey, SymbolSnapshot> {
     let mut out = BTreeMap::new();
+    // Read each file at most once: many declarations share a source, and the
+    // body hash only needs the file's text sliced by line range.
+    let mut file_text: HashMap<PathBuf, Option<String>> = HashMap::new();
     for unit in analyzer.all_declarations() {
         if unit.is_synthetic() {
             continue;
@@ -1026,13 +1273,20 @@ fn symbol_snapshot_map(
             .map(|s| s.to_string())
             .or_else(|| unit.signature().map(str::to_string))
             .unwrap_or_default();
+        let name = unit.identifier().to_string();
+        let token_sig = file_text
+            .entry(unit.source().abs_path())
+            .or_insert_with(|| unit.source().read_to_string().ok())
+            .as_deref()
+            .and_then(|text| body_token_signature(text, &name, range.start_line, range.end_line));
         out.insert(
             key.clone(),
             SymbolSnapshot {
                 key,
+                token_sig,
                 symbol: CommitSymbol {
                     fqn: unit.fq_name(),
-                    name: unit.identifier().to_string(),
+                    name,
                     kind,
                     signature,
                     path,
@@ -1045,6 +1299,332 @@ fn symbol_snapshot_map(
         );
     }
     out
+}
+
+/// How the two endpoints' symbols line up.
+struct EndpointPairing<'a> {
+    /// `(preimage, postimage)` for every symbol both endpoints hold.
+    pairs: Vec<(&'a SymbolSnapshot, &'a SymbolSnapshot)>,
+    postimage_only: Vec<&'a SymbolSnapshot>,
+    preimage_only: Vec<&'a SymbolSnapshot>,
+    /// Keys of the symbols paired by the body-similarity rule rather than by
+    /// identity or a Git rename. These relocated (and possibly were renamed or
+    /// lightly edited), but the hunks that deleted them from one place and
+    /// inserted them at another are not edits to report -- see the classifier.
+    fallback_paired: HashSet<&'a SymbolKey>,
+}
+
+/// Match preimage symbols to postimage symbols.
+///
+/// Two symbols pair when their key -- fqn, kind and language -- is identical,
+/// which covers everything a patch leaves in place. The second rule exists
+/// because a fully-qualified name derived from a path does not survive a file
+/// move: when Git reports a rename, a preimage symbol under the old path pairs
+/// with a postimage symbol under the new one, provided the name, kind and
+/// language single one candidate out on each side.
+///
+/// Without that rule a moved module reports every symbol it declares as both
+/// deleted and introduced, and every call between two of them as churn.
+///
+/// Overloads are exactly the case the uniqueness requirement rejects: two
+/// same-named declarations in a renamed file offer no evidence about which
+/// preimage one became which postimage one, so both stay unpaired.
+///
+/// The third rule catches what the first two miss: a symbol moved to a file Git
+/// did not report as a rename, or renamed in place -- possibly with light
+/// internal edits -- keeps neither its key nor a rename bucket. Leftovers are
+/// paired by token-similarity of their bodies, greedily and one-to-one above a
+/// threshold, so a relocated-and-renamed symbol still lines up. Trivial bodies
+/// never participate.
+fn pair_endpoints<'a>(
+    before: &'a BTreeMap<SymbolKey, SymbolSnapshot>,
+    after: &'a BTreeMap<SymbolKey, SymbolSnapshot>,
+    file_changes: &[FileChange],
+) -> EndpointPairing<'a> {
+    let mut pairs = Vec::new();
+    let mut preimage_only = Vec::new();
+    let mut postimage_only = Vec::new();
+    for (key, post) in after {
+        match before.get(key) {
+            Some(pre) => pairs.push((pre, post)),
+            None => postimage_only.push(post),
+        }
+    }
+    for (key, pre) in before {
+        if !after.contains_key(key) {
+            preimage_only.push(pre);
+        }
+    }
+
+    let renamed_paths: HashMap<&str, &str> = file_changes
+        .iter()
+        .filter_map(|change| Some((change.old_path.as_deref()?, change.path.as_deref()?)))
+        .collect();
+
+    // Bucket both leftovers under the postimage path so a rename lines them up,
+    // then keep only the buckets where one preimage symbol faces exactly one
+    // postimage symbol.
+    type SymbolIdentity<'i> = (&'i str, &'i str, &'i str, &'i str);
+    let mut candidates: HashMap<
+        SymbolIdentity<'_>,
+        (Vec<&'a SymbolSnapshot>, Vec<&'a SymbolSnapshot>),
+    > = HashMap::new();
+    for pre in preimage_only.iter().copied() {
+        let Some(new_path) = renamed_paths.get(pre.symbol.path.as_str()).copied() else {
+            continue;
+        };
+        candidates
+            .entry((
+                new_path,
+                pre.symbol.name.as_str(),
+                pre.key.kind.as_str(),
+                pre.key.language.as_str(),
+            ))
+            .or_default()
+            .0
+            .push(pre);
+    }
+    for post in postimage_only.iter().copied() {
+        candidates
+            .entry((
+                post.symbol.path.as_str(),
+                post.symbol.name.as_str(),
+                post.key.kind.as_str(),
+                post.key.language.as_str(),
+            ))
+            .or_default()
+            .1
+            .push(post);
+    }
+    let mut moved_keys: HashSet<&SymbolKey> = HashSet::new();
+    for (pre, post) in candidates
+        .into_values()
+        .filter(|(pre, post)| pre.len() == 1 && post.len() == 1)
+        .map(|(pre, post)| (pre[0], post[0]))
+    {
+        moved_keys.insert(&pre.key);
+        moved_keys.insert(&post.key);
+        pairs.push((pre, post));
+    }
+    preimage_only.retain(|snapshot| !moved_keys.contains(&snapshot.key));
+    postimage_only.retain(|snapshot| !moved_keys.contains(&snapshot.key));
+
+    // Third rule: pair the remaining leftovers by body SIMILARITY. A symbol cut
+    // from one place and pasted at another -- under a new name, in a file Git
+    // did not report as a rename, and perhaps with a few internal edits --
+    // shares no identity key and lands in no rename bucket, so it would
+    // otherwise surface as delete+introduce plus the very call-edge churn
+    // `fqn_renames` exists to cancel. Score every leftover preimage against
+    // every leftover postimage by token similarity and greedily accept the
+    // best mutual matches above the threshold, one-to-one. Greedy-by-descending
+    // score means the most confident relocation claims its counterpart first;
+    // ties break on fqn so the result is deterministic. Trivial bodies carry
+    // `token_sig == None` and never participate.
+    let mut scored: Vec<(f64, &'a SymbolSnapshot, &'a SymbolSnapshot)> = Vec::new();
+    for pre in preimage_only.iter().copied() {
+        let Some(pre_sig) = pre.token_sig.as_deref() else {
+            continue;
+        };
+        for post in postimage_only.iter().copied() {
+            let Some(post_sig) = post.token_sig.as_deref() else {
+                continue;
+            };
+            let score = body_similarity(pre_sig, post_sig);
+            if score >= BODY_MOVE_SIMILARITY_THRESHOLD {
+                scored.push((score, pre, post));
+            }
+        }
+    }
+    scored.sort_by(|(sa, pa, qa), (sb, pb, qb)| {
+        sb.partial_cmp(sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| pa.symbol.fqn.cmp(&pb.symbol.fqn))
+            .then_with(|| qa.symbol.fqn.cmp(&qb.symbol.fqn))
+    });
+    let mut fallback_paired: HashSet<&SymbolKey> = HashSet::new();
+    for (_, pre, post) in scored {
+        if fallback_paired.contains(&pre.key) || fallback_paired.contains(&post.key) {
+            continue;
+        }
+        fallback_paired.insert(&pre.key);
+        fallback_paired.insert(&post.key);
+        pairs.push((pre, post));
+    }
+    preimage_only.retain(|snapshot| !fallback_paired.contains(&snapshot.key));
+    postimage_only.retain(|snapshot| !fallback_paired.contains(&snapshot.key));
+
+    EndpointPairing {
+        pairs,
+        postimage_only,
+        preimage_only,
+        fallback_paired,
+    }
+}
+
+/// Replace every whole-identifier occurrence of `name` in `line` with a fixed
+/// placeholder, leaving substrings (a `sum` inside `summary`) untouched.
+///
+/// This is what makes the body fingerprint name-independent: the symbol's own
+/// name appears in its declaration line and in any recursive call, so a rename
+/// would otherwise change the hash and defeat move detection. Neutralizing the
+/// name -- and only the name -- lets a renamed body still match its original.
+fn blank_identifier<'a>(line: &'a str, name: &str) -> Cow<'a, str> {
+    if name.is_empty() {
+        return Cow::Borrowed(line);
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out: Option<String> = None;
+    let mut last = 0;
+    for (idx, _) in line.match_indices(name) {
+        let boundary_before = line[..idx].chars().next_back().is_none_or(|c| !is_word(c));
+        let boundary_after = line[idx + name.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_word(c));
+        if boundary_before && boundary_after {
+            let buf = out.get_or_insert_with(|| String::with_capacity(line.len()));
+            buf.push_str(&line[last..idx]);
+            buf.push('\u{0}');
+            last = idx + name.len();
+        }
+    }
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&line[last..]);
+            Cow::Owned(buf)
+        }
+        None => Cow::Borrowed(line),
+    }
+}
+
+/// The minimum body token similarity for two leftover symbols to be paired as
+/// the same symbol relocated. Chosen to accept a renamed method whose body also
+/// saw a few internal renames or a small edit, while rejecting merely
+/// structurally-similar but unrelated code.
+const BODY_MOVE_SIMILARITY_THRESHOLD: f64 = 0.70;
+
+/// A normalized token sequence for a symbol's body, or `None` when the body is
+/// too trivial to identify a move by content alone.
+///
+/// The symbol's own `name` is blanked (see [`blank_identifier`]) so a rename
+/// does not change the signature, then the `[start_line, end_line]` span
+/// (1-based, inclusive) is tokenized into identifier/number runs and individual
+/// punctuation characters. Internal identifiers are deliberately KEPT: they let
+/// [`body_similarity`] tell genuinely different logic apart, and the threshold
+/// absorbs the few that a rename touches. A body of fewer than two non-blank
+/// lines is rejected (`None`): too weak a fingerprint to pair on without
+/// inventing moves.
+fn body_token_signature(
+    source: &str,
+    name: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Option<Vec<String>> {
+    if start_line == 0 || end_line < start_line {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let mut non_blank_lines = 0;
+    for line in source
+        .lines()
+        .skip(start_line - 1)
+        .take(end_line - start_line + 1)
+    {
+        let blanked = blank_identifier(line, name);
+        let before = tokens.len();
+        tokenize_into(&blanked, &mut tokens);
+        if tokens.len() > before {
+            non_blank_lines += 1;
+        }
+    }
+    if non_blank_lines < 2 || tokens.is_empty() {
+        return None;
+    }
+    Some(tokens)
+}
+
+/// Append `line`'s tokens to `out`: maximal `[A-Za-z0-9_]`/NUL runs (words,
+/// numbers, and the blanked-name placeholder) and every other non-whitespace
+/// character as its own token. Whitespace is dropped, so indentation and
+/// spacing never affect the signature.
+fn tokenize_into(line: &str, out: &mut Vec<String>) {
+    let mut word = String::new();
+    for ch in line.chars() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '\u{0}' {
+            word.push(ch);
+        } else {
+            if !word.is_empty() {
+                out.push(std::mem::take(&mut word));
+            }
+            if !ch.is_whitespace() {
+                out.push(ch.to_string());
+            }
+        }
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+}
+
+/// Multiset (bag) Jaccard similarity of two token sequences, in `[0.0, 1.0]`.
+///
+/// Frequency-weighted: the shared size sums `min(count_a, count_b)` per token
+/// and the total sums `max`, so a token used three times on one side and once
+/// on the other counts as two mismatches, not one. Bag Jaccard tolerates the
+/// scattered token changes a rename introduces -- a variable renamed a handful
+/// of times barely moves the score -- which matters because a relocated symbol
+/// is usually renamed too. The deliberate cost is order-blindness: two bodies
+/// built from the same token bag in a different arrangement score alike. For a
+/// move-pairing heuristic guarded by a threshold and one-to-one assignment that
+/// is an acceptable trade; distinct real functions carry distinct token bags.
+fn body_similarity(a: &[String], b: &[String]) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut counts: HashMap<&str, i32> = HashMap::new();
+    for token in a {
+        *counts.entry(token).or_default() += 1;
+    }
+    for token in b {
+        *counts.entry(token).or_default() -= 1;
+    }
+    // Sum of |count| is the symmetric difference of the two bags; each bag has
+    // `a.len()`/`b.len()` elements, so intersection = (|a|+|b|-symdiff)/2.
+    let symmetric_difference: i32 = counts.values().map(|c| c.abs()).sum();
+    let total = a.len() + b.len();
+    let intersection = (total as i32 - symmetric_difference) as f64 / 2.0;
+    let union = total as f64 - intersection;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
+/// Whether a paired symbol's line change is fully explained by edits ELSEWHERE
+/// in the same file (a pure shift), as opposed to a genuine relocation.
+///
+/// An unchanged symbol occupies the same position *among unchanged lines* on
+/// both endpoints. Subtracting the deletions before its old start and the
+/// insertions before its new start collapses both sides to that shared
+/// unchanged-line index; equal indices mean the symbol only slid, it did not
+/// move. Same-file only -- a path change is always a relocation.
+fn is_pure_line_shift(
+    pre: &CommitSymbol,
+    post: &CommitSymbol,
+    changed_lines: &BTreeMap<String, ChangedLines>,
+) -> bool {
+    if pre.path != post.path {
+        return false;
+    }
+    let deletions_before = changed_lines
+        .get(&pre.path)
+        .map_or(0, |cl| cl.old.range(..pre.start_line).count());
+    let insertions_before = changed_lines
+        .get(&post.path)
+        .map_or(0, |cl| cl.new.range(..post.start_line).count());
+    pre.start_line.saturating_sub(deletions_before)
+        == post.start_line.saturating_sub(insertions_before)
 }
 
 /// Deleted lines of the patch that fall inside a preimage symbol's range.
@@ -1124,28 +1704,185 @@ fn imports_for_path(analyzer: &dyn IAnalyzer, path: &Path) -> BTreeSet<String> {
     analyzer.import_statements(&file).into_iter().collect()
 }
 
-fn call_edge_changes_and_dependencies(
+/// A usage-graph endpoint as the graph itself names one: fqn plus language.
+///
+/// Kind is deliberately absent. [`UsageGraphEdge`] carries only these two
+/// fields, so this is the finest key an edge can be attributed by.
+type CallerKey = (String, String);
+
+/// Added and removed callees of one symbol.
+#[derive(Debug, Clone, Default)]
+struct CalleeDelta {
+    added: Vec<CalleeChange>,
+    removed: Vec<CalleeChange>,
+}
+
+/// What comparing the two scoped usage graphs produced.
+struct CallEdgeDiff {
+    /// Callee deltas keyed by caller. Every caller is named the way the
+    /// postimage names it, including symbols the patch moved to a new fqn.
+    deltas: HashMap<CallerKey, CalleeDelta>,
+    dependency_symbols: Vec<CommitSymbol>,
+}
+
+fn symbol_edge_key(symbol: &CommitSymbol) -> CallerKey {
+    (symbol.fqn.clone(), symbol.language.clone())
+}
+
+/// `(preimage fqn, language) -> postimage fqn` for every symbol the patch moved
+/// to a new fully-qualified name.
+///
+/// This is what keeps a move from masquerading as call-edge churn. Moving a
+/// module renames every symbol it declares, so an untouched call between two of
+/// them becomes a removed edge under the old names and an added edge under the
+/// new ones, and every outside caller of a moved callee reports the same
+/// spurious pair. Rewriting the preimage graph through this mapping before the
+/// comparison cancels both.
+///
+/// Ambiguity is dropped rather than guessed: overloads and same-name
+/// declarations of different kinds can map one preimage name onto two postimage
+/// names, and an edge endpoint carries no kind to tell them apart.
+fn fqn_renames(moved: &[MovedSymbol]) -> HashMap<CallerKey, String> {
+    let mut candidates: HashMap<CallerKey, BTreeSet<String>> = HashMap::new();
+    for entry in moved {
+        if entry.before.fqn == entry.after.fqn {
+            continue;
+        }
+        candidates
+            .entry(symbol_edge_key(&entry.before))
+            .or_default()
+            .insert(entry.after.fqn.clone());
+    }
+    candidates
+        .into_iter()
+        .filter(|(_, targets)| targets.len() == 1)
+        .map(|(key, targets)| {
+            let target = targets
+                .into_iter()
+                .next()
+                .expect("a one-element set has a first element");
+            (key, target)
+        })
+        .collect()
+}
+
+/// Rewrite both endpoints of every preimage edge under the postimage names.
+///
+/// A patch that moved nothing borrows the graph it was given: the rewrite would
+/// copy every edge and its callsites to change none of them.
+fn rename_edges<'e>(
+    edges: &'e [UsageGraphEdge],
+    renames: &HashMap<CallerKey, String>,
+) -> Cow<'e, [UsageGraphEdge]> {
+    if renames.is_empty() {
+        return Cow::Borrowed(edges);
+    }
+    let renamed = |fqn: &String, language: &String| -> String {
+        renames
+            .get(&(fqn.clone(), language.clone()))
+            .cloned()
+            .unwrap_or_else(|| fqn.clone())
+    };
+    Cow::Owned(
+        edges
+            .iter()
+            .map(|edge| UsageGraphEdge {
+                from: renamed(&edge.from, &edge.language),
+                to: renamed(&edge.to, &edge.language),
+                language: edge.language.clone(),
+                weight: edge.weight,
+                sites: edge.sites.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// Compare the two scoped usage graphs and group the differences by caller.
+///
+/// Edge identity is `(from, to, language)`, so a weight-only change is not a
+/// difference: the same call written twice instead of once keeps one edge.
+fn diff_call_edges(
     before: &[UsageGraphEdge],
     after: &[UsageGraphEdge],
-    symbols: &BTreeMap<SymbolKey, SymbolSnapshot>,
-) -> (Vec<CallEdgeChange>, Vec<CommitSymbol>) {
-    let old = edge_map(before);
+    renames: &HashMap<CallerKey, String>,
+    postimage: &BTreeMap<SymbolKey, SymbolSnapshot>,
+) -> CallEdgeDiff {
+    let before = rename_edges(before, renames);
+    let old = edge_map(&before);
     let new = edge_map(after);
-    let mut changes = Vec::new();
-    let mut deps = BTreeMap::new();
+    let definitions = symbols_by_edge_key(postimage);
+    let mut deltas: HashMap<CallerKey, CalleeDelta> = HashMap::new();
+    let mut deps: BTreeMap<String, CommitSymbol> = BTreeMap::new();
     for (key, edge) in &new {
-        if !old.contains_key(key) {
-            changes.push(edge_change("added", edge));
-            if let Some(symbol) = find_symbol(symbols, &edge.to, &edge.language) {
-                deps.insert(symbol.fqn.clone(), symbol.clone());
-            }
+        if old.contains_key(key) {
+            continue;
+        }
+        deltas
+            .entry((edge.from.clone(), edge.language.clone()))
+            .or_default()
+            .added
+            .push(callee_change(edge));
+        if let Some(symbol) = definitions.get(&(edge.to.as_str(), edge.language.as_str())) {
+            deps.insert(symbol.fqn.clone(), (*symbol).clone());
         }
     }
     for (key, edge) in &old {
-        if !new.contains_key(key) {
-            changes.push(edge_change("removed", edge));
+        if new.contains_key(key) {
+            continue;
         }
+        deltas
+            .entry((edge.from.clone(), edge.language.clone()))
+            .or_default()
+            .removed
+            .push(callee_change(edge));
     }
+    for delta in deltas.values_mut() {
+        sort_callee_changes(&mut delta.added);
+        sort_callee_changes(&mut delta.removed);
+    }
+    let mut dependency_symbols: Vec<_> = deps.into_values().collect();
+    sort_symbols(&mut dependency_symbols);
+    CallEdgeDiff {
+        deltas,
+        dependency_symbols,
+    }
+}
+
+/// Restore the `from` and `change` fields that per-symbol attribution implied,
+/// for the edges no patch symbol claimed.
+fn flatten_unattributed(
+    deltas: HashMap<CallerKey, CalleeDelta>,
+    claimed_added: &HashSet<CallerKey>,
+    claimed_removed: &HashSet<CallerKey>,
+) -> Vec<CallEdgeChange> {
+    let mut changes: Vec<CallEdgeChange> = deltas
+        .into_iter()
+        .flat_map(|(key, delta)| {
+            let added = if claimed_added.contains(&key) {
+                Vec::new()
+            } else {
+                delta.added
+            };
+            let removed = if claimed_removed.contains(&key) {
+                Vec::new()
+            } else {
+                delta.removed
+            };
+            let (from, _) = key;
+            added
+                .into_iter()
+                .map(|callee| ("added", callee))
+                .chain(removed.into_iter().map(|callee| ("removed", callee)))
+                .map(move |(change, callee)| CallEdgeChange {
+                    change: change.to_string(),
+                    from: from.clone(),
+                    to: callee.to,
+                    language: callee.language,
+                    weight: callee.weight,
+                    sites: callee.sites,
+                })
+        })
+        .collect();
     changes.sort_by(|a, b| {
         a.language
             .cmp(&b.language)
@@ -1153,9 +1890,11 @@ fn call_edge_changes_and_dependencies(
             .then_with(|| a.to.cmp(&b.to))
             .then_with(|| a.change.cmp(&b.change))
     });
-    let mut dependency_symbols: Vec<_> = deps.into_values().collect();
-    sort_symbols(&mut dependency_symbols);
-    (changes, dependency_symbols)
+    changes
+}
+
+fn sort_callee_changes(changes: &mut [CalleeChange]) {
+    changes.sort_by(|a, b| a.language.cmp(&b.language).then_with(|| a.to.cmp(&b.to)));
 }
 
 fn edge_map(edges: &[UsageGraphEdge]) -> BTreeMap<EdgeKey, &UsageGraphEdge> {
@@ -1174,10 +1913,8 @@ fn edge_map(edges: &[UsageGraphEdge]) -> BTreeMap<EdgeKey, &UsageGraphEdge> {
         .collect()
 }
 
-fn edge_change(change: &str, edge: &UsageGraphEdge) -> CallEdgeChange {
-    CallEdgeChange {
-        change: change.to_string(),
-        from: edge.from.clone(),
+fn callee_change(edge: &UsageGraphEdge) -> CalleeChange {
+    CalleeChange {
         to: edge.to.clone(),
         language: edge.language.clone(),
         weight: edge.weight,
@@ -1185,15 +1922,21 @@ fn edge_change(change: &str, edge: &UsageGraphEdge) -> CallEdgeChange {
     }
 }
 
-fn find_symbol(
+/// Index the postimage symbols the way an edge endpoint names them.
+///
+/// The snapshot map is keyed by fqn, kind and language, but an edge carries no
+/// kind, so the two fqns a class and a function share collapse onto one entry.
+/// The first in snapshot-key order wins, which is the symbol a scan of the map
+/// would have found.
+fn symbols_by_edge_key(
     symbols: &BTreeMap<SymbolKey, SymbolSnapshot>,
-    fqn: &str,
-    language: &str,
-) -> Option<CommitSymbol> {
-    symbols
-        .values()
-        .find(|snapshot| snapshot.key.fqn == fqn && snapshot.key.language == language)
-        .map(|snapshot| snapshot.symbol.clone())
+) -> HashMap<(&str, &str), &CommitSymbol> {
+    let mut out: HashMap<(&str, &str), &CommitSymbol> = HashMap::new();
+    for snapshot in symbols.values() {
+        out.entry((snapshot.key.fqn.as_str(), snapshot.key.language.as_str()))
+            .or_insert(&snapshot.symbol);
+    }
+    out
 }
 
 fn large_callsite_symbols(
@@ -1280,9 +2023,258 @@ fn kind_name(kind: CodeUnitType) -> &'static str {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{RevisionTempDir, create_private_dirs, write_private_file};
+    use super::{
+        BODY_MOVE_SIMILARITY_THRESHOLD, ChangedLines, CommitSymbol, FileChange, RevisionTempDir,
+        SymbolKey, SymbolSnapshot, body_similarity, body_token_signature, create_private_dirs,
+        is_pure_line_shift, pair_endpoints, write_private_file,
+    };
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Tokenize with the production normalizer, then score -- the path a real
+    /// symbol body takes.
+    fn similarity(a_name: &str, a_src: &str, b_name: &str, b_src: &str) -> f64 {
+        let lines_a = a_src.lines().count();
+        let lines_b = b_src.lines().count();
+        let a = body_token_signature(a_src, a_name, 1, lines_a).unwrap();
+        let b = body_token_signature(b_src, b_name, 1, lines_b).unwrap();
+        body_similarity(&a, &b)
+    }
+
+    fn symbol_at(path: &str, start_line: usize) -> CommitSymbol {
+        CommitSymbol {
+            fqn: format!("{path}::sym"),
+            name: "sym".to_string(),
+            kind: "function".to_string(),
+            signature: "fn sym()".to_string(),
+            path: path.to_string(),
+            start_line,
+            end_line: start_line + 3,
+            language: "rust".to_string(),
+            is_test: false,
+        }
+    }
+
+    fn snapshot(
+        fqn: &str,
+        name: &str,
+        path: &str,
+        token_sig: Option<Vec<String>>,
+    ) -> SymbolSnapshot {
+        SymbolSnapshot {
+            key: SymbolKey {
+                fqn: fqn.to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+            },
+            token_sig,
+            symbol: CommitSymbol {
+                fqn: fqn.to_string(),
+                name: name.to_string(),
+                kind: "function".to_string(),
+                signature: format!("fn {name}()"),
+                path: path.to_string(),
+                start_line: 1,
+                end_line: 4,
+                language: "rust".to_string(),
+                is_test: false,
+            },
+        }
+    }
+
+    /// Guards the regression behind #1897: a symbol whose start line only slid
+    /// because lines were inserted/deleted *before* it must not be reported as
+    /// moved. A single early insert once produced hundreds of spurious "moved"
+    /// rows -- one per symbol below it -- because any `start_line` delta was
+    /// treated as a relocation.
+    #[test]
+    fn pure_line_shift_is_not_a_move() {
+        // Three lines inserted before the symbol: it slid 10 -> 13 with no
+        // deletions on the old side. Same position among unchanged lines.
+        let mut changed = BTreeMap::new();
+        changed.insert(
+            "src/a.rs".to_string(),
+            ChangedLines {
+                old: Default::default(),
+                new: [1usize, 2, 3].into_iter().collect(),
+            },
+        );
+        let pre = symbol_at("src/a.rs", 10);
+        let post = symbol_at("src/a.rs", 13);
+        assert!(is_pure_line_shift(&pre, &post, &changed));
+
+        // A larger jump than the 3 insertions explain is a genuine relocation.
+        let moved_post = symbol_at("src/a.rs", 20);
+        assert!(!is_pure_line_shift(&pre, &moved_post, &changed));
+
+        // A path change is always a relocation, regardless of line arithmetic.
+        let renamed_post = symbol_at("src/b.rs", 13);
+        assert!(!is_pure_line_shift(&pre, &renamed_post, &changed));
+    }
+
+    // A realistic reduce-over-a-slice body, parameterized by function and
+    // accumulator name so tests can rename either.
+    fn accumulate_body(fn_name: &str, acc: &str) -> String {
+        format!(
+            "pub fn {fn_name}(items: &[i32]) -> i32 {{\n    \
+             let mut {acc} = 0;\n    \
+             for it in items {{\n        \
+             {acc} += *it;\n    \
+             }}\n    \
+             {acc}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn body_similarity_tolerates_rename_and_indentation_but_not_unrelated_code() {
+        let foo = accumulate_body("compute_total", "sum");
+
+        // Pure rename: only the function name changed. Blanking the symbol's own
+        // name must make the two bodies score identically.
+        let renamed = accumulate_body("sum_all", "sum");
+        assert_eq!(similarity("compute_total", &foo, "sum_all", &renamed), 1.0);
+
+        // Reindented into a deeper scope with a blank line: whitespace is
+        // dropped, so the score is unaffected.
+        let reindented = format!(
+            "\n        {}",
+            accumulate_body("sum_all", "sum").replace('\n', "\n        ")
+        );
+        assert_eq!(
+            similarity("compute_total", &foo, "sum_all", &reindented),
+            1.0
+        );
+
+        // Move + rename + an internal variable rename (sum -> total): still well
+        // above the pairing threshold.
+        let edited = accumulate_body("sum_all", "total");
+        let score = similarity("compute_total", &foo, "sum_all", &edited);
+        assert!(
+            score >= BODY_MOVE_SIMILARITY_THRESHOLD,
+            "renamed move with an internal rename scored {score}, below threshold"
+        );
+
+        // Unrelated function: must fall well below the threshold.
+        let unrelated = "pub fn greet(name: &str) -> String {\n    let mut out = String::new();\n    out.push_str(name);\n    out.push('!');\n    out\n}\n";
+        let score = similarity("compute_total", &foo, "greet", unrelated);
+        assert!(
+            score < BODY_MOVE_SIMILARITY_THRESHOLD,
+            "unrelated bodies scored {score}, at/above threshold"
+        );
+    }
+
+    #[test]
+    fn body_token_signature_rejects_trivial_and_degenerate_ranges() {
+        let src = accumulate_body("f", "sum");
+        let n = src.lines().count();
+        assert!(body_token_signature(&src, "f", 1, n).is_some());
+        // One non-blank line is too weak a fingerprint.
+        assert_eq!(
+            body_token_signature("pub fn f() { done() }\n", "f", 1, 1),
+            None
+        );
+        // Degenerate ranges are rejected, not panicked on.
+        assert_eq!(body_token_signature(&src, "f", 0, n), None);
+        assert_eq!(body_token_signature(&src, "f", 5, 1), None);
+    }
+
+    fn snap_src(fqn: &str, name: &str, path: &str, src: &str) -> SymbolSnapshot {
+        let n = src.lines().count();
+        snapshot(fqn, name, path, body_token_signature(src, name, 1, n))
+    }
+
+    /// The third pairing rule (RM-style move detection): a symbol relocated to a
+    /// file Git did not flag as a rename -- renamed and lightly edited in the
+    /// process -- keeps no identity key and no rename bucket, yet body
+    /// similarity pairs it. An unrelated leftover must NOT be dragged in.
+    #[test]
+    fn fuzzy_pairing_matches_a_renamed_move_and_resists_false_positives() {
+        // compute_total moved a.rs -> b.rs, renamed sum_all, accumulator renamed.
+        let before = BTreeMap::from([
+            {
+                let s = snap_src(
+                    "a::compute_total",
+                    "compute_total",
+                    "src/a.rs",
+                    &accumulate_body("compute_total", "sum"),
+                );
+                (s.key.clone(), s)
+            },
+            {
+                // An unrelated deleted function that must stay unpaired.
+                let src = "pub fn greet(name: &str) -> String {\n    let mut out = String::new();\n    out.push_str(name);\n    out\n}\n";
+                let s = snap_src("a::greet", "greet", "src/a.rs", src);
+                (s.key.clone(), s)
+            },
+        ]);
+        let after = BTreeMap::from([{
+            let s = snap_src(
+                "b::sum_all",
+                "sum_all",
+                "src/b.rs",
+                &accumulate_body("sum_all", "total"),
+            );
+            (s.key.clone(), s)
+        }]);
+
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert_eq!(pairing.pairs.len(), 1, "the renamed move should pair");
+        assert_eq!(pairing.pairs[0].0.symbol.fqn, "a::compute_total");
+        assert_eq!(pairing.pairs[0].1.symbol.fqn, "b::sum_all");
+        assert!(pairing.fallback_paired.contains(&pairing.pairs[0].0.key));
+        // greet stayed unpaired -- not a false-positive move.
+        assert_eq!(pairing.preimage_only.len(), 1);
+        assert_eq!(pairing.preimage_only[0].symbol.fqn, "a::greet");
+        assert!(pairing.postimage_only.is_empty());
+
+        // Greedy one-to-one: two candidate moves, each must claim its true twin
+        // rather than cross-pair. Give b a clearly-better match than a.
+        let before = BTreeMap::from([
+            {
+                let s = snap_src(
+                    "a::compute_total",
+                    "compute_total",
+                    "src/a.rs",
+                    &accumulate_body("compute_total", "sum"),
+                );
+                (s.key.clone(), s)
+            },
+            {
+                let src = "pub fn render(node: &Node) -> String {\n    let mut buf = String::new();\n    buf.push_str(node.label());\n    buf.push('\\n');\n    buf\n}\n";
+                let s = snap_src("a::render", "render", "src/a.rs", src);
+                (s.key.clone(), s)
+            },
+        ]);
+        let after = BTreeMap::from([
+            {
+                let s = snap_src(
+                    "b::sum_all",
+                    "sum_all",
+                    "src/b.rs",
+                    &accumulate_body("sum_all", "total"),
+                );
+                (s.key.clone(), s)
+            },
+            {
+                let src = "pub fn draw(node: &Node) -> String {\n    let mut buf = String::new();\n    buf.push_str(node.label());\n    buf.push('\\n');\n    buf\n}\n";
+                let s = snap_src("b::draw", "draw", "src/b.rs", src);
+                (s.key.clone(), s)
+            },
+        ]);
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        let mut got: Vec<(&str, &str)> = pairing
+            .pairs
+            .iter()
+            .map(|(p, q)| (p.symbol.fqn.as_str(), q.symbol.fqn.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("a::compute_total", "b::sum_all"), ("a::render", "b::draw")],
+            "each move claimed its own twin"
+        );
+    }
 
     #[test]
     fn snapshot_materialization_uses_private_permissions() {

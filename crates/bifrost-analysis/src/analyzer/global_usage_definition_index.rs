@@ -1,8 +1,7 @@
 use crate::analyzer::common::language_for_file;
+use crate::analyzer::languages::{LanguageSupport, language_support};
 use crate::analyzer::{
-    CSharpAnalyzer, CodeUnit, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer, JavascriptAnalyzer,
-    Language, PhpAnalyzer, ProjectFile, PythonAnalyzer, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
-    TypescriptAnalyzer, resolve_analyzer,
+    BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, sort_units,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -46,64 +45,6 @@ pub struct GlobalUsageDefinitionIndex {
 struct NormalizedViews {
     by_fqn: HashMap<String, Vec<CodeUnit>>,
     direct_children_by_fqn: HashMap<String, Vec<CodeUnit>>,
-}
-
-/// Candidate-shaped declaration operations used by forward symbols queries.
-///
-/// Unlike [`GlobalUsageDefinitionIndex`], implementations backed by a persisted
-/// analyzer must not materialize every workspace declaration.  The legacy
-/// index implements this trait only for explicit whole-workspace graph paths;
-/// forward `get_definition` and `get_type_by_location` dispatches use the
-/// `dyn IAnalyzer` implementation, which delegates to bounded store queries.
-pub(crate) trait BoundedDefinitionLookup {
-    fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
-    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit>;
-
-    /// Exact-fq lookup across *every* language the workspace indexes.
-    ///
-    /// A language-scoped resolver cannot tell "this fq is not in the workspace"
-    /// apart from "this fq belongs to another language's declarations", so a
-    /// confident cross-workspace boundary claim must consult this before it
-    /// fires (#1174).  The default is the implementation's own scope: bounded
-    /// single-language providers genuinely have no view of other languages, and
-    /// answering same-language keeps them conservative (they can only *fail* to
-    /// suppress a boundary claim, never invent a cross-language hit).
-    fn fqn_in_any_language(&self, fqn: &str) -> Vec<CodeUnit> {
-        self.fqn(fqn)
-    }
-
-    /// Language-blind counterpart of [`Self::package_exists`]; see
-    /// [`Self::fqn_in_any_language`] for why the default is same-language.
-    fn package_exists_in_any_language(&self, package: &str) -> bool {
-        self.package_exists(package)
-    }
-
-    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit>;
-    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
-    fn fqn_exists(&self, fqn: &str) -> bool;
-    fn package_exists(&self, package: &str) -> bool;
-    fn package_exists_in_language(&self, package: &str, language: Language) -> bool;
-    fn fqn_prefix_exists(&self, prefix: &str) -> bool;
-
-    fn fqn_candidates(&self, fqns: Vec<String>) -> Vec<CodeUnit> {
-        let mut candidates = fqns
-            .into_iter()
-            .flat_map(|fqn| self.fqn(&fqn))
-            .collect::<Vec<_>>();
-        sort_units(&mut candidates);
-        candidates.dedup();
-        candidates
-    }
-
-    fn file_identifier_in_files(&self, files: &[ProjectFile], ident: &str) -> Vec<CodeUnit> {
-        let mut out = Vec::new();
-        for file in files {
-            out.extend(self.file_identifier(file, ident));
-        }
-        sort_units(&mut out);
-        out.dedup();
-        out
-    }
 }
 
 pub(crate) trait ForwardQueryProvider {
@@ -186,7 +127,7 @@ impl<'a> AnalyzerDefinitionLookup<'a> {
     }
 
     /// The languages this workspace actually indexes, in a stable order.
-    /// Resolved once per batch: `IAnalyzer::languages` rebuilds a set per call.
+    /// Resolved once per batch: `CodeUnitIndex::languages` rebuilds a set per call.
     fn workspace_languages(&self) -> &[Language] {
         self.workspace_languages
             .get_or_init(|| self.analyzer.languages().into_iter().collect())
@@ -210,27 +151,7 @@ fn analyzer_for_language(
     analyzer: &dyn IAnalyzer,
     language: Language,
 ) -> Option<&dyn ForwardQueryProvider> {
-    match language {
-        Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer).map(|value| value as _),
-        Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer).map(|value| value as _),
-        Language::Cpp => resolve_analyzer::<CppAnalyzer>(analyzer).map(|value| value as _),
-        Language::Go => resolve_analyzer::<GoAnalyzer>(analyzer).map(|value| value as _),
-        Language::JavaScript => {
-            resolve_analyzer::<JavascriptAnalyzer>(analyzer).map(|value| value as _)
-        }
-        Language::Php => resolve_analyzer::<PhpAnalyzer>(analyzer).map(|value| value as _),
-        Language::Python => resolve_analyzer::<PythonAnalyzer>(analyzer).map(|value| value as _),
-        Language::TypeScript => {
-            resolve_analyzer::<TypescriptAnalyzer>(analyzer).map(|value| value as _)
-        }
-        Language::Rust => resolve_analyzer::<RustAnalyzer>(analyzer).map(|value| value as _),
-        Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|value| value as _),
-        Language::Ruby => resolve_analyzer::<RubyAnalyzer>(analyzer).map(|value| value as _),
-        Language::Kotlin => {
-            resolve_analyzer::<crate::analyzer::KotlinAnalyzer>(analyzer).map(|value| value as _)
-        }
-        Language::None => None,
-    }
+    language_support(language).and_then(|support| support.forward_query_provider(analyzer))
 }
 
 impl BoundedDefinitionLookup for GlobalUsageDefinitionIndex {
@@ -240,6 +161,30 @@ impl BoundedDefinitionLookup for GlobalUsageDefinitionIndex {
 
     fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
         Self::fqn_in_language(self, fqn, language)
+    }
+
+    fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+        Self::types_in_package(self, package, simple).to_vec()
+    }
+
+    fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
+        Self::by_normalized_fqn(self, normalized).to_vec()
+    }
+
+    fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
+        Self::identifier(self, ident).to_vec()
+    }
+
+    fn members_for_owner_name(
+        &self,
+        owner_fqn: &str,
+        normalized_owner_fqn: &str,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        Self::members_for_owner_name(self, owner_fqn, normalized_owner_fqn, name)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
@@ -894,6 +839,30 @@ impl BoundedDefinitionLookup for DefinitionIndexHandle<'_> {
         Self::fqn_in_language(self, fqn, language)
     }
 
+    fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+        Self::types_in_package(self, package, simple)
+    }
+
+    fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
+        Self::by_normalized_fqn(self, normalized)
+    }
+
+    fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
+        Self::identifier(self, ident)
+    }
+
+    fn members_for_owner_name(
+        &self,
+        owner_fqn: &str,
+        normalized_owner_fqn: &str,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        Self::members_for_owner_name(self, owner_fqn, normalized_owner_fqn, name)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
         Self::file_identifier(self, file, ident)
     }
@@ -920,24 +889,11 @@ impl BoundedDefinitionLookup for DefinitionIndexHandle<'_> {
 }
 
 fn package_parent_name(language: Language, package: &str) -> Option<&str> {
-    let separator = match language {
-        Language::Go => "/",
-        Language::Cpp => "::",
-        _ => ".",
-    };
+    let separator = language_support(language).map_or(".", LanguageSupport::package_separator);
     package
         .rsplit_once(separator)
         .map(|(parent, _)| parent)
         .or(Some(""))
-}
-
-fn sort_units(units: &mut [CodeUnit]) {
-    units.sort_by(|left, right| {
-        rel_path_string(left.source())
-            .cmp(&rel_path_string(right.source()))
-            .then_with(|| left.fq_name().cmp(&right.fq_name()))
-            .then_with(|| left.signature().cmp(&right.signature()))
-    });
 }
 
 #[cfg(test)]

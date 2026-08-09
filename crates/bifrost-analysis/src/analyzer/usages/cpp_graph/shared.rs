@@ -1,15 +1,28 @@
-use super::extractor::{ScanState, prepare_file, scan_prepared_file};
-use super::inverted;
-use super::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::cpp::cpp_sentinel_recovered_classes;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::cpp_graph::CppDispatch;
+use crate::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
+    parse_and_collect,
+};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_cpp::declarations::CppSentinelRecoveredClass;
+use brokk_bifrost_cpp::graph::extractor::{ScanState, prepare_file, scan_prepared_file};
+use brokk_bifrost_cpp::graph::resolver::{TargetSpec, TypeScanKey, VisibilityIndex};
 use std::collections::BTreeSet;
+use std::sync::{Arc, OnceLock};
+
+struct PreparedCppFile {
+    prepared: Arc<PreparedSyntaxTree>,
+    recovered_sentinel_classes: Vec<CppSentinelRecoveredClass>,
+    class_ranges: OnceLock<Arc<ClassRangeIndex>>,
+}
 
 fn scan_file_major<F, S, P, I, C, Prepare, Scan>(
     files: I,
@@ -50,6 +63,7 @@ fn retain_scan_spec(seen_type_specs: &mut HashSet<TypeScanKey>, spec: &TargetSpe
 
 pub(crate) struct CppQueryResolver<'a> {
     cpp: &'a CppAnalyzer,
+    class_ranges: HashMap<ProjectFile, Arc<ClassRangeIndex>>,
 }
 
 /// One authoritative inverse batch over a fixed union of caller roots.
@@ -67,7 +81,7 @@ pub struct CppAuthoritativeUsageBatch<'a> {
 
 impl<'a> CppAuthoritativeUsageBatch<'a> {
     pub fn new(analyzer: &'a dyn IAnalyzer, roots: &HashSet<ProjectFile>) -> Option<Self> {
-        let resolver = CppQueryResolver::try_new(analyzer)?;
+        let mut resolver = CppQueryResolver::try_new(analyzer)?;
         // This listing already validates every live path for the active outer
         // request scope.  Have it seed the request's live-source memo before
         // visibility construction or parallel target scans can begin, so those
@@ -80,11 +94,21 @@ impl<'a> CppAuthoritativeUsageBatch<'a> {
         resolver
             .cpp
             .bulk_file_states_for_query(roots.iter().cloned());
+        resolver.class_ranges = roots
+            .iter()
+            .map(|file| {
+                (
+                    file.clone(),
+                    Arc::new(ClassRangeIndex::build(analyzer, file)),
+                )
+            })
+            .collect();
         #[cfg(any(test, feature = "test-support"))]
         resolver
             .cpp
             .record_authoritative_visibility_build_for_test();
-        let visibility = VisibilityIndex::build(resolver.cpp, analyzer, roots);
+        let dispatch = CppDispatch::new(analyzer);
+        let visibility = VisibilityIndex::build(resolver.cpp, &dispatch.source(), roots);
         Some(Self {
             analyzer,
             resolver,
@@ -123,6 +147,7 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
     fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         Some(Self {
             cpp: resolve_analyzer::<CppAnalyzer>(analyzer)?,
+            class_ranges: HashMap::default(),
         })
     }
 
@@ -136,9 +161,10 @@ impl<'a> UsageQueryResolver<'a> for CppQueryResolver<'a> {
         let files = self.scan_files(overloads, scan_scope);
         #[cfg(any(test, feature = "test-support"))]
         self.cpp.record_authoritative_visibility_build_for_test();
+        let dispatch = CppDispatch::new(analyzer);
         let visibility = VisibilityIndex::build_with_cancellation(
             self.cpp,
-            analyzer,
+            &dispatch.source(),
             &files,
             scan_scope.cancellation(),
         );
@@ -158,10 +184,12 @@ impl CppQueryResolver<'_> {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
+        let dispatch = CppDispatch::new(analyzer);
+        let source = dispatch.source();
         let mut specs = Vec::with_capacity(overloads.len());
         let mut seen_type_specs = HashSet::default();
         for overload in overloads {
-            let Some(spec) = TargetSpec::from_target(analyzer, overload) else {
+            let Some(spec) = TargetSpec::from_target(&source, overload) else {
                 return GraphUsageOutcome::fallback_safe(
                     overload.fq_name(),
                     GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
@@ -197,20 +225,54 @@ impl CppQueryResolver<'_> {
                         prepared.tree().root_node(),
                         prepared.source(),
                     );
-                    (prepared, recovered_sentinel_classes)
+                    let class_range_cell = OnceLock::new();
+                    if let Some(class_ranges) = self.class_ranges.get(file).cloned() {
+                        assert!(
+                            class_range_cell.set(class_ranges).is_ok(),
+                            "class range cache is initialized once"
+                        );
+                    }
+                    PreparedCppFile {
+                        prepared,
+                        recovered_sentinel_classes,
+                        class_ranges: class_range_cell,
+                    }
                 })
             },
-            |file, (prepared, recovered_sentinel_classes), spec| {
+            |file, prepared_file, spec| {
                 #[cfg(any(test, feature = "test-support"))]
                 self.cpp.record_target_spec_scan_for_test();
-                let spec = spec
-                    .with_visible_callable_arities(analyzer, self.cpp, visibility, file, prepared);
-                scan_prepared_file(
-                    analyzer,
+                let spec = spec.with_visible_callable_arities(
+                    &source,
+                    self.cpp,
                     visibility,
                     file,
-                    prepared,
-                    recovered_sentinel_classes,
+                    prepared_file.prepared.as_ref(),
+                );
+                let class_ranges = spec.type_scan_key().and_then(|_| {
+                    // The authoritative batch already built this index. Use it
+                    // for every type scan, including malformed class bodies
+                    // that do not produce a sentinel recovery record.
+                    if let Some(class_ranges) = prepared_file.class_ranges.get() {
+                        return Some(class_ranges.as_ref());
+                    }
+                    if prepared_file.recovered_sentinel_classes.is_empty() {
+                        return None;
+                    }
+                    Some(
+                        prepared_file
+                            .class_ranges
+                            .get_or_init(|| Arc::new(ClassRangeIndex::build(analyzer, file)))
+                            .as_ref(),
+                    )
+                });
+                scan_prepared_file(
+                    &source,
+                    visibility,
+                    file,
+                    prepared_file.prepared.as_ref(),
+                    &prepared_file.recovered_sentinel_classes,
+                    class_ranges,
                     spec.as_ref(),
                     &target_group,
                     &mut state,
@@ -259,19 +321,54 @@ impl CppQueryResolver<'_> {
     }
 }
 
+/// Build the whole C++ `caller -> callee` edge set in a single inverted pass
+/// over the resolver-owned file set. `nodes`/`keep_file` mirror the Go builder.
+///
+/// The fan-out stays on this side of the seam: `build_edge_output` and
+/// `parse_and_collect` are the shared, language-agnostic driver, and only the
+/// per-file C++ walk crossed.
+pub(super) fn build_cpp_edges<Output, F>(
+    analyzer: &dyn IAnalyzer,
+    files: &[ProjectFile],
+    visibility: &VisibilityIndex<'_>,
+    nodes: &HashSet<String>,
+    keep_file: F,
+) -> Output
+where
+    Output: UsageEdgeBuildOutput<String>,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let language = tree_sitter_cpp::LANGUAGE.into();
+    let dispatch = CppDispatch::new(analyzer);
+    build_edge_output(files, keep_file, |file| {
+        parse_and_collect(analyzer, file, nodes, &language, |input| {
+            brokk_bifrost_cpp::graph::inverted::scan_file(
+                &dispatch.source(),
+                visibility,
+                file,
+                input,
+            )
+        })
+    })
+}
+
 pub(crate) struct CppEdgeResolver<'a> {
     cpp: &'a CppAnalyzer,
     files: Vec<ProjectFile>,
 }
 
-impl<'a> UsageEdgeResolver<'a> for CppEdgeResolver<'a> {
-    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+/// The whole-workspace `caller -> callee` scan behind this language's
+/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
+/// analyzer once, then walk every file once and finalize into either site-bearing edges or
+/// reference-kind weights.
+impl<'a> CppEdgeResolver<'a> {
+    pub(crate) fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
         let files = analyzed_files_for_language(analyzer, Language::Cpp);
         Some(Self { cpp, files })
     }
 
-    fn build_edges<F>(
+    pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
@@ -290,11 +387,12 @@ impl<'a> UsageEdgeResolver<'a> for CppEdgeResolver<'a> {
             .filter(|file| keep_file(file))
             .cloned()
             .collect();
-        let visibility = VisibilityIndex::build(self.cpp, analyzer, &roots);
-        inverted::build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
+        let dispatch = CppDispatch::new(analyzer);
+        let visibility = VisibilityIndex::build(self.cpp, &dispatch.source(), &roots);
+        build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
     }
 
-    fn build_edge_weights<F>(
+    pub(crate) fn build_edge_weights<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
@@ -309,8 +407,9 @@ impl<'a> UsageEdgeResolver<'a> for CppEdgeResolver<'a> {
             .filter(|file| keep_file(file))
             .cloned()
             .collect();
-        let visibility = VisibilityIndex::build(self.cpp, analyzer, &roots);
-        inverted::build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
+        let dispatch = CppDispatch::new(analyzer);
+        let visibility = VisibilityIndex::build(self.cpp, &dispatch.source(), &roots);
+        build_cpp_edges(analyzer, &self.files, &visibility, nodes, keep_file)
     }
 }
 
@@ -319,9 +418,9 @@ mod tests {
     use std::cell::Cell;
 
     use super::{retain_scan_spec, scan_file_major};
-    use crate::analyzer::usages::cpp_graph::resolver::{TargetKind, TargetSpec};
     use crate::analyzer::{CallableArity, CodeUnit, CodeUnitType, ProjectFile};
     use crate::hash::HashSet;
+    use brokk_bifrost_cpp::graph::resolver::{TargetKind, TargetSpec};
 
     #[test]
     fn identical_method_redeclarations_remain_physically_distinct_scan_specs() {

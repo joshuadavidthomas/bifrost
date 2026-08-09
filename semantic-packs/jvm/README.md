@@ -4,6 +4,14 @@ This directory pins the source inputs used to build Bifrost's published JDK,
 Kotlin, and Scala standard-library declaration packs. Generated manifests and shards
 are release assets; they are not checked into Git.
 
+The pinned-spec schema itself is ecosystem neutral. The same
+spec -> generate -> verify -> bundle pipeline covers every producer family with
+an exact-artifact producer, including Java source and class JARs, TypeScript
+declaration files, .NET assemblies, rustdoc JSON documents, and Python stub
+trees. Specs for other families live in sibling directories as their packs are
+authored. Every spec must name its upstream provenance source and license; a
+spec with an unknown family or a placeholder license fails validation.
+
 The Kotlin and Scala packs are source-semantic: they preserve authored declarations,
 signatures, companions, traits, hierarchy, and source locators. It does not
 invent Kotlin JVM facade names or compiler-generated Scala case-class members such
@@ -35,16 +43,21 @@ digest differs from the specification and refuses to replace a release asset
 with different bytes.
 
 The output contains a canonical `index.json`, content-addressed manifests and
-shards, content-addressed notices, `measurements.json`, and `SHA256SUMS`.
+shards, content-addressed notices, a structured `rejects.json`,
+`measurements.json`, and `SHA256SUMS`.
 Verification re-hashes and decodes every indexed asset and cross-checks the
-index, compiled metadata, measurements, and checksum inventory. Measurements
-record generation and activation time, stored/raw bytes, retained active-model
-index bytes, and cold/warm representative lookup timings. Timing values are
-observations; the canonical index, manifests, shards, notices, and checksum
-inventory are deterministic for the same pinned inputs. The release workflow
-publishes `measurements.json` as a separate CI artifact and excludes it from
-the immutable GitHub Release archive so a retry can reproduce the archive
-byte-for-byte.
+index, compiled metadata, rejects, measurements, and checksum inventory.
+`rejects.json` is the extraction burn-down report: it lists every source
+entry a producer rejected, with the reject reason, so pack completeness
+converges release over release. Both `generate` and `verify` print the
+report. It is deterministic and part of the checksummed inventory.
+Measurements record generation and activation time, stored/raw bytes,
+retained active-model index bytes, and cold/warm representative lookup
+timings. Timing values are observations; the canonical index, manifests,
+shards, notices, rejects, and checksum inventory are deterministic for the
+same pinned inputs. The release workflow publishes `measurements.json` as a
+separate CI artifact and excludes it from the immutable GitHub Release
+archive so a retry can reproduce the archive byte-for-byte.
 
 After selecting and unpacking a compatible published bundle, a consumer can
 verify and install it into a durable semantic-pack catalog explicitly:

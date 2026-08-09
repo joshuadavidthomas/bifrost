@@ -10,8 +10,11 @@ use std::fs::Metadata;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
-use git2::{IndexEntry, ObjectType, Oid, Repository, Status, StatusOptions};
+use git2::{
+    AttrCheckFlags, AttrValue, IndexEntry, ObjectType, Oid, Repository, Status, StatusOptions,
+};
 use growable_bloom_filter::GrowableBloom;
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -94,10 +97,11 @@ pub fn working_tree_oids(
 
 /// Resolve many working-tree paths with one Git index and dirty-tree scan.
 ///
-/// Clean tracked files use the index OID without reading their bytes. Dirty,
-/// and untracked files use the bytes visible to the analyzer. Missing files
-/// are absent from the result. This startup path replaces repeated point
-/// resolution, which read every clean source file in large Java workspaces.
+/// Clean tracked files use the index OID without reading their bytes when Git
+/// records byte-identical worktree content. Dirty, transformed, and untracked
+/// files use the bytes visible to the analyzer. Missing files are absent from
+/// the result. This startup path replaces repeated point resolution, which
+/// read every clean source file in large Java workspaces.
 pub fn working_tree_oid_values(
     repo: &Repository,
     rel_paths: &[String],
@@ -112,29 +116,198 @@ pub fn working_tree_oid_values(
         .iter()
         .map(|entry| Ok((index_path_to_string(&entry)?, entry.id)))
         .collect::<Result<_>>()?;
-    resolve_working_tree_oid_values(workdir, rel_paths, &dirty, &index_oids, started)
+    let blob_sizes = canonical_blob_sizes(
+        repo,
+        rel_paths
+            .iter()
+            .filter(|rel| !dirty.contains(*rel))
+            .filter_map(|rel| index_oids.get(rel).copied()),
+    );
+    resolve_working_tree_oid_values(
+        repo,
+        workdir,
+        rel_paths,
+        &dirty,
+        &index_oids,
+        &blob_sizes,
+        started,
+    )
 }
 
-/// Resolve every tracked and untracked path in one repository snapshot.
-/// Language analyzers share this result instead of repeating Git work.
-pub fn all_working_tree_oid_values(repo: &Repository) -> Result<HashMap<String, Oid>> {
+/// One-scan working-tree identity snapshot: index OIDs with their cached
+/// stat data for tracked paths, and the set of dirty (modified, staged, or
+/// untracked) paths.
+///
+/// Callers resolve individual paths against it and hash only the files whose
+/// working bytes Git did not record. Building the snapshot reads no file
+/// contents, so an unreadable file outside the caller's file set (for example
+/// another process's live database under `.bifrost/cache`) cannot fail the
+/// scan. Serving an index OID re-checks the file's current stat against the
+/// index entry, the same way Git detects worktree edits, so a snapshot taken
+/// at startup stays valid for later full-refresh sweeps.
+pub struct WorkingTreeIdentity {
+    tracked: HashMap<String, TrackedIdentity>,
+    dirty: HashSet<String>,
+    verified_clean_paths: Mutex<HashSet<String>>,
+}
+
+struct TrackedIdentity {
+    oid: Oid,
+    file_size: u32,
+    mtime_seconds: i32,
+    mtime_nanoseconds: u32,
+}
+
+impl WorkingTreeIdentity {
+    /// Index OID for `rel` when the file at `abs_path` still carries the
+    /// bytes Git recorded: the path was clean at scan time and its current
+    /// size and mtime match the index entry's cached stat. Dirty, untracked,
+    /// ignored, and since-edited paths return `None`; their identity is the
+    /// hash of the visible working bytes.
+    pub fn clean_index_oid(&self, repo: &Repository, rel: &str, abs_path: &Path) -> Option<Oid> {
+        if self.dirty.contains(rel) {
+            return None;
+        }
+        let tracked = self.tracked.get(rel)?;
+        let metadata = std::fs::metadata(abs_path).ok()?;
+        if !metadata.is_file() || metadata.len() != u64::from(tracked.file_size) {
+            return None;
+        }
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        if modified.as_secs() != u64::try_from(tracked.mtime_seconds).ok()? {
+            return None;
+        }
+        // Index entries on some filesystems and Git versions truncate the
+        // nanosecond field to zero; only a recorded value can disagree.
+        if tracked.mtime_nanoseconds != 0 && modified.subsec_nanos() != tracked.mtime_nanoseconds {
+            return None;
+        }
+
+        if self
+            .verified_clean_paths
+            .lock()
+            .expect("working-tree identity verification mutex poisoned")
+            .contains(rel)
+        {
+            return Some(tracked.oid);
+        }
+
+        // Git can keep a transformed worktree clean while the index OID still
+        // names the canonical blob. Hash those bytes instead of serving the
+        // canonical OID. A line-ending conversion changes the worktree size,
+        // while other filters need the attribute guard below.
+        if canonical_blob_size(repo, tracked.oid) != Some(metadata.len())
+            || has_content_transform(repo, Path::new(rel))
+        {
+            return None;
+        }
+        self.verified_clean_paths
+            .lock()
+            .expect("working-tree identity verification mutex poisoned")
+            .insert(rel.to_string());
+        Some(tracked.oid)
+    }
+}
+
+/// Take one repository-wide identity scan. Language analyzers share this
+/// result instead of repeating Git index and dirty-tree work at startup.
+pub fn working_tree_identity(repo: &Repository) -> Result<WorkingTreeIdentity> {
     let started = std::time::Instant::now();
-    let workdir = workdir(repo)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     index.read(true).map_err(|e| e.to_string())?;
     let dirty = dirty_worktree_paths(repo)?;
-    let index_oids: HashMap<String, Oid> = index
-        .iter()
-        .map(|entry| Ok((index_path_to_string(&entry)?, entry.id)))
-        .collect::<Result<_>>()?;
-    let mut rel_paths = index_oids.keys().cloned().collect::<Vec<_>>();
-    rel_paths.extend(
-        dirty
-            .iter()
-            .filter(|path| !index_oids.contains_key(*path))
-            .cloned(),
-    );
-    resolve_working_tree_oid_values(workdir, &rel_paths, &dirty, &index_oids, started)
+    // Keep the startup scan to index and dirty-tree data. Canonical blob sizes
+    // and attributes are checked only when an analyzer requests that path.
+    // This avoids object-database work for unrelated languages and files.
+    let entries: Vec<IndexEntry> = index.iter().collect();
+    let mut tracked = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        let rel = index_path_to_string(&entry)?;
+        tracked.insert(
+            rel,
+            TrackedIdentity {
+                oid: entry.id,
+                file_size: entry.file_size,
+                mtime_seconds: entry.mtime.seconds(),
+                mtime_nanoseconds: entry.mtime.nanoseconds(),
+            },
+        );
+    }
+    if crate::profiling::enabled() {
+        crate::profiling::note(format!(
+            "git_identity_scan index={} dirty={} blob_headers=0 elapsed_ms={:.1}",
+            tracked.len(),
+            dirty.len(),
+            started.elapsed().as_secs_f64() * 1000.0,
+        ));
+    }
+    Ok(WorkingTreeIdentity {
+        tracked,
+        dirty,
+        verified_clean_paths: Mutex::new(HashSet::new()),
+    })
+}
+
+/// Return whether Git may change the bytes visible in the worktree for `path`.
+///
+/// Text/eol conversion is handled by comparing the index stat size with the
+/// canonical blob size in [`WorkingTreeIdentity::clean_index_oid`]. These
+/// attributes cover custom filters and other byte transforms whose output can
+/// have the same size as the canonical blob.
+fn has_content_transform(repo: &Repository, path: &Path) -> bool {
+    for name in ["filter", "ident", "working-tree-encoding"] {
+        let value = match repo.get_attr_bytes(path, name, AttrCheckFlags::FILE_THEN_INDEX) {
+            Ok(value) => value,
+            // An attribute lookup failure prevents proof of byte identity.
+            // Hash the visible bytes instead of trusting the index OID.
+            Err(_) => return true,
+        };
+        if !matches!(
+            AttrValue::from_bytes(value),
+            AttrValue::False | AttrValue::Unspecified
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Read canonical blob sizes once per unique index OID.
+///
+/// A missing object or an unavailable object database returns `None`. Callers
+/// treat that result as transformed and hash visible worktree bytes.
+fn canonical_blob_sizes(
+    repo: &Repository,
+    oids: impl Iterator<Item = Oid>,
+) -> HashMap<Oid, Option<u64>> {
+    let mut object_db = None;
+    let mut sizes = HashMap::new();
+    for oid in oids {
+        if sizes.contains_key(&oid) {
+            continue;
+        }
+        if object_db.is_none() {
+            object_db = repo.odb().ok();
+        }
+        let size = object_db.as_ref().and_then(|odb| {
+            odb.read_header(oid)
+                .ok()
+                .and_then(|(size, kind)| (kind == ObjectType::Blob).then_some(size as u64))
+        });
+        sizes.insert(oid, size);
+    }
+    sizes
+}
+
+fn canonical_blob_size(repo: &Repository, oid: Oid) -> Option<u64> {
+    canonical_blob_sizes(repo, std::iter::once(oid))
+        .get(&oid)
+        .copied()
+        .flatten()
 }
 
 /// Resolve every existing tracked and untracked path in one repository snapshot.
@@ -166,10 +339,12 @@ pub fn all_working_tree_paths(repo: &Repository) -> Result<HashSet<String>> {
 }
 
 fn resolve_working_tree_oid_values(
+    repo: &Repository,
     workdir: &Path,
     rel_paths: &[String],
     dirty: &HashSet<String>,
     index_oids: &HashMap<String, Oid>,
+    blob_sizes: &HashMap<Oid, Option<u64>>,
     started: std::time::Instant,
 ) -> Result<HashMap<String, Oid>> {
     let mut out = HashMap::with_capacity(rel_paths.len());
@@ -177,7 +352,23 @@ fn resolve_working_tree_oid_values(
     for rel in rel_paths {
         let path = Path::new(rel);
         let index_oid = index_oids.get(rel).copied();
-        let use_worktree = dirty.contains(rel) || index_oid.is_none();
+        let use_worktree = if dirty.contains(rel) || index_oid.is_none() {
+            true
+        } else {
+            let size_differs = match index_oid.and_then(|oid| blob_sizes.get(&oid).copied()) {
+                Some(Some(blob_size)) => std::fs::metadata(workdir.join(path))
+                    .map(|metadata| metadata.len() != blob_size)
+                    .unwrap_or(true),
+                // A missing index object cannot prove byte identity. Hash the
+                // visible bytes instead of serving a potentially stale OID.
+                Some(None) | None => true,
+            };
+            if size_differs {
+                true
+            } else {
+                has_content_transform(repo, path)
+            }
+        };
         let oid = if use_worktree {
             match hash_working_file(workdir, rel) {
                 Ok(oid) => oid,
@@ -541,14 +732,16 @@ thread_local! {
     static HASH_WORKING_FILE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Throwaway repositories for tests. Unconditional rather than `#[cfg(test)]`
-/// because the analyzer store, workspace and tree-sitter unit tests in
-/// `brokk-bifrost-analysis` build these fixtures too, and a `cfg(test)` module
-/// is invisible across a crate boundary. Same reasoning as the `*_for_test`
-/// entry points in [`crate::cache_gc`].
+/// Throwaway repositories for tests, not published API. The analyzer store,
+/// workspace and tree-sitter unit tests in `brokk-bifrost-analysis` build these
+/// fixtures too, and a `cfg(test)` module is invisible across a crate boundary,
+/// so dependents reach it by enabling this crate's `test-support` feature. Same
+/// gate as the `*_for_test` entry points in [`crate::cache_gc`].
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_repo {
-    use git2::{IndexAddOption, Oid, Repository, Signature};
+    use git2::{IndexAddOption, IndexTime, Oid, Repository, Signature};
     use std::path::Path;
+    use std::time::UNIX_EPOCH;
 
     pub fn init_repo(dir: &Path) -> Repository {
         let repo = Repository::init(dir).unwrap();
@@ -560,12 +753,8 @@ pub mod test_repo {
         repo
     }
 
-    pub fn commit_all(repo: &Repository, message: &str) -> Oid {
+    fn commit_index(repo: &Repository, message: &str) -> Oid {
         let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
         let tree_id = index.write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
         let sig = Signature::now("T", "t@example.com").unwrap();
@@ -579,11 +768,59 @@ pub mod test_repo {
                 .unwrap(),
         }
     }
+
+    pub fn commit_all(repo: &Repository, message: &str) -> Oid {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        drop(index);
+        commit_index(repo, message)
+    }
+
+    pub fn commit_paths(repo: &Repository, paths: &[&str], message: &str) -> Oid {
+        let mut index = repo.index().unwrap();
+        for path in paths {
+            index.add_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        drop(index);
+        commit_index(repo, message)
+    }
+
+    /// Refresh the index stat for a worktree file while preserving its OID.
+    pub fn refresh_index_stat_preserving_oid(repo: &Repository, path: &str) -> Oid {
+        let workdir = repo.workdir().expect("test repository workdir");
+        let metadata = std::fs::metadata(workdir.join(path)).unwrap();
+        let modified = metadata
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
+        let mut index = repo.index().unwrap();
+        let mut entry = index
+            .get_path(Path::new(path), 0)
+            .expect("source index entry");
+        let oid = entry.id;
+        entry.file_size = u32::try_from(metadata.len()).unwrap();
+        let index_time = IndexTime::new(
+            i32::try_from(modified.as_secs()).unwrap(),
+            modified.subsec_nanos(),
+        );
+        entry.mtime = index_time;
+        entry.ctime = index_time;
+        index.add(&entry).unwrap();
+        index.write().unwrap();
+        oid
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_repo::{commit_all, init_repo};
+    use super::test_repo::{
+        commit_all, commit_paths, init_repo, refresh_index_stat_preserving_oid,
+    };
     use super::*;
 
     fn reset_hash_calls() {
@@ -632,6 +869,61 @@ mod tests {
         let paths = all_working_tree_paths(&repo).unwrap();
         assert!(!paths.contains("tracked.rs"), "{paths:?}");
         assert!(paths.contains("dirty.rs"), "{paths:?}");
+    }
+
+    #[test]
+    fn clean_eol_transformed_file_oid_matches_visible_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let source_path = temp.path().join("a.cs");
+        std::fs::write(&source_path, "class A {}\n").unwrap();
+        commit_all(&repo, "source");
+
+        std::fs::write(temp.path().join(".gitattributes"), "*.cs text eol=crlf\n").unwrap();
+        commit_paths(&repo, &[".gitattributes"], "attributes");
+        std::fs::write(&source_path, "class A {}\r\n").unwrap();
+
+        // Match the index stat Git records after a transformed checkout while
+        // retaining the canonical LF blob OID.
+        let index_oid = refresh_index_stat_preserving_oid(&repo, "a.cs");
+        let visible_oid = Oid::hash_object(ObjectType::Blob, b"class A {}\r\n").unwrap();
+        assert_ne!(visible_oid, index_oid, "LF and CRLF OIDs must differ");
+
+        reset_hash_calls();
+        let resolved = working_tree_oids(&repo, &["a.cs".to_string()]).unwrap();
+        let visible_oid_hex = visible_oid.to_string();
+        let index_oid_hex = index_oid.to_string();
+        assert_eq!(resolved.get("a.cs"), Some(&visible_oid_hex));
+        assert_ne!(resolved.get("a.cs"), Some(&index_oid_hex));
+        assert_eq!(hash_calls(), 1);
+    }
+
+    #[test]
+    fn equal_size_filter_attribute_hashes_working_tree_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let source_path = temp.path().join("a.txt");
+        std::fs::write(&source_path, "hello\n").unwrap();
+        commit_all(&repo, "source");
+
+        // The explicit filter has equal-size output in this fixture. The
+        // attribute guard must still avoid trusting the index OID.
+        std::fs::write(temp.path().join(".gitattributes"), "*.txt filter=opaque\n").unwrap();
+        commit_paths(&repo, &[".gitattributes"], "attributes");
+
+        let index_oid = repo
+            .index()
+            .unwrap()
+            .get_path(Path::new("a.txt"), 0)
+            .expect("source index entry")
+            .id;
+        let visible_oid = Oid::hash_object(ObjectType::Blob, b"hello\n").unwrap();
+        assert_eq!(visible_oid, index_oid);
+
+        reset_hash_calls();
+        let resolved = working_tree_oids(&repo, &["a.txt".to_string()]).unwrap();
+        assert_eq!(resolved.get("a.txt"), Some(&visible_oid.to_string()));
+        assert_eq!(hash_calls(), 1);
     }
 
     #[test]

@@ -1,42 +1,24 @@
 use crate::analyzer::clone_detection::{
-    CloneCandidateData, CloneCandidateProfile, compact_clone_excerpt,
-    detect_structural_clone_smells, refine_clone_similarity_with_ast,
+    CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::fq_name::{FqName, SegmentKind};
 use crate::analyzer::{
     AliasResolver, AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, Language, Project, ProjectFile, SemanticDiagnostic,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    ImportAnalysisProvider, ImportInfo, Language, Project, ProjectFile, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
+use brokk_bifrost_js_ts::queries::TYPESCRIPT_QUERY_DIRECTORY;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use tree_sitter::{Language as TsLanguage, Node, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, Parser, Tree};
 
 use crate::analyzer::js_ts::cache::JsTsMemoCaches;
-use crate::analyzer::js_ts::clones::{
-    build_js_ts_clone_ast_signature, normalized_clone_tokens_js_ts,
-};
+use crate::analyzer::js_ts::clones::build_js_ts_clone_candidate_data;
 use crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics;
-use crate::analyzer::js_ts::hierarchy::extract_ts_supertypes;
-use crate::analyzer::js_ts::identifiers::collect_js_ts_identifiers;
-use crate::analyzer::js_ts::imports::{
-    extract_js_ts_call_receiver, parse_commonjs_require_import_infos_from_node,
-    parse_es_import_infos_from_node,
-};
-use crate::analyzer::js_ts::model::{
-    add_default_export_unit, add_destructured_binder_units, call_has_likely_surface_factory_name,
-    call_identifier_name, call_is_schema_object_builder, collect_function_nodes,
-    file_scoped_field_fq, file_scoped_field_name, js_ts_segment, module_code_unit,
-    module_scoped_field_uses_file_name, node_text, property_name_text, record_default_reexport,
-    record_named_declarator_exports, record_named_export, root_node, this_member_property,
-    trim_statement, variable_header,
-};
-use crate::analyzer::js_ts::providers::{self, JsTsAnalyzerHost};
-use crate::analyzer::js_ts::tests::detect_js_ts_test_assertion_smells;
+use crate::analyzer::js_ts::providers::{self, JsTsMemoSource};
 use crate::analyzer::js_ts::{
     path_contains_tests as js_ts_path_contains_tests,
     source_contains_tests as js_ts_source_contains_tests,
@@ -44,7 +26,12 @@ use crate::analyzer::js_ts::{
 };
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
-use crate::cancellation::CancellationToken;
+use brokk_bifrost_js_ts::identifiers::collect_js_ts_identifiers;
+use brokk_bifrost_js_ts::imports::extract_js_ts_call_receiver;
+use brokk_bifrost_js_ts::model::{module_code_unit, module_scoped_field_uses_file_name};
+use brokk_bifrost_js_ts::providers::JsTsSource;
+use brokk_bifrost_js_ts::test_detection::detect_js_ts_test_assertion_smells;
+use brokk_bifrost_js_ts::typescript::*;
 
 mod semantic;
 
@@ -57,7 +44,7 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
     }
 
     fn query_directory(&self) -> &'static str {
-        "resources/treesitter/typescript"
+        TYPESCRIPT_QUERY_DIRECTORY
     }
 
     fn storage_language_key_for_file(&self, file: &ProjectFile) -> String {
@@ -153,76 +140,7 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         source: &str,
         tree: &Tree,
     ) -> crate::analyzer::tree_sitter_analyzer::ParsedFile {
-        let root = tree.root_node();
-        let mut parsed = crate::analyzer::tree_sitter_analyzer::ParsedFile::new(String::new());
-        let module = module_code_unit(file);
-        let mut module_has_imports = false;
-        let exported_roots = ts_es_named_exported_roots(root, source);
-
-        for index in 0..root.named_child_count() {
-            let Some(child) = root.named_child(index) else {
-                continue;
-            };
-            match child.kind() {
-                "import_statement" => {
-                    module_has_imports = true;
-                    parsed
-                        .imports
-                        .extend(parse_es_import_infos_from_node(child, source));
-                }
-                "expression_statement" => {
-                    let imports = parse_commonjs_require_import_infos_from_node(child, source);
-                    if !imports.is_empty() {
-                        module_has_imports = true;
-                        parsed.imports.extend(imports);
-                    }
-                }
-                "export_statement" => {
-                    visit_ts_export(file, source, child, None, &mut parsed, &exported_roots)
-                }
-                "ambient_declaration" => {
-                    visit_ts_ambient_declarations(file, source, child, None, &mut parsed, false);
-                }
-                "internal_module" if ts_is_global_internal_module(child, source) => {
-                    visit_ts_ambient_declarations(file, source, child, None, &mut parsed, false);
-                }
-                "class_declaration"
-                | "abstract_class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "internal_module" => {
-                    visit_ts_class_like(file, source, child, None, &mut parsed, false);
-                }
-                "function_declaration" | "function_signature" => {
-                    visit_ts_function(file, source, child, None, &mut parsed, false);
-                }
-                "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
-                    if matches!(child.kind(), "lexical_declaration" | "variable_declaration") {
-                        let imports = parse_commonjs_require_import_infos_from_node(child, source);
-                        if !imports.is_empty() {
-                            module_has_imports = true;
-                            parsed.imports.extend(imports);
-                        }
-                    }
-                    visit_ts_value(
-                        file,
-                        source,
-                        child,
-                        None,
-                        &mut parsed,
-                        false,
-                        &exported_roots,
-                    );
-                }
-                _ => {}
-            }
-        }
-
-        if module_has_imports {
-            parsed.add_code_unit(module, root, source, None, None);
-        }
-
-        parsed
+        parse_typescript_file(file, source, tree)
     }
 
     fn cognitive_complexity_config(
@@ -242,23 +160,57 @@ pub struct TypescriptAnalyzer {
     alias_resolver: Arc<AliasResolver>,
 }
 
-impl JsTsAnalyzerHost for TypescriptAnalyzer {
-    type Adapter = TypescriptAdapter;
-
-    fn ts_inner(&self) -> &TreeSitterAnalyzer<TypescriptAdapter> {
-        &self.inner
-    }
-
-    fn memo_caches(&self) -> &JsTsMemoCaches {
-        &self.memo_caches
-    }
-
-    fn alias_resolver(&self) -> &AliasResolver {
+impl JsTsSource for TypescriptAnalyzer {
+    fn alias_resolver(&self) -> &Arc<AliasResolver> {
         &self.alias_resolver
     }
 
-    fn js_ts_language(&self) -> Language {
+    fn language(&self) -> Language {
         Language::TypeScript
+    }
+
+    fn all_files(&self) -> Vec<ProjectFile> {
+        self.inner.all_files()
+    }
+
+    fn bulk_import_infos(&self, files: &[ProjectFile]) -> HashMap<ProjectFile, Vec<ImportInfo>> {
+        self.inner.bulk_import_infos(files.iter().cloned())
+    }
+
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.raw_supertypes_of(code_unit)
+    }
+
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
+        self.inner.is_type_alias(code_unit)
+    }
+
+    fn raw_signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.signatures_vec_of(code_unit)
+    }
+
+    fn usage_definitions(&self) -> &dyn brokk_bifrost_core::analyzer::BoundedDefinitionLookup {
+        self.inner.global_usage_definition_index_ref()
+    }
+
+    fn usage_index(
+        &self,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> Option<Arc<JsTsUsageIndex>> {
+        cancellation.map_or_else(
+            || Some(providers::jsts_usage_index(self)),
+            |token| providers::jsts_usage_index_with_cancellation(self, token),
+        )
+    }
+}
+
+impl JsTsMemoSource for TypescriptAnalyzer {
+    fn memo_caches(&self) -> &JsTsMemoCaches {
+        &self.memo_caches
     }
 }
 
@@ -266,6 +218,16 @@ crate::analyzer::impl_forward_query_provider!(TypescriptAnalyzer);
 
 impl TypescriptAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
+        // The clone keeps this analyzer's `alias_resolver`, whose config memo is
+        // keyed on the root it was built with. Re-projecting is a same-root
+        // operation (the only caller wraps the same project in an overlay), and
+        // the shared resolver every JS/TS resolution path now reads would answer
+        // for the wrong tree if that stopped holding.
+        debug_assert_eq!(
+            self.inner.project().root(),
+            project.root(),
+            "re-projecting a JS/TS analyzer must not change its root"
+        );
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
         clone
@@ -284,19 +246,6 @@ impl TypescriptAnalyzer {
             memo_caches: Arc::new(JsTsMemoCaches::new(memo_budget)),
             alias_resolver,
         }
-    }
-
-    /// Lazily-built, analyzer-cached JS/TS usage-resolution maps for this analyzer's
-    /// language. Built once and reused until `update`/`update_all` resets the cell.
-    pub(crate) fn jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
-        providers::jsts_usage_index(self)
-    }
-
-    pub(crate) fn jsts_usage_index_with_cancellation(
-        &self,
-        cancellation: &CancellationToken,
-    ) -> Option<Arc<JsTsUsageIndex>> {
-        providers::jsts_usage_index_with_cancellation(self, cancellation)
     }
 
     pub(crate) fn prewarm_jsts_usage_index(&self) -> Arc<JsTsUsageIndex> {
@@ -341,6 +290,24 @@ impl TypescriptAnalyzer {
         self.inner.ranges_limited(code_unit, limit)
     }
 
+    /// Mirrors the type-alias terminator that `signatures` appends, so a bounded read
+    /// returns the same text as the unbounded one.
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<String> {
+        let mut result = self.inner.signatures_limited(code_unit, limit);
+        if self.inner.is_type_alias(code_unit) {
+            for signature in &mut result.rows {
+                if !signature.ends_with(';') {
+                    signature.push(';');
+                }
+            }
+        }
+        result
+    }
+
     #[doc(hidden)]
     pub fn reset_full_hydration_count_for_test(&self) {
         self.inner.reset_full_hydration_count_for_test();
@@ -349,10 +316,6 @@ impl TypescriptAnalyzer {
     #[doc(hidden)]
     pub fn full_hydration_count_for_test(&self) -> usize {
         self.inner.full_hydration_count_for_test()
-    }
-
-    pub fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
-        self.inner.is_type_alias(code_unit)
     }
 
     pub fn extract_type_identifiers(&self, source: &str) -> BTreeSet<String> {
@@ -367,26 +330,10 @@ impl TypescriptAnalyzer {
         collect_js_ts_identifiers(tree.root_node(), source, &mut identifiers);
         identifiers.into_iter().collect()
     }
-
-    fn module_import_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        if !code_unit.is_module() {
-            return None;
-        }
-
-        let imports = self.inner.import_statements(code_unit.source());
-        (!imports.is_empty()).then(|| imports.join("\n"))
-    }
-
-    fn type_alias_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.inner
-            .is_type_alias(code_unit)
-            .then(|| self.inner.signatures(code_unit).first().cloned())
-            .flatten()
-    }
 }
 
 impl ImportAnalysisProvider for TypescriptAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         providers::imported_code_units_of(self, file)
     }
 
@@ -409,7 +356,7 @@ impl ImportAnalysisProvider for TypescriptAnalyzer {
         &self,
         file: &ProjectFile,
         imports: &[ImportInfo],
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
         providers::imported_code_units_from_infos(self, file, imports)
     }
 
@@ -453,29 +400,25 @@ impl TypeHierarchyProvider for TypescriptAnalyzer {
     }
 }
 
-impl IAnalyzer for TypescriptAnalyzer {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.begin_query(context);
+use crate::analyzer::CodeUnitIndex;
+
+impl CodeUnitIndex for TypescriptAnalyzer {
+    fn enclosing_code_unit(
+        &self,
+        file: &ProjectFile,
+        range: &crate::analyzer::Range,
+    ) -> Option<CodeUnit> {
+        self.inner.enclosing_code_unit(file, range)
     }
 
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.end_query(context);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
-    }
-
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        self.inner
+            .enclosing_code_unit_for_lines(file, start_line, end_line)
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
@@ -495,6 +438,14 @@ impl IAnalyzer for TypescriptAnalyzer {
 
     fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
         self.inner.indexed_source(file)
+    }
+
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.inner.location_declarations(file)
+    }
+
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
+        self.inner.location_ranges(code_unit)
     }
 
     fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
@@ -524,50 +475,8 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .global_usage_definition_index_build_count_for_test()
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner.reset_full_declaration_scan_count_for_test();
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.full_declaration_scan_count_for_test()
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
-    }
-
-    fn reset_workspace_path_scan_count_for_test(&self) {
-        self.inner.reset_workspace_path_scan_count_for_test();
-    }
-
-    fn workspace_path_scan_count_for_test(&self) -> usize {
-        self.inner.workspace_path_scan_count_for_test()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
-    }
-
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
-    }
-
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
@@ -584,43 +493,22 @@ impl IAnalyzer for TypescriptAnalyzer {
             .ranges_with_limit(code_unit, max_ranges, cancellation)
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
-    }
-
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
     }
+
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
         self.inner.get_analyzed_files()
     }
+
     fn languages(&self) -> BTreeSet<Language> {
         self.inner.languages()
     }
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        let inner = self.inner.update(changed_files);
-        // Rebuild from root so a changed tsconfig.json drops its stale parse cache.
-        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
-            alias_resolver,
-        }
-    }
-    fn update_all(&self) -> Self {
-        let inner = self.inner.update_all();
-        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
-        Self {
-            inner,
-            memo_budget: self.memo_budget,
-            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
-            alias_resolver,
-        }
-    }
+
     fn project(&self) -> &dyn Project {
         self.inner.project()
     }
+
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
         self.inner.structural_parent_of(code_unit).or_else(|| {
             module_scoped_field_uses_file_name(code_unit)
@@ -629,65 +517,26 @@ impl IAnalyzer for TypescriptAnalyzer {
         })
     }
 
-    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
-        self.inner.parse_errors(file)
-    }
-
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        collect_typescript_semantic_diagnostics(self, file, source, &self.alias_resolver)
-            .into_iter()
-            .map(Into::into)
-            .collect()
-    }
-
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
-    }
-    fn enclosing_code_unit(
-        &self,
-        file: &ProjectFile,
-        range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
-    }
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
-    }
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
-    }
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
-    }
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.module_import_skeleton(code_unit)
-            .or_else(|| self.type_alias_skeleton(code_unit))
+        providers::module_import_skeleton(self, code_unit)
+            .or_else(|| ts_type_alias_skeleton(self, code_unit))
             .or_else(|| self.inner.get_skeleton(code_unit))
     }
+
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.module_import_skeleton(code_unit)
-            .or_else(|| self.type_alias_skeleton(code_unit))
+        providers::module_import_skeleton(self, code_unit)
+            .or_else(|| ts_type_alias_skeleton(self, code_unit))
             .or_else(|| self.inner.get_skeleton_header(code_unit))
     }
+
     fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
         self.inner.get_source(code_unit, include_comments)
     }
+
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
         self.inner.get_sources(code_unit, include_comments)
     }
+
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.inner.search_definitions(pattern, auto_quote)
     }
@@ -706,20 +555,12 @@ impl IAnalyzer for TypescriptAnalyzer {
         self.inner.lookup_candidates_by_short_name(symbol)
     }
 
-    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        self.inner.lookup_declarations_by_identifier(identifier)
-    }
-
     fn has_complete_symbol_lookup_index(&self) -> bool {
         self.inner.has_complete_symbol_lookup_index()
     }
 
-    fn search_symbol_candidates(
-        &self,
-        patterns: &crate::analyzer::SearchSymbolPatternBatch,
-        cancellation: Option<&crate::CancellationToken>,
-    ) -> crate::analyzer::SearchSymbolCandidates {
-        self.inner.search_symbol_candidates(patterns, cancellation)
+    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_declarations_by_identifier(identifier)
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -735,15 +576,128 @@ impl IAnalyzer for TypescriptAnalyzer {
             })
             .collect()
     }
+}
+
+impl IAnalyzer for TypescriptAnalyzer {
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
+    }
+
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.inner.workspace_file_index_cell()
+    }
+
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
+        self.inner.global_usage_definition_index()
+    }
+
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
+    }
+
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        let inner = self.inner.update(changed_files);
+        // Rebuild from root so a changed tsconfig.json drops its stale parse cache.
+        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
+        Self {
+            inner,
+            memo_budget: self.memo_budget,
+            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
+            alias_resolver,
+        }
+    }
+
+    fn update_all(&self) -> Self {
+        let inner = self.inner.update_all();
+        let alias_resolver = Arc::new(AliasResolver::new(inner.project().root().to_path_buf()));
+        Self {
+            inner,
+            memo_budget: self.memo_budget,
+            memo_caches: Arc::new(JsTsMemoCaches::new(self.memo_budget)),
+            alias_resolver,
+        }
+    }
+
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        collect_typescript_semantic_diagnostics(self, file, source)
+    }
+
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        self.inner.extract_call_receiver(reference)
+    }
+
+    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
+        self.inner.is_access_expression(file, start_byte, end_byte)
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+        ident: &str,
+    ) -> Option<crate::analyzer::DeclarationInfo> {
+        self.inner
+            .find_nearest_declaration(file, start_byte, end_byte, ident)
+    }
+
+    fn search_symbol_candidates(
+        &self,
+        patterns: &crate::analyzer::SearchSymbolPatternBatch,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> crate::analyzer::SearchSymbolCandidates {
+        self.inner.search_symbol_candidates(patterns, cancellation)
+    }
+
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
         Some(self)
     }
+
     fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
         Some(self)
     }
+
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
         Some(self)
     }
+
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
     }
@@ -814,7 +768,14 @@ impl IAnalyzer for TypescriptAnalyzer {
                 code_unit.is_function()
                     && matches!(file_language(code_unit.source()), Language::TypeScript)
             })
-            .filter_map(|code_unit| self.build_clone_candidate_data(&code_unit, weights))
+            .filter_map(|code_unit| {
+                build_js_ts_clone_candidate_data(
+                    self,
+                    &code_unit,
+                    weights,
+                    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                )
+            })
             .map(|candidate| CloneCandidateProfile::create(candidate, weights))
             .collect();
         if all_candidates.is_empty() {
@@ -830,1558 +791,47 @@ impl IAnalyzer for TypescriptAnalyzer {
     }
 }
 
-impl TypescriptAnalyzer {
-    fn build_clone_candidate_data(
-        &self,
-        code_unit: &CodeUnit,
-        weights: CloneSmellWeights,
-    ) -> Option<CloneCandidateData> {
-        self.get_source(code_unit, false)
-            .map(|source| source.trim().to_string())
-            .filter(|source| !source.is_empty())
-            .and_then(|source| {
-                let normalized_tokens = normalized_clone_tokens_js_ts(
-                    &source,
-                    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                );
-                if normalized_tokens.len() < weights.min_normalized_tokens.max(0) as usize {
-                    return None;
-                }
-                Some(CloneCandidateData {
-                    unit: code_unit.clone(),
-                    normalized_tokens,
-                    ast_signature: build_js_ts_clone_ast_signature(
-                        &source,
-                        tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-                    ),
-                    excerpt: compact_clone_excerpt(&source),
-                })
-            })
-    }
-}
-
-fn visit_ts_ambient_declarations(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    parent: Option<&CodeUnit>,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-    exported: bool,
-) {
-    let definition = if node.kind() == "export_statement" {
-        node.child_by_field_name("declaration").unwrap_or(node)
-    } else {
-        node
-    };
-    match definition.kind() {
-        "ambient_declaration" | "statement_block" => {
-            let mut cursor = definition.walk();
-            for child in definition.named_children(&mut cursor) {
-                visit_ts_ambient_declarations(file, source, child, parent, parsed, exported);
-            }
-        }
-        "internal_module" if ts_is_global_internal_module(definition, source) => {
-            if let Some(body) = definition.child_by_field_name("body") {
-                let mut cursor = body.walk();
-                for child in body.named_children(&mut cursor) {
-                    visit_ts_ambient_declarations(file, source, child, parent, parsed, false);
-                }
-            }
-        }
-        "class_declaration"
-        | "abstract_class_declaration"
-        | "interface_declaration"
-        | "enum_declaration"
-        | "internal_module" => {
-            visit_ts_class_like(file, source, definition, parent, parsed, exported);
-        }
-        "function_declaration" | "function_signature" => {
-            visit_ts_function(file, source, definition, parent, parsed, exported);
-        }
-        "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
-            visit_ts_value(
-                file,
-                source,
-                definition,
-                parent,
-                parsed,
-                exported,
-                &HashSet::default(),
-            );
-        }
-        _ => {}
-    }
-}
-
-pub(crate) fn ts_is_global_internal_module(node: Node<'_>, source: &str) -> bool {
-    node.kind() == "internal_module"
-        && node
-            .child_by_field_name("name")
-            .is_some_and(|name| trim_statement(node_text(name, source)) == "global")
-}
-
-fn visit_ts_export(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    parent: Option<&CodeUnit>,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-    exported_roots: &HashSet<String>,
-) {
-    if let Some(declaration) = node.child_by_field_name("declaration") {
-        match declaration.kind() {
-            "ambient_declaration" => {
-                visit_ts_ambient_declarations(file, source, declaration, parent, parsed, true);
-            }
-            "internal_module" if ts_is_global_internal_module(declaration, source) => {
-                visit_ts_ambient_declarations(file, source, declaration, parent, parsed, true);
-            }
-            "class_declaration"
-            | "abstract_class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "internal_module" => {
-                if matches!(
-                    declaration.kind(),
-                    "class_declaration" | "abstract_class_declaration"
-                ) && declaration.child_by_field_name("name").is_none()
-                    && ts_export_is_default(node, source)
-                    && parent.is_none()
-                {
-                    visit_ts_default_export_class(file, source, node, declaration, parsed);
-                } else {
-                    if parent.is_none() {
-                        record_named_export(
-                            source,
-                            node,
-                            declaration,
-                            ts_export_is_default(node, source),
-                            parsed,
-                        );
-                    }
-                    visit_ts_class_like(file, source, node, parent, parsed, true);
-                }
-            }
-            "function_declaration" | "function_signature" => {
-                if declaration.kind() == "function_declaration"
-                    && declaration.child_by_field_name("name").is_none()
-                    && ts_export_is_default(node, source)
-                    && parent.is_none()
-                {
-                    visit_ts_default_export_function(file, source, node, declaration, parsed);
-                } else {
-                    if parent.is_none() {
-                        record_named_export(
-                            source,
-                            node,
-                            declaration,
-                            ts_export_is_default(node, source),
-                            parsed,
-                        );
-                    }
-                    visit_ts_function(file, source, node, parent, parsed, true);
-                }
-            }
-            "lexical_declaration" | "variable_declaration" | "type_alias_declaration" => {
-                if parent.is_none() {
-                    if declaration.kind() == "type_alias_declaration" {
-                        record_named_export(source, node, declaration, false, parsed);
-                    } else {
-                        record_named_declarator_exports(source, node, declaration, parsed);
-                    }
-                }
-                visit_ts_value(file, source, node, parent, parsed, true, exported_roots);
-            }
-            _ => {}
-        }
-    } else if parent.is_none()
-        && let Some(value) = node.child_by_field_name("value")
-    {
-        visit_ts_default_export_value(file, source, node, value, parsed);
-    }
-}
-
-fn ts_export_is_default(node: Node<'_>, source: &str) -> bool {
-    (0..node.child_count()).any(|index| {
-        node.child(index)
-            .is_some_and(|child| child.kind() == "default" || node_text(child, source) == "default")
-    })
-}
-
-fn visit_ts_default_export_value(
-    file: &ProjectFile,
-    source: &str,
-    export: Node<'_>,
-    value: Node<'_>,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) {
-    match value.kind() {
-        "arrow_function" | "function_expression" | "generator_function" => {
-            visit_ts_default_export_function(file, source, export, value, parsed);
-        }
-        "class" => {
-            visit_ts_default_export_class(file, source, export, value, parsed);
-        }
-        "object" => {
-            let code_unit = add_default_export_unit(
-                file,
-                source,
-                export,
-                crate::analyzer::CodeUnitType::Field,
-                parsed,
-            );
-            parsed.add_signature(code_unit.clone(), trim_statement(node_text(export, source)));
-            visit_ts_object_literal_properties(file, source, value, &code_unit, &code_unit, parsed);
-        }
-        // `export default name` points at an existing binding; indexing `default`
-        // here would duplicate that declaration instead of describing new code.
-        // The export declaration itself is still recorded.
-        _ => record_default_reexport(export, parsed),
-    }
-}
-
-fn visit_ts_default_export_function(
-    file: &ProjectFile,
-    source: &str,
-    export: Node<'_>,
-    function: Node<'_>,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) -> CodeUnit {
-    let code_unit = add_default_export_unit(
-        file,
-        source,
-        export,
-        crate::analyzer::CodeUnitType::Function,
-        parsed,
-    );
-    parsed.add_signature_with_metadata(
-        code_unit.clone(),
-        SignatureMetadata::with_parameter_labels(
-            ts_default_export_function_signature(function, source),
-            ts_parameter_labels(function, source),
-        ),
-    );
-    visit_ts_return_object_literal_properties(
-        file, source, function, &code_unit, &code_unit, parsed,
-    );
-    code_unit
-}
-
-fn visit_ts_default_export_class(
-    file: &ProjectFile,
-    source: &str,
-    export: Node<'_>,
-    class: Node<'_>,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) -> CodeUnit {
-    let code_unit = add_default_export_unit(
-        file,
-        source,
-        export,
-        crate::analyzer::CodeUnitType::Class,
-        parsed,
-    );
-    parsed.add_signature(
-        code_unit.clone(),
-        ts_default_export_class_signature(export, source),
-    );
-    let supertypes = extract_ts_supertypes(class, source);
-    if !supertypes.is_empty() {
-        parsed.set_raw_supertypes(code_unit.clone(), supertypes);
-    }
-    let _nested = visit_ts_class_like_body(file, source, class, &code_unit, &code_unit, parsed);
-    code_unit
-}
-
-fn visit_ts_class_like(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    parent: Option<&CodeUnit>,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-    exported: bool,
-) -> Option<CodeUnit> {
-    let mut first = None;
-    let mut stack = vec![(node, parent.cloned(), exported)];
-    while let Some((node, parent, exported)) = stack.pop() {
-        let definition = if node.kind() == "export_statement" {
-            node.child_by_field_name("declaration").unwrap_or(node)
-        } else {
-            node
-        };
-        let Some(name_node) = definition.child_by_field_name("name") else {
-            continue;
-        };
-        let name = trim_statement(node_text(name_node, source));
-        if name.is_empty() {
-            continue;
-        }
-        let short_name = parent
-            .as_ref()
-            .map(|parent| format!("{}.{}", parent.short_name(), name))
-            .unwrap_or(name.clone());
-        let fq = match &parent {
-            Some(parent) => parent
-                .fq()
-                .clone()
-                .with_pushed(js_ts_segment(&name, SegmentKind::Type)),
-            None => FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Type)),
-        };
-        let code_unit = CodeUnit::new_fq(
-            file.clone(),
-            crate::analyzer::CodeUnitType::Class,
-            "",
-            short_name,
-            fq,
-        );
-        if first.is_none() {
-            first = Some(code_unit.clone());
-        }
-        let top_level = parent.clone().unwrap_or_else(|| code_unit.clone());
-        let range_node = if exported { node } else { definition };
-        parsed.add_code_unit(
-            code_unit.clone(),
-            range_node,
-            source,
-            parent.clone(),
-            Some(top_level.clone()),
-        );
-        parsed.add_signature(
-            code_unit.clone(),
-            ts_class_signature(node, source, exported),
-        );
-        let supertypes = extract_ts_supertypes(definition, source);
-        if !supertypes.is_empty() {
-            parsed.set_raw_supertypes(code_unit.clone(), supertypes);
-        }
-
-        if definition.kind() == "enum_declaration" {
-            if let Some(body) = definition.child_by_field_name("body") {
-                for index in 0..body.named_child_count() {
-                    let Some(child) = body.named_child(index) else {
-                        continue;
-                    };
-                    if child.kind() == "enum_assignment"
-                        || child.kind() == "property_identifier"
-                        || child.kind() == "identifier"
-                    {
-                        visit_ts_enum_member(file, source, child, &code_unit, &top_level, parsed);
-                    }
-                }
-            }
-            continue;
-        }
-
-        let nested_class_like =
-            visit_ts_class_like_body(file, source, definition, &code_unit, &top_level, parsed);
-        stack.extend(
-            nested_class_like
-                .into_iter()
-                .rev()
-                .map(|child| (child, Some(code_unit.clone()), false)),
-        );
-    }
-    first
-}
-
-fn visit_ts_class_like_body<'tree>(
-    file: &ProjectFile,
-    source: &str,
-    class_like: Node<'tree>,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) -> Vec<Node<'tree>> {
-    let Some(body) = class_like.child_by_field_name("body") else {
-        return Vec::new();
-    };
-    let mut nested_class_like = Vec::new();
-    for index in 0..body.named_child_count() {
-        let Some(child) = body.named_child(index) else {
-            continue;
-        };
-        match child.kind() {
-            "method_definition" | "method_signature" | "abstract_method_signature" => {
-                visit_ts_method(file, source, child, parent, top_level, parsed);
-            }
-            "public_field_definition" | "property_signature" | "index_signature" => {
-                visit_ts_field(file, source, child, parent, top_level, parsed);
-            }
-            "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "internal_module" => {
-                nested_class_like.push(child);
-            }
-            _ => {}
-        }
-    }
-    nested_class_like
-}
-
-fn visit_ts_function(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    parent: Option<&CodeUnit>,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-    exported: bool,
-) {
-    let definition = if node.kind() == "export_statement" {
-        node.child_by_field_name("declaration").unwrap_or(node)
-    } else {
-        node
-    };
-    let Some(name_node) = definition.child_by_field_name("name") else {
-        return;
-    };
-    let name = trim_statement(node_text(name_node, source));
-    if name.is_empty() {
-        return;
-    }
-    let short_name = parent
-        .map(|parent| format!("{}.{}", parent.short_name(), name))
-        .unwrap_or_else(|| name.clone());
-    let fq = match parent {
-        Some(parent) => parent
-            .fq()
-            .clone()
-            .with_pushed(js_ts_segment(&name, SegmentKind::Member)),
-        None => FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member)),
-    };
-    let code_unit = CodeUnit::new_fq(
-        file.clone(),
-        crate::analyzer::CodeUnitType::Function,
-        "",
-        short_name,
-        fq,
-    );
-    let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
-    let range_node = if exported { node } else { definition };
-    parsed.add_code_unit(
-        code_unit.clone(),
-        range_node,
-        source,
-        parent.cloned(),
-        Some(top_level.clone()),
-    );
-    let signature = ts_function_signature(node, source, exported);
-    parsed.add_signature_with_metadata(
-        code_unit.clone(),
-        SignatureMetadata::with_parameter_labels(
-            signature,
-            ts_parameter_labels(definition, source),
-        ),
-    );
-    visit_ts_return_object_literal_properties(
-        file, source, definition, &code_unit, &top_level, parsed,
-    );
-}
-
-fn visit_ts_value(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    parent: Option<&CodeUnit>,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-    exported: bool,
-    exported_roots: &HashSet<String>,
-) {
-    let definition = if node.kind() == "export_statement" {
-        node.child_by_field_name("declaration").unwrap_or(node)
-    } else {
-        node
-    };
-
-    if definition.kind() == "type_alias_declaration" {
-        let Some(name_node) = definition.child_by_field_name("name") else {
-            return;
-        };
-        let name = trim_statement(node_text(name_node, source));
-        let short_name = parent
-            .map(|parent| format!("{}.{}", parent.short_name(), name))
-            .unwrap_or_else(|| {
-                format!(
-                    "{}.{}",
-                    file.rel_path()
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("module"),
-                    name
-                )
-            });
-        // Mirrors `short_name` above: a nested type alias is a plain `Member`
-        // off the parent's `fq`; a top-level one is qualified by the same
-        // file-name `Path` prefix as `file_scoped_field_name` (built by hand
-        // above rather than via the shared helper, but structurally identical).
-        let fq = match parent {
-            Some(parent) => parent
-                .fq()
-                .clone()
-                .with_pushed(js_ts_segment(&name, SegmentKind::Member)),
-            None => file_scoped_field_fq(file, &name),
-        };
-        let code_unit = CodeUnit::new_fq(
-            file.clone(),
-            crate::analyzer::CodeUnitType::Field,
-            "",
-            short_name,
-            fq,
-        );
-        let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
-        let range_node = if exported { node } else { definition };
-        parsed.add_code_unit(
-            code_unit.clone(),
-            range_node,
-            source,
-            parent.cloned(),
-            Some(top_level.clone()),
-        );
-        parsed.add_signature(code_unit.clone(), trim_statement(node_text(node, source)));
-        parsed.mark_type_alias(code_unit.clone());
-        visit_ts_type_alias_members(file, source, definition, &code_unit, &top_level, parsed);
-        return;
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::AnalyzerTestHooks for TypescriptAnalyzer {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
     }
 
-    for index in 0..definition.named_child_count() {
-        let Some(child) = definition.named_child(index) else {
-            continue;
-        };
-        if child.kind() != "variable_declarator" {
-            continue;
-        }
-        let Some(name_node) = child.child_by_field_name("name") else {
-            continue;
-        };
-        if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
-            let signature = ts_variable_signature(definition, child, source, exported);
-            let range_node = if exported { node } else { definition };
-            add_destructured_binder_units(
-                file, source, name_node, range_node, parent, &signature, parsed,
-            );
-            continue;
-        }
-        let name = trim_statement(node_text(name_node, source));
-        let value = child.child_by_field_name("value");
-        let is_function = value
-            .map(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
-            .unwrap_or(false);
-        let module_surface = parent.is_none()
-            && (exported || exported_roots.contains(&name))
-            && value.is_some_and(|value| {
-                ts_exported_surface_object_literal_value(child, value, source).is_some()
-            });
-        let kind = if is_function {
-            crate::analyzer::CodeUnitType::Function
-        } else {
-            crate::analyzer::CodeUnitType::Field
-        };
-        let short_name = if kind == crate::analyzer::CodeUnitType::Field {
-            if let Some(parent) = parent {
-                format!("{}.{}", parent.short_name(), name)
-            } else {
-                file_scoped_field_name(file, &name)
-            }
-        } else {
-            parent
-                .map(|parent| format!("{}.{}", parent.short_name(), name))
-                .unwrap_or_else(|| name.clone())
-        };
-        // Mirrors `short_name` above segment-for-segment (see the analogous
-        // javascript `visit_js_variable_statement`).
-        let fq = if kind == crate::analyzer::CodeUnitType::Field {
-            match parent {
-                Some(parent) => parent
-                    .fq()
-                    .clone()
-                    .with_pushed(js_ts_segment(&name, SegmentKind::Member)),
-                None => file_scoped_field_fq(file, &name),
-            }
-        } else {
-            match parent {
-                Some(parent) => parent
-                    .fq()
-                    .clone()
-                    .with_pushed(js_ts_segment(&name, SegmentKind::Member)),
-                None => FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member)),
-            }
-        };
-        let code_unit = CodeUnit::new_fq(file.clone(), kind, "", short_name, fq);
-        let top_level = parent.cloned().unwrap_or_else(|| code_unit.clone());
-        let range_node = if exported { node } else { definition };
-        parsed.add_code_unit(
-            code_unit.clone(),
-            range_node,
-            source,
-            parent.cloned(),
-            Some(top_level.clone()),
-        );
-        let variable_signature = if is_function {
-            let signature = ts_variable_function_signature(definition, child, source, exported);
-            if let Some(value) = value {
-                parsed.add_signature_with_metadata(
-                    code_unit.clone(),
-                    SignatureMetadata::with_parameter_labels(
-                        signature.clone(),
-                        ts_parameter_labels(value, source),
-                    ),
-                );
-                visit_ts_return_object_literal_properties(
-                    file, source, value, &code_unit, &top_level, parsed,
-                );
-            } else {
-                parsed.add_signature(code_unit.clone(), signature.clone());
-            }
-            signature
-        } else {
-            let signature = ts_variable_signature(definition, child, source, exported);
-            parsed.add_signature(code_unit.clone(), signature.clone());
-            signature
-        };
-        let indexable_object = if !is_function {
-            value.and_then(|value| {
-                if module_surface {
-                    ts_exported_surface_object_literal_value(child, value, source)
-                } else {
-                    ts_indexable_object_literal_value(child, value, source)
-                }
-            })
-        } else {
-            None
-        };
-        if let Some(object) = indexable_object {
-            visit_ts_object_literal_properties(
-                file, source, object, &code_unit, &top_level, parsed,
-            );
-        }
-        if module_surface && kind == crate::analyzer::CodeUnitType::Field && parent.is_none() {
-            let surface_fq = FqName::new().with_pushed(js_ts_segment(&name, SegmentKind::Member));
-            let surface_code_unit = CodeUnit::new_fq(
-                file.clone(),
-                crate::analyzer::CodeUnitType::Field,
-                "",
-                name,
-                surface_fq,
-            );
-            parsed.add_code_unit(
-                surface_code_unit.clone(),
-                range_node,
-                source,
-                None,
-                Some(surface_code_unit.clone()),
-            );
-            parsed.add_signature(surface_code_unit.clone(), variable_signature);
-            if let Some(object) = indexable_object {
-                visit_ts_object_literal_properties(
-                    file,
-                    source,
-                    object,
-                    &surface_code_unit,
-                    &surface_code_unit,
-                    parsed,
-                );
-            }
-        }
-    }
-}
-
-fn visit_ts_type_alias_members(
-    file: &ProjectFile,
-    source: &str,
-    definition: Node<'_>,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) {
-    let Some(value) = definition.child_by_field_name("value") else {
-        return;
-    };
-    let container = value.child_by_field_name("body").unwrap_or(value);
-    for index in 0..container.named_child_count() {
-        let Some(child) = container.named_child(index) else {
-            continue;
-        };
-        match child.kind() {
-            "method_signature" | "abstract_method_signature" => {
-                visit_ts_method(file, source, child, parent, top_level, parsed);
-            }
-            "property_signature" | "index_signature" => {
-                visit_ts_field(file, source, child, parent, top_level, parsed);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn ts_indexable_object_literal_value<'tree>(
-    declarator: Node<'tree>,
-    value: Node<'tree>,
-    source: &str,
-) -> Option<Node<'tree>> {
-    ts_object_literal_value(value).or_else(|| {
-        (value.kind() == "call_expression")
-            .then(|| ts_shape_preserving_call_object_argument(declarator, value, source))
-            .flatten()
-    })
-}
-
-fn ts_exported_surface_object_literal_value<'tree>(
-    declarator: Node<'tree>,
-    value: Node<'tree>,
-    source: &str,
-) -> Option<Node<'tree>> {
-    ts_object_literal_value(value).or_else(|| {
-        (value.kind() == "call_expression")
-            .then(|| ts_surface_call_object_argument(declarator, value, source))
-            .flatten()
-    })
-}
-
-fn ts_object_literal_value(node: Node<'_>) -> Option<Node<'_>> {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "object" => return Some(node),
-            "parenthesized_expression"
-            | "as_expression"
-            | "satisfies_expression"
-            | "type_assertion" => {
-                for index in (0..node.named_child_count()).rev() {
-                    if let Some(child) = node.named_child(index) {
-                        stack.push(child);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn ts_shape_preserving_call_object_argument<'tree>(
-    anchor: Node<'tree>,
-    call: Node<'tree>,
-    source: &str,
-) -> Option<Node<'tree>> {
-    let arguments = call.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .enumerate()
-        .find_map(|(index, argument)| {
-            let object = ts_object_literal_value(argument)?;
-            ts_call_preserves_object_argument_shape(anchor, call, source, index).then_some(object)
-        })
-}
-
-fn ts_call_preserves_object_argument_shape(
-    anchor: Node<'_>,
-    call: Node<'_>,
-    source: &str,
-    argument_index: usize,
-) -> bool {
-    if argument_index == 0 && call_is_schema_object_builder(call, source) {
-        return true;
-    }
-    ts_call_object_argument_shape_preservation(anchor, call, source, argument_index)
-        == TsShapePreservation::Preserves
-}
-
-fn ts_source_function_preserves_parameter_shape(
-    anchor: Node<'_>,
-    source: &str,
-    function_name: &str,
-    parameter_index: usize,
-) -> TsShapePreservation {
-    let root = root_node(anchor);
-    let mut functions = Vec::new();
-    collect_function_nodes(root, source, function_name, &mut functions);
-    if functions.is_empty() {
-        return TsShapePreservation::Unknown;
-    }
-    if functions.into_iter().any(|function| {
-        ts_function_node_preserves_parameter_shape(function, source, parameter_index)
-    }) {
-        TsShapePreservation::Preserves
-    } else {
-        TsShapePreservation::DoesNotPreserve
-    }
-}
-
-fn ts_surface_call_object_argument<'tree>(
-    anchor: Node<'tree>,
-    call: Node<'tree>,
-    source: &str,
-) -> Option<Node<'tree>> {
-    let arguments = call.child_by_field_name("arguments")?;
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .enumerate()
-        .find_map(|(index, argument)| {
-            let object = ts_object_literal_value(argument)?;
-            ts_surface_call_preserves_object_argument_shape(anchor, call, source, index)
-                .then_some(object)
-        })
-}
-
-fn ts_surface_call_preserves_object_argument_shape(
-    anchor: Node<'_>,
-    call: Node<'_>,
-    source: &str,
-    argument_index: usize,
-) -> bool {
-    if argument_index == 0 && call_is_schema_object_builder(call, source) {
-        return true;
-    }
-    match ts_call_object_argument_shape_preservation(anchor, call, source, argument_index) {
-        TsShapePreservation::Preserves => true,
-        TsShapePreservation::DoesNotPreserve => false,
-        TsShapePreservation::Unknown => call_has_likely_surface_factory_name(call, source),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TsShapePreservation {
-    Preserves,
-    DoesNotPreserve,
-    Unknown,
-}
-
-fn ts_call_object_argument_shape_preservation(
-    anchor: Node<'_>,
-    call: Node<'_>,
-    source: &str,
-    argument_index: usize,
-) -> TsShapePreservation {
-    let Some(callee_name) = call_identifier_name(call, source) else {
-        return TsShapePreservation::Unknown;
-    };
-    ts_source_function_preserves_parameter_shape(anchor, source, &callee_name, argument_index)
-}
-
-fn ts_function_node_preserves_parameter_shape(
-    function: Node<'_>,
-    source: &str,
-    parameter_index: usize,
-) -> bool {
-    let Some(parameter_name) = ts_function_parameter_name(function, source, parameter_index) else {
-        return false;
-    };
-    if function.kind() == "arrow_function"
-        && let Some(body) = function.child_by_field_name("body")
-        && ts_expression_preserves_parameter_shape(body, source, &parameter_name)
-    {
-        return true;
-    }
-    ts_function_returns_parameter_shape(function, function.id(), source, &parameter_name)
-}
-
-fn ts_function_parameter_name(
-    function: Node<'_>,
-    source: &str,
-    parameter_index: usize,
-) -> Option<String> {
-    let parameters = function.child_by_field_name("parameters")?;
-    let mut cursor = parameters.walk();
-    parameters
-        .named_children(&mut cursor)
-        .filter_map(ts_parameter_name_node)
-        .nth(parameter_index)
-        .map(|name| node_text(name, source).trim().to_string())
-        .filter(|name| !name.is_empty())
-}
-
-fn ts_parameter_name_node(parameter: Node<'_>) -> Option<Node<'_>> {
-    match parameter.kind() {
-        "identifier" | "shorthand_property_identifier_pattern" => Some(parameter),
-        "required_parameter" | "optional_parameter" => parameter
-            .child_by_field_name("pattern")
-            .or_else(|| parameter.child_by_field_name("name")),
-        _ => None,
-    }
-}
-
-fn ts_parameter_labels(function: Node<'_>, source: &str) -> Vec<String> {
-    let Some(parameters) = function.child_by_field_name("parameters") else {
-        return Vec::new();
-    };
-    let mut cursor = parameters.walk();
-    parameters
-        .named_children(&mut cursor)
-        .filter_map(ts_parameter_name_node)
-        .filter_map(|name| {
-            let label = node_text(name, source).trim();
-            (!label.is_empty()).then(|| label.to_string())
-        })
-        .collect()
-}
-
-fn ts_function_returns_parameter_shape(
-    node: Node<'_>,
-    root_id: usize,
-    source: &str,
-    parameter_name: &str,
-) -> bool {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.id() != root_id
-            && matches!(
-                node.kind(),
-                "function_declaration"
-                    | "function_expression"
-                    | "arrow_function"
-                    | "method_definition"
-                    | "class_declaration"
-                    | "abstract_class_declaration"
-                    | "interface_declaration"
-            )
-        {
-            continue;
-        }
-        if node.kind() == "return_statement" {
-            let mut cursor = node.walk();
-            if node
-                .named_children(&mut cursor)
-                .next()
-                .is_some_and(|expression| {
-                    ts_expression_preserves_parameter_shape(expression, source, parameter_name)
-                })
-            {
-                return true;
-            }
-            continue;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-    false
-}
-
-fn ts_expression_preserves_parameter_shape(
-    expression: Node<'_>,
-    source: &str,
-    parameter_name: &str,
-) -> bool {
-    let Some(expression) = ts_object_shape_expression(expression) else {
-        return false;
-    };
-    if matches!(expression.kind(), "identifier" | "property_identifier")
-        && node_text(expression, source).trim() == parameter_name
-    {
-        return true;
-    }
-    if expression.kind() != "object" {
-        return false;
-    }
-    let mut cursor = expression.walk();
-    expression.named_children(&mut cursor).any(|child| {
-        child.kind() == "spread_element"
-            && child
-                .named_child(0)
-                .and_then(ts_object_shape_expression)
-                .is_some_and(|spread| node_text(spread, source).trim() == parameter_name)
-    })
-}
-
-fn ts_object_shape_expression(node: Node<'_>) -> Option<Node<'_>> {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "as_expression" | "satisfies_expression" | "type_assertion" => {
-                for index in (0..node.named_child_count()).rev() {
-                    if let Some(child) = node.named_child(index) {
-                        stack.push(child);
-                    }
-                }
-            }
-            _ => return Some(node),
-        }
-    }
-    None
-}
-
-fn visit_ts_return_object_literal_properties(
-    file: &ProjectFile,
-    source: &str,
-    function: Node<'_>,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) {
-    let mut objects = Vec::new();
-    collect_ts_return_object_literals(function, function.id(), &mut objects);
-    for object in objects {
-        visit_ts_object_literal_properties(file, source, object, parent, top_level, parsed);
-    }
-}
-
-fn collect_ts_return_object_literals<'tree>(
-    node: Node<'tree>,
-    root_id: usize,
-    out: &mut Vec<Node<'tree>>,
-) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.id() != root_id
-            && matches!(
-                node.kind(),
-                "function_declaration"
-                    | "function_expression"
-                    | "arrow_function"
-                    | "method_definition"
-                    | "class_declaration"
-                    | "abstract_class_declaration"
-                    | "interface_declaration"
-            )
-        {
-            continue;
-        }
-
-        if node.kind() == "return_statement" {
-            let mut cursor = node.walk();
-            if let Some(object) = node
-                .named_children(&mut cursor)
-                .find_map(ts_object_literal_value)
-            {
-                out.push(object);
-            }
-            continue;
-        }
-
-        if node.kind() == "arrow_function"
-            && let Some(body) = node.child_by_field_name("body")
-            && let Some(object) = ts_object_literal_value(body)
-        {
-            out.push(object);
-        }
-
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-}
-
-fn visit_ts_object_literal_properties(
-    file: &ProjectFile,
-    source: &str,
-    object: Node<'_>,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) {
-    for index in 0..object.named_child_count() {
-        let Some(child) = object.named_child(index) else {
-            continue;
-        };
-        let Some(name) = ts_object_literal_property_name(child, source) else {
-            continue;
-        };
-        let kind = if ts_object_literal_property_is_function(child) {
-            crate::analyzer::CodeUnitType::Function
-        } else {
-            crate::analyzer::CodeUnitType::Field
-        };
-        let fq = parent
-            .fq()
-            .clone()
-            .with_pushed(js_ts_segment(&name, SegmentKind::Member));
-        let code_unit = CodeUnit::with_signature_and_fq(
-            file.clone(),
-            kind,
-            "",
-            format!("{}.{}", parent.short_name(), name),
-            None,
-            true,
-            fq,
-        );
-        parsed.add_code_unit(
-            code_unit.clone(),
-            child,
-            source,
-            Some(parent.clone()),
-            Some(top_level.clone()),
-        );
-        parsed.add_signature(code_unit, trim_statement(node_text(child, source)));
-    }
-}
-
-pub(in crate::analyzer) fn ts_object_literal_property_name(
-    node: Node<'_>,
-    source: &str,
-) -> Option<String> {
-    let key = match node.kind() {
-        "pair" => node
-            .child_by_field_name("key")
-            .or_else(|| node.named_child(0))?,
-        "shorthand_property_identifier" => node,
-        "method_definition" => node.child_by_field_name("name")?,
-        _ => return None,
-    };
-    if key.kind() == "computed_property_name" {
-        return None;
-    }
-    let name = trim_statement(node_text(key, source))
-        .trim_matches('"')
-        .trim_matches('\'')
-        .to_string();
-    (!name.is_empty()).then_some(name)
-}
-
-fn ts_object_literal_property_is_function(node: Node<'_>) -> bool {
-    node.kind() == "method_definition"
-        || node
-            .child_by_field_name("value")
-            .is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression"))
-}
-
-fn ts_es_named_exported_roots(root: Node<'_>, source: &str) -> HashSet<String> {
-    let mut roots = HashSet::default();
-    for index in 0..root.named_child_count() {
-        let Some(child) = root.named_child(index) else {
-            continue;
-        };
-        if child.kind() != "export_statement" || child.child_by_field_name("source").is_some() {
-            continue;
-        }
-        let mut cursor = child.walk();
-        for export_child in child.named_children(&mut cursor) {
-            collect_ts_export_clause_roots(export_child, source, &mut roots);
-        }
-    }
-    roots
-}
-
-fn collect_ts_export_clause_roots(node: Node<'_>, source: &str, roots: &mut HashSet<String>) {
-    match node.kind() {
-        "export_clause" => {
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                collect_ts_export_clause_roots(child, source, roots);
-            }
-        }
-        "export_specifier" => {
-            let name = node
-                .child_by_field_name("name")
-                .or_else(|| node.named_child(0));
-            if let Some(name) = name {
-                collect_ts_export_identifier(name, source, roots);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_ts_export_identifier(node: Node<'_>, source: &str, roots: &mut HashSet<String>) {
-    if matches!(
-        node.kind(),
-        "identifier" | "property_identifier" | "shorthand_property_identifier" | "type_identifier"
-    ) {
-        let name = node_text(node, source).trim();
-        if !name.is_empty() {
-            roots.insert(name.to_string());
-        }
-    }
-}
-
-fn visit_ts_method(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) {
-    let Some(name_node) = node.child_by_field_name("name") else {
-        return;
-    };
-    let name = trim_statement(node_text(name_node, source))
-        .trim_matches('"')
-        .to_string();
-    let member_name = if is_static_ts_member(node, source) {
-        format!("{name}$static")
-    } else {
-        name
-    };
-    // `member_name` already embeds the `$static` suffix (if any) as part of
-    // its own text, so pushing it as a single Member segment reproduces the
-    // legacy `.{member_name}` join exactly with no new segment kind.
-    let fq = parent
-        .fq()
-        .clone()
-        .with_pushed(js_ts_segment(&member_name, SegmentKind::Member));
-    let code_unit = CodeUnit::new_fq(
-        file.clone(),
-        crate::analyzer::CodeUnitType::Function,
-        "",
-        format!("{}.{}", parent.short_name(), member_name),
-        fq,
-    );
-    parsed.add_code_unit(
-        code_unit.clone(),
-        node,
-        source,
-        Some(parent.clone()),
-        Some(top_level.clone()),
-    );
-    let signature = match node.kind() {
-        "method_definition" => format!(
-            "{} {{ ... }}",
-            trim_statement(node_text(node, source).split('{').next().unwrap_or(""))
-        ),
-        _ => trim_statement(node_text(node, source).split('{').next().unwrap_or("")),
-    };
-    parsed.add_signature_with_metadata(
-        code_unit,
-        SignatureMetadata::with_parameter_labels(signature, ts_parameter_labels(node, source)),
-    );
-    if member_name == "constructor" {
-        visit_ts_constructor_assigned_fields(file, source, node, parent, top_level, parsed);
-    }
-}
-
-/// Index constructor-assigned instance properties (`this.x = ...`) as Field
-/// units, mirroring the JavaScript analyzer: pre-class-field style codebases
-/// (and any constructor that assigns properties) otherwise have instance
-/// fields that scan_usages resolves but search_symbols cannot find.
-fn visit_ts_constructor_assigned_fields(
-    file: &ProjectFile,
-    source: &str,
-    constructor: Node<'_>,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) {
-    let mut stack = vec![constructor];
-    while let Some(node) = stack.pop() {
-        if node.id() != constructor.id()
-            && matches!(
-                node.kind(),
-                "function_declaration"
-                    | "function_expression"
-                    | "function"
-                    | "arrow_function"
-                    | "method_definition"
-                    | "class_declaration"
-                    | "class"
-            )
-        {
-            continue;
-        }
-        if node.kind() == "assignment_expression"
-            && let Some(left) = node.child_by_field_name("left")
-            && let Some(property) = this_member_property(left, source)
-        {
-            let Some(name) = property_name_text(property, source) else {
-                continue;
-            };
-            let fq = parent
-                .fq()
-                .clone()
-                .with_pushed(js_ts_segment(&name, SegmentKind::Member));
-            let code_unit = CodeUnit::new_fq(
-                file.clone(),
-                crate::analyzer::CodeUnitType::Field,
-                "",
-                format!("{}.{}", parent.short_name(), name),
-                fq,
-            );
-            parsed.add_code_unit(
-                code_unit.clone(),
-                property,
-                source,
-                Some(parent.clone()),
-                Some(top_level.clone()),
-            );
-            parsed.add_signature(code_unit, trim_statement(node_text(node, source)));
-            continue;
-        }
-        for index in (0..node.named_child_count()).rev() {
-            if let Some(child) = node.named_child(index) {
-                stack.push(child);
-            }
-        }
-    }
-}
-
-fn visit_ts_field(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) {
-    let name_node = node.child_by_field_name("name").unwrap_or(node);
-    let name = trim_statement(node_text(name_node, source))
-        .trim_matches('"')
-        .to_string();
-    let member_name = if is_static_ts_member(node, source) {
-        format!("{name}$static")
-    } else {
-        name
-    };
-    let fq = parent
-        .fq()
-        .clone()
-        .with_pushed(js_ts_segment(&member_name, SegmentKind::Member));
-    let code_unit = CodeUnit::new_fq(
-        file.clone(),
-        crate::analyzer::CodeUnitType::Field,
-        "",
-        format!("{}.{}", parent.short_name(), member_name),
-        fq,
-    );
-    parsed.add_code_unit(
-        code_unit.clone(),
-        node,
-        source,
-        Some(parent.clone()),
-        Some(top_level.clone()),
-    );
-    parsed.add_signature(code_unit, ts_field_signature(node, source));
-}
-
-fn visit_ts_enum_member(
-    file: &ProjectFile,
-    source: &str,
-    node: Node<'_>,
-    parent: &CodeUnit,
-    top_level: &CodeUnit,
-    parsed: &mut crate::analyzer::tree_sitter_analyzer::ParsedFile,
-) {
-    let name = if node.kind() == "enum_assignment" {
-        node.child_by_field_name("name")
-            .map(|name| trim_statement(node_text(name, source)))
-            .unwrap_or_default()
-    } else {
-        trim_statement(node_text(node, source))
-    };
-    if name.is_empty() {
-        return;
-    }
-    let fq = parent
-        .fq()
-        .clone()
-        .with_pushed(js_ts_segment(&name, SegmentKind::Member));
-    let code_unit = CodeUnit::new_fq(
-        file.clone(),
-        crate::analyzer::CodeUnitType::Field,
-        "",
-        format!("{}.{}", parent.short_name(), name),
-        fq,
-    );
-    parsed.add_code_unit(
-        code_unit.clone(),
-        node,
-        source,
-        Some(parent.clone()),
-        Some(top_level.clone()),
-    );
-    let raw = trim_statement(node_text(node, source));
-    let suffix = source
-        .get(node.end_byte()..)
-        .map(str::trim_start)
-        .filter(|tail| tail.starts_with(','))
-        .map(|_| ",")
-        .unwrap_or("");
-    parsed.add_signature(code_unit, format!("{raw}{suffix}"));
-}
-
-fn ts_class_signature(node: Node<'_>, source: &str, exported: bool) -> String {
-    let definition = if node.kind() == "export_statement" {
-        node.child_by_field_name("declaration").unwrap_or(node)
-    } else {
-        node
-    };
-    let text = if node.kind() == "export_statement" {
-        node_text(node, source)
-    } else {
-        node_text(definition, source)
-    };
-    let head = trim_statement(text.split('{').next().unwrap_or(text));
-    if definition.kind() == "enum_declaration" {
-        let open = format!(
-            "{} {{",
-            if exported && !head.starts_with("export ") {
-                format!("export {head}")
-            } else {
-                head
-            }
-        );
-        return open;
-    }
-    format!(
-        "{} {{",
-        if exported && !head.starts_with("export ") {
-            format!("export {head}")
-        } else {
-            head
-        }
-    )
-}
-
-fn ts_default_export_class_signature(export: Node<'_>, source: &str) -> String {
-    let text = node_text(export, source);
-    let head = trim_statement(text.split('{').next().unwrap_or(text));
-    format!("{head} {{")
-}
-
-fn ts_function_signature(node: Node<'_>, source: &str, exported: bool) -> String {
-    let definition = if node.kind() == "export_statement" {
-        node.child_by_field_name("declaration").unwrap_or(node)
-    } else {
-        node
-    };
-    let head = trim_statement(
-        if node.kind() == "export_statement" {
-            node_text(node, source)
-        } else {
-            node_text(definition, source)
-        }
-        .split('{')
-        .next()
-        .unwrap_or(node_text(definition, source)),
-    );
-    let head = if exported && !head.starts_with("export ") {
-        format!("export {head}")
-    } else {
-        head
-    };
-    if definition.kind() == "function_signature" {
-        head
-    } else {
-        format!("{head} {{ ... }}")
-    }
-}
-
-fn ts_default_export_function_signature(function: Node<'_>, source: &str) -> String {
-    let text = node_text(function, source);
-    let async_prefix = if text.trim_start().starts_with("async ") {
-        "async "
-    } else {
-        ""
-    };
-    let params = function
-        .child_by_field_name("parameters")
-        .map(|node| trim_statement(node_text(node, source)))
-        .unwrap_or_else(|| "()".to_string());
-    let return_type = function
-        .child_by_field_name("return_type")
-        .map(|node| trim_statement(node_text(node, source)))
-        .unwrap_or_default();
-    let return_suffix = if return_type.is_empty() {
-        String::new()
-    } else {
-        format!(": {}", return_type.trim_start_matches(':').trim())
-    };
-    match function.kind() {
-        "function_declaration" | "function_expression" => {
-            format!("export default {async_prefix}function{params}{return_suffix} {{ ... }}")
-        }
-        "generator_function" => {
-            format!("export default {async_prefix}function*{params}{return_suffix} {{ ... }}")
-        }
-        _ => format!("export default {async_prefix}{params}{return_suffix} => {{ ... }}"),
-    }
-}
-
-fn ts_variable_function_signature(
-    statement: Node<'_>,
-    declarator: Node<'_>,
-    source: &str,
-    exported: bool,
-) -> String {
-    let kind = statement
-        .child(0)
-        .map(|node| node_text(node, source).trim().to_string())
-        .unwrap_or_else(|| "const".to_string());
-    let name = declarator
-        .child_by_field_name("name")
-        .map(|node| trim_statement(node_text(node, source)))
-        .unwrap_or_default();
-    let value = declarator
-        .child_by_field_name("value")
-        .unwrap_or(declarator);
-    let params = value
-        .child_by_field_name("parameters")
-        .map(|node| trim_statement(node_text(node, source)))
-        .unwrap_or_else(|| "()".to_string());
-    let return_type = value
-        .child_by_field_name("return_type")
-        .map(|node| trim_statement(node_text(node, source)))
-        .unwrap_or_default();
-    let export_prefix = if exported { "export " } else { "" };
-    let return_suffix = if return_type.is_empty() {
-        String::new()
-    } else {
-        format!(": {}", return_type.trim_start_matches(':').trim())
-    };
-    format!("{export_prefix}{kind} {name} = {params}{return_suffix} => {{ ... }}")
-}
-
-fn ts_variable_signature(
-    statement: Node<'_>,
-    declarator: Node<'_>,
-    source: &str,
-    exported: bool,
-) -> String {
-    let header = variable_header(statement, declarator, source, exported);
-    match declarator.child_by_field_name("value") {
-        Some(value) if is_simple_ts_initializer(value) => {
-            let value_text = trim_statement(node_text(value, source));
-            format!("{header} = {value_text}")
-        }
-        _ => header,
-    }
-}
-
-fn ts_field_signature(node: Node<'_>, source: &str) -> String {
-    if matches!(node.kind(), "property_signature" | "index_signature") {
-        return trim_statement(node_text(node, source));
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test()
     }
 
-    let raw = trim_statement(node_text(node, source));
-    if let Some(value) = node.child_by_field_name("value")
-        && !is_simple_ts_initializer(value)
-    {
-        return raw
-            .split('=')
-            .next()
-            .map(trim_statement)
-            .filter(|header| !header.is_empty())
-            .unwrap_or(raw);
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
     }
-    raw
-}
 
-fn is_simple_ts_initializer(node: Node<'_>) -> bool {
-    matches!(
-        node.kind(),
-        "string"
-            | "number"
-            | "true"
-            | "false"
-            | "null"
-            | "undefined"
-            | "regex"
-            | "template_string"
-            | "unary_expression"
-            | "binary_expression"
-            | "identifier"
-            | "member_expression"
-    )
-}
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .full_declaration_scan_count_for_test()
+    }
 
-fn is_static_ts_member(node: Node<'_>, source: &str) -> bool {
-    let head = node_text(node, source)
-        .split(['{', ';'])
-        .next()
-        .unwrap_or("");
-    head.split_whitespace().any(|token| token == "static")
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_workspace_path_scan_count_for_test();
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.inner.test_hooks().workspace_path_scan_count_for_test()
+    }
 }

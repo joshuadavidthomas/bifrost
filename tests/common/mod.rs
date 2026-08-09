@@ -12,14 +12,42 @@ pub mod semantic_graph;
 pub mod usage_graph;
 
 use brokk_bifrost::{
-    CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, RubyAnalyzer, SearchToolsService,
-    TestProject,
+    CSharpAnalyzer, CodeUnit, GoAnalyzer, IAnalyzer, Language, ProjectFile, RubyAnalyzer,
+    SearchToolsService, TestProject,
 };
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
 use tempfile::TempDir;
+
+/// Run one git command in `dir` and panic with its transcript on failure.
+///
+/// Tests that need a repository fixture (for example diff-aware policy
+/// gating) call this instead of hand-rolling `std::process::Command`.
+#[allow(dead_code)]
+pub fn run_git(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "commit.gpgSign=false"])
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// `git init` plus the throwaway committer identity test commits need.
+#[allow(dead_code)]
+pub fn init_git_repo_with_identity(dir: &Path) {
+    run_git(dir, &["init"]);
+    run_git(dir, &["config", "user.email", "test@example.com"]);
+    run_git(dir, &["config", "user.name", "Test User"]);
+}
 
 #[allow(dead_code)]
 pub fn copy_fixture_to_temp(name: &str) -> TempDir {
@@ -54,7 +82,8 @@ pub use scratch_cache::{FixtureCorpus, ScratchCacheDir};
 
 #[allow(unused_imports)]
 pub use search_tools::{
-    call_tool, definition_reference_status, sorted_source_paths, symbol_sources,
+    call_tool, definition_at, definition_paths, definition_reference_status, sorted_source_paths,
+    symbol_sources,
 };
 
 #[allow(dead_code)]
@@ -195,6 +224,21 @@ pub fn go_analyzer_with_files(files: &[(&str, &str)]) -> (BuiltInlineTestProject
     }
     let project = builder.build();
     let analyzer = GoAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+/// An inline C# workspace and a fresh analyzer over it. The project is returned
+/// alongside because it owns the temporary root the analyzer reads from.
+#[allow(dead_code)]
+pub fn csharp_analyzer_with_files(
+    files: &[(&str, &str)],
+) -> (BuiltInlineTestProject, CSharpAnalyzer) {
+    let mut builder = InlineTestProject::with_language(Language::CSharp);
+    for (path, contents) in files {
+        builder = builder.file(*path, *contents);
+    }
+    let project = builder.build();
+    let analyzer = CSharpAnalyzer::from_project(project.project().clone());
     (project, analyzer)
 }
 

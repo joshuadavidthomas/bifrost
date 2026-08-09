@@ -40,25 +40,10 @@ pub const MAX_OCCURRENCE_FILTER_ENTRIES: usize = 32;
 pub const MAX_ENVIRONMENT_FILTER_ENTRIES: usize = 32;
 /// Upper bound on the length of one `:name` entry of a binding filter.
 pub const MAX_BINDING_NAME_LENGTH: usize = 256;
-pub const SCHEMA_VERSION: u64 = 12;
-pub const DECLARATION_CONTAINMENT_SCHEMA_VERSION: u64 = 5;
-pub const OCCURRENCE_SCHEMA_VERSION: u64 = 8;
-/// Lexical scope, binding and resolution-candidate rows with their seeds and
-/// seven steps (#1474).
-pub const RESOLUTION_SCHEMA_VERSION: u64 = 9;
-/// Canonical reference-edge rows with their forward and inverse projection
-/// steps (#1479). Referenced by transports and tests that pin the minimum
-/// version the edge domain requires.
-pub const REFERENCE_EDGE_SCHEMA_VERSION: u64 = 11;
-/// Qualified-path and path-segment rows with the `paths` seed and the
-/// `segments-of`/`segment-target` steps (#1475).
-pub const IDENTITY_SCHEMA_VERSION: u64 = 10;
-/// Declaration materialization: generation sites, exports, declaration state,
-/// implementation linkage (issue #1476). Renumbered twice at merge time per
-/// the #1473 retrospective's precedent: from 10 to 11 because #1475 claimed
-/// 10 first, then from 11 to 12 because #1479 landed on master with 11 while
-/// this slice was still in flight.
-pub const MATERIALIZATION_SCHEMA_VERSION: u64 = 12;
+/// The single supported CodeQuery/RQL schema version. The pre-1.0 lineage of
+/// auto-compatible versions was collapsed to 1; a new version is minted only
+/// when an existing query stops parsing or changes meaning.
+pub const SCHEMA_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryValueKind {
@@ -76,10 +61,21 @@ pub enum QueryValueKind {
     CallSite,
     ExpressionSite,
     ReceiverAnalysis,
+    ReceiverOutcome,
+    ReceiverEvidence,
+    CallShape,
+    CallArgumentGroup,
+    CallArgument,
+    MemberSelection,
+    DispatchOutcome,
+    DispatchTarget,
+    MemberFamily,
+    MemberFamilyEdge,
     Occurrence,
     LexicalScope,
     Binding,
     ResolutionCandidate,
+    CandidateHop,
     ReferenceEdge,
     QualifiedPath,
     PathSegment,
@@ -106,10 +102,21 @@ impl QueryValueKind {
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
             Self::ReceiverAnalysis => "receiver_analysis",
+            Self::ReceiverOutcome => "receiver_outcome",
+            Self::ReceiverEvidence => "receiver_evidence",
+            Self::CallShape => "call_shape",
+            Self::CallArgumentGroup => "call_argument_group",
+            Self::CallArgument => "call_argument",
+            Self::MemberSelection => "member_selection",
+            Self::DispatchOutcome => "dispatch_outcome",
+            Self::DispatchTarget => "dispatch_target",
+            Self::MemberFamily => "member_family",
+            Self::MemberFamilyEdge => "member_family_edge",
             Self::Occurrence => "occurrence",
             Self::LexicalScope => "lexical_scope",
             Self::Binding => "binding",
             Self::ResolutionCandidate => "resolution_candidate",
+            Self::CandidateHop => "candidate_hop",
             Self::ReferenceEdge => "reference_edge",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
@@ -265,6 +272,16 @@ pub enum QueryStep {
     ReceiverTargets(ReceiverTraversalFilter),
     PointsTo(ReceiverTraversalFilter),
     MemberTargets(ReceiverTraversalFilter),
+    ReceiverOutcome,
+    ReceiverEvidence,
+    CallShape,
+    CallArgumentGroups,
+    CallArguments,
+    MemberSelection,
+    DispatchOutcome,
+    DispatchTargets,
+    MemberFamily,
+    FamilyEdges,
     OccurrencesOf(OccurrenceFilter),
     OccurrencesIn(OccurrenceFilter),
     OccurrenceTarget,
@@ -274,6 +291,7 @@ pub enum QueryStep {
     ReachingBinding(ReachingBindingOptions),
     BindingOccurrence,
     CandidatesOf(CandidateFilter),
+    CandidateHierarchy,
     CandidateTarget,
     EdgesOf(EdgeFilter),
     EdgesFrom(EdgeFilter),
@@ -741,6 +759,16 @@ impl QueryStep {
             Self::ReceiverTargets(_) => QueryStepOp::ReceiverTargets,
             Self::PointsTo(_) => QueryStepOp::PointsTo,
             Self::MemberTargets(_) => QueryStepOp::MemberTargets,
+            Self::ReceiverOutcome => QueryStepOp::ReceiverOutcome,
+            Self::ReceiverEvidence => QueryStepOp::ReceiverEvidence,
+            Self::CallShape => QueryStepOp::CallShape,
+            Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
+            Self::CallArguments => QueryStepOp::CallArguments,
+            Self::MemberSelection => QueryStepOp::MemberSelection,
+            Self::DispatchOutcome => QueryStepOp::DispatchOutcome,
+            Self::DispatchTargets => QueryStepOp::DispatchTargets,
+            Self::MemberFamily => QueryStepOp::MemberFamily,
+            Self::FamilyEdges => QueryStepOp::FamilyEdges,
             Self::OccurrencesOf(_) => QueryStepOp::OccurrencesOf,
             Self::OccurrencesIn(_) => QueryStepOp::OccurrencesIn,
             Self::OccurrenceTarget => QueryStepOp::OccurrenceTarget,
@@ -750,6 +778,7 @@ impl QueryStep {
             Self::ReachingBinding(_) => QueryStepOp::ReachingBinding,
             Self::BindingOccurrence => QueryStepOp::BindingOccurrence,
             Self::CandidatesOf(_) => QueryStepOp::CandidatesOf,
+            Self::CandidateHierarchy => QueryStepOp::CandidateHierarchy,
             Self::Generates => QueryStepOp::Generates,
             Self::GeneratedBy => QueryStepOp::GeneratedBy,
             Self::DeclarationStateOf(_) => QueryStepOp::DeclarationStateOf,
@@ -804,6 +833,16 @@ impl QueryStep {
             QueryStepOp::MemberTargets => {
                 Some(Self::MemberTargets(ReceiverTraversalFilter::default()))
             }
+            QueryStepOp::ReceiverOutcome => Some(Self::ReceiverOutcome),
+            QueryStepOp::ReceiverEvidence => Some(Self::ReceiverEvidence),
+            QueryStepOp::CallShape => Some(Self::CallShape),
+            QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
+            QueryStepOp::CallArguments => Some(Self::CallArguments),
+            QueryStepOp::MemberSelection => Some(Self::MemberSelection),
+            QueryStepOp::DispatchOutcome => Some(Self::DispatchOutcome),
+            QueryStepOp::DispatchTargets => Some(Self::DispatchTargets),
+            QueryStepOp::MemberFamily => Some(Self::MemberFamily),
+            QueryStepOp::FamilyEdges => Some(Self::FamilyEdges),
             QueryStepOp::OccurrencesOf => Some(Self::OccurrencesOf(OccurrenceFilter::default())),
             QueryStepOp::OccurrencesIn => Some(Self::OccurrencesIn(OccurrenceFilter::default())),
             QueryStepOp::OccurrenceTarget => Some(Self::OccurrenceTarget),
@@ -815,6 +854,7 @@ impl QueryStep {
             }
             QueryStepOp::BindingOccurrence => Some(Self::BindingOccurrence),
             QueryStepOp::CandidatesOf => Some(Self::CandidatesOf(CandidateFilter::default())),
+            QueryStepOp::CandidateHierarchy => Some(Self::CandidateHierarchy),
             QueryStepOp::CandidateTarget => Some(Self::CandidateTarget),
             QueryStepOp::EdgesOf => Some(Self::EdgesOf(EdgeFilter::default())),
             QueryStepOp::EdgesFrom => Some(Self::EdgesFrom(EdgeFilter::default())),
@@ -873,6 +913,16 @@ impl QueryStep {
                 | QueryValueKind::CallSite
                 | QueryValueKind::ExpressionSite
                 | QueryValueKind::ReceiverAnalysis
+                | QueryValueKind::ReceiverOutcome
+                | QueryValueKind::ReceiverEvidence
+                | QueryValueKind::CallShape
+                | QueryValueKind::CallArgumentGroup
+                | QueryValueKind::CallArgument
+                | QueryValueKind::MemberSelection
+                | QueryValueKind::DispatchOutcome
+                | QueryValueKind::DispatchTarget
+                | QueryValueKind::MemberFamily
+                | QueryValueKind::MemberFamilyEdge
                 | QueryValueKind::Occurrence
                 | QueryValueKind::LexicalScope
                 | QueryValueKind::Binding
@@ -904,18 +954,61 @@ impl QueryStep {
                 QueryValueKind::StructuralMatch
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
-                | QueryValueKind::ExpressionSite,
+                | QueryValueKind::ExpressionSite
+                | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::ReceiverAnalysis),
             (
                 Self::PointsTo(_),
                 QueryValueKind::StructuralMatch
                 | QueryValueKind::ReferenceSite
-                | QueryValueKind::ExpressionSite,
+                | QueryValueKind::ExpressionSite
+                | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::ReceiverAnalysis),
             (
                 Self::MemberTargets(_),
-                QueryValueKind::StructuralMatch | QueryValueKind::ReferenceSite,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::Occurrence,
             ) => Some(QueryValueKind::ReceiverAnalysis),
+            (Self::ReceiverOutcome, QueryValueKind::ReceiverAnalysis) => {
+                Some(QueryValueKind::ReceiverOutcome)
+            }
+            (Self::ReceiverEvidence, QueryValueKind::ReceiverAnalysis) => {
+                Some(QueryValueKind::ReceiverEvidence)
+            }
+            (
+                Self::CallShape,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::CallSite
+                | QueryValueKind::Occurrence,
+            ) => Some(QueryValueKind::CallShape),
+            (Self::CallArgumentGroups, QueryValueKind::CallShape) => {
+                Some(QueryValueKind::CallArgumentGroup)
+            }
+            (Self::CallArguments, QueryValueKind::CallArgumentGroup) => {
+                Some(QueryValueKind::CallArgument)
+            }
+            (Self::MemberSelection, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::MemberSelection)
+            }
+            (
+                Self::DispatchOutcome,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::CallSite
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::Occurrence,
+            ) => Some(QueryValueKind::DispatchOutcome),
+            (
+                Self::DispatchTargets,
+                QueryValueKind::StructuralMatch
+                | QueryValueKind::CallSite
+                | QueryValueKind::ReferenceSite
+                | QueryValueKind::Occurrence,
+            ) => Some(QueryValueKind::DispatchTarget),
+            (Self::MemberFamily, QueryValueKind::Declaration) => Some(QueryValueKind::MemberFamily),
+            (Self::FamilyEdges, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::MemberFamilyEdge)
+            }
             (Self::OccurrencesOf(_), QueryValueKind::Declaration) => {
                 Some(QueryValueKind::Occurrence)
             }
@@ -942,6 +1035,9 @@ impl QueryStep {
             (Self::BindingOccurrence, QueryValueKind::Binding) => Some(QueryValueKind::Occurrence),
             (Self::CandidatesOf(_), QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::ResolutionCandidate)
+            }
+            (Self::CandidateHierarchy, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::CandidateHop)
             }
             (Self::SegmentsOf(_), QueryValueKind::QualifiedPath) => {
                 Some(QueryValueKind::PathSegment)
@@ -976,7 +1072,6 @@ pub(super) fn validate_query_steps(
     steps: &[QueryStep],
     input: QueryValueKind,
     path: &str,
-    schema_version: u64,
 ) -> Result<QueryValueKind, QueryError> {
     if steps.len() > MAX_QUERY_STEPS {
         return Err(QueryError::new(
@@ -1004,16 +1099,6 @@ pub(super) fn validate_query_steps(
                 ));
             }
         }
-        let minimum_schema_version = step.op().minimum_schema_version();
-        if schema_version < minimum_schema_version {
-            return Err(QueryError::new(
-                format!("{step_path}.op"),
-                format!(
-                    "query step {} requires schema version {minimum_schema_version}, but this query uses schema version {schema_version}",
-                    step.label()
-                ),
-            ));
-        }
         let expected_input = match step {
             QueryStep::EnclosingDecl => "structural_match",
             QueryStep::ProcedureOf => "structural_match or declaration",
@@ -1025,7 +1110,7 @@ pub(super) fn validate_query_steps(
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, receiver_analysis, occurrence, lexical_scope, or binding"
+                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, receiver_analysis, receiver_outcome, receiver_evidence, occurrence, lexical_scope, or binding"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
@@ -1039,10 +1124,21 @@ pub(super) fn validate_query_steps(
             | QueryStep::CallSitesFrom(_) => "declaration",
             QueryStep::CallInput(_) => "call_site",
             QueryStep::ReceiverTargets(_) => {
-                "structural_match, reference_site, call_site, or expression_site"
+                "structural_match, reference_site, call_site, expression_site, or occurrence"
             }
-            QueryStep::PointsTo(_) => "structural_match, reference_site, or expression_site",
-            QueryStep::MemberTargets(_) => "structural_match or reference_site",
+            QueryStep::PointsTo(_) => {
+                "structural_match, reference_site, expression_site, or occurrence"
+            }
+            QueryStep::MemberTargets(_) => "structural_match, reference_site, or occurrence",
+            QueryStep::ReceiverOutcome | QueryStep::ReceiverEvidence => "receiver_analysis",
+            QueryStep::CallShape => "structural_match, call_site, or occurrence",
+            QueryStep::CallArgumentGroups => "call_shape",
+            QueryStep::CallArguments => "call_argument_group",
+            QueryStep::MemberSelection => "occurrence",
+            QueryStep::DispatchOutcome | QueryStep::DispatchTargets => {
+                "structural_match, call_site, reference_site, or occurrence"
+            }
+            QueryStep::MemberFamily | QueryStep::FamilyEdges => "declaration",
             QueryStep::OccurrencesOf(_) => "declaration",
             QueryStep::OccurrencesIn(_) => "structural_match or file",
             QueryStep::OccurrenceTarget => "occurrence",
@@ -1052,6 +1148,7 @@ pub(super) fn validate_query_steps(
             QueryStep::ReachingBinding(_) => "occurrence",
             QueryStep::BindingOccurrence => "binding",
             QueryStep::CandidatesOf(_) => "occurrence",
+            QueryStep::CandidateHierarchy => "occurrence",
             QueryStep::CandidateTarget => "resolution_candidate",
             QueryStep::EdgesOf(_) => "declaration",
             QueryStep::EdgesFrom(_) => "occurrence",
@@ -1204,7 +1301,7 @@ impl CodeQuery {
     /// rely solely on decoder validation.
     pub fn validate_steps(&self) -> Result<QueryValueKind, QueryError> {
         let mut nodes = 0;
-        validate_plan(&self.plan, "", 0, &mut nodes, self.schema_version).map(|domain| domain.kind)
+        validate_plan(&self.plan, "", 0, &mut nodes).map(|domain| domain.kind)
     }
 }
 
@@ -1219,7 +1316,6 @@ fn validate_plan(
     path: &str,
     depth: usize,
     nodes: &mut usize,
-    schema_version: u64,
 ) -> Result<ValidatedDomain, QueryError> {
     if depth > MAX_QUERY_PLAN_DEPTH {
         return Err(QueryError::new(
@@ -1236,87 +1332,34 @@ fn validate_plan(
     }
 
     let mut domain = match &plan.source {
-        CodeQueryPlanSource::Seed(seed) => {
-            if seed.inside_decl.is_some() && schema_version < DECLARATION_CONTAINMENT_SCHEMA_VERSION
-            {
-                return Err(QueryError::new(
-                    child_query_path(path, "inside_decl"),
-                    format!(
-                        "inside_decl requires schema version {DECLARATION_CONTAINMENT_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
-                    ),
-                ));
-            }
-            ValidatedDomain {
-                kind: QueryValueKind::StructuralMatch,
-                captures: Some(seed.positive_capture_names()),
-            }
-        }
-        CodeQueryPlanSource::Occurrences(_) => {
-            if schema_version < OCCURRENCE_SCHEMA_VERSION {
-                return Err(QueryError::new(
-                    child_query_path(path, "occurrences"),
-                    format!(
-                        "the occurrences source requires schema version {OCCURRENCE_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
-                    ),
-                ));
-            }
-            ValidatedDomain {
-                kind: QueryValueKind::Occurrence,
-                captures: None,
-            }
-        }
-        CodeQueryPlanSource::Paths(_) => {
-            if schema_version < IDENTITY_SCHEMA_VERSION {
-                return Err(QueryError::new(
-                    child_query_path(path, "paths"),
-                    format!(
-                        "the paths source requires schema version {IDENTITY_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
-                    ),
-                ));
-            }
-            ValidatedDomain {
-                kind: QueryValueKind::QualifiedPath,
-                captures: None,
-            }
-        }
-        CodeQueryPlanSource::Scopes(_) | CodeQueryPlanSource::Bindings(_) => {
-            let (label, kind) = match &plan.source {
-                CodeQueryPlanSource::Scopes(_) => ("scopes", QueryValueKind::LexicalScope),
-                _ => ("bindings", QueryValueKind::Binding),
-            };
-            if schema_version < RESOLUTION_SCHEMA_VERSION {
-                return Err(QueryError::new(
-                    child_query_path(path, label),
-                    format!(
-                        "the {label} source requires schema version {RESOLUTION_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
-                    ),
-                ));
-            }
-            ValidatedDomain {
-                kind,
-                captures: None,
-            }
-        }
-        CodeQueryPlanSource::GenerationSites(_) | CodeQueryPlanSource::Exports(_) => {
-            let (label, kind) = match &plan.source {
-                CodeQueryPlanSource::GenerationSites(_) => {
-                    ("generation_sites", QueryValueKind::GenerationSite)
-                }
-                _ => ("exports", QueryValueKind::Export),
-            };
-            if schema_version < MATERIALIZATION_SCHEMA_VERSION {
-                return Err(QueryError::new(
-                    child_query_path(path, label),
-                    format!(
-                        "the {label} source requires schema version {MATERIALIZATION_SCHEMA_VERSION}, but this query uses schema version {schema_version}"
-                    ),
-                ));
-            }
-            ValidatedDomain {
-                kind,
-                captures: None,
-            }
-        }
+        CodeQueryPlanSource::Seed(seed) => ValidatedDomain {
+            kind: QueryValueKind::StructuralMatch,
+            captures: Some(seed.positive_capture_names()),
+        },
+        CodeQueryPlanSource::Occurrences(_) => ValidatedDomain {
+            kind: QueryValueKind::Occurrence,
+            captures: None,
+        },
+        CodeQueryPlanSource::Paths(_) => ValidatedDomain {
+            kind: QueryValueKind::QualifiedPath,
+            captures: None,
+        },
+        CodeQueryPlanSource::Scopes(_) => ValidatedDomain {
+            kind: QueryValueKind::LexicalScope,
+            captures: None,
+        },
+        CodeQueryPlanSource::Bindings(_) => ValidatedDomain {
+            kind: QueryValueKind::Binding,
+            captures: None,
+        },
+        CodeQueryPlanSource::GenerationSites(_) => ValidatedDomain {
+            kind: QueryValueKind::GenerationSite,
+            captures: None,
+        },
+        CodeQueryPlanSource::Exports(_) => ValidatedDomain {
+            kind: QueryValueKind::Export,
+            captures: None,
+        },
         CodeQueryPlanSource::Set { op, branches } => {
             let op_path = child_query_path(path, op.label());
             if branches.len() < 2 {
@@ -1334,13 +1377,7 @@ fn validate_plan(
             let mut branch_domains = Vec::with_capacity(branches.len());
             for (index, branch) in branches.iter().enumerate() {
                 let branch_path = format!("{op_path}[{index}]");
-                branch_domains.push(validate_plan(
-                    branch,
-                    &branch_path,
-                    depth + 1,
-                    nodes,
-                    schema_version,
-                )?);
+                branch_domains.push(validate_plan(branch, &branch_path, depth + 1, nodes)?);
             }
             let expected = branch_domains[0].kind;
             for (index, branch) in branch_domains.iter().enumerate().skip(1) {
@@ -1380,7 +1417,7 @@ fn validate_plan(
     };
 
     let steps_path = child_query_path(path, "steps");
-    let output = validate_query_steps(&plan.steps, domain.kind, &steps_path, schema_version)?;
+    let output = validate_query_steps(&plan.steps, domain.kind, &steps_path)?;
     let mut input = domain.kind;
     for (index, step) in plan.steps.iter().enumerate() {
         let filter = match step {

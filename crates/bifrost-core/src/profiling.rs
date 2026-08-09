@@ -56,9 +56,29 @@ pub fn scope(label: impl Into<String>) -> Scope {
     Scope::new(label)
 }
 
+/// [`scope`] for a label that costs something to build.
+///
+/// The label closure runs only when timing is on, so a disabled call is one
+/// predictable branch with no allocation. Call sites inside per-candidate loops
+/// must use this form; `scope` builds its label before the flag is consulted.
+pub fn scope_with(label: impl FnOnce() -> String) -> Scope {
+    if enabled() {
+        Scope::new(label())
+    } else {
+        Scope {
+            label: None,
+            start: None,
+        }
+    }
+}
+
 pub fn enabled() -> bool {
+    // Read once: the flag is set in the process environment at spawn and
+    // never toggled at run time, and `scope` sits on per-candidate hot paths
+    // where a per-call `env::var_os` (a global env lock) is measurable.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static KEY: &str = "BIFROST_TIMING";
-    timing_enabled(env::var_os(KEY).as_deref())
+    *ENABLED.get_or_init(|| timing_enabled(env::var_os(KEY).as_deref()))
 }
 
 /// Whether `BIFROST_TIMING` asks for span tracing.
@@ -89,6 +109,14 @@ pub fn note(label: impl AsRef<str>) {
         let indent = "  ".repeat(depth.get());
         eprintln!("[bifrost-timing] {indent}NOTE {}", label.as_ref());
     });
+}
+
+/// [`note`] for a label that costs something to build. See [`scope_with`].
+pub fn note_with(label: impl FnOnce() -> String) {
+    if !enabled() {
+        return;
+    }
+    note(label());
 }
 
 pub fn duration(label: impl AsRef<str>, duration: Duration) {

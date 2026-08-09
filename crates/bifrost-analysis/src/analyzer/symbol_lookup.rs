@@ -1,7 +1,5 @@
 use crate::analyzer::common::identifier_addresses_target;
 use crate::analyzer::common::language_for_target as code_unit_language;
-use crate::analyzer::csharp::strip_csharp_generic_arity;
-use crate::analyzer::fq_name::{FqName, SegmentInterner, SegmentKind};
 use crate::analyzer::{CodeUnit, GO_MODULE_SCOPE_SEGMENT, IAnalyzer, Language};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -584,6 +582,19 @@ fn suffix_stage_from_index(
     if analyzer.has_complete_symbol_lookup_index() && no_indexed_matches {
         return Ok(SuffixStageOutcome::Decided(CodeUnitResolution::NotFound));
     }
+    // Only a *full* stage-1 match may short-circuit. A lone stage-1 suffix
+    // match is not evidence that the query resolves uniquely: this stage
+    // enumerates through `lookup_candidates_by_short_name`, which the
+    // `CodeUnitIndex` contract defines as best-effort ("Implementations return
+    // an empty set when they cannot answer this cheaply; callers retain their
+    // broader lookup path then"). The pattern stage below is the authority on
+    // which declarations a suffix query reaches, and it reaches strictly more
+    // of them, because `suffix_search_pattern` treats `$` as a path delimiter
+    // and lets Go's module-scope segment be skipped. Returning the lone
+    // short-name hit early therefore turned missing recall into a confident
+    // wrong answer: `pkg.Foo$Bar` lost its full-match precedence to
+    // `pkg.Foo.Bar`, and a genuinely ambiguous `pkg.Name` collapsed onto
+    // whichever package the short-name index happened to hold (#1739).
 
     drop(stage1_scope);
 
@@ -933,16 +944,24 @@ fn codeunit_lookup_aliases(code_unit: &CodeUnit) -> BTreeSet<Vec<String>> {
 fn query_symbol_interpretations(language: Language, input: &str) -> BTreeSet<Vec<String>> {
     let mut paths = BTreeSet::new();
     insert_path_variants(&mut paths, language, input);
-    if language == Language::CSharp {
-        let normalized: Vec<_> = parse_symbol_path(language, input)
-            .into_iter()
-            .map(|segment| strip_csharp_generic_arity(&segment).to_string())
-            .collect();
-        if !normalized.is_empty() && normalized.iter().all(|segment| !segment.is_empty()) {
-            paths.insert(normalized);
-        }
+    let parsed = parse_symbol_path(language, input);
+    let aliased = alias_segments(language, &parsed);
+    if aliased != parsed && aliased.iter().all(|segment| !segment.is_empty()) {
+        paths.insert(aliased);
     }
     paths
+}
+
+/// Each segment respelled the way its language also accepts it, or the segments unchanged
+/// when it accepts only one spelling.
+fn alias_segments(language: Language, segments: &[String]) -> Vec<String> {
+    let Some(support) = crate::analyzer::languages::language_support(language) else {
+        return segments.to_vec();
+    };
+    segments
+        .iter()
+        .map(|segment| support.alias_name_segment(segment).to_string())
+        .collect()
 }
 
 pub(crate) fn symbol_selector_leaf(language: Language, input: &str) -> Option<String> {
@@ -994,31 +1013,20 @@ fn symbol_path_variants(language: Language, value: &str) -> Vec<Vec<String>> {
         variants.push(dollar_split);
     }
 
-    // C# generic arity: indexed names carry `Type`1`, but nobody types
-    // arity — the query side already strips it
-    // (query_symbol_interpretations), so aliases must offer the
-    // arity-free form too or generic types are unaddressable (#1063).
-    // Strip from *every* variant, not just the primary: a nested generic
-    // member (`Ns.Outer$Inner`1.Method`) displays as
-    // `Ns.Outer.Inner.Method`, so the arity-free dollar-split form must
-    // exist too (xunit/MudBlazor tier-3 more-specific-fails).
-    if language == Language::CSharp {
-        let arity_free: Vec<Vec<String>> = variants
-            .iter()
-            .map(|variant| {
-                variant
-                    .iter()
-                    .map(|segment| strip_csharp_generic_arity(segment).to_string())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|normalized| {
-                !normalized.is_empty() && normalized.iter().all(|segment| !segment.is_empty())
-            })
-            .collect();
-        for normalized in arity_free {
-            if !variants.contains(&normalized) {
-                variants.push(normalized);
-            }
+    // Respell every variant, not just the primary: a nested C# generic member
+    // (`Ns.Outer$Inner`1.Method`) displays as `Ns.Outer.Inner.Method`, so the
+    // arity-free dollar-split form has to exist too (xunit/MudBlazor tier-3
+    // more-specific-fails). The query side strips arity in
+    // query_symbol_interpretations, so without these aliases generic types are
+    // unaddressable (#1063).
+    let aliased: Vec<Vec<String>> = variants
+        .iter()
+        .map(|variant| alias_segments(language, variant))
+        .filter(|aliased| !aliased.is_empty() && aliased.iter().all(|segment| !segment.is_empty()))
+        .collect();
+    for variant in aliased {
+        if !variants.contains(&variant) {
+            variants.push(variant);
         }
     }
 
@@ -1104,146 +1112,12 @@ fn split_segments_on_dollar(segments: &[String]) -> Vec<String> {
 /// separator-free and join with `.` to match how indexed fq strings compose,
 /// which is what makes this the structured way to normalize a `::`-qualified
 /// reference before an enclosing-scope walk.
-/// The structured sibling of [`parse_symbol_path`]: split a client-supplied
-/// qualified-name path into an [`FqName`], reusing the exact same splitter and
-/// per-language segment normalization. Every segment is interned with
-/// [`SegmentKind::Unknown`] — a user types a spelling, not a kind, so input
-/// segments carry no kind claim and are matched kind-insensitively against
-/// extracted names. Because `Unknown` renders with an ordinary `.` join, the
-/// returned `FqName` renders (via `display`/`display_native`) to exactly the
-/// canonical `.`-joined spelling that [`parse_symbol_path`]`.join(".")`
-/// produces, which is what the string-keyed `definitions` index is keyed by.
-/// See the M2 Decision Log in `.agents/plans/fqname-interned-segments.md`.
-pub(crate) fn parse_symbol_path_fq(
-    language: Language,
-    value: &str,
-    interner: &SegmentInterner,
-) -> FqName {
-    let mut fq = FqName::new();
-    for segment in parse_symbol_path(language, value) {
-        fq.push(interner.intern(&segment, SegmentKind::Unknown));
-    }
-    fq
-}
-
-pub(crate) fn parse_symbol_path(language: Language, value: &str) -> Vec<String> {
-    let trimmed = value.trim().trim_start_matches('\\');
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut chars = trimmed.char_indices().peekable();
-
-    while let Some((index, ch)) = chars.next() {
-        let rest = &trimmed[index..];
-        if language == Language::Cpp
-            && let Some(operator) = cpp_operator_token(rest, current.is_empty())
-        {
-            current.push_str(operator);
-            for _ in operator.chars().skip(1) {
-                chars.next();
-            }
-            continue;
-        }
-
-        if rest.starts_with("::") {
-            flush_segment(language, &mut current, &mut segments);
-            chars.next();
-            continue;
-        }
-
-        if matches!(ch, '.' | '\\' | '/' | '+') {
-            flush_segment(language, &mut current, &mut segments);
-            continue;
-        }
-
-        current.push(ch);
-    }
-    flush_segment(language, &mut current, &mut segments);
-
-    segments
-}
-
-fn cpp_operator_token(value: &str, at_segment_start: bool) -> Option<&str> {
-    if !at_segment_start || !value.starts_with("operator") {
-        return None;
-    }
-
-    let suffix = &value["operator".len()..];
-    if suffix.starts_with("()") {
-        return Some(&value[.."operator()".len()]);
-    }
-
-    let mut end = "operator".len();
-    for (offset, ch) in suffix.char_indices() {
-        if offset == 0 && ch.is_whitespace() {
-            break;
-        }
-        if offset > 0 && is_symbol_path_delimiter_at(&suffix[offset..]) {
-            break;
-        }
-        end = "operator".len() + offset + ch.len_utf8();
-    }
-    Some(&value[..end])
-}
-
-fn is_symbol_path_delimiter_at(value: &str) -> bool {
-    value.starts_with("::")
-        || value
-            .chars()
-            .next()
-            .is_some_and(|ch| matches!(ch, '.' | '\\' | '/' | '+'))
-}
-
-fn flush_segment(language: Language, current: &mut String, segments: &mut Vec<String>) {
-    let trimmed = current.trim();
-    if !trimmed.is_empty() {
-        // Normalization can consume a segment whole (`r#` alone is a bare raw-
-        // identifier escape with no identifier). An empty segment is not a name
-        // any index holds, and it would give the suffix stage a pattern with no
-        // terminal to seek on, so drop it here rather than downstream.
-        let normalized = normalized_client_symbol_segment(language, trimmed);
-        if !normalized.is_empty() {
-            segments.push(normalized);
-        }
-    }
-    current.clear();
-}
-
-fn normalized_client_symbol_segment(language: Language, segment: &str) -> String {
-    // This normalizes client-provided symbol selector text, not Go source.
-    // Go declaration extraction already uses tree-sitter receiver nodes and
-    // indexes pointer receiver methods canonically as `Type.Method`.
-    if language == Language::Go {
-        return normalized_go_client_symbol_segment(segment);
-    }
-
-    // Rust declarations are indexed under the canonical (un-escaped) name —
-    // `r#` is raw-identifier escape syntax, not part of the identifier
-    // (#1128) — so a client-typed segment carrying the escape (`r#type`,
-    // copy-pasted from an old display or from source) must alias to the
-    // same canonical segment (`type`) the index uses. Only the identifier's
-    // own `r#` prefix is stripped; this operates on one already-flushed
-    // selector segment, never a larger path or arbitrary text.
-    if language == Language::Rust {
-        return crate::analyzer::common::strip_raw_identifier_prefix(segment).to_string();
-    }
-
-    segment.to_string()
-}
-
-fn normalized_go_client_symbol_segment(segment: &str) -> String {
-    let receiver = segment.trim();
-    let receiver = go_receiver_type_segment(receiver).unwrap_or(receiver);
-    let base = receiver
-        .split_once('[')
-        .map(|(base, _)| base.trim())
-        .unwrap_or(receiver);
-
-    if base.is_empty() {
-        segment.to_string()
-    } else {
-        base.to_string()
-    }
-}
+///
+/// The splitter itself is core-owned: `brokk-bifrost-rust` resolves Rust
+/// use-paths through it and cannot depend on analysis.
+pub(crate) use brokk_bifrost_core::analyzer::symbol_path::{
+    parse_symbol_path, parse_symbol_path_fq,
+};
 
 fn go_receiver_declaration_selector(value: &str) -> Option<String> {
     let trimmed = value.trim();
@@ -1259,7 +1133,8 @@ fn go_receiver_declaration_selector(value: &str) -> Option<String> {
         .rsplit_once(".(")
         .map(|(prefix, receiver)| (Some(prefix), format!("({receiver}")))
         .unwrap_or((None, receiver.to_string()));
-    let receiver_type = normalized_go_client_symbol_segment(&receiver);
+    let receiver_type =
+        brokk_bifrost_core::analyzer::symbol_path::normalized_go_client_symbol_segment(&receiver);
     if receiver_type == receiver {
         return None;
     }
@@ -1267,24 +1142,6 @@ fn go_receiver_declaration_selector(value: &str) -> Option<String> {
         Some(prefix) => format!("{prefix}.{receiver_type}.{method}"),
         None => format!("{receiver_type}.{method}"),
     })
-}
-
-fn go_receiver_type_segment(segment: &str) -> Option<&str> {
-    let inner = segment.strip_prefix('(')?.strip_suffix(')')?.trim();
-    let receiver = inner.strip_prefix('*').unwrap_or(inner).trim();
-    if receiver.is_empty() {
-        return None;
-    }
-
-    let Some(type_start) = receiver.find(char::is_whitespace) else {
-        return Some(receiver);
-    };
-
-    let receiver_type = receiver[type_start..].trim();
-    if receiver_type.is_empty() {
-        return None;
-    }
-    Some(receiver_type.strip_prefix('*').unwrap_or(receiver_type))
 }
 
 fn path_ends_with(candidate: &[String], query: &[String]) -> bool {

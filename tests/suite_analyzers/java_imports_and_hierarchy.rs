@@ -1,4 +1,5 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     AnalyzerConfig, IAnalyzer, ImportAnalysisProvider, JavaAnalyzer, JvmAnalyzerConfig,
     JvmExternalDependencies, JvmMavenCoordinate, Language, ProjectFile, TestProject,
@@ -98,9 +99,9 @@ fn java_external_type_resolution_uses_exact_maven_coordinate_without_workspace_d
         .next()
         .unwrap();
 
-    assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalService"));
-    assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalService.Nested"));
-    assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalHelper"));
+    assert!(analyzer.is_known_type_name_in_file(None, app.source(), "ExternalService"));
+    assert!(analyzer.is_known_type_name_in_file(None, app.source(), "ExternalService.Nested"));
+    assert!(analyzer.is_known_type_name_in_file(None, app.source(), "ExternalHelper"));
     assert!(
         analyzer
             .resolve_type_name_in_file(app.source(), "ExternalService")
@@ -140,7 +141,7 @@ fn explicit_import_beats_wildcard() {
         .unwrap();
     let imports = analyzer.imported_code_units_of(consumer.source());
     let ambiguous: Vec<_> = imports
-        .into_iter()
+        .iter()
         .filter(|code_unit| code_unit.identifier() == "Ambiguous")
         .collect();
 
@@ -172,7 +173,7 @@ fn wildcard_imports_are_deterministic() {
         .unwrap();
     let imports = analyzer.imported_code_units_of(consumer.source());
     let ambiguous: Vec<_> = imports
-        .into_iter()
+        .iter()
         .filter(|code_unit| code_unit.identifier() == "Ambiguous")
         .collect();
 

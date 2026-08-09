@@ -1,5 +1,9 @@
 use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
+use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
+use brokk_bifrost_js_ts::syntax::JsTsLexicalBindingIndex;
+use brokk_bifrost_jvm::scala::bare_name_scopes::ScalaBareNameDeclarationScopes;
+use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +30,41 @@ pub fn reference_candidate_ranges(
         &|| false,
     )
     .expect("non-cancellable collection cannot be cancelled")
+}
+
+/// Return whether a structured reference range must use a point lookup.
+///
+/// Some C++ names are composite grammar nodes that begin with the lexical
+/// token `operator`. Definition lookup must receive a point inside that token,
+/// while callers retain the complete structured range as the reference
+/// identity.
+pub fn reference_candidate_requires_point_lookup(
+    root: Node<'_>,
+    language: Language,
+    range: &Range,
+) -> bool {
+    if language != Language::Cpp {
+        return false;
+    }
+    let Some(mut node) = root.named_descendant_for_byte_range(range.start_byte, range.end_byte)
+    else {
+        return false;
+    };
+    loop {
+        if matches!(
+            node.kind(),
+            "operator_name" | "operator_cast" | "literal_operator_name"
+        ) {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if parent.start_byte() != range.start_byte || parent.end_byte() != range.end_byte {
+            return false;
+        }
+        node = parent;
+    }
 }
 
 pub(crate) fn reference_candidate_ranges_cancellable(
@@ -61,10 +100,90 @@ pub fn semantic_token_candidate_ranges(
     .expect("non-cancellable collection cannot be cancelled")
 }
 
+/// The raw tree-sitter identifier census: every identifier-class leaf token plus
+/// the receiver keywords and compound callable names, with NO per-language
+/// reference exclusions. This is the census-seeded FIRD probe frontier
+/// (`--probe-seed census`): it is deliberately ignorant of the analyzer's
+/// declaration index, so it proposes occurrences the index-filtered
+/// [`reference_candidate_ranges`] frontier never surfaces. Comment and string
+/// contents are excluded structurally, because they are not identifier-class
+/// leaf nodes. Declaration and local-binding occurrences are recorded here and
+/// filtered downstream by the engine (they are not usage probes). Tree-sitter
+/// ERROR subtrees are excluded, because their identifiers are artifacts of
+/// error recovery rather than source occurrences the engine can grade.
+pub fn census_identifier_ranges(
+    root: Node<'_>,
+    language: Language,
+    limit: usize,
+) -> ReferenceCandidateRanges {
+    collect_candidate_ranges(root, language, limit, CandidateFrontier::Census, &|| false)
+        .expect("non-cancellable collection cannot be cancelled")
+}
+
+/// Per-file answer to "could a BARE occurrence of this name, at this byte, bind
+/// to something declared in this file?".
+///
+/// The census grades a forward-unresolvable occurrence by asking whether the
+/// file declares the name (#1783). A name match alone is too weak for a bare
+/// call: in JavaScript a `Lexer.prototype.isNumber` member is reachable only
+/// through a receiver, so it is not evidence for a bare `isNumber(value)` that
+/// could never bind to it. Scope, not name, decides -- and scope is a
+/// per-language question, so a language without a scope index says so by
+/// answering `None` here instead of pretending nothing is bound.
+pub struct CensusBareNameBindings {
+    scopes: CensusBareNameScopes,
+}
+
+/// The per-language index that answers the bindability question. Each language
+/// contributes the notion of scope its own binding rules use: a lexical binder
+/// index where a bare name binds lexically and nothing else, a
+/// declaration-visibility index where it also reaches the enclosing type's
+/// members.
+enum CensusBareNameScopes {
+    JsTsLexical(JsTsLexicalBindingIndex),
+    ScalaDeclarations(ScalaBareNameDeclarationScopes),
+    PhpFreeFunctions(PhpBareNameFunctionScopes),
+}
+
+impl CensusBareNameBindings {
+    /// `None` when the language has no scope index. JavaScript and TypeScript
+    /// share the lexical one the forward resolver already uses, so the census
+    /// grades bare calls against the same notion of scope the resolver binds
+    /// them with. Scala answers with declaration visibility instead, because a
+    /// bare Scala call also reaches the enclosing template's own, inherited,
+    /// self-typed and imported members (#1858). PHP answers with the file's free
+    /// FUNCTION declarations and nothing else, because it has no
+    /// implicit-receiver call at all (#1867).
+    pub fn build(root: Node<'_>, source: &str, language: Language) -> Option<Self> {
+        let scopes = match language {
+            Language::JavaScript | Language::TypeScript => {
+                CensusBareNameScopes::JsTsLexical(JsTsLexicalBindingIndex::build(root, source))
+            }
+            Language::Scala => CensusBareNameScopes::ScalaDeclarations(
+                ScalaBareNameDeclarationScopes::build(root, source),
+            ),
+            Language::Php => CensusBareNameScopes::PhpFreeFunctions(
+                PhpBareNameFunctionScopes::build(root, source),
+            ),
+            _ => return None,
+        };
+        Some(Self { scopes })
+    }
+
+    pub fn is_bound_at(&self, name: &str, byte: usize) -> bool {
+        match &self.scopes {
+            CensusBareNameScopes::JsTsLexical(lexical) => lexical.is_bound_at(name, byte),
+            CensusBareNameScopes::ScalaDeclarations(scopes) => scopes.is_bound_at(name, byte),
+            CensusBareNameScopes::PhpFreeFunctions(scopes) => scopes.is_bound_at(name, byte),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum CandidateFrontier {
     References,
     SemanticTokens,
+    Census,
 }
 
 fn collect_candidate_ranges(
@@ -80,12 +199,35 @@ fn collect_candidate_ranges(
         if is_cancelled() {
             return None;
         }
-        let compound = matches!(frontier, CandidateFrontier::References)
-            && is_compound_reference_candidate(language, node.kind());
+        // Tree-sitter error recovery destroys the enclosing declaration nodes,
+        // so the identifiers it leaves behind describe the recovery, not the
+        // source: a Flow class-property name recovers as a bare
+        // `property_identifier` and a Flow type keyword recovers as an
+        // object-pattern binding. The census grades what it proposes, so it
+        // must stop at the ERROR subtree instead of grading misparse fallout.
+        // The test is per-subtree, not per-file: a locally recoverable ERROR
+        // leaves the rest of the file proposed. The index-filtered and
+        // semantic-token frontiers keep their existing reach, because the LSP
+        // still colors and resolves inside a broken edit.
+        if matches!(frontier, CandidateFrontier::Census) && node.is_error() {
+            continue;
+        }
+        let compound = matches!(
+            frontier,
+            CandidateFrontier::References | CandidateFrontier::Census
+        ) && is_compound_reference_candidate(language, node.kind());
         let candidate = match frontier {
             CandidateFrontier::References => is_reference_candidate_node(language, node.kind()),
             CandidateFrontier::SemanticTokens => {
                 is_semantic_token_identifier_node(language, node.kind())
+            }
+            // The census is the maximal grammar-only identifier frontier: the
+            // identifier-class leaves the semantic-token frontier keeps, unioned
+            // with the receiver keywords and compound callable names the
+            // reference frontier adds. No index knowledge, no exclusions.
+            CandidateFrontier::Census => {
+                is_semantic_token_identifier_node(language, node.kind())
+                    || is_reference_candidate_node(language, node.kind())
             }
         };
         if candidate
@@ -121,6 +263,23 @@ fn is_excluded_reference_candidate(
     node: Node<'_>,
     frontier: CandidateFrontier,
 ) -> bool {
+    // A C# statement label (`Render:`, `goto Render;`) is not an occurrence any
+    // frontier can grade. Labels live in the method's own label namespace, so no
+    // declaration index will ever hold one, and the census grades what it
+    // proposes: left in, every label sharing a name with a same-file member
+    // becomes a tier-2 "same-file declaration exists but forward returned
+    // no_definition" gap that no analyzer change can close (#1799). This is the
+    // same reason the census stops at ERROR subtrees. Semantic tokens keep the
+    // label, because the editor still colors it.
+    if language == Language::CSharp
+        && matches!(
+            frontier,
+            CandidateFrontier::References | CandidateFrontier::Census
+        )
+        && csharp_is_statement_label(node)
+    {
+        return true;
+    }
     if !matches!(frontier, CandidateFrontier::References) {
         return false;
     }
@@ -251,6 +410,267 @@ mod tests {
             panic!("reference candidate budget exceeded for {language:?}");
         };
         ranges.into_iter().map(|range| range.start_byte).collect()
+    }
+
+    fn census_ranges(language: Language, path: &str, source: &str) -> Vec<Range> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, path);
+        let tree = parse_tree_for_language(&file, language, source)
+            .unwrap_or_else(|| panic!("failed to parse {language:?}"));
+        let ReferenceCandidateRanges::Complete(ranges) =
+            census_identifier_ranges(tree.root_node(), language, 1000)
+        else {
+            panic!("census budget exceeded for {language:?}");
+        };
+        ranges
+    }
+
+    fn census_offsets(language: Language, path: &str, source: &str) -> Vec<usize> {
+        census_ranges(language, path, source)
+            .into_iter()
+            .map(|range| range.start_byte)
+            .collect()
+    }
+
+    fn census_texts<'a>(language: Language, path: &str, source: &'a str) -> Vec<&'a str> {
+        census_ranges(language, path, source)
+            .into_iter()
+            .map(|range| &source[range.start_byte..range.end_byte])
+            .collect()
+    }
+
+    /// The bindability answer the census grades bare calls with (#1783): a
+    /// module-scope binder is reachable by bare name anywhere it is in scope,
+    /// while a prototype/object-literal member of the same name is reachable
+    /// only through a receiver and therefore is not bound at a bare call site.
+    #[test]
+    fn census_bare_name_bindings_answer_js_lexical_scope() {
+        let source = concat!(
+            "var toBigNumber = function(value) { return value; };\n",
+            "function Lexer() {}\n",
+            "Lexer.prototype = {\n",
+            "  isNumber: function(ch) { return ch >= '0'; },\n",
+            "};\n",
+            "function parseValue(value) {\n",
+            "  return isNumber(toBigNumber(value));\n",
+            "}\n",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "parse.js");
+        let tree = parse_tree_for_language(&file, Language::JavaScript, source).expect("js tree");
+        let bindings =
+            CensusBareNameBindings::build(tree.root_node(), source, Language::JavaScript)
+                .expect("JavaScript answers bare-name bindability");
+
+        let bound_site = source.find("toBigNumber(value)").expect("bound call site");
+        assert!(
+            bindings.is_bound_at("toBigNumber", bound_site),
+            "a module-scope `var` binder is bound at a bare call inside a later function"
+        );
+
+        let member_site = source
+            .find("isNumber(toBigNumber")
+            .expect("member call site");
+        assert!(
+            !bindings.is_bound_at("isNumber", member_site),
+            "an object-literal member is not a lexical binding of its bare name"
+        );
+
+        // Languages without a scope index say so, rather than answering
+        // "not bound" and pruning their evidence.
+        assert!(
+            CensusBareNameBindings::build(tree.root_node(), source, Language::Java).is_none(),
+            "Java has no scope index and must not answer bare-name bindability"
+        );
+    }
+
+    /// PHP's arm (#1867): a bare call binds to a free FUNCTION the file
+    /// publishes and to nothing else. It has no implicit-receiver call, so a
+    /// method or property of the enclosing class is not evidence -- the premise
+    /// that grouped PHP with Ruby and over-graded all 59 census sites.
+    #[test]
+    fn census_bare_name_bindings_answer_php_free_functions_only() {
+        let source = concat!(
+            "<?php\n",
+            "namespace Demo\\Support;\n",
+            "function local_helper(string $name): string { return $name; }\n",
+            "class Utils {\n",
+            "    private $time = 0;\n",
+            "    public static function substr(string $s): string { return substr($s, 0, 2); }\n",
+            "    public function go(): string { return local_helper('a') . time(); }\n",
+            "}\n",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let file = ProjectFile::new(&root, "Utils.php");
+        let tree = parse_tree_for_language(&file, Language::Php, source).expect("php tree");
+        let bindings = CensusBareNameBindings::build(tree.root_node(), source, Language::Php)
+            .expect("PHP answers bare-name bindability");
+
+        assert!(
+            bindings.is_bound_at(
+                "local_helper",
+                source.find("local_helper('a')").expect("site")
+            ),
+            "a same-file free function is reachable from a bare call"
+        );
+        assert!(
+            !bindings.is_bound_at("substr", source.find("substr($s, 0, 2)").expect("site")),
+            "a method needs a receiver, so it is not a bare-call binding"
+        );
+        assert!(
+            !bindings.is_bound_at("time", source.find("time()").expect("site")),
+            "a property is not callable at all"
+        );
+    }
+
+    #[test]
+    fn census_frontier_is_a_superset_of_the_reference_frontier() {
+        // The census keeps identifier occurrences the index-filtered reference
+        // frontier deliberately drops: the JS export alias and the Go field and
+        // type declaration names. This is the whole point of census seeding -
+        // it proposes sites the analyzer's own frontier never surfaces.
+        let js = "const value = 1; export { value as renamed };\n";
+        let js_census = census_offsets(Language::JavaScript, "index.js", js);
+        let alias_start = js.find("renamed").expect("export alias");
+        assert!(
+            js_census.contains(&alias_start),
+            "census must keep the JS export alias the reference frontier drops: {js_census:?}"
+        );
+
+        let go = "package sample\n\ntype Repository struct {\n    Query Query\n}\n";
+        let go_census = census_offsets(Language::Go, "sample.go", go);
+        let field_decl = go.find("Query Query").expect("field declaration");
+        assert!(
+            go_census.contains(&field_decl),
+            "census must keep the Go field declaration name: {go_census:?}"
+        );
+        // And the census is a strict superset: every reference candidate is a
+        // census candidate.
+        let go_reference = reference_candidate_offsets(Language::Go, "sample.go", go);
+        for offset in go_reference {
+            assert!(
+                go_census.contains(&offset),
+                "census dropped a reference-frontier candidate at {offset}: {go_census:?}"
+            );
+        }
+    }
+
+    /// Tree-sitter error recovery destroys enclosing declaration nodes: a
+    /// Flow-typed `.js` file parsed with the plain JavaScript grammar loses the
+    /// whole class declaration into one ERROR node. The identifiers inside it
+    /// are misparse fallout, not source references, so the census must not
+    /// propose them (#1784): `registries` is a Flow class-property declaration
+    /// name that forward resolution would chase through an import binder into
+    /// another module, and `boolean` is a Flow type keyword that the JavaScript
+    /// grammar mistakes for an object-pattern binding.
+    #[test]
+    fn census_skips_identifiers_inside_error_subtrees() {
+        let source = concat!(
+            "import {registries} from './registries.js';\n",
+            "export default class Install {\n",
+            "  registries: Array<RegistryNames>;\n",
+            "  run(opts: {bailout: boolean}) {\n",
+            "    return call(opts);\n",
+            "  }\n",
+            "}\n",
+        );
+        let offsets = census_offsets(Language::JavaScript, "install.js", source);
+        let flow_property = source
+            .find("registries: Array")
+            .expect("flow class property");
+        let flow_keyword = source.find("boolean").expect("misparsed flow type keyword");
+        for excluded in [flow_property, flow_keyword] {
+            assert!(
+                !offsets.contains(&excluded),
+                "identifier at byte {excluded} is inside an ERROR subtree and must not be proposed: {:?}",
+                census_texts(Language::JavaScript, "install.js", source)
+            );
+        }
+
+        // Recovery swallows everything from `export` through the closing brace
+        // into a single ERROR node, so the import specifier is the only intact
+        // identifier the file still has.
+        let import_specifier = source.find("registries").expect("import specifier");
+        assert_eq!(
+            offsets,
+            vec![import_specifier],
+            "only the ERROR-free import specifier may be proposed: {:?}",
+            census_texts(Language::JavaScript, "install.js", source)
+        );
+    }
+
+    /// A locally recoverable ERROR must not disqualify the rest of the file.
+    /// Here recovery consumes only `r:`; `P` recovers as a field definition and
+    /// the method body parses cleanly, so every neighbor stays proposed.
+    #[test]
+    fn census_keeps_neighbors_of_a_locally_recoverable_error() {
+        let source = concat!(
+            "class W {\n",
+            "  r: P;\n",
+            "  m() { return call(x); }\n",
+            "}\n",
+            "function after() { return other(); }\n",
+        );
+        let offsets = census_offsets(Language::JavaScript, "widget.js", source);
+        let annotation_name = source.find("r: P").expect("flow annotation name");
+        assert!(
+            !offsets.contains(&annotation_name),
+            "the annotation name inside the ERROR subtree must not be proposed: {:?}",
+            census_texts(Language::JavaScript, "widget.js", source)
+        );
+
+        let expected = vec![
+            source.find('W').expect("class name"),
+            source.find("P;").expect("recovered field definition"),
+            source.find("m()").expect("method name"),
+            source.find("call(x)").expect("call callee"),
+            source.find("x)").expect("call argument"),
+            source.find("after").expect("following function name"),
+            source.find("other()").expect("following call callee"),
+        ];
+        assert_eq!(
+            offsets,
+            expected,
+            "a local ERROR must leave the surrounding file proposed: {:?}",
+            census_texts(Language::JavaScript, "widget.js", source)
+        );
+    }
+
+    /// Tree-sitter MISSING nodes are zero-width fabricated tokens with no
+    /// source text. They need no dedicated frontier rule: the grammars insert
+    /// them as anonymous leaves that the named-child walk never visits, and the
+    /// non-empty range guard would reject them regardless. An inserted token
+    /// also does not contaminate its neighbors, so the real identifiers around
+    /// it stay proposed. Here the JavaScript grammar inserts a MISSING `)`.
+    #[test]
+    fn census_ignores_missing_tokens_without_dropping_their_neighbors() {
+        let source = concat!(
+            "function f() { return call(x; }\n",
+            "function after() { return other(); }\n",
+        );
+        let ranges = census_ranges(Language::JavaScript, "missing.js", source);
+        assert!(
+            ranges.iter().all(|range| range.start_byte < range.end_byte),
+            "a zero-width fabricated token must never become a candidate: {ranges:?}"
+        );
+
+        let offsets: Vec<usize> = ranges.iter().map(|range| range.start_byte).collect();
+        let expected = vec![
+            source.find("f()").expect("function name"),
+            source.find("call").expect("call callee"),
+            source.find("x;").expect("call argument"),
+            source.find("after").expect("following function name"),
+            source.find("other").expect("following call callee"),
+        ];
+        assert_eq!(
+            offsets,
+            expected,
+            "an inserted MISSING token must not disqualify its neighbors: {:?}",
+            census_texts(Language::JavaScript, "missing.js", source)
+        );
     }
 
     #[test]
@@ -544,6 +964,56 @@ func run() {
                 offsets.contains(&reference),
                 "neighboring C# type/reference at byte {reference} must remain in the frontier: {offsets:?}"
             );
+        }
+    }
+
+    // Both the reference frontier and the census must drop C# statement labels:
+    // no declaration index holds a label, so a proposed label whose name matches
+    // a same-file member can only be graded as a gap that never closes (#1799).
+    // The `goto case <constant>;` expression is a real constant reference and
+    // stays proposed.
+    #[test]
+    fn csharp_frontiers_exclude_statement_labels_but_keep_goto_case_constants() {
+        let source = r#"class RendererBase {
+    const int Retry = 1;
+
+    object Render(object o) { return o; }
+
+    object Write(object obj, bool flag) {
+        if (flag) { goto Render; }
+        switch (obj) { case 0: goto case Retry; }
+    Render:
+        return Render(obj);
+    }
+}
+"#;
+        let goto_label = source.find("goto Render;").expect("goto statement") + "goto ".len();
+        let label = source.find("\n    Render:").expect("label declaration") + "\n    ".len();
+        let goto_case = source.find("goto case Retry;").expect("goto case") + "goto case ".len();
+        let call = source.find("return Render(obj);").expect("call") + "return ".len();
+
+        for (frontier, offsets) in [
+            (
+                "reference",
+                reference_candidate_offsets(Language::CSharp, "RendererBase.cs", source),
+            ),
+            (
+                "census",
+                census_offsets(Language::CSharp, "RendererBase.cs", source),
+            ),
+        ] {
+            for excluded in [goto_label, label] {
+                assert!(
+                    !offsets.contains(&excluded),
+                    "{frontier} frontier must drop the C# statement label at byte {excluded}: {offsets:?}"
+                );
+            }
+            for kept in [goto_case, call] {
+                assert!(
+                    offsets.contains(&kept),
+                    "{frontier} frontier must keep the C# reference at byte {kept}: {offsets:?}"
+                );
+            }
         }
     }
 

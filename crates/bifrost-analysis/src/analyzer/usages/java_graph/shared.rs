@@ -1,19 +1,20 @@
-use super::extractor::{ReturnTypeCaches, ScanState, scan_file};
-use super::inverted;
-use super::jvm_scala::scan_scala_files_for_java_target;
-use super::resolver::TargetSpec;
-use super::return_type::{FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache};
+use super::{build_java_edges, with_java_graph_source};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::traits::{UsageEdgeResolver, UsageQueryResolver, UsageScanScope};
+use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     BulkFileStateSource, CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer,
 };
 use crate::hash::HashMap;
 use crate::hash::HashSet;
+use brokk_bifrost_jvm::java::graph::extractor::{ReturnTypeCaches, ScanState, scan_file};
+use brokk_bifrost_jvm::java::graph::resolver::TargetSpec;
+use brokk_bifrost_jvm::java::graph::return_type::{
+    FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache,
+};
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
@@ -79,22 +80,17 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
-        for file in files {
-            let _scan_scope = crate::profiling::scope("java_graph::scan_file");
-            scan_file(
-                self.java,
-                analyzer,
-                &file,
-                &spec,
-                &return_caches,
-                &mut state,
-            );
-            if *state.limit_exceeded {
-                break;
+        with_java_graph_source(analyzer, |graph| {
+            for file in files {
+                let _scan_scope = crate::profiling::scope("java_graph::scan_file");
+                scan_file(self.java, &graph, &file, &spec, &return_caches, &mut state);
+                if *state.limit_exceeded {
+                    break;
+                }
             }
-        }
+        });
         let _scala_scope = crate::profiling::scope("java_graph::scan_scala_files");
-        scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
+        super::scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
         drop(_scala_scope);
         // A Java class is equally nameable from Kotlin source; the realm is one
         // candidate space, so find-references on a Java type must see its Kotlin
@@ -136,8 +132,12 @@ pub(crate) struct JavaEdgeResolver<'a> {
     file_states: HashMap<ProjectFile, FileState>,
 }
 
-impl<'a> UsageEdgeResolver<'a> for JavaEdgeResolver<'a> {
-    fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
+/// The whole-workspace `caller -> callee` scan behind this language's
+/// [`LanguageEdgePass`](crate::analyzer::languages::LanguageEdgePass): borrow the concrete
+/// analyzer once, then walk every file once and finalize into either site-bearing edges or
+/// reference-kind weights.
+impl<'a> JavaEdgeResolver<'a> {
+    pub(crate) fn try_new(analyzer: &'a dyn IAnalyzer) -> Option<Self> {
         let java = resolve_analyzer::<JavaAnalyzer>(analyzer)?;
         let files: Vec<ProjectFile> = analyzer
             .project()
@@ -153,7 +153,7 @@ impl<'a> UsageEdgeResolver<'a> for JavaEdgeResolver<'a> {
         })
     }
 
-    fn build_edges<F>(
+    pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
@@ -162,7 +162,7 @@ impl<'a> UsageEdgeResolver<'a> for JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_java_edges(
+        build_java_edges(
             analyzer,
             self.java,
             &self.files,
@@ -172,7 +172,7 @@ impl<'a> UsageEdgeResolver<'a> for JavaEdgeResolver<'a> {
         )
     }
 
-    fn build_edge_weights<F>(
+    pub(crate) fn build_edge_weights<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         nodes: &HashSet<String>,
@@ -181,7 +181,7 @@ impl<'a> UsageEdgeResolver<'a> for JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_java_edges(
+        build_java_edges(
             analyzer,
             self.java,
             &self.files,

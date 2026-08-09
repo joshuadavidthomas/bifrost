@@ -16,12 +16,12 @@ use crate::analyzer::semantic_model::{
     TypeRef, Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
-use crate::analyzer::usages::scala_graph::syntax::{
+use crate::analyzer::{CodeUnit, ProjectFile};
+use crate::hash::HashMap;
+use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallableRole, ScalaCallableSourceAlternative, ScalaSourceFacts, ScalaTypeExpressionPath,
     scala_source_facts_from_tree,
 };
-use crate::analyzer::{CodeUnit, ProjectFile};
-use crate::hash::HashMap;
 use std::io::{Cursor, Read};
 use tree_sitter::{Node, Parser, Tree};
 use zip::ZipArchive;
@@ -367,6 +367,7 @@ fn scala_entry_facts(
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: Locator::Source {
                 path: entry_name.to_owned(),
                 symbol: Some(declaration.fq_name()),
@@ -493,6 +494,7 @@ fn scala_entry_facts(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            guard: None,
             locator: Locator::Source {
                 path: entry_name.to_owned(),
                 symbol: Some(declaration.fq_name()),
@@ -536,6 +538,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        guard: None,
         locator: owner.locator.clone(),
     }
 }
@@ -619,7 +622,7 @@ fn scala_member_kind(
 fn scala_signature(
     callable: &ScalaCallableSourceAlternative,
     callable_generic_facts: Option<
-        &crate::analyzer::usages::scala_graph::syntax::ScalaGenericOwnerSourceFacts,
+        &brokk_bifrost_jvm::scala::graph::syntax::ScalaGenericOwnerSourceFacts,
     >,
     owner_type_parameters: &[String],
 ) -> Option<Signature> {

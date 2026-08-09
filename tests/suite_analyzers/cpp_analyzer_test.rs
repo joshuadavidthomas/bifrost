@@ -1,4 +1,5 @@
 use crate::common::{InlineTestProject, assert_code_eq, cpp_fixture_project};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::{
     CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, ImportAnalysisProvider, Language, Project,
     ProjectFile, TestProject, TypeAliasProvider, TypeHierarchyProvider,
@@ -783,6 +784,117 @@ PN_CPP_CLASS_EXTERN connection : public internal::object<pn_connection_t>, publi
 }
 
 #[test]
+fn enum_enumerators_are_children_not_top_level_declarations() {
+    let project = inline_cpp_project(&[(
+        "colors.hpp",
+        r#"namespace ui {
+enum class color { alice_blue, antique_white, aqua };
+enum stroke { thin, thick };
+}
+"#,
+    )]);
+    let analyzer = CppAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "colors.hpp");
+
+    let top_level = analyzer.get_top_level_declarations(&file);
+    assert!(
+        top_level.iter().any(|unit| unit.fq_name() == "ui.color"),
+        "the enum itself must stay top-level: {top_level:#?}"
+    );
+    assert!(
+        top_level
+            .iter()
+            .all(|unit| unit.kind() != CodeUnitType::Field),
+        "enumerators must not appear as top-level declarations: {top_level:#?}"
+    );
+
+    let color = top_level
+        .iter()
+        .find(|unit| unit.fq_name() == "ui.color")
+        .unwrap();
+    let children: Vec<_> = analyzer
+        .direct_children(color)
+        .into_iter()
+        .map(|unit| unit.fq_name())
+        .collect();
+    for expected in [
+        "ui.color.alice_blue",
+        "ui.color.antique_white",
+        "ui.color.aqua",
+    ] {
+        assert!(
+            children.iter().any(|name| name == expected),
+            "missing enumerator child {expected}: {children:#?}"
+        );
+    }
+}
+
+#[test]
+fn stacked_sentinel_enum_keeps_later_sibling_declarations() {
+    // fmt's color.h shape: two stacked unknown export macros make tree-sitter
+    // wrap the whole file in one ERROR envelope, and the first enum's body is
+    // recovered through the sentinel macro region. The declarations after the
+    // recovered enum's close must survive as ordinary siblings.
+    let project = inline_cpp_project(&[(
+        "color.h",
+        r#"FMT_BEGIN_NAMESPACE
+FMT_BEGIN_EXPORT
+
+enum class color : uint32_t {
+  alice_blue = 0xF0F8FF,               // rgb(240,248,255)
+  antique_white = 0xFAEBD7,            // rgb(250,235,215)
+};  // enum class color
+
+enum class terminal_color : uint8_t {
+  black = 30,
+  red
+};
+
+struct rgb {
+  int r;
+};
+
+FMT_END_EXPORT
+FMT_END_NAMESPACE
+"#,
+    )]);
+    let analyzer = CppAnalyzer::from_project(project);
+    let file = ProjectFile::new(analyzer.project().root().to_path_buf(), "color.h");
+
+    let declarations = analyzer.get_declarations(&file);
+    for expected in [
+        "color",
+        "color.alice_blue",
+        "terminal_color",
+        "terminal_color.black",
+        "terminal_color.red",
+        "rgb",
+        "rgb.r",
+    ] {
+        assert!(
+            declarations.iter().any(|unit| unit.fq_name() == expected),
+            "missing {expected}: {declarations:#?}"
+        );
+    }
+    let color_count = declarations
+        .iter()
+        .filter(|unit| unit.fq_name() == "color")
+        .count();
+    assert_eq!(
+        color_count, 1,
+        "the recovered enum must not be indexed twice: {declarations:#?}"
+    );
+
+    let top_level = analyzer.get_top_level_declarations(&file);
+    for expected in ["color", "terminal_color", "rgb"] {
+        assert!(
+            top_level.iter().any(|unit| unit.fq_name() == expected),
+            "missing top-level {expected}: {top_level:#?}"
+        );
+    }
+}
+
+#[test]
 fn cpp_iterative_visitor_preserves_top_level_source_order() {
     let project = inline_cpp_project(&[(
         "ordered.cpp",
@@ -1075,8 +1187,14 @@ fn test_cpp_include_resolution_and_c_file_support() {
     );
 }
 
+/// The provider resolves an include the way the forward resolver's include
+/// closure does: source-relative, then project-relative, then a *unique*
+/// project header by suffix. A separate include root (`-I include`) is the
+/// ordinary C++ layout, so `"helper.h"` from `src/main.cpp` is a real import
+/// (#1829); an absolute path outside the project is not, and neither is a
+/// basename two project headers answer to.
 #[test]
-fn test_cpp_imported_code_units_only_resolve_relative_quoted_includes() {
+fn test_cpp_imported_code_units_resolve_a_unique_project_header_and_refuse_the_rest() {
     let project = inline_cpp_project(&[
         (
             "src/main.cpp",
@@ -1094,7 +1212,41 @@ fn test_cpp_imported_code_units_only_resolve_relative_quoted_includes() {
 
     let imports = analyzer.imported_code_units_of(&main_cpp);
 
-    assert!(imports.is_empty(), "{imports:?}");
+    assert!(
+        imports.iter().any(|cu| cu.short_name() == "Helper"),
+        "a unique project header is reachable through its own include root: {imports:?}"
+    );
+    assert!(
+        imports
+            .iter()
+            .all(|cu| cu.source().rel_path().ends_with("include/helper.h")),
+        "an absolute include outside the project resolves to nothing: {imports:?}"
+    );
+}
+
+#[test]
+fn test_cpp_imported_code_units_refuse_an_ambiguous_include_basename() {
+    let project = inline_cpp_project(&[
+        (
+            "src/main.cpp",
+            r#"
+            #include "helper.h"
+
+            int main() { return 0; }
+            "#,
+        ),
+        ("first/helper.h", "struct FirstHelper {};"),
+        ("second/helper.h", "struct SecondHelper {};"),
+    ]);
+    let analyzer = CppAnalyzer::from_project(project.clone());
+    let main_cpp = ProjectFile::new(project.root().to_path_buf(), "src/main.cpp");
+
+    let imports = analyzer.imported_code_units_of(&main_cpp);
+
+    assert!(
+        imports.is_empty(),
+        "two headers answer to this basename, so neither is the import: {imports:?}"
+    );
 }
 
 #[test]

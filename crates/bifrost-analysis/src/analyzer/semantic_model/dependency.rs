@@ -120,6 +120,28 @@ impl ResolvedDependencyArtifact {
         }
     }
 
+    /// A source set whose ecosystem import identity is known. Composer uses this
+    /// for a PSR-4 namespace prefix, so one package's separately mapped prefixes
+    /// stay distinguishable after the files are collected.
+    pub fn module_source_set(
+        role: DependencyArtifactRole,
+        kind: ExternalArtifactKind,
+        module: String,
+        root: PathBuf,
+        relative_paths: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            role,
+            kind,
+            module: Some(module),
+            input: ResolvedDependencyArtifactInput::SourceSet {
+                root,
+                relative_paths,
+            },
+            expected_sha256: None,
+        }
+    }
+
     pub fn path(&self) -> &Path {
         match &self.input {
             ResolvedDependencyArtifactInput::File(path) => path,
@@ -331,6 +353,20 @@ impl DependencyDiscoveryOutcome {
             cancelled: false,
         }
     }
+
+    /// Convert discovery completeness into the shared diagnostic suppression
+    /// vocabulary. This does not start discovery or read the filesystem.
+    pub fn semantic_diagnostic_incomplete_reasons(
+        &self,
+    ) -> Vec<crate::analyzer::SemanticDiagnosticIncompleteReason> {
+        if self.cancelled {
+            vec![crate::analyzer::SemanticDiagnosticIncompleteReason::Cancelled]
+        } else if !self.complete {
+            vec![crate::analyzer::SemanticDiagnosticIncompleteReason::Truncated]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl std::ops::Deref for DependencyDiscoveryOutcome {
@@ -391,6 +427,49 @@ impl DependencyDiscoveryEvidence {
     /// dotted module names discovery itself recorded, so segment-prefix
     /// containment is their defined structure, not a re-parse of source text.
     pub fn declares_module_path(&self, path: &str) -> bool {
+        self.declares_path_below(path, '.')
+    }
+
+    /// Whether the build declares the Go module that `import_path` routes
+    /// through: an exact declared identity, or one reached by walking the
+    /// slash-separated import path back toward its module root
+    /// (`github.com/pkg/errors/internal` is declared when the
+    /// `github.com/pkg/errors` module is).
+    ///
+    /// Go import paths are slash-separated, so [`Self::declares_module_path`]'s
+    /// dotted walk cannot answer this: `github.com/pkg/errors/internal` splits
+    /// on `.` into `github`, which names nothing. The declared identities are
+    /// the module paths discovery itself recorded, so segment-prefix
+    /// containment is their defined structure, not a re-parse of source text.
+    pub fn declares_go_import_path(&self, import_path: &str) -> bool {
+        self.declares_path_below(import_path, '/')
+    }
+
+    /// Whether the build declares the gem that a Ruby `require` argument loads:
+    /// an exact declared gem name, or one reached by walking the load path back
+    /// toward its root (`widget/core` is declared when the `widget` gem is).
+    ///
+    /// Ruby discovery records one identity per locked gem, which is the bare
+    /// gem name (`crates/bifrost-analysis/src/analyzer/ruby/dependency_discovery.rs`
+    /// puts `RubyGemApiArtifact::name` in the package coordinate and leaves the
+    /// module coordinate empty). A require argument is the slash-separated load
+    /// path a gem publishes, so this shares Go's walk rather than the dotted
+    /// one: `widget/core` splits on `.` into itself and would match nothing.
+    ///
+    /// A Ruby *constant* path is not a load path and must not be asked here.
+    /// `Widget::Config` is `::`-separated and its head, `Widget`, is a constant
+    /// name that only an inflection rule relates to the gem name `widget`.
+    /// Bifrost does not guess inflections, so a constant is classified against
+    /// the activated overlay instead (see `ruby::constant_identity`).
+    pub fn declares_ruby_require_path(&self, require_path: &str) -> bool {
+        self.declares_path_below(require_path, '/')
+    }
+
+    /// The shared containment walk behind the three `declares_*` accessors: an
+    /// exact declared identity, or one reached by removing trailing
+    /// `separator`-delimited segments. Segment removal rather than
+    /// `str::starts_with` is what keeps `requestsfoo` from matching `requests`.
+    fn declares_path_below(&self, path: &str, separator: char) -> bool {
         if path.is_empty() {
             return false;
         }
@@ -398,13 +477,91 @@ impl DependencyDiscoveryEvidence {
             return true;
         }
         let mut prefix = path;
-        while let Some((head, _)) = prefix.rsplit_once('.') {
+        while let Some((head, _)) = prefix.rsplit_once(separator) {
             if self.declared_modules.contains(head) {
                 return true;
             }
             prefix = head;
         }
         false
+    }
+}
+
+/// What retained discovery evidence says about one module path when nothing
+/// indexed it.
+///
+/// Resolution-trace boundary refinement and proof-gated diagnostics ask the
+/// same question and must not answer it differently; they only render the
+/// answer differently. The trace collapses everything but "the build knows
+/// nothing about this" into `ExternalDeclaredUnindexed`, while diagnostics
+/// keep truncation apart from a declared-but-unindexed distribution because
+/// the two carry different typed suppression reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedDiscoveryVerdict {
+    /// No discovery has run against this analyzer, so nothing is retained.
+    NoDiscovery,
+    /// Discovery could not read everything the build declared, so a miss is
+    /// not proof that the build declares nothing.
+    Truncated,
+    /// The build declares this module, or a module containing it.
+    Declared,
+    /// Discovery ran completely and the build declares nothing containing it.
+    Undeclared,
+}
+
+/// Classify `module_path` against retained discovery evidence. This reads what
+/// the analyzer already holds; it never starts discovery.
+pub fn retained_discovery_verdict(
+    evidence: Option<&DependencyDiscoveryEvidence>,
+    module_path: &str,
+) -> RetainedDiscoveryVerdict {
+    match evidence {
+        None => RetainedDiscoveryVerdict::NoDiscovery,
+        Some(evidence) if evidence.truncated() => RetainedDiscoveryVerdict::Truncated,
+        Some(evidence) if evidence.declares_module_path(module_path) => {
+            RetainedDiscoveryVerdict::Declared
+        }
+        Some(_) => RetainedDiscoveryVerdict::Undeclared,
+    }
+}
+
+/// Whether retained discovery evidence can still account for `module_path`:
+/// the build declares it, or discovery could not read everything the build
+/// declared, so a miss is not proof of absence.
+///
+/// A caller that hits here is at [`BoundaryStatus::ExternalDeclaredUnindexed`];
+/// one that misses, with no other evidence, is at
+/// [`BoundaryStatus::ExternalUnknown`]. Where no discovery has run, nothing is
+/// retained and the honest answer is `false`. This function never starts
+/// discovery.
+///
+/// [`BoundaryStatus::ExternalDeclaredUnindexed`]: crate::analyzer::structural::BoundaryStatus::ExternalDeclaredUnindexed
+/// [`BoundaryStatus::ExternalUnknown`]: crate::analyzer::structural::BoundaryStatus::ExternalUnknown
+pub fn retained_evidence_declares(
+    evidence: Option<&DependencyDiscoveryEvidence>,
+    module_path: &str,
+) -> bool {
+    matches!(
+        retained_discovery_verdict(evidence, module_path),
+        RetainedDiscoveryVerdict::Truncated | RetainedDiscoveryVerdict::Declared
+    )
+}
+
+/// Read retained discovery evidence for a diagnostic request. A missing value
+/// is incomplete external evidence. This function never starts discovery.
+pub fn dependency_discovery_incomplete_reasons(
+    evidence: Option<&DependencyDiscoveryEvidence>,
+) -> Vec<crate::analyzer::SemanticDiagnosticIncompleteReason> {
+    match evidence {
+        None => vec![
+            crate::analyzer::SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                boundary: crate::analyzer::structural::BoundaryStatus::ExternalUnknown,
+            },
+        ],
+        Some(evidence) if evidence.truncated() => {
+            vec![crate::analyzer::SemanticDiagnosticIncompleteReason::Truncated]
+        }
+        Some(_) => Vec::new(),
     }
 }
 
@@ -476,12 +633,33 @@ pub fn prepare_dependency_semantic_packs(
                     installed_packs.push(installed);
                     profile.installed_packs += 1;
                 }
-                Ok(None) => diagnostics.error(
-                    "dependency.pack_unavailable",
-                    Some(&dependency.id),
-                    None,
-                    "resolved dependency has no exact locally producible artifact or compatible installed semantic pack",
-                ),
+                // No usable pack. Distinguish "a pack exists for another
+                // version of this exact coordinate" from "no pack at all":
+                // the near miss names the installed and required versions so
+                // a version mismatch is attributable, never silent (#1884).
+                Ok(None) => match installed_pack_query(dependency)
+                    .map(|query| catalog.version_near_misses(&query))
+                {
+                    Some(Ok(near_misses)) if !near_misses.is_empty() => {
+                        for near_miss in near_misses {
+                            diagnostics.error(
+                                "dependency.pack_version_mismatch",
+                                Some(&dependency.id),
+                                None,
+                                near_miss.describe(),
+                            );
+                        }
+                    }
+                    Some(Err(error)) => {
+                        diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error)
+                    }
+                    Some(Ok(_)) | None => diagnostics.error(
+                        "dependency.pack_unavailable",
+                        Some(&dependency.id),
+                        None,
+                        "resolved dependency has no exact locally producible artifact or compatible installed semantic pack",
+                    ),
+                },
                 Err(error) => {
                     diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error)
                 }
@@ -806,10 +984,11 @@ pub fn prepare_dependency_semantic_packs(
     }
 }
 
-fn compatible_installed_pack(
-    catalog: &SemanticPackCatalog,
-    dependency: &ResolvedDependency,
-) -> Result<Option<PreparedInstalledDependencyPack>, CatalogError> {
+/// The evidence-only catalog query for one dependency, or `None` when the
+/// dependency carries no exact package or toolchain version. Version-exact
+/// selection (#1884) starts here: a versionless dependency never consults
+/// installed packs, and the same query later names version near misses.
+fn installed_pack_query(dependency: &ResolvedDependency) -> Option<SemanticPackSelectorQuery> {
     let has_exact_coordinate = dependency
         .evidence
         .package
@@ -823,9 +1002,9 @@ fn compatible_installed_pack(
             .and_then(|coordinate| coordinate.version.as_ref())
             .is_some();
     if !has_exact_coordinate {
-        return Ok(None);
+        return None;
     }
-    let query = SemanticPackSelectorQuery {
+    Some(SemanticPackSelectorQuery {
         language: dependency.evidence.language.clone(),
         ecosystem: dependency.evidence.ecosystem.clone(),
         package: dependency.evidence.package.clone(),
@@ -836,6 +1015,15 @@ fn compatible_installed_pack(
         artifact_sha256: None,
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("Bifrost package version must be semantic"),
+    })
+}
+
+fn compatible_installed_pack(
+    catalog: &SemanticPackCatalog,
+    dependency: &ResolvedDependency,
+) -> Result<Option<PreparedInstalledDependencyPack>, CatalogError> {
+    let Some(query) = installed_pack_query(dependency) else {
+        return Ok(None);
     };
     let mut manifest_digests = Vec::new();
     let mut has_complete_pack = false;
@@ -1034,6 +1222,7 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::PythonStub => "python_stub",
         ExternalArtifactKind::PythonSource => "python_source",
         ExternalArtifactKind::RubyGemArchive => "ruby_gem_archive",
+        ExternalArtifactKind::ComposerPackageSourceSet => "composer_package_source_set",
     }
 }
 
@@ -1139,4 +1328,56 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     value[..end].to_owned()
+}
+
+#[cfg(test)]
+mod semantic_diagnostic_evidence_tests {
+    use super::*;
+    use crate::analyzer::{SemanticDiagnosticIncompleteReason, structural::BoundaryStatus};
+
+    #[test]
+    fn discovery_outcome_maps_cancelled_and_truncated_states() {
+        let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
+        assert!(outcome.semantic_diagnostic_incomplete_reasons().is_empty());
+
+        outcome.complete = false;
+        assert_eq!(
+            outcome.semantic_diagnostic_incomplete_reasons(),
+            vec![SemanticDiagnosticIncompleteReason::Truncated]
+        );
+
+        outcome.cancelled = true;
+        assert_eq!(
+            outcome.semantic_diagnostic_incomplete_reasons(),
+            vec![SemanticDiagnosticIncompleteReason::Cancelled]
+        );
+    }
+
+    #[test]
+    fn retained_discovery_evidence_distinguishes_missing_and_truncated() {
+        assert_eq!(
+            dependency_discovery_incomplete_reasons(None),
+            vec![
+                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                    boundary: BoundaryStatus::ExternalUnknown,
+                }
+            ]
+        );
+
+        let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
+        assert!(
+            dependency_discovery_incomplete_reasons(Some(
+                &DependencyDiscoveryEvidence::from_outcome(&outcome)
+            ))
+            .is_empty()
+        );
+
+        outcome.complete = false;
+        assert_eq!(
+            dependency_discovery_incomplete_reasons(Some(
+                &DependencyDiscoveryEvidence::from_outcome(&outcome)
+            )),
+            vec![SemanticDiagnosticIncompleteReason::Truncated]
+        );
+    }
 }

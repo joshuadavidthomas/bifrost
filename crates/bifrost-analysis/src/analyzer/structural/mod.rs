@@ -50,7 +50,9 @@ pub mod search;
 
 // The normalized kind/role registry and the spec trait a language implements
 // live in `brokk-bifrost-core`, below every grammar; only the engine that
-// consumes them stays here.
+// consumes them stays here. `adapter_helpers` is split rather than moved: its
+// production mechanics went to core, its test assertions stayed (see that
+// module).
 pub use brokk_bifrost_core::analyzer::structural::{
     edges, kinds, materialization, occurrences, resolution, routes, spec,
 };
@@ -90,9 +92,9 @@ pub use execution::{
     CodeQueryOperatorDisposition, CodeQueryOperatorObservation, CodeQueryOperatorTermination,
     CodeQueryOperatorTimings, CodeQueryPhysicalNode, CodeQueryPhysicalOperator,
     CodeQueryPhysicalPlan, CodeQueryProfile, CodeQueryProfileCacheCounters,
-    CodeQueryProfileCacheLayer, CodeQueryProfileScheduling, CodeQueryProfileTimings,
-    CodeQueryProfileWork, CodeQuerySchedulingPolicy, CodeQuerySelectedScheduling,
-    CodeQueryStructuralFactsCacheCounters,
+    CodeQueryProfileCacheLayer, CodeQueryProfileRequestTimings, CodeQueryProfileScheduling,
+    CodeQueryProfileTimings, CodeQueryProfileWork, CodeQuerySchedulingPolicy,
+    CodeQuerySelectedScheduling, CodeQueryStructuralFactsCacheCounters,
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use identity_routes::{
@@ -148,11 +150,12 @@ pub use query::{
 };
 pub use resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_DECLARED_VISIBILITIES, ALL_ENVIRONMENT_AXES,
-    ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS, ALL_REJECTION_REASONS, BindingActivation,
-    BindingKind, BoundaryStatus, CandidateOutcome, DEEP_LEXICAL_ENVIRONMENT_SUPPORT,
-    DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS, DeclaredVisibility, EnvironmentAxis,
-    EnvironmentSupport, HoistingClass, LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
-    PrecedenceTier, RejectionReason,
+    ALL_HIERARCHY_RELATIONS, ALL_HOISTING_CLASSES, ALL_MEMBER_DISPATCH_TIERS, ALL_PRECEDENCE_TIERS,
+    ALL_REJECTION_REASONS, BindingActivation, BindingKind, BoundaryStatus, CandidateOutcome,
+    DEEP_LEXICAL_ENVIRONMENT_SUPPORT, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS,
+    DeclaredVisibility, EnvironmentAxis, EnvironmentSupport, HierarchyRelation, HoistingClass,
+    LexicalEnvironmentSupport, MemberDispatchTier, NO_LEXICAL_ENVIRONMENT_SUPPORT, PrecedenceTier,
+    RejectionReason,
 };
 pub use routes::{
     ALL_CANONICAL_SEGMENT_KINDS, ALL_IDENTITY_AXES, ALL_ROUTE_HOP_KINDS, ALL_ROUTE_TERMINATIONS,
@@ -164,30 +167,31 @@ pub use rune_ir::{
     RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
     render_source_rune_ir,
 };
-pub(crate) use search::{BoundedTaintProjection, project_taint_finding_report_bounded};
 pub use search::{
-    CodeQueryCallArgument, CodeQueryCallSite, CodeQueryCapture, CodeQueryCompletion,
-    CodeQueryControlEdge, CodeQueryDeclaration, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
-    CodeQueryDiagnosticImpact, CodeQueryExecutionLimits, CodeQueryExecutionWork,
-    CodeQueryExpressionSite, CodeQueryFile, CodeQueryFlowCarrierSymbol, CodeQueryFlowCertainty,
-    CodeQueryFlowCompletion, CodeQueryFlowDeclarationSegment, CodeQueryFlowEndpoint,
-    CodeQueryFlowEvent, CodeQueryFlowFactSymbol, CodeQueryFlowMustStatus, CodeQueryFlowPortSymbol,
-    CodeQueryFlowReachability, CodeQueryFlowSelectorSymbol, CodeQueryFlowSolverTermination,
-    CodeQueryFlowSymbolSite, CodeQueryFlowWitness, CodeQueryFlowWitnessStep,
-    CodeQueryFlowWitnessStepKind, CodeQueryMatch, CodeQueryProcedure, CodeQueryProgramPoint,
-    CodeQueryProgramPointBoundary, CodeQueryProgramPointRef, CodeQueryProvenance,
-    CodeQueryProvenanceStep, CodeQueryRange, CodeQueryReceiverAnalysis, CodeQueryReceiverValue,
-    CodeQueryReferenceEdge, CodeQueryReferenceSite, CodeQueryResponse, CodeQueryResult,
-    CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, CodeQuerySemanticCompleteness,
-    CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
-    CodeQuerySemanticWork, CodeQuerySourceSite, CodeQueryTaintFinding, CodeQueryTaintLimits,
-    CodeQueryTaintOrigin, CodeQueryTaintProjectionLimits, CodeQueryTaintWitness,
-    CodeQueryTypestateCertainty, CodeQueryTypestateFinding, CodeQueryTypestateFindingKind,
-    CodeQueryTypestateLimits, CodeQueryTypestateSubject, CodeQueryTypestateUncertainty,
-    CodeQueryTypestateWitness, CodeQueryTypestateWitnessStep, CodeQueryTypestateWitnessStepKind,
-    CodeQueryTypestateWork, CodeQueryValueFlowLimits, CodeQueryValueFlowWork, execute,
-    execute_request, execute_request_with_cancellation, execute_request_with_limits,
-    execute_with_limits, execute_workspace, execute_workspace_request,
+    ALL_DETAILED_CODE_QUERY_DOMAINS, CodeQueryCallArgument, CodeQueryCallSite, CodeQueryCapture,
+    CodeQueryCompletion, CodeQueryControlEdge, CodeQueryDeclaration, CodeQueryDiagnostic,
+    CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryExecutionLimits,
+    CodeQueryExecutionWork, CodeQueryExpressionSite, CodeQueryFile, CodeQueryFlowCarrierSymbol,
+    CodeQueryFlowCertainty, CodeQueryFlowCompletion, CodeQueryFlowDeclarationSegment,
+    CodeQueryFlowEndpoint, CodeQueryFlowEvent, CodeQueryFlowFactSymbol, CodeQueryFlowMustStatus,
+    CodeQueryFlowPortSymbol, CodeQueryFlowReachability, CodeQueryFlowSelectorSymbol,
+    CodeQueryFlowSolverTermination, CodeQueryFlowSymbolSite, CodeQueryFlowWitness,
+    CodeQueryFlowWitnessStep, CodeQueryFlowWitnessStepKind, CodeQueryMatch, CodeQueryProcedure,
+    CodeQueryProgramPoint, CodeQueryProgramPointBoundary, CodeQueryProgramPointRef,
+    CodeQueryProvenance, CodeQueryProvenanceStep, CodeQueryRange, CodeQueryReceiverAnalysis,
+    CodeQueryReceiverValue, CodeQueryReferenceEdge, CodeQueryReferenceSite, CodeQueryResponse,
+    CodeQueryResult, CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue,
+    CodeQueryRowField, CodeQueryRowFieldError, CodeQueryRowRef, CodeQueryRowScalarRef,
+    CodeQueryRowScalarType, CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence,
+    CodeQuerySemanticLimits, CodeQuerySemanticProof, CodeQuerySemanticWork, CodeQuerySourceSite,
+    CodeQueryTaintFinding, CodeQueryTaintLimits, CodeQueryTaintOrigin,
+    CodeQueryTaintProjectionLimits, CodeQueryTaintWitness, CodeQueryTypestateCertainty,
+    CodeQueryTypestateFinding, CodeQueryTypestateFindingKind, CodeQueryTypestateLimits,
+    CodeQueryTypestateSubject, CodeQueryTypestateUncertainty, CodeQueryTypestateWitness,
+    CodeQueryTypestateWitnessStep, CodeQueryTypestateWitnessStepKind, CodeQueryTypestateWork,
+    CodeQueryValueFlowLimits, CodeQueryValueFlowWork, execute, execute_request,
+    execute_request_with_cancellation, execute_request_with_limits, execute_with_limits,
+    execute_workspace, execute_workspace_request,
     execute_workspace_request_with_all_analysis_registration_lease,
     execute_workspace_request_with_analysis_registration_lease,
     execute_workspace_request_with_cancellation, execute_workspace_request_with_limits,
@@ -197,4 +201,5 @@ pub use search::{
     execute_workspace_request_with_registrations, execute_workspace_with_limits,
     project_taint_finding_report,
 };
+pub(crate) use search::{BoundedTaintProjection, project_taint_finding_report_bounded};
 pub use spec::{RoleSink, StructuralSpec};

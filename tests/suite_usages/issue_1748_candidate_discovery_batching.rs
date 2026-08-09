@@ -24,6 +24,8 @@
 //! separate cost recorded in the v2 plan's Surprises, and would swamp what
 //! these counters measure.
 
+use brokk_bifrost::analyzer::CodeUnitIndex;
+
 use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::AnalyzerQueryScope;
 use brokk_bifrost::usages::{UsageFinder, UsageHitKind};
@@ -134,11 +136,19 @@ fn issue_1748_a_usage_query_resolves_import_targets_in_one_batched_read() {
     // about, so the second query measures steady-state candidate discovery.
     let _ = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
 
-    analyzer.reset_definition_candidates_query_count_for_test();
-    analyzer.reset_definition_prefetch_batch_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_definition_candidates_query_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_definition_prefetch_batch_count_for_test();
     let query = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
-    let batches = analyzer.definition_prefetch_batch_count_for_test();
-    let point_lookups = analyzer.definition_candidates_query_count_for_test();
+    let batches = analyzer
+        .test_hooks()
+        .definition_prefetch_batch_count_for_test();
+    let point_lookups = analyzer
+        .test_hooks()
+        .definition_candidates_query_count_for_test();
 
     let hits = query.result.all_hits_including_imports();
     assert!(
@@ -254,11 +264,19 @@ fn issue_1748_a_multi_language_workspace_gets_the_same_batched_read() {
     let analyzer: &dyn IAnalyzer = multi.as_ref();
     let target = collect_it_target(analyzer, project.root());
 
-    rust_delegate(&multi).reset_definition_candidates_query_count_for_test();
-    rust_delegate(&multi).reset_definition_prefetch_batch_count_for_test();
+    rust_delegate(&multi)
+        .test_hooks()
+        .reset_definition_candidates_query_count_for_test();
+    rust_delegate(&multi)
+        .test_hooks()
+        .reset_definition_prefetch_batch_count_for_test();
     let query = UsageFinder::new().query(analyzer, std::slice::from_ref(&target), 1000, 1000);
-    let batches = rust_delegate(&multi).definition_prefetch_batch_count_for_test();
-    let point_lookups = rust_delegate(&multi).definition_candidates_query_count_for_test();
+    let batches = rust_delegate(&multi)
+        .test_hooks()
+        .definition_prefetch_batch_count_for_test();
+    let point_lookups = rust_delegate(&multi)
+        .test_hooks()
+        .definition_candidates_query_count_for_test();
 
     assert_eq!(
         1, batches,
@@ -327,11 +345,15 @@ fn issue_1748_a_stopped_multi_language_prefetch_memoizes_no_absence() {
         let spent = CancellationToken::default();
         spent.cancel();
         let _inner = AnalyzerQueryScope::with_cancellation(analyzer, &spent);
-        rust_delegate(&multi).reset_definition_prefetch_batch_count_for_test();
+        rust_delegate(&multi)
+            .test_hooks()
+            .reset_definition_prefetch_batch_count_for_test();
         provider.prefetch_import_targets(&files, None, &spent);
         assert_eq!(
             0,
-            rust_delegate(&multi).definition_prefetch_batch_count_for_test(),
+            rust_delegate(&multi)
+                .test_hooks()
+                .definition_prefetch_batch_count_for_test(),
             "a prefetch past the request's deadline must not issue its batched read"
         );
     }
@@ -379,11 +401,15 @@ fn issue_1809_a_read_past_the_deadline_is_neither_taken_nor_memoized() {
         let spent = CancellationToken::default();
         spent.cancel();
         let _inner = AnalyzerQueryScope::with_cancellation(&analyzer, &spent);
-        analyzer.reset_definition_candidate_row_read_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_definition_candidate_row_read_count_for_test();
         let stopped: Vec<_> = analyzer.definitions(&fq_name).collect();
         assert_eq!(
             0,
-            analyzer.definition_candidate_row_read_count_for_test(),
+            analyzer
+                .test_hooks()
+                .definition_candidate_row_read_count_for_test(),
             "a candidate-row read must not start once the request's deadline has passed"
         );
         assert!(
@@ -469,7 +495,9 @@ fn issue_1809_a_scan_passes_its_own_deadline_to_the_reads_below_it() {
         read_name: target.fq_name(),
     };
 
-    analyzer.reset_definition_candidate_row_read_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_definition_candidate_row_read_count_for_test();
     let query = UsageFinder::new()
         .with_cancellation(cancellation)
         .query_with_provider(
@@ -482,7 +510,9 @@ fn issue_1809_a_scan_passes_its_own_deadline_to_the_reads_below_it() {
 
     assert_eq!(
         0,
-        analyzer.definition_candidate_row_read_count_for_test(),
+        analyzer
+            .test_hooks()
+            .definition_candidate_row_read_count_for_test(),
         "a read issued after the scan's budget expired must not reach the store"
     );
     assert_eq!(

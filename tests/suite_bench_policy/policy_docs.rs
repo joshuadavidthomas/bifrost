@@ -139,7 +139,7 @@ fn marked_normalized_fragments_match_checked_golds() {
 }
 
 #[test]
-fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
+fn documented_match_policy_executes_and_semantic_analysis_boundary_is_explicit() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let docs = read(root.join(POLICY_DOC));
     let examples = marked_examples(root.join(POLICY_DOC).as_path(), &docs);
@@ -177,12 +177,11 @@ fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
 
     assert_policy_cli_human(workspace.root(), "policies/dynamic-eval.rqlp", human);
 
-    let unsupported_sentence = "evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824)";
-    assert_eq!(
-        docs.matches(unsupported_sentence).count(),
-        1,
-        "only the taint row should retain the #824 unsupported boundary"
-    );
+    assert!(docs.contains(
+        "Executes the production compiler, compatible batch planner, solver, retained report, and human/JSON/SARIF projection."
+    ));
+    assert!(!docs.contains("evaluation reports `unsupported` until"));
+    assert!(!docs.contains("#824 completes the flow adapter"));
     assert!(docs.contains(
         "Executes query-local semantic bindings and emits production findings with stable identity"
     ));
@@ -213,6 +212,67 @@ fn documented_match_policy_executes_and_future_analysis_boundary_is_explicit() {
     assert!(normalized_docs.contains(
         "The policy report does not currently record the analyzer version, workspace root/revision, or configured budget maxima;"
     ));
+}
+
+#[test]
+fn diff_gating_documentation_states_the_contract_and_limitations() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs = read(root.join(POLICY_DOC));
+    assert!(docs.contains("## Gate Only On What The Change Introduced"));
+    let normalized = docs.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in [
+        // The asymmetric reliability contract.
+        "an unresolvable base is an unreliable diff request, never a silent full run",
+        "degrades to full gating",
+        "`diff-base-unreliable` report diagnostic",
+        // The two accepted identity limitations.
+        "A pure file rename re-keys every finding in the file",
+        "can shift the ordinals and misclassify one pair",
+        // The gate interaction with suppressions and scope.
+        "a suppressed or scoped new finding does not gate",
+    ] {
+        assert!(
+            normalized.contains(required),
+            "policy docs must state the diff-gating contract: {required}"
+        );
+    }
+}
+
+#[test]
+fn baseline_documentation_states_the_contract() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs = read(root.join(POLICY_DOC));
+    assert!(docs.contains("## Accept Today's Findings, Gate Tomorrow's"));
+    let normalized = docs.split_whitespace().collect::<Vec<_>>().join(" ");
+    for required in [
+        // The trust rules that make the bulk mechanism safe.
+        "an unreliable run refuses to define a baseline and exits 2 without writing",
+        "A malformed or oversized document is a diagnostic and exit 2",
+        "a baseline never turns an unreliable run clean",
+        // The claim ordering and the composed gate.
+        "a finding already suppressed or scoped is not claimed by the baseline",
+        "gating counts findings that are new and unclaimed by suppression, scope, and baseline",
+        // The audit-state semantics.
+        "marks its entries drifted without reactivating them",
+        "stale only when an exhaustive completed run proves the finding absent",
+        // The size contract and the SARIF representation.
+        "100,000 entries in at most 16 MiB",
+        "`bifrost.decision: \"baseline\"`",
+        // Regeneration discipline.
+        "the baseline never refreshes itself",
+    ] {
+        assert!(
+            normalized.contains(required),
+            "policy docs must state the baseline contract: {required}"
+        );
+    }
+
+    let ci_docs = read(root.join("docs/src/content/docs/ci-github-actions.md"));
+    assert!(ci_docs.contains("--accept-current"));
+    assert!(ci_docs.contains("git add .bifrost/baseline.json"));
+
+    let cli_docs = read(root.join("docs/src/content/docs/cli.md"));
+    assert!(cli_docs.contains("`--accept-current`, `--baseline-file`"));
 }
 
 #[test]

@@ -1,9 +1,9 @@
 mod adapter;
 mod cache;
 mod clones;
-mod declarations;
+pub(crate) mod constant_identity;
 mod dependency_discovery;
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod external;
 mod gem_artifact;
 mod hierarchy;
@@ -17,127 +17,54 @@ mod tests;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::languages::{
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
+};
 use crate::analyzer::store::LimitedQueryRows;
-use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
+use crate::analyzer::type_relations::TypeRelation;
+use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupOutcome, resolve_ruby_bounded,
+};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_ruby_type_bounded};
+use crate::analyzer::usages::ruby_graph::{
+    RubyUsageGraphStrategy, build_ruby_usage_edge_weights, build_ruby_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+use crate::analyzer::weighted_cache::{
+    build_weighted_cache, weight_code_unit_set, weight_project_file_set,
+};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    CodeUnitType, DirectDescendantIndex, IAnalyzer, ImportAnalysisProvider, Language, PoolSafeMemo,
-    Project, ProjectFile, Range, RubyMethodDispatchMode, SemanticDiagnostic, SignatureMetadata,
+    DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language,
+    PoolSafeMemo, Project, ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata,
     TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider,
+    TreeSitterAnalyzer, TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
-use std::path::Path;
+
 use std::sync::{Arc, OnceLock};
 use tree_sitter::Node;
 
 pub(crate) use adapter::RubyAdapter;
-use cache::{weight_code_unit_set, weight_code_unit_vec, weight_project_file_set};
+use cache::weight_code_unit_vec;
 use clones::build_ruby_clone_candidate_data;
 
-pub(crate) use declarations::{
-    RubyFieldScope, RubyNamePath, extract_name_path, extract_name_segments, parse_ruby_tree,
-    ruby_field_short_name, ruby_variable_field_name,
+pub(crate) use brokk_bifrost_ruby::declarations::{
+    RubyFieldScope, RubyNamePath, extract_name_segments, parse_ruby_tree, ruby_field_short_name,
+};
+pub(crate) use brokk_bifrost_ruby::graph_support::RubySemanticFacts;
+pub(crate) use brokk_bifrost_ruby::imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
+pub(crate) use brokk_bifrost_ruby::syntax::{
+    is_runtime_node, ruby_call_arguments, ruby_semantic_identifier_range,
 };
 pub use dependency_discovery::resolve_ruby_semantic_pack_dependencies;
-pub use external::RubyDependencyPackAdapter;
-pub(crate) use imports::{is_ruby_autoload_symbol_argument, ruby_symbol_name};
-
-pub(crate) fn single_static_string_content_node(node: Node<'_>) -> Option<Node<'_>> {
-    if node.named_child_count() != 1 {
-        return None;
-    }
-    let content = node.named_child(0)?;
-    (content.kind() == "string_content").then_some(content)
-}
-
-pub(crate) fn ruby_call_arguments(node: Node<'_>) -> Vec<Node<'_>> {
-    let Some(arguments) = ruby_call_arguments_node(node) else {
-        return Vec::new();
-    };
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .filter(|child| is_runtime_node(child.kind()))
-        .collect()
-}
-
-pub(crate) fn ruby_first_call_argument(node: Node<'_>) -> Option<Node<'_>> {
-    let arguments = ruby_call_arguments_node(node)?;
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .find(|child| is_runtime_node(child.kind()))
-}
-
-fn ruby_call_arguments_node(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("arguments")
-}
-
-fn is_runtime_node(kind: &str) -> bool {
-    !matches!(
-        kind,
-        "comment"
-            | "method_parameters"
-            | "lambda_parameters"
-            | "block_parameters"
-            | "block_parameter"
-            | "optional_parameter"
-            | "keyword_parameter"
-            | "splat_parameter"
-            | "hash_splat_parameter"
-            | "forward_parameter"
-            | "destructured_parameter"
-            | "exception_variable"
-            | "hash_key_symbol"
-            | "bare_symbol"
-    )
-}
-
-/// Returns the source range of the semantic identifier carried by a Ruby symbol.
-///
-/// Tree-sitter represents an unquoted symbol such as `:audit` as one leaf
-/// `simple_symbol` node, so its parser range includes the leading colon. Static
-/// quoted symbols have a structured `string_content` child that excludes both
-/// the colon and quote delimiters. Other nodes keep their parser range.
-pub(crate) fn ruby_semantic_identifier_range(node: Node<'_>, source: &str) -> Range {
-    let node_range = || Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    };
-
-    match node.kind() {
-        "simple_symbol" => {
-            let text = source.get(node.start_byte()..node.end_byte()).unwrap_or("");
-            if text.strip_prefix(':').is_none_or(str::is_empty) {
-                return node_range();
-            }
-            Range {
-                start_byte: node.start_byte() + ':'.len_utf8(),
-                end_byte: node.end_byte(),
-                start_line: node.start_position().row,
-                end_line: node.end_position().row,
-            }
-        }
-        "delimited_symbol" => {
-            let Some(content) = single_static_string_content_node(node) else {
-                return node_range();
-            };
-            Range {
-                start_byte: content.start_byte(),
-                end_byte: content.end_byte(),
-                start_line: content.start_position().row,
-                end_line: content.end_position().row,
-            }
-        }
-        _ => node_range(),
-    }
-}
+pub use external::{RubyDependencyPackAdapter, RubyGemArchivePackProducer};
 
 #[derive(Clone)]
 pub struct RubyAnalyzer {
@@ -146,7 +73,10 @@ pub struct RubyAnalyzer {
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
+    /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
+    /// from rayon workers during cold scans, and a blocking `get_or_init` parks
+    /// every one of them behind the single initializer for its full duration.
+    direct_descendant_index: Arc<PoolSafeMemo<DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     autoload_constant_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
     zeitwerk_project: Arc<OnceLock<bool>>,
@@ -206,7 +136,7 @@ impl RubyAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
-            direct_descendant_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             autoload_constant_files: Arc::new(OnceLock::new()),
             zeitwerk_project: Arc::new(OnceLock::new()),
@@ -293,13 +223,31 @@ impl RubyAnalyzer {
         self.inner.signature_metadata_limited(unit, limit)
     }
 
+    pub(crate) fn signatures_limited(
+        &self,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        self.inner.signatures_limited(unit, limit)
+    }
+
+    #[doc(hidden)]
+    pub fn reset_full_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn full_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test()
+    }
+
     pub(crate) fn ranges_limited(&self, unit: &CodeUnit, limit: usize) -> LimitedQueryRows<Range> {
         self.inner.ranges_limited(unit, limit)
     }
 
     pub(crate) fn semantic_facts(&self) -> &RubySemanticFacts {
         self.semantic_facts
-            .get_or_init(|| RubySemanticFacts::build(self))
+            .get_or_init(|| brokk_bifrost_ruby::graph_support::build_ruby_semantic_facts(self))
     }
 
     pub(crate) fn method_dispatch_mode(&self, unit: &CodeUnit) -> RubyMethodDispatchMode {
@@ -315,87 +263,27 @@ impl RubyAnalyzer {
     ) -> LimitedQueryRows<RubyMethodDispatchMode> {
         self.inner.ruby_method_dispatch_modes_limited(unit, limit)
     }
-
-    pub(crate) fn forward_raw_supertypes(&self, unit: &CodeUnit) -> Vec<String> {
-        self.forward_superclass_targets(unit)
-    }
 }
 
-pub(crate) struct RubySemanticFacts {
-    pub(crate) ancestors: HashMap<String, HashSet<String>>,
-    pub(crate) mixin_included_owners: HashMap<String, Vec<String>>,
-    pub(crate) mixin_prepended_owners: HashMap<String, Vec<String>>,
-    pub(crate) mixin_class_owners: HashMap<String, Vec<String>>,
-}
+use crate::analyzer::CodeUnitIndex;
 
-impl RubySemanticFacts {
-    fn build(ruby: &RubyAnalyzer) -> Self {
-        let mut ancestors = HashMap::default();
-        let mut mixin_included_owners: HashMap<String, Vec<String>> = HashMap::default();
-        let mut mixin_prepended_owners: HashMap<String, Vec<String>> = HashMap::default();
-        let mut mixin_class_owners: HashMap<String, Vec<String>> = HashMap::default();
-
-        for unit in ruby
-            .all_declarations()
-            .filter(|unit| unit.is_class() || unit.is_module())
-        {
-            let direct = ruby
-                .get_direct_ancestors(&unit)
-                .into_iter()
-                .map(|ancestor| ancestor.fq_name())
-                .collect();
-            ancestors.insert(unit.fq_name(), direct);
-        }
-
-        for relation in ruby.mixin_relations() {
-            let entry = match relation.kind {
-                TypeRelationKind::MixinInclude => &mut mixin_included_owners,
-                TypeRelationKind::MixinPrepend => &mut mixin_prepended_owners,
-                TypeRelationKind::MixinExtend => &mut mixin_class_owners,
-                _ => continue,
-            };
-            push_ordered_mixin(entry, relation.from.fq_name(), relation.to.fq_name());
-        }
-
-        Self {
-            ancestors,
-            mixin_included_owners,
-            mixin_prepended_owners,
-            mixin_class_owners,
-        }
-    }
-}
-
-fn push_ordered_mixin(index: &mut HashMap<String, Vec<String>>, from: String, to: String) {
-    let owners = index.entry(from).or_default();
-    if !owners.contains(&to) {
-        owners.push(to);
-    }
-}
-
-impl IAnalyzer for RubyAnalyzer {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.begin_query(context);
+impl CodeUnitIndex for RubyAnalyzer {
+    fn enclosing_code_unit(
+        &self,
+        file: &ProjectFile,
+        range: &crate::analyzer::Range,
+    ) -> Option<CodeUnit> {
+        self.inner.enclosing_code_unit(file, range)
     }
 
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.end_query(context);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
-    }
-
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        self.inner
+            .enclosing_code_unit_for_lines(file, start_line, end_line)
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
@@ -415,6 +303,14 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
         self.inner.indexed_source(file)
+    }
+
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.inner.location_declarations(file)
+    }
+
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
+        self.inner.location_ranges(code_unit)
     }
 
     fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
@@ -440,52 +336,8 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .global_usage_definition_index_build_count_for_test()
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner.reset_full_declaration_scan_count_for_test();
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.full_declaration_scan_count_for_test()
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
-    }
-
-    fn structural_search_providers(
-        &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
-    }
-
-    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
-        Some(self.inner.snapshot_caches())
-    }
-
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
-    }
-
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
@@ -502,10 +354,6 @@ impl IAnalyzer for RubyAnalyzer {
             .ranges_with_limit(code_unit, max_ranges, cancellation)
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
-    }
-
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures(code_unit)
     }
@@ -518,64 +366,8 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.languages()
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self::from_inner(self.inner.update(changed_files), self.memo_budget)
-    }
-
-    fn update_all(&self) -> Self {
-        Self::from_inner(self.inner.update_all(), self.memo_budget)
-    }
-
     fn project(&self) -> &dyn Project {
         self.inner.project()
-    }
-
-    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
-        self.inner.parse_errors(file)
-    }
-
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_ruby_semantic_diagnostics(self, file, source)
-            .into_iter()
-            .map(Into::into)
-            .collect()
-    }
-
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
-    }
-
-    fn enclosing_code_unit(
-        &self,
-        file: &ProjectFile,
-        range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
-    }
-
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
-    }
-
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
@@ -612,12 +404,108 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.lookup_candidates_by_short_name(symbol)
     }
 
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        self.inner.has_complete_symbol_lookup_index()
+    }
+
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_declarations_by_identifier(identifier)
     }
+}
 
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.inner.has_complete_symbol_lookup_index()
+impl IAnalyzer for RubyAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
+    }
+
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.inner.workspace_file_index_cell()
+    }
+
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
+        self.inner.global_usage_definition_index()
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
+    }
+
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(self.inner.snapshot_caches())
+    }
+
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
+    }
+
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        Self::from_inner(self.inner.update(changed_files), self.memo_budget)
+    }
+
+    fn update_all(&self) -> Self {
+        Self::from_inner(self.inner.update_all(), self.memo_budget)
+    }
+
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        diagnostics::collect_ruby_semantic_diagnostics(self, file, source)
+    }
+
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        self.inner.extract_call_receiver(reference)
+    }
+
+    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
+        self.inner.is_access_expression(file, start_byte, end_byte)
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+        ident: &str,
+    ) -> Option<crate::analyzer::DeclarationInfo> {
+        self.inner
+            .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
     fn search_symbol_candidates(
@@ -665,7 +553,9 @@ impl IAnalyzer for RubyAnalyzer {
         let Ok(source) = self.inner.project().read_source(file) else {
             return Vec::new();
         };
-        tests::detect_ruby_test_assertion_smells(file, &source, &weights)
+        brokk_bifrost_ruby::test_detection::detect_ruby_test_assertion_smells(
+            file, &source, &weights,
+        )
     }
 
     fn find_test_assertion_smells_limited(
@@ -688,7 +578,12 @@ impl IAnalyzer for RubyAnalyzer {
                 truncated: false,
             };
         };
-        tests::detect_ruby_test_assertion_smells_limited(file, &source, &weights, max_candidates)
+        brokk_bifrost_ruby::test_detection::detect_ruby_test_assertion_smells_limited(
+            file,
+            &source,
+            &weights,
+            max_candidates,
+        )
     }
 
     fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
@@ -701,5 +596,213 @@ impl IAnalyzer for RubyAnalyzer {
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
         Some(self)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::AnalyzerTestHooks for RubyAnalyzer {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+}
+
+static RUBY_USAGE_STRATEGY: RubyUsageGraphStrategy = RubyUsageGraphStrategy::new();
+
+pub(crate) struct RubySupport;
+
+impl LanguageSupport for RubySupport {
+    fn language(&self) -> Language {
+        Language::Ruby
+    }
+
+    fn declaration_name_range(&self, node: Node<'_>, source: &str) -> Range {
+        ruby_semantic_identifier_range(node, source)
+    }
+
+    fn symbol_literal_name(&self, node: Node<'_>, source: &str) -> Option<String> {
+        ruby_symbol_name(node, source)
+    }
+
+    fn signature_metadata_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        resolve_analyzer::<RubyAnalyzer>(analyzer)
+            .map(|ruby| ruby.signature_metadata_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<RubyAnalyzer>(analyzer).map(|ruby| ruby.signatures_limited(unit, limit))
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<RubyAnalyzer>(analyzer).map(|ruby| ruby.ranges_limited(unit, limit))
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<RubyAnalyzer>(analyzer).map(|value| value as _)
+    }
+
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Ruby
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &RUBY_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&RubyEdgePass)
+    }
+
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&RUBY_USAGE_STRATEGY),
+            bulk: Some(&RubyDeadCodeBulk),
+        }
+    }
+
+    fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        Some(&RubySupport)
+    }
+
+    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
+        tree_sitter_ruby::LANGUAGE.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &structural::RUBY_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(tree_sitter_ruby::HIGHLIGHTS_QUERY)
+    }
+}
+
+struct RubyEdgePass;
+
+impl LanguageEdgePass for RubyEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Ruby
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_ruby_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_ruby_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
+    }
+}
+
+impl StructuralReceiverResolver for RubySupport {
+    fn resolve_type_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        resolve_ruby_type_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+
+    fn resolve_definition_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        resolve_ruby_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+}
+
+struct RubyDeadCodeBulk;
+
+impl DeadCodeBulkProof for RubyDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Ruby
+    }
+
+    /// Only fields are held back: a Ruby attribute's readers and writers are synthesized
+    /// rather than called by name, so the inverted pass cannot see their uses.
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        routing.candidate.is_field()
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "Ruby",
+            files: analyzable_file_count(analyzer, Language::Ruby),
+        }
+    }
+
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::Ruby,
+            |unit| unit.is_function() || unit.is_class(),
+            candidates,
+        );
+        build_ruby_usage_edges(analyzer, &nodes, |_| true)
+            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
     }
 }

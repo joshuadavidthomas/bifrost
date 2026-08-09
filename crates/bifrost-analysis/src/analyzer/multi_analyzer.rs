@@ -1,16 +1,20 @@
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::jvm::realm::JvmSourceRealm;
+use crate::analyzer::jvm::realm_builder::jvm_source_realm;
+use crate::analyzer::store::StoreError;
 use crate::analyzer::{
-    CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
-    DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
-    GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, JavascriptAnalyzer,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzer, CloneSmell,
+    CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer, DeclarationInfo,
+    DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights, GoAnalyzer, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer, JavascriptAnalyzer,
     KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
     RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
-    SemanticDiagnostic, SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider, TypescriptAnalyzer,
+    SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    TypescriptAnalyzer,
 };
 use crate::hash::{HashMap, HashSet};
+use crate::profiling;
+use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,6 +22,13 @@ use std::sync::{Arc, Mutex};
 
 /// Resolve a concrete analyzer of type `T` out of a `&dyn IAnalyzer`, whether it is
 /// that analyzer directly or a [`MultiAnalyzer`] holding it as a per-language delegate.
+///
+/// The contract: `T` must be a concrete analyzer type (`RustAnalyzer`,
+/// `CppAnalyzer`, ...); `None` means the workspace holds no analyzer of that
+/// type, which callers treat as "no declarations of that language exist" --
+/// never as an error. This is the one supported downcast from the framework's
+/// `&dyn IAnalyzer` into a language analyzer; host crates (e.g. the LSP
+/// handlers) call it rather than re-deriving the delegate walk.
 pub fn resolve_analyzer<T: Any>(analyzer: &dyn IAnalyzer) -> Option<&T> {
     if let Some(direct) = (analyzer as &dyn Any).downcast_ref::<T>() {
         return Some(direct);
@@ -219,6 +230,52 @@ impl AnalyzerDelegate {
     }
 }
 
+/// Construct the concrete analyzer serving `language`.
+///
+/// Assembly-layer code: this is the one place outside the registry allowed to name
+/// concrete per-language analyzer types, because concrete storage and construction is
+/// what [`AnalyzerDelegate`] is for.
+pub(crate) fn build_language_delegate(
+    language: Language,
+    project: Arc<dyn Project>,
+    config: AnalyzerConfig,
+    mut store_context: AnalyzerStoreContext,
+    progress: Option<BuildProgress>,
+    revalidate_filesystem_paths: bool,
+) -> Result<AnalyzerDelegate, StoreError> {
+    let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
+    store_context.live_paths = Arc::new(if revalidate_filesystem_paths {
+        crate::analyzer::store::liveness::LivePathMap::default()
+    } else {
+        crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation()
+    });
+    macro_rules! build_delegate {
+        ($variant:ident, $analyzer:ty) => {
+            AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
+                project,
+                config,
+                store_context,
+                progress,
+            )?)
+        };
+    }
+    Ok(match language {
+        Language::Java => build_delegate!(Java, JavaAnalyzer),
+        Language::Go => build_delegate!(Go, GoAnalyzer),
+        Language::Cpp => build_delegate!(Cpp, CppAnalyzer),
+        Language::JavaScript => build_delegate!(JavaScript, JavascriptAnalyzer),
+        Language::TypeScript => build_delegate!(TypeScript, TypescriptAnalyzer),
+        Language::Python => build_delegate!(Python, PythonAnalyzer),
+        Language::Rust => build_delegate!(Rust, RustAnalyzer),
+        Language::Php => build_delegate!(Php, PhpAnalyzer),
+        Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
+        Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
+        Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
+        Language::Kotlin => build_delegate!(Kotlin, KotlinAnalyzer),
+        Language::None => unreachable!("Language::None is filtered before delegate build"),
+    })
+}
+
 fn is_js_ts_config_file(file: &ProjectFile) -> bool {
     matches!(
         file.rel_path().file_name().and_then(|name| name.to_str()),
@@ -300,8 +357,36 @@ impl MultiAnalyzer {
         }
     }
 
+    /// The delegate language a file's queries route to.
+    ///
+    /// The extension registry answers for every file it names. A file it does
+    /// not name may still be analyzed, because a language claimed it through
+    /// its own imports (#1837): route those to the one language that infers
+    /// claims, so a query positioned inside an adopted `.inc` reaches the
+    /// analyzer that indexed it instead of falling off the routing table.
+    ///
+    /// An unclaimed-extension file that inference did NOT adopt routes to that
+    /// same delegate and finds nothing there, which is the same empty answer it
+    /// got when it routed nowhere. Asking each delegate whether it analyzed the
+    /// file would be exact, but that is a store round-trip on a path every
+    /// query takes.
+    ///
+    /// CLAIMS SEAM: see [`crate::analyzer::languages::claim_inferring_languages`].
+    /// With two inferring languages this must become a real lookup.
+    fn dispatch_language(&self, file: &ProjectFile) -> Language {
+        let language = language_for_file(file);
+        if language != Language::None {
+            return language;
+        }
+        crate::analyzer::languages::claim_inferring_languages()
+            .iter()
+            .copied()
+            .find(|language| self.delegates.contains_key(language))
+            .unwrap_or(Language::None)
+    }
+
     pub(crate) fn delegate_for_file(&self, file: &ProjectFile) -> Option<&AnalyzerDelegate> {
-        self.delegates.get(&language_for_file(file))
+        self.delegates.get(&self.dispatch_language(file))
     }
 
     pub(crate) fn program_semantics_provider_for_file(
@@ -329,7 +414,7 @@ impl MultiAnalyzer {
         let Some(AnalyzerDelegate::Kotlin(kotlin)) = self.delegates.get(&Language::Kotlin) else {
             return None;
         };
-        let realm = JvmSourceRealm::of(self);
+        let realm = jvm_source_realm(self);
         realm
             .has_peers_of(Language::Kotlin)
             .then_some((kotlin, realm))
@@ -337,7 +422,7 @@ impl MultiAnalyzer {
 }
 
 impl ImportAnalysisProvider for MultiAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         // A Kotlin file can import a Java or Scala declaration from the same
         // workspace, and only the multi-analyzer can see both sides.
         if language_for_file(file) == Language::Kotlin
@@ -383,7 +468,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
             grouped
-                .entry(language_for_file(file))
+                .entry(self.dispatch_language(file))
                 .or_default()
                 .push(file.clone());
         }
@@ -481,6 +566,20 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         }
     }
 
+    /// A file whose language has no delegate is undecided, not unreachable:
+    /// `unwrap_or` must not manufacture a proof the workspace never made.
+    fn import_reachability(
+        &self,
+        source_file: &ProjectFile,
+        imports: &[ImportInfo],
+        target: &ProjectFile,
+    ) -> ImportReachability {
+        self.delegate_for_file(source_file)
+            .and_then(AnalyzerDelegate::import_analysis_provider)
+            .map(|provider| provider.import_reachability(source_file, imports, target))
+            .unwrap_or(ImportReachability::Unknown)
+    }
+
     /// Without this override, `MultiAnalyzer` falls back to the trait default (always `None`) instead
     /// of forwarding to the per-language delegate's implementation -- silently defeating a delegate's
     /// own `imported_code_units_from_infos` (e.g. Python's) for every workspace-level caller that goes
@@ -489,7 +588,7 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         &self,
         file: &ProjectFile,
         imports: &[ImportInfo],
-    ) -> Option<HashSet<CodeUnit>> {
+    ) -> Option<Arc<HashSet<CodeUnit>>> {
         self.delegate_for_file(file)
             .and_then(AnalyzerDelegate::import_analysis_provider)
             .and_then(|provider| provider.imported_code_units_from_infos(file, imports))
@@ -570,6 +669,34 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     }
 }
 
+/// Method families across the whole workspace (#1477 M4).
+///
+/// The delegation mirrors `TypeHierarchyProvider`'s, and for the same reason:
+/// a Kotlin class can override a Java method, so the ancestor and descendant
+/// edges a family walk needs are exactly the realm-aware ones only the
+/// multi-analyzer resolves. The per-language relation therefore receives
+/// `self` as its hierarchy source rather than the owning delegate.
+///
+/// Language support is stated per member, never defaulted: a member whose
+/// language has no landed family answers `unsupported`, even though this
+/// composite exposes a provider for the workspace as a whole.
+impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
+    fn member_family_capability(
+        &self,
+        member: &CodeUnit,
+    ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
+        crate::analyzer::usages::java_member_family_capability(self, member)
+    }
+
+    fn member_family(
+        &self,
+        member: &CodeUnit,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::MemberFamilyAnswer {
+        crate::analyzer::usages::java_member_family(self, self, member, cancellation)
+    }
+}
+
 impl TypeAliasProvider for MultiAnalyzer {
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.delegate_for_code_unit(code_unit)
@@ -581,7 +708,325 @@ impl TypeAliasProvider for MultiAnalyzer {
 
 impl TestDetectionProvider for MultiAnalyzer {}
 
+use crate::analyzer::CodeUnitIndex;
+
+impl CodeUnitIndex for MultiAnalyzer {
+    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().enclosing_code_unit(file, range))
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        self.delegate_for_file(file).and_then(|delegate| {
+            delegate
+                .analyzer()
+                .enclosing_code_unit_for_lines(file, start_line, end_line)
+        })
+    }
+
+    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
+        match self.delegate_for_file(file) {
+            Some(delegate) => delegate.analyzer().top_level_declarations(file),
+            None => Vec::new(),
+        }
+    }
+
+    fn summary_file_projection(&self, file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().summary_file_projection(file))
+    }
+
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
+        let mut files: Vec<_> = self
+            .delegates
+            .values()
+            .flat_map(|delegate| delegate.analyzer().analyzed_files())
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
+        self.delegate_for_file(file)
+            .and_then(|delegate| delegate.analyzer().indexed_source(file))
+    }
+
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.delegate_for_file(file)
+            .map(|delegate| delegate.analyzer().location_declarations(file))
+            .unwrap_or_default()
+    }
+
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        self.delegate_for_code_unit(code_unit)
+            .map(|delegate| delegate.analyzer().location_ranges(code_unit))
+            .unwrap_or_default()
+    }
+
+    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
+        self.delegate_for_file(file)
+            .is_some_and(|delegate| delegate.analyzer().indexed_source_matches(file, source))
+    }
+
+    fn render_source_fragment(
+        &self,
+        code_unit: &CodeUnit,
+        source: String,
+        declaration_start: usize,
+    ) -> String {
+        match self.delegate_for_code_unit(code_unit) {
+            Some(delegate) => {
+                delegate
+                    .analyzer()
+                    .render_source_fragment(code_unit, source, declaration_start)
+            }
+            None => source,
+        }
+    }
+
+    fn is_analyzed(&self, file: &ProjectFile) -> bool {
+        self.delegates
+            .values()
+            .any(|delegate| delegate.analyzer().is_analyzed(file))
+    }
+
+    fn languages(&self) -> BTreeSet<Language> {
+        self.delegates.keys().copied().collect()
+    }
+
+    fn project(&self) -> &dyn Project {
+        self.delegates
+            .values()
+            .next()
+            .expect("MultiAnalyzer requires at least one delegate")
+            .analyzer()
+            .project()
+    }
+
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        Box::new(
+            self.delegates
+                .values()
+                .flat_map(|delegate| delegate.analyzer().all_declarations()),
+        )
+    }
+
+    fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
+        self.delegates
+            .values()
+            .flat_map(|delegate| delegate.analyzer().all_declarations_with_primary_ranges())
+            .collect()
+    }
+
+    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        match self.delegate_for_file(file) {
+            Some(delegate) => delegate.analyzer().declarations(file),
+            None => BTreeSet::new(),
+        }
+    }
+
+    fn materialization_records(
+        &self,
+        file: &ProjectFile,
+    ) -> Vec<crate::analyzer::structural::materialization::MaterializationRecord> {
+        match self.delegate_for_file(file) {
+            Some(delegate) => delegate.analyzer().materialization_records(file),
+            None => Vec::new(),
+        }
+    }
+
+    fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        let matches: Vec<_> = self
+            .delegates
+            .iter()
+            .flat_map(|(language, delegate)| {
+                let _scope =
+                    crate::profiling::scope(format!("multi.definitions[{language:?}][{fq_name}]"));
+                delegate.analyzer().definitions(fq_name)
+            })
+            .collect();
+        Box::new(matches.into_iter())
+    }
+
+    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        match self.delegate_for_code_unit(code_unit) {
+            Some(delegate) => delegate.analyzer().direct_children(code_unit),
+            None => Vec::new(),
+        }
+    }
+
+    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        match self.delegate_for_code_unit(code_unit) {
+            Some(delegate) => delegate.analyzer().direct_children_in_file(code_unit),
+            None => Vec::new(),
+        }
+    }
+
+    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        self.delegate_for_code_unit(code_unit)
+            .and_then(|delegate| delegate.analyzer().parent_of(code_unit))
+    }
+
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        self.delegate_for_code_unit(code_unit)
+            .map(|delegate| delegate.analyzer().ranges(code_unit))
+            .unwrap_or_default()
+    }
+
+    fn ranges_with_limit(
+        &self,
+        code_unit: &CodeUnit,
+        max_ranges: usize,
+        cancellation: &crate::CancellationToken,
+    ) -> (Vec<Range>, usize, bool) {
+        self.delegate_for_code_unit(code_unit)
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .ranges_with_limit(code_unit, max_ranges, cancellation)
+            })
+            .unwrap_or_default()
+    }
+
+    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
+        self.delegate_for_code_unit(code_unit)
+            .and_then(|delegate| delegate.analyzer().get_skeleton(code_unit))
+    }
+
+    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
+        self.delegate_for_code_unit(code_unit)
+            .and_then(|delegate| delegate.analyzer().get_skeleton_header(code_unit))
+    }
+
+    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
+        self.delegate_for_code_unit(code_unit)
+            .and_then(|delegate| delegate.analyzer().get_source(code_unit, include_comments))
+    }
+
+    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
+        self.delegate_for_code_unit(code_unit)
+            .map(|delegate| delegate.analyzer().get_sources(code_unit, include_comments))
+            .unwrap_or_default()
+    }
+
+    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
+        self.delegates
+            .values()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|delegate| delegate.analyzer().search_definitions(pattern, auto_quote))
+            .reduce(BTreeSet::new, |mut acc, definitions| {
+                acc.extend(definitions);
+                acc
+            })
+    }
+
+    fn search_definitions_by_suffix_pattern(
+        &self,
+        pattern: &str,
+        terminal_identifiers: &[String],
+        language: Language,
+    ) -> BTreeSet<CodeUnit> {
+        // The pattern is language-specific, so only that language's delegate
+        // can produce matches the caller keeps; fanning out to every delegate
+        // multiplied lookup cost by the language count (#1430).
+        self.delegates
+            .get(&language)
+            .map(|delegate| {
+                delegate.analyzer().search_definitions_by_suffix_pattern(
+                    pattern,
+                    terminal_identifiers,
+                    language,
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
+        self.delegates
+            .values()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|delegate| delegate.analyzer().lookup_candidates_by_short_name(symbol))
+            .reduce(BTreeSet::new, |mut acc, candidates| {
+                acc.extend(candidates);
+                acc
+            })
+    }
+
+    /// Every delegate must be able to answer from an index before a miss is
+    /// conclusive: one in-memory delegate's incomplete view would make a
+    /// qualified miss mean "not in the indexed languages", not "not in the
+    /// workspace".
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        self.delegates
+            .values()
+            .all(|delegate| delegate.analyzer().has_complete_symbol_lookup_index())
+    }
+
+    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.delegates
+            .values()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .lookup_candidates_by_identifier(identifier)
+            })
+            .reduce(BTreeSet::new, |mut acc, candidates| {
+                acc.extend(candidates);
+                acc
+            })
+    }
+
+    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
+        // Fan out to each delegate's `search_definitions_persisted` so the
+        // FTS5 path is consulted per-language. The default impl on
+        // `IAnalyzer` would otherwise re-dispatch through our own
+        // `search_definitions` override, which only hits in-memory state.
+        self.delegates
+            .values()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|delegate| delegate.analyzer().search_definitions_persisted(pattern))
+            .reduce(BTreeSet::new, |mut acc, definitions| {
+                acc.extend(definitions);
+                acc
+            })
+    }
+
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.delegate_for_code_unit(code_unit)
+            .map(|delegate| delegate.analyzer().signatures(code_unit))
+            .unwrap_or_default()
+    }
+
+    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.delegate_for_code_unit(code_unit)
+            .map(|delegate| delegate.analyzer().signature_metadata(code_unit))
+            .unwrap_or_default()
+    }
+}
+
 impl IAnalyzer for MultiAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn invalidate_cached_file_identities(&self) {
+        self.delegates
+            .values()
+            .for_each(|delegate| delegate.analyzer().invalidate_cached_file_identities());
+    }
+
     fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         let mut contexts = self
             .query_contexts
@@ -634,65 +1079,6 @@ impl IAnalyzer for MultiAnalyzer {
             .next()?
             .analyzer()
             .workspace_file_index_cell()
-    }
-
-    fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
-        match self.delegate_for_file(file) {
-            Some(delegate) => delegate.analyzer().top_level_declarations(file),
-            None => Vec::new(),
-        }
-    }
-
-    fn summary_file_projection(&self, file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
-        self.delegate_for_file(file)
-            .and_then(|delegate| delegate.analyzer().summary_file_projection(file))
-    }
-
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        let mut files: Vec<_> = self
-            .delegates
-            .values()
-            .flat_map(|delegate| delegate.analyzer().analyzed_files())
-            .collect();
-        files.sort();
-        files.dedup();
-        files
-    }
-
-    fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
-        self.delegate_for_file(file)
-            .and_then(|delegate| delegate.analyzer().indexed_source(file))
-    }
-
-    fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
-        self.delegate_for_file(file)
-            .is_some_and(|delegate| delegate.analyzer().indexed_source_matches(file, source))
-    }
-
-    fn render_source_fragment(
-        &self,
-        code_unit: &CodeUnit,
-        source: String,
-        declaration_start: usize,
-    ) -> String {
-        match self.delegate_for_code_unit(code_unit) {
-            Some(delegate) => {
-                delegate
-                    .analyzer()
-                    .render_source_fragment(code_unit, source, declaration_start)
-            }
-            None => source,
-        }
-    }
-
-    fn is_analyzed(&self, file: &ProjectFile) -> bool {
-        self.delegates
-            .values()
-            .any(|delegate| delegate.analyzer().is_analyzed(file))
-    }
-
-    fn languages(&self) -> BTreeSet<Language> {
-        self.delegates.keys().copied().collect()
     }
 
     fn warm_query_indexes(&self) {
@@ -760,60 +1146,6 @@ impl IAnalyzer for MultiAnalyzer {
         Self::new_with_derived_layer_budget(delegates, self.derived_layer_budget_bytes)
     }
 
-    fn project(&self) -> &dyn Project {
-        self.delegates
-            .values()
-            .next()
-            .expect("MultiAnalyzer requires at least one delegate")
-            .analyzer()
-            .project()
-    }
-
-    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        Box::new(
-            self.delegates
-                .values()
-                .flat_map(|delegate| delegate.analyzer().all_declarations()),
-        )
-    }
-
-    fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
-        self.delegates
-            .values()
-            .flat_map(|delegate| delegate.analyzer().all_declarations_with_primary_ranges())
-            .collect()
-    }
-
-    fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
-        match self.delegate_for_file(file) {
-            Some(delegate) => delegate.analyzer().declarations(file),
-            None => BTreeSet::new(),
-        }
-    }
-
-    fn materialization_records(
-        &self,
-        file: &ProjectFile,
-    ) -> Vec<crate::analyzer::structural::materialization::MaterializationRecord> {
-        match self.delegate_for_file(file) {
-            Some(delegate) => delegate.analyzer().materialization_records(file),
-            None => Vec::new(),
-        }
-    }
-
-    fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        let matches: Vec<_> = self
-            .delegates
-            .iter()
-            .flat_map(|(language, delegate)| {
-                let _scope =
-                    crate::profiling::scope(format!("multi.definitions[{language:?}][{fq_name}]"));
-                delegate.analyzer().definitions(fq_name)
-            })
-            .collect();
-        Box::new(matches.into_iter())
-    }
-
     /// A view over the delegates' own indexes, never a merged copy.
     ///
     /// Each shard is built lazily by its delegate on first use, so the cost of
@@ -836,172 +1168,9 @@ impl IAnalyzer for MultiAnalyzer {
         )
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .reset_global_usage_definition_index_build_count_for_test();
-        }
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .global_usage_definition_index_build_count_for_test()
-            })
-            .sum::<usize>()
-    }
-
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .reset_definition_candidates_query_count_for_test();
-        }
-    }
-
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .definition_candidates_query_count_for_test()
-            })
-            .sum()
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .reset_full_declaration_scan_count_for_test();
-        }
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| delegate.analyzer().full_declaration_scan_count_for_test())
-            .sum()
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .reset_candidate_hydration_count_for_test();
-        }
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| delegate.analyzer().candidate_hydration_count_for_test())
-            .sum()
-    }
-
-    fn full_candidate_hydration_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .full_candidate_hydration_count_for_test()
-            })
-            .sum()
-    }
-
-    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .bulk_candidate_hydration_count_for_test()
-            })
-            .sum()
-    }
-
-    fn reset_workspace_path_scan_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .reset_workspace_path_scan_count_for_test();
-        }
-    }
-
-    fn workspace_path_scan_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| delegate.analyzer().workspace_path_scan_count_for_test())
-            .sum()
-    }
-
-    fn reset_scala_project_types_build_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .reset_scala_project_types_build_count_for_test();
-        }
-    }
-
-    fn scala_project_types_build_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .scala_project_types_build_count_for_test()
-            })
-            .sum()
-    }
-
-    fn reset_scala_query_scan_counts_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate.analyzer().reset_scala_query_scan_counts_for_test();
-        }
-    }
-
-    fn scala_query_parse_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| delegate.analyzer().scala_query_parse_count_for_test())
-            .sum()
-    }
-
-    fn scala_query_walk_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| delegate.analyzer().scala_query_walk_count_for_test())
-            .sum()
-    }
-
-    fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        match self.delegate_for_code_unit(code_unit) {
-            Some(delegate) => delegate.analyzer().direct_children(code_unit),
-            None => Vec::new(),
-        }
-    }
-
-    fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        match self.delegate_for_code_unit(code_unit) {
-            Some(delegate) => delegate.analyzer().direct_children_in_file(code_unit),
-            None => Vec::new(),
-        }
-    }
-
     fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
         self.delegate_for_code_unit(code_unit)
             .and_then(|delegate| delegate.analyzer().declaration_syntax_kind(code_unit))
-    }
-
-    fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        self.delegate_for_code_unit(code_unit)
-            .and_then(|delegate| delegate.analyzer().parent_of(code_unit))
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -1009,25 +1178,137 @@ impl IAnalyzer for MultiAnalyzer {
             .and_then(|delegate| delegate.analyzer().parse_errors(file))
     }
 
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        // A Kotlin file's unresolved-type diagnostics must see the same
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        // JVM diagnostics must see the same
         // wider JVM source realm its import and hierarchy resolution do:
         // otherwise a type declared in a Java or Scala sibling file would be
         // misreported as unrecognized. Only `MultiAnalyzer` can construct
         // that realm view (see `kotlin_realm`), so this is the one place the
         // widening happens rather than inside `KotlinAnalyzer` itself.
         if language_for_file(file) == Language::Kotlin
-            && let Some((kotlin, realm)) = self.kotlin_realm()
+            && self.delegates.contains_key(&Language::Kotlin)
         {
+            // Every Kotlin file routes here, not only one with Java or Scala
+            // peers: the realm widens *resolution*, but the active dependency
+            // model that decides whether a miss is provable is published on the
+            // dispatcher either way. Falling through to the delegate for a
+            // Kotlin-only workspace would read its empty overlay and suppress
+            // every unknown name.
+            //
+            // `self`, not the Kotlin delegate, for the same reason -- plus the
+            // enclosing-declaration lookup, which crosses languages. The shim
+            // downcasts to the Kotlin analyzer itself.
+            let realm = self.kotlin_realm().map(|(_, realm)| realm);
             return crate::analyzer::kotlin::diagnostics::collect_kotlin_semantic_diagnostics(
-                kotlin,
+                self,
                 file,
                 source,
-                Some(&realm),
-            )
-            .into_iter()
-            .map(SemanticDiagnostic::from)
-            .collect();
+                realm.as_ref(),
+            );
+        }
+        if language_for_file(file) == Language::Java && self.delegates.contains_key(&Language::Java)
+        {
+            return crate::analyzer::java::diagnostics::collect_java_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // Scala's own ladder is delegate-resident, but the active dependency
+        // model it must not claim absence past is published on the dispatcher.
+        if language_for_file(file) == Language::Scala
+            && self.delegates.contains_key(&Language::Scala)
+        {
+            return crate::analyzer::scala::diagnostics::collect_scala_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // Go classifies references that leave the workspace against the
+        // activated exact API packs (#1623), and the semantic-model overlay
+        // and the retained Go module graph belong to the dispatching analyzer,
+        // not to the delegate. Passing `self` is what lets a Go file's import
+        // of an indexed module resolve instead of reporting nothing known.
+        if language_for_file(file) == Language::Go && self.delegates.contains_key(&Language::Go) {
+            return crate::analyzer::go::diagnostics::collect_go_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // Python's environment proof lives on the analyzer a host activated
+        // packs against, which is this composite one and not the delegate. A
+        // request routed straight to the delegate would see no overlay and no
+        // discovery evidence, and would report every external import as an
+        // unknown boundary.
+        if language_for_file(file) == Language::Python
+            && self.delegates.contains_key(&Language::Python)
+        {
+            return crate::analyzer::python::diagnostics::collect_python_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // PHP's proof ladder reads the semantic-model overlay and the retained
+        // Composer discovery evidence, and only the dispatching analyzer holds
+        // them. Delegating to the `PhpAnalyzer` would hand the collector a view
+        // with no indexed dependencies, so every vendor symbol would look
+        // unknown even with an active pack.
+        if language_for_file(file) == Language::Php && self.delegates.contains_key(&Language::Php) {
+            return crate::analyzer::php::diagnostics::collect_php_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // JS/TS diagnostics judge external imports against the activated npm
+        // declaration surface and the retained npm discovery evidence (#1620).
+        // Both hang off the analyzer that owns the workspace snapshot, which is
+        // this one: a delegate passed on its own carries no snapshot caches and
+        // would report every npm import as an unknown boundary.
+        let language = language_for_file(file);
+        if language == Language::JavaScript && self.delegates.contains_key(&Language::JavaScript) {
+            return crate::analyzer::js_ts::diagnostics::collect_javascript_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        if language == Language::TypeScript && self.delegates.contains_key(&Language::TypeScript) {
+            return crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // Rust classifies paths that leave the workspace against the activated
+        // exact Cargo API packs (#1625), and the semantic-model overlay and the
+        // retained Cargo dependency evidence belong to the dispatching
+        // analyzer, not to the delegate. Passing `self` is what lets a path
+        // into an indexed dependency resolve instead of reporting nothing
+        // known.
+        if language_for_file(file) == Language::Rust && self.delegates.contains_key(&Language::Rust)
+        {
+            return crate::analyzer::rust::diagnostics::collect_rust_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // Ruby classifies a constant that leaves the visible require closure
+        // against the activated exact gem API packs (#1624), and both the
+        // semantic-model overlay and the retained Gemfile.lock discovery
+        // evidence belong to the dispatching analyzer, not to the delegate.
+        // Passing `self` is what lets a gem's indexed constant resolve instead
+        // of reporting an unknown boundary.
+        if language_for_file(file) == Language::Ruby && self.delegates.contains_key(&Language::Ruby)
+        {
+            return crate::analyzer::ruby::diagnostics::collect_ruby_semantic_diagnostics(
+                self, file, source,
+            );
+        }
+        // C# reads the retained dependency-discovery evidence that refines an
+        // unindexed assembly boundary, and a host publishes that on the
+        // analyzer it ran discovery against, which is this composite one.
+        // Delegating to the `CSharpAnalyzer` would hand the collector no
+        // evidence at all, so every miss past a `using` would report the
+        // weakest boundary even where the build declares the assembly.
+        if language_for_file(file) == Language::CSharp
+            && self.delegates.contains_key(&Language::CSharp)
+        {
+            return crate::analyzer::csharp::diagnostics::collect_csharp_semantic_diagnostics(
+                self, file, source,
+            );
         }
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().semantic_diagnostics(file, source))
@@ -1044,24 +1325,6 @@ impl IAnalyzer for MultiAnalyzer {
         self.delegate_for_file(file)
             .map(|delegate| delegate.analyzer().import_statements(file))
             .unwrap_or_default()
-    }
-
-    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
-        self.delegate_for_file(file)
-            .and_then(|delegate| delegate.analyzer().enclosing_code_unit(file, range))
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.delegate_for_file(file).and_then(|delegate| {
-            delegate
-                .analyzer()
-                .enclosing_code_unit_for_lines(file, start_line, end_line)
-        })
     }
 
     fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
@@ -1086,27 +1349,6 @@ impl IAnalyzer for MultiAnalyzer {
                 .analyzer()
                 .find_nearest_declaration(file, start_byte, end_byte, ident)
         })
-    }
-
-    fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
-        self.delegate_for_code_unit(code_unit)
-            .map(|delegate| delegate.analyzer().ranges(code_unit))
-            .unwrap_or_default()
-    }
-
-    fn ranges_with_limit(
-        &self,
-        code_unit: &CodeUnit,
-        max_ranges: usize,
-        cancellation: &crate::CancellationToken,
-    ) -> (Vec<Range>, usize, bool) {
-        self.delegate_for_code_unit(code_unit)
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .ranges_with_limit(code_unit, max_ranges, cancellation)
-            })
-            .unwrap_or_default()
     }
 
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
@@ -1201,7 +1443,7 @@ impl IAnalyzer for MultiAnalyzer {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
             grouped
-                .entry(language_for_file(file))
+                .entry(self.dispatch_language(file))
                 .or_default()
                 .push(file.clone());
         }
@@ -1217,94 +1459,6 @@ impl IAnalyzer for MultiAnalyzer {
             }
         }
         findings
-    }
-
-    fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.delegate_for_code_unit(code_unit)
-            .and_then(|delegate| delegate.analyzer().get_skeleton(code_unit))
-    }
-
-    fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
-        self.delegate_for_code_unit(code_unit)
-            .and_then(|delegate| delegate.analyzer().get_skeleton_header(code_unit))
-    }
-
-    fn get_source(&self, code_unit: &CodeUnit, include_comments: bool) -> Option<String> {
-        self.delegate_for_code_unit(code_unit)
-            .and_then(|delegate| delegate.analyzer().get_source(code_unit, include_comments))
-    }
-
-    fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
-        self.delegate_for_code_unit(code_unit)
-            .map(|delegate| delegate.analyzer().get_sources(code_unit, include_comments))
-            .unwrap_or_default()
-    }
-
-    fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
-        self.delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|delegate| delegate.analyzer().search_definitions(pattern, auto_quote))
-            .reduce(BTreeSet::new, |mut acc, definitions| {
-                acc.extend(definitions);
-                acc
-            })
-    }
-
-    fn search_definitions_by_suffix_pattern(
-        &self,
-        pattern: &str,
-        terminal_identifiers: &[String],
-        language: Language,
-    ) -> BTreeSet<CodeUnit> {
-        // The pattern is language-specific, so only that language's delegate
-        // can produce matches the caller keeps; fanning out to every delegate
-        // multiplied lookup cost by the language count (#1430).
-        self.delegates
-            .get(&language)
-            .map(|delegate| {
-                delegate.analyzer().search_definitions_by_suffix_pattern(
-                    pattern,
-                    terminal_identifiers,
-                    language,
-                )
-            })
-            .unwrap_or_default()
-    }
-
-    fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
-        self.delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|delegate| delegate.analyzer().lookup_candidates_by_short_name(symbol))
-            .reduce(BTreeSet::new, |mut acc, candidates| {
-                acc.extend(candidates);
-                acc
-            })
-    }
-
-    fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        self.delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .lookup_candidates_by_identifier(identifier)
-            })
-            .reduce(BTreeSet::new, |mut acc, candidates| {
-                acc.extend(candidates);
-                acc
-            })
-    }
-
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.delegates
-            .values()
-            .all(|delegate| delegate.analyzer().has_complete_symbol_lookup_index())
     }
 
     fn search_symbol_candidates(
@@ -1325,34 +1479,6 @@ impl IAnalyzer for MultiAnalyzer {
                 || SearchSymbolCandidates::complete(Vec::new(), 0),
                 SearchSymbolCandidates::merge,
             )
-    }
-
-    fn search_definitions_persisted(&self, pattern: &str) -> BTreeSet<CodeUnit> {
-        // Fan out to each delegate's `search_definitions_persisted` so the
-        // FTS5 path is consulted per-language. The default impl on
-        // `IAnalyzer` would otherwise re-dispatch through our own
-        // `search_definitions` override, which only hits in-memory state.
-        self.delegates
-            .values()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|delegate| delegate.analyzer().search_definitions_persisted(pattern))
-            .reduce(BTreeSet::new, |mut acc, definitions| {
-                acc.extend(definitions);
-                acc
-            })
-    }
-
-    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.delegate_for_code_unit(code_unit)
-            .map(|delegate| delegate.analyzer().signatures(code_unit))
-            .unwrap_or_default()
-    }
-
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.delegate_for_code_unit(code_unit)
-            .map(|delegate| delegate.analyzer().signature_metadata(code_unit))
-            .unwrap_or_default()
     }
 
     fn partial_declaration_parts(&self, code_unit: &CodeUnit) -> Option<Vec<CodeUnit>> {
@@ -1394,6 +1520,13 @@ impl IAnalyzer for MultiAnalyzer {
             .values()
             .any(|delegate| delegate.type_alias_provider().is_some())
             .then_some(self as &dyn TypeAliasProvider)
+    }
+
+    fn member_family_provider(&self) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
+        self.delegates
+            .values()
+            .any(|delegate| delegate.analyzer().member_family_provider().is_some())
+            .then_some(self as &dyn crate::analyzer::usages::MemberFamilyProvider)
     }
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
@@ -1451,7 +1584,7 @@ impl IAnalyzer for MultiAnalyzer {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
             grouped
-                .entry(language_for_file(file))
+                .entry(self.dispatch_language(file))
                 .or_default()
                 .push(file.clone());
         }
@@ -1473,7 +1606,7 @@ impl IAnalyzer for MultiAnalyzer {
         let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
         for file in files {
             grouped
-                .entry(language_for_file(file))
+                .entry(self.dispatch_language(file))
                 .or_default()
                 .push(file.clone());
         }
@@ -1487,6 +1620,192 @@ impl IAnalyzer for MultiAnalyzer {
             }
         }
         result
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_global_usage_definition_index_build_count_for_test();
+        }
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .global_usage_definition_index_build_count_for_test()
+            })
+            .sum::<usize>()
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_definition_candidates_query_count_for_test();
+        }
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .definition_candidates_query_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_full_declaration_scan_count_for_test();
+        }
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .full_declaration_scan_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_candidate_hydration_count_for_test();
+        }
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .candidate_hydration_count_for_test()
+            })
+            .sum()
+    }
+
+    fn full_candidate_hydration_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .full_candidate_hydration_count_for_test()
+            })
+            .sum()
+    }
+
+    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .bulk_candidate_hydration_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_workspace_path_scan_count_for_test();
+        }
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .workspace_path_scan_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_scala_project_types_build_count_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_scala_project_types_build_count_for_test();
+        }
+    }
+
+    fn scala_project_types_build_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .scala_project_types_build_count_for_test()
+            })
+            .sum()
+    }
+
+    fn reset_scala_query_scan_counts_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .reset_scala_query_scan_counts_for_test();
+        }
+    }
+
+    fn scala_query_parse_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .scala_query_parse_count_for_test()
+            })
+            .sum()
+    }
+
+    fn scala_query_walk_count_for_test(&self) -> usize {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .scala_query_walk_count_for_test()
+            })
+            .sum()
     }
 }
 
@@ -1601,8 +1920,12 @@ mod tests {
     #[test]
     fn definition_query_builds_each_delegate_index_once_and_scans_nothing() {
         let (_temp, analyzer) = two_language_analyzer();
-        analyzer.reset_global_usage_definition_index_build_count_for_test();
-        analyzer.reset_full_declaration_scan_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
 
         // Two queries, so a view that rebuilt per call would show it.
         assert_eq!(
@@ -1621,6 +1944,7 @@ mod tests {
             assert_eq!(
                 delegate
                     .analyzer()
+                    .test_hooks()
                     .global_usage_definition_index_build_count_for_test(),
                 1,
                 "delegate {language:?} built its definition index more than once"
@@ -1628,14 +1952,21 @@ mod tests {
         }
         // The merged view answers out of the delegates' own indexes; it must
         // never fall back to a full declaration scan per delegate.
-        assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            0
+        );
     }
 
     #[test]
     fn update_with_only_irrelevant_files_retains_indexes_and_snapshot_caches() {
         let (_temp, analyzer) = two_language_analyzer();
-        analyzer.reset_global_usage_definition_index_build_count_for_test();
-        analyzer.reset_full_declaration_scan_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
         assert_eq!(
             analyzer
                 .global_usage_definition_index()
@@ -1655,12 +1986,16 @@ mod tests {
             assert_eq!(
                 delegate
                     .analyzer()
+                    .test_hooks()
                     .global_usage_definition_index_build_count_for_test(),
                 1,
                 "delegate {language:?} rebuilt its definition index after an irrelevant change"
             );
         }
-        assert_eq!(updated.full_declaration_scan_count_for_test(), 0);
+        assert_eq!(
+            updated.test_hooks().full_declaration_scan_count_for_test(),
+            0
+        );
         assert!(
             Arc::ptr_eq(&analyzer.snapshot_caches, &updated.snapshot_caches),
             "an update touching no analyzed file must keep the workspace derived-layer caches"

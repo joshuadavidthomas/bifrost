@@ -1,4 +1,5 @@
 use crate::common::{InlineTestProject, call_search_tool_json, line_of};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, JavaUsageGraphStrategy, ScalaUsageGraphStrategy,
     UsageAnalyzer, UsageFinder, UsageHit, UsageHitKind,
@@ -898,7 +899,9 @@ public class Consumer {
         "org.example.ProcessOperationLockRegistry.waitUntilReleaseReady",
     );
 
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
     let notify_hits = hits(JavaUsageGraphStrategy::new().find_usages(
         &analyzer,
         std::slice::from_ref(&notify),
@@ -919,7 +922,7 @@ public class Consumer {
     );
     assert_eq!(
         0,
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         "targeted Java return-receiver inference must not build the workspace-wide usage-facts index"
     );
 
@@ -1825,18 +1828,26 @@ public class Target {
         .expect("this field success");
     assert_eq!(1, field_hits.len());
 
-    let method_hits = JavaUsageGraphStrategy::new()
-        .find_usages(
-            &analyzer,
-            std::slice::from_ref(&method_target),
-            &candidates,
-            1000,
-        )
-        .into_either()
-        .expect("this method success");
+    // `this.run()` inside `run` is a recursive call (#1638). It is a real
+    // occurrence, so the editor surface lists it as a same-owner self receiver
+    // site; the external usage surface omits it, because it is not a call from
+    // anywhere else and must not make `run` look used from outside.
+    let method_result = JavaUsageGraphStrategy::new().find_usages(
+        &analyzer,
+        std::slice::from_ref(&method_target),
+        &candidates,
+        1000,
+    );
+    let recursive_hits = self_receiver_hits(&method_result);
+    assert_eq!(1, recursive_hits.len(), "{recursive_hits:#?}");
+    assert_hit_contains(&recursive_hits, "this.run();");
     assert!(
-        method_hits.is_empty(),
-        "self-recursive this.run should still be filtered"
+        method_result
+            .clone()
+            .into_either()
+            .expect("this method success")
+            .is_empty(),
+        "a recursive call is not an external usage"
     );
 }
 

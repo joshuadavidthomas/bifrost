@@ -1,5 +1,6 @@
 use tree_sitter::{Node, Tree};
 
+use crate::analyzer::reference_candidates::reference_candidate_requires_point_lookup;
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role, Span};
 use crate::analyzer::{Language, ProjectFile, Range};
 
@@ -151,30 +152,7 @@ pub(crate) fn call_reference_requires_point_lookup(
     language: Language,
     range: &Range,
 ) -> bool {
-    if language != Language::Cpp {
-        return false;
-    }
-    let Some(mut node) = tree
-        .root_node()
-        .named_descendant_for_byte_range(range.start_byte, range.end_byte)
-    else {
-        return false;
-    };
-    loop {
-        if matches!(
-            node.kind(),
-            "operator_name" | "operator_cast" | "literal_operator_name"
-        ) {
-            return true;
-        }
-        let Some(parent) = node.parent() else {
-            return false;
-        };
-        if parent.start_byte() != range.start_byte || parent.end_byte() != range.end_byte {
-            return false;
-        }
-        node = parent;
-    }
+    reference_candidate_requires_point_lookup(tree.root_node(), language, range)
 }
 
 pub(crate) fn call_site_syntax_for_reference(
@@ -416,7 +394,9 @@ fn callee_node_for_call<'tree>(node: Node<'tree>, language: Language) -> Option<
             _ => None,
         },
         Language::Scala => scala_callee_node_for_call(node),
-        Language::Kotlin => crate::analyzer::kotlin::syntax::kotlin_callee(node),
+        Language::Kotlin => {
+            crate::analyzer::languages::language_support(language)?.call_callee_node(node)
+        }
         Language::Ruby => node.child_by_field_name("method"),
         _ => node
             .child_by_field_name("function")
@@ -431,13 +411,12 @@ fn arguments_node_for_call(node: Node<'_>, language: Language) -> Option<Node<'_
 }
 
 fn argument_nodes_for_call(node: Node<'_>, language: Language) -> Vec<Node<'_>> {
-    // Kotlin's argument list is `value_arguments`, and an ordinary call nests it
-    // one level down inside `call_suffix`, so neither the field lookup nor the
-    // shared child-kind list below reaches it.
-    if language == Language::Kotlin {
-        return crate::analyzer::kotlin::syntax::kotlin_value_arguments(node)
-            .into_iter()
-            .collect();
+    // A language whose argument list neither the field lookup nor the shared child-kind
+    // list below can reach answers here instead, and its answer is the whole answer.
+    if let Some(nodes) = crate::analyzer::languages::language_support(language)
+        .and_then(|support| support.call_argument_nodes(node))
+    {
+        return nodes;
     }
     let mut nodes = Vec::new();
     if let Some(arguments) = node

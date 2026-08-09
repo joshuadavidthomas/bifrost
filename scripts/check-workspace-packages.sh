@@ -4,6 +4,15 @@ set -euo pipefail
 
 readonly packages=(
   brokk-bifrost-core
+  brokk-bifrost-cpp
+  brokk-bifrost-csharp
+  brokk-bifrost-go
+  brokk-bifrost-js-ts
+  brokk-bifrost-jvm
+  brokk-bifrost-php
+  brokk-bifrost-python
+  brokk-bifrost-ruby
+  brokk-bifrost-rust
   brokk-bifrost-analysis
   brokk-bifrost-nlp
   brokk-bifrost-policy
@@ -27,6 +36,15 @@ cd "$repo_root"
 # resolvable while leaving each normalized archive manifest registry-ready.
 readonly cargo_patch_args=(
   --config 'patch.crates-io.brokk-bifrost-core.path="crates/bifrost-core"'
+  --config 'patch.crates-io.brokk-bifrost-cpp.path="crates/bifrost-cpp"'
+  --config 'patch.crates-io.brokk-bifrost-csharp.path="crates/bifrost-csharp"'
+  --config 'patch.crates-io.brokk-bifrost-go.path="crates/bifrost-go"'
+  --config 'patch.crates-io.brokk-bifrost-js-ts.path="crates/bifrost-js-ts"'
+  --config 'patch.crates-io.brokk-bifrost-jvm.path="crates/bifrost-jvm"'
+  --config 'patch.crates-io.brokk-bifrost-php.path="crates/bifrost-php"'
+  --config 'patch.crates-io.brokk-bifrost-python.path="crates/bifrost-python"'
+  --config 'patch.crates-io.brokk-bifrost-ruby.path="crates/bifrost-ruby"'
+  --config 'patch.crates-io.brokk-bifrost-rust.path="crates/bifrost-rust"'
   --config 'patch.crates-io.brokk-bifrost-analysis.path="crates/bifrost-analysis"'
   --config 'patch.crates-io.brokk-bifrost-nlp.path="crates/bifrost-nlp"'
   --config 'patch.crates-io.brokk-bifrost-policy.path="crates/bifrost-policy"'
@@ -101,9 +119,43 @@ done
 require_archive_file brokk-bifrost-core src/lib.rs
 # The unified cache DB's migrations moved down with cache_db.rs.
 require_archive_file brokk-bifrost-core migrations/cache/0001-current-baseline.sql
-require_archive_file brokk-bifrost-analysis build.rs
+# The C++, C#, Go, Java, PHP, Python, Ruby, Rust and Scala tree-sitter query
+# assets moved down with their language crates; the epoch salt hashes them from
+# there, so a missing file is a silent epoch change. Kotlin's `highlights.scm`
+# is never salted but `KotlinSupport::highlight_query` embeds it, so it is
+# required for the same reason.
+require_archive_file brokk-bifrost-cpp resources/treesitter/cpp/definitions.scm
+require_archive_file brokk-bifrost-cpp resources/treesitter/cpp/identifiers.scm
+require_archive_file brokk-bifrost-cpp resources/treesitter/cpp/imports.scm
+require_archive_file brokk-bifrost-csharp resources/treesitter/c_sharp/definitions.scm
+require_archive_file brokk-bifrost-csharp resources/treesitter/c_sharp/imports.scm
+require_archive_file brokk-bifrost-go resources/treesitter/go/definitions.scm
+require_archive_file brokk-bifrost-go resources/treesitter/go/identifiers.scm
+require_archive_file brokk-bifrost-go resources/treesitter/go/imports.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/javascript/definitions.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/javascript/identifiers.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/javascript/imports.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/typescript/definitions.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/typescript/identifiers.scm
+require_archive_file brokk-bifrost-js-ts resources/treesitter/typescript/imports.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/java/definitions.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/java/identifiers.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/java/imports.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/scala/definitions.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/scala/imports.scm
+require_archive_file brokk-bifrost-jvm resources/treesitter/kotlin/highlights.scm
+require_archive_file brokk-bifrost-jvm build.rs
+require_archive_file brokk-bifrost-php resources/treesitter/php/definitions.scm
+require_archive_file brokk-bifrost-php resources/treesitter/php/imports.scm
+require_archive_file brokk-bifrost-python resources/treesitter/python/definitions.scm
+require_archive_file brokk-bifrost-python resources/treesitter/python/identifiers.scm
+require_archive_file brokk-bifrost-python resources/treesitter/python/imports.scm
+require_archive_file brokk-bifrost-ruby resources/treesitter/ruby/definitions.scm
+require_archive_file brokk-bifrost-ruby resources/treesitter/ruby/identifiers.scm
+require_archive_file brokk-bifrost-ruby resources/treesitter/ruby/imports.scm
+require_archive_file brokk-bifrost-rust resources/treesitter/rust/definitions.scm
+require_archive_file brokk-bifrost-rust resources/treesitter/rust/imports.scm
 require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0001-current-baseline.sql
-require_archive_file brokk-bifrost-analysis resources/treesitter/java/definitions.scm
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
 require_archive_file brokk-bifrost-nlp src/lib.rs
 require_archive_file brokk-bifrost-policy src/lib.rs
@@ -112,15 +164,10 @@ require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
 
-required_analysis_vendor_files=(
-  vendor/tree-sitter-scala/LICENSE
-  vendor/tree-sitter-scala/BIFROST_PATCH.md
-  vendor/tree-sitter-scala/grammar.js
-  vendor/tree-sitter-scala/src/parser.c
-  vendor/tree-sitter-scala/src/scanner.c
-  vendor/tree-sitter-scala/src/tree_sitter/alloc.h
-  vendor/tree-sitter-scala/src/tree_sitter/array.h
-  vendor/tree-sitter-scala/src/tree_sitter/parser.h
+# The vendored Kotlin grammar lives in brokk-bifrost-jvm with build.rs. Its
+# `parser.c` bytes are named in the Kotlin epoch salt, so an archive missing it
+# would publish a crate that cannot build the parser that salt promises.
+required_jvm_vendor_files=(
   vendor/tree-sitter-kotlin/LICENSE
   vendor/tree-sitter-kotlin/BIFROST_PROVENANCE.md
   vendor/tree-sitter-kotlin/grammar.js
@@ -130,8 +177,8 @@ required_analysis_vendor_files=(
   vendor/tree-sitter-kotlin/src/tree_sitter/array.h
   vendor/tree-sitter-kotlin/src/tree_sitter/parser.h
 )
-for required_file in "${required_analysis_vendor_files[@]}"; do
-  require_archive_file brokk-bifrost-analysis "$required_file"
+for required_file in "${required_jvm_vendor_files[@]}"; do
+  require_archive_file brokk-bifrost-jvm "$required_file"
 done
 
 manifest_policy_files="$temporary/manifest-policy-files.txt"
@@ -198,6 +245,15 @@ full = ["brokk-bifrost/nlp", "brokk-bifrost/python"]
 
 [patch.crates-io]
 brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
+brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
+brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
+brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
+brokk-bifrost-js-ts = { path = "$unpacked/brokk-bifrost-js-ts-$version" }
+brokk-bifrost-jvm = { path = "$unpacked/brokk-bifrost-jvm-$version" }
+brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
+brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
+brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
+brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 brokk-bifrost-nlp = { path = "$unpacked/brokk-bifrost-nlp-$version" }
 brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
@@ -230,6 +286,15 @@ brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 
 [patch.crates-io]
 brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
+brokk-bifrost-cpp = { path = "$unpacked/brokk-bifrost-cpp-$version" }
+brokk-bifrost-csharp = { path = "$unpacked/brokk-bifrost-csharp-$version" }
+brokk-bifrost-go = { path = "$unpacked/brokk-bifrost-go-$version" }
+brokk-bifrost-js-ts = { path = "$unpacked/brokk-bifrost-js-ts-$version" }
+brokk-bifrost-jvm = { path = "$unpacked/brokk-bifrost-jvm-$version" }
+brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
+brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
+brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
+brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
 EOF
 cat > "$analysis_consumer/src/main.rs" <<'EOF'
 fn main() {

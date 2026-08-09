@@ -1927,11 +1927,12 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
-Bifrost-patched tree-sitter-scala parser
+tree-sitter-scala parser
 ================================================================================
 
-Vendored source: https://github.com/tree-sitter/tree-sitter-scala/tree/a067c39163b62b19e76cea17476f3188da8c9e51
-Source notice: crates/bifrost-analysis/vendor/tree-sitter-scala/LICENSE
+Rust package: tree-sitter-scala@0.26.2
+Package source: https://crates.io/crates/tree-sitter-scala/0.26.2
+Source notice: LICENSE
 Inclusion: compiled into Bifrost on every release target
 
 The MIT License (MIT)
@@ -1961,7 +1962,7 @@ Bifrost-pinned tree-sitter-kotlin parser
 ================================================================================
 
 Vendored source: https://github.com/fwcd/tree-sitter-kotlin/tree/c8ac3d2627240160b999a2c100de3babbdb8f419
-Source notice: crates/bifrost-analysis/vendor/tree-sitter-kotlin/LICENSE
+Source notice: crates/bifrost-jvm/vendor/tree-sitter-kotlin/LICENSE
 Inclusion: compiled into Bifrost on every release target
 
 The MIT License (MIT)

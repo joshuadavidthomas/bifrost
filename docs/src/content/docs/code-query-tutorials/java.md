@@ -3,7 +3,7 @@ title: Java
 description: Query Java member calls, constructors, annotations, exceptions, and control flow with query_code.
 ---
 
-> Last verified end to end: 2026-08-04 (`query_code` schema version 2).
+> Last verified end to end: 2026-08-04 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -173,6 +173,8 @@ Java receiver traversal uses shared semantic value and heap evidence together wi
         "start_line": 25
       },
       "result_type": "receiver_analysis",
+      "site_ast_id": "3bc1940c77bd67811e353b90dd15b4854c289cddfe56924df27c0f28f4b511de",
+      "site_id": "092f93072ecc0fa7907f049ba694926e3a98b4520a050f854ae369350878c71c",
       "text": "client",
       "values": [
         {

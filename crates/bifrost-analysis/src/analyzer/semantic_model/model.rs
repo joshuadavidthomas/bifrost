@@ -1,4 +1,5 @@
 use schemars::JsonSchema;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::analyzer::dataflow::{
@@ -265,6 +266,8 @@ pub struct TypeFact {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub extension_surfaces: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<DeclarationGuard>,
     pub locator: Locator,
 }
 
@@ -328,7 +331,218 @@ pub struct MemberFact {
     pub extension_receiver_constraints: Vec<TypeRef>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<DeclarationGuard>,
     pub locator: Locator,
+}
+
+/// The condition under which one activation declares a record.
+///
+/// A reference surface can spell a declaration inside a conditional block.
+/// Typeshed guards `builtins.float.from_number` with
+/// `if sys.version_info >= (3, 14):` and `os.startfile` with
+/// `if sys.platform == "win32":`. Publishing the union of every branch with no
+/// guard makes a published name mean only "some supported toolchain declares
+/// this somewhere", which is a false positive for a presence claim (#1899).
+///
+/// Every recorded constraint is a *necessary* condition for the record to
+/// exist. A producer that cannot interpret part of a condition records
+/// [`Self::uninterpreted`] and drops that part rather than the declaration, so
+/// the guard never claims more than the producer read. Activation may drop a
+/// record only when [`Self::excludes`] proves the pinned activation cannot
+/// declare it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeclarationGuard {
+    /// Lowest toolchain version that declares this record, inclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_toolchain_version: Option<GuardVersion>,
+    /// Lowest toolchain version that no longer declares this record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_toolchain_version_exclusive: Option<GuardVersion>,
+    /// Activation targets that declare this record. Empty places no
+    /// requirement on the target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_targets: Vec<String>,
+    /// Activation targets that do not declare this record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_targets: Vec<String>,
+    /// The producer read a condition it could not express here. The recorded
+    /// constraints stay necessary, but they are not the whole condition, so a
+    /// record this flag marks is never dropped for want of a constraint.
+    #[serde(default)]
+    pub uninterpreted: bool,
+}
+
+/// One toolchain-version bound a guard names, padded to three components.
+///
+/// A source condition can name fewer components than a toolchain version
+/// carries, as `sys.version_info >= (3, 14)` does. Padding with zeros keeps
+/// one comparable shape, and comparing only the three release components keeps
+/// a pre-release toolchain on the same side of a bound as its release.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct GuardVersion {
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+}
+
+impl GuardVersion {
+    pub fn new(major: u64, minor: u64, patch: u64) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    pub fn of(version: &Version) -> Self {
+        Self::new(version.major, version.minor, version.patch)
+    }
+}
+
+impl DeclarationGuard {
+    /// A guard that records only "this producer read a condition it could not
+    /// express". It never excludes an activation.
+    pub fn uninterpreted() -> Self {
+        Self {
+            uninterpreted: true,
+            ..Self::default()
+        }
+    }
+
+    /// How many constraints this guard records, ignoring
+    /// [`Self::uninterpreted`].
+    fn constraint_count(&self) -> usize {
+        usize::from(self.min_toolchain_version.is_some())
+            + usize::from(self.max_toolchain_version_exclusive.is_some())
+            + usize::from(!self.required_targets.is_empty())
+            + usize::from(!self.excluded_targets.is_empty())
+    }
+
+    /// The guard of a declaration that holds only when both guards hold, as a
+    /// declaration nested in two conditional blocks does.
+    pub fn and(&self, other: &Self) -> Self {
+        let required_targets = if self.required_targets.is_empty() {
+            other.required_targets.clone()
+        } else if other.required_targets.is_empty() {
+            self.required_targets.clone()
+        } else {
+            self.required_targets
+                .iter()
+                .filter(|target| other.required_targets.contains(target))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // Two disjoint requirements describe a declaration no target
+        // declares, which an empty `required_targets` would read as "every
+        // target". Record the honest weaker statement instead: something here
+        // is not expressible, so nothing here excludes an activation.
+        let contradictory = required_targets.is_empty()
+            && !self.required_targets.is_empty()
+            && !other.required_targets.is_empty();
+        let mut excluded_targets = self.excluded_targets.clone();
+        excluded_targets.extend(other.excluded_targets.iter().cloned());
+        excluded_targets.sort_unstable();
+        excluded_targets.dedup();
+        Self {
+            min_toolchain_version: self.min_toolchain_version.max(other.min_toolchain_version),
+            max_toolchain_version_exclusive: match (
+                self.max_toolchain_version_exclusive,
+                other.max_toolchain_version_exclusive,
+            ) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (bound, None) | (None, bound) => bound,
+            },
+            required_targets,
+            excluded_targets,
+            uninterpreted: self.uninterpreted || other.uninterpreted || contradictory,
+        }
+    }
+
+    /// The guard of the branch this guard's condition does not take, when that
+    /// branch is expressible.
+    ///
+    /// Only one recorded constraint negates to one constraint: the complement
+    /// of a half-line is a half-line, and the complement of a target set is
+    /// its exclusion. A conjunction negates to a disjunction, which this shape
+    /// cannot hold, so the caller records [`Self::uninterpreted`] instead.
+    pub fn negated(&self) -> Option<Self> {
+        if self.uninterpreted || self.constraint_count() != 1 {
+            return None;
+        }
+        if let Some(min) = self.min_toolchain_version {
+            return Some(Self {
+                max_toolchain_version_exclusive: Some(min),
+                ..Self::default()
+            });
+        }
+        if let Some(max) = self.max_toolchain_version_exclusive {
+            return Some(Self {
+                min_toolchain_version: Some(max),
+                ..Self::default()
+            });
+        }
+        if !self.required_targets.is_empty() {
+            return Some(Self {
+                excluded_targets: self.required_targets.clone(),
+                ..Self::default()
+            });
+        }
+        Some(Self {
+            required_targets: self.excluded_targets.clone(),
+            ..Self::default()
+        })
+    }
+
+    /// The guard of a declaration that two branches both declare.
+    ///
+    /// A constraint survives only when both branches state it, so an
+    /// unguarded branch makes the declaration unguarded and two different
+    /// guards leave nothing necessary behind.
+    pub fn union(left: Option<Self>, right: Option<Self>) -> Option<Self> {
+        match (left, right) {
+            (Some(left), Some(right)) if left == right => Some(left),
+            (Some(_), Some(_)) => Some(Self::uninterpreted()),
+            _ => None,
+        }
+    }
+
+    /// Whether this guard proves that an activation pinned to
+    /// `toolchain_version` and `target` does not declare the record.
+    ///
+    /// An unknown coordinate proves nothing, so a missing version or target
+    /// never excludes. [`Self::uninterpreted`] does not disable the recorded
+    /// constraints: each one stays a necessary condition for the record to
+    /// exist, whatever the part the producer could not read says.
+    pub fn excludes(&self, toolchain_version: Option<&Version>, target: Option<&str>) -> bool {
+        if let Some(version) = toolchain_version {
+            let pinned = GuardVersion::of(version);
+            if self.min_toolchain_version.is_some_and(|min| pinned < min) {
+                return true;
+            }
+            if self
+                .max_toolchain_version_exclusive
+                .is_some_and(|max| pinned >= max)
+            {
+                return true;
+            }
+        }
+        if let Some(target) = target {
+            if !self.required_targets.is_empty()
+                && !self.required_targets.iter().any(|name| name == target)
+            {
+                return true;
+            }
+            if self.excluded_targets.iter().any(|name| name == target) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

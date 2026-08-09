@@ -55,7 +55,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken as McpCancellationToken;
 
 /// `_meta` key carrying the identity of the binary that hosts this MCP server.
@@ -349,10 +349,8 @@ enum WorkspaceBindingSource {
 
 /// Per-connection workspace authorization state.
 ///
-/// Unlike the hand-written host this replaces, it carries no protocol
-/// bookkeeping: `rmcp` owns the lifecycle, owns outbound request ids, and
-/// turns `roots/list` into an ordinary awaited call, so there is nothing to
-/// correlate by hand.
+/// RMCP owns the lifecycle, outbound request ids, and `roots/list` calls.
+/// Bifrost therefore keeps only the authorization state.
 struct ConnectionState {
     accepts_client_roots: bool,
     /// What the handshake established, or nothing if it has not happened.
@@ -1140,6 +1138,7 @@ impl BifrostMcpHandler {
         mcp_cancellation: McpCancellationToken,
         permit: AnalyzerPermit,
         cold_workspace: bool,
+        transport_queue_wait: Duration,
     ) -> Result<CallToolResult, ErrorData> {
         // The deadline was set when the request was accepted, not when it
         // reached the analyzer, so time already spent queueing counts against
@@ -1185,11 +1184,12 @@ impl BifrostMcpHandler {
             let _execution_scope = profiling::scope(execution_label);
             let _cold_execution_scope =
                 cold_workspace.then(|| profiling::scope("mcp_cold.first_tool_execution"));
-            let output = execution_service.call_tool_output_with_cancellation(
+            let output = execution_service.call_tool_output_with_transport_queue_wait(
                 &execution_name,
                 arguments,
                 render_options,
                 Some(&execution_cancellation),
+                transport_queue_wait,
             )?;
             let output = if execution_name == "get_summaries" {
                 fit_get_summaries_output_to_budget(
@@ -1318,6 +1318,16 @@ fn map_service_error(code: SearchToolsServiceErrorCode, message: String) -> Erro
         SearchToolsServiceErrorCode::DeadlineExceeded => ErrorData::internal_error(message, None),
         SearchToolsServiceErrorCode::Internal => ErrorData::internal_error(message, None),
     }
+}
+
+/// Apply the bounded cold-start fallback to every analyzer tool except symbol
+/// discovery. `search_symbols` is the first request that agent clients use to
+/// discover a workspace. It waits for the already-running snapshot build
+/// without holding the workspace lock or an analyzer permit. Giving that wait
+/// the fallback deadline makes a cold workspace report a retryable failure
+/// even when the snapshot becomes ready immediately afterwards.
+fn default_cold_workspace_budget_applies(tool_name: &str, cold_workspace: bool) -> bool {
+    cold_workspace && tool_name != "search_symbols"
 }
 
 /// Whether this request's peer negotiated MCP `2026-07-28` or newer.
@@ -1618,11 +1628,23 @@ impl ServerHandler for BifrostMcpHandler {
             .ok()
             .map(|id| request_correlation_id(&id));
         let serial = !named_mode && serial_tool_request(&name);
-        let _serial_guard = if serial { state } else { None };
+        // `state` must leave scope here either way. `if serial { state } else
+        // { None }` moves it only in the serial branch; the non-serial branch
+        // leaves the maybe-moved binding alive until the end of this function,
+        // holding the workspace lock across readiness, admission, and the
+        // whole analyzer execution -- which serializes every tool call on the
+        // connection and starves light requests behind heavy scans (the
+        // `mcp_fairness` benchmark failure). `then_some` evaluates its
+        // argument eagerly, so the guard moves and drops now for non-serial
+        // calls.
+        let _serial_guard = serial.then_some(state).flatten();
 
         let accepted_at = Instant::now();
         let cold_workspace = service.workspace_build_pending();
-        let deadline = mcp_request_deadline(accepted_at, cold_workspace);
+        let deadline = mcp_request_deadline(
+            accepted_at,
+            default_cold_workspace_budget_applies(&name, cold_workspace),
+        );
         if !serial {
             let service = Arc::clone(&service);
             let ct = context.ct.clone();
@@ -1727,13 +1749,13 @@ impl ServerHandler for BifrostMcpHandler {
                 context.ct.clone(),
                 permit,
                 cold_workspace,
+                queue_wait,
             )
             .await;
         // The response -- success or execution error -- is ready the moment
         // execute_tool returns; everything after this point is transport. Arm
         // the timing keyed by the wire id so the transport wrapper can emit
-        // `response_queue_wait` and `writer_delivery` when it delivers it,
-        // matching the hand-written host's writer-thread phases (#1491).
+        // `response_queue_wait` and `writer_delivery` when it delivers it.
         self.response_timings
             .arm(context.id.clone(), name, correlation_id);
         Ok(response?.into())
@@ -1804,6 +1826,7 @@ pub fn run_stdio_server_with_build_identity(
     root: Option<PathBuf>,
     render_options: McpRenderOptions,
     spec: &McpServerSpec,
+    diff_snapshot_object_dir: Option<PathBuf>,
     build_identity: &str,
 ) -> Result<(), String> {
     // Explicit roots build in the background. Rootless servers answer
@@ -1813,12 +1836,17 @@ pub fn run_stdio_server_with_build_identity(
 
     let accepts_client_roots = root.is_none();
     let watch_files = file_watching_enabled(std::env::var_os(MCP_FILE_WATCHER_ENV).as_deref())?;
-    let service = Arc::new(match (root, watch_files) {
+    let service = match (root, watch_files) {
         (Some(root), true) => SearchToolsService::new_deferred(root)?,
         (Some(root), false) => SearchToolsService::new_deferred_manual(root)?,
         (None, true) => SearchToolsService::new_unbound(),
         (None, false) => SearchToolsService::new_unbound_manual(),
-    });
+    };
+    let service = match diff_snapshot_object_dir {
+        Some(dir) => service.with_diff_snapshot_object_dir(dir),
+        None => service,
+    };
+    let service = Arc::new(service);
     run_stdio_server_impl(
         service,
         None,
@@ -1991,5 +2019,26 @@ mod named_workspace_tests {
         for invalid in ["", "-repo", "two repos", "repo/path"] {
             assert!(validate_workspace_name(invalid).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod cold_workspace_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn cold_search_symbols_does_not_take_the_default_readiness_deadline() {
+        assert!(!default_cold_workspace_budget_applies(
+            "search_symbols",
+            true
+        ));
+        assert!(default_cold_workspace_budget_applies(
+            "scan_usages_by_location",
+            true
+        ));
+        assert!(!default_cold_workspace_budget_applies(
+            "search_symbols",
+            false
+        ));
     }
 }

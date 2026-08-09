@@ -96,7 +96,22 @@ impl CountingAnalyzer {
     }
 }
 
-impl IAnalyzer for CountingAnalyzer {
+use crate::analyzer::CodeUnitIndex;
+
+impl CodeUnitIndex for CountingAnalyzer {
+    fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
+        None
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        _file: &ProjectFile,
+        _start_line: usize,
+        _end_line: usize,
+    ) -> Option<CodeUnit> {
+        None
+    }
+
     fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
         None
     }
@@ -108,24 +123,6 @@ impl IAnalyzer for CountingAnalyzer {
 
     fn languages(&self) -> BTreeSet<Language> {
         BTreeSet::from([Language::Java])
-    }
-
-    fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self {
-            project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
-            analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
-            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
-            search_definition_results: self.search_definition_results.clone(),
-        }
-    }
-
-    fn update_all(&self) -> Self {
-        Self {
-            project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
-            analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
-            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
-            search_definition_results: self.search_definition_results.clone(),
-        }
     }
 
     fn project(&self) -> &dyn Project {
@@ -146,46 +143,6 @@ impl IAnalyzer for CountingAnalyzer {
 
     fn get_direct_children(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
         Vec::new()
-    }
-
-    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
-        None
-    }
-
-    fn import_statements_of(&self, _file: &ProjectFile) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
-        None
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        _file: &ProjectFile,
-        _start_line: usize,
-        _end_line: usize,
-    ) -> Option<CodeUnit> {
-        None
-    }
-
-    fn is_access_expression(
-        &self,
-        _file: &ProjectFile,
-        _start_byte: usize,
-        _end_byte: usize,
-    ) -> bool {
-        false
-    }
-
-    fn find_nearest_declaration(
-        &self,
-        _file: &ProjectFile,
-        _start_byte: usize,
-        _end_byte: usize,
-        _ident: &str,
-    ) -> Option<DeclarationInfo> {
-        None
     }
 
     // `ranges_of` defaults to this, so overriding `ranges` alone keeps the two
@@ -226,6 +183,53 @@ impl IAnalyzer for CountingAnalyzer {
 
     fn has_complete_symbol_lookup_index(&self) -> bool {
         true
+    }
+}
+
+impl IAnalyzer for CountingAnalyzer {
+    fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
+        Self {
+            project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
+            analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
+            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
+            search_definition_results: self.search_definition_results.clone(),
+        }
+    }
+
+    fn update_all(&self) -> Self {
+        Self {
+            project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
+            analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
+            search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
+            search_definition_results: self.search_definition_results.clone(),
+        }
+    }
+
+    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
+        None
+    }
+
+    fn import_statements_of(&self, _file: &ProjectFile) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn is_access_expression(
+        &self,
+        _file: &ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+    ) -> bool {
+        false
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        _file: &ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+        _ident: &str,
+    ) -> Option<DeclarationInfo> {
+        None
     }
 
     fn list_symbols(&self, file: &ProjectFile) -> String {
@@ -293,6 +297,37 @@ fn complete_symbol_index_skips_enclosing_owner_regex_scan() {
 }
 
 #[test]
+fn definition_outcome_key_reuses_declaration_context() {
+    use crate::analyzer::usages::get_definition::{
+        DefinitionLookupOutcome, DefinitionLookupStatus,
+    };
+    use crate::test_support::AnalyzerFixture;
+
+    let fixture =
+        AnalyzerFixture::new_for_language(Language::Rust, &[("lib.rs", "pub fn target() {}\n")]);
+    let analyzer = fixture.analyzer.analyzer();
+    let unit = analyzer
+        .search_definitions("target", false)
+        .into_iter()
+        .next()
+        .expect("target declaration");
+    let outcome = DefinitionLookupOutcome {
+        status: DefinitionLookupStatus::Resolved,
+        reference: None,
+        definitions: vec![unit],
+        lexical_definition: None,
+        diagnostics: Vec::new(),
+    };
+    let mut render_cache = DefinitionCandidateRenderCache::default();
+
+    let first = super::definitions::semantic_outcome_key(analyzer, &outcome, &mut render_cache);
+    let second = super::definitions::semantic_outcome_key(analyzer, &outcome, &mut render_cache);
+
+    assert_eq!(first, second);
+    assert_eq!(render_cache.declaration_context_count(), 1);
+}
+
+#[test]
 fn python_module_functions_are_not_duplicated_in_file_summary() {
     use crate::analyzer::{Language, PythonAnalyzer, TestProject};
 
@@ -355,7 +390,13 @@ fn issue_1431_source_block_end_line_counts_cr_only_terminators() {
         .into_iter()
         .find(|unit| unit.fq_name().contains(".m"))
         .expect("method unit");
-    let blocks = super::sources::source_blocks_for_resolved_units(&analyzer, &[unit]);
+    let blocks = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec![unit.fq_name()],
+        },
+    )
+    .sources;
     let block = blocks
         .iter()
         .find(|block| block.text.contains("public void m"))

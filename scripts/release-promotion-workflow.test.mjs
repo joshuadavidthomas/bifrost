@@ -69,7 +69,7 @@ test("release is the only tag and manual-dispatch entrypoint for package publica
   }
 });
 
-test("uv CLI package exposes only the native bifrost command", () => {
+test("uv CLI package exposes bifrost through its package name", () => {
   assert.match(uvCliManifest, /^name = "brokk-bifrost"$/mu);
   assert.match(uvCliManifest, /^dynamic = \["version"\]$/mu);
   assert.match(uvCliManifest, /^bindings = "bin"$/mu);
@@ -78,6 +78,7 @@ test("uv CLI package exposes only the native bifrost command", () => {
     uvCliManifest,
     /^targets = \[\{ name = "bifrost", kind = "bin" \}\]$/mu,
   );
+  assert.match(uvCliManifest, /^data = "wheel-data"$/mu);
   assert.match(uvCliManifest, /^license-files = \["\.generated-licenses\/\*"\]$/mu);
   for (const license of [
     "LICENSE.md",
@@ -163,6 +164,12 @@ test("promotion evidence covers validation before every external publisher", () 
   for (const job of [
     "release",
     "publish-crate-core",
+    "publish-crate-csharp",
+    "publish-crate-go",
+    "publish-crate-php",
+    "publish-crate-python",
+    "publish-crate-ruby",
+    "publish-crate-rust",
     "publish-crate-analysis",
     "publish-wheels",
     "publish-agent-plugin",
@@ -199,6 +206,39 @@ test("promotion evidence covers validation before every external publisher", () 
     /dist\/bifrost-semantic-packs-\$\{\{ needs\.release-context\.outputs\.tag \}\}\.tar\.gz/u,
   );
 
+  // Each language crate publishes straight after core; analysis waits for all
+  // of them, because it names every one with an exact `=` requirement.
+  const languageCrates = [
+    "cpp",
+    "csharp",
+    "go",
+    "js-ts",
+    "jvm",
+    "php",
+    "python",
+    "ruby",
+    "rust",
+  ];
+  for (const language of languageCrates) {
+    assert.match(
+      jobBlock(release, `publish-crate-${language}`),
+      /^    needs: \[release-context, promotion-evidence, publish-crate-core\]$/mu,
+    );
+  }
+  // Derived from the roster above rather than spelled out, so a newly landed
+  // language crate cannot be added to the parallel band while analysis quietly
+  // stops waiting for it. The literal form drifted once already: the C++
+  // landing widened `release.yml` without widening this assertion.
+  const analysisNeeds = [
+    "release-context",
+    "promotion-evidence",
+    "publish-crate-core",
+    ...languageCrates.map((language) => `publish-crate-${language}`),
+  ].join(", ");
+  assert.match(
+    jobBlock(release, "publish-crate-analysis"),
+    new RegExp(`^    needs: \\[${analysisNeeds}\\]$`, "mu"),
+  );
   // Publish order mirrors the workspace dependency DAG (#1548): analysis, then
   // its direct dependents policy/nlp/semantic-packs, then runtime (which needs
   // policy), then the hosts, then the facade.
@@ -272,7 +312,6 @@ test("agent plugin release smoke follows the packaged Codex manifest and release
   }
   for (const jobName of ["agent-plugin-prepublish-smoke", "agent-plugin-release-smoke"]) {
     const smoke = jobBlock(release, jobName);
-    assert.match(smoke, /BIFROST_MCP_RMCP: 'on'/u);
     assert.match(smoke, /scripts\/smoke-agent-plugin-release\.mjs/u);
   }
 });

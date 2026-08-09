@@ -1,16 +1,20 @@
 use super::*;
-use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::lexical_definitions::{
     PythonMethodBinding, formal_parameter_slots_for_owner_bounded,
 };
-use crate::analyzer::python::bindings::{
-    PythonLexicalNameResolution, PythonLexicalScopeInventory,
-    python_unambiguous_module_class_binding_bounded,
-};
+use crate::analyzer::python::lexical_scope::python_lexical_scope_inventory_bounded;
 use crate::analyzer::python::{
     python_deferred_annotation_identifier_ranges, python_node_is_in_annotation,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use crate::analyzer::{
+    BoundedDefinitionLookup, resolve_fqn_candidates, resolve_module_code_unit,
+    usage_resolve_module_files,
+};
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
+use brokk_bifrost_python::bindings::{
+    PythonLexicalNameResolution, python_unambiguous_module_class_binding_bounded,
+};
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -73,6 +77,11 @@ impl<'a> PythonDefinitionProvider<'a> {
     pub(crate) fn ranges(&self, unit: &CodeUnit) -> Vec<Range> {
         self.session
             .query_limited_rows(|limit| self.python.ranges_limited(unit, limit))
+    }
+
+    /// The import bindings `file` declares, charged as one indexed query.
+    fn import_binder(&self, file: &ProjectFile) -> Option<Arc<ImportBinder>> {
+        self.session.query(|| self.python.import_binder_of(file))
     }
 
     fn scope_step(&self) -> bool {
@@ -152,6 +161,13 @@ pub(crate) fn resolve_python_bounded(
                             ),
                         )
                     } else {
+                        // Found by asking the index for `<receiver fq>.<member>`,
+                        // so the receiver is the owner and the walk took no
+                        // hierarchy hop (#1477). This seam has no ancestor walk
+                        // at all, so an inherited member never reaches it.
+                        let mut attribution = PythonMemberAttribution::default();
+                        attribution.record_direct(&receiver, &candidates);
+                        attribution.stage();
                         candidates_outcome(candidates)
                     }
                 }
@@ -211,17 +227,48 @@ pub(crate) fn python_type_lookup_resolution_bounded(
         site.focus_start_byte,
         site.focus_end_byte,
     )?;
-    let target_kind = if node.kind() == "identifier"
-        && !python_has_lexical_binding_bounded(support, node, source)
-        && python_class_candidate_for_name(support, file, source, node, python_slice(node, source))
-            .is_some()
+    let expression = python_type_expression_node_bounded(support, node)?;
+    let target_kind = if expression.kind() == "identifier"
+        && !python_has_lexical_binding_bounded(support, expression, source)
+        && python_class_candidate_for_name(
+            support,
+            file,
+            source,
+            expression,
+            python_slice(expression, source),
+        )
+        .is_some()
     {
         TypeLookupTargetKind::TypeReference
     } else {
         TypeLookupTargetKind::ValueExpression
     };
-    let unit = python_type_for_expression_bounded(support, file, source, root, node, 0)?;
+    let unit = python_type_for_expression_bounded(support, file, source, root, expression, 0)?;
     Some(PythonTypeLookupResolution { unit, target_kind })
+}
+
+/// The expression whose type the caret asks for.
+///
+/// A caret on the member of `value.paint` covers the `paint` identifier alone,
+/// but the type owed is the attribute expression's, so climb to the outermost
+/// `attribute` the caret's node is the member of. A caret on the receiver stays
+/// where it is: `value` in `value.paint` still asks for `value`'s own type.
+fn python_type_expression_node_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if !support.scope_step() {
+            return None;
+        }
+        if parent.kind() != "attribute" || parent.child_by_field_name("attribute") != Some(current)
+        {
+            break;
+        }
+        current = parent;
+    }
+    Some(current)
 }
 
 fn python_smallest_named_node_covering_bounded<'tree>(
@@ -445,12 +492,134 @@ fn python_type_for_expression_bounded(
             }?;
             python_callable_return_type_in_tree(support, file, source, root, &callable, depth + 1)
         }
+        // `value.paint` outside a call: the receiver's type owns the member, so
+        // the member declaration's own type is the expression's type.
+        "attribute" => {
+            let object = node.child_by_field_name("object")?;
+            let member = python_slice(node.child_by_field_name("attribute")?, source);
+            if member.is_empty() {
+                return None;
+            }
+            let receiver =
+                python_type_for_expression_bounded(support, file, source, root, object, depth + 1)?;
+            let declaration = unique_python_candidate(
+                support.members_for_owner_name(&receiver.fq_name(), member),
+            )?;
+            python_member_declared_type_bounded(
+                support,
+                file,
+                source,
+                root,
+                &declaration,
+                depth + 1,
+            )
+        }
         "parenthesized_expression" => {
             let child = node.named_child(0)?;
             python_type_for_expression_bounded(support, file, source, root, child, depth + 1)
         }
         _ => None,
     }
+}
+
+/// The type a resolved member declaration carries: a nested class is its own
+/// type, a method's is its return type, and an attribute's is its annotation or
+/// the type of the value bound to it.
+///
+/// The syntax routes read the site's own tree, so a member declared in another
+/// file has no bounded answer here. That is the same in-file rule
+/// [`python_callable_return_type_in_tree`] applies to a resolved callable: the
+/// bounded core answers from the tree the caller already parsed and never
+/// cold-parses a second file to finish a step.
+fn python_member_declared_type_bounded(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    member: &CodeUnit,
+    depth: usize,
+) -> Option<CodeUnit> {
+    if depth >= 12 || !support.scope_step() {
+        return None;
+    }
+    if member.is_class() {
+        return Some(member.clone());
+    }
+    if member.source() != file {
+        return None;
+    }
+    let mut types = Vec::new();
+    for range in support.ranges(member) {
+        if range.start_byte >= range.end_byte || range.end_byte > source.len() {
+            continue;
+        }
+        let Some(mut node) = python_smallest_named_node_covering_bounded(
+            support,
+            root,
+            range.start_byte,
+            range.end_byte,
+        ) else {
+            continue;
+        };
+        loop {
+            if !support.scope_step() {
+                return None;
+            }
+            if node.kind() == "function_definition"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| python_slice(name, source) == member.identifier())
+            {
+                types.extend(python_function_return_type_from_node_bounded(
+                    support,
+                    file,
+                    source,
+                    root,
+                    node,
+                    depth + 1,
+                ));
+                break;
+            }
+            // `name: T = ..` at class level and `self.name = ..` in a method are
+            // both assignments whose bound name is the member's identifier.
+            let bound = (node.kind() == "assignment")
+                .then(|| node.child_by_field_name("left"))
+                .flatten()
+                .and_then(|left| match left.kind() {
+                    "identifier" => Some(left),
+                    "attribute" => left.child_by_field_name("attribute"),
+                    _ => None,
+                });
+            if bound.is_some_and(|bound| python_slice(bound, source) == member.identifier()) {
+                let declared = match node.child_by_field_name("type") {
+                    Some(annotation) => python_type_from_annotation_bounded(
+                        support,
+                        file,
+                        source,
+                        annotation,
+                        depth + 1,
+                    ),
+                    None => node.child_by_field_name("right").and_then(|value| {
+                        python_type_for_expression_bounded(
+                            support,
+                            file,
+                            source,
+                            root,
+                            value,
+                            depth + 1,
+                        )
+                    }),
+                };
+                types.extend(declared);
+                break;
+            }
+            let Some(parent) = node.parent() else {
+                break;
+            };
+            node = parent;
+        }
+    }
+    unique_python_candidate(types)
 }
 
 fn python_class_candidate_for_name(
@@ -474,6 +643,11 @@ fn python_class_candidate_for_name(
     if let Some(candidate) = unique_python_candidate(file_candidates) {
         return Some(candidate);
     }
+    // A same-file declaration shadows an import, so the binder is consulted only
+    // after the file's own classes cannot answer the name.
+    if let Some(candidate) = python_imported_class_candidate(support, file, name) {
+        return Some(candidate);
+    }
     if !name.contains('.') {
         return None;
     }
@@ -483,6 +657,34 @@ fn python_class_candidate_for_name(
         .filter(CodeUnit::is_class)
         .collect::<Vec<_>>();
     unique_python_candidate(exact_candidates)
+}
+
+/// The class an imported local name binds to.
+///
+/// `from widget import Widget` records the module the name came from, and a
+/// workspace declaration is indexed at `<module>.<imported name>`, so the
+/// binder plus one fq-name query resolves an annotation whose class lives in
+/// another file. Only a named import binds a declaration: a namespace binding
+/// names a module, not a type.
+fn python_imported_class_candidate(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    name: &str,
+) -> Option<CodeUnit> {
+    let binder = support.import_binder(file)?;
+    let binding = binder.bindings.get(name)?;
+    if binding.kind != ImportKind::Named {
+        return None;
+    }
+    let imported = binding.imported_name.as_ref()?;
+    let fqn = format!("{}.{}", binding.module_specifier, imported);
+    unique_python_candidate(
+        support
+            .fqn(&fqn)
+            .into_iter()
+            .filter(CodeUnit::is_class)
+            .collect(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1109,9 +1311,7 @@ fn python_lexical_binding_bounded<'tree>(
             })
         {
             let Some(inventory) =
-                PythonLexicalScopeInventory::collect_bounded(candidate, source, || {
-                    support.scope_step()
-                })
+                python_lexical_scope_inventory_bounded(candidate, source, || support.scope_step())
             else {
                 return PythonLexicalBinding::Other;
             };
@@ -1441,7 +1641,7 @@ fn python_visible_module_binding_candidates(
                 imported_name,
             } => {
                 let mut resolved = false;
-                for module_file in py.usage_resolve_module_files(&context.file, module) {
+                for module_file in usage_resolve_module_files(py, &context.file, module) {
                     let Some(module_fqn) = analyzer
                         .declarations(&module_file)
                         .into_iter()
@@ -1452,9 +1652,9 @@ fn python_visible_module_binding_candidates(
                     };
                     resolved = true;
                     let fqn = format!("{module_fqn}.{imported_name}");
-                    candidates.extend(
-                        py.resolve_fqn_candidates(&fqn, |candidate| support.fqn(candidate)),
-                    );
+                    candidates.extend(resolve_fqn_candidates(py, &fqn, |candidate| {
+                        support.fqn(candidate)
+                    }));
                 }
                 if !resolved {
                     let fqn = if module.ends_with('.') {
@@ -1463,7 +1663,7 @@ fn python_visible_module_binding_candidates(
                         format!("{module}.{imported_name}")
                     };
                     let mut resolved_candidates =
-                        py.resolve_fqn_candidates(&fqn, |candidate| support.fqn(candidate));
+                        resolve_fqn_candidates(py, &fqn, |candidate| support.fqn(candidate));
                     if resolved_candidates.is_empty() {
                         // No Python module backs the specifier because it names a
                         // CLR/JVM namespace this workspace indexes in another
@@ -1480,7 +1680,7 @@ fn python_visible_module_binding_candidates(
                     .get(name)
                     .map(String::as_str)
                     .unwrap_or(module);
-                candidates.extend(py.resolve_module_code_unit(bound_module));
+                candidates.extend(resolve_module_code_unit(py, bound_module));
             }
             ModuleBindingEventKind::Other => {
                 if let Some(local) = context.same_file.get(name) {
@@ -1761,7 +1961,9 @@ impl PythonDefinitionContext {
         self.build_counters
             .generic_receiver_type_fallbacks
             .fetch_add(1, Ordering::Relaxed);
-        resolve_python_receiver_type(analyzer, py, file, raw_type, target_self_file)
+        with_python_graph_source(analyzer, |graph| {
+            resolve_python_receiver_type(&graph, py, file, raw_type, target_self_file)
+        })
     }
 
     #[cfg(test)]
@@ -1798,9 +2000,9 @@ impl PythonDefinitionContext {
                 self.build_counters
                     .scope_fact_builds
                     .fetch_add(1, Ordering::Relaxed);
-                Arc::new(collect_scope_facts_from_parsed_source(
-                    analyzer, py, file, source, root,
-                ))
+                Arc::new(with_python_graph_source(analyzer, |graph| {
+                    collect_scope_facts_from_parsed_source(&graph, py, file, source, root)
+                }))
             })
             .clone()
     }
@@ -1895,7 +2097,7 @@ fn python_fqn_outcome(
     fqn: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
-    let candidates = py.resolve_fqn_candidates(fqn, |name| support.fqn(name));
+    let candidates = resolve_fqn_candidates(py, fqn, |name| support.fqn(name));
     if !candidates.is_empty() {
         return candidates_outcome(candidates);
     }
@@ -1933,7 +2135,7 @@ fn python_module_outcome(
     module_fq: &str,
     raw: &str,
 ) -> DefinitionLookupOutcome {
-    if let Some(module) = py.resolve_module_code_unit(module_fq) {
+    if let Some(module) = resolve_module_code_unit(py, module_fq) {
         return candidates_outcome(vec![module]);
     }
     // Same workspace-namespace gate as the fqn path above, plus the module path
@@ -1958,7 +2160,7 @@ fn python_class_for_fqn(
     support: &dyn BoundedDefinitionLookup,
     fqn: &str,
 ) -> Option<CodeUnit> {
-    py.resolve_fqn_candidates(fqn, |name| support.fqn(name))
+    resolve_fqn_candidates(py, fqn, |name| support.fqn(name))
         .into_iter()
         .find(|unit| unit.is_class())
         .or_else(|| {
@@ -1996,11 +2198,26 @@ fn python_member_outcome(
         units
     };
     let mut candidates = member_candidates(&receiver_type.fq_name());
+    // The member attribution this seam can name: every candidate was found by
+    // asking the index for `<owner fq>.<member>`, so the owner is exactly the
+    // type the lookup asked about, and the hop distance is that type's distance
+    // from the receiver. Built only while a trace records (#1477).
+    let mut attribution = PythonMemberAttribution::default();
+    attribution.record_direct(&receiver_type, &candidates);
     if candidates.is_empty()
         && let Some(provider) = analyzer.type_hierarchy_provider()
     {
+        // The routes are the walk `get_ancestors` performs, retaining the hop
+        // distance and the first-discovery parent it discards.
+        let routes = if trace::recording() {
+            PythonAncestorRoutes::build(provider, &receiver_type)
+        } else {
+            PythonAncestorRoutes::default()
+        };
         for ancestor in provider.get_ancestors(&receiver_type) {
-            candidates.extend(member_candidates(&ancestor.fq_name()));
+            let found = member_candidates(&ancestor.fq_name());
+            attribution.record_inherited(&receiver_type, &ancestor, &found, &routes);
+            candidates.extend(found);
         }
         sort_units(&mut candidates);
         candidates.dedup();
@@ -2017,7 +2234,197 @@ fn python_member_outcome(
         };
         no_definition("no_indexed_definition", message)
     } else {
+        attribution.stage();
         candidates_outcome(candidates)
+    }
+}
+
+/// How many ancestor types the recording-only route walk may visit. Mirrors the
+/// bound the Java member-family walk applies to the same kind of closure: a
+/// diamond or a deep framework hierarchy stays bounded, and a hierarchy that
+/// exceeds the bound loses attribution rather than gaining a wrong one.
+const MAX_ANCESTOR_FRONTIER: usize = 512;
+
+/// The hop distance and first-discovery parent of every ancestor the Python
+/// member walk can reach (#1477).
+///
+/// `TypeHierarchyProvider::get_ancestors` flattens its breadth-first walk to a
+/// list, discarding both facts. This repeats that walk over the same
+/// direct-ancestor edges, in the same order and with the same
+/// fully-qualified-name deduplication, and retains them. It decides nothing:
+/// the production loop still consumes `get_ancestors` unchanged.
+///
+/// The walk is bounded by [`MAX_ANCESTOR_FRONTIER`]. Truncation removes
+/// attribution, never distorts it: breadth-first order fixes every depth at
+/// the level it was recorded, so an ancestor the bound cut off simply has no
+/// depth and [`PythonAncestorRoutes::route`] returns `None` for it, leaving
+/// that candidate unattributed.
+#[derive(Default)]
+struct PythonAncestorRoutes {
+    /// First-discovery parent of each ancestor the walk expanded.
+    parents: HashMap<CodeUnit, CodeUnit>,
+    /// Breadth-first hop distance from the receiver.
+    depths: HashMap<CodeUnit, usize>,
+}
+
+impl PythonAncestorRoutes {
+    fn build(provider: &dyn crate::analyzer::TypeHierarchyProvider, receiver: &CodeUnit) -> Self {
+        let mut routes = Self::default();
+        let mut seen: HashSet<String> = HashSet::default();
+        seen.insert(receiver.fq_name());
+        let mut level = provider.get_direct_ancestors(receiver);
+        for ancestor in &level {
+            routes
+                .parents
+                .entry(ancestor.clone())
+                .or_insert_with(|| receiver.clone());
+        }
+        let mut depth = 0usize;
+        let mut visited = 0usize;
+        'walk: while !level.is_empty() {
+            depth += 1;
+            let mut next_level = Vec::new();
+            for ancestor in level {
+                if !seen.insert(ancestor.fq_name()) {
+                    continue;
+                }
+                visited += 1;
+                if visited > MAX_ANCESTOR_FRONTIER {
+                    // Stop before recording anything about this ancestor. Every
+                    // depth already recorded is the breadth-first minimum and
+                    // stays correct; the rest of the closure is simply absent,
+                    // so its candidates stay unattributed.
+                    break 'walk;
+                }
+                routes.depths.insert(ancestor.clone(), depth);
+                let expanded = provider.get_direct_ancestors(&ancestor);
+                for next in &expanded {
+                    routes
+                        .parents
+                        .entry(next.clone())
+                        .or_insert_with(|| ancestor.clone());
+                }
+                next_level.extend(expanded);
+            }
+            level = next_level;
+        }
+        routes
+    }
+
+    /// The exact route from `receiver` to `owner`, as first-discovery hops.
+    /// Every Python direct-ancestor edge is a base-class edge, so each hop is
+    /// [`HierarchyRelation::Extends`]. Returns `None` when the walk never
+    /// reached `owner`, which leaves the candidate unattributed rather than
+    /// attributed to a route this seam cannot name.
+    fn route(
+        &self,
+        receiver: &CodeUnit,
+        owner: &CodeUnit,
+    ) -> Option<(usize, Vec<trace::HierarchyHopRecord>)> {
+        use crate::analyzer::structural::HierarchyRelation;
+
+        let depth = *self.depths.get(owner)?;
+        let mut chain = vec![owner.clone()];
+        while chain.last() != Some(receiver) {
+            let parent = self
+                .parents
+                .get(chain.last().expect("chain is never empty"))?;
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+        debug_assert_eq!(
+            chain.len(),
+            depth + 1,
+            "the first-discovery chain must be exactly the walk's hop distance"
+        );
+        let route = chain
+            .windows(2)
+            .enumerate()
+            .map(|(hop, pair)| trace::HierarchyHopRecord {
+                hop,
+                from: pair[0].clone(),
+                to: pair[1].clone(),
+                relation: HierarchyRelation::Extends,
+            })
+            .collect();
+        Some((depth, route))
+    }
+}
+
+/// The member attribution the Python member seams accumulate before they hand
+/// their candidates to the shared outcome constructor (#1477).
+///
+/// Applicability stays `Unknown`: these seams select by owner and name and
+/// never inspect the call shape, so claiming anything else would be inventing
+/// a check the resolver did not perform.
+#[derive(Default)]
+struct PythonMemberAttribution {
+    by_fq_name: Vec<(String, trace::MemberEnrichment)>,
+}
+
+impl PythonMemberAttribution {
+    /// Candidates found on the receiver's own type: depth zero, no route.
+    fn record_direct(&mut self, receiver: &CodeUnit, found: &[CodeUnit]) {
+        use crate::analyzer::structural::MemberDispatchTier;
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        if !trace::recording() {
+            return;
+        }
+        for candidate in found {
+            self.by_fq_name.push((
+                candidate.fq_name(),
+                trace::MemberEnrichment {
+                    owner: receiver.clone(),
+                    hierarchy_depth: 0,
+                    dispatch_tier: MemberDispatchTier::InherentOrDirect,
+                    applicability: ApplicabilityVerdict::Unknown,
+                    route: Vec::new(),
+                },
+            ));
+        }
+    }
+
+    /// Candidates found on an ancestor of the receiver. A candidate whose owner
+    /// the route walk cannot place stays unattributed.
+    fn record_inherited(
+        &mut self,
+        receiver: &CodeUnit,
+        owner: &CodeUnit,
+        found: &[CodeUnit],
+        routes: &PythonAncestorRoutes,
+    ) {
+        use crate::analyzer::structural::MemberDispatchTier;
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        if !trace::recording() || found.is_empty() {
+            return;
+        }
+        let Some((depth, route)) = routes.route(receiver, owner) else {
+            return;
+        };
+        for candidate in found {
+            self.by_fq_name.push((
+                candidate.fq_name(),
+                trace::MemberEnrichment {
+                    owner: owner.clone(),
+                    hierarchy_depth: depth,
+                    dispatch_tier: MemberDispatchTier::InheritedOrPromoted,
+                    applicability: ApplicabilityVerdict::Unknown,
+                    route: route.clone(),
+                },
+            ));
+        }
+    }
+
+    /// Stage the attribution for the outcome constructor the caller is about to
+    /// reach. Staging nothing leaves the rows unattributed, which is what an
+    /// unrecorded trace and an unplaceable owner must both look like.
+    fn stage(self) {
+        if self.by_fq_name.is_empty() {
+            return;
+        }
+        trace::stage_member_context(self.by_fq_name);
     }
 }
 
@@ -2028,7 +2435,7 @@ fn python_crosses_unindexed_boundary(support: &dyn BoundedDefinitionLookup, fqn:
     // `rsplit_once('.')`'s (module, _) split exactly, including the no-dot
     // case (an empty module, which `python_workspace_module_exists` always
     // rejects).
-    let segments = crate::analyzer::symbol_lookup::parse_symbol_path(Language::Python, fqn);
+    let segments = parse_symbol_path(Language::Python, fqn);
     let module = segments[..segments.len().saturating_sub(1)].join(".");
     !python_workspace_module_exists(support, &module)
 }
@@ -2266,7 +2673,7 @@ fn python_unresolved_import_boundary(
         if alias_or_identifier == Some(local) {
             return provider
                 .imported_code_units_of(file)
-                .into_iter()
+                .iter()
                 .all(|unit| unit.identifier() != local);
         }
         if let Some(attribute) = attribute
@@ -2275,7 +2682,7 @@ fn python_unresolved_import_boundary(
         {
             return provider
                 .imported_code_units_of(file)
-                .into_iter()
+                .iter()
                 .all(|unit| unit.identifier() != attribute);
         }
     }
@@ -2398,6 +2805,14 @@ fn python_is_non_reference_context(node: Node<'_>) -> bool {
     let deferred_annotation = node.kind() == "string_content" && python_node_is_in_annotation(node);
     let mut parent = Some(node);
     while let Some(current) = parent {
+        // An f-string interpolation hole holds ordinary expression nodes, so the
+        // enclosing `string` does not make them opaque. The walk is bottom-up, so
+        // reaching the hole before any `string` proves no nested string literal
+        // separates the node from the code context. `format_expression` is the
+        // same hole inside a format specifier (`f"{value:{width}}"`).
+        if matches!(current.kind(), "interpolation" | "format_expression") {
+            return false;
+        }
         if deferred_annotation && matches!(current.kind(), "string" | "string_content") {
             parent = current.parent();
             continue;

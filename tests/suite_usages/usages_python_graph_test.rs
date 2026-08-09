@@ -1,11 +1,12 @@
 use crate::common::usage_graph::{has_edge, usage_graph_at};
 use crate::common::{BuiltInlineTestProject, InlineTestProject, call_search_tool_json};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{PythonExportUsageGraphStrategy, UsageAnalyzer, UsageFinder};
 use brokk_bifrost::{
     AnalyzerDelegate, CodeUnit, IAnalyzer, Language, MultiAnalyzer, PythonAnalyzer,
 };
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn definition(analyzer: &PythonAnalyzer, fq_name: &str) -> CodeUnit {
     analyzer
@@ -286,6 +287,36 @@ def run():
         .into_either()
         .expect("graph should resolve aliased import");
     assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn scan_usages_keeps_direct_and_reexport_aliases_and_ignores_unrelated_files() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "def target():\n    return None\n")
+        .file("pkg/__init__.py", "from service import target as alias\n")
+        .file("direct.py", "from service import target\n\ntarget()\n")
+        .file("alias.py", "from pkg import alias\n\nalias()\n")
+        .file("unrelated.py", "def unrelated():\n    return None\n")
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.target");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve direct and re-export aliases");
+
+    let files: BTreeMap<_, _> = hits
+        .iter()
+        .map(|hit| (hit.file.clone(), hit.snippet.clone()))
+        .collect();
+    assert!(files.contains_key(&project.file("direct.py")), "{hits:#?}");
+    assert!(files.contains_key(&project.file("alias.py")), "{hits:#?}");
+    assert!(
+        !files.contains_key(&project.file("unrelated.py")),
+        "an unrelated file must not produce a usage: {hits:#?}"
+    );
 }
 
 #[test]
@@ -3582,5 +3613,407 @@ fn class_field_default_argument_resolves_in_owner_class_scope() {
         ),
         1,
         "the default is evaluated in the class body; the method body is not",
+    );
+}
+
+#[test]
+fn fstring_interpolation_call_is_a_usage() {
+    let source = concat!(
+        "def d(value):\n",
+        "    return value.decode()\n",
+        "\n",
+        "\n",
+        "def parse(request_line):\n",
+        "    raise ValueError(f\"invalid HTTP request line: {d(request_line)}\")\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("http11.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "http11.d");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve the interpolated call");
+
+    let lines: Vec<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(lines, vec![6], "{hits:#?}");
+    let hit = hits.iter().next().expect("one interpolated call hit");
+    let call = source
+        .find("{d(request_line)}")
+        .expect("interpolation hole")
+        + 1;
+    assert_eq!(
+        (hit.start_offset, hit.end_offset),
+        (call, call + 1),
+        "{hit:#?}"
+    );
+}
+
+#[test]
+fn fstring_interpolation_attribute_call_is_a_member_usage() {
+    let source = concat!(
+        "class Holder:\n",
+        "    def render(self):\n",
+        "        return \"x\"\n",
+        "\n",
+        "\n",
+        "def show(obj: Holder):\n",
+        "    return f\"value: {obj.render()}\"\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("holder.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "holder.Holder.render");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve the interpolated member call");
+
+    let lines: Vec<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(lines, vec![7], "{hits:#?}");
+}
+
+#[test]
+fn plain_string_identifier_text_is_not_a_usage() {
+    let source = concat!(
+        "def d(value):\n",
+        "    return value\n",
+        "\n",
+        "\n",
+        "def parse(request_line):\n",
+        "    raise ValueError(\"invalid d(request_line) here\")\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("plain.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "plain.d");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for the plain-string control");
+
+    assert!(hits.is_empty(), "plain string text is not code: {hits:#?}");
+}
+
+// Issue #1763: a module-qualified annotation whose target is owned by a module
+// (a type alias, TypeVar, NewType value, or a function) is a usage. Only the
+// class-owned shapes used to survive the annotation path.
+#[test]
+fn module_qualified_annotation_resolves_module_field_target() {
+    let source = "import op_tree\n\n\ndef g() -> op_tree.OP_TREE:\n    return 1\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("op_tree.py", "OP_TREE = int\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "op_tree.OP_TREE",
+        "user.py",
+        source,
+        &[("OP_TREE", 0)],
+    );
+}
+
+#[test]
+fn module_qualified_subscripted_annotation_resolves_module_field_target() {
+    let source =
+        "import op_tree\n\n\ndef g(items: list[op_tree.OP_TREE]) -> None:\n    return None\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("op_tree.py", "OP_TREE = int\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "op_tree.OP_TREE",
+        "user.py",
+        source,
+        &[("OP_TREE", 0)],
+    );
+}
+
+#[test]
+fn module_qualified_annotation_resolves_module_function_target() {
+    let source = "import service\nfrom typing import Annotated\n\n\ndef g() -> Annotated[int, service.merge]:\n    return 1\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "def merge(left, right):\n    return left\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.merge",
+        "user.py",
+        source,
+        &[("merge", 0)],
+    );
+}
+
+#[test]
+fn module_qualified_value_reference_resolves_module_field_target() {
+    // Control: the value position always worked and must keep working.
+    let source = "import op_tree\n\nvalue = op_tree.OP_TREE\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("op_tree.py", "OP_TREE = int\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "op_tree.OP_TREE",
+        "user.py",
+        source,
+        &[("OP_TREE", 0)],
+    );
+}
+
+#[test]
+fn bare_name_annotation_resolves_module_field_target() {
+    // Control: the from-import spelling of the same reference was consistent.
+    let source = "from op_tree import OP_TREE\n\n\ndef g() -> OP_TREE:\n    return 1\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("op_tree.py", "OP_TREE = int\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "op_tree.OP_TREE",
+        "user.py",
+        source,
+        &[("OP_TREE", 1)],
+    );
+}
+
+#[test]
+fn module_qualified_annotation_resolves_class_target() {
+    // Control: a class target through the same syntax was consistent.
+    let source =
+        "import service\n\n\ndef g(value: service.Thing) -> service.Thing:\n    return value\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "class Thing:\n    pass\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.Thing",
+        "user.py",
+        source,
+        &[("Thing", 0), ("Thing", 1)],
+    );
+}
+
+#[test]
+fn module_qualified_annotation_resolves_class_owned_field_target() {
+    // Issue #1763 also lifted this shape: a class-owned alias reached through a
+    // namespace import used to produce no proven hit at all.
+    let source = "import service\n\n\ndef g() -> service.Holder.Alias:\n    return 1\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "class Holder:\n    Alias = int\n")
+        .file("user.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.Holder.Alias",
+        "user.py",
+        source,
+        &[("Alias", 0)],
+    );
+}
+
+// Issue #1764: re-exports nested in a block are exports too. The AST collector
+// the export index falls back to when an import name collides with a top-level
+// declaration used to look at depth-1 children only.
+const PYTHON_NESTED_REEXPORT_CONSUMER: &str =
+    "from .compatibility import timeout\n\n\ndef go():\n    with timeout(5):\n        pass\n";
+
+fn python_nested_reexport_project(compatibility: &str) -> BuiltInlineTestProject {
+    InlineTestProject::with_language(Language::Python)
+        .file("src/ws/__init__.py", "")
+        .file(
+            "src/ws/async_timeout.py",
+            "def timeout(delay):\n    return delay\n",
+        )
+        .file("src/ws/compatibility.py", compatibility)
+        .file("src/ws/server.py", PYTHON_NESTED_REEXPORT_CONSUMER)
+        .build()
+}
+
+#[test]
+fn block_nested_reexport_shadowing_a_declaration_reaches_consumers() {
+    let project = python_nested_reexport_project(
+        "zzz = 1\nif True:\n    from asyncio import zzz\n    from .async_timeout import timeout\n",
+    );
+
+    assert_python_usage_hits(
+        &project,
+        "ws.async_timeout.timeout",
+        "src/ws/server.py",
+        PYTHON_NESTED_REEXPORT_CONSUMER,
+        &[("timeout", 1)],
+    );
+}
+
+#[test]
+fn flat_reexport_shadowing_a_declaration_reaches_consumers() {
+    // Control: the same collision without nesting was always consistent.
+    let project = python_nested_reexport_project(
+        "zzz = 1\nfrom asyncio import zzz\nfrom .async_timeout import timeout\n",
+    );
+
+    assert_python_usage_hits(
+        &project,
+        "ws.async_timeout.timeout",
+        "src/ws/server.py",
+        PYTHON_NESTED_REEXPORT_CONSUMER,
+        &[("timeout", 1)],
+    );
+}
+
+#[test]
+fn block_nested_reexport_without_a_collision_reaches_consumers() {
+    // Control: with no shadowed name the export index reads the import records,
+    // which always saw nested imports.
+    let project =
+        python_nested_reexport_project("if True:\n    from .async_timeout import timeout\n");
+
+    assert_python_usage_hits(
+        &project,
+        "ws.async_timeout.timeout",
+        "src/ws/server.py",
+        PYTHON_NESTED_REEXPORT_CONSUMER,
+        &[("timeout", 1)],
+    );
+}
+
+#[test]
+fn function_scoped_import_is_not_a_reexport() {
+    // Near miss for the block-nested walk: a function body is a scope, so the
+    // import it runs binds a local, not an export of the module.
+    let project = python_nested_reexport_project(
+        "zzz = 1\nif True:\n    from asyncio import zzz\n\n\ndef load():\n    from .async_timeout import timeout\n\n    return timeout\n",
+    );
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "ws.async_timeout.timeout");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should succeed for the function-scoped import");
+
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("src/ws/server.py")),
+        "a function-local import does not re-export the name: {hits:#?}"
+    );
+}
+
+/// The `(file, line)` of every external usage a Python query reports.
+fn python_usage_sites(
+    analyzer: &PythonAnalyzer,
+    overloads: &[CodeUnit],
+) -> BTreeSet<(String, usize)> {
+    let query = UsageFinder::new().query(analyzer, overloads, 1000, 1000);
+    assert!(query.graph_failure.is_none(), "query: {:?}", query.result);
+    query
+        .result
+        .all_hits()
+        .into_iter()
+        .map(|hit| {
+            (
+                hit.file.rel_path().to_string_lossy().replace('\\', "/"),
+                hit.line,
+            )
+        })
+        .collect()
+}
+
+/// #1791 (following #1779): two vendored copies of one package -- `first/pkg`
+/// and `second/pkg`, each its own package root because only `pkg` carries an
+/// `__init__.py` -- give every item in them the module-qualified name
+/// `pkg.service.Service.run`, so forward resolution answers one query with both
+/// declarations.
+///
+/// Python keys import resolution on that module name rather than on the
+/// declaring file, so whichever copy wins the definition lookup proves both
+/// consumers' calls and its sibling proves nothing at all. Scanning only
+/// `overloads.first()` therefore let candidate order decide the whole answer:
+/// with the losing copy first the query reported no usages.
+#[test]
+fn python_duplicate_package_target_group_unions_every_candidate_scan() {
+    let service = "class Service:\n    def run(self):\n        pass\n";
+    let consumer = "from pkg.service import Service\n\n\ndef go(s: Service):\n    s.run()\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("first/pkg/__init__.py", "")
+        .file("first/pkg/service.py", service)
+        .file("first/pkg/consumer.py", consumer)
+        .file("second/pkg/__init__.py", "")
+        .file("second/pkg/service.py", service)
+        .file("second/pkg/consumer.py", consumer)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+
+    let mut definitions = analyzer.get_definitions("pkg.service.Service.run");
+    definitions.sort_by_key(|unit| unit.source().rel_path().to_path_buf());
+    assert_eq!(
+        definitions
+            .iter()
+            .map(|unit| unit
+                .source()
+                .rel_path()
+                .to_string_lossy()
+                .replace('\\', "/"))
+            .collect::<Vec<_>>(),
+        vec![
+            "first/pkg/service.py".to_string(),
+            "second/pkg/service.py".to_string()
+        ],
+        "both copies must resolve as candidates of one target group"
+    );
+
+    let both = BTreeSet::from([
+        ("first/pkg/consumer.py".to_string(), 5),
+        ("second/pkg/consumer.py".to_string(), 5),
+    ]);
+
+    assert_eq!(
+        python_usage_sites(&analyzer, &definitions),
+        both,
+        "the group's usages must include both copies' call sites"
+    );
+    let reversed: Vec<CodeUnit> = definitions.iter().rev().cloned().collect();
+    assert_eq!(
+        python_usage_sites(&analyzer, &reversed),
+        both,
+        "candidate order must not change the reported sites"
+    );
+
+    // Controls: exactly one copy wins the `pkg.service` lookup, so exactly one
+    // single-candidate query answers with anything. That asymmetry is what made
+    // the pre-fix truncation lose every site whenever the losing copy sorted
+    // first, and it is why the union must run every candidate's scan.
+    let first_only = python_usage_sites(&analyzer, &definitions[..1]);
+    let second_only = python_usage_sites(&analyzer, &definitions[1..]);
+    assert!(
+        first_only.is_empty() != second_only.is_empty(),
+        "one copy must win the module-name lookup outright: {first_only:?} / {second_only:?}"
+    );
+    assert_eq!(
+        &first_only | &second_only,
+        both,
+        "between them the candidates must account for both call sites"
     );
 }

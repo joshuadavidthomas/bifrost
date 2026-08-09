@@ -5,6 +5,15 @@ import { pathToFileURL } from "node:url";
 
 const FACADE = "brokk-bifrost";
 const CORE = "brokk-bifrost-core";
+const CPP = "brokk-bifrost-cpp";
+const CSHARP = "brokk-bifrost-csharp";
+const GO = "brokk-bifrost-go";
+const JS_TS = "brokk-bifrost-js-ts";
+const JVM = "brokk-bifrost-jvm";
+const PHP = "brokk-bifrost-php";
+const PYTHON = "brokk-bifrost-python";
+const RUBY = "brokk-bifrost-ruby";
+const RUST = "brokk-bifrost-rust";
 const ANALYSIS = "brokk-bifrost-analysis";
 const NLP = "brokk-bifrost-nlp";
 const POLICY = "brokk-bifrost-policy";
@@ -16,6 +25,15 @@ const SEMANTIC_PACKS = "brokk-bifrost-semantic-packs";
 const EXPECTED_MEMBERS = new Set([
   FACADE,
   CORE,
+  CPP,
+  CSHARP,
+  GO,
+  JS_TS,
+  JVM,
+  PHP,
+  PYTHON,
+  RUBY,
+  RUST,
   ANALYSIS,
   NLP,
   POLICY,
@@ -25,12 +43,27 @@ const EXPECTED_MEMBERS = new Set([
   SEMANTIC_PACKS,
 ]);
 // Core is the bottom of the graph and depends on no workspace package; the
-// analysis crate sits directly on it. Policy and nlp sit directly on analysis
-// as siblings (#1548) so that neither can be pulled into the analysis
-// compilation unit again.
+// analysis crate sits directly on it. The per-language crates (cpp, csharp, go,
+// jvm, php, python, ruby, rust) sit between the two and depend on core alone -- that is what keeps a
+// language's knowledge out of the analysis compilation unit. `jvm` is one crate
+// for Java, Scala and Kotlin because the JVM source realm makes their routes
+// mutually dependent and all three share one `JvmAnalyzerConfig`; `js-ts` is one
+// crate for JavaScript and TypeScript for the same reason -- one module, one
+// `EdgePassId`, one usage strategy and one `JsTsAnalyzerConfig`. Policy and nlp sit directly
+// on analysis as siblings (#1548) so that neither can be pulled into the
+// analysis compilation unit again.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
-  [ANALYSIS, new Set([CORE])],
+  [CPP, new Set([CORE])],
+  [CSHARP, new Set([CORE])],
+  [GO, new Set([CORE])],
+  [JS_TS, new Set([CORE])],
+  [JVM, new Set([CORE])],
+  [PHP, new Set([CORE])],
+  [PYTHON, new Set([CORE])],
+  [RUBY, new Set([CORE])],
+  [RUST, new Set([CORE])],
+  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -41,7 +74,16 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
-  [ANALYSIS, new Set([CORE])],
+  [CPP, new Set([CORE])],
+  [CSHARP, new Set([CORE])],
+  [GO, new Set([CORE])],
+  [JS_TS, new Set([CORE])],
+  [JVM, new Set([CORE])],
+  [PHP, new Set([CORE])],
+  [PYTHON, new Set([CORE])],
+  [RUBY, new Set([CORE])],
+  [RUST, new Set([CORE])],
+  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
@@ -58,6 +100,42 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
   // same ban: it is below analysis, so anything forbidden there is worse here.
   [
     CORE,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    CPP,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    CSHARP,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    GO,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    JS_TS,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    JVM,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    PHP,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    PYTHON,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    RUBY,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [
+    RUST,
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
   ],
   [

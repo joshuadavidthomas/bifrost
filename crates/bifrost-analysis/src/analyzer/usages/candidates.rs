@@ -4,7 +4,7 @@ use crate::analyzer::usages::common::{
 };
 use crate::analyzer::usages::traits::CandidateFileProvider;
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportAnalysisProvider, Language, ProjectFile,
+    CodeUnit, IAnalyzer, ImportAnalysisProvider, ImportReachability, Language, ProjectFile,
     cpp_callable_definitions_share_identity_evidence,
 };
 use crate::cancellation::CancellationToken;
@@ -245,17 +245,33 @@ fn find_direct_importers_with_cancellation(
             .and_then(|infos| infos.get(candidate))
             .cloned()
             .unwrap_or_else(|| import_provider.import_info_of(candidate));
-        let could_import_target = source_files
-            .iter()
-            .any(|target| import_provider.could_import_file(candidate, &imports, target));
+        // A single `DoesNotReach` only rules out one target, so the walk keeps
+        // asking until a target reaches or one answers `Unknown`. The backstop
+        // below is skipped only when EVERY target was proved unreachable
+        // (#1730): one undecided pair is enough to need it.
+        let mut verdict = ImportReachability::DoesNotReach;
+        for target in source_files {
+            match import_provider.import_reachability(candidate, &imports, target) {
+                ImportReachability::Reaches => {
+                    verdict = ImportReachability::Reaches;
+                    break;
+                }
+                ImportReachability::Unknown => verdict = ImportReachability::Unknown,
+                ImportReachability::DoesNotReach => {}
+            }
+        }
         if cancellation.is_cancelled() {
             return Err(());
         }
-        if could_import_target {
-            if let Ok(mut sink) = importers.lock() {
-                sink.insert(candidate.clone());
+        match verdict {
+            ImportReachability::Reaches => {
+                if let Ok(mut sink) = importers.lock() {
+                    sink.insert(candidate.clone());
+                }
+                return Ok(());
             }
-            return Ok(());
+            ImportReachability::DoesNotReach => return Ok(()),
+            ImportReachability::Unknown => {}
         }
         let imported = import_provider
             .imported_code_units_from_infos(candidate, &imports)
@@ -580,8 +596,12 @@ fn should_union_text_candidates(target: &CodeUnit) -> bool {
     (language == Language::Python && (target.is_function() || target.is_field()) && member)
         // Dynamic instance receivers can cross unresolved emitted-file import
         // boundaries, so the import graph alone cannot prove candidate absence.
+        // A browser-script namespace field (`WLT.Utils = ...`) is read across
+        // files with no import edge at all, so fields need the same union
+        // (#1777). Text search only selects files that spell the identifier;
+        // the JS/TS graph still proves each receiver.
         || (matches!(language, Language::JavaScript | Language::TypeScript)
-            && target.is_function()
+            && (target.is_function() || target.is_field())
             && member
             && !target.short_name().ends_with("$static"))
         // Symbolic Scala methods such as `-` and `<` are commonly visible through
@@ -659,26 +679,13 @@ pub(crate) fn find_default_candidates_with_cancellation(
     analyzer: &dyn IAnalyzer,
     cancellation: &CancellationToken,
 ) -> HashSet<ProjectFile> {
-    let mut candidates = apply_fallback_policy(
+    apply_fallback_policy(
         target,
         analyzer,
         || find_import_graph_candidates(target, analyzer, Some(cancellation)),
         || find_text_candidates(target, analyzer, Some(cancellation)),
         || cancellation.is_cancelled(),
-    );
-    if !cancellation.is_cancelled() && language_for_target(target) == Language::Python {
-        candidates.extend(super::python_graph::python_usage_candidate_files(
-            analyzer, target,
-        ));
-    }
-    if !cancellation.is_cancelled() && language_for_target(target) == Language::Rust {
-        candidates.extend(super::rust_graph::rust_usage_candidate_files(
-            analyzer,
-            target,
-            cancellation,
-        ));
-    }
-    candidates
+    )
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
@@ -708,8 +715,8 @@ mod tests {
     }
 
     impl ImportAnalysisProvider for FileEdgeProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
-            HashSet::default()
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+            Arc::new(HashSet::default())
         }
 
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -727,7 +734,7 @@ mod tests {
     }
 
     impl ImportAnalysisProvider for BatchedImportProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
             panic!("batched importer discovery must not hydrate individual import states");
         }
 
@@ -757,16 +764,16 @@ mod tests {
             &self,
             _file: &ProjectFile,
             _imports: &[ImportInfo],
-        ) -> Option<HashSet<CodeUnit>> {
-            Some([self.imported.clone()].into_iter().collect())
+        ) -> Option<Arc<HashSet<CodeUnit>>> {
+            Some(Arc::new([self.imported.clone()].into_iter().collect()))
         }
     }
 
     impl ImportAnalysisProvider for CancellingImportProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             self.cancellation.cancel();
-            [self.imported.clone()].into_iter().collect()
+            Arc::new([self.imported.clone()].into_iter().collect())
         }
 
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {
@@ -899,8 +906,8 @@ mod tests {
     }
 
     impl ImportAnalysisProvider for PrefetchingImportProvider {
-        fn imported_code_units_of(&self, _file: &ProjectFile) -> HashSet<CodeUnit> {
-            HashSet::default()
+        fn imported_code_units_of(&self, _file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
+            Arc::new(HashSet::default())
         }
 
         fn referencing_files_of(&self, _file: &ProjectFile) -> HashSet<ProjectFile> {

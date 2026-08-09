@@ -1,20 +1,19 @@
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::js_ts::syntax::JsTsImportBinder;
 use crate::analyzer::lexical_definitions::{
     LexicalBindingResolution, LexicalDefinition, resolve_lexical_binding,
 };
 use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::common::namespace_prefixes;
 use crate::analyzer::usages::cpp_graph::{
-    CallArityEvidence, CppBareCallTargetResolution, CppDesignatedInitializerOwner,
-    CppLexicalScopeResolution, CppLexicalTypeResolution, CppTargetKind, CppVisibilityIndex,
-    cpp_argument_children, cpp_constructor_type_node, cpp_designated_initializer_owner,
-    cpp_enclosing_lexical_scope_components, cpp_field_declared_type_binding, cpp_first_type_child,
-    cpp_function_return_type_text, cpp_initialized_effective_using_imports,
-    cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_reference_fqn_candidates,
-    cpp_resolve_bare_call_target, cpp_signature_arity, cpp_split_top_level_commas,
-    cpp_template_reference_arguments, cpp_type_name_components, extract_variable_name,
-    is_globally_qualified_cpp_name, normalize_cpp_type_text,
+    CallArityEvidence, CppBareCallTargetResolution, CppDesignatedInitializerOwner, CppDispatch,
+    CppLexicalScopeResolution, CppLexicalTypeResolution, CppTargetKind, CppTemplateResolutionError,
+    CppVisibilityIndex, cpp_argument_children, cpp_constructor_type_node,
+    cpp_designated_initializer_owner, cpp_enclosing_lexical_scope_components,
+    cpp_field_declared_type_binding, cpp_first_type_child, cpp_function_return_type_text,
+    cpp_initialized_effective_using_imports, cpp_is_declaration_name, cpp_is_declarator_node,
+    cpp_name_for, cpp_reference_fqn_candidates, cpp_resolve_bare_call_target, cpp_signature_arity,
+    cpp_split_top_level_commas, cpp_template_reference_arguments, cpp_type_name_components,
+    extract_variable_name, is_globally_qualified_cpp_name, normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
     csharp_argument_count, csharp_extension_invocation_return_type_fq_name,
@@ -41,35 +40,28 @@ use crate::analyzer::usages::local_inference::{
 };
 use crate::analyzer::usages::model::{ImportBinder, ImportKind};
 use crate::analyzer::usages::php_graph::{
-    FileContext, php_node_text, php_qualified_candidate_text, resolve_php_constant,
-    resolve_php_function, resolve_php_type,
+    FileContext, PhpCallableCandidates, php_node_text, php_qualified_candidate_text,
+    resolve_php_constant, resolve_php_function, resolve_php_type,
 };
 use crate::analyzer::usages::python_graph::{
     collect_assigned_identifiers, collect_module_binding_timeline,
     collect_scope_facts_from_parsed_source, enclosing_scope_facts,
     is_declaration_identifier as python_is_declaration_identifier, python_slice,
-    resolve_receiver_type as resolve_python_receiver_type,
+    resolve_receiver_type as resolve_python_receiver_type, with_python_graph_source,
 };
 use crate::analyzer::usages::receiver_analysis::{ReceiverAnalysisBudget, ReceiverAnalysisOutcome};
 pub(crate) use crate::analyzer::usages::reference_site::byte_offset_for_character_column;
 pub(crate) use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, SourceLocationRequest, resolve_reference_site_with_line_starts,
-    smallest_named_node_covering,
+    simple_reference_name, smallest_named_node_covering,
 };
-use crate::analyzer::usages::ruby_graph::{
-    ReceiverMode as RubyReceiverMode, ReceiverType as RubyReceiverType, RubySemanticIndex,
-    is_call_method_identifier as ruby_is_call_method_identifier,
-    is_declaration_constant as ruby_is_declaration_constant,
-    is_declaration_identifier as ruby_is_declaration_identifier,
-    is_dynamic_dispatch_method as ruby_is_dynamic_dispatch_method,
-    is_plain_assignment_left_variable as ruby_is_plain_assignment_left_variable,
-    method_receiver_mode as ruby_method_receiver_mode, node_text as ruby_node_text,
-    ruby_enclosing_receiver, ruby_field_reference_owner_and_scope,
-    ruby_field_target as ruby_field_target_from_code_unit, ruby_receiver_type,
-    ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
-    symbol_or_string_value as ruby_symbol_or_string_value,
-};
-use crate::analyzer::usages::scala_graph::syntax::ScalaPackageContextIndex;
+use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
+// The Ruby definition route is parked on `ResolutionSession`'s siblings while
+// `ruby_graph/*` has moved into `brokk-bifrost-ruby`, so this block -- the
+// fleet's largest reach-in into a language's graph module -- inverts through the
+// crate. The direction is one-way, exactly as it is for rust and python:
+// `brokk_bifrost_ruby::graph` names `ResolutionSession`, `get_definition`,
+// `get_type` and `DefinitionBatchContext` zero times.
 use crate::analyzer::usages::scala_graph::{
     import_candidate_fq_names, import_candidate_owner_fq_names,
     package_name_of as scala_package_name_of, scala_builtin_type_name,
@@ -90,6 +82,25 @@ use crate::navigation::NavigationOperation;
 use crate::path_utils::rel_path_string;
 use crate::profiling;
 use crate::text_utils::{compute_line_starts, find_line_index_for_offset};
+use brokk_bifrost_jvm::scala::graph::syntax::ScalaPackageContextIndex;
+use brokk_bifrost_ruby::graph::RubyGraphSource;
+use brokk_bifrost_ruby::graph::extractor::{
+    ruby_enclosing_receiver, ruby_field_reference_owner_and_scope, ruby_receiver_type,
+    ruby_seed_assignment, ruby_seed_parameter_shadows, ruby_type_owner,
+};
+use brokk_bifrost_ruby::graph::resolver::{
+    ReceiverMode as RubyReceiverMode, ReceiverType as RubyReceiverType, RubySemanticIndex,
+    ruby_field_target as ruby_field_target_from_code_unit,
+};
+use brokk_bifrost_ruby::graph::syntax::{
+    is_call_method_identifier as ruby_is_call_method_identifier,
+    is_declaration_constant as ruby_is_declaration_constant,
+    is_declaration_identifier as ruby_is_declaration_identifier,
+    is_dynamic_dispatch_method as ruby_is_dynamic_dispatch_method,
+    is_plain_assignment_left_variable as ruby_is_plain_assignment_left_variable,
+    method_receiver_mode as ruby_method_receiver_mode, node_text as ruby_node_text,
+    symbol_or_string_value as ruby_symbol_or_string_value,
+};
 pub(crate) use rust::{
     AnalyzerRustDefinitionProvider, RustTypeLookupCache, resolve_rust_bounded,
     rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
@@ -115,12 +126,12 @@ pub(crate) mod js_ts;
 mod kotlin;
 mod php;
 mod python;
-mod resolution_session;
 mod ruby;
 mod rust;
 mod scala;
 pub mod trace;
 
+pub(crate) use brokk_bifrost_core::analyzer::usages::resolution_session;
 pub use call_sites::call_signature_context;
 pub(crate) use call_sites::{
     CallSiteSyntax, CallSyntaxKind, ExactCallReference, ExactCallReferenceGap,
@@ -129,17 +140,16 @@ pub(crate) use call_sites::{
 };
 pub(crate) use cpp::{cpp_type_lookup_resolution_in_session, resolve_cpp_bounded};
 pub(crate) use csharp::{
-    CSharpTypeLookupResolution, csharp_type_lookup_resolution,
-    csharp_type_lookup_resolution_in_session, resolve_csharp_bounded,
+    CSharpTypeLookupResolution, csharp_type_lookup_resolution_in_session, resolve_csharp_bounded,
 };
 pub(crate) use go::{
     AnalyzerGoDefinitionProvider, GoDefinitionProvider, GoTypeLookupResolutionKind,
     go_type_lookup_resolution, resolve_go_bounded,
 };
-pub(crate) use java::{JavaTypeLookupResolution, java_type_lookup_resolution};
+pub(crate) use java::JavaTypeLookupResolution;
 pub(crate) use kotlin::{
-    KotlinDefinitionProvider, KotlinTypeLookupResolution, kotlin_type_lookup_resolution,
-    kotlin_type_lookup_resolution_in_session, resolve_kotlin_bounded,
+    KotlinDefinitionProvider, KotlinTypeLookupResolution, kotlin_type_lookup_resolution_in_session,
+    resolve_kotlin_bounded,
 };
 pub(crate) use php::{
     PhpDefinitionProvider, php_type_lookup_resolution_bounded, resolve_php_bounded,
@@ -153,7 +163,7 @@ pub(crate) use ruby::{
 };
 pub(crate) use scala::{
     ScalaDefinitionProvider, ScalaTypeLookupResolution, resolve_scala_bounded,
-    scala_type_lookup_resolution, scala_type_lookup_resolution_in_session,
+    scala_type_lookup_resolution_in_session,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use scala::{
@@ -457,6 +467,33 @@ pub struct DefinitionLookupDiagnostic {
 /// Consumers must not treat the accompanying declaration as the complete target
 /// of the originally requested selector chain.
 pub const PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND: &str = "partial_selector_chain";
+
+/// The name binds to a local binder -- a `case` pattern binding, a block-local
+/// `val`/`def`, a parameter -- which no analyzer publishes as a CodeUnit.
+pub const LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND: &str = "local_variable_reference";
+
+/// The site is a declaration or import occurrence, not a reference, so there is
+/// no definition for it to reach.
+pub const DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND: &str = "declaration_or_import_site";
+
+/// Whether a diagnostic kind carries an ADJUDICATED answer: the resolver
+/// identified what the site is and answered it, rather than failing to reach a
+/// target it was looking for.
+///
+/// That distinction is what separates an answer from joint blindness, and any
+/// consumer that grades forward misses must honour it. The status alone cannot:
+/// [`DefinitionLookupStatus::NoDefinition`] carries both "the target exists and
+/// I could not reach it" and "there is no target to reach, and here is why".
+/// [`DefinitionLookupStatus::UnresolvableImportBoundary`] says it in the status;
+/// the kinds here say it in the diagnostic, because the resolver PROVED the name
+/// binds to something the declaration index deliberately does not publish
+/// (#1858).
+pub fn is_adjudicated_answer_diagnostic_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND | DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND
+    )
+}
 
 pub(crate) fn resolve_definition_batch(
     analyzer: &dyn IAnalyzer,
@@ -957,12 +994,13 @@ impl<'a> DefinitionBatchContext<'a> {
         analyzer: &dyn IAnalyzer,
         file: &ProjectFile,
     ) -> Arc<CppVisibilityIndex<'a>> {
+        let dispatch = CppDispatch::new(analyzer);
         self.cpp_visibility
             .entry(file.clone())
             .or_insert_with(|| {
                 let mut roots = HashSet::default();
                 roots.insert(file.clone());
-                Arc::new(CppVisibilityIndex::build(cpp, analyzer, &roots))
+                Arc::new(CppVisibilityIndex::build(cpp, &dispatch.source(), &roots))
             })
             .clone()
     }
@@ -1130,6 +1168,11 @@ fn resolve_one<'a>(
         }
     };
 
+    let tree = {
+        let _scope = profiling::scope("get_definition::parse_tree");
+        context.tree(&request.file, language, &source)
+    };
+
     let site = {
         let _scope = profiling::scope("get_definition::reference_site");
         let line_starts = context.line_starts(&request.file, &source);
@@ -1137,6 +1180,7 @@ fn resolve_one<'a>(
             &request.as_source_location(),
             &source,
             &line_starts,
+            tree.as_ref().map(Tree::root_node),
         ) {
             Ok(site) => site,
             Err(message) => {
@@ -1148,16 +1192,13 @@ fn resolve_one<'a>(
             }
         }
     };
-    let site = if matches!(language, Language::JavaScript | Language::TypeScript) {
-        js_ts::jsts_site_for_focus(site)
-    } else {
-        site
+    let site = match tree.as_ref() {
+        Some(tree) if matches!(language, Language::JavaScript | Language::TypeScript) => {
+            js_ts::jsts_site_for_focus(site, tree.root_node(), &source, language)
+        }
+        _ => site,
     };
 
-    let tree = {
-        let _scope = profiling::scope("get_definition::parse_tree");
-        context.tree(&request.file, language, &source)
-    };
     let site = if language == Language::Ruby {
         tree.as_ref()
             .map(|tree| ruby::ruby_site_for_focus(site.clone(), tree, &source))
@@ -1412,27 +1453,20 @@ pub(super) fn node_contains_focus(node: Node<'_>, focus: Node<'_>) -> bool {
         || (node.start_byte() <= focus.start_byte() && focus.end_byte() <= node.end_byte())
 }
 
+/// Parse `source` under the grammar registered for `language`.
+///
+/// `file` selects the grammar flavor, which only TypeScript distinguishes (`.tsx`); every
+/// other language answers one grammar for both. `None` means the language has no grammar
+/// (`Language::None`) or the source did not parse.
 pub fn parse_tree_for_language(
     file: &ProjectFile,
     language: Language,
     source: &str,
 ) -> Option<Tree> {
-    match language {
-        Language::JavaScript | Language::TypeScript => {
-            js_ts::parse_js_ts_tree(file, source, language)
-        }
-        Language::Cpp => cpp::parse_cpp_tree(source),
-        Language::Scala => scala::parse_scala_tree(source),
-        Language::Java => java::parse_java_tree(source),
-        Language::Php => php::parse_php_tree(source),
-        Language::CSharp => csharp::parse_csharp_tree(source),
-        Language::Python => python::parse_python_tree(source),
-        Language::Rust => rust::parse_rust_tree(source),
-        Language::Go => go::parse_go_tree(source),
-        Language::Ruby => crate::analyzer::ruby::parse_ruby_tree(source),
-        Language::Kotlin => kotlin::parse_kotlin_tree(source),
-        Language::None => None,
-    }
+    let grammar = crate::analyzer::parser_language_for_path(language, file.rel_path())?;
+    let mut parser = Parser::new();
+    parser.set_language(&grammar).ok()?;
+    parser.parse(source, None)
 }
 
 fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome {
@@ -1442,18 +1476,24 @@ fn candidates_outcome(mut candidates: Vec<CodeUnit>) -> DefinitionLookupOutcome 
     for candidate in &candidates {
         semantic_keys.insert(definition_symbol_key(candidate));
     }
-    let status = if semantic_keys.len() == 1 {
-        DefinitionLookupStatus::Resolved
-    } else {
-        DefinitionLookupStatus::Ambiguous
-    };
-    let diagnostics = if semantic_keys.len() > 1 {
-        vec![DefinitionLookupDiagnostic {
-            kind: "ambiguous_definition".to_string(),
-            message: "reference resolved to multiple workspace definitions".to_string(),
-        }]
-    } else {
-        Vec::new()
+    // Zero candidates is "nothing was found", never an ambiguity: an answer
+    // that lists nothing gives a caller nothing to choose between (#1811).
+    let (status, diagnostics) = match semantic_keys.len() {
+        0 => (
+            DefinitionLookupStatus::NoDefinition,
+            vec![DefinitionLookupDiagnostic {
+                kind: "no_indexed_definition".to_string(),
+                message: "the reference resolved to no workspace definition".to_string(),
+            }],
+        ),
+        1 => (DefinitionLookupStatus::Resolved, Vec::new()),
+        _ => (
+            DefinitionLookupStatus::Ambiguous,
+            vec![DefinitionLookupDiagnostic {
+                kind: "ambiguous_definition".to_string(),
+                message: "reference resolved to multiple workspace definitions".to_string(),
+            }],
+        ),
     };
     let outcome = DefinitionLookupOutcome {
         status,
@@ -1640,12 +1680,22 @@ fn navigation_lookup_outcome(
     }
 }
 
+/// Report `candidates` as an ambiguity the caller must decide, keeping every
+/// candidate in the answer.
+///
+/// An empty candidate set downgrades to `no_definition`, mirroring the same
+/// downgrade in [`navigation_lookup_outcome`]: ambiguity means "choose one of
+/// these", so an answer with nothing to choose from is a missing answer, not an
+/// ambiguous one (#1811).
 fn ambiguous_candidates_outcome(
     mut candidates: Vec<CodeUnit>,
     message: impl Into<String>,
 ) -> DefinitionLookupOutcome {
     sort_units(&mut candidates);
     candidates.dedup();
+    if candidates.is_empty() {
+        return no_definition("no_indexed_definition", message);
+    }
     DefinitionLookupOutcome {
         status: DefinitionLookupStatus::Ambiguous,
         reference: None,
@@ -1773,19 +1823,49 @@ fn no_definition(kind: impl Into<String>, message: impl Into<String>) -> Definit
     diagnostic_outcome(DefinitionLookupStatus::NoDefinition, kind, message)
 }
 
-fn ambiguous_definition(message: impl Into<String>) -> DefinitionLookupOutcome {
-    diagnostic_outcome(
-        DefinitionLookupStatus::Ambiguous,
-        "ambiguous_definition",
-        message,
-    )
+/// Report an ambiguity whose contenders are *not* indexed code units.
+///
+/// This is the raw emitter; it is named `_without_candidates` on purpose so
+/// that every call site is greppable and must justify why the caller is given
+/// nothing to choose between. Prefer [`ambiguous_candidates_outcome`] on any
+/// path that holds the contenders: an answer a caller can act on beats a status
+/// it can only log, and dropping a *proven* candidate here is exactly the C
+/// regression in #1811 (2008 of 2010 ambiguous census sites answered with an
+/// empty target list).
+///
+/// It is legitimate only where the ambiguity verdict genuinely arrives without
+/// units - a fail-closed `LexicalTypeResolution::Ambiguous`, competing template
+/// specialization patterns, semantic-model records, or a provider that
+/// deliberately withholds candidate evidence. Each such call site MUST carry a
+/// `// no candidates:` comment naming where the contenders were lost.
+fn ambiguous_without_candidates(message: impl Into<String>) -> DefinitionLookupOutcome {
+    DefinitionLookupOutcome {
+        status: DefinitionLookupStatus::Ambiguous,
+        reference: None,
+        definitions: Vec::new(),
+        lexical_definition: None,
+        diagnostics: vec![DefinitionLookupDiagnostic {
+            kind: "ambiguous_definition".to_string(),
+            message: message.into(),
+        }],
+    }
 }
 
+/// Build an outcome that carries a diagnostic and no definitions.
+///
+/// Ambiguity has one dedicated emitter each for the with-candidates and
+/// without-candidates cases, so this generic constructor never answers
+/// [`DefinitionLookupStatus::Ambiguous`]: an ambiguous answer that reaches a
+/// caller through an unrelated status helper is the #1811 shape defect.
 fn diagnostic_outcome(
     status: DefinitionLookupStatus,
     kind: impl Into<String>,
     message: impl Into<String>,
 ) -> DefinitionLookupOutcome {
+    debug_assert!(
+        status != DefinitionLookupStatus::Ambiguous,
+        "ambiguity is emitted by `ambiguous_candidates_outcome` or `ambiguous_without_candidates`"
+    );
     DefinitionLookupOutcome {
         status,
         reference: None,
@@ -1828,8 +1908,12 @@ mod tests {
         );
         let file = ProjectFile::new(fixture.project_root(), "app.py");
         let analyzer = fixture.analyzer.analyzer();
-        analyzer.reset_global_usage_definition_index_build_count_for_test();
-        analyzer.reset_full_declaration_scan_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
         let mut context = DefinitionBatchContext::new(analyzer, true);
         let requests = ["run", "stop"]
             .into_iter()
@@ -1856,10 +1940,15 @@ mod tests {
         }));
         assert_eq!(context.python_build_counts(), (1, 1, 1, 0));
         assert_eq!(
-            analyzer.global_usage_definition_index_build_count_for_test(),
+            analyzer
+                .test_hooks()
+                .global_usage_definition_index_build_count_for_test(),
             0
         );
-        assert_eq!(analyzer.full_declaration_scan_count_for_test(), 0);
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            0
+        );
         assert!(context.python_contexts.is_empty());
     }
 

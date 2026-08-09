@@ -731,6 +731,41 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::ReceiverOutcome
+        | RqlForm::ReceiverEvidence
+        | RqlForm::MemberSelection
+        | RqlForm::CandidateHierarchy
+        | RqlForm::DispatchOutcome
+        | RqlForm::DispatchTargets
+        | RqlForm::MemberFamily
+        | RqlForm::FamilyEdges
+        | RqlForm::CallShape
+        | RqlForm::CallArgumentGroups
+        | RqlForm::CallArguments => {
+            expect_len(expr, items, 2, head)?;
+            let mut query = query_object(&items[1])?;
+            let op = match form {
+                RqlForm::ReceiverOutcome => "receiver_outcome",
+                RqlForm::ReceiverEvidence => "receiver_evidence",
+                RqlForm::CallShape => "call_shape",
+                RqlForm::CallArgumentGroups => "call_argument_groups",
+                RqlForm::CallArguments => "call_arguments",
+                RqlForm::MemberSelection => "member_selection",
+                RqlForm::CandidateHierarchy => "candidate_hierarchy",
+                RqlForm::DispatchOutcome => "dispatch_outcome",
+                RqlForm::DispatchTargets => "dispatch_targets",
+                RqlForm::MemberFamily => "member_family",
+                RqlForm::FamilyEdges => "family_edges",
+                _ => unreachable!("receiver row wrapper filtered above"),
+            };
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(json!({ "op": op }));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::Supertypes | RqlForm::Subtypes => {
             let (query_expr, option) = match items.len() {
                 2 => (&items[1], None),
@@ -1472,6 +1507,12 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ReceiverTargets
         | RqlForm::PointsTo
         | RqlForm::MemberTargets
+        | RqlForm::ReceiverOutcome
+        | RqlForm::ReceiverEvidence
+        | RqlForm::CallShape
+        | RqlForm::CallArgumentGroups
+        | RqlForm::CallArguments
+        | RqlForm::MemberSelection
         | RqlForm::Occurrences
         | RqlForm::OccurrencesOf
         | RqlForm::OccurrencesIn
@@ -1484,6 +1525,11 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ReachingBinding
         | RqlForm::BindingOccurrence
         | RqlForm::CandidatesOf
+        | RqlForm::CandidateHierarchy
+        | RqlForm::DispatchOutcome
+        | RqlForm::DispatchTargets
+        | RqlForm::MemberFamily
+        | RqlForm::FamilyEdges
         | RqlForm::CandidateTarget
         | RqlForm::GenerationSites
         | RqlForm::Exports
@@ -1885,18 +1931,6 @@ mod tests {
 
         assert_eq!(error.path, "limit");
         assert_eq!(&source[error.range], "0");
-    }
-
-    #[test]
-    fn version_three_cfg_forms_reject_version_two_at_the_authored_operation() {
-        let source = "(procedure-of (function))";
-        let expr = parse_query_expr(source).unwrap();
-        let schema = resolve_rql_schema_version(Some(2)).unwrap();
-        let error = code_query_from_expr(&expr, schema).unwrap_err();
-
-        assert_eq!(error.path, "steps[0].op");
-        assert_eq!(&source[error.range], "procedure-of");
-        assert!(error.message.contains("requires schema version 3"));
     }
 
     #[test]

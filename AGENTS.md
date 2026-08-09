@@ -84,7 +84,9 @@ Put code in `brokk-bifrost-analysis` when the code needs one or more of these it
 
 Do not move such code to `brokk-bifrost-core`, even when the move appears convenient.
 
-`analyzer/capabilities.rs` is the standard example. It remains in analysis because `TypeHierarchyProvider::get_polymorphic_matches` and `build_direct_descendant_index` are generic over `IAnalyzer`.
+`analyzer/capabilities.rs` no longer illustrates this rule. The file moved to `crates/bifrost-core/src/analyzer/capabilities.rs` when the nine language crates were split out. The move is correct: the capability traits name only core types, and every language crate implements them, so leaving the traits in analysis would have made each language crate depend on the largest compilation unit. The parts that are generic over `IAnalyzer` -- `TypeHierarchyProvider::get_polymorphic_matches` and `build_direct_descendant_index` -- stayed in `brokk-bifrost-analysis`, which is what the rule above actually requires.
+
+Read the rule as stated, not through that example. What must stay in analysis is code that needs an `IAnalyzer`, a store, a grammar, or a language module. A trait definition that needs none of them belongs in core.
 
 # Analyzer Test Guidance
 
@@ -264,6 +266,8 @@ When visible RQL vocabulary changes, add the applicable behavior tests:
 Also update the conservative TextMate grammar in `editors/vscode/syntaxes/bifrost-rql.tmLanguage.json`.
 
 Do not include ordinary JSON documents in the RQL editor integration. Recognize JSON-shaped CodeQuery source only after the host identifies the document as `bifrost-rql`.
+
+Do not mint a new RQL schema version for an additive or compatible vocabulary change. Keep the current version. Add a new version only when an existing query stops parsing or changes meaning. Apply the same rule to the policy document schema.
 
 # Review findings as RQL regressions
 

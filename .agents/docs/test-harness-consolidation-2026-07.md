@@ -28,7 +28,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 
 ## Groups
 
-### `suite_analyzers` (82 modules)
+### `suite_analyzers` (84 modules)
 
 - `cpp_analyzer_test`
 - `cpp_macro_call_arity`
@@ -36,6 +36,8 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `cpp_type_hierarchy_test`
 - `csharp_analyzer_test`
 - `csharp_analyzer_update_test`
+- `csharp_import_reachability`
+- `csharp_namespace_of_file`
 - `csharp_test_detection_test`
 - `go_analyzer_parity`
 - `go_analyzer_test`
@@ -113,7 +115,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `typescript_analyzer_update_test`
 - `typescript_import_test`
 
-### `suite_bench_policy` (27 modules)
+### `suite_bench_policy` (29 modules)
 
 - `benchmark_compare`
 - `benchmark_manifest`
@@ -126,6 +128,8 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `no_stringly_name_parsing`
 - `policy_assertion_conformance`
 - `policy_assertion_evaluation`
+- `policy_assertion_per_file_completion`
+- `policy_baseline_evaluation`
 - `policy_docs`
 - `policy_loading`
 - `policy_loading_workspace`

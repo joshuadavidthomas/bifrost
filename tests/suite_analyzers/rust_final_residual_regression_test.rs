@@ -1,7 +1,8 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::hash::HashSet;
 use brokk_bifrost::usages::{ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit};
-use brokk_bifrost::{CodeUnit, IAnalyzer, Language, RustAnalyzer};
+use brokk_bifrost::{CodeUnit, Language, RustAnalyzer};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -363,11 +364,17 @@ fn inverse_rust_shared_lib_bin_external_module_keeps_exact_grouped_prefix() {
         .file("src/other.rs", "pub struct ApiResult;\n")
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    let target = analyzer
-        .declarations(&project.file("src/main.rs"))
-        .into_iter()
-        .find(|unit| unit.is_module() && unit.identifier() == "error")
-        .expect("main-target error module");
+    let module_named = |file, name: &str| {
+        analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.is_module() && unit.identifier() == name)
+            .unwrap_or_else(|| panic!("{name} module"))
+    };
+    // `src/api.rs` is a library module, so `crate::` roots at the library and
+    // its grouped prefix names the library's `error`, not the binary target's
+    // same-named sibling.
+    let target = module_named(project.file("src/lib.rs"), "error");
     let found = authoritative_hits(
         &analyzer,
         target,
@@ -385,7 +392,16 @@ fn inverse_rust_shared_lib_bin_external_module_keeps_exact_grouped_prefix() {
             hit.file == project.file("src/api.rs")
                 && (hit.start_offset, hit.end_offset) == (expected, expected + "error".len())
         }),
-        "external module prefix must resolve to the exact main-target declaration: {found:#?}"
+        "external module prefix must resolve to the exact library declaration: {found:#?}"
+    );
+    let binary_sibling = authoritative_hits(
+        &analyzer,
+        module_named(project.file("src/main.rs"), "error"),
+        [project.file("src/api.rs")].into_iter().collect(),
+    );
+    assert!(
+        binary_sibling.is_empty(),
+        "the binary target's same-named module must not claim library uses: {binary_sibling:#?}"
     );
     assert!(
         found.iter().all(|hit| {
@@ -663,7 +679,7 @@ fn shadowed(filter_as_usize: fn(&Option<Level>) -> usize) -> usize {
         .file("tracing-core/src/metadata.rs", source)
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    let target = definition(&analyzer, "tracing-core.src.metadata.filter_as_usize");
+    let target = definition(&analyzer, "tracing_core.metadata.filter_as_usize");
     let candidates: HashSet<_> = [project.file("tracing-core/src/metadata.rs")]
         .into_iter()
         .collect();
@@ -721,7 +737,7 @@ fn large() {
         .file("examples/client.rs", consumer)
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    let target = definition(&analyzer, "parser.options.Options");
+    let target = definition(&analyzer, "demo.parser.options.Options");
     let candidates = [project.file("examples/client.rs")].into_iter().collect();
     let found = authoritative_hits(&analyzer, target, candidates);
     let expected: Vec<_> = consumer
@@ -775,7 +791,7 @@ impl From<ListStyleType> for options::ListStyleType {
         .file("src/main.rs", consumer)
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    let target = definition(&analyzer, "parser.options.ListStyleType");
+    let target = definition(&analyzer, "demo.parser.options.ListStyleType");
     let candidates = [project.file("src/main.rs")].into_iter().collect();
     let found = authoritative_hits(&analyzer, target, candidates);
     let expected = consumer
@@ -815,7 +831,7 @@ impl From<ListStyleType> for ListStyleType {
         .file("src/main.rs", consumer)
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    let physical = definition(&analyzer, "parser.ListStyleType");
+    let physical = definition(&analyzer, "demo.parser.ListStyleType");
     let candidates = [project.file("src/main.rs")].into_iter().collect();
     let found = authoritative_hits(&analyzer, physical, candidates);
     let self_range = consumer
@@ -993,4 +1009,46 @@ impl Stream for Other {
             .all(|hit| (hit.start_offset, hit.end_offset) != unrelated),
         "Self::Item in another impl must not resolve to the target: {found:#?}"
     );
+}
+
+#[test]
+fn inverse_rust_grouped_reexport_survives_nested_workspace_crate_root() {
+    // #1376: a crate that lives at `rust/src/lib/` with a non-standard
+    // `[lib] path = "lib.rs"` must still route `crate::` to the Cargo library
+    // root. The legacy path-derived scheme collapsed `rust/src/lib/...` to
+    // `rust.src`, so grouped `pub use crate::{module::Type}` reexport hits were
+    // dropped by inverse usage analysis. The same topology under `src/lib.rs`
+    // already resolves, so the manifest layout, not the reexport shape, was the
+    // fault. Mirrors nmstate `rust/src/lib/lib.rs:132,135`.
+    let lib = "pub mod dispatch;\npub mod hostname;\npub use crate::{dispatch::DispatchConfig, hostname::HostNameState};\n";
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "rust/Cargo.toml",
+            "[workspace]\nresolver = \"2\"\nmembers = [\"src/lib\"]\n",
+        )
+        .file(
+            "rust/src/lib/Cargo.toml",
+            "[package]\nname = \"nmstate\"\nversion = \"2.2.61\"\n\n[lib]\npath = \"lib.rs\"\n",
+        )
+        .file("rust/src/lib/lib.rs", lib)
+        .file("rust/src/lib/dispatch.rs", "pub struct DispatchConfig;\n")
+        .file("rust/src/lib/hostname.rs", "pub struct HostNameState;\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let lib_file = project.file("rust/src/lib/lib.rs");
+    for (fq, name) in [
+        ("nmstate.dispatch.DispatchConfig", "DispatchConfig"),
+        ("nmstate.hostname.HostNameState", "HostNameState"),
+    ] {
+        let target = definition(&analyzer, fq);
+        let candidates = [lib_file.clone()].into_iter().collect();
+        let found = authoritative_hits(&analyzer, target, candidates);
+        let start = lib.find(name).expect("reexport token");
+        assert!(
+            found.iter().any(|hit| hit.file == lib_file
+                && (hit.start_offset, hit.end_offset) == (start, start + name.len())),
+            "grouped reexport hit for {name} under a nested workspace crate root must survive: {found:#?}"
+        );
+    }
 }

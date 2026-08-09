@@ -4,13 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use semver::{Version, VersionReq};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
     ActivationSelector, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
-    CompiledPackManifest, CompiledProcedureSummary, CompiledShard, GeneratorRule, MemberFact,
-    PayloadKind, RelationFact, RuleTrigger, SemanticModelOverlay, SemanticModelOverlayBuildError,
-    SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
+    CompiledPackManifest, CompiledProcedureSummary, CompiledShard, DeclarationGuard, GeneratorRule,
+    MemberFact, PayloadKind, RelationFact, RuleTrigger, SemanticModelOverlay,
+    SemanticModelOverlayBuildError, SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
 };
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::is_lower_sha256;
@@ -22,6 +23,8 @@ use crate::analyzer::{IAnalyzer, Language};
 use crate::hash::{HashMap, map_with_capacity};
 
 pub const SEMANTIC_MODEL_RUNTIME_REPRESENTATION_VERSION: u32 = 1;
+
+type DependencyEvidencePublication = (Box<[Language]>, super::DependencyDiscoveryEvidence);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SemanticModelActivationEvidence {
@@ -98,7 +101,8 @@ pub struct SemanticModelActivationRequest {
     pub limits: SemanticModelRuntimeLimits,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SemanticModelActivationStatus {
     Active,
     Disabled,
@@ -109,7 +113,8 @@ pub enum SemanticModelActivationStatus {
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticModelActivationExplanation {
     pub manifest_digest: String,
     pub pack_id: Option<String>,
@@ -120,20 +125,26 @@ pub struct SemanticModelActivationExplanation {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticModelActivationReport {
     pub explanations: Vec<SemanticModelActivationExplanation>,
     pub suppressed_explanations: usize,
     pub catalog_candidates: usize,
     pub loaded_shards: usize,
     pub loaded_records: usize,
+    /// Declarations a loaded shard publishes that the pinned activation
+    /// coordinates prove absent, so the matcher never indexed them (#1899).
+    #[serde(default)]
+    pub guard_excluded_records: usize,
     pub index_entries: usize,
     pub working_bytes: u64,
     pub retained_bytes: u64,
     pub phase_measurements: SemanticModelActivationPhaseMeasurements,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticModelActivationPhaseMeasurements {
     pub selection_nanos: u64,
     pub decode_hydration_nanos: u64,
@@ -150,6 +161,26 @@ pub struct ActiveSemanticModelShard {
     pub matched_evidence: SemanticModelActivationEvidence,
     evidence_rank: EvidenceRank,
     source_rank: u8,
+}
+
+impl ActiveSemanticModelShard {
+    /// Whether the evidence this shard activated against proves the guarded
+    /// record absent.
+    ///
+    /// This is the only place a declaration leaves an activated pack. An
+    /// unguarded record, and a guard whose constraints the pinned coordinates
+    /// satisfy or say nothing about, both stay active (#1899).
+    pub fn guard_excludes(&self, guard: Option<&DeclarationGuard>) -> bool {
+        guard.is_some_and(|guard| {
+            guard.excludes(
+                self.matched_evidence
+                    .toolchain
+                    .as_ref()
+                    .and_then(|toolchain| toolchain.version.as_ref()),
+                self.matched_evidence.target.as_deref(),
+            )
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -428,6 +459,7 @@ impl MatcherIndexes {
         let mut entries = 0usize;
         let mut working_bytes = 0u64;
         let mut records_visited = 0usize;
+        let mut guard_excluded_records = 0usize;
 
         for (shard_index, selection) in active.iter().enumerate() {
             let shard = u32::try_from(shard_index)
@@ -438,6 +470,10 @@ impl MatcherIndexes {
                 for (record_index, fact) in types.iter().enumerate() {
                     poll_matcher_cancellation(cancellation, records_visited)?;
                     records_visited += 1;
+                    if selection.active.guard_excludes(fact.guard.as_ref()) {
+                        guard_excluded_records += 1;
+                        continue;
+                    }
                     let address = record_address(shard, record_index)?;
                     insert_posting(
                         &mut indexes.types_by_id,
@@ -472,6 +508,10 @@ impl MatcherIndexes {
                 for (record_index, fact) in members.iter().enumerate() {
                     poll_matcher_cancellation(cancellation, records_visited)?;
                     records_visited += 1;
+                    if selection.active.guard_excludes(fact.guard.as_ref()) {
+                        guard_excluded_records += 1;
+                        continue;
+                    }
                     let address = record_address(shard, record_index)?;
                     insert_posting(
                         &mut indexes.members_by_id,
@@ -606,6 +646,7 @@ impl MatcherIndexes {
         report.index_entries = entries;
         report.working_bytes = working_bytes;
         report.retained_bytes = retained_bytes;
+        report.guard_excluded_records = guard_excluded_records;
         Ok(indexes)
     }
 }
@@ -840,7 +881,8 @@ pub enum SemanticModelResolutionOutcome {
     Unavailable(SemanticModelActivationReport),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SemanticModelRuntimeLifecycle {
     Cached,
     Built,
@@ -861,10 +903,40 @@ pub enum SemanticModelRuntimeOutcome {
     Unavailable(SemanticModelActivationReport),
 }
 
+impl SemanticModelRuntimeOutcome {
+    /// Convert an existing activation result into diagnostic suppression
+    /// reasons. This method performs no activation, discovery, or package I/O.
+    pub fn semantic_diagnostic_incomplete_reasons(
+        &self,
+    ) -> Vec<crate::analyzer::SemanticDiagnosticIncompleteReason> {
+        use crate::analyzer::SemanticDiagnosticIncompleteReason;
+
+        match self {
+            Self::Ready { .. } => Vec::new(),
+            Self::Incomplete { report, .. } => {
+                vec![SemanticDiagnosticIncompleteReason::RuntimeUnavailable {
+                    detail: format!("incomplete activation: {report:?}"),
+                }]
+            }
+            Self::Cancelled(_) => vec![SemanticDiagnosticIncompleteReason::Cancelled],
+            Self::Unavailable(report) => {
+                vec![SemanticDiagnosticIncompleteReason::RuntimeUnavailable {
+                    detail: format!("unavailable activation: {report:?}"),
+                }]
+            }
+        }
+    }
+}
+
 pub(crate) struct SemanticModelRuntimeCache {
     values: CompleteValueCache<String, ResolvedActiveSemanticModels>,
-    overlay: Mutex<Option<PublishedSemanticModelOverlay>>,
-    dependency_evidence: Mutex<HashMap<Language, Arc<super::DependencyDiscoveryEvidence>>>,
+    published: Mutex<PublishedSemanticModelState>,
+}
+
+#[derive(Default)]
+struct PublishedSemanticModelState {
+    overlay: Option<PublishedSemanticModelOverlay>,
+    dependency_evidence: HashMap<Language, Arc<super::DependencyDiscoveryEvidence>>,
 }
 
 struct PublishedSemanticModelOverlay {
@@ -891,26 +963,27 @@ impl SemanticModelRuntimeCache {
                 max_retained_bytes,
                 |_, active| u32::try_from(active.retained_bytes()).unwrap_or(u32::MAX),
             ),
-            overlay: Mutex::new(None),
-            dependency_evidence: Mutex::new(HashMap::default()),
+            published: Mutex::new(PublishedSemanticModelState::default()),
         }
     }
 
-    /// Retain one discovery run's evidence for every language its ecosystem
-    /// serves (Python; JavaScript and TypeScript together). A later run for
-    /// the same ecosystem replaces the earlier evidence.
+    /// Retain one discovery run's evidence for every language its ecosystem serves.
+    /// Production hosts use the atomic activation method instead.
+    #[cfg(test)]
     pub(crate) fn retain_dependency_discovery_evidence(
         &self,
         languages: &[Language],
         evidence: super::DependencyDiscoveryEvidence,
     ) {
         let evidence = Arc::new(evidence);
-        let mut slot = self
-            .dependency_evidence
+        let mut published = self
+            .published
             .lock()
-            .expect("dependency-discovery evidence mutex poisoned");
+            .expect("semantic-model publication mutex poisoned");
         for language in languages {
-            slot.insert(*language, Arc::clone(&evidence));
+            published
+                .dependency_evidence
+                .insert(*language, Arc::clone(&evidence));
         }
     }
 
@@ -918,17 +991,32 @@ impl SemanticModelRuntimeCache {
         &self,
         language: Language,
     ) -> Option<Arc<super::DependencyDiscoveryEvidence>> {
-        self.dependency_evidence
+        self.published
             .lock()
-            .expect("dependency-discovery evidence mutex poisoned")
+            .expect("semantic-model publication mutex poisoned")
+            .dependency_evidence
             .get(&language)
             .cloned()
     }
 
-    pub(crate) fn overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
-        self.overlay
+    pub(crate) fn invalidate_dependency_pack_state(&self, languages: &[Language]) -> bool {
+        let mut published = self
+            .published
             .lock()
-            .expect("semantic-model overlay mutex poisoned")
+            .expect("semantic-model publication mutex poisoned");
+        let mut evidence_changed = false;
+        for language in languages {
+            evidence_changed |= published.dependency_evidence.remove(language).is_some();
+        }
+        let overlay_changed = published.overlay.take().is_some();
+        evidence_changed || overlay_changed
+    }
+
+    pub(crate) fn overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
+        self.published
+            .lock()
+            .expect("semantic-model publication mutex poisoned")
+            .overlay
             .as_ref()
             .map(|published| Arc::clone(&published.overlay))
     }
@@ -937,18 +1025,20 @@ impl SemanticModelRuntimeCache {
         &self,
         analyzer: &dyn IAnalyzer,
         active: &Arc<ResolvedActiveSemanticModels>,
+        dependency_evidence: Option<&[DependencyEvidencePublication]>,
         cancellation: &CancellationToken,
         max_combined_retained_bytes: u64,
     ) -> Result<Arc<SemanticModelOverlay>, SemanticModelOverlayBuildError> {
         {
-            let slot = self
-                .overlay
+            let published = self
+                .published
                 .lock()
-                .expect("semantic-model overlay mutex poisoned");
-            if let Some(published) = slot.as_ref()
-                && Arc::ptr_eq(&published.active, active)
+                .expect("semantic-model publication mutex poisoned");
+            if dependency_evidence.is_none()
+                && let Some(overlay) = published.overlay.as_ref()
+                && Arc::ptr_eq(&overlay.active, active)
             {
-                return Ok(Arc::clone(&published.overlay));
+                return Ok(Arc::clone(&overlay.overlay));
             }
         }
         let overlay = Arc::new(SemanticModelOverlay::build(
@@ -957,16 +1047,27 @@ impl SemanticModelRuntimeCache {
             cancellation,
             max_combined_retained_bytes,
         )?);
-        let mut slot = self
-            .overlay
+        let mut published = self
+            .published
             .lock()
-            .expect("semantic-model overlay mutex poisoned");
-        if let Some(published) = slot.as_ref()
-            && Arc::ptr_eq(&published.active, active)
+            .expect("semantic-model publication mutex poisoned");
+        if dependency_evidence.is_none()
+            && let Some(current) = published.overlay.as_ref()
+            && Arc::ptr_eq(&current.active, active)
         {
-            return Ok(Arc::clone(&published.overlay));
+            return Ok(Arc::clone(&current.overlay));
         }
-        *slot = Some(PublishedSemanticModelOverlay {
+        if let Some(evidence) = dependency_evidence {
+            for (languages, value) in evidence {
+                let value = Arc::new(value.clone());
+                for language in languages {
+                    published
+                        .dependency_evidence
+                        .insert(*language, Arc::clone(&value));
+                }
+            }
+        }
+        published.overlay = Some(PublishedSemanticModelOverlay {
             active: Arc::clone(active),
             overlay: Arc::clone(&overlay),
         });
@@ -1151,12 +1252,14 @@ pub fn resolve_active_semantic_models(
             &evidence,
             &request.bifrost_version,
         ) else {
+            let reason =
+                strict_activation_mismatch_reason(&loaded.manifest, &loaded.shard, &evidence);
             push_loaded_explanation(
                 &mut report,
                 request.limits,
                 &loaded,
                 SemanticModelActivationStatus::Incompatible,
-                "complete activation evidence does not satisfy the manifest and shard selector",
+                &reason,
             );
             continue;
         };
@@ -1329,6 +1432,26 @@ pub fn acquire_active_semantic_models(
     request: &SemanticModelActivationRequest,
     cancellation: &CancellationToken,
 ) -> SemanticModelRuntimeOutcome {
+    acquire_active_semantic_models_with_evidence(
+        analyzer,
+        catalog,
+        persistence,
+        request,
+        None,
+        cancellation,
+    )
+}
+
+/// Acquire and atomically publish one generation's overlay and discovery evidence.
+/// A failed acquisition leaves the previously complete publication unchanged.
+pub fn acquire_active_semantic_models_with_evidence(
+    analyzer: &dyn IAnalyzer,
+    catalog: &SemanticPackCatalog,
+    persistence: Option<SemanticModelActivationPersistence<'_>>,
+    request: &SemanticModelActivationRequest,
+    dependency_evidence: Option<&[DependencyEvidencePublication]>,
+    cancellation: &CancellationToken,
+) -> SemanticModelRuntimeOutcome {
     let request_key = match runtime_request_key(request) {
         Ok(key) => key,
         Err(reason) => {
@@ -1370,16 +1493,17 @@ pub fn acquire_active_semantic_models(
             if !analyzer.snapshot_generations_match(&generations) {
                 return stale_generation_outcome(request.limits);
             }
+            if let Err(error) = publish_active_models(catalog, persistence, &value) {
+                return catalog_lifecycle_error(request.limits, "publish", error);
+            }
             if let Err(error) = caches.semantic_models().publish_overlay(
                 analyzer,
                 &value,
+                dependency_evidence,
                 cancellation,
                 request.limits.max_retained_bytes,
             ) {
                 return overlay_build_outcome(&value, error, request.limits);
-            }
-            if let Err(error) = publish_active_models(catalog, persistence, &value) {
-                return catalog_lifecycle_error(request.limits, "publish", error);
             }
             SemanticModelRuntimeOutcome::Ready {
                 active: value,
@@ -1395,16 +1519,17 @@ pub fn acquire_active_semantic_models(
                 return stale_generation_outcome(request.limits);
             }
             let active = Arc::new(active);
+            if let Err(error) = publish_active_models(catalog, persistence, &active) {
+                return catalog_lifecycle_error(request.limits, "publish", error);
+            }
             if let Err(error) = caches.semantic_models().publish_overlay(
                 analyzer,
                 &active,
+                dependency_evidence,
                 cancellation,
                 request.limits.max_retained_bytes,
             ) {
                 return overlay_build_outcome(&active, error, request.limits);
-            }
-            if let Err(error) = publish_active_models(catalog, persistence, &active) {
-                return catalog_lifecycle_error(request.limits, "publish", error);
             }
             permit.publish_complete(Arc::clone(&active));
             SemanticModelRuntimeOutcome::Ready {
@@ -1787,6 +1912,134 @@ fn strict_coordinate_matches(
     }
 }
 
+/// Explain a failed strict activation match. When the evidence names a
+/// required coordinate but an exact version requirement rejects it, the
+/// explanation names the workspace version and the pack requirement (#1884).
+/// Every other rejection keeps the generic statement.
+fn strict_activation_mismatch_reason(
+    manifest: &CompiledPackManifest,
+    shard: &CompiledShard,
+    evidence: &[SemanticModelActivationEvidence],
+) -> String {
+    let scoped = || {
+        evidence
+            .iter()
+            .filter(|row| row.language == manifest.language && row.ecosystem == manifest.ecosystem)
+    };
+    for constraint in &manifest.compatibility.toolchains {
+        let Ok(requirement) = VersionReq::parse(&constraint.requirement) else {
+            continue;
+        };
+        let satisfied = scoped().any(|row| {
+            row.toolchain.as_ref().is_some_and(|toolchain| {
+                toolchain.name == constraint.name
+                    && toolchain
+                        .version
+                        .as_ref()
+                        .is_some_and(|version| requirement.matches(version))
+            })
+        });
+        if satisfied {
+            continue;
+        }
+        if let Some(toolchain) = scoped()
+            .filter_map(|row| row.toolchain.as_ref())
+            .find(|toolchain| toolchain.name == constraint.name)
+        {
+            return match &toolchain.version {
+                Some(version) => format!(
+                    "workspace toolchain {} {version} does not satisfy the pack requirement {}",
+                    constraint.name, constraint.requirement
+                ),
+                None => format!(
+                    "workspace toolchain {} has no exact version and does not satisfy the pack requirement {}",
+                    constraint.name, constraint.requirement
+                ),
+            };
+        }
+    }
+    for selector in shard.activation() {
+        for row in scoped() {
+            if !strict_coordinate_names_match(selector.package.as_ref(), row.package.as_ref())
+                || !strict_coordinate_names_match(selector.module.as_ref(), row.module.as_ref())
+                || !strict_coordinate_names_match(
+                    selector.toolchain.as_ref(),
+                    row.toolchain.as_ref(),
+                )
+            {
+                continue;
+            }
+            let non_version_predicates_pass = (selector.targets.is_empty()
+                || row
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| selector.targets.contains(target)))
+                && (selector.configurations.is_empty()
+                    || row.configuration.as_ref().is_some_and(|configuration| {
+                        selector.configurations.contains(configuration)
+                    }))
+                && selector
+                    .artifact_sha256
+                    .as_ref()
+                    .is_none_or(|expected| row.artifact_sha256.as_ref() == Some(expected));
+            if !non_version_predicates_pass {
+                continue;
+            }
+            for (axis, coordinate_selector, coordinate_evidence) in [
+                ("package", selector.package.as_ref(), row.package.as_ref()),
+                ("module", selector.module.as_ref(), row.module.as_ref()),
+                (
+                    "toolchain",
+                    selector.toolchain.as_ref(),
+                    row.toolchain.as_ref(),
+                ),
+            ] {
+                let (Some(coordinate_selector), Some(coordinate_evidence)) =
+                    (coordinate_selector, coordinate_evidence)
+                else {
+                    continue;
+                };
+                let Some(requirement_source) = &coordinate_selector.version else {
+                    continue;
+                };
+                let Ok(requirement) = VersionReq::parse(requirement_source) else {
+                    continue;
+                };
+                let satisfied = coordinate_evidence
+                    .version
+                    .as_ref()
+                    .is_some_and(|version| requirement.matches(version));
+                if !satisfied {
+                    return match &coordinate_evidence.version {
+                        Some(version) => format!(
+                            "workspace {axis} {} {version} does not satisfy the pack requirement {requirement_source}",
+                            coordinate_selector.name
+                        ),
+                        None => format!(
+                            "workspace {axis} {} has no exact version and does not satisfy the pack requirement {requirement_source}",
+                            coordinate_selector.name
+                        ),
+                    };
+                }
+            }
+        }
+    }
+    "complete activation evidence does not satisfy the manifest and shard selector".to_owned()
+}
+
+/// The name half of `strict_coordinate_matches`: whether the evidence names
+/// the selector's coordinate at all.
+fn strict_coordinate_names_match(
+    selector: Option<&super::NameSelector>,
+    evidence: Option<&CatalogCoordinate>,
+) -> bool {
+    match (selector, evidence) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(selector), Some(evidence)) => selector.name == evidence.name,
+    }
+}
+
 fn selector_rank(selector: &ActivationSelector) -> EvidenceRank {
     if selector.artifact_sha256.is_some() {
         EvidenceRank::ExactArtifact
@@ -1966,5 +2219,40 @@ fn push_explanation(
         report.explanations.push(explanation);
     } else {
         report.suppressed_explanations = report.suppressed_explanations.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod semantic_diagnostic_runtime_tests {
+    use super::*;
+    use crate::analyzer::SemanticDiagnosticIncompleteReason;
+
+    #[test]
+    fn runtime_outcomes_map_to_shared_suppression_reasons() {
+        let report = SemanticModelActivationReport::default();
+        assert_eq!(
+            SemanticModelRuntimeOutcome::Cancelled(report.clone())
+                .semantic_diagnostic_incomplete_reasons(),
+            vec![SemanticDiagnosticIncompleteReason::Cancelled]
+        );
+
+        let incomplete = SemanticModelRuntimeOutcome::Incomplete {
+            usable: None,
+            report: report.clone(),
+        }
+        .semantic_diagnostic_incomplete_reasons();
+        assert!(matches!(
+            incomplete.as_slice(),
+            [SemanticDiagnosticIncompleteReason::RuntimeUnavailable { detail }]
+                if detail.starts_with("incomplete activation:")
+        ));
+
+        let unavailable = SemanticModelRuntimeOutcome::Unavailable(report)
+            .semantic_diagnostic_incomplete_reasons();
+        assert!(matches!(
+            unavailable.as_slice(),
+            [SemanticDiagnosticIncompleteReason::RuntimeUnavailable { detail }]
+                if detail.starts_with("unavailable activation:")
+        ));
     }
 }

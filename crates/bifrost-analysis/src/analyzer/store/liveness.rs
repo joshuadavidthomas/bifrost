@@ -17,16 +17,7 @@ type Result<T> = std::result::Result<T, String>;
 pub struct Liveness {
     repo: Mutex<Repository>,
     workdir: PathBuf,
-    /// Working-tree blob identity per repository-relative path.
-    ///
-    /// Seeded by one batched Git index plus dirty-tree scan, which is what
-    /// keeps cold start on a 400k-file repository from hashing every file, and
-    /// then kept current per path by that path's filesystem stat. The batched
-    /// scan describes one instant, so serving it unconditionally to a later
-    /// caller reports the pre-edit blob for every file edited since -- which
-    /// made `update_paths` re-register the stale blob and hid the edit from
-    /// every blob-keyed reader.
-    working_tree_oids: Mutex<Option<HashMap<String, TrackedOid>>>,
+    startup_identity: Mutex<Option<Arc<gitblob::WorkingTreeIdentity>>>,
     snapshot: Mutex<Option<MemoizedSnapshot>>,
     overlay: Mutex<OverlayState>,
     /// Canonical form of each project root this handle has been asked about.
@@ -34,16 +25,6 @@ pub struct Liveness {
     canonical_roots: Mutex<HashMap<PathBuf, Arc<Path>>>,
     /// Canonicalizations performed after construction, for the regression pin.
     canonicalizations: AtomicUsize,
-}
-
-/// One path's last resolved blob identity and the stat it was resolved
-/// against. `stat` is `None` for a seeded entry that no caller has been served
-/// yet: the batched scan reads the Git index rather than the file, so there is
-/// no stat to compare until the first serve takes one.
-#[derive(Clone)]
-struct TrackedOid {
-    oid: Oid,
-    stat: Option<FileStat>,
 }
 
 impl Liveness {
@@ -56,7 +37,7 @@ impl Liveness {
         Ok(Self {
             repo: Mutex::new(repo),
             workdir,
-            working_tree_oids: Mutex::new(None),
+            startup_identity: Mutex::new(None),
             snapshot: Mutex::new(None),
             overlay: Mutex::new(OverlayState::default()),
             canonical_roots: Mutex::new(HashMap::default()),
@@ -88,29 +69,47 @@ impl Liveness {
     /// re-resolution -- `update_paths`, a watcher delta, `refresh` -- report
     /// the edited blob rather than the one the scan saw.
     pub fn oids_for_files(&self, files: &[ProjectFile]) -> Result<HashMap<ProjectFile, Oid>> {
-        self.seed_working_tree_oids()?;
+        let identity = {
+            let mut guard = self
+                .startup_identity
+                .lock()
+                .expect("liveness startup identity mutex poisoned");
+            if guard.is_none() {
+                let repo = self.repo.lock().expect("liveness repo mutex poisoned");
+                *guard = Some(Arc::new(gitblob::working_tree_identity(&repo)?));
+            }
+            Arc::clone(
+                guard
+                    .as_ref()
+                    .expect("startup identity was initialized above"),
+            )
+        };
 
         // Apache Camel has tens of thousands of Java files. Keep the lock only
-        // around one-time Git discovery and the individual map operations, and
-        // use the existing Rayon pool for the independent per-path stat, hash
-        // and path-conversion work.
+        // around the one-time Git scan, then let language analyzers project
+        // their file sets in parallel. Only requested dirty files are hashed,
+        // so an unreadable file elsewhere in the worktree (for example another
+        // process's live database) cannot fail this projection.
         let planned = files
             .par_iter()
             .map(|file| {
-                let abs_path = file.abs_path();
-                let rel_path = abs_path.strip_prefix(&self.workdir).map_err(|_| {
-                    format!(
-                        "project file {} is not under git workdir {}",
-                        abs_path.display(),
-                        self.workdir.display()
-                    )
-                })?;
+                let rel_path = self.rel_path_from_workdir(file)?;
                 // Git paths use forward slashes on every host. This conversion
                 // stays at the Git API boundary.
                 let rel = rel_path.to_string_lossy().replace('\\', "/");
-                Ok(self
-                    .current_working_tree_oid(&rel, &abs_path)?
-                    .map(|oid| (file.clone(), oid)))
+                let abs_path = self.workdir.join(&rel_path);
+                let repo = self.repo.lock().expect("liveness repo mutex poisoned");
+                if let Some(oid) = identity.clean_index_oid(&repo, &rel, &abs_path) {
+                    return Ok(Some((file.clone(), oid)));
+                }
+                // Dirty, untracked, ignored, or edited after the scan: the
+                // visible working bytes are the identity.
+                if !abs_path.is_file() {
+                    return Ok(None);
+                }
+                Oid::hash_file(ObjectType::Blob, &abs_path)
+                    .map(|oid| Some((file.clone(), oid)))
+                    .map_err(|err| err.to_string())
             })
             .collect::<Vec<Result<Option<(ProjectFile, Oid)>>>>();
         let mut resolved = map_with_capacity(files.len());
@@ -122,81 +121,11 @@ impl Liveness {
         Ok(resolved)
     }
 
-    /// Run the batched working-tree scan once per repository handle. Every
-    /// language delegate's build resolves its own files through the same
-    /// handle, so without this each of them would pay the whole scan.
-    fn seed_working_tree_oids(&self) -> Result<()> {
-        let mut guard = self
-            .working_tree_oids
+    pub fn invalidate_startup_oids(&self) {
+        *self
+            .startup_identity
             .lock()
-            .expect("liveness working-tree OID mutex poisoned");
-        if guard.is_some() {
-            return Ok(());
-        }
-        let repo = self.repo.lock().expect("liveness repo mutex poisoned");
-        *guard = Some(
-            gitblob::all_working_tree_oid_values(&repo)?
-                .into_iter()
-                .map(|(rel, oid)| (rel, TrackedOid { oid, stat: None }))
-                .collect(),
-        );
-        Ok(())
-    }
-
-    /// The blob identity of `abs_path` now: the tracked one when the file's
-    /// stat is unchanged since it was resolved, otherwise the hash of the
-    /// bytes on disk. `None` when nothing is there to hash.
-    fn current_working_tree_oid(&self, rel: &str, abs_path: &Path) -> Result<Option<Oid>> {
-        let stat = FileStat::from_path(abs_path);
-        let tracked = {
-            let guard = self
-                .working_tree_oids
-                .lock()
-                .expect("liveness working-tree OID mutex poisoned");
-            guard
-                .as_ref()
-                .expect("working-tree OIDs are seeded before resolution")
-                .get(rel)
-                .cloned()
-        };
-        let Some(stat) = stat else {
-            // The path is gone (or is not a file), so it has no live blob --
-            // including when the scan still lists the deleted path.
-            return Ok(None);
-        };
-        if let Some(tracked) = &tracked {
-            match &tracked.stat {
-                Some(resolved_under) if resolved_under == &stat => return Ok(Some(tracked.oid)),
-                // A seeded entry the scan produced and nobody has been served
-                // yet: the scan read it at this instant, so record the stat it
-                // is being served under and answer from it.
-                None => {
-                    self.track_working_tree_oid(rel, tracked.oid, stat);
-                    return Ok(Some(tracked.oid));
-                }
-                Some(_) => {}
-            }
-        }
-        let oid = Oid::hash_file(ObjectType::Blob, abs_path).map_err(|err| err.to_string())?;
-        self.track_working_tree_oid(rel, oid, stat);
-        Ok(Some(oid))
-    }
-
-    fn track_working_tree_oid(&self, rel: &str, oid: Oid, stat: FileStat) {
-        let mut guard = self
-            .working_tree_oids
-            .lock()
-            .expect("liveness working-tree OID mutex poisoned");
-        guard
-            .as_mut()
-            .expect("working-tree OIDs are seeded before resolution")
-            .insert(
-                rel.to_string(),
-                TrackedOid {
-                    oid,
-                    stat: Some(stat),
-                },
-            );
+            .expect("liveness startup identity mutex poisoned") = None;
     }
 
     /// Full live view; rebuilt when the Git index bytes or overlay generation change.
@@ -839,7 +768,9 @@ impl PlatformStat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitblob::test_repo::{commit_all, init_repo};
+    use crate::gitblob::test_repo::{
+        commit_all, commit_paths, init_repo, refresh_index_stat_preserving_oid,
+    };
     use git2::{IndexAddOption, ObjectType};
 
     fn project_file(root: &Path, rel: &str) -> ProjectFile {
@@ -1036,6 +967,121 @@ mod tests {
         assert_eq!(
             resolved.get(&created),
             Some(&Oid::hash_object(ObjectType::Blob, b"fn b() {}\n").unwrap())
+        );
+    }
+
+    #[test]
+    fn bulk_oid_projection_observes_edits_after_the_startup_scan() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
+        commit_all(&repo, "init");
+
+        let file = project_file(temp.path(), "a.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let before = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            before.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn old() {}\n").unwrap())
+        );
+
+        // A full-refresh sweep after an out-of-band edit reuses the memoized
+        // startup scan; the stat check must reject the stale index OID.
+        std::fs::write(temp.path().join("a.rs"), "fn refreshed() {}\n").unwrap();
+        let after = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            after.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn refreshed() {}\n").unwrap())
+        );
+    }
+
+    #[test]
+    fn bulk_oid_projection_hashes_clean_eol_transformed_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        let source_path = temp.path().join("a.cs");
+        std::fs::write(&source_path, "class A {}\n").unwrap();
+        commit_all(&repo, "source");
+
+        // The attribute is committed before the line-ending conversion so Git
+        // treats the CRLF worktree bytes as clean.
+        std::fs::write(temp.path().join(".gitattributes"), "*.cs text eol=crlf\n").unwrap();
+        commit_paths(&repo, &[".gitattributes"], "attributes");
+        std::fs::write(&source_path, "class A {}\r\n").unwrap();
+
+        // Match the index stat Git records after a transformed checkout while
+        // retaining the canonical LF blob OID. This exercises the clean fast
+        // path; a stat-only implementation would incorrectly return the index
+        // OID without hashing the visible CRLF bytes.
+        let index_oid = refresh_index_stat_preserving_oid(&repo, "a.cs");
+
+        assert!(
+            repo.statuses(None).unwrap().is_empty(),
+            "Git must treat the transformed worktree as clean"
+        );
+        let visible_oid = Oid::hash_object(ObjectType::Blob, b"class A {}\r\n").unwrap();
+        assert_ne!(visible_oid, index_oid, "LF and CRLF OIDs must differ");
+
+        let file = project_file(temp.path(), "a.cs");
+        let liveness = Liveness::new(repo).unwrap();
+        let resolved = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(resolved.get(&file), Some(&visible_oid));
+        assert_ne!(resolved.get(&file), Some(&index_oid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bulk_oid_projection_ignores_unreadable_files_outside_the_request() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        commit_all(&repo, "init");
+
+        // An untracked, unreadable file elsewhere in the worktree models
+        // another process's live database (for example a locked SQLite file
+        // under `.bifrost/cache` on Windows). It must not fail the scan for
+        // files the analyzer actually requested.
+        let locked = temp.path().join("locked.db");
+        std::fs::write(&locked, "junk").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let file = project_file(temp.path(), "a.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let resolved = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            resolved.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn a() {}\n").unwrap())
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn ignored_requested_file_uses_its_working_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join(".gitignore"), "generated.rs\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("generated.rs"), "fn generated() {}\n").unwrap();
+
+        let file = project_file(temp.path(), "generated.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let resolved = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            resolved.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn generated() {}\n").unwrap())
         );
     }
 
@@ -1316,6 +1362,34 @@ mod tests {
         assert_eq!(
             snapshot.oid_for_path(&file),
             Some(Oid::hash_object(ObjectType::Blob, b"fn dirty() {}\n").unwrap())
+        );
+    }
+
+    #[test]
+    fn invalidating_startup_oids_refreshes_bulk_working_tree_identities() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("a.rs"), "fn old() {}\n").unwrap();
+        commit_all(&repo, "init");
+
+        let file = project_file(temp.path(), "a.rs");
+        let liveness = Liveness::new(repo).unwrap();
+        let initial = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            initial.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn old() {}\n").unwrap())
+        );
+
+        std::fs::write(temp.path().join("a.rs"), "fn refreshed() {}\n").unwrap();
+        liveness.invalidate_startup_oids();
+        let refreshed = liveness
+            .oids_for_files(std::slice::from_ref(&file))
+            .unwrap();
+        assert_eq!(
+            refreshed.get(&file),
+            Some(&Oid::hash_object(ObjectType::Blob, b"fn refreshed() {}\n").unwrap())
         );
     }
 }

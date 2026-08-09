@@ -24,13 +24,13 @@
 //! - an import is `import_header` = `identifier` (one `simple_identifier` per
 //!   segment), optional `import_alias`, optional `wildcard_import`.
 //!
-//! The positional reads themselves live in `crate::analyzer::kotlin::syntax`,
+//! The positional reads themselves live in [`brokk_bifrost_jvm::kotlin::syntax`],
 //! shared with the usage graphs (issue #1239) so the two cannot drift apart
 //! about what a syntax shape means.
 //!
 //! # How a name becomes a declaration
 //!
-//! Name precedence is not reimplemented here. `crate::analyzer::kotlin::types`
+//! Name precedence is not reimplemented here. [`brokk_bifrost_jvm::kotlin::types`]
 //! owns Kotlin's ladder (enclosing scopes, then explicit imports, then the
 //! file's package, then star imports, then default imports) as
 //! [`resolve_kotlin_type_name`], parameterised over a "does this
@@ -42,27 +42,30 @@
 
 use super::*;
 use crate::analyzer::kotlin::KotlinAnalyzer;
-use crate::analyzer::kotlin::declarations::kotlin_package_name;
-use crate::analyzer::kotlin::syntax::{
-    kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_declaration_node,
-    kotlin_enclosing_import_header, kotlin_is_declaration_name, kotlin_is_expression_kind,
-    kotlin_named_argument_label,
-};
-use crate::analyzer::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 use crate::analyzer::semantic_model::{
     SemanticModelOverlay, SemanticModelSymbol, SemanticModelSymbolKind, TypeRef,
+};
+use crate::analyzer::structural::{
+    HierarchyRelation, MemberDispatchTier, PrecedenceTier, RejectionReason,
 };
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{BoundedDefinitionLookup, ForwardQueryProvider, SignatureMetadata};
+use brokk_bifrost_jvm::kotlin::declarations::kotlin_package_name;
+use brokk_bifrost_jvm::kotlin::syntax::{
+    kotlin_call_arity, kotlin_call_with_callee, kotlin_callee, kotlin_declaration_node,
+    kotlin_enclosing_import_header, kotlin_is_declaration_name, kotlin_is_expression_kind,
+    kotlin_named_argument_label,
+};
+use brokk_bifrost_jvm::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
 /// How many levels of ancestor scope a name lookup inherits.
 ///
-/// Matches `MAX_INHERITED_SCOPE_DEPTH` in `crate::analyzer::kotlin::types`:
+/// Matches `MAX_INHERITED_SCOPE_DEPTH` in [`brokk_bifrost_jvm::kotlin::types`]:
 /// inherited nested types are rare and deep chains rarer, and a small cap keeps
 /// a cyclic hierarchy from turning one lookup into an unbounded traversal.
 const MAX_INHERITED_SCOPE_DEPTH: usize = 4;
@@ -885,7 +888,9 @@ impl<'a> KotlinCtx<'a> {
             );
         }
         if records.iter().any(|record| record.provenance.ambiguous) {
-            return ambiguous_definition(format!(
+            // no candidates: the conflicting records are semantic-model symbols,
+            // not indexed code units, so none can be offered as a target.
+            return ambiguous_without_candidates(format!(
                 "`{subject}` matches conflicting active Kotlin model declarations"
             ));
         }
@@ -993,26 +998,29 @@ impl<'a> KotlinCtx<'a> {
     /// right. Companion-ness is read from the declaration's syntax
     /// (`companion_object` versus `object_declaration`) because the two are
     /// indistinguishable in the index: both are nested classes.
-    fn companion_fqns(&self, owner_fqn: &str) -> Vec<String> {
+    fn companion_objects(&self, owner_fqn: &str) -> Vec<CodeUnit> {
         self.support
             .fqn_direct_children(owner_fqn)
             .into_iter()
             .filter(|unit| unit.is_class() && self.is_companion_object(unit))
-            .map(|unit| unit.fq_name())
             .collect()
     }
 
-    /// Members declared at `fqn` that can answer a reference, optionally
-    /// restricted to those that accept a call of `arity`.
-    fn members_named(&self, fqn: &str, arity: Option<usize>) -> Vec<CodeUnit> {
+    /// Declarations at `fqn` that can answer a member reference, before the call
+    /// shape is considered.
+    fn member_declarations(&self, fqn: &str) -> Vec<CodeUnit> {
         self.support
             .fqn_in_any_language(fqn)
             .into_iter()
             .filter(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
-            .filter(|unit| {
-                arity.is_none_or(|arity| !unit.is_function() || self.accepts_arity(unit, arity))
-            })
             .collect()
+    }
+
+    /// Whether a member declaration can answer a call of `arity`. A property is
+    /// never rejected on a call shape: what it holds decides that, not the
+    /// property's own declaration.
+    fn member_accepts_arity(&self, unit: &CodeUnit, arity: Option<usize>) -> bool {
+        arity.is_none_or(|arity| !unit.is_function() || self.accepts_arity(unit, arity))
     }
 
     /// The innermost class-like declaration enclosing `byte` in the requesting
@@ -1226,7 +1234,11 @@ impl<'a> KotlinCtx<'a> {
             if owners.contains(&fqn) {
                 continue;
             }
-            owners.extend(self.companion_fqns(&fqn));
+            owners.extend(
+                self.companion_objects(&fqn)
+                    .into_iter()
+                    .map(|unit| unit.fq_name()),
+            );
             owners.push(fqn);
         }
 
@@ -1239,7 +1251,11 @@ impl<'a> KotlinCtx<'a> {
                     if owners.contains(&fqn) {
                         continue;
                     }
-                    owners.extend(self.companion_fqns(&fqn));
+                    owners.extend(
+                        self.companion_objects(&fqn)
+                            .into_iter()
+                            .map(|unit| unit.fq_name()),
+                    );
                     owners.push(fqn);
                     next.push(ancestor);
                 }
@@ -1346,7 +1362,8 @@ fn kotlin_import_reference_outcome(
 /// Resolve a focus on a `type_identifier`: a type annotation, a supertype, an
 /// annotation name, a receiver type, or a type argument.
 fn kotlin_type_reference_outcome(ctx: &KotlinCtx<'_>, node: Node<'_>) -> DefinitionLookupOutcome {
-    let spelled = kotlin_type_spelling_through(ctx, node);
+    let segments = kotlin_type_spelling_segments(ctx, node);
+    let spelled = segments.join(".");
     if spelled.is_empty() {
         return no_definition("no_reference_text", "Kotlin type reference is blank");
     }
@@ -1370,7 +1387,14 @@ fn kotlin_type_reference_outcome(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Definit
                     format!("`{spelled}` names a package, which has no declaration to navigate to"),
                 );
             }
-            no_definition(
+            // `kotlin_type_leaves_the_workspace` fuses the external-route signal
+            // with the workspace-package check, so its negation is the
+            // workspace-internal gate.
+            gated_boundary(
+                || !kotlin_type_leaves_the_workspace(ctx, &scope, &segments),
+                format!(
+                    "`{spelled}` appears to cross a Kotlin import boundary not indexed in this workspace"
+                ),
                 "no_indexed_definition",
                 format!("`{spelled}` is not indexed as a Kotlin type"),
             )
@@ -1378,16 +1402,18 @@ fn kotlin_type_reference_outcome(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Definit
     }
 }
 
-/// The dotted name a focused `type_identifier` spells, up to and including
+/// The dotted segments a focused `type_identifier` spells, up to and including
 /// itself.
 ///
 /// A dotted type is one `user_type` node with one `type_identifier` child per
 /// segment, so focusing `Outer` in `Outer.Inner` asks about `Outer` while
-/// focusing `Inner` asks about `Outer.Inner`. Joining the children's own text
-/// is a structural read of the tree, not a re-parse of the source.
-fn kotlin_type_spelling_through(ctx: &KotlinCtx<'_>, node: Node<'_>) -> String {
+/// focusing `Inner` asks about `Outer.Inner`. Reading the children's own text
+/// is a structural read of the tree, not a re-parse of the source, and keeping
+/// the segments apart is what lets a boundary check address the head and the
+/// qualifier without splitting the joined spelling again.
+fn kotlin_type_spelling_segments<'a>(ctx: &KotlinCtx<'a>, node: Node<'_>) -> Vec<&'a str> {
     let Some(parent) = node.parent().filter(|parent| parent.kind() == "user_type") else {
-        return ctx.text(node).to_string();
+        return vec![ctx.text(node)];
     };
     let segments = named_children(parent)
         .into_iter()
@@ -1400,8 +1426,82 @@ fn kotlin_type_spelling_through(ctx: &KotlinCtx<'_>, node: Node<'_>) -> String {
     segments[..=last]
         .iter()
         .map(|segment| ctx.text(*segment))
-        .collect::<Vec<_>>()
-        .join(".")
+        .collect()
+}
+
+/// Whether a type spelling that nothing in scope resolves leaves the indexed
+/// workspace.
+///
+/// Two shapes say so, and each fuses the workspace check `gated_boundary`
+/// demands, so the negation of this predicate is the workspace-internal gate:
+///
+/// - the leading segment is bound by an explicit import whose owning package
+///   the workspace does not declare, or a star import names such a package.
+///   This is the Kotlin form of Java's `java_import_boundary_for_type`, read
+///   through `local_name` because Kotlin's ladder binds an aliased import under
+///   its alias, and with the explicit tier consulted first because that tier is
+///   terminal in the ladder.
+/// - the spelling is written qualified and its qualifier is neither a workspace
+///   package nor a name this scope resolves (the #1089 workspace-namespace
+///   shape). Kotlin never searches enclosing packages, so a qualifier the
+///   workspace does not declare is a route out of it.
+fn kotlin_type_leaves_the_workspace(
+    ctx: &KotlinCtx<'_>,
+    scope: &KotlinScope,
+    segments: &[&str],
+) -> bool {
+    let Some((_, qualifier_segments)) = segments.split_last() else {
+        return false;
+    };
+    let head = segments[0];
+
+    for import in &scope.facts.imports {
+        if import.is_wildcard || import.local_name() != Some(head) {
+            continue;
+        }
+        let Some(path) = import
+            .path
+            .as_ref()
+            .filter(|path| !path.segments.is_empty())
+        else {
+            continue;
+        };
+        let owner = path.segments[..path.segments.len() - 1].join(".");
+        return !kotlin_workspace_package_exists(ctx.support, &owner);
+    }
+    for import in &scope.facts.imports {
+        if !import.is_wildcard {
+            continue;
+        }
+        let Some(path) = import
+            .path
+            .as_ref()
+            .filter(|path| !path.segments.is_empty())
+        else {
+            continue;
+        };
+        if !kotlin_workspace_package_exists(ctx.support, &path.render_segments(".")) {
+            return true;
+        }
+    }
+
+    if qualifier_segments.is_empty() {
+        return false;
+    }
+    let qualifier = qualifier_segments.join(".");
+    !kotlin_workspace_package_exists(ctx.support, &qualifier)
+        && ctx.resolve_name(&qualifier, scope) == KotlinTypeName::Unresolved
+}
+
+/// Whether the workspace declares `package` -- as a package of its own, or as
+/// the prefix of some declaration's fully-qualified name -- in any language.
+///
+/// A Kotlin file names Java and Scala packages in the same JVM realm, so a
+/// language-scoped answer would let a confident boundary claim fire for a
+/// package the workspace does index (#1174).
+fn kotlin_workspace_package_exists(support: &dyn BoundedDefinitionLookup, package: &str) -> bool {
+    !package.is_empty()
+        && (support.package_exists_in_any_language(package) || support.fqn_prefix_exists(package))
 }
 
 // ---------------------------------------------------------------------------
@@ -1873,10 +1973,13 @@ fn kotlin_member_candidates(
     arity: Option<usize>,
     site_byte: usize,
 ) -> Vec<CodeUnit> {
+    use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+    let mut member_trace = trace::recording().then(KotlinMemberTrace::default);
     for required_arity in [arity, None] {
         let mut seen = Vec::new();
         let mut frontier = vec![receiver.owner.clone()];
-        for _ in 0..MAX_MEMBER_HIERARCHY_DEPTH {
+        for level in 0..MAX_MEMBER_HIERARCHY_DEPTH {
             let mut next = Vec::new();
             for owner in &frontier {
                 let owner_fqn = owner.fq_name();
@@ -1885,18 +1988,52 @@ fn kotlin_member_candidates(
                 }
                 seen.push(owner_fqn.clone());
 
-                let mut owners = vec![owner_fqn.clone()];
+                let mut owners = vec![owner.clone()];
                 if receiver.static_qualifier {
-                    owners.extend(ctx.companion_fqns(&owner_fqn));
+                    let companions = ctx.companion_objects(&owner_fqn);
+                    if let Some(state) = member_trace.as_mut() {
+                        state.record_companions(owner, &companions);
+                    }
+                    owners.extend(companions);
                 }
                 for scope in owners {
-                    let found = ctx.members_named(&format!("{scope}.{member}"), required_arity);
+                    let mut found = Vec::new();
+                    let mut inapplicable = Vec::new();
+                    for unit in ctx.member_declarations(&format!("{}.{member}", scope.fq_name())) {
+                        if ctx.member_accepts_arity(&unit, required_arity) {
+                            found.push(unit);
+                        } else if member_trace.is_some() {
+                            // Computed by the walk and discarded on the call
+                            // shape alone: a row, not a silence (#1477 rule 5).
+                            inapplicable.push(unit);
+                        }
+                    }
+                    if let Some(state) = member_trace.as_mut() {
+                        state.record_found(&found, &scope, level);
+                        state.record_found(&inapplicable, &scope, level);
+                        state.record_inapplicable(&receiver.owner, &inapplicable);
+                    }
                     if !found.is_empty() {
+                        if let Some(state) = member_trace.as_ref() {
+                            state.stage_selection(
+                                &receiver.owner,
+                                &found,
+                                if required_arity.is_some() {
+                                    ApplicabilityVerdict::Applicable
+                                } else {
+                                    ApplicabilityVerdict::Unknown
+                                },
+                            );
+                        }
                         return found;
                     }
                 }
 
-                next.extend(ctx.direct_ancestors(owner));
+                let expanded = ctx.direct_ancestors(owner);
+                if let Some(state) = member_trace.as_mut() {
+                    state.record_supertypes(owner, &expanded);
+                }
+                next.extend(expanded);
             }
             if next.is_empty() {
                 break;
@@ -1916,6 +2053,202 @@ fn kotlin_member_candidates(
     Vec::new()
 }
 
+/// Where the Kotlin member walk found each candidate, recorded as the walk ran.
+///
+/// `depth` is the length of the route back to the receiver's own type, so a
+/// companion find counts the promotion edge that reached it; `level` is the
+/// breadth-first hierarchy level of the class the walk was inspecting, which is
+/// what Kotlin's own precedence ladder orders by. The two differ only for a
+/// companion, and keeping both is what lets the row state an exact route
+/// without claiming a companion member is inherited.
+struct KotlinMemberFind {
+    owner: CodeUnit,
+    depth: usize,
+    level: usize,
+    dispatch_tier: MemberDispatchTier,
+}
+
+/// The per-candidate attribution the Kotlin member walk records while it runs
+/// (#1477), built only when a trace is being recorded.
+///
+/// The walk decides nothing from it. Every entry is a fact the walk already
+/// held: which scope each candidate was found in, at which breadth-first level,
+/// and through which first-discovery edges that scope was reached.
+///
+/// Two honest limits are stated here rather than guessed around. The walk
+/// expands ancestors through `get_direct_ancestors`, which reports
+/// undifferentiated supertypes, so a Kotlin superclass hop and an interface hop
+/// are the same edge to this walk and both are recorded as
+/// [`HierarchyRelation::Supertype`] with the `inherited_or_promoted` bucket --
+/// a `trait_or_interface` claim would be a distinction the provider never made.
+/// And a companion is reached by promotion out of the class that declares it,
+/// which is the edge [`HierarchyRelation::Embedded`] names: the nested
+/// declaration's members answer references qualified by the enclosing type.
+#[derive(Default)]
+struct KotlinMemberTrace {
+    /// First-discovery supertype parent of each ancestor the walk expanded.
+    parents: HashMap<CodeUnit, CodeUnit>,
+    /// Companion object -> the class whose companions the walk expanded.
+    companion_of: HashMap<CodeUnit, CodeUnit>,
+    found: HashMap<CodeUnit, KotlinMemberFind>,
+}
+
+impl KotlinMemberTrace {
+    fn record_supertypes(&mut self, owner: &CodeUnit, ancestors: &[CodeUnit]) {
+        for ancestor in ancestors {
+            self.parents
+                .entry(ancestor.clone())
+                .or_insert_with(|| owner.clone());
+        }
+    }
+
+    fn record_companions(&mut self, owner: &CodeUnit, companions: &[CodeUnit]) {
+        for companion in companions {
+            self.companion_of
+                .entry(companion.clone())
+                .or_insert_with(|| owner.clone());
+        }
+    }
+
+    /// Attribute every candidate the walk just read out of `scope`, which sits
+    /// at breadth-first hierarchy `level`.
+    fn record_found(&mut self, candidates: &[CodeUnit], scope: &CodeUnit, level: usize) {
+        let companion = self.companion_of.contains_key(scope);
+        let dispatch_tier = if companion {
+            MemberDispatchTier::StaticOrCompanion
+        } else if level == 0 {
+            MemberDispatchTier::InherentOrDirect
+        } else {
+            MemberDispatchTier::InheritedOrPromoted
+        };
+        let depth = level + usize::from(companion);
+        for candidate in candidates {
+            self.found
+                .entry(candidate.clone())
+                .or_insert_with(|| KotlinMemberFind {
+                    owner: scope.clone(),
+                    depth,
+                    level,
+                    dispatch_tier,
+                });
+        }
+    }
+
+    /// The exact route from `base` to the scope `candidate` was found in, as the
+    /// first-discovery edges the walk actually took.
+    fn route(&self, base: &CodeUnit, candidate: &CodeUnit) -> Vec<trace::HierarchyHopRecord> {
+        let Some(find) = self.found.get(candidate) else {
+            return Vec::new();
+        };
+        let mut reversed: Vec<(CodeUnit, CodeUnit, HierarchyRelation)> = Vec::new();
+        let mut current = find.owner.clone();
+        while &current != base {
+            let step = if let Some(class) = self.companion_of.get(&current) {
+                (class.clone(), HierarchyRelation::Embedded)
+            } else if let Some(parent) = self.parents.get(&current) {
+                (parent.clone(), HierarchyRelation::Supertype)
+            } else {
+                break;
+            };
+            reversed.push((step.0.clone(), current, step.1));
+            current = step.0;
+        }
+        debug_assert_eq!(
+            reversed.len(),
+            find.depth,
+            "the first-discovery route must be exactly the recorded depth"
+        );
+        reversed.reverse();
+        reversed
+            .into_iter()
+            .enumerate()
+            .map(|(hop, (from, to, relation))| trace::HierarchyHopRecord {
+                hop,
+                from,
+                to,
+                relation,
+            })
+            .collect()
+    }
+
+    fn enrichment(
+        &self,
+        base: &CodeUnit,
+        candidate: &CodeUnit,
+        applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
+    ) -> Option<trace::MemberEnrichment> {
+        let find = self.found.get(candidate)?;
+        Some(trace::MemberEnrichment {
+            owner: find.owner.clone(),
+            hierarchy_depth: find.depth,
+            dispatch_tier: find.dispatch_tier,
+            applicability,
+            route: self.route(base, candidate),
+        })
+    }
+
+    /// Kotlin's precedence ladder for a member find, which follows the
+    /// hierarchy level: a companion of the receiver's own type is that type's
+    /// own member, not an inherited one.
+    fn precedence_tier(&self, candidate: &CodeUnit) -> Option<PrecedenceTier> {
+        self.found.get(candidate).map(|find| {
+            if find.level == 0 {
+                PrecedenceTier::OwnMember
+            } else {
+                PrecedenceTier::InheritedMember
+            }
+        })
+    }
+
+    /// Record the candidates this scope computed and then discarded because
+    /// they cannot accept the call's argument list. The structured story of an
+    /// argument-list mismatch belongs to the callable axis (#1478), so the
+    /// rejection reason defers to it.
+    fn record_inapplicable(&self, base: &CodeUnit, losers: &[CodeUnit]) {
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
+        for loser in losers {
+            let mut row = trace::TraceCandidate::rejected(
+                trace::TraceCandidateRef::Unit(loser.clone()),
+                self.precedence_tier(loser),
+                RejectionReason::CallableApplicabilityDeferred,
+            );
+            if let Some(enrichment) =
+                self.enrichment(base, loser, ApplicabilityVerdict::Inapplicable)
+            {
+                row = row.with_member(enrichment);
+            }
+            trace::record(row);
+        }
+    }
+
+    /// Stage attribution for the candidates the walk is about to return, for
+    /// the outcome constructor the caller reaches next.
+    fn stage_selection(
+        &self,
+        base: &CodeUnit,
+        winners: &[CodeUnit],
+        applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
+    ) {
+        if let Some(tier) = winners
+            .iter()
+            .filter_map(|unit| self.precedence_tier(unit))
+            .min()
+        {
+            trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
+        }
+        trace::stage_member_context(
+            winners
+                .iter()
+                .filter_map(|unit| {
+                    self.enrichment(base, unit, applicability)
+                        .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+    }
+}
+
 /// Extension functions named `member` that are in scope at the reference and
 /// whose declared receiver type is the receiver's type or one of its supertypes.
 ///
@@ -1929,23 +2262,64 @@ fn kotlin_extension_candidates(
     arity: Option<usize>,
     site_byte: usize,
 ) -> Vec<CodeUnit> {
+    use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
     let scope = ctx.scope_at(site_byte);
-    let conforming = |unit: &CodeUnit| {
-        arity.is_none_or(|arity| ctx.accepts_arity(unit, arity))
-            && ctx
-                .extension_receiver_unit(unit)
-                .is_some_and(|declared| ctx.type_conforms_to(&receiver.owner, &declared))
+    // The declared receiver each admitted extension conformed to, kept from the
+    // very check that admitted it. Re-reading it afterwards would spend session
+    // budget a recording run must not spend.
+    let admitted = |unit: &CodeUnit| -> Option<CodeUnit> {
+        if !arity.is_none_or(|arity| ctx.accepts_arity(unit, arity)) {
+            return None;
+        }
+        let declared = ctx.extension_receiver_unit(unit)?;
+        ctx.type_conforms_to(&receiver.owner, &declared)
+            .then_some(declared)
     };
     let resolution = resolve_kotlin_type_name(member, &scope.as_name_scope(), |candidate| {
-        ctx.callables_named(candidate).iter().any(conforming)
+        ctx.callables_named(candidate)
+            .iter()
+            .any(|unit| admitted(unit).is_some())
     });
     let Some(fqn) = resolution.resolved() else {
         return Vec::new();
     };
-    ctx.callables_named(&fqn)
+    let matched: Vec<(CodeUnit, CodeUnit)> = ctx
+        .callables_named(&fqn)
         .into_iter()
-        .filter(|unit| conforming(unit))
-        .collect()
+        .filter_map(|unit| admitted(&unit).map(|declared| (unit, declared)))
+        .collect();
+    if trace::recording() && !matched.is_empty() {
+        // An extension is admitted by conformance, and conformance is a yes/no
+        // question: `type_conforms_to` walks the hierarchy without metering the
+        // distance it walked. So only an extension declared directly on the
+        // receiver's own type has a route this seam holds -- depth zero, no
+        // hops. An extension of a supertype stays unattributed rather than
+        // being given a depth the walk never counted.
+        trace::stage_member_context(
+            matched
+                .iter()
+                .filter(|(_, declared)| declared.fq_name() == receiver.owner.fq_name())
+                .map(|(unit, declared)| {
+                    (
+                        unit.fq_name(),
+                        trace::MemberEnrichment {
+                            owner: declared.clone(),
+                            hierarchy_depth: 0,
+                            dispatch_tier: MemberDispatchTier::Extension,
+                            applicability: if arity.is_some() {
+                                ApplicabilityVerdict::Applicable
+                            } else {
+                                ApplicabilityVerdict::Unknown
+                            },
+                            route: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+    }
+    matched.into_iter().map(|(unit, _)| unit).collect()
 }
 
 /// Type the expression a member is selected from.
@@ -2306,25 +2680,6 @@ pub(crate) enum KotlinTypeLookupResolution {
     InappropriateSymbolContext,
 }
 
-pub(crate) fn kotlin_type_lookup_resolution(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    site: &ResolvedReferenceSite,
-) -> Option<KotlinTypeLookupResolution> {
-    kotlin_type_lookup_resolution_in_session(
-        analyzer,
-        support,
-        &ResolutionSession::unbounded(),
-        file,
-        source,
-        root,
-        site,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn kotlin_type_lookup_resolution_in_session(
     analyzer: &dyn IAnalyzer,
@@ -2342,7 +2697,7 @@ pub(crate) fn kotlin_type_lookup_resolution_in_session(
         if kotlin_enclosing_import_header(node).is_some() {
             return None;
         }
-        let spelled = kotlin_type_spelling_through(&ctx, node);
+        let spelled = kotlin_type_spelling_segments(&ctx, node).join(".");
         let scope = ctx.scope_at(node.start_byte());
         let fqn = ctx.resolve_name(&spelled, &scope).resolved()?;
         return Some(KotlinTypeLookupResolution::Type {

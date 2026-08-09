@@ -2,6 +2,71 @@ use super::navigation::*;
 use super::selectors::*;
 use super::summaries::*;
 use super::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymbolSourcesBudgetExceeded {
+    max_source_bytes: usize,
+}
+
+impl SymbolSourcesBudgetExceeded {
+    pub fn max_source_bytes(self) -> usize {
+        self.max_source_bytes
+    }
+}
+
+#[derive(Clone)]
+struct SourceByteBudget {
+    max_source_bytes: usize,
+    used_source_bytes: Arc<AtomicUsize>,
+    exceeded: Arc<AtomicBool>,
+}
+
+impl SourceByteBudget {
+    fn unbounded() -> Self {
+        Self::new(usize::MAX)
+    }
+
+    fn new(max_source_bytes: usize) -> Self {
+        Self {
+            max_source_bytes,
+            used_source_bytes: Arc::new(AtomicUsize::new(0)),
+            exceeded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn reserve(&self, source_bytes: usize) -> bool {
+        let mut used = self.used_source_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = used.checked_add(source_bytes) else {
+                self.exceeded.store(true, Ordering::Release);
+                return false;
+            };
+            if next > self.max_source_bytes {
+                self.exceeded.store(true, Ordering::Release);
+                return false;
+            }
+            match self.used_source_bytes.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => used = current,
+            }
+        }
+    }
+
+    fn release(&self, source_bytes: usize) {
+        self.used_source_bytes
+            .fetch_sub(source_bytes, Ordering::AcqRel);
+    }
+
+    fn is_exceeded(&self) -> bool {
+        self.exceeded.load(Ordering::Acquire)
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolSourcesResult {
@@ -39,15 +104,18 @@ pub(super) enum SourceLookupOutcome {
     Ambiguous(AmbiguousSymbol),
     AmbiguousPath(AmbiguousPathInput),
     TooBroad(TooBroadScope),
+    BudgetExceeded,
 }
 
-pub(super) fn source_blocks_for_resolved_units(
+fn source_blocks_for_resolved_units_with_budget(
     analyzer: &dyn IAnalyzer,
     code_units: &[CodeUnit],
-) -> Vec<SourceBlock> {
+    source_budget: &SourceByteBudget,
+) -> Result<Vec<SourceBlock>, SymbolSourcesBudgetExceeded> {
     let mut blocks = Vec::new();
     let mut module_units = Vec::new();
-    let mut cpp_identity = CppIdentityRenderCache::default();
+    let mut render_cache = SourceRenderCache::default();
+    let mut seen_function_units: HashSet<(String, ProjectFile)> = HashSet::default();
 
     for code_unit in code_units {
         if is_file_listing_target(code_unit) {
@@ -55,8 +123,26 @@ pub(super) fn source_blocks_for_resolved_units(
             continue;
         }
 
-        let source_blocks =
-            source_blocks_for_code_unit_with_cache(analyzer, code_unit, true, &mut cpp_identity);
+        // Duplicate resolved function units sharing (fq_name, source) render
+        // byte-identical blocks -- every input to the block is derived from
+        // that pair -- and dedup_source_blocks collapses them downstream
+        // anyway. Skip the repeats up front: against generated amalgamations
+        // (#1689, phalcon's 9.5 MB phalcon.zep.c) N duplicate units each
+        // re-collect N candidate ranges, an O(N^2) range render that dominated
+        // both CPU and the multi-GB pre-dedup block heap.
+        if code_unit.is_function()
+            && !seen_function_units.insert((code_unit.fq_name(), code_unit.source().clone()))
+        {
+            continue;
+        }
+
+        let source_blocks = source_blocks_for_code_unit_with_cache(
+            analyzer,
+            code_unit,
+            true,
+            &mut render_cache,
+            source_budget,
+        )?;
         if source_blocks.is_empty() && is_scala_object_like(code_unit) {
             module_units.push(code_unit.clone());
         } else {
@@ -64,11 +150,28 @@ pub(super) fn source_blocks_for_resolved_units(
         }
     }
 
-    blocks.extend(module_file_listing_blocks(analyzer, &module_units));
-    blocks
+    let module_blocks = module_file_listing_blocks(analyzer, &module_units);
+    reserve_source_blocks(source_budget, &module_blocks)?;
+    blocks.extend(module_blocks);
+    Ok(blocks)
 }
 
-fn prefer_definition_source_blocks(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
+fn preferred_source_blocks_for_resolved_units_with_budget(
+    analyzer: &dyn IAnalyzer,
+    code_units: &[CodeUnit],
+    source_budget: &SourceByteBudget,
+) -> Result<Vec<SourceBlock>, SymbolSourcesBudgetExceeded> {
+    let blocks = source_blocks_for_resolved_units_with_budget(analyzer, code_units, source_budget)?;
+    Ok(prefer_definition_source_blocks_with_budget(
+        blocks,
+        source_budget,
+    ))
+}
+
+fn prefer_definition_source_blocks_with_budget(
+    blocks: Vec<SourceBlock>,
+    source_budget: &SourceByteBudget,
+) -> Vec<SourceBlock> {
     let definition_groups: HashSet<_> = blocks
         .iter()
         .filter(|block| block.occurrence_role.as_deref() == Some("definition"))
@@ -76,20 +179,18 @@ fn prefer_definition_source_blocks(blocks: Vec<SourceBlock>) -> Vec<SourceBlock>
         .collect();
     blocks
         .into_iter()
-        .filter(|block| {
-            block.canonical_selector.as_ref().is_none_or(|selector| {
+        .filter_map(|block| {
+            let keep = block.canonical_selector.as_ref().is_none_or(|selector| {
                 !definition_groups.contains(selector)
                     || block.occurrence_role.as_deref() == Some("definition")
-            })
+            });
+            if !keep {
+                source_budget.release(block.text.len());
+                return None;
+            }
+            Some(block)
         })
         .collect()
-}
-
-fn preferred_source_blocks_for_resolved_units(
-    analyzer: &dyn IAnalyzer,
-    code_units: &[CodeUnit],
-) -> Vec<SourceBlock> {
-    prefer_definition_source_blocks(source_blocks_for_resolved_units(analyzer, code_units))
 }
 
 pub fn symbol_source_candidate_files(
@@ -165,11 +266,12 @@ pub(super) fn extend_candidate_unit_files(
     }));
 }
 
-pub(super) fn resolve_file_anchored_symbol_sources(
+fn resolve_file_anchored_symbol_sources(
     analyzer: &dyn IAnalyzer,
     input: &str,
     anchor: String,
     lookup: &str,
+    source_budget: &SourceByteBudget,
 ) -> SourceLookupOutcome {
     let code_units = match anchor_scoped_codeunit_resolution(analyzer, &anchor, lookup) {
         CodeUnitResolution::Resolved(code_units) | CodeUnitResolution::Ambiguous(code_units) => {
@@ -190,9 +292,12 @@ pub(super) fn resolve_file_anchored_symbol_sources(
                     input, &anchor, lookup,
                 ));
             }
-            if let Some(outcome) =
-                semantic_model_source_outcome_with_anchor(analyzer, lookup, Some(&anchor))
-            {
+            if let Some(outcome) = semantic_model_source_outcome_with_anchor(
+                analyzer,
+                lookup,
+                Some(&anchor),
+                source_budget,
+            ) {
                 return outcome;
             }
             if let Some(item) = unsupported_selector_shape_not_found_input(analyzer, input) {
@@ -211,7 +316,14 @@ pub(super) fn resolve_file_anchored_symbol_sources(
         [] => SourceLookupOutcome::NotFound(symbol_not_found_input(input)),
         [(_, _)] => {
             let code_units: Vec<_> = groups.into_iter().flat_map(|(_, units)| units).collect();
-            let sources = source_blocks_for_resolved_units(analyzer, &code_units);
+            let sources = match source_blocks_for_resolved_units_with_budget(
+                analyzer,
+                &code_units,
+                source_budget,
+            ) {
+                Ok(sources) => sources,
+                Err(_) => return SourceLookupOutcome::BudgetExceeded,
+            };
             if sources.is_empty() {
                 SourceLookupOutcome::NotFound(renderable_not_found_input(input))
             } else {
@@ -229,18 +341,32 @@ pub fn get_symbol_sources(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
 ) -> SymbolSourcesResult {
-    get_symbol_sources_with_cap(analyzer, params, GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET)
+    get_symbol_sources_with_budget(analyzer, params, &SourceByteBudget::unbounded())
+        .expect("an unbounded source lookup must not exceed its budget")
 }
 
-/// `max_files_per_target` bounds how many files one glob-shaped symbol argument
-/// may expand to; a target over the bound is reported through `too_broad` and
-/// contributes no source blocks at all, because the full text of an arbitrary
-/// subset of a huge match looks complete while meaning nothing.
-fn get_symbol_sources_with_cap(
+pub fn get_symbol_sources_with_source_budget(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
-    max_files_per_target: usize,
-) -> SymbolSourcesResult {
+    max_source_bytes: usize,
+) -> Result<SymbolSourcesResult, SymbolSourcesBudgetExceeded> {
+    get_symbol_sources_with_budget(analyzer, params, &SourceByteBudget::new(max_source_bytes))
+}
+
+/// Two independent bounds apply here. `source_budget` caps the total bytes of
+/// source text one call may return, and exceeding it fails the whole call.
+/// `GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET` caps how many files ONE
+/// glob-shaped symbol argument may expand to; a target over that bound is
+/// reported through `too_broad` and contributes no source blocks at all,
+/// because the full text of an arbitrary subset of a huge match looks complete
+/// while meaning nothing. The per-target cap is checked first: a too-broad
+/// target is a bad request, not an oversized answer.
+fn get_symbol_sources_with_budget(
+    analyzer: &dyn IAnalyzer,
+    params: SymbolLookupParams,
+    source_budget: &SourceByteBudget,
+) -> Result<SymbolSourcesResult, SymbolSourcesBudgetExceeded> {
+    let max_files_per_target = GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET;
     // One tool call is one read-only analyzer request. The scope is what lets
     // every `WorkspaceFileResolver` built below -- one per call site, times one
     // per symbol in the parallel loop -- share a single workspace listing
@@ -260,8 +386,12 @@ fn get_symbol_sources_with_cap(
         .into_par_iter()
         .enumerate()
         .map(|(index, symbol)| {
+            if source_budget.is_exceeded() {
+                return (index, SourceLookupOutcome::BudgetExceeded);
+            }
             if symbol.starts_with("bifrost-model://")
-                && let Some(outcome) = semantic_model_source_outcome(analyzer, &symbol)
+                && let Some(outcome) =
+                    semantic_model_source_outcome(analyzer, &symbol, source_budget)
             {
                 return (index, outcome);
             }
@@ -278,9 +408,21 @@ fn get_symbol_sources_with_cap(
             match resolve_selectable_definitions(analyzer, &symbol, exact_codeunit_resolution) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = if file_anchored {
-                        source_blocks_for_resolved_units(analyzer, &code_units)
+                        source_blocks_for_resolved_units_with_budget(
+                            analyzer,
+                            &code_units,
+                            source_budget,
+                        )
                     } else {
-                        preferred_source_blocks_for_resolved_units(analyzer, &code_units)
+                        preferred_source_blocks_for_resolved_units_with_budget(
+                            analyzer,
+                            &code_units,
+                            source_budget,
+                        )
+                    };
+                    let sources = match sources {
+                        Ok(sources) => sources,
+                        Err(_) => return (index, SourceLookupOutcome::BudgetExceeded),
                     };
                     return if sources.is_empty() {
                         (
@@ -301,6 +443,7 @@ fn get_symbol_sources_with_cap(
                             analyzer,
                             lookup,
                             Some(&anchor),
+                            source_budget,
                         )
                     {
                         return (index, outcome);
@@ -314,10 +457,32 @@ fn get_symbol_sources_with_cap(
                 crate::profiling::scope(format!("get_symbol_sources.path_qualified[{symbol}]"));
             match split_path_qualified_definition_selector(analyzer, &symbol) {
                 Some(PathQualifiedSelector::Resolved { anchor, lookup }) => {
-                    return (
-                        index,
-                        resolve_file_anchored_symbol_sources(analyzer, &symbol, anchor, lookup),
-                    );
+                    return match resolve_file_anchored_symbol_sources(
+                        analyzer,
+                        &symbol,
+                        anchor,
+                        lookup,
+                        source_budget,
+                    ) {
+                        SourceLookupOutcome::Found(blocks) => {
+                            (index, SourceLookupOutcome::Found(blocks))
+                        }
+                        SourceLookupOutcome::NotFound(item) => {
+                            (index, SourceLookupOutcome::NotFound(item))
+                        }
+                        SourceLookupOutcome::Ambiguous(item) => {
+                            (index, SourceLookupOutcome::Ambiguous(item))
+                        }
+                        SourceLookupOutcome::AmbiguousPath(item) => {
+                            (index, SourceLookupOutcome::AmbiguousPath(item))
+                        }
+                        SourceLookupOutcome::BudgetExceeded => {
+                            (index, SourceLookupOutcome::BudgetExceeded)
+                        }
+                        SourceLookupOutcome::TooBroad(item) => {
+                            (index, SourceLookupOutcome::TooBroad(item))
+                        }
+                    };
                 }
                 Some(PathQualifiedSelector::AmbiguousPath(item)) => {
                     return (index, SourceLookupOutcome::AmbiguousPath(item));
@@ -334,7 +499,14 @@ fn get_symbol_sources_with_cap(
                     exact_then_fuzzy_codeunit_resolution,
                 ) {
                     SelectableDefinitionResolution::Resolved(code_units) => {
-                        let sources = source_blocks_for_resolved_units(analyzer, &code_units);
+                        let sources = match source_blocks_for_resolved_units_with_budget(
+                            analyzer,
+                            &code_units,
+                            source_budget,
+                        ) {
+                            Ok(sources) => sources,
+                            Err(_) => return (index, SourceLookupOutcome::BudgetExceeded),
+                        };
                         return if sources.is_empty() {
                             (
                                 index,
@@ -370,7 +542,14 @@ fn get_symbol_sources_with_cap(
                         )),
                     );
                 }
-                let sources = source_blocks_for_files(analyzer, file_matches.files);
+                let sources = match source_blocks_for_files_with_budget(
+                    analyzer,
+                    file_matches.files,
+                    source_budget,
+                ) {
+                    Ok(sources) => sources,
+                    Err(_) => return (index, SourceLookupOutcome::BudgetExceeded),
+                };
                 return if sources.is_empty() {
                     (
                         index,
@@ -415,7 +594,14 @@ fn get_symbol_sources_with_cap(
                 crate::profiling::scope(format!("get_symbol_sources.fuzzy[{symbol}]"));
             match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
-                    let sources = preferred_source_blocks_for_resolved_units(analyzer, &code_units);
+                    let sources = match preferred_source_blocks_for_resolved_units_with_budget(
+                        analyzer,
+                        &code_units,
+                        source_budget,
+                    ) {
+                        Ok(sources) => sources,
+                        Err(_) => return (index, SourceLookupOutcome::BudgetExceeded),
+                    };
                     if sources.is_empty() {
                         (
                             index,
@@ -432,7 +618,9 @@ fn get_symbol_sources_with_cap(
                     let _diagnostics_scope = crate::profiling::scope(format!(
                         "get_symbol_sources.not_found_diagnostics[{symbol}]"
                     ));
-                    if let Some(outcome) = semantic_model_source_outcome(analyzer, &symbol) {
+                    if let Some(outcome) =
+                        semantic_model_source_outcome(analyzer, &symbol, source_budget)
+                    {
                         return (index, outcome);
                     }
                     if let Some(item) =
@@ -465,29 +653,36 @@ fn get_symbol_sources_with_cap(
             SourceLookupOutcome::Ambiguous(item) => ambiguous.push(item),
             SourceLookupOutcome::AmbiguousPath(item) => ambiguous_paths.push(item),
             SourceLookupOutcome::TooBroad(item) => too_broad.push(item),
+            SourceLookupOutcome::BudgetExceeded => {
+                return Err(SymbolSourcesBudgetExceeded {
+                    max_source_bytes: source_budget.max_source_bytes,
+                });
+            }
         }
     }
 
-    SymbolSourcesResult {
+    Ok(SymbolSourcesResult {
         sources,
         not_found,
         ambiguous,
         ambiguous_paths,
         too_broad,
-    }
+    })
 }
 
 fn semantic_model_source_outcome(
     analyzer: &dyn IAnalyzer,
     symbol: &str,
+    source_budget: &SourceByteBudget,
 ) -> Option<SourceLookupOutcome> {
-    semantic_model_source_outcome_with_anchor(analyzer, symbol, None)
+    semantic_model_source_outcome_with_anchor(analyzer, symbol, None, source_budget)
 }
 
 fn semantic_model_source_outcome_with_anchor(
     analyzer: &dyn IAnalyzer,
     symbol: &str,
     required_path: Option<&str>,
+    source_budget: &SourceByteBudget,
 ) -> Option<SourceLookupOutcome> {
     let overlay = analyzer.semantic_model_overlay()?;
     let mut records = if symbol.starts_with("bifrost-model://") {
@@ -527,9 +722,11 @@ fn semantic_model_source_outcome_with_anchor(
             let model = records[0];
             match &model.location {
                 crate::analyzer::semantic_model::SemanticModelLocation::Model(_) => {
-                    Some(SourceLookupOutcome::Found(vec![
-                        semantic_model_source_block(model),
-                    ]))
+                    let blocks = vec![semantic_model_source_block(model)];
+                    match reserve_source_blocks(source_budget, &blocks) {
+                        Ok(()) => Some(SourceLookupOutcome::Found(blocks)),
+                        Err(_) => Some(SourceLookupOutcome::BudgetExceeded),
+                    }
                 }
                 crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor) => {
                     let units = analyzer
@@ -542,12 +739,23 @@ fn semantic_model_source_outcome_with_anchor(
                                 == anchor.path
                         })
                         .collect::<Vec<_>>();
-                    let sources = preferred_source_blocks_for_resolved_units(analyzer, &units);
-                    Some(SourceLookupOutcome::Found(if sources.is_empty() {
-                        vec![semantic_model_source_block(model)]
-                    } else {
-                        sources
-                    }))
+                    match preferred_source_blocks_for_resolved_units_with_budget(
+                        analyzer,
+                        &units,
+                        source_budget,
+                    ) {
+                        Ok(sources) if !sources.is_empty() => {
+                            Some(SourceLookupOutcome::Found(sources))
+                        }
+                        Ok(_) => {
+                            let blocks = vec![semantic_model_source_block(model)];
+                            match reserve_source_blocks(source_budget, &blocks) {
+                                Ok(()) => Some(SourceLookupOutcome::Found(blocks)),
+                                Err(_) => Some(SourceLookupOutcome::BudgetExceeded),
+                            }
+                        }
+                        Err(_) => Some(SourceLookupOutcome::BudgetExceeded),
+                    }
                 }
             }
         }
@@ -568,74 +776,164 @@ fn semantic_model_source_outcome_with_anchor(
     }
 }
 
+#[derive(Default)]
+struct SourceRenderCache {
+    cpp_identity: CppIdentityRenderCache,
+    line_starts: HashMap<ProjectFile, std::rc::Rc<Vec<usize>>>,
+    function_ranges_by_name: HashMap<String, HashMap<ProjectFile, Vec<Range>>>,
+}
+
+fn source_ranges_for_code_unit(
+    analyzer: &dyn IAnalyzer,
+    code_unit: &CodeUnit,
+    render_cache: &mut SourceRenderCache,
+) -> Vec<Range> {
+    if !code_unit.is_function() {
+        return analyzer.ranges(code_unit);
+    }
+
+    let fq_name = code_unit.fq_name();
+    if let Some(ranges_by_source) = render_cache.function_ranges_by_name.get(&fq_name) {
+        return ranges_by_source
+            .get(code_unit.source())
+            .cloned()
+            .unwrap_or_default();
+    }
+
+    // A broad macro or function name can resolve to many files. Collect each
+    // candidate range set once per name. Looking up all same-name definitions
+    // again for every file is quadratic on generated amalgamations such as
+    // Phalcon's PHP_METHOD declarations.
+    let mut ranges_by_source: HashMap<ProjectFile, Vec<Range>> = HashMap::default();
+    for candidate in analyzer.definitions(&fq_name) {
+        ranges_by_source
+            .entry(candidate.source().clone())
+            .or_default()
+            .extend(analyzer.ranges(&candidate));
+    }
+    let ranges = ranges_by_source
+        .get(code_unit.source())
+        .cloned()
+        .unwrap_or_default();
+    render_cache
+        .function_ranges_by_name
+        .insert(fq_name, ranges_by_source);
+    ranges
+}
+
 fn source_blocks_for_code_unit_with_cache(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
     include_comments: bool,
-    cpp_identity: &mut CppIdentityRenderCache,
-) -> Vec<SourceBlock> {
+    render_cache: &mut SourceRenderCache,
+    source_budget: &SourceByteBudget,
+) -> Result<Vec<SourceBlock>, SymbolSourcesBudgetExceeded> {
     let Some(content) = analyzer.indexed_source(code_unit.source()) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let language = language_for_target(code_unit);
-    let canonical_selector = cpp_identity.canonical_selector(analyzer, code_unit);
+    let canonical_selector = render_cache
+        .cpp_identity
+        .canonical_selector(analyzer, code_unit);
 
-    let mut ranges = if code_unit.is_function() {
-        let mut grouped = Vec::new();
-        for candidate in analyzer.definitions(&code_unit.fq_name()) {
-            if candidate.source() == code_unit.source() {
-                grouped.extend(analyzer.ranges(&candidate));
-            }
+    let mut ranges = source_ranges_for_code_unit(analyzer, code_unit, render_cache);
+    ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+    // definitions() can return the same candidate through multiple identity
+    // paths; identical ranges render identical blocks, so drop the repeats
+    // before paying for text extraction.
+    ranges.dedup_by_key(|range| (range.start_byte, range.end_byte));
+
+    // The line-start table is derived data of the immutable indexed content;
+    // compute it once per file per tool call instead of twice per range
+    // (#1689: two full-file scans per range dominated get_symbol_sources on
+    // multi-megabyte generated files).
+    let line_starts = render_cache
+        .line_starts
+        .entry(code_unit.source().clone())
+        .or_insert_with(|| std::rc::Rc::new(compute_line_starts(&content)))
+        .clone();
+
+    let mut blocks = Vec::new();
+    for range in ranges {
+        let occurrence_role = render_cache
+            .cpp_identity
+            .occurrence_role(analyzer, code_unit, &range);
+        let start_byte = if include_comments {
+            expanded_comment_start(language, &content, range.start_byte)
+        } else {
+            range.start_byte
+        };
+        let Some(source) = content.get(start_byte..range.end_byte) else {
+            continue;
+        };
+        if source.is_empty() {
+            continue;
         }
-        grouped
-    } else {
-        analyzer.ranges(code_unit).to_vec()
-    };
-    ranges.sort_by_key(|range| range.start_byte);
 
-    ranges
-        .into_iter()
-        .filter_map(|range| {
-            let occurrence_role = cpp_identity.occurrence_role(analyzer, code_unit, &range);
-            let start_byte = if include_comments {
-                expanded_comment_start(language, &content, range.start_byte)
-            } else {
-                range.start_byte
-            };
-            let text = content.get(start_byte..range.end_byte)?.to_string();
-            if text.is_empty() {
-                return None;
+        // Reserve the indexed fragment before cloning it. A broad symbol can
+        // resolve thousands of generated definitions. Do not allocate their
+        // text after the transport limit can no longer contain the response.
+        if !source_budget.reserve(source.len()) {
+            return Err(SymbolSourcesBudgetExceeded {
+                max_source_bytes: source_budget.max_source_bytes,
+            });
+        }
+        let mut text = analyzer.render_source_fragment(
+            code_unit,
+            source.to_string(),
+            range.start_byte.saturating_sub(start_byte),
+        );
+        if text.len() > source.len() {
+            if !source_budget.reserve(text.len() - source.len()) {
+                return Err(SymbolSourcesBudgetExceeded {
+                    max_source_bytes: source_budget.max_source_bytes,
+                });
             }
-            let text = analyzer.render_source_fragment(
-                code_unit,
-                text,
-                range.start_byte.saturating_sub(start_byte),
-            );
-            let start_line = line_number_at_offset(&content, start_byte);
-            Some(SourceBlock {
-                label: display_symbol_for_target(code_unit),
-                path: rel_path_string(code_unit.source()),
-                start_line,
-                // Same CR-aware line table as start_line: text.lines() counts
-                // only \n, which undercounts rows on CR-only files (#1431).
-                end_line: line_number_at_offset(&content, range.end_byte.saturating_sub(1)),
-                text,
-                canonical_selector: canonical_selector.clone(),
-                occurrence_role,
-                presentation: None,
-                note: None,
-                semantic_model: None,
-            })
-        })
-        .collect()
+        } else {
+            source_budget.release(source.len() - text.len());
+        }
+
+        let start_line = find_line_index_for_offset(&line_starts, start_byte) + 1;
+        blocks.push(SourceBlock {
+            label: display_symbol_for_target(code_unit),
+            path: rel_path_string(code_unit.source()),
+            start_line,
+            // Same CR-aware line table as start_line: the line-start index
+            // counts both \n and CR-only row starts (#1431).
+            end_line: find_line_index_for_offset(&line_starts, range.end_byte.saturating_sub(1))
+                + 1,
+            text: std::mem::take(&mut text),
+            canonical_selector: canonical_selector.clone(),
+            occurrence_role,
+            presentation: None,
+            note: None,
+            semantic_model: None,
+        });
+    }
+    Ok(blocks)
 }
 
-pub(super) fn source_blocks_for_files(
+fn reserve_source_blocks(
+    source_budget: &SourceByteBudget,
+    blocks: &[SourceBlock],
+) -> Result<(), SymbolSourcesBudgetExceeded> {
+    for block in blocks {
+        if !source_budget.reserve(block.text.len()) {
+            return Err(SymbolSourcesBudgetExceeded {
+                max_source_bytes: source_budget.max_source_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn source_blocks_for_files_with_budget(
     analyzer: &dyn IAnalyzer,
     files: Vec<ProjectFile>,
-) -> Vec<SourceBlock> {
-    files
+    source_budget: &SourceByteBudget,
+) -> Result<Vec<SourceBlock>, SymbolSourcesBudgetExceeded> {
+    let blocks = files
         .into_iter()
         .filter_map(|file| {
             if let Some(block) = file_outline_source_block(
@@ -654,7 +952,9 @@ pub(super) fn source_blocks_for_files(
 
             excerpt_fallback_source_block(analyzer, &file)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    reserve_source_blocks(source_budget, &blocks)?;
+    Ok(blocks)
 }
 
 pub(super) fn file_outline_source_block(
@@ -913,11 +1213,6 @@ pub(super) fn is_file_listing_target(code_unit: &CodeUnit) -> bool {
 
 pub(super) fn is_ancestor_target(code_unit: &CodeUnit) -> bool {
     code_unit.is_class() || code_unit.is_module()
-}
-
-pub(super) fn line_number_at_offset(content: &str, offset: usize) -> usize {
-    let bounded = offset.min(content.len());
-    find_line_index_for_offset(&compute_line_starts(content), bounded) + 1
 }
 
 pub(super) fn expanded_comment_start(language: Language, source: &str, start_byte: usize) -> usize {

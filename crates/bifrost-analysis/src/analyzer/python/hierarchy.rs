@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::build_direct_descendant_index;
+use brokk_bifrost_python::graph_support::resolve_base_class;
 use std::sync::Arc;
 
 impl TypeHierarchyProvider for PythonAnalyzer {
@@ -12,7 +13,7 @@ impl TypeHierarchyProvider for PythonAnalyzer {
             .inner
             .raw_supertypes_of(code_unit)
             .iter()
-            .filter_map(|raw| self.resolve_base_class(code_unit, raw))
+            .filter_map(|raw| resolve_base_class(self, code_unit, raw))
             .collect();
         self.direct_ancestors
             .insert(code_unit.clone(), Arc::new(ancestors.clone()));
@@ -20,8 +21,13 @@ impl TypeHierarchyProvider for PythonAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+        // The builder itself is serial, so the same closure serves both memo
+        // arms; the memo's value here is the non-blocking claim protocol.
         self.direct_descendant_index
-            .get_or_init(|| build_direct_descendant_index(self, self))
+            .get_or_build(
+                || build_direct_descendant_index(self, self),
+                || build_direct_descendant_index(self, self),
+            )
             .descendants(code_unit)
     }
 }

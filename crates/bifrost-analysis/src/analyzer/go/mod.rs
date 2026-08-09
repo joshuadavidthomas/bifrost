@@ -2,24 +2,37 @@ mod adapter;
 mod artifact;
 mod cache;
 mod clones;
-mod declarations;
 mod dependency_discovery;
 pub(crate) mod diagnostics;
-mod hierarchy;
-pub(crate) mod imports;
-pub(crate) mod packages;
+mod imports;
+pub(crate) mod package_identity;
 mod semantic;
-pub(crate) mod structural;
-mod tests;
+use crate::analyzer::Range;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::languages::{
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
+};
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupOutcome, resolve_go_bounded,
+};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_go_type_bounded};
+use crate::analyzer::usages::go_graph::{
+    GoUsageGraphStrategy, build_go_usage_edge_weights, build_go_usage_edges,
+    go_implicit_entry_point,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile, SemanticDiagnostic,
+    ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language, Project, ProjectFile,
     SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, resolve_analyzer,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -27,18 +40,21 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 pub(crate) use adapter::GoAdapter;
-pub use artifact::GoDependencyPackAdapter;
+pub use artifact::{GoDependencyPackAdapter, GoModulePackProducer, GoPinnedPackage};
+// The Go declaration walk lives in the go crate; the rest of analysis (artifact,
+// semantic) still reaches its helpers through `super::declarations::`.
+pub(crate) use brokk_bifrost_go::declarations;
+pub(crate) use brokk_bifrost_go::declarations::{
+    determine_go_package_name, go_structured_type_identity_bounded,
+};
+use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
+pub(crate) use brokk_bifrost_go::packages;
+pub(crate) use brokk_bifrost_go::packages::GO_MODULE_SCOPE_SEGMENT;
+use brokk_bifrost_go::packages::canonical_go_package_name;
+use brokk_bifrost_go::test_detection::detect_go_test_assertion_smells;
 use cache::GoMemoCaches;
 use clones::build_go_clone_candidate_data;
-pub(crate) use declarations::{
-    collect_go_import_infos, determine_go_package_name, go_embedded_type_nodes,
-    go_structured_type_identity_bounded,
-};
 pub use dependency_discovery::resolve_go_semantic_pack_dependencies;
-use tests::detect_go_test_assertion_smells;
-use tree_sitter::Node;
-
-pub(crate) const GO_MODULE_SCOPE_SEGMENT: &str = "_module_";
 
 #[derive(Clone)]
 pub struct GoAnalyzer {
@@ -149,6 +165,14 @@ impl GoAnalyzer {
         self.inner.signature_metadata_limited(code_unit, limit)
     }
 
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        self.inner.signatures_limited(code_unit, limit)
+    }
+
     pub(crate) fn ranges_limited(
         &self,
         code_unit: &CodeUnit,
@@ -187,7 +211,7 @@ impl GoAnalyzer {
         root: tree_sitter::Node<'_>,
     ) -> String {
         let declared = determine_go_package_name(root, source);
-        packages::canonical_go_package_name(file, &declared)
+        canonical_go_package_name(file, &declared)
     }
 
     #[doc(hidden)]
@@ -203,18 +227,6 @@ impl GoAnalyzer {
     #[doc(hidden)]
     pub fn bulk_hydration_count_for_test(&self) -> usize {
         self.inner.bulk_hydration_count_for_test()
-    }
-
-    #[doc(hidden)]
-    pub fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    #[doc(hidden)]
-    pub fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .global_usage_definition_index_build_count_for_test()
     }
 
     pub(crate) fn package_clause_of(&self, file: &ProjectFile) -> Option<String> {
@@ -280,11 +292,6 @@ impl GoAnalyzer {
     }
 }
 
-pub(crate) fn go_field_declaration_is_embedded(node: Node<'_>) -> bool {
-    node.child_by_field_name("name")
-        .is_none_or(|name| name.kind() == "type_identifier")
-}
-
 impl TypeAliasProvider for GoAnalyzer {
     fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
         self.inner.is_type_alias(code_unit)
@@ -295,50 +302,46 @@ impl TypeHierarchyProvider for GoAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.memo_caches
             .hierarchy_index
-            .get_or_init(|| hierarchy::GoHierarchyIndex::build(self))
+            .get_or_init(|| GoHierarchyIndex::build(&self.inner, self))
             .direct_ancestors(code_unit)
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> crate::hash::HashSet<CodeUnit> {
         self.memo_caches
             .hierarchy_index
-            .get_or_init(|| hierarchy::GoHierarchyIndex::build(self))
+            .get_or_init(|| GoHierarchyIndex::build(&self.inner, self))
             .direct_descendants(code_unit)
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
         self.memo_caches
             .hierarchy_index
-            .get_or_init(|| hierarchy::GoHierarchyIndex::build(self))
+            .get_or_init(|| GoHierarchyIndex::build(&self.inner, self))
             .supports(code_unit)
     }
 }
 
 impl TestDetectionProvider for GoAnalyzer {}
 
-impl IAnalyzer for GoAnalyzer {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.begin_query(context);
+use crate::analyzer::CodeUnitIndex;
+
+impl CodeUnitIndex for GoAnalyzer {
+    fn enclosing_code_unit(
+        &self,
+        file: &ProjectFile,
+        range: &crate::analyzer::Range,
+    ) -> Option<CodeUnit> {
+        self.inner.enclosing_code_unit(file, range)
     }
 
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.end_query(context);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
-    }
-
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        self.inner
+            .enclosing_code_unit_for_lines(file, start_line, end_line)
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
@@ -358,6 +361,14 @@ impl IAnalyzer for GoAnalyzer {
 
     fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
         self.inner.indexed_source(file)
+    }
+
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.inner.location_declarations(file)
+    }
+
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
+        self.inner.location_ranges(code_unit)
     }
 
     fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
@@ -380,42 +391,8 @@ impl IAnalyzer for GoAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
-    }
-
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .global_usage_definition_index_build_count_for_test()
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner.reset_full_declaration_scan_count_for_test();
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.full_declaration_scan_count_for_test()
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
-    }
-
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.direct_children(code_unit)
-    }
-
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
@@ -430,10 +407,6 @@ impl IAnalyzer for GoAnalyzer {
     ) -> (Vec<crate::analyzer::Range>, usize, bool) {
         self.inner
             .ranges_with_limit(code_unit, max_ranges, cancellation)
-    }
-
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -452,20 +425,6 @@ impl IAnalyzer for GoAnalyzer {
         self.inner.languages()
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        Self {
-            inner: self.inner.update(changed_files),
-            memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
-        }
-    }
-
-    fn update_all(&self) -> Self {
-        Self {
-            inner: self.inner.update_all(),
-            memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
-        }
-    }
-
     fn project(&self) -> &dyn Project {
         self.inner.project()
     }
@@ -476,54 +435,6 @@ impl IAnalyzer for GoAnalyzer {
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
         self.inner.get_definitions(fq_name)
-    }
-
-    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
-        self.inner.parse_errors(file)
-    }
-
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_go_semantic_diagnostics(self, file, source)
-            .into_iter()
-            .map(Into::into)
-            .collect()
-    }
-
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
-    }
-
-    fn enclosing_code_unit(
-        &self,
-        file: &ProjectFile,
-        range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
-    }
-
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
-    }
-
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
@@ -618,12 +529,107 @@ impl IAnalyzer for GoAnalyzer {
         self.inner.lookup_candidates_by_short_name(symbol)
     }
 
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        self.inner.has_complete_symbol_lookup_index()
+    }
+
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_declarations_by_identifier(identifier)
     }
+}
 
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.inner.has_complete_symbol_lookup_index()
+impl IAnalyzer for GoAnalyzer {
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
+    }
+
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.inner.workspace_file_index_cell()
+    }
+
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
+        self.inner.global_usage_definition_index()
+    }
+
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
+    }
+
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        Self {
+            inner: self.inner.update(changed_files),
+            memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
+        }
+    }
+
+    fn update_all(&self) -> Self {
+        Self {
+            inner: self.inner.update_all(),
+            memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
+        }
+    }
+
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.inner.parse_errors(file)
+    }
+
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        // The Go collector builds the complete report itself: it is the only
+        // caller that knows which of its lookups checked a workspace lexical
+        // scope, an indexed external package surface, or nothing at all.
+        diagnostics::collect_go_semantic_diagnostics(self, file, source)
+    }
+
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        self.inner.extract_call_receiver(reference)
+    }
+
+    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
+        self.inner.is_access_expression(file, start_byte, end_byte)
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+        ident: &str,
+    ) -> Option<crate::analyzer::DeclarationInfo> {
+        self.inner
+            .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
     fn search_symbol_candidates(
@@ -702,5 +708,253 @@ impl IAnalyzer for GoAnalyzer {
 
     fn get_test_modules(&self, files: &[ProjectFile]) -> Vec<String> {
         Self::get_test_modules_static(files)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::AnalyzerTestHooks for GoAnalyzer {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+}
+
+static GO_USAGE_STRATEGY: GoUsageGraphStrategy = GoUsageGraphStrategy::new();
+
+pub(crate) struct GoSupport;
+
+impl LanguageSupport for GoSupport {
+    fn language(&self) -> Language {
+        Language::Go
+    }
+
+    fn package_separator(&self) -> &'static str {
+        "/"
+    }
+
+    fn signature_metadata_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        resolve_analyzer::<GoAnalyzer>(analyzer)
+            .map(|go| go.signature_metadata_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<GoAnalyzer>(analyzer).map(|go| go.signatures_limited(unit, limit))
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<GoAnalyzer>(analyzer).map(|go| go.ranges_limited(unit, limit))
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<GoAnalyzer>(analyzer).map(|value| value as _)
+    }
+
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Go
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &GO_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&GoEdgePass)
+    }
+
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&GO_USAGE_STRATEGY),
+            bulk: Some(&GoDeadCodeBulk),
+        }
+    }
+
+    fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        Some(&GoSupport)
+    }
+
+    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
+        tree_sitter_go::LANGUAGE.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &brokk_bifrost_go::structural::GO_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(tree_sitter_go::HIGHLIGHTS_QUERY)
+    }
+}
+
+struct GoEdgePass;
+
+impl LanguageEdgePass for GoEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Go
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_go_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_go_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
+    }
+}
+
+impl StructuralReceiverResolver for GoSupport {
+    fn resolve_type_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        resolve_go_type_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+
+    fn resolve_definition_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        resolve_go_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+}
+
+struct GoDeadCodeBulk;
+
+impl DeadCodeBulkProof for GoDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Go
+    }
+
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        routing.candidate.is_field() || go_implicit_entry_point(routing.candidate)
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "Go",
+            files: analyzable_file_count(analyzer, Language::Go),
+        }
+    }
+
+    /// Module-level variables count as callers as well as declarations: a package-level
+    /// `var` initializer is a real call site in Go.
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let nodes = fqn_bulk_nodes(
+            analyzer,
+            Language::Go,
+            |unit| unit.is_function() || unit.is_class() || go_module_level_field(unit),
+            candidates,
+        );
+        build_go_usage_edges(analyzer, &nodes, |_| true)
+            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+    }
+}
+
+fn go_module_level_field(unit: &CodeUnit) -> bool {
+    unit.is_field() && unit.short_name().starts_with("_module_.")
+}
+
+#[cfg(test)]
+mod hierarchy_tests {
+    //! Lives here rather than beside the builder in `brokk-bifrost-go`: the
+    //! fixture needs a real `GoAnalyzer` to supply the `CodeUnitIndex` and
+    //! `ImportAnalysisProvider` the hierarchy is built from.
+    use super::*;
+    use crate::analyzer::TestProject;
+    use crate::analyzer::type_relations::TypeRelationKind;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn analyzer(files: &[(&str, &str)]) -> GoAnalyzer {
+        let temp = tempdir().unwrap();
+        let root = temp.keep();
+        fs::write(root.join("go.mod"), "module example.com/app\n\ngo 1.22\n").unwrap();
+        for (path, source) in files {
+            let path = root.join(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, source).unwrap();
+        }
+        GoAnalyzer::from_project(TestProject::new(root, Language::Go))
+    }
+
+    #[test]
+    fn structural_relation_records_satisfied_interface() {
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\ntype Runner interface { Run() error }\ntype Worker struct{}\nfunc (Worker) Run() error { return nil }\n",
+        )]);
+        let index = GoHierarchyIndex::build(&analyzer, &analyzer);
+        assert!(index.relations().iter().any(|relation| {
+            relation.kind == TypeRelationKind::StructuralSatisfaction
+                && relation.from.identifier() == "Worker"
+                && relation.to.identifier() == "Runner"
+        }));
     }
 }

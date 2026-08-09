@@ -1,8 +1,6 @@
 #[cfg(test)]
 pub(crate) mod benchmark_provenance;
 pub(crate) mod bounded_output;
-pub mod canonical_hash;
-mod capabilities;
 mod clone_detection;
 pub mod cognitive_complexity;
 #[cfg(test)]
@@ -24,10 +22,11 @@ mod javascript;
 mod js_ts;
 pub(crate) mod jvm;
 mod kotlin;
+pub(crate) mod languages;
 pub mod lexical_definitions;
 mod multi_analyzer;
+pub mod packs_document;
 mod php;
-mod pool_memo;
 mod python;
 pub mod reference_candidates;
 mod ruby;
@@ -40,15 +39,15 @@ pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
 pub mod taint;
-pub(crate) mod test_assertions;
+pub use brokk_bifrost_core::analyzer::test_assertions;
 pub mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
-pub(crate) mod type_relations;
 mod typescript;
 pub mod typestate;
 mod usage_facts;
 pub mod usages;
 pub mod value_flow;
+pub(crate) mod weighted_cache;
 mod work_budget;
 mod workspace;
 
@@ -59,13 +58,22 @@ mod workspace;
 // blocks below read the same as when the modules were declared here.
 // Each keeps the visibility its `mod` declaration had, so the seam does not
 // quietly widen this crate's public surface.
-use brokk_bifrost_core::analyzer::{config, model, project, source_content};
-pub(crate) use brokk_bifrost_core::analyzer::{dense_id, fq_name, semantic_diagnostics};
-pub use brokk_bifrost_core::analyzer::{identifier, test_paths};
+pub use brokk_bifrost_core::analyzer::{canonical_hash, identifier, test_paths};
+use brokk_bifrost_core::analyzer::{
+    capabilities, code_unit_index, config, definition_lookup, model, pool_memo, project,
+    source_content,
+};
+pub(crate) use brokk_bifrost_core::analyzer::{dense_id, fq_name, type_relations};
+pub use code_unit_index::CodeUnitIndex;
+pub(crate) use code_unit_index::default_parent_fq_name;
+pub(crate) use definition_lookup::{BoundedDefinitionLookup, sort_units};
 
+pub(crate) use brokk_bifrost_cpp::imports::{
+    include_paths as cpp_include_paths, resolve_include_targets, resolve_include_targets_with_index,
+};
 pub use capabilities::{
-    CapabilityProvider, ImportAnalysisProvider, TestDetectionProvider, TypeAliasProvider,
-    TypeHierarchyProvider,
+    CapabilityProvider, ImportAnalysisProvider, ImportReachability, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 pub(crate) use capabilities::{
     DirectDescendantIndex, build_direct_descendant_index, build_reverse_file_index,
@@ -77,17 +85,17 @@ pub use config::{
     JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig, JvmAnalyzerConfig,
     JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
     JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
-    JvmStandardLibraryDiscoveryConfig, PythonAnalyzerConfig, PythonEnvironmentConfig,
-    PythonEnvironmentLimits, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
-    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
+    JvmStandardLibraryDiscoveryConfig, PhpAnalyzerConfig, PhpDependencyApiEvidence,
+    PythonAnalyzerConfig, PythonEnvironmentConfig, PythonEnvironmentLimits, RubyAnalyzerConfig,
+    RubyDependencyApiEvidence, RubyGemApiArtifact, RustAnalyzerConfig, RustDependencyApiEvidence,
+    RustPackageApiArtifact, RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
+pub use cpp::cpp_is_constructor_or_destructor_declarator_name;
 pub(crate) use cpp::{
-    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, IncludeTargetIndex,
-    cpp_callable_definitions_share_identity_evidence, cpp_callable_unit_role,
-    cpp_indexed_callable_linkage, cpp_template_term, include_paths as cpp_include_paths,
-    node_text as cpp_node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
-    resolve_include_targets, resolve_include_targets_with_index,
+    CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole,
+    cpp_callable_definitions_share_identity_evidence, cpp_header_body_files_are_related,
+    node_text as cpp_node_text,
 };
 pub use csharp::CSharpAnalyzer;
 pub use csharp::external::{
@@ -96,36 +104,39 @@ pub use csharp::external::{
     CSharpExternalType, CSharpExternalTypeKind, CSharpVisibility,
     resolve_csharp_semantic_pack_dependencies,
 };
+// The C# usage graph left with `brokk-bifrost-csharp`, taking most of this
+// block's consumers with it. What remains is what the parked definition route
+// (`usages/get_definition/csharp.rs`, `usages/get_type/csharp.rs`) and the
+// framework hub still read.
 pub(crate) use csharp::{
-    CSharpMemberName, csharp_attribute_name_node, csharp_attribute_terminal_name,
-    csharp_attribute_type_names, csharp_callable_arity, csharp_conditional_member_access,
-    csharp_constant_pattern_type_candidate, csharp_member_access_type_receiver, csharp_member_name,
-    csharp_method_generic_arity, csharp_nameof_type_candidates, csharp_normalize_full_name,
-    csharp_signature_return_type, csharp_source_identifier, csharp_type_leftmost_identifier,
-    csharp_type_node_identity, csharp_type_reference_root, csharp_type_terminal_identifier,
-    csharp_unqualified_invocation_for_name, csharp_using_directive_is_global,
-    csharp_using_directive_is_static, csharp_using_directive_namespace,
-    csharp_using_directive_target,
+    csharp_attribute_name_node, csharp_attribute_type_names, csharp_callable_arity,
+    csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
+    csharp_normalize_full_name, csharp_source_identifier,
 };
 pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
 pub use fq_name::FqName;
 pub(crate) use global_usage_definition_index::{
-    AnalyzerDefinitionLookup, BoundedDefinitionLookup, ForwardQueryProvider,
-    impl_forward_query_provider,
+    AnalyzerDefinitionLookup, ForwardQueryProvider, impl_forward_query_provider,
 };
 pub use global_usage_definition_index::{DefinitionIndexHandle, GlobalUsageDefinitionIndex};
-pub(crate) use go::{
-    GO_MODULE_SCOPE_SEGMENT,
-    packages::{GoModuleRoot, go_internal_import_allowed, go_module_roots},
+// Go language knowledge lives in `brokk-bifrost-go`; these keep their
+// historical `crate::analyzer::` paths for the analysis-side consumers
+// (symbol_lookup, searchtools, the definition routes).
+pub(crate) use brokk_bifrost_go::packages::{
+    GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, go_internal_import_allowed, go_module_roots,
 };
-pub use go::{GoAnalyzer, GoDependencyPackAdapter, resolve_go_semantic_pack_dependencies};
+pub use go::{
+    GoAnalyzer, GoDependencyPackAdapter, GoModulePackProducer, GoPinnedPackage,
+    resolve_go_semantic_pack_dependencies,
+};
 pub use i_analyzer::AnalyzerQueryScope;
 pub use i_analyzer::AnalyzerStreamingFileScope;
-pub(crate) use i_analyzer::default_parent_fq_name;
 pub use i_analyzer::{
     AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,
     SearchSymbolPatternBatch, WorkspaceFileIndex, WorkspaceFileIndexCell,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use i_analyzer::{AnalyzerTestHooks, NoOpAnalyzerTestHooks};
 pub use index_warmer::IndexWarmer;
 pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
@@ -140,39 +151,39 @@ pub use jvm::jdk_artifact::{JdkSourceArchiveLayout, JdkSourceArchivePackProducer
 pub use jvm::kotlin_artifact::KotlinSourceJarPackProducer;
 pub use jvm::scala_artifact::ScalaSourceJarPackProducer;
 pub use kotlin::KotlinAnalyzer;
-pub use model::SemanticDiagnostic;
 pub use model::{
-    CallableArity, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType,
-    CommentDensityStats, DeclarationInfo, DeclarationKind, DispatchExtensibility,
+    CallableArity, CallableFacts, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit,
+    CodeUnitType, CommentDensityStats, DeclarationInfo, DeclarationKind, DispatchExtensibility,
     ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, ImportInfo, Language,
-    MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, ParameterMetadata, ParseError,
-    ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
+    LanguageDialect, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights, PackageAnchor,
+    ParameterMetadata, ParseError, ParseErrorKind, ProjectFile, Range, RubyMethodDispatchMode,
+    ScalaExportInfo, ScalaExportSelector, SearchSymbolCandidate, SemanticAbsenceProof,
+    SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
+    SemanticDiagnosticOutcome, SemanticDiagnosticReport, SemanticDiagnosticReportStatus,
     SignatureMetadata, StructuredImportPath, StructuredImportPathKind, StructuredImportScope,
     StructuredTypeIdentity, StructuredTypeName, SummaryFileProjection, TestAssertionAnalysis,
     TestAssertionSmell, TestAssertionWeights, metrics_from_declarations,
 };
-pub(crate) use model::{
-    CallableLinkage, CppTemplateAliasTargetMetadata, CppTemplateExpression, CppTemplateMetadata,
-    CppTemplateParameterKind, CppTemplateParameterMetadata, CppTemplateTerm,
-};
+pub(crate) use model::{CallableLinkage, CppFieldLinkage, CppTemplateMetadata};
 pub use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
+pub use php::{
+    ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDependencyPackAdapter,
+    resolve_php_semantic_pack_dependencies,
+};
 pub use php::{
     PhpAnalyzer, PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
-pub(crate) use php::{
-    PhpFileContext, php_signature_return_type_text, resolve_php_constant, resolve_php_function,
-    resolve_php_type,
-};
-pub(crate) use pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo, spawn_on_dedicated_build_pool};
+pub(crate) use pool_memo::PoolSafeMemo;
 pub use project::{
     BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,
     MultiRootProject, OverlayProject, OverlayRevision, Project, ProjectSourceOrigin,
     ProjectSourceSnapshot, TestProject, WorkspaceFileListingCache, collect_workspace_files,
 };
 pub(crate) use python::{
-    ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
+    ModuleBindingEventKind, ModuleBindingTimeline, resolve_fqn_candidates,
+    resolve_module_code_unit, usage_resolve_module_files,
 };
 pub use python::{
     PythonAnalyzer, PythonImportBinding,
@@ -183,17 +194,21 @@ pub use python::{
     parse_python_import_bindings, parse_python_import_infos,
 };
 pub use ruby::RubyAnalyzer;
-pub(crate) use ruby::RubySemanticFacts;
-pub use ruby::{RubyDependencyPackAdapter, resolve_ruby_semantic_pack_dependencies};
+pub use ruby::{
+    RubyDependencyPackAdapter, RubyGemArchivePackProducer, resolve_ruby_semantic_pack_dependencies,
+};
+pub(crate) use rust::is_rust_public_like_declaration;
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{
     RustAnalyzer, RustDependencyPackAdapter, RustReferenceContext, RustdocJsonPackProducer,
-    reset_rust_tree_parse_counters_for_test, resolve_rust_semantic_pack_dependencies,
-    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
-    rust_tree_parsed_bytes_for_test,
+    resolve_rust_semantic_pack_dependencies,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use rust::{
+    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
+    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
 pub use scala::ScalaAnalyzer;
-pub(crate) use scala::scala_parenthesized_arity;
 pub use source_content::SourceContent;
 pub use source_ingestion::{
     IngestedSource, SourceIngestionError, SourceIngestionKind, ingest_source_bytes,
@@ -207,8 +222,9 @@ pub use tree_sitter_analyzer::{
 pub use typescript::TypescriptAnalyzer;
 pub(crate) use usage_facts::UsageFactsIndex;
 pub use workspace::{
-    EmptyAnalyzer, PythonSemanticModelActivationOutcome, PythonSemanticModelWorkspaceContext,
-    WorkspaceAnalyzer,
+    DependencyPackActivationOutcome, DependencyPackEcosystem, DependencyPackEcosystemOutcome,
+    DependencyPackWorkspaceContext, EmptyAnalyzer, PythonSemanticModelActivationOutcome,
+    PythonSemanticModelWorkspaceContext, WorkspaceAnalyzer,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,93 +233,12 @@ pub(crate) enum ParserFlavor {
     TypeScriptTsx,
 }
 
-/// A source language plus the parser dialect needed to interpret one file.
-///
-/// Most languages have one grammar. TypeScript is the exception because `.ts`
-/// and `.tsx` files use distinct tree-sitter grammars while sharing the same
-/// normalized language adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum LanguageDialect {
-    Standard(Language),
-    TypeScriptTsx,
-}
-
-impl LanguageDialect {
-    /// Parse a user-facing language or dialect label.
-    pub fn from_config_label(label: &str) -> Option<Self> {
-        let normalized = label
-            .trim()
-            .trim_start_matches('.')
-            .to_ascii_lowercase()
-            .replace(['_', '-'], "");
-        if matches!(
-            normalized.as_str(),
-            "tsx" | "typescriptreact" | "typescripttsx"
-        ) {
-            return Some(Self::TypeScriptTsx);
+impl ParserFlavor {
+    const fn for_dialect(dialect: LanguageDialect) -> Self {
+        match dialect {
+            LanguageDialect::Standard(_) => Self::Default,
+            LanguageDialect::TypeScriptTsx => Self::TypeScriptTsx,
         }
-        Language::from_config_label(label).map(Self::Standard)
-    }
-
-    /// Select the parser dialect used by the indexed analyzer for `path`.
-    pub fn for_path(language: Language, path: &std::path::Path) -> Self {
-        if parser_flavor_for_path(language, path) == ParserFlavor::TypeScriptTsx {
-            Self::TypeScriptTsx
-        } else {
-            Self::Standard(language)
-        }
-    }
-
-    pub const fn language(self) -> Language {
-        match self {
-            Self::Standard(language) => language,
-            Self::TypeScriptTsx => Language::TypeScript,
-        }
-    }
-
-    /// Canonical durable identity label. Unlike [`Self::config_label`], this
-    /// makes the TypeScript language explicit rather than using the `tsx`
-    /// shorthand.
-    pub fn stable_label(self) -> &'static str {
-        match self {
-            Self::Standard(language) => language.config_label(),
-            Self::TypeScriptTsx => "typescript-tsx",
-        }
-    }
-
-    /// Short user-facing configuration label retained by Rune IR and the CLI.
-    pub fn config_label(self) -> &'static str {
-        match self {
-            Self::Standard(language) => language.config_label(),
-            Self::TypeScriptTsx => "tsx",
-        }
-    }
-
-    pub fn config_labels() -> impl Iterator<Item = &'static str> {
-        Language::ANALYZABLE
-            .iter()
-            .map(|language| language.config_label())
-            .chain(std::iter::once("tsx"))
-    }
-
-    pub(crate) fn parser_language(self) -> Option<tree_sitter::Language> {
-        let flavor = match self {
-            Self::Standard(_) => ParserFlavor::Default,
-            Self::TypeScriptTsx => ParserFlavor::TypeScriptTsx,
-        };
-        parser_language_for_flavor(self.language(), flavor)
-    }
-}
-
-impl From<Language> for LanguageDialect {
-    fn from(language: Language) -> Self {
-        Self::Standard(language)
-    }
-}
-
-impl std::fmt::Display for LanguageDialect {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.stable_label())
     }
 }
 
@@ -312,29 +247,23 @@ pub fn parser_language_for(language: Language) -> Option<tree_sitter::Language> 
     parser_language_for_flavor(language, ParserFlavor::Default)
 }
 
+/// Resolve the parser grammar for one [`LanguageDialect`].
+///
+/// [`LanguageDialect`] itself is core-owned so language crates can name it;
+/// the grammar registry it would need for this is analysis machinery, so the
+/// resolution stays here as a free function.
+pub(crate) fn parser_language_for_dialect(
+    dialect: LanguageDialect,
+) -> Option<tree_sitter::Language> {
+    parser_language_for_flavor(dialect.language(), ParserFlavor::for_dialect(dialect))
+}
+
 /// Resolve a parser grammar from the canonical language registry.
 pub(crate) fn parser_language_for_flavor(
     language: Language,
     flavor: ParserFlavor,
 ) -> Option<tree_sitter::Language> {
-    Some(match language {
-        Language::Java => tree_sitter_java::LANGUAGE.into(),
-        Language::Go => tree_sitter_go::LANGUAGE.into(),
-        Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        Language::TypeScript if flavor == ParserFlavor::TypeScriptTsx => {
-            tree_sitter_typescript::LANGUAGE_TSX.into()
-        }
-        Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
-        Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
-        Language::Scala => crate::analyzer::scala::language::LANGUAGE.into(),
-        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
-        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-        Language::Kotlin => crate::analyzer::kotlin::language::LANGUAGE.into(),
-        Language::None => return None,
-    })
+    languages::language_support(language).map(|support| support.parser_language(flavor))
 }
 
 /// Resolve the parser grammar used by the indexed analyzer for a specific path.
@@ -346,16 +275,7 @@ pub(crate) fn parser_language_for_path(
 }
 
 pub(crate) fn parser_flavor_for_path(language: Language, path: &std::path::Path) -> ParserFlavor {
-    if language == Language::TypeScript
-        && path
-            .extension()
-            .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("tsx"))
-    {
-        ParserFlavor::TypeScriptTsx
-    } else {
-        ParserFlavor::Default
-    }
+    ParserFlavor::for_dialect(LanguageDialect::for_path(language, path))
 }
 
 /// Resolve the normalized structural adapter registered for a language
@@ -363,19 +283,5 @@ pub(crate) fn parser_flavor_for_path(language: Language, path: &std::path::Path)
 pub(crate) fn structural_spec_for(
     language: Language,
 ) -> Option<&'static dyn structural::StructuralSpec> {
-    Some(match language {
-        Language::Java => &java::structural::JAVA_STRUCTURAL_SPEC,
-        Language::Go => &go::structural::GO_STRUCTURAL_SPEC,
-        Language::Cpp => &cpp::structural::CPP_STRUCTURAL_SPEC,
-        Language::JavaScript => &js_ts::structural::JAVASCRIPT_STRUCTURAL_SPEC,
-        Language::TypeScript => &js_ts::structural::TYPESCRIPT_STRUCTURAL_SPEC,
-        Language::Python => &python::structural::PYTHON_STRUCTURAL_SPEC,
-        Language::Rust => &rust::structural::RUST_STRUCTURAL_SPEC,
-        Language::Php => &php::structural::PHP_STRUCTURAL_SPEC,
-        Language::Scala => &scala::structural::SCALA_STRUCTURAL_SPEC,
-        Language::CSharp => &csharp::structural::CSHARP_STRUCTURAL_SPEC,
-        Language::Ruby => &ruby::structural::RUBY_STRUCTURAL_SPEC,
-        Language::Kotlin => &kotlin::structural::KOTLIN_STRUCTURAL_SPEC,
-        Language::None => return None,
-    })
+    languages::language_support(language).map(languages::LanguageSupport::structural_spec)
 }

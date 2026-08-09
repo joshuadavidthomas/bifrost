@@ -11,13 +11,16 @@ mod common;
 
 mod bifrostignore;
 mod classify_test_files_test;
+mod csharp_constructor_resolution;
 mod diff_analysis_test;
 mod get_definition_test;
 mod most_relevant_files;
+mod optional_chain_reference_site;
 mod reusable_summaries;
 mod searchtools_definition_selectors;
 mod searchtools_fuzzy_symbol_lookup;
 mod searchtools_list_symbols;
 mod searchtools_service;
+mod searchtools_source_budget;
 mod searchtools_summary_ranges;
 mod searchtools_too_broad_scope;

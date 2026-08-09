@@ -148,7 +148,9 @@ fn normalize_line_endings(source: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_analysis::analyzer::{CppAnalyzer, JavaAnalyzer, Language, TestProject};
+    use brokk_bifrost_analysis::analyzer::{
+        CodeUnitIndex, CppAnalyzer, JavaAnalyzer, Language, TestProject,
+    };
 
     fn fixture_analyzer() -> (tempfile::TempDir, JavaAnalyzer) {
         let temp = tempfile::tempdir().unwrap();
@@ -212,9 +214,16 @@ mod tests {
     #[test]
     fn extracts_only_ordered_functions_with_structured_class_names() {
         let (_temp, analyzer) = fixture_analyzer();
-        analyzer.reset_package_declaration_scan_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_package_declaration_scan_count_for_test();
         let result = chunks_for(&analyzer, "A.java");
-        assert_eq!(analyzer.package_declaration_scan_count_for_test(), 0);
+        assert_eq!(
+            analyzer
+                .test_hooks()
+                .package_declaration_scan_count_for_test(),
+            0
+        );
         assert_eq!(result.chunks.len(), 3);
         assert!(
             result
@@ -247,14 +256,23 @@ mod tests {
             .into_iter()
             .find(|file| rel_path_string(file) == "A.java")
             .expect("A.java analyzed");
-        analyzer.reset_candidate_hydration_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_candidate_hydration_count_for_test();
 
         let extracted = extract_file_chunks(&analyzer, &file);
         assert!(!extracted.chunks.is_empty());
-        assert_eq!(analyzer.candidate_hydration_count_for_test(), 1);
+        assert_eq!(
+            analyzer.test_hooks().candidate_hydration_count_for_test(),
+            1
+        );
 
         assert!(!analyzer.top_level_declarations(&file).is_empty());
-        assert_eq!(analyzer.candidate_hydration_count_for_test(), 2);
+        assert_eq!(
+            analyzer.test_hooks().candidate_hydration_count_for_test(),
+            2,
+            "the ordinary read must hydrate again after the streaming scope closes"
+        );
     }
 
     #[test]

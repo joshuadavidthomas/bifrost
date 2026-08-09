@@ -6,9 +6,10 @@ description: Take a query from RQL exploration to a native RQLP policy or tested
 A Bifrost rule begins as a versioned `CodeQuery`. It can remain an application-owned query integration, or it can become a native `.rqlp` policy with stable rule identity, severity, completeness, and human/JSON/SARIF reporting. This guide builds a small “direct calls to Python `eval`” query, then shows both production paths.
 
 > **Execution boundary:** Bifrost executes `.rqlp` policies whose analysis has
-> `:type match` or `:type typestate`. Taint-analysis syntax is available for
-> authoring and validation, but taint evaluation is not implemented yet;
-> running it reports `unsupported` and exits with status 2.
+> `:type match`, `:type taint`, `:type typestate`, or `:type assertion`.
+> Taint and typestate are bounded semantic analyses: their findings retain
+> completeness, uncertainty, and witness limits instead of converting partial
+> work into clean negatives.
 
 This example becomes a structural policy: it finds parsed call expressions whose callee is named `eval`. It does not prove runtime dispatch, taint, reachability, or data flow. Choose a graph step and proof filter when declaration identity matters, and choose another analysis engine when the policy requires an unsupported guarantee.
 
@@ -39,7 +40,7 @@ Run `:json` in the RQL prompt. Save the resulting canonical model under the anal
 <!-- code-query-test:json:rule-eval -->
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "languages": ["python"],
   "match": {
     "kind": "call",
@@ -68,7 +69,7 @@ one policy document instead of writing a reporting adapter:
     (analysis
       :type match
       :selector
-        (rql :schema-version 2
+        (rql :schema-version 1
           (language python
             (call :callee (name "eval"))))))
 ```
@@ -77,8 +78,9 @@ Save it as one `.rqlp` file and run it with `bifrost --policy-file`. The policy
 owns finding identity and presentation while the nested RQL remains the same
 typed selector explored above. See [Static-Analysis
 Policies](/static-analysis-policies/) for endpoint libraries, taint and
-typestate syntax, schema inference, composition, typestate execution and report
-parity, and the current taint execution boundary.
+typestate syntax, schema inference, composition, semantic execution and report
+parity. [Data Flow, Taint, and Typestate](/data-flow-and-typestate/) explains
+the registered-query, policy, and external-summary boundaries.
 
 If an application needs the raw query result or custom domain logic rather than
 a Bifrost policy report, keep the checked-in CodeQuery and use one of the
@@ -134,7 +136,7 @@ use std::path::PathBuf;
 fn run_rule(root: PathBuf) -> Result<CodeQueryResult, String> {
     let service = SearchToolsService::new_without_semantic_index(root)?;
     let result = service.query_code_result(json!({
-        "schema_version": 2,
+        "schema_version": 1,
         "languages": ["python"],
         "match": {"kind": "call", "callee": {"name": "eval"}},
         "limit": 1000,

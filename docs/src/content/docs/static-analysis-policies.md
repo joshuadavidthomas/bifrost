@@ -1,6 +1,6 @@
 ---
 title: Static-Analysis Policies
-description: Author reusable RQLP rules and endpoints, run match policies, and interpret complete human, JSON, or SARIF reports.
+description: Author reusable RQLP rules and endpoints, run structural and semantic policies, and interpret complete human, JSON, or SARIF reports.
 ---
 
 Bifrost static-analysis policies are human-readable S-expressions stored in
@@ -9,10 +9,11 @@ and completeness semantics around native [Rune Query Language
 (RQL)](/rune-query-language/) selectors. JSON is available as a normalized or
 reporting form, but it is not an alternate RQLP authoring syntax.
 
-> **Current execution boundary:** Bifrost executes match-, typestate-, and
-> assertion-analysis policies. Taint-analysis policies can be authored, parsed,
-> validated, and composed, but their evaluator is not implemented yet. Running
-> taint reports an `unsupported` completion and exits with status 2.
+> **Current execution boundary:** Bifrost executes match-, taint-, typestate-,
+> and assertion-analysis policies. Taint resolves typed source and sink
+> bindings, compiles compatible demand, runs bounded set-oriented propagation,
+> and renders retained findings. Unsupported or incomplete semantic boundaries
+> remain non-clean completion states rather than empty successful results.
 
 > **Important:** An RQL selector returns analysis candidates. An endpoint
 > selector match is diagnostic-neutral. Neither an endpoint match nor the
@@ -115,7 +116,7 @@ With `--fail-on never`, the complete human report is:
 
 <!-- policy-doc-test:human:dynamic-eval -->
 ```text
-note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 12
+note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL schema 1
 [warning]  app.py:2:12
     Dynamic evaluation is forbidden
 
@@ -136,7 +137,7 @@ independently:
 | Source form | Omitted version | Explicit version |
 | --- | --- | --- |
 | `(policy ...)` or `(endpoint ...)` | Select the newest compiled-in version in the compatible policy lineage (currently 1). | An exact pin; unsupported versions fail instead of falling back. |
-| `(rql QUERY)` | Select the compatible RQL head (currently 3). | Add `:schema-version N` for an exact RQL pin. |
+| `(rql QUERY)` | Select the compatible RQL head (currently 1). | Add `:schema-version N` for an exact RQL pin. |
 | `(rql-file :path "queries/rule.rql")` | With no wrapper pin, an explicit pin in the referenced document wins; if both omit a version, resolve the compatible RQL head. | A wrapper pin is exact; an explicit referenced-document pin must agree. |
 
 File-backed selectors have four version-resolution cases:
@@ -237,7 +238,7 @@ source/sink leaves should normally use endpoint documents.
 | Type | Public authoring model | Evaluation in this release |
 | --- | --- | --- |
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
-| `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Parses, validates, and composes; evaluation reports `unsupported` until [#824](https://github.com/BrokkAi/bifrost/issues/824). |
+| `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Executes the production compiler, compatible batch planner, solver, retained report, and human/JSON/SARIF projection. |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
 | `assertion` | A subject selector that captures identifier tokens, plus one or more `assert`, `assert-resolution`, `assert-reaching`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant. |
 
@@ -290,7 +291,7 @@ specific combination supplies more actionable wording:
 
 </details>
 
-A generated message is emitted only after the future taint analysis reports an
+A generated message is emitted only after the taint analysis reports an
 actual compatible source/sink meeting. Merely matching both endpoint selectors
 does **not** license “can reach.” For one actual pair, an applicable explicit
 combination replaces the generated default. If multiple explicit combinations
@@ -298,7 +299,7 @@ apply, `:supersedes` must leave one unique winner; it never creates a second
 solver run or duplicate finding.
 
 Categories, display phrases, and finding messages select and present this
-composition. They do not become propagation keys or change the future solver's
+composition. They do not become propagation keys or change the solver's
 set-oriented run identity.
 
 ### Assertion: what the parser must say about a token
@@ -473,7 +474,7 @@ first is not. The requirement is therefore that the sorted receiver be declared
       :type assertion
       :subject
         (rql
-          :schema-version 9
+          :schema-version 1
           (union
             (language rust
               (inside (loop :capture "region")
@@ -870,6 +871,117 @@ findings. Use `--scope-file PATH` on the CLI or `scope_file` on the MCP
 `run_policy` tool for one workspace-relative override; both default to
 `.bifrost/policy-scope.json`.
 
+## Gate Only On What The Change Introduced
+
+A full policy run fails a repository for every finding, including debt that
+predates the change under review. `--diff-base REV` turns the same run into a
+changed-code gate: the identical policies also evaluate the committed content
+of `REV`, findings are joined across the two revisions by `(policy_id,
+finding_id)`, and the failure threshold counts only the findings whose
+identity is absent from the base.
+
+```bash
+bifrost --root . \
+  --policy-pack bifrost.code-smells \
+  --format sarif --output out.sarif \
+  --diff-base origin/main
+```
+
+The join works because a strong finding identity hashes only content-derived
+facts: the workspace-relative path, the semantic owner key, a digest of the
+matched source bytes, and a small ordinal for identical slices under one
+owner. It contains no absolute path, revision, timestamp, or run-local
+handle, so the same finding in unchanged content produces the same identity
+at both revisions. The base revision is exported into a private temporary
+directory and analyzed there; the checkout is never touched.
+
+Each retained finding gains a `diff` decision (`new` or `persisting`, plus a
+`weak_identity` marker), and the report gains one top-level `diff` review
+with the requested revision, the resolved commit, the three counts, and the
+fixed identities the head no longer produces. Weak identities are
+snapshot-local by construction, so a weak finding never joins and always
+classifies as new. Suppressions and scope still apply first: a suppressed or
+scoped new finding does not gate, exactly as in a full run. SARIF results
+carry the standard `baselineState` field (`new` or `unchanged`; fixed base
+findings are not emitted as results), and concise human output hides
+persisting findings while the summary reports all three counts.
+
+The reliability contract is asymmetric on purpose. An unresolvable base -- a
+workspace outside a git repository, or a revision `git rev-parse` cannot
+resolve -- fails the run with status 2: an unresolvable base is an unreliable
+diff request, never a silent full run. A base that resolves but whose
+evaluation cannot prove its own completeness instead degrades to full gating:
+every head finding gates as if `--diff-base` had not been given, the review
+records `degraded: true`, and a `diff-base-unreliable` report diagnostic
+states why, so a broken base can never hide new findings and can never be
+mistaken for a clean diff run.
+
+Two identity limitations are accepted rather than solved. A pure file rename
+re-keys every finding in the file (the path is part of the identity), so a
+rename reports one `fixed` plus one `new` pair. Identical source slices under
+one owner are distinguished by an ordinal, so inserting an exact duplicate
+above an existing one can shift the ordinals and misclassify one pair.
+
+The base evaluation is a full second in-memory analysis of the base tree; it
+shares no analyzer cache in this version. For the GitHub Actions recipe that
+passes the pull request's base SHA, see
+[CI Gating with GitHub Actions](/ci-github-actions/).
+
+## Accept Today's Findings, Gate Tomorrow's
+
+A repository adopting Bifrost can carry hundreds to thousands of pre-existing
+findings. The suppression store is deliberately the wrong tool for that scale:
+it caps at 512 identity-exact records and demands a reviewed reason for each,
+which is right for governed waivers and wrong for onboarding. `--diff-base`
+removes the pressure from pull-request gates, but scheduled full runs and
+release gates still need "accept everything that exists today, gate everything
+new." That is the baseline document:
+
+```bash
+bifrost --root . --policy-pack bifrost.code-smells --accept-current
+```
+
+`--accept-current` runs the selected policies and writes
+`.bifrost/baseline.json` (override with `--baseline-file`) from the completed
+run: per policy, the sorted strong finding-id hashes plus the policy's
+semantic hash at acceptance, under one batch-level reason and acceptance date.
+Entries are identity-only — no per-record prose — so the document holds up to
+100,000 entries in at most 16 MiB, two decimal orders beyond the suppression
+cap. Acceptance is written only by a clean run: an unreliable run refuses to
+define a baseline and exits 2 without writing, because an identity the run
+could not prove cannot be accepted. Weak-identity findings are never written
+(their identities are snapshot-local), and their excluded count is reported.
+Regeneration is always an explicit re-run; the baseline never refreshes
+itself.
+
+On every later run the document joins by `(policy_id, finding_id)` after
+suppressions and directory scope claim their findings; a finding already
+suppressed or scoped is not claimed by the baseline, and its entry is audited
+as `finding_claimed`. Claimed findings stay in the report with a `baseline`
+decision and stop counting toward `--fail-on`, in full and in `--diff-base`
+runs alike: gating counts findings that are new and unclaimed by suppression,
+scope, and baseline. The report gains one top-level `baseline` review with the
+document path, the batch metadata, exact per-state counts, and a bounded
+needs-attention entry list (anything other than applied-with-matching-hash;
+the counts stay exact when the list truncates). SARIF renders each baselined
+finding as an external accepted suppression entry whose property bag carries
+`bifrost.decision: "baseline"`, and concise human output hides baselined
+findings while the summary reports the counts.
+
+The audit rules mirror suppressions. A malformed or oversized document is a
+diagnostic and exit 2; a baseline never turns an unreliable run clean. Editing
+a policy marks its entries drifted without reactivating them — a drifted entry
+still applies, and the drift count in the review is the signal to re-review.
+An entry is stale only when an exhaustive completed run proves the finding
+absent; an incomplete run reports `policy_incomplete` instead of guessing. The
+`--diff-base` identity limitations apply unchanged: a rename or an edited
+source slice re-keys the finding, so the old entry goes stale and the re-keyed
+finding gates until it is re-accepted or fixed.
+
+For the onboarding recipe that commits the baseline once and keeps
+pull-request gates on `--diff-base`, see
+[CI Gating with GitHub Actions](/ci-github-actions/).
+
 ## Classification And CVSS v4.0
 
 A policy can declare one broad fallback taxonomy classification plus typed
@@ -922,11 +1034,13 @@ from that set. The CLI does not guess paths or scan ambient directories.
 `--fail-on` accepts `never`, `finding`, `note`, `warning` (the default), or
 `error`; `finding` includes unrated findings. It changes only the complete-run
 finding threshold. It cannot turn an invalid, incomplete, cancelled, or
-unsupported run into status 0. Today, running a taint policy emits a retained
-report with an `unsupported` completion and exits 2 until #824 completes the
-flow adapter. Typestate policies execute; cancellation, budgets, incomplete
-selector discovery, semantic uncertainty, and witness truncation remain visible
-in run/finding completeness instead of becoming clean zero-results.
+unsupported run into status 0. Taint and typestate policies execute through the
+production semantic engine; cancellation, budgets, incomplete selector
+discovery, semantic uncertainty, unmodeled call boundaries, and witness
+truncation remain visible in run/finding completeness instead of becoming clean
+zero-results. Source-backed taint works without external models. An embedding
+must explicitly supply and activate a semantic-model catalog when external
+procedure summaries are required.
 
 See [CLI](/cli/#static-analysis-policies) for option interactions and
 [Reproduce an Analysis](/reproduce-analysis/) for the artifacts to preserve.

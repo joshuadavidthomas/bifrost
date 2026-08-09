@@ -1,15 +1,20 @@
+use crate::analyzer::languages::language_support;
+use crate::analyzer::multi_analyzer::build_language_delegate;
 use crate::analyzer::semantic_model::{
-    DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackLimits,
-    DependencyPackPreparationOutcome, SemanticModelActivationPersistence,
+    DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackAdapter,
+    DependencyPackLimits, DependencyPackPreparationOutcome, SemanticModelActivationPersistence,
     SemanticModelActivationRequest, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-    acquire_active_semantic_models, prepare_dependency_semantic_packs,
+    acquire_active_semantic_models_with_evidence, prepare_dependency_semantic_packs,
 };
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpAnalyzer, CppAnalyzer, GoAnalyzer,
-    IAnalyzer, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, MultiAnalyzer,
-    PhpAnalyzer, Project, PythonAnalyzer, PythonDependencyPackAdapter, RubyAnalyzer, RustAnalyzer,
-    ScalaAnalyzer, TypescriptAnalyzer, resolve_python_semantic_pack_dependencies,
+    AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpDependencyPackAdapter,
+    GoDependencyPackAdapter, IAnalyzer, JsTsDependencyPackAdapter, JvmDependencyPackAdapter,
+    Language, MultiAnalyzer, Project, PythonDependencyPackAdapter, RubyDependencyPackAdapter,
+    RustDependencyPackAdapter, resolve_csharp_semantic_pack_dependencies,
+    resolve_go_semantic_pack_dependencies, resolve_js_ts_semantic_pack_dependencies,
+    resolve_jvm_semantic_pack_dependencies, resolve_python_semantic_pack_dependencies,
+    resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,30 +31,32 @@ impl EmptyAnalyzer {
     }
 }
 
-impl IAnalyzer for EmptyAnalyzer {
+use crate::analyzer::CodeUnitIndex;
+
+impl CodeUnitIndex for EmptyAnalyzer {
+    fn enclosing_code_unit(
+        &self,
+        _file: &crate::analyzer::ProjectFile,
+        _range: &crate::analyzer::Range,
+    ) -> Option<crate::analyzer::CodeUnit> {
+        None
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        _file: &crate::analyzer::ProjectFile,
+        _start_line: usize,
+        _end_line: usize,
+    ) -> Option<crate::analyzer::CodeUnit> {
+        None
+    }
+
     fn all_declarations(&self) -> Box<dyn Iterator<Item = crate::analyzer::CodeUnit> + '_> {
         Box::new(std::iter::empty())
     }
 
     fn languages(&self) -> std::collections::BTreeSet<Language> {
         std::collections::BTreeSet::new()
-    }
-
-    fn update(
-        &self,
-        _changed_files: &std::collections::BTreeSet<crate::analyzer::ProjectFile>,
-    ) -> Self
-    where
-        Self: Sized,
-    {
-        self.clone()
-    }
-
-    fn update_all(&self) -> Self
-    where
-        Self: Sized,
-    {
-        self.clone()
     }
 
     fn project(&self) -> &dyn Project {
@@ -76,50 +83,6 @@ impl IAnalyzer for EmptyAnalyzer {
         _code_unit: &crate::analyzer::CodeUnit,
     ) -> Vec<crate::analyzer::CodeUnit> {
         Vec::new()
-    }
-
-    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
-        None
-    }
-
-    fn import_statements(&self, _file: &crate::analyzer::ProjectFile) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn enclosing_code_unit(
-        &self,
-        _file: &crate::analyzer::ProjectFile,
-        _range: &crate::analyzer::Range,
-    ) -> Option<crate::analyzer::CodeUnit> {
-        None
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        _file: &crate::analyzer::ProjectFile,
-        _start_line: usize,
-        _end_line: usize,
-    ) -> Option<crate::analyzer::CodeUnit> {
-        None
-    }
-
-    fn is_access_expression(
-        &self,
-        _file: &crate::analyzer::ProjectFile,
-        _start_byte: usize,
-        _end_byte: usize,
-    ) -> bool {
-        false
-    }
-
-    fn find_nearest_declaration(
-        &self,
-        _file: &crate::analyzer::ProjectFile,
-        _start_byte: usize,
-        _end_byte: usize,
-        _ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        None
     }
 
     fn ranges(&self, _code_unit: &crate::analyzer::CodeUnit) -> Vec<crate::analyzer::Range> {
@@ -159,17 +122,63 @@ impl IAnalyzer for EmptyAnalyzer {
     }
 }
 
+impl IAnalyzer for EmptyAnalyzer {
+    fn update(
+        &self,
+        _changed_files: &std::collections::BTreeSet<crate::analyzer::ProjectFile>,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.clone()
+    }
+
+    fn update_all(&self) -> Self
+    where
+        Self: Sized,
+    {
+        self.clone()
+    }
+
+    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
+        None
+    }
+
+    fn import_statements(&self, _file: &crate::analyzer::ProjectFile) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn is_access_expression(
+        &self,
+        _file: &crate::analyzer::ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+    ) -> bool {
+        false
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        _file: &crate::analyzer::ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+        _ident: &str,
+    ) -> Option<crate::analyzer::DeclarationInfo> {
+        None
+    }
+}
+
 #[derive(Clone)]
 pub enum WorkspaceAnalyzer {
     Empty(EmptyAnalyzer),
     Multi(Box<MultiAnalyzer>),
 }
 
-/// Caller-owned state needed to activate explicitly configured Python API packs.
+/// Caller-owned state needed to activate explicitly configured dependency packs.
 /// Constructing a workspace never opens a semantic-pack catalog or discovers an
-/// interpreter; hosts must opt in by supplying this context.
+/// ecosystem; hosts must opt in by supplying this context.
 #[derive(Clone, Copy)]
-pub struct PythonSemanticModelWorkspaceContext<'a> {
+pub struct DependencyPackWorkspaceContext<'a> {
     pub catalog: &'a SemanticPackCatalog,
     pub persistence: Option<SemanticModelActivationPersistence<'a>>,
     pub activation: &'a SemanticModelActivationRequest,
@@ -177,11 +186,151 @@ pub struct PythonSemanticModelWorkspaceContext<'a> {
     pub cancellation: &'a crate::CancellationToken,
 }
 
+pub type PythonSemanticModelWorkspaceContext<'a> = DependencyPackWorkspaceContext<'a>;
+
 #[derive(Debug)]
 pub struct PythonSemanticModelActivationOutcome {
     pub discovery: DependencyDiscoveryOutcome,
     pub preparation: Option<DependencyPackPreparationOutcome>,
     pub runtime: Option<SemanticModelRuntimeOutcome>,
+}
+
+/// One dependency ecosystem whose exact local evidence a host can activate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DependencyPackEcosystem {
+    Jvm,
+    DotNet,
+    Npm,
+    Python,
+    Go,
+    Cargo,
+    Ruby,
+    Composer,
+}
+
+impl DependencyPackEcosystem {
+    /// Every ecosystem a host can activate. Hosts iterate this to select the
+    /// ecosystems their workspace needs.
+    pub const ALL: [Self; 8] = [
+        Self::Jvm,
+        Self::DotNet,
+        Self::Npm,
+        Self::Python,
+        Self::Go,
+        Self::Cargo,
+        Self::Ruby,
+        Self::Composer,
+    ];
+
+    pub fn languages(self) -> &'static [Language] {
+        match self {
+            Self::Jvm => &[Language::Java, Language::Kotlin, Language::Scala],
+            Self::DotNet => &[Language::CSharp],
+            Self::Npm => &[Language::JavaScript, Language::TypeScript],
+            Self::Python => &[Language::Python],
+            Self::Go => &[Language::Go],
+            Self::Cargo => &[Language::Rust],
+            Self::Ruby => &[Language::Ruby],
+            Self::Composer => &[Language::Php],
+        }
+    }
+
+    /// Stable lowercase label used by workspace configuration documents
+    /// (`.bifrost/packs.json`) and activation reporting.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Jvm => "jvm",
+            Self::DotNet => "dotnet",
+            Self::Npm => "npm",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::Cargo => "cargo",
+            Self::Ruby => "ruby",
+            Self::Composer => "composer",
+        }
+    }
+
+    /// Parse one configuration-document label back into its ecosystem.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|ecosystem| ecosystem.label() == label)
+    }
+
+    /// Base names of the files whose change can invalidate this ecosystem's
+    /// published pack proof (#1628).
+    ///
+    /// A host watches these names, calls
+    /// [`WorkspaceAnalyzer::invalidate_dependency_pack_state`] for the matching
+    /// ecosystems, and re-activates. The list covers both the files a resolver
+    /// reads directly and the conventional manifests a host names as evidence
+    /// for the evidence-driven ecosystems (Cargo, Ruby, Composer, Python),
+    /// whose exact paths are configuration rather than convention. Naming a
+    /// file that a given configuration does not read costs one redundant
+    /// activation; missing one would leave stale proof in place, so this table
+    /// errs toward invalidating.
+    ///
+    /// Reading these files is the whole of discovery: no resolver runs a
+    /// package manager and none opens a network connection.
+    pub fn dependency_inputs(self) -> &'static [&'static str] {
+        match self {
+            // `is_jvm_dependency_input` is the reader-side predicate for the
+            // same inputs; these are its base names.
+            Self::Jvm => &[
+                "pom.xml",
+                "settings.xml",
+                "build.gradle",
+                "build.gradle.kts",
+                "settings.gradle",
+                "settings.gradle.kts",
+                "gradle.properties",
+                "gradle.lockfile",
+                "libs.versions.toml",
+                "gradle-wrapper.properties",
+            ],
+            Self::DotNet => &["project.assets.json"],
+            Self::Npm => &["package.json", "package-lock.json", "npm-shrinkwrap.json"],
+            // Python discovery reads distribution metadata under the roots the
+            // host configures; there is no project-level manifest it consults.
+            Self::Python => &["METADATA", "RECORD", "top_level.txt"],
+            Self::Go => &["go.mod", "go.sum", "go.work", "go.work.sum", "modules.txt"],
+            Self::Cargo => &["Cargo.toml", "Cargo.lock"],
+            Self::Ruby => &["Gemfile", "Gemfile.lock", "gems.locked"],
+            Self::Composer => &["composer.json", "composer.lock", "installed.json"],
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct DependencyPackEcosystemOutcome {
+    pub ecosystem: DependencyPackEcosystem,
+    pub discovery: DependencyDiscoveryOutcome,
+    pub preparation: Option<DependencyPackPreparationOutcome>,
+}
+
+/// Result of one host-owned activation transaction.
+#[derive(Debug)]
+pub struct DependencyPackActivationOutcome {
+    pub ecosystems: Vec<DependencyPackEcosystemOutcome>,
+    pub runtime: Option<SemanticModelRuntimeOutcome>,
+    /// Hosts must refresh published diagnostics when this value is true.
+    pub diagnostic_refresh_required: bool,
+}
+
+impl DependencyPackActivationOutcome {
+    pub fn complete(&self) -> bool {
+        self.ecosystems.iter().all(|outcome| {
+            outcome.discovery.complete
+                && outcome
+                    .preparation
+                    .as_ref()
+                    .is_some_and(|preparation| preparation.complete)
+        }) && self
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| matches!(runtime, SemanticModelRuntimeOutcome::Ready { .. }))
+    }
 }
 
 impl PythonSemanticModelActivationOutcome {
@@ -196,57 +345,213 @@ impl PythonSemanticModelActivationOutcome {
 }
 
 impl WorkspaceAnalyzer {
+    /// Discover, prepare, and publish exact local dependency packs as one
+    /// analyzer-generation transaction. Diagnostic requests only read the
+    /// published result and never call this host-owned method.
+    pub fn activate_dependency_packs(
+        &self,
+        config: &AnalyzerConfig,
+        ecosystems: &[DependencyPackEcosystem],
+        context: DependencyPackWorkspaceContext<'_>,
+    ) -> DependencyPackActivationOutcome {
+        let mut outcomes = Vec::with_capacity(ecosystems.len());
+        let mut activation = context.activation.clone();
+        let mut publication_evidence = Vec::with_capacity(ecosystems.len());
+
+        for ecosystem in ecosystems.iter().copied() {
+            let mut limits = context.limits;
+            if ecosystem == DependencyPackEcosystem::Python
+                && let Some(environment) = &config.python.environment
+            {
+                limits.max_artifacts_per_dependency = limits
+                    .max_artifacts_per_dependency
+                    .max(environment.limits.max_files_per_distribution);
+            }
+            // Composer emits one artifact per autoload rule so a PSR-4 prefix
+            // stays bound to the files it admits. Discovery caps the rule count
+            // itself, so the artifact budget only has to admit that cap.
+            if ecosystem == DependencyPackEcosystem::Composer {
+                limits.max_artifacts_per_dependency = limits
+                    .max_artifacts_per_dependency
+                    .max(crate::analyzer::php::PHP_MAX_AUTOLOAD_RULES_PER_PACKAGE);
+            }
+            let (discovery, adapter): (DependencyDiscoveryOutcome, &dyn DependencyPackAdapter) =
+                match ecosystem {
+                    DependencyPackEcosystem::Jvm => (
+                        resolve_jvm_semantic_pack_dependencies(
+                            &config.jvm,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &JvmDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::DotNet => (
+                        resolve_csharp_semantic_pack_dependencies(
+                            &config.csharp,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &CSharpDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Npm => (
+                        resolve_js_ts_semantic_pack_dependencies(
+                            &config.js_ts.dependency_discovery,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &JsTsDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Python => (
+                        resolve_python_semantic_pack_dependencies(
+                            &config.python,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &PythonDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Go => (
+                        resolve_go_semantic_pack_dependencies(
+                            &config.go,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &GoDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Cargo => (
+                        resolve_rust_semantic_pack_dependencies(
+                            &config.rust,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &RustDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Ruby => (
+                        resolve_ruby_semantic_pack_dependencies(
+                            &config.ruby,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &RubyDependencyPackAdapter,
+                    ),
+                    DependencyPackEcosystem::Composer => (
+                        crate::analyzer::php::resolve_php_semantic_pack_dependencies(
+                            &config.php,
+                            self.analyzer().project(),
+                            &limits,
+                            Some(context.cancellation),
+                        ),
+                        &crate::analyzer::php::PhpDependencyPackAdapter,
+                    ),
+                };
+            if discovery.cancelled || !discovery.complete {
+                outcomes.push(DependencyPackEcosystemOutcome {
+                    ecosystem,
+                    discovery,
+                    preparation: None,
+                });
+                return DependencyPackActivationOutcome {
+                    ecosystems: outcomes,
+                    runtime: None,
+                    diagnostic_refresh_required: false,
+                };
+            }
+            let preparation = prepare_dependency_semantic_packs(
+                context.catalog,
+                adapter,
+                &discovery.dependencies,
+                &limits,
+                Some(context.cancellation),
+            );
+            if !preparation.complete {
+                outcomes.push(DependencyPackEcosystemOutcome {
+                    ecosystem,
+                    discovery,
+                    preparation: Some(preparation),
+                });
+                return DependencyPackActivationOutcome {
+                    ecosystems: outcomes,
+                    runtime: None,
+                    diagnostic_refresh_required: false,
+                };
+            }
+            activation
+                .evidence
+                .extend(preparation.evidence.iter().cloned());
+            publication_evidence.push((
+                ecosystem.languages().to_vec().into_boxed_slice(),
+                DependencyDiscoveryEvidence::from_outcome(&discovery),
+            ));
+            outcomes.push(DependencyPackEcosystemOutcome {
+                ecosystem,
+                discovery,
+                preparation: Some(preparation),
+            });
+        }
+
+        activation.evidence.sort();
+        activation.evidence.dedup();
+        let runtime = acquire_active_semantic_models_with_evidence(
+            self.analyzer(),
+            context.catalog,
+            context.persistence,
+            &activation,
+            Some(&publication_evidence),
+            context.cancellation,
+        );
+        let diagnostic_refresh_required =
+            matches!(runtime, SemanticModelRuntimeOutcome::Ready { .. });
+        DependencyPackActivationOutcome {
+            ecosystems: outcomes,
+            runtime: Some(runtime),
+            diagnostic_refresh_required,
+        }
+    }
+
+    /// Invalidate published proof after a host observes changed dependency inputs.
+    pub fn invalidate_dependency_pack_state(&self, ecosystems: &[DependencyPackEcosystem]) -> bool {
+        let languages = ecosystems
+            .iter()
+            .flat_map(|ecosystem| ecosystem.languages().iter().copied())
+            .collect::<Vec<_>>();
+        self.analyzer()
+            .snapshot_caches()
+            .is_some_and(|caches| caches.invalidate_dependency_pack_state(&languages))
+    }
+
     /// Discover, prepare, and publish Python environment facts into this
     /// workspace's existing snapshot. A disabled environment is a successful
     /// no-op; cancellation and unavailable preparation deliberately leave any
     /// previously published overlay unchanged.
+    ///
+    /// Deliberately Python-specific public workspace API, not a language
+    /// capability: hosts call it by name to activate a Python interpreter's
+    /// packs, and there is no other language it would dispatch over. It, along
+    /// with `PythonDependencyPackAdapter` and
+    /// `resolve_python_semantic_pack_dependencies`, is a named allowlist entry
+    /// for the language-reach-in gate rather than a `LanguageSupport` method.
     pub fn activate_python_environment_packs(
         &self,
         config: &AnalyzerConfig,
         context: PythonSemanticModelWorkspaceContext<'_>,
     ) -> PythonSemanticModelActivationOutcome {
-        let mut limits = context.limits;
-        if let Some(environment) = &config.python.environment {
-            limits.max_artifacts_per_dependency = limits
-                .max_artifacts_per_dependency
-                .max(environment.limits.max_files_per_distribution);
-        }
-        let discovery = resolve_python_semantic_pack_dependencies(
-            &config.python,
-            self.analyzer().project(),
-            &limits,
-            Some(context.cancellation),
-        );
-        self.retain_dependency_discovery_evidence(&[Language::Python], &discovery);
-        if discovery.cancelled || discovery.dependencies.is_empty() {
-            return PythonSemanticModelActivationOutcome {
-                discovery,
-                preparation: None,
-                runtime: None,
-            };
-        }
-        let preparation = prepare_dependency_semantic_packs(
-            context.catalog,
-            &PythonDependencyPackAdapter,
-            &discovery.dependencies,
-            &limits,
-            Some(context.cancellation),
-        );
-        let runtime = preparation
-            .compose_activation_request(context.activation.clone())
-            .map(|activation| {
-                acquire_active_semantic_models(
-                    self.analyzer(),
-                    context.catalog,
-                    context.persistence,
-                    &activation,
-                    context.cancellation,
-                )
-            });
+        let outcome =
+            self.activate_dependency_packs(config, &[DependencyPackEcosystem::Python], context);
+        let mut ecosystems = outcome.ecosystems.into_iter();
+        let ecosystem = ecosystems
+            .next()
+            .expect("Python activation always records its ecosystem outcome");
+        debug_assert!(ecosystems.next().is_none());
         PythonSemanticModelActivationOutcome {
-            discovery,
-            preparation: Some(preparation),
-            runtime,
+            discovery: ecosystem.discovery,
+            preparation: ecosystem.preparation,
+            runtime: outcome.runtime,
         }
     }
 
@@ -259,7 +564,8 @@ impl WorkspaceAnalyzer {
     ///
     /// A cancelled discovery retains nothing: its outcome is a statement about
     /// the cancellation, not about the build.
-    pub fn retain_dependency_discovery_evidence(
+    #[cfg(test)]
+    pub(crate) fn retain_dependency_discovery_evidence(
         &self,
         languages: &[Language],
         discovery: &DependencyDiscoveryOutcome,
@@ -394,7 +700,7 @@ impl WorkspaceAnalyzer {
                         let handle = std::thread::Builder::new()
                             .name(format!("bifrost-build-{language:?}"))
                             .spawn_scoped(scope, move || {
-                                Self::build_language_delegate(
+                                build_language_delegate(
                                     language,
                                     project,
                                     cfg,
@@ -431,47 +737,6 @@ impl WorkspaceAnalyzer {
         })
     }
 
-    fn build_language_delegate(
-        language: Language,
-        project: Arc<dyn Project>,
-        config: AnalyzerConfig,
-        mut store_context: crate::analyzer::AnalyzerStoreContext,
-        progress: Option<BuildProgress>,
-        revalidate_filesystem_paths: bool,
-    ) -> Result<AnalyzerDelegate, StoreError> {
-        let _scope = profiling::scope(format!("WorkspaceAnalyzer::build[{language:?}]"));
-        store_context.live_paths = Arc::new(if revalidate_filesystem_paths {
-            crate::analyzer::store::liveness::LivePathMap::default()
-        } else {
-            crate::analyzer::store::liveness::LivePathMap::trust_filesystem_generation()
-        });
-        macro_rules! build_delegate {
-            ($variant:ident, $analyzer:ty) => {
-                AnalyzerDelegate::$variant(<$analyzer>::new_with_config_store_context(
-                    project,
-                    config,
-                    store_context,
-                    progress,
-                )?)
-            };
-        }
-        Ok(match language {
-            Language::Java => build_delegate!(Java, JavaAnalyzer),
-            Language::Go => build_delegate!(Go, GoAnalyzer),
-            Language::Cpp => build_delegate!(Cpp, CppAnalyzer),
-            Language::JavaScript => build_delegate!(JavaScript, JavascriptAnalyzer),
-            Language::TypeScript => build_delegate!(TypeScript, TypescriptAnalyzer),
-            Language::Python => build_delegate!(Python, PythonAnalyzer),
-            Language::Rust => build_delegate!(Rust, RustAnalyzer),
-            Language::Php => build_delegate!(Php, PhpAnalyzer),
-            Language::Scala => build_delegate!(Scala, ScalaAnalyzer),
-            Language::CSharp => build_delegate!(CSharp, CSharpAnalyzer),
-            Language::Ruby => build_delegate!(Ruby, RubyAnalyzer),
-            Language::Kotlin => build_delegate!(Kotlin, KotlinAnalyzer),
-            Language::None => unreachable!("Language::None is filtered before delegate build"),
-        })
-    }
-
     pub fn analyzer(&self) -> &dyn IAnalyzer {
         match self {
             Self::Empty(analyzer) => analyzer,
@@ -479,46 +744,15 @@ impl WorkspaceAnalyzer {
         }
     }
 
-    /// Bring the persisted per-file Rust usage facts up to date ahead of the
-    /// first query that reads them.
-    ///
-    /// This replaced a workspace-wide index build (issues #1416, #1757, #1758):
-    /// under ExecPlan Milestone 3 there is nothing to build, and the warm's
-    /// only job is to find the live blobs analysis did not persist rows for and
-    /// repair them off the request path. A no-op for workspaces without Rust.
-    pub fn warm_rust_usage_facts(&self) {
-        if let Some(rust) =
-            crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
-        {
-            // The catch-up issues per-file store queries that are only cheap
-            // under request-scoped memoization; without a scope each lookup
-            // re-hydrates (observed ~65s instead of ~3.5s on the Bifrost
-            // workspace).
-            let _scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer());
-            rust.warm_usage_facts();
+    /// Pre-build whatever lazily constructed usage indexes each language wants
+    /// warmed ahead of demand. Languages that need none inherit the trait's
+    /// no-op, so this stays a no-op for the workspaces they make up.
+    pub fn warm_usage_analysis(&self) {
+        for language in Language::ANALYZABLE {
+            language_support(language)
+                .expect("analyzable languages are registered")
+                .warm_usage_analysis(self.analyzer());
         }
-    }
-
-    /// Whether a Rust usage query would wait for a fact catch-up batch.
-    ///
-    /// Re-pointed by ExecPlan Milestone 3 from "is the v1 usage index built"
-    /// to "is the catch-up set empty": under v2 nothing is built, and the only
-    /// wait a query can inherit is an above-threshold batch of live blobs whose
-    /// facts are being persisted in the background. Answers without blocking
-    /// behind that batch, which is the point (#1757). Always true for a
-    /// workspace with no Rust.
-    pub fn rust_usage_facts_ready(&self) -> bool {
-        crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
-            .is_none_or(|rust| rust.rust_usage_facts_ready())
-    }
-
-    /// Whether the Rust fact catch-up has run for this generation. The
-    /// warm-ness question, as distinct from the wait question
-    /// [`Self::rust_usage_facts_ready`] answers: a session that never warms and
-    /// never queries is ready but not warm.
-    pub fn rust_usage_facts_warm(&self) -> bool {
-        crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
-            .is_none_or(|rust| rust.rust_usage_facts_warm())
     }
 
     /// Select the execution-semantics provider for the requested file without
@@ -727,37 +961,6 @@ mod tests {
         assert!(!multi.query_indexes_warm());
         multi.warm_query_indexes();
         assert!(multi.query_indexes_warm());
-    }
-
-    /// The two Rust usage predicates a caller can ask a workspace, and the
-    /// distinction ExecPlan Milestone 3 introduced between them: readiness is
-    /// "would a query wait", which a healthy workspace answers `true` even
-    /// before any warm because v2 has nothing to build, and warmth is "has the
-    /// catch-up run for this generation", which only the warm makes true.
-    /// Neither may be `false` for a workspace with no Rust.
-    #[test]
-    fn rust_usage_readiness_and_warmth_are_distinct_and_vacuous_without_rust() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        ProjectFile::new(root.clone(), "src/lib.rs")
-            .write("pub mod worker;\npub fn root() {}\n")
-            .unwrap();
-        ProjectFile::new(root.clone(), "src/worker.rs")
-            .write("use crate::root;\npub fn run() { root(); }\n")
-            .unwrap();
-
-        let rust: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let rust = WorkspaceAnalyzer::build(rust, AnalyzerConfig::default());
-        assert!(rust.rust_usage_facts_ready());
-        assert!(!rust.rust_usage_facts_warm());
-        rust.warm_rust_usage_facts();
-        assert!(rust.rust_usage_facts_ready());
-        assert!(rust.rust_usage_facts_warm());
-
-        let java: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
-        let java = WorkspaceAnalyzer::build(java, AnalyzerConfig::default());
-        assert!(java.rust_usage_facts_ready());
-        assert!(java.rust_usage_facts_warm());
     }
 
     #[test]

@@ -154,7 +154,15 @@ fn ensure_inline_local_policy(
             local_endpoint_ids
         }
         PolicyAnalysis::Assertion { spec } => {
-            ensure_inline_selector(&spec.subject)?;
+            if let Some(plan) = &spec.relational {
+                for binding in &plan.bindings {
+                    if let RowBindingSource::Query(selector) = &binding.source {
+                        ensure_inline_selector(selector)?;
+                    }
+                }
+            } else {
+                ensure_inline_selector(&spec.subject)?;
+            }
             HashSet::new()
         }
     };
@@ -223,8 +231,17 @@ fn policy_selector_paths(definition: &PolicyDefinition) -> HashSet<String> {
                     }),
             );
         }
-        PolicyAnalysis::Assertion { .. } => {
-            paths.insert(ASSERTION_SUBJECT_SELECTOR_PATH.to_string());
+        PolicyAnalysis::Assertion { spec } => {
+            if let Some(plan) = &spec.relational {
+                paths.extend(
+                    plan.bindings
+                        .iter()
+                        .filter(|binding| matches!(binding.source, RowBindingSource::Query(_)))
+                        .map(|binding| relational_binding_selector_path(&binding.name)),
+                );
+            } else {
+                paths.insert(ASSERTION_SUBJECT_SELECTOR_PATH.to_string());
+            }
         }
     }
     paths
@@ -694,18 +711,113 @@ fn policy_analysis_to_json(analysis: &PolicyAnalysis) -> Value {
         }
         PolicyAnalysis::Assertion { spec } => {
             let mut object = tagged("assertion");
-            insert(&mut object, "subject", selector_to_json(&spec.subject));
-            insert(
-                &mut object,
-                "asserts",
-                // Assert order is authored order, not a set: reordering the
-                // list is a different document even though the invariants are
-                // independent, and the semantic hash must say so.
-                Value::Array(spec.asserts.iter().map(policy_assert_to_json).collect()),
-            );
+            if let Some(plan) = &spec.relational {
+                insert(&mut object, "plan", relational_assertion_plan_to_json(plan));
+            } else {
+                insert(&mut object, "subject", selector_to_json(&spec.subject));
+                insert(
+                    &mut object,
+                    "asserts",
+                    // Assert order is authored order, not a set: reordering the
+                    // list is a different document even though the invariants are
+                    // independent, and the semantic hash must say so.
+                    Value::Array(spec.asserts.iter().map(policy_assert_to_json).collect()),
+                );
+            }
             Value::Object(object)
         }
     }
+}
+
+fn relational_assertion_plan_to_json(plan: &RelationalAssertionPlan) -> Value {
+    json!({
+        "bindings": plan.bindings.iter().map(row_binding_to_json).collect::<Vec<_>>(),
+        "joins": plan.joins.iter().map(row_join_to_json).collect::<Vec<_>>(),
+        "groups": plan.groups.iter().map(row_group_to_json).collect::<Vec<_>>(),
+        "assertions": plan.assertions.iter().map(row_assertion_to_json).collect::<Vec<_>>(),
+        "limits": {
+            "max_source_rows": plan.limits.max_source_rows,
+            "max_expanded_rows": plan.limits.max_expanded_rows,
+            "max_join_comparisons": plan.limits.max_join_comparisons,
+            "max_joined_rows": plan.limits.max_joined_rows,
+            "max_groups": plan.limits.max_groups,
+            "max_values_per_group": plan.limits.max_values_per_group,
+        },
+    })
+}
+
+fn row_binding_to_json(binding: &RowBinding) -> Value {
+    match &binding.source {
+        RowBindingSource::Query(selector) => json!({
+            "name": binding.name.as_str(),
+            "query": selector_to_json(selector),
+        }),
+        RowBindingSource::Expansion { from, step } => json!({
+            "name": binding.name.as_str(),
+            "from": from.as_str(),
+            "step": step.label(),
+        }),
+    }
+}
+
+fn row_join_to_json(join: &RowJoin) -> Value {
+    json!({
+        "left": join.left.as_str(),
+        "right": join.right.as_str(),
+        "kind": join.kind.label(),
+        "on": join.on.iter().map(|condition| {
+            json!([condition.left_field, condition.right_field])
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn row_group_to_json(group: &RowGroup) -> Value {
+    json!({
+        "name": group.name.as_str(),
+        "by": group.by.iter().map(row_field_ref_to_json).collect::<Vec<_>>(),
+        "aggregates": group.aggregates.iter().map(row_aggregate_to_json).collect::<Vec<_>>(),
+    })
+}
+
+fn row_aggregate_to_json(aggregate: &RowAggregate) -> Value {
+    json!({
+        "name": aggregate.name.as_str(),
+        "op": aggregate.op.label(),
+        "value": aggregate.value.as_ref().map(row_field_ref_to_json),
+        "where": aggregate.predicate.iter().map(row_predicate_to_json).collect::<Vec<_>>(),
+    })
+}
+
+fn row_predicate_to_json(predicate: &RowPredicate) -> Value {
+    let value = match &predicate.value {
+        RowLiteral::String(value) | RowLiteral::ConstrainedEnum(value) => json!(value),
+        RowLiteral::Integer(value) => json!(value),
+        RowLiteral::Boolean(value) => json!(value),
+    };
+    json!({
+        "field": row_field_ref_to_json(&predicate.field),
+        "op": "eq",
+        "value": value,
+    })
+}
+
+fn row_assertion_to_json(assertion: &RowAssertion) -> Value {
+    json!({
+        "id": assertion.id.as_str(),
+        "group": assertion.group.as_str(),
+        "aggregate": assertion.aggregate.as_str(),
+        "cardinality": {
+            "kind": assertion.cardinality.label(),
+            "count": assertion.cardinality.count(),
+        },
+    })
+}
+
+fn row_field_ref_to_json(field: &RowFieldRef) -> Value {
+    json!({
+        "binding": field.binding.as_str(),
+        "field": field.field,
+    })
 }
 
 /// The canonical projection of one assert record.
@@ -2147,9 +2259,9 @@ mod tests {
 
     fn inline_selector() -> PolicySelector {
         PolicySelector::Inline {
-            schema: schema(2),
+            schema: schema(1),
             query: CodeQuery::from_json(&json!({
-                "schema_version": 2,
+                "schema_version": 1,
                 "match": {
                     "kind": "call",
                     "callee": { "name": "eval" },
@@ -2210,9 +2322,9 @@ mod tests {
                     "type": "match",
                     "selector": {
                         "type": "inline",
-                        "schema_version": 2,
+                        "schema_version": 1,
                         "query": {
-                            "schema_version": 2,
+                            "schema_version": 1,
                             "match": { "kind": "call", "callee": { "name": "eval" } },
                         },
                     },
@@ -2234,7 +2346,7 @@ mod tests {
         let semantic = document.to_inline_local_canonical_semantic_json().unwrap();
         assert_eq!(
             semantic.pointer("/analysis/selector/schema_version"),
-            Some(&json!(2))
+            Some(&json!(1))
         );
         assert!(semantic.pointer("/analysis/selector/type").is_none());
     }
@@ -2255,7 +2367,7 @@ mod tests {
                     PolicyCategoryId::new("io.user").unwrap(),
                 ],
                 selector: PolicySelector::File {
-                    authored_schema_version: Some(2),
+                    authored_schema_version: Some(1),
                     path: WorkspaceRelativePath::new("queries/request.rql").unwrap(),
                 },
                 binding: PolicyEndpointBinding::ArgumentIndex { index: 0 },
@@ -2283,7 +2395,7 @@ mod tests {
                 "categories": ["io.user"],
                 "selector": {
                     "type": "file",
-                    "authored_schema_version": 2,
+                    "authored_schema_version": 1,
                     "path": "queries/request.rql",
                 },
                 "binding": { "type": "argument_index", "index": 0 },

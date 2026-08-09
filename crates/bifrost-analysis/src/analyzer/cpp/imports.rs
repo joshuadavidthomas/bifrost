@@ -1,26 +1,55 @@
+//! The `CppAnalyzer` half of C++ include analysis.
+//!
+//! `#include` parsing, the workspace-wide [`IncludeTargetIndex`] and every
+//! target-resolution rule moved to [`brokk_bifrost_cpp::imports`]; what stays
+//! here is the two provider impls the analyzer satisfies and the memo cells
+//! (`OnceLock`, `PoolSafeMemo`) whose contents those functions produce.
+//!
+//! Every resolution point here reads `#include <...>` and `#include "..."` the
+//! same way, through [`parse_include_path`] / [`include_paths`]. The
+//! quoted-only spellings this module used to carry made a project that reaches
+//! its own headers with angle brackets invisible to the inverse while the
+//! forward resolved it (#1829).
+//!
+//! The two include-to-file rules differ by what the caller does with the
+//! answer, not by include spelling. A *visibility* claim
+//! (`imported_code_units_of`, `imported_files_from_infos`) uses
+//! [`resolve_include_targets_with_index`], the same direct-then-unique-suffix
+//! rule the forward resolver's include closure uses; its unique-suffix step is
+//! what makes admitting `<...>` safe without a compiler include path, because
+//! it refuses an ambiguous basename rather than picking one. *Candidate
+//! discovery* (`referencing_files_of`, via `include_targets_for_file`) uses
+//! `IncludeTargetIndex::resolve_indexed`, which deliberately over-approximates:
+//! a file that only might reach the target still has to be scanned, and the
+//! usage strategy proves or rejects each hit from the syntax tree.
+
 use super::*;
-use std::path::{Path, PathBuf};
+use brokk_bifrost_cpp::imports::{
+    include_paths, parse_include_path, resolve_include_targets_with_index,
+};
+use std::path::Path;
 use std::sync::Arc;
 
 impl TestDetectionProvider for CppAnalyzer {}
 
 impl ImportAnalysisProvider for CppAnalyzer {
-    fn imported_code_units_of(&self, file: &ProjectFile) -> HashSet<CodeUnit> {
+    fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         if let Some(cached) = self.imported_code_units.get(file) {
-            return (*cached).clone();
+            return cached;
         }
 
         let mut resolved = HashSet::default();
         let include_targets = self.include_target_index();
-        let imports = self.inner.import_statements(file);
-        for path in quoted_include_paths(&imports) {
-            for target in resolve_direct_include_targets_with_index(file, &path, include_targets) {
+        let imports = self.import_statements_from_projection(file);
+        for path in include_paths(&imports) {
+            for target in resolve_include_targets_with_index(file, &path, include_targets) {
                 resolved.extend(self.inner.top_level_declarations(&target));
             }
         }
 
+        let resolved = Arc::new(resolved);
         self.imported_code_units
-            .insert(file.clone(), Arc::new(resolved.clone()));
+            .insert(file.clone(), Arc::clone(&resolved));
         resolved
     }
 
@@ -53,23 +82,21 @@ impl ImportAnalysisProvider for CppAnalyzer {
         Some(
             imports
                 .iter()
-                .filter_map(|import| parse_quoted_include(&import.raw_snippet))
-                .flat_map(|path| {
-                    resolve_direct_include_targets_with_index(file, &path, include_targets)
-                })
+                .filter_map(|import| parse_include_path(&import.raw_snippet))
+                .flat_map(|path| resolve_include_targets_with_index(file, &path, include_targets))
                 .collect(),
         )
     }
 
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let source = code_unit.source();
-        let identifiers = self
-            .extract_type_identifiers(&self.inner.get_source(code_unit, true).unwrap_or_default());
-        self.inner
-            .import_statements(source)
+        let identifiers = brokk_bifrost_cpp::imports::extract_type_identifiers(
+            &self.inner.get_source(code_unit, true).unwrap_or_default(),
+        );
+        self.import_statements_from_projection(source)
             .iter()
             .filter(|line| {
-                parse_quoted_include(line).is_some_and(|path| {
+                parse_include_path(line).is_some_and(|path| {
                     let stem = Path::new(&path)
                         .file_stem()
                         .and_then(|value| value.to_str())
@@ -92,7 +119,7 @@ impl ImportAnalysisProvider for CppAnalyzer {
             .file_name()
             .and_then(|value| value.to_str());
         imports.iter().any(|import| {
-            parse_quoted_include(&import.raw_snippet).is_some_and(|include| {
+            parse_include_path(&import.raw_snippet).is_some_and(|include| {
                 target.rel_path() == Path::new(&include)
                     || target_name.is_some_and(|name| include.ends_with(name))
                     || source_file.parent().join(&include) == target.rel_path()
@@ -104,14 +131,35 @@ impl ImportAnalysisProvider for CppAnalyzer {
 impl CppAnalyzer {
     /// The path -> file map every include resolution reads.
     ///
-    /// Sourced from the workspace listing, not from the analyzed set: the index
-    /// only ever answers `by_rel_path`/`by_file_name` lookups, so it needs file
-    /// identity and never a parse product. An include target exists the moment
-    /// the file exists (#1758).
+    /// Two sources, and each is there for a reason the other does not cover.
+    ///
+    /// The workspace listing, filtered to C++'s own extensions, is the bulk of
+    /// it: the index only ever answers `by_rel_path`/`by_file_name` lookups, so
+    /// it needs file identity and never a parse product, and an include target
+    /// with a C++ extension exists the moment the file exists (#1758). Reading
+    /// the analyzed set alone made a header resolvable only after something had
+    /// parsed it.
+    ///
+    /// The analyzed set supplies the rest: include-driven inference (#1837)
+    /// adopts a file whose extension no language claims -- a `.inc` fragment,
+    /// say -- into this analyzer, and adoption is recorded in the live path map
+    /// rather than being derivable from the name. Widening the listing filter
+    /// to every unclaimed extension instead would be wrong, not merely broad:
+    /// an unadopted extensionless `vendor/vector` would then satisfy
+    /// `#include <vector>` on basename alone, which
+    /// `cpp_extensionless_angle_include_with_unrelated_basename_reports_boundary`
+    /// pins as a boundary.
     pub(crate) fn include_target_index(&self) -> &IncludeTargetIndex {
         self.include_target_index.get_or_init(|| {
             let _scope = crate::profiling::scope("cpp.include_target_index.build");
-            let files = self.inner.workspace_language_files();
+            let mut files = self.inner.workspace_language_files();
+            let listed: HashSet<ProjectFile> = files.iter().cloned().collect();
+            files.extend(
+                self.inner
+                    .all_files()
+                    .into_iter()
+                    .filter(|file| !listed.contains(file)),
+            );
             IncludeTargetIndex::build(files.iter())
         })
     }
@@ -128,8 +176,8 @@ impl CppAnalyzer {
         let include_targets = self.include_target_index();
         let mut matched_targets = HashSet::default();
         let mut resolved_targets = Vec::new();
-        let imports = self.inner.import_statements(candidate);
-        for include in quoted_include_paths(&imports) {
+        let imports = self.import_statements_from_projection(candidate);
+        for include in include_paths(&imports) {
             for target in include_targets.resolve_indexed(&include) {
                 if matched_targets.insert(target.clone()) {
                     resolved_targets.push(target);
@@ -137,296 +185,5 @@ impl CppAnalyzer {
             }
         }
         resolved_targets
-    }
-}
-
-pub(crate) struct IncludeTargetIndex {
-    by_rel_path: HashMap<PathBuf, Vec<ProjectFile>>,
-    by_file_name: HashMap<String, Vec<ProjectFile>>,
-}
-
-impl IncludeTargetIndex {
-    pub(crate) fn build<'a>(files: impl IntoIterator<Item = &'a ProjectFile>) -> Self {
-        let mut by_rel_path: HashMap<PathBuf, Vec<ProjectFile>> = HashMap::default();
-        let mut by_file_name: HashMap<String, Vec<ProjectFile>> = HashMap::default();
-        for file in files {
-            by_rel_path
-                .entry(file.rel_path().to_path_buf())
-                .or_default()
-                .push(file.clone());
-            if let Some(file_name) = file.rel_path().file_name().and_then(|value| value.to_str()) {
-                by_file_name
-                    .entry(file_name.to_string())
-                    .or_default()
-                    .push(file.clone());
-            }
-        }
-        Self {
-            by_rel_path,
-            by_file_name,
-        }
-    }
-
-    fn resolve_indexed(&self, include: &str) -> Vec<ProjectFile> {
-        let include_path = Path::new(include);
-        let mut matched = HashSet::default();
-        let mut resolved = Vec::new();
-        if let Some(targets) = self.by_rel_path.get(include_path) {
-            for target in targets {
-                if matched.insert(target.clone()) {
-                    resolved.push(target.clone());
-                }
-            }
-        }
-        for suffix in string_suffixes(include) {
-            if let Some(targets) = self.by_file_name.get(suffix) {
-                for target in targets {
-                    if matched.insert(target.clone()) {
-                        resolved.push(target.clone());
-                    }
-                }
-            }
-        }
-        resolved
-    }
-
-    fn resolve_direct(&self, source_file: &ProjectFile, include: &str) -> Vec<ProjectFile> {
-        let include_path = Path::new(include);
-        let mut matched = HashSet::default();
-        let mut resolved = Vec::new();
-        if include_path.is_absolute() {
-            if let Some(rel_path) = project_relative_include_path(source_file.root(), include_path)
-            {
-                self.extend_rel_path(&rel_path, &mut matched, &mut resolved);
-            }
-            return resolved;
-        }
-
-        let source_relative = ProjectFile::new(
-            source_file.root().to_path_buf(),
-            source_file.parent().join(include_path),
-        );
-        self.extend_rel_path(source_relative.rel_path(), &mut matched, &mut resolved);
-
-        let project_relative =
-            ProjectFile::new(source_file.root().to_path_buf(), include_path.to_path_buf());
-        self.extend_rel_path(project_relative.rel_path(), &mut matched, &mut resolved);
-        resolved
-    }
-
-    fn extend_rel_path(
-        &self,
-        rel_path: &Path,
-        matched: &mut HashSet<ProjectFile>,
-        out: &mut Vec<ProjectFile>,
-    ) {
-        if let Some(targets) = self.by_rel_path.get(rel_path) {
-            for target in targets {
-                if matched.insert(target.clone()) {
-                    out.push(target.clone());
-                }
-            }
-        }
-    }
-
-    fn resolve_unique_fallback(&self, include: &str) -> Vec<ProjectFile> {
-        let include_path = Path::new(include);
-        let matches: Vec<_> = self
-            .resolve_indexed(include)
-            .into_iter()
-            .filter(|file| {
-                if include_path.components().count() > 1 {
-                    file.rel_path().ends_with(include_path)
-                } else {
-                    file.rel_path()
-                        .file_name()
-                        .is_some_and(|name| name == include_path)
-                }
-            })
-            .collect();
-        if matches.len() == 1 {
-            matches
-        } else {
-            Vec::new()
-        }
-    }
-}
-
-fn string_suffixes(value: &str) -> impl Iterator<Item = &str> {
-    value.char_indices().map(|(index, _)| &value[index..])
-}
-
-pub(crate) fn parse_quoted_include(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    let quote_start = trimmed.find('"')?;
-    let quote_end = trimmed[quote_start + 1..].find('"')?;
-    Some(trimmed[quote_start + 1..quote_start + 1 + quote_end].to_string())
-}
-
-pub(crate) fn parse_include_path(line: &str) -> Option<String> {
-    if let Some(path) = parse_quoted_include(line) {
-        return Some(path);
-    }
-    let trimmed = line.trim();
-    let angle_start = trimmed.find('<')?;
-    let angle_end = trimmed[angle_start + 1..].find('>')?;
-    Some(trimmed[angle_start + 1..angle_start + 1 + angle_end].to_string())
-}
-
-pub(crate) fn resolve_include_targets(
-    project: &dyn Project,
-    source_file: &ProjectFile,
-    include: &str,
-) -> Vec<ProjectFile> {
-    let mut candidates = Vec::new();
-    let include_path = Path::new(include);
-    let source_root = project.root().to_path_buf();
-    let relative_path = if include_path.is_absolute() {
-        match project_relative_include_path(project.root(), include_path) {
-            Some(path) => path,
-            None => return candidates,
-        }
-    } else {
-        source_file.parent().join(include_path)
-    };
-    let relative_file = ProjectFile::new(source_root.clone(), relative_path);
-    if relative_file.exists() {
-        candidates.push(relative_file);
-    }
-    if !include_path.is_absolute() {
-        let project_relative_file = ProjectFile::new(source_root.clone(), include_path);
-        if project_relative_file.exists() {
-            candidates.push(project_relative_file);
-        }
-    }
-
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
-pub(crate) fn resolve_include_targets_with_index(
-    source_file: &ProjectFile,
-    include: &str,
-    include_targets: &IncludeTargetIndex,
-) -> Vec<ProjectFile> {
-    let mut candidates = include_targets.resolve_direct(source_file, include);
-    if !candidates.is_empty() {
-        return candidates;
-    }
-    if Path::new(include).is_absolute() {
-        return candidates;
-    }
-    candidates.extend(include_targets.resolve_unique_fallback(include));
-    candidates
-}
-
-pub(crate) fn resolve_direct_include_targets_with_index(
-    source_file: &ProjectFile,
-    include: &str,
-    include_targets: &IncludeTargetIndex,
-) -> Vec<ProjectFile> {
-    include_targets.resolve_direct(source_file, include)
-}
-
-fn project_relative_include_path(project_root: &Path, include_path: &Path) -> Option<PathBuf> {
-    let canonical_root = project_root
-        .canonicalize()
-        .unwrap_or_else(|_| project_root.to_path_buf());
-    let canonical_include = include_path
-        .canonicalize()
-        .unwrap_or_else(|_| include_path.to_path_buf());
-    canonical_include
-        .strip_prefix(&canonical_root)
-        .map(Path::to_path_buf)
-        .or_else(|_| {
-            include_path
-                .strip_prefix(project_root)
-                .map(Path::to_path_buf)
-        })
-        .ok()
-        .or_else(|| lexical_project_relative_include_path(&canonical_root, &canonical_include))
-        .or_else(|| lexical_project_relative_include_path(project_root, include_path))
-}
-
-pub(crate) fn quoted_include_paths(parsed: &[String]) -> Vec<String> {
-    parsed
-        .iter()
-        .filter_map(|line| parse_quoted_include(line))
-        .collect()
-}
-
-pub(crate) fn include_paths(parsed: &[String]) -> Vec<String> {
-    parsed
-        .iter()
-        .filter_map(|line| parse_include_path(line))
-        .collect()
-}
-
-fn lexical_project_relative_include_path(
-    project_root: &Path,
-    include_path: &Path,
-) -> Option<PathBuf> {
-    let root = slash_path(project_root);
-    let include = slash_path(include_path);
-    strip_slash_prefix(&include, &root).map(PathBuf::from)
-}
-
-fn slash_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    raw.replace('\\', "/").trim_end_matches('/').to_string()
-}
-
-#[cfg(windows)]
-fn strip_slash_prefix<'a>(path: &'a str, root: &str) -> Option<&'a str> {
-    if path.eq_ignore_ascii_case(root) {
-        return Some("");
-    }
-    if path.len() > root.len()
-        && path.as_bytes().get(root.len()) == Some(&b'/')
-        && path[..root.len()].eq_ignore_ascii_case(root)
-    {
-        return Some(&path[root.len() + 1..]);
-    }
-    None
-}
-
-#[cfg(not(windows))]
-fn strip_slash_prefix<'a>(path: &'a str, root: &str) -> Option<&'a str> {
-    if path == root {
-        return Some("");
-    }
-    path.strip_prefix(root)
-        .and_then(|rest| rest.strip_prefix('/'))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use tempfile::TempDir;
-
-    fn write_file(root: &Path, rel: &str) -> ProjectFile {
-        let path = root.join(rel);
-        fs::create_dir_all(path.parent().expect("test file has parent")).unwrap();
-        fs::write(&path, "").unwrap();
-        ProjectFile::new(root.to_path_buf(), rel)
-    }
-
-    #[test]
-    fn indexed_include_resolution_uses_unique_suffix_fallback() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let source = write_file(&root, "src/lib.c");
-        let target = write_file(&root, "include/git2/sys/credential.h");
-        let duplicate = write_file(&root, "vendor/credential.h");
-        let index = IncludeTargetIndex::build([&source, &target, &duplicate]);
-
-        let resolved = resolve_include_targets_with_index(&source, "git2/sys/credential.h", &index);
-        assert_eq!(resolved, vec![target]);
-
-        let ambiguous = resolve_include_targets_with_index(&source, "credential.h", &index);
-        assert!(ambiguous.is_empty());
     }
 }

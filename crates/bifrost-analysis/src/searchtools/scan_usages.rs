@@ -1298,23 +1298,24 @@ pub(super) fn resolve_scan_usages_target(
         }
     };
 
-    // The byte offset computed below from `target.line`/`target.column` is
-    // matched against `analyzer.ranges_of(&unit)` further down, which is
-    // itself keyed to the analyzer's indexed snapshot — so the line/column
-    // must be interpreted against that same snapshot, not a fresh disk read,
-    // or the two coordinate systems could disagree on a just-edited file.
-    let source = match analyzer.indexed_source(&file) {
-        Some(source) => source,
-        None => {
-            return location_selector_failure(
-                &target,
-                "read_failed",
-                format!(
-                    "failed to read `{}`: not indexed by analyzer",
-                    rel_path_string(&file)
-                ),
-            );
-        }
+    // Location ranges use the current source projection. Read the same
+    // working-tree source for line and column conversion, then fall back to
+    // the indexed snapshot when the file is not readable.
+    let source = match analyzer.project().read_source(&file) {
+        Ok(source) => source,
+        Err(_) => match analyzer.indexed_source(&file) {
+            Some(source) => source,
+            None => {
+                return location_selector_failure(
+                    &target,
+                    "read_failed",
+                    format!(
+                        "failed to read `{}`: not indexed by analyzer",
+                        rel_path_string(&file)
+                    ),
+                );
+            }
+        },
     };
 
     if target.column == Some(0) {
@@ -1480,9 +1481,9 @@ pub(super) fn resolve_scan_usages_target(
                     let selector_matches =
                         selector_arg.is_some_and(|symbol| matches_selector(&unit, symbol));
                     let ranges = if selector_matches && unit.is_module() {
-                        analyzer.ranges_of(&unit)
+                        analyzer.location_ranges(&unit)
                     } else if selector_matches || selector_arg.is_none() {
-                        range_context.name_ranges(analyzer, &unit)
+                        range_context.location_name_ranges(analyzer, &unit)
                     } else {
                         return None;
                     };
@@ -1537,7 +1538,7 @@ pub(super) fn resolve_scan_usages_target(
     if matching_units.is_empty()
         && let Some(symbol) = selector
     {
-        let declarations = analyzer.declarations(&file);
+        let declarations = analyzer.location_declarations(&file);
         let lookup = AnalyzerDefinitionLookup::new(analyzer, language_for_file(&file));
         let lookup_only_candidates: Vec<CodeUnit> = lookup
             .fqn(symbol)
@@ -1684,7 +1685,7 @@ pub(super) fn scan_usages_location_diagnostic(
 
 pub(super) fn declarations_in_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Vec<CodeUnit> {
     let mut declarations: Vec<CodeUnit> = analyzer
-        .get_declarations(file)
+        .location_declarations(file)
         .into_iter()
         .filter(|unit| unit.source() == file)
         .collect();
@@ -1979,8 +1980,56 @@ pub(crate) fn scan_usages_by_location_with_context(
     result
 }
 
+/// Dedicated rayon pool for usage-scan fan-out.
+///
+/// A scan's per-candidate work saturates whichever pool runs it. On the
+/// global pool that starves every concurrent light request whose own
+/// resolution injects nested parallel work from a non-worker thread: the
+/// injected job parks on a latch until a worker frees, and none frees until
+/// the scan finishes. The `mcp_fairness` scenario in
+/// benchmark/interactive-latency.toml measures exactly this overlap. Scans
+/// therefore fan out on their own pool, sized one thread below the machine so
+/// interactive queries keep idle global workers and CPU headroom.
+static HEAVY_SCAN_POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::LazyLock::new(|| {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .saturating_sub(1)
+        .max(1);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("bifrost-scan-{index}"))
+        .build()
+        .expect("failed to build the usage-scan thread pool")
+});
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_usages_backend(
+    analyzer: &dyn IAnalyzer,
+    surface: ScanUsagesSurface,
+    include_tests: bool,
+    paths: Option<&[String]>,
+    symbols: Vec<ScanUsageRequest>,
+    targets: Vec<ScanUsageRequest>,
+    include_same_owner: bool,
+    context: &ScanUsagesExecutionContext,
+) -> ScanUsagesResult {
+    HEAVY_SCAN_POOL.install(|| {
+        scan_usages_backend_on_pool(
+            analyzer,
+            surface,
+            include_tests,
+            paths,
+            symbols,
+            targets,
+            include_same_owner,
+            context,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_usages_backend_on_pool(
     analyzer: &dyn IAnalyzer,
     surface: ScanUsagesSurface,
     include_tests: bool,
@@ -2749,155 +2798,16 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                 });
             }
         };
-    {
-        let _scope = profiling::scope("usage_graph::resolve_go");
-        let go_edges = crate::analyzer::usages::go_graph::build_go_usage_edges(
+    for entry in crate::analyzer::languages::edge_passes() {
+        let _scope = profiling::scope(format!("usage_graph::resolve_{}", entry.id.as_str()));
+        let ctx = crate::analyzer::languages::EdgeSiteScanCtx {
             analyzer,
-            catalog.fqns(UsageEcosystem::Go),
-            keep_file,
-        );
+            fqns: catalog.fqns(entry.ecosystem),
+            keep_file: &keep_file,
+        };
         record_inverted(
-            UsageEcosystem::Go,
-            go_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_jsts");
-        let jsts_edges = crate::analyzer::usages::js_ts_graph::build_jsts_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::JavaScriptTypeScript),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::JavaScriptTypeScript,
-            jsts_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_python");
-        let python_edges = crate::analyzer::usages::python_graph::build_python_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Python),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Python,
-            python_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_rust");
-        let rust_edges = crate::analyzer::usages::rust_graph::build_rust_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Rust),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Rust,
-            rust_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        // One JVM realm, three resolvers: Java, Scala, and Kotlin declarations
-        // share one candidate space, so all three builders run over the same fqn
-        // set and merge into it. Each resolver only scans files of its own
-        // language, so the passes cover disjoint call sites and cannot double
-        // count.
-        let _scope = profiling::scope("usage_graph::resolve_jvm");
-        let java_edges = crate::analyzer::usages::java_graph::build_java_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Jvm),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Jvm,
-            java_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-        let scala_edges = crate::analyzer::usages::scala_graph::build_scala_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Jvm),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Jvm,
-            scala_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-        let kotlin_edges = crate::analyzer::usages::kotlin_graph::build_kotlin_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Jvm),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Jvm,
-            kotlin_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_csharp");
-        let csharp_edges = crate::analyzer::usages::csharp_graph::build_csharp_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::CSharp),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::CSharp,
-            csharp_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_php");
-        let php_edges = crate::analyzer::usages::php_graph::build_php_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Php),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Php,
-            php_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_ruby");
-        let ruby_edges = crate::analyzer::usages::ruby_graph::build_ruby_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Ruby),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Ruby,
-            ruby_edges,
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
-    {
-        let _scope = profiling::scope("usage_graph::resolve_cpp");
-        let cpp_edges = crate::analyzer::usages::cpp_graph::build_cpp_usage_edges(
-            analyzer,
-            catalog.fqns(UsageEcosystem::Cpp),
-            keep_file,
-        );
-        record_inverted(
-            UsageEcosystem::Cpp,
-            cpp_edges,
+            entry.ecosystem,
+            entry.pass.edge_sites(&ctx).map(|sites| sites.0),
             &mut edge_sites,
             &mut truncated_symbols,
         );
@@ -4963,7 +4873,11 @@ mod tests {
     #[test]
     fn issue_1630_location_partial_scan_gives_structured_recovery_guidance() {
         let (_temp, analyzer) = partial_scan_fixture();
-
+        // Warm the lazy Rust indexes first, as the reference-surface sibling
+        // above does. Since #1636 a cancelled scan no longer publishes the
+        // usage index it was building, so an all-cancelled sweep repays the
+        // whole cold build every iteration and never reaches the scan that
+        // proves a site -- the entry stays a bare cancelled Failure.
         let complete = scan_location_with(&analyzer, CancellationToken::default());
         let complete_entry = &complete.results[0];
         assert_eq!(ScanUsagesStatus::Found, complete_entry.status);

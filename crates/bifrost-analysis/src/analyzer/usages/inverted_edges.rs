@@ -1,20 +1,24 @@
-//! Language-agnostic machinery for the inverted whole-workspace edge build.
+//! The driver for the inverted whole-workspace edge build.
 //!
 //! `usage_graph` builds a caller→callee graph. The scalable shape is a single
 //! pass over files: walk each file once, resolve every reference to the callee it
-//! names, and attribute it to its enclosing declaration. Everything except the
-//! per-language "walk + resolve a reference to a callee fqn" is identical across
-//! languages, and lives here:
+//! names, and attribute it to its enclosing declaration. This module owns
+//! everything except the walk:
 //!
-//! - [`build_enclosers`] / [`EdgeCollector::enclosing`] — attribute a reference to
-//!   its smallest enclosing declaration (the caller), matching
-//!   `IAnalyzer::enclosing_code_unit` but precomputed once per file.
-//! - [`EdgeCollector::record_kind`] — the per-reference rules: drop self-references and
-//!   references inside the callee's own definition, require both endpoints to be
-//!   nodes, count distinct call sites for the cap, and dedup edge weight by
-//!   `(file, line, caller)`.
+//! - [`build_file_declarations`] — the per-file declaration index, from an
+//!   `IAnalyzer` or a cached `FileState`.
+//! - [`parse_and_collect`] — parse one file on demand, hand the language a
+//!   [`FileEdgeScanInput`], and drop the tree when it returns.
+//! - [`build_edge_output`] — the parallel fan-out over files.
 //! - [`merge_and_cap`] — sum per-file results and drop callees past the call-site
 //!   cap into `truncated`.
+//!
+//! A language supplies one function per file: `FnOnce(&FileEdgeScanInput<K>) ->
+//! PerFileEdges<K>`. Both of those types, and the per-reference accounting rules
+//! on `PerFileEdges`, live in `brokk-bifrost-core`, so the scan is pure logic
+//! over core types and a language crate can implement it without depending on
+//! this one. See the Go implementation in [`super::go_graph`] for the reference
+//! shape.
 //!
 //! The engine is generic over its node-key type `K` (see [`NodeKey`]). Most
 //! languages are package-scoped: a bare fqn is globally unique, so `K = String`
@@ -22,416 +26,51 @@
 //! name in two files is two distinct symbols, instantiate the same engine with
 //! `K = UsageNodeKey` so endpoints carry the file. There is one implementation of
 //! every accounting rule — only the key type differs.
-//!
-//! Each language provides only a `scan_file` that walks its AST and calls
-//! [`EdgeCollector::record_kind`]; see the Go implementation in
-//! [`super::go_graph`] for the reference shape.
+
+pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
+    CallSite, ClassRangeIndex, FileDeclarations, FileEdgeScanInput, JsTsScopedNodeStatus,
+    JsTsScopedUsageEdges, NodeKey, PerFileEdges, UsageEdgeWeights, UsageEdges, UsageNodeKey,
+    UsageReferenceCounts, first_precise,
+};
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
-use crate::analyzer::usages::local_inference::{LocalInferenceEngine, SymbolResolution};
 use crate::analyzer::usages::parsed_tree::{
     ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
-use crate::text_utils::find_line_index_for_offset;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
-use std::hash::Hash;
-use tree_sitter::{Language as TreeSitterLanguage, Node};
+use tree_sitter::Language as TreeSitterLanguage;
 
-/// Per-file index of class-like declaration spans, for attributing an
-/// unqualified / `this` / `self` reference to its enclosing class. Sources the
-/// analyzer's own fqns, so nested classes resolve to whatever fqn the analyzer
-/// emits.
-#[derive(Clone)]
-pub(crate) struct ClassRangeIndex {
-    ranges: Vec<(usize, usize, CodeUnit, String)>,
+/// [`ClassRangeIndex`] over a persisted file state, for scans that already
+/// hydrated one and would otherwise pay the declaration/range queries twice.
+pub(crate) fn class_range_index_from_state(state: &FileState) -> ClassRangeIndex {
+    class_range_index_from_declaration_ranges(&state.declarations, &state.ranges)
 }
 
-impl ClassRangeIndex {
-    pub(crate) fn build(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Self {
-        let ranges = analyzer
-            .declarations(file)
-            .into_iter()
-            .filter(|unit| unit.is_class())
-            .flat_map(|unit| {
-                analyzer.ranges(&unit).into_iter().map(move |range| {
-                    (
-                        range.start_byte,
-                        range.end_byte,
-                        unit.clone(),
-                        unit.fq_name(),
-                    )
-                })
-            })
-            .collect();
-        Self { ranges }
-    }
-
-    pub(crate) fn build_from_state(state: &FileState) -> Self {
-        let ranges = state
-            .declarations
-            .iter()
-            .filter(|unit| unit.is_class())
-            .flat_map(|unit| {
-                state
-                    .ranges
-                    .get(unit)
-                    .into_iter()
-                    .flatten()
-                    .map(move |range| {
-                        (
-                            range.start_byte,
-                            range.end_byte,
-                            unit.clone(),
-                            unit.fq_name(),
-                        )
-                    })
-            })
-            .collect();
-        Self { ranges }
-    }
-
-    /// The fqn of the smallest class declaration containing `byte`.
-    pub(crate) fn enclosing(&self, byte: usize) -> Option<&str> {
-        self.ranges
-            .iter()
-            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
-            .min_by_key(|(start, end, _, _)| end - start)
-            .map(|(_, _, _, fqn)| fqn.as_str())
-    }
-
-    /// The exact declaration identity of the smallest class containing `byte`.
-    pub(crate) fn enclosing_unit(&self, byte: usize) -> Option<&CodeUnit> {
-        self.ranges
-            .iter()
-            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
-            .min_by_key(|(start, end, _, _)| end - start)
-            .map(|(_, _, unit, _)| unit)
-    }
-
-    /// The indexed class-like declaration whose parser span is exactly
-    /// `[start, end)`. Local templates have no entry and are resolved from
-    /// their parser-recorded supertypes by the Scala usage scanners.
-    pub(crate) fn unit_for_exact_span(&self, start: usize, end: usize) -> Option<&CodeUnit> {
-        self.ranges
-            .iter()
-            .find(|(range_start, range_end, _, _)| *range_start == start && *range_end == end)
-            .map(|(_, _, unit, _)| unit)
-    }
-
-    /// Apply `resolve` to class/object declarations containing `byte`, choosing
-    /// the successful result from the innermost owner. This preserves exact
-    /// analyzer identities without allocating or reconstructing lexical parents
-    /// from rendered fqns.
-    pub(crate) fn find_in_enclosing_units<T>(
-        &self,
-        byte: usize,
-        mut resolve: impl FnMut(&CodeUnit) -> Option<T>,
-    ) -> Option<T> {
-        self.ranges
-            .iter()
-            .filter(|(start, end, _, _)| *start <= byte && byte < *end)
-            .filter_map(|(start, end, unit, _)| {
-                resolve(unit).map(|resolved| (end - start, resolved))
-            })
-            .min_by_key(|(length, _)| *length)
-            .map(|(_, resolved)| resolved)
-    }
-}
-
-/// The single precise binding for `name`, if the engine resolved it to exactly
-/// one (or a first-of) target. Shared by the per-language receiver typing.
-pub(crate) fn first_precise<T: Clone + Eq + Hash>(
-    bindings: &LocalInferenceEngine<T>,
-    name: &str,
-) -> Option<T> {
-    bindings
-        .resolve_symbol_ref(name)
-        .and_then(SymbolResolution::as_precise)
-        .and_then(|targets| targets.iter().next().cloned())
+/// [`class_range_index_from_state`] over the two maps it actually reads, for a
+/// scan whose per-file record is a language crate's decode of the state rather
+/// than the state itself.
+pub(crate) fn class_range_index_from_declaration_ranges(
+    declarations: &HashSet<CodeUnit>,
+    ranges: &HashMap<CodeUnit, Vec<Range>>,
+) -> ClassRangeIndex {
+    ClassRangeIndex::from_class_spans(declarations.iter().filter(|unit| unit.is_class()).flat_map(
+        |unit| {
+            ranges
+                .get(unit)
+                .into_iter()
+                .flatten()
+                .map(move |range| (unit.clone(), *range))
+        },
+    ))
 }
 
 /// A callee with more distinct call sites than this is reported as truncated and
 /// contributes no edges. Tied to the per-symbol scan's guardrail
 /// (`DEFAULT_MAX_USAGES`) so `usage_graph`'s truncation matches `scan_usages`.
 pub(crate) const MAX_CALLSITES: usize = crate::analyzer::usages::DEFAULT_MAX_USAGES;
-
-/// Broad semantic category of a proven usage reference. The categories stay
-/// deliberately small so every supported grammar can classify sites without
-/// inventing language-specific public vocabulary.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum UsageReferenceKind {
-    #[default]
-    Other,
-    Type,
-    Member,
-    Call,
-}
-
-/// Distinct source-line counts for one caller/callee pair, split by reference kind.
-/// Summing the fields reproduces the legacy unit-per-line edge weight.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct UsageReferenceCounts {
-    pub(crate) calls: u16,
-    pub(crate) members: u16,
-    pub(crate) types: u16,
-    pub(crate) other: u16,
-}
-
-impl UsageReferenceCounts {
-    pub(crate) fn total(self) -> usize {
-        usize::from(self.calls)
-            + usize::from(self.members)
-            + usize::from(self.types)
-            + usize::from(self.other)
-    }
-
-    fn record(&mut self, kind: UsageReferenceKind) {
-        match kind {
-            UsageReferenceKind::Call => self.calls = self.calls.saturating_add(1),
-            UsageReferenceKind::Member => self.members = self.members.saturating_add(1),
-            UsageReferenceKind::Type => self.types = self.types.saturating_add(1),
-            UsageReferenceKind::Other => self.other = self.other.saturating_add(1),
-        }
-    }
-}
-
-/// Classify a resolved reference from tree-sitter structure. Language scanners
-/// pass the precise identifier/member/type node they resolved; walking only its
-/// named ancestors keeps this independent of source spelling while covering the
-/// common grammar shapes used by Bifrost's supported languages.
-pub(crate) fn classify_reference_node(node: Node<'_>) -> UsageReferenceKind {
-    if matches!(
-        node.kind(),
-        "type_identifier"
-            | "scoped_type_identifier"
-            | "generic_type"
-            | "template_type"
-            | "predefined_type"
-            | "nullable_type"
-            | "array_type"
-            | "pointer_type"
-            | "reference_type"
-            | "union_type"
-            | "intersection_type"
-            | "type_projection"
-            | "stable_type_identifier"
-    ) {
-        return UsageReferenceKind::Type;
-    }
-
-    let site_start = node.start_byte();
-    let site_end = node.end_byte();
-    let mut current = node;
-    let mut member = false;
-    for _ in 0..4 {
-        let Some(parent) = current.parent() else {
-            break;
-        };
-        let kind = parent.kind();
-        if matches!(
-            kind,
-            "type_annotation"
-                | "generic_type"
-                | "type_arguments"
-                | "type_parameters"
-                | "base_list"
-                | "superclass"
-                | "extends_type_clause"
-                | "implements_clause"
-                | "trait_bounds"
-        ) || field_contains_site(
-            parent,
-            &["type", "return_type", "superclass"],
-            site_start,
-            site_end,
-        ) {
-            return UsageReferenceKind::Type;
-        }
-        if matches!(
-            kind,
-            "member_expression"
-                | "field_expression"
-                | "member_access_expression"
-                | "selector_expression"
-                | "navigation_expression"
-                | "scope_resolution_expression"
-                | "attribute"
-                | "field_access"
-                | "scoped_property_access_expression"
-        ) && field_contains_site(
-            parent,
-            &["property", "field", "name", "attribute"],
-            site_start,
-            site_end,
-        ) {
-            member = true;
-        }
-        if matches!(
-            kind,
-            "call"
-                | "call_expression"
-                | "method_invocation"
-                | "invocation_expression"
-                | "function_call_expression"
-                | "member_call_expression"
-                | "scoped_call_expression"
-                | "command"
-        ) && field_contains_site(
-            parent,
-            &["function", "name", "method", "call"],
-            site_start,
-            site_end,
-        ) {
-            return UsageReferenceKind::Call;
-        }
-        if matches!(
-            kind,
-            "function_item"
-                | "function_declaration"
-                | "method_declaration"
-                | "method_definition"
-                | "class_declaration"
-        ) {
-            break;
-        }
-        current = parent;
-    }
-
-    if member {
-        UsageReferenceKind::Member
-    } else {
-        UsageReferenceKind::Other
-    }
-}
-
-fn field_contains_site(
-    node: Node<'_>,
-    fields: &[&str],
-    site_start: usize,
-    site_end: usize,
-) -> bool {
-    fields.iter().any(|field| {
-        node.child_by_field_name(field)
-            .is_some_and(|child| child.start_byte() <= site_start && site_end <= child.end_byte())
-    })
-}
-
-impl std::ops::AddAssign for UsageReferenceCounts {
-    fn add_assign(&mut self, rhs: Self) {
-        self.calls = self.calls.saturating_add(rhs.calls);
-        self.members = self.members.saturating_add(rhs.members);
-        self.types = self.types.saturating_add(rhs.types);
-        self.other = self.other.saturating_add(rhs.other);
-    }
-}
-
-/// A single resolved call site for an edge: a workspace-relative file path and the
-/// 1-based line where a reference to the callee occurs. Lines are 1-based to match
-/// `scan_usages` hit lines and node `start_line`. The set of call sites for an edge
-/// is exactly its distinct `(file, line, caller)` reference sites, so an edge's
-/// weight equals its call-site count.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct CallSite {
-    pub(crate) path: String,
-    pub(crate) line: usize,
-}
-
-/// The identity of a usage-graph node, as seen by the edge engine. Implemented for
-/// `String` (package-scoped languages: the fqn is globally unique) and
-/// [`UsageNodeKey`] (module-scoped languages: the fqn plus its file). The engine is
-/// generic over this trait so there is one implementation of every accounting rule.
-pub(crate) trait NodeKey: Clone + Ord + Hash {
-    /// The node key for a declaration.
-    fn from_unit(unit: &CodeUnit) -> Self;
-    /// The fqn component used for terminal-name matching.
-    fn fqn(&self) -> &str;
-}
-
-impl NodeKey for String {
-    fn from_unit(unit: &CodeUnit) -> Self {
-        unit.fq_name()
-    }
-
-    fn fqn(&self) -> &str {
-        self
-    }
-}
-
-/// File-scoped declaration identity for languages where a bare fqn/export name is
-/// not globally unique.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct UsageNodeKey {
-    pub(crate) file: ProjectFile,
-    pub(crate) fqn: String,
-}
-
-impl UsageNodeKey {
-    pub(crate) fn new(file: ProjectFile, fqn: String) -> Self {
-        Self { file, fqn }
-    }
-}
-
-impl NodeKey for UsageNodeKey {
-    fn from_unit(unit: &CodeUnit) -> Self {
-        UsageNodeKey::new(unit.source().clone(), unit.fq_name())
-    }
-
-    fn fqn(&self) -> &str {
-        &self.fqn
-    }
-}
-
-/// Aggregated result of an inverted edge build, keyed by node-key type `K`.
-#[derive(Clone)]
-pub(crate) struct UsageEdges<K = String> {
-    /// `(caller, callee) -> call sites`. The site count is the edge weight
-    /// (distinct `(file, line, caller)` sites); sites are sorted by `(path, line)`.
-    pub(crate) edges: BTreeMap<(K, K), Vec<CallSite>>,
-    /// Callees past the call-site cap: `callee -> total call sites`.
-    pub(crate) truncated: BTreeMap<K, usize>,
-    /// Per-callee count of structurally matching call/member sites whose receiver
-    /// could not be resolved to a proven edge.
-    pub(crate) unproven_inbound: BTreeMap<K, usize>,
-}
-
-// Hand-written so the bound is `K: Ord` (BTreeMap), not `K: Default` that
-// `#[derive(Default)]` would impose — `UsageNodeKey` has no `Default`.
-impl<K: Ord> Default for UsageEdges<K> {
-    fn default() -> Self {
-        Self {
-            edges: BTreeMap::new(),
-            truncated: BTreeMap::new(),
-            unproven_inbound: BTreeMap::new(),
-        }
-    }
-}
-
-impl<K: NodeKey> UsageEdges<K> {
-    /// Iterate edges as `(caller, callee, weight)`, where weight is the call-site
-    /// count. The single place edge weight is derived from the site list, so
-    /// weight-only consumers (e.g. dead-code inbound counts) stay decoupled from
-    /// how — or whether — per-site locations are stored.
-    pub(crate) fn edge_weights(&self) -> impl Iterator<Item = (&K, &K, usize)> {
-        self.edges
-            .iter()
-            .map(|((caller, callee), sites)| (caller, callee, sites.len()))
-    }
-}
-
-/// Aggregated edge weights for callers that do not need per-site locations.
-pub(crate) struct UsageEdgeWeights<K = String> {
-    /// `(caller, callee) -> reference-kind counts`, with each distinct
-    /// `(file, line, caller)` site assigned to exactly one kind.
-    pub(crate) edges: BTreeMap<(K, K), UsageReferenceCounts>,
-    /// Callees past the call-site cap: `callee -> total call sites`.
-    pub(crate) truncated: BTreeMap<K, usize>,
-    /// Per-callee count of structurally matching call/member sites whose receiver
-    /// could not be resolved to a proven edge.
-    pub(crate) unproven_inbound: BTreeMap<K, usize>,
-}
 
 /// Selects how a whole-workspace per-file scan is finalized. Language builders
 /// are generic over this trait so the AST walk is written once while callers can
@@ -450,56 +89,6 @@ impl<K: NodeKey> UsageEdgeBuildOutput<K> for UsageEdgeWeights<K> {
     fn merge(per_file: Vec<PerFileEdges<K>>) -> Self {
         merge_weights_and_cap(per_file)
     }
-}
-
-impl<K: Ord> Default for UsageEdgeWeights<K> {
-    fn default() -> Self {
-        Self {
-            edges: BTreeMap::new(),
-            truncated: BTreeMap::new(),
-            unproven_inbound: BTreeMap::new(),
-        }
-    }
-}
-
-/// One file's contribution, merged by [`merge_and_cap`].
-pub(crate) struct PerFileEdges<K = String> {
-    /// Workspace-relative path of the file these edges came from. Every reference is
-    /// recorded in the file being scanned, so a single path covers all of this
-    /// file's sites; [`merge_and_cap`] pairs it with each line to build `CallSite`s.
-    path: String,
-    /// `(caller, callee) -> distinct 1-based lines and their strongest observed
-    /// kind`. A line remains one legacy site even if the scanner resolves the same
-    /// declaration more than once on that line.
-    edge_lines: BTreeMap<(K, K), HashMap<usize, UsageReferenceKind>>,
-    /// `callee -> distinct call-site offsets` (for the cap).
-    callsites: BTreeMap<K, HashSet<usize>>,
-    /// `callee -> distinct unresolved structural member offsets`.
-    unproven_inbound: BTreeMap<K, HashSet<usize>>,
-}
-
-impl<K: Ord> Default for PerFileEdges<K> {
-    fn default() -> Self {
-        Self {
-            path: String::new(),
-            edge_lines: BTreeMap::new(),
-            callsites: BTreeMap::new(),
-            unproven_inbound: BTreeMap::new(),
-        }
-    }
-}
-
-/// Per-file declaration index for one source file, built in a single pass over
-/// the file's declarations.
-pub(crate) struct FileDeclarations<K = String> {
-    /// `(start_byte, end_byte, key)` for every declaration — attribute a reference
-    /// to its smallest enclosing declaration (the caller).
-    enclosers: Vec<(usize, usize, K)>,
-    /// `key -> declaration byte spans in *this* file` — exclude a reference that
-    /// falls inside the callee's own declaration. Keyed per file (not globally) so
-    /// a callee declared in a *different* file can never spuriously match a
-    /// caller-file reference whose byte offset happens to overlap.
-    definitions: HashMap<K, Vec<(usize, usize)>>,
 }
 
 pub(crate) fn build_file_declarations<K: NodeKey>(
@@ -525,15 +114,20 @@ pub(crate) fn build_file_declarations<K: NodeKey>(
 pub(crate) fn build_file_declarations_from_state<K: NodeKey>(
     state: &FileState,
 ) -> FileDeclarations<K> {
+    build_file_declarations_from_declaration_ranges(&state.declarations, &state.ranges)
+}
+
+/// [`build_file_declarations_from_state`] over the two maps it actually reads;
+/// see [`class_range_index_from_declaration_ranges`].
+pub(crate) fn build_file_declarations_from_declaration_ranges<K: NodeKey>(
+    declarations: &HashSet<CodeUnit>,
+    ranges: &HashMap<CodeUnit, Vec<Range>>,
+) -> FileDeclarations<K> {
     let mut enclosers = Vec::new();
     let mut definitions: HashMap<K, Vec<(usize, usize)>> = HashMap::default();
-    for unit in state
-        .declarations
-        .iter()
-        .filter(|unit| !unit.is_file_scope())
-    {
+    for unit in declarations.iter().filter(|unit| !unit.is_file_scope()) {
         let key = K::from_unit(unit);
-        for unit_range in state.ranges.get(unit).into_iter().flatten() {
+        for unit_range in ranges.get(unit).into_iter().flatten() {
             let span = (unit_range.start_byte, unit_range.end_byte);
             enclosers.push((span.0, span.1, key.clone()));
             definitions.entry(key.clone()).or_default().push(span);
@@ -543,167 +137,6 @@ pub(crate) fn build_file_declarations_from_state<K: NodeKey>(
         enclosers,
         definitions,
     }
-}
-
-/// Accumulates one file's edges. A language's `scan_file` walks the AST and calls
-/// [`record_kind`](Self::record_kind) for every reference it resolves to a callee key.
-pub(crate) struct EdgeCollector<'a, K = String> {
-    line_starts: &'a [usize],
-    nodes: &'a HashSet<K>,
-    nodes_by_terminal: HashMap<String, Vec<K>>,
-    declarations: FileDeclarations<K>,
-    out: PerFileEdges<K>,
-}
-
-impl<'a, K: NodeKey> EdgeCollector<'a, K> {
-    pub(crate) fn new(
-        line_starts: &'a [usize],
-        nodes: &'a HashSet<K>,
-        declarations: FileDeclarations<K>,
-    ) -> Self {
-        let mut nodes_by_terminal: HashMap<String, Vec<K>> = HashMap::default();
-        for node in nodes {
-            nodes_by_terminal
-                .entry(node_terminal(node))
-                .or_default()
-                .push(node.clone());
-        }
-        Self {
-            line_starts,
-            nodes,
-            nodes_by_terminal,
-            declarations,
-            out: PerFileEdges::default(),
-        }
-    }
-
-    /// The key of the smallest declaration whose byte span contains `[start, end)`
-    /// — the call site's enclosing caller. Mirrors `IAnalyzer::enclosing_code_unit`.
-    fn enclosing(&self, start: usize, end: usize) -> Option<&K> {
-        self.declarations
-            .enclosers
-            .iter()
-            .filter(|(unit_start, unit_end, _)| *unit_start <= start && end <= *unit_end)
-            .min_by_key(|(unit_start, unit_end, _)| unit_end - unit_start)
-            .map(|(_, _, key)| key)
-    }
-
-    /// Record a reference at `[start, end)` that resolves to `callee`. Updates the
-    /// per-callee call-site count (for the cap) and, when the site is a real edge,
-    /// the `(caller, callee)` weight.
-    pub(crate) fn record_kind(
-        &mut self,
-        callee: K,
-        kind: UsageReferenceKind,
-        start: usize,
-        end: usize,
-    ) {
-        if !self.nodes.contains(&callee) {
-            return;
-        }
-        let caller = match self.enclosing(start, end) {
-            Some(caller) => caller.clone(),
-            None => return,
-        };
-        self.record_with_caller_kind(caller, callee, kind, start, end);
-    }
-
-    pub(crate) fn record_with_caller_kind(
-        &mut self,
-        caller: K,
-        callee: K,
-        kind: UsageReferenceKind,
-        start: usize,
-        end: usize,
-    ) {
-        if !self.nodes.contains(&callee) {
-            return;
-        }
-        // A recursive call's enclosing definition is the callee itself; the
-        // per-symbol path excludes it from the call-site count.
-        if caller == callee {
-            return;
-        }
-        self.out
-            .callsites
-            .entry(callee.clone())
-            .or_default()
-            .insert(start);
-
-        // Edge-only exclusions (the cap count above ignores these): a reference
-        // overlapping the callee's own declaration *in this file*, and a caller
-        // that is not a node a consumer can rank.
-        if self
-            .declarations
-            .definitions
-            .get(&callee)
-            .is_some_and(|spans| spans.iter().any(|(s, e)| *s < end && start < *e))
-        {
-            return;
-        }
-        if !self.nodes.contains(&caller) {
-            return;
-        }
-        // 1-based, matching `scan_usages` hit lines and node `start_line`.
-        let line = find_line_index_for_offset(self.line_starts, start) + 1;
-        let line_kinds = self.out.edge_lines.entry((caller, callee)).or_default();
-        line_kinds
-            .entry(line)
-            .and_modify(|existing| *existing = (*existing).max(kind))
-            .or_insert(kind);
-    }
-
-    pub(crate) fn contains_node(&self, node: &K) -> bool {
-        self.nodes.contains(node)
-    }
-
-    /// Record that a structured call/member site with terminal member `name`
-    /// matched requested nodes but could not be resolved to a proven callee.
-    pub(crate) fn record_unproven_name(&mut self, name: &str, start: usize, end: usize) {
-        let Some(candidates) = self.nodes_by_terminal.get(name) else {
-            return;
-        };
-        let candidates = candidates.clone();
-        for callee in candidates {
-            self.record_unproven(callee, start, end);
-        }
-    }
-
-    /// Record that a structured call/member site matched `callee` exactly but
-    /// could not be resolved to a proven edge.
-    pub(crate) fn record_unproven(&mut self, callee: K, start: usize, end: usize) {
-        if !self.nodes.contains(&callee) {
-            return;
-        }
-        let Some(caller) = self.enclosing(start, end).cloned() else {
-            return;
-        };
-        if caller == callee {
-            return;
-        }
-        if self
-            .declarations
-            .definitions
-            .get(&callee)
-            .is_some_and(|spans| spans.iter().any(|(s, e)| *s < end && start < *e))
-        {
-            return;
-        }
-        self.out
-            .unproven_inbound
-            .entry(callee)
-            .or_default()
-            .insert(start);
-    }
-
-    pub(crate) fn finish(self) -> PerFileEdges<K> {
-        self.out
-    }
-}
-
-fn node_terminal<K: NodeKey>(node: &K) -> String {
-    let fqn = node.fqn();
-    fqn.rsplit('.').next().unwrap_or(fqn).to_string()
 }
 
 /// Drive a whole-workspace inverted edge build over `files` in parallel, where each
@@ -771,43 +204,45 @@ where
         .collect()
 }
 
-/// Build one file's edges: construct its declaration index and an [`EdgeCollector`],
-/// run the language `walk` against the collector, and return the owned result. The
-/// collector's borrow of `line_starts` is scoped to this call, so the caller is free
-/// to drop the parsed tree / source / line starts as soon as this returns.
-pub(crate) fn collect_file_edges<K, W>(
+/// Build one file's edges: construct its declaration index and the
+/// [`FileEdgeScanInput`] the language reads, run the language `scan`, and stamp the
+/// file path onto the result. Every borrow the input hands out is scoped to this
+/// call, so the caller is free to drop the parsed tree / source / line starts as
+/// soon as this returns.
+pub(crate) fn collect_file_edges<K, S>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     nodes: &HashSet<K>,
-    line_starts: &[usize],
-    walk: W,
+    parsed: &ParsedTreeFile,
+    scan: S,
 ) -> PerFileEdges<K>
 where
     K: NodeKey,
-    W: FnOnce(&mut EdgeCollector<K>),
+    S: FnOnce(&FileEdgeScanInput<'_, K>) -> PerFileEdges<K>,
 {
     let declarations = build_file_declarations(analyzer, file);
-    let mut collector = EdgeCollector::new(line_starts, nodes, declarations);
-    walk(&mut collector);
-    let mut out = collector.finish();
-    out.path = crate::path_utils::rel_path_string(file);
-    out
+    collect_file_edges_with_declarations(file, nodes, parsed, declarations, scan)
 }
 
-pub(crate) fn collect_file_edges_with_declarations<K, W>(
+pub(crate) fn collect_file_edges_with_declarations<K, S>(
     file: &ProjectFile,
     nodes: &HashSet<K>,
-    line_starts: &[usize],
+    parsed: &ParsedTreeFile,
     declarations: FileDeclarations<K>,
-    walk: W,
+    scan: S,
 ) -> PerFileEdges<K>
 where
     K: NodeKey,
-    W: FnOnce(&mut EdgeCollector<K>),
+    S: FnOnce(&FileEdgeScanInput<'_, K>) -> PerFileEdges<K>,
 {
-    let mut collector = EdgeCollector::new(line_starts, nodes, declarations);
-    walk(&mut collector);
-    let mut out = collector.finish();
+    let input = FileEdgeScanInput::new(
+        &parsed.tree,
+        parsed.source.as_str(),
+        &parsed.line_starts,
+        nodes,
+        &declarations,
+    );
+    let mut out = scan(&input);
     out.path = crate::path_utils::rel_path_string(file);
     out
 }
@@ -815,7 +250,7 @@ where
 /// Parse `file` on demand, build its edges via [`collect_file_edges`], and drop the
 /// tree / source / line starts when this returns — bounding live trees to ≈ the rayon
 /// worker count. Returns `None` to skip an unreadable or empty file. The `scan`
-/// closure receives the parsed file and the collector and owns the language AST walk.
+/// closure receives the file's [`FileEdgeScanInput`] and owns the language AST walk.
 /// Centralizing the parse, the skip-on-failure, and the tree-lifetime scoping here
 /// keeps the six local-parse adapters from each repeating them, and gives a single
 /// home for any later parse-failure handling, tracing, or memory instrumentation.
@@ -833,16 +268,10 @@ pub(crate) fn parse_and_collect<S>(
     scan: S,
 ) -> Option<PerFileEdges>
 where
-    S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
+    S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
     let parsed = parse_tree_sitter_file(file, language)?;
-    Some(collect_file_edges(
-        analyzer,
-        file,
-        nodes,
-        &parsed.line_starts,
-        |collector| scan(&parsed, collector),
-    ))
+    Some(collect_file_edges(analyzer, file, nodes, &parsed, scan))
 }
 
 pub(crate) fn parse_and_collect_with_declarations<S>(
@@ -853,15 +282,15 @@ pub(crate) fn parse_and_collect_with_declarations<S>(
     scan: S,
 ) -> Option<PerFileEdges>
 where
-    S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
+    S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
     let parsed = parse_tree_sitter_file(file, language)?;
     Some(collect_file_edges_with_declarations(
         file,
         nodes,
-        &parsed.line_starts,
+        &parsed,
         declarations,
-        |collector| scan(&parsed, collector),
+        scan,
     ))
 }
 
@@ -874,15 +303,15 @@ pub(crate) fn parse_source_and_collect_with_declarations<S>(
     scan: S,
 ) -> Option<PerFileEdges>
 where
-    S: FnOnce(&ParsedTreeFile, &mut EdgeCollector),
+    S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
     let parsed = parse_tree_sitter_source(source, language)?;
     Some(collect_file_edges_with_declarations(
         file,
         nodes,
-        &parsed.line_starts,
+        &parsed,
         declarations,
-        |collector| scan(&parsed, collector),
+        scan,
     ))
 }
 
@@ -972,6 +401,10 @@ pub(crate) fn merge_weights_and_cap<K: NodeKey>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_utils::find_line_index_for_offset;
+    use brokk_bifrost_core::analyzer::usages::inverted_edges::UsageReferenceKind;
+    use brokk_bifrost_core::analyzer::usages::inverted_edges::classify_reference_node;
+    use tree_sitter::Node;
 
     fn find_node<'tree>(root: Node<'tree>, source: &str, kind: &str, text: &str) -> Node<'tree> {
         let mut stack = vec![root];
@@ -1243,6 +676,14 @@ mod tests {
     fn record_emits_one_based_line_for_file_scoped_key() {
         use crate::analyzer::ProjectFile;
 
+        // The scan input carries a parsed tree the language would walk; this pin
+        // exercises only the offset arithmetic, so any tree will do.
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse("const a = 1;\n", None).unwrap();
+
         // `temp_dir()` is absolute on every platform (a bare "/repo" is not
         // absolute on Windows, which `ProjectFile::new` asserts).
         let file = ProjectFile::new(std::env::temp_dir(), "src/a.ts");
@@ -1269,14 +710,15 @@ mod tests {
             definitions: HashMap::default(),
         };
 
-        let mut collector = EdgeCollector::new(&line_starts, &nodes, declarations);
-        collector.record_kind(
+        let input = FileEdgeScanInput::new(&tree, "", &line_starts, &nodes, &declarations);
+        let mut per_file: PerFileEdges<UsageNodeKey> = PerFileEdges::default();
+        per_file.record_kind(
+            &input,
             callee.clone(),
             UsageReferenceKind::Other,
             offset,
             offset + 2,
         );
-        let per_file = collector.finish();
 
         let lines = per_file
             .edge_lines

@@ -229,6 +229,7 @@ pub(super) struct RankedSearchCandidate {
     score: SymbolCandidateScore,
     line: usize,
     primary_range: Range,
+    is_type_alias: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -413,7 +414,7 @@ pub(super) fn search_symbols_with_cap(
                     language_for_file(candidate.code_unit.source()),
                 );
             if params.include_tests || !is_test {
-                filtered.push((candidate.code_unit, range, is_test));
+                filtered.push((candidate.code_unit, range, is_test, candidate.is_type_alias));
             }
         }
         filtered
@@ -461,8 +462,9 @@ pub(super) fn search_symbols_with_cap(
         .flatten()
         .map(|candidate| candidate.code_unit.fq_name())
         .collect();
-    let (model_symbols, total_model_symbols) = analyzer
-        .semantic_model_overlay()
+    let semantic_model_overlay = analyzer.semantic_model_overlay();
+    let (model_symbols, total_model_symbols) = semantic_model_overlay
+        .as_deref()
         .map(|overlay| {
             let (matched, total, model_complete) = overlay.search_with_limit_filter(
                 &pattern_batch,
@@ -525,38 +527,61 @@ pub(super) fn search_symbols_with_cap(
                 complete = false;
                 break;
             }
-            let render_context = load_declaration_name_context(analyzer, &file);
+            let render_context = {
+                let _scope =
+                    profiling::scope("searchtools::search_symbols.render.load_declaration_context");
+                load_declaration_name_context(analyzer, &file)
+            };
             let render_context = render_context.as_ref();
+            let (classes, functions, fields, modules, macros) = {
+                let _scope = profiling::scope("searchtools::search_symbols.render.collect_hits");
+                (
+                    collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Class,
+                        render_context,
+                        semantic_model_overlay.as_deref(),
+                    ),
+                    collect_callable_kind_names(
+                        analyzer,
+                        &code_units,
+                        render_context,
+                        semantic_model_overlay.as_deref(),
+                    ),
+                    collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Field,
+                        render_context,
+                        semantic_model_overlay.as_deref(),
+                    ),
+                    collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Module,
+                        render_context,
+                        semantic_model_overlay.as_deref(),
+                    ),
+                    collect_ranked_kind_names(
+                        analyzer,
+                        &code_units,
+                        CodeUnitType::Macro,
+                        render_context,
+                        semantic_model_overlay.as_deref(),
+                    ),
+                )
+            };
             files.push(SearchSymbolsFile {
                 path: rel_path_string(&file),
                 loc: render_context
                     .map(|context| line_count(context.content()))
                     .unwrap_or(0),
-                classes: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Class,
-                    render_context,
-                ),
-                functions: collect_callable_kind_names(analyzer, &code_units, render_context),
-                fields: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Field,
-                    render_context,
-                ),
-                modules: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Module,
-                    render_context,
-                ),
-                macros: collect_ranked_kind_names(
-                    analyzer,
-                    &code_units,
-                    CodeUnitType::Macro,
-                    render_context,
-                ),
+                classes,
+                functions,
+                fields,
+                modules,
+                macros,
             });
         }
         files
@@ -2101,12 +2126,12 @@ fn is_model_ancestor_target(symbol: &crate::analyzer::semantic_model::SemanticMo
 pub(super) fn rank_search_symbol_candidates(
     analyzer: &dyn IAnalyzer,
     patterns: &[String],
-    code_units: Vec<(CodeUnit, Range, bool)>,
+    code_units: Vec<(CodeUnit, Range, bool, bool)>,
     cancellation: Option<&crate::CancellationToken>,
 ) -> (Vec<RankedSearchCandidate>, bool) {
     let mut ranked = Vec::new();
     let mut complete = true;
-    for (code_unit, primary_range, is_test) in code_units {
+    for (code_unit, primary_range, is_test, is_type_alias) in code_units {
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
             complete = false;
             break;
@@ -2116,6 +2141,7 @@ pub(super) fn rank_search_symbol_candidates(
             score: score_search_symbol_candidate(analyzer, patterns, &code_unit, is_test),
             code_unit,
             primary_range,
+            is_type_alias,
         });
     }
     ranked.sort_by(compare_ranked_search_candidates);
@@ -2516,46 +2542,68 @@ pub(super) fn collect_ranked_kind_names(
     code_units: &[RankedSearchCandidate],
     kind: CodeUnitType,
     render_context: Option<&DeclarationNameRangeContext>,
+    semantic_model_overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
 ) -> Vec<SearchSymbolHit> {
-    collect_ranked_names_by(analyzer, code_units, render_context, |unit| {
-        unit.kind() == kind
-    })
+    collect_ranked_names_by(
+        analyzer,
+        code_units,
+        render_context,
+        semantic_model_overlay,
+        |unit| unit.kind() == kind,
+    )
 }
 
 pub(super) fn collect_callable_kind_names(
     analyzer: &dyn IAnalyzer,
     code_units: &[RankedSearchCandidate],
     render_context: Option<&DeclarationNameRangeContext>,
+    semantic_model_overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
 ) -> Vec<SearchSymbolHit> {
-    collect_ranked_names_by(analyzer, code_units, render_context, CodeUnit::is_callable)
+    collect_ranked_names_by(
+        analyzer,
+        code_units,
+        render_context,
+        semantic_model_overlay,
+        CodeUnit::is_callable,
+    )
 }
 
 pub(super) fn collect_ranked_names_by(
     analyzer: &dyn IAnalyzer,
     code_units: &[RankedSearchCandidate],
     render_context: Option<&DeclarationNameRangeContext>,
+    semantic_model_overlay: Option<&crate::analyzer::semantic_model::SemanticModelOverlay>,
     matches_kind: impl Fn(&CodeUnit) -> bool,
 ) -> Vec<SearchSymbolHit> {
     let mut hits: Vec<_> = code_units
         .iter()
         .filter(|candidate| matches_kind(&candidate.code_unit))
         .flat_map(|candidate| {
-            let semantic_model = analyzer.semantic_model_overlay().and_then(|overlay| {
+            let semantic_model = semantic_model_overlay.and_then(|overlay| {
                 let matched = overlay.symbols_named(&candidate.code_unit.fq_name());
                 (matched.disposition
                     == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
                     .then(|| matched.records[0].provenance.clone())
             });
-            let is_type_alias = analyzer
-                .type_alias_provider()
-                .is_some_and(|provider| provider.is_type_alias(&candidate.code_unit));
-            display_signatures(analyzer, &candidate.code_unit)
+            let is_type_alias = candidate.is_type_alias;
+            let signatures = {
+                let _scope = profiling::scope(
+                    "searchtools::search_symbols.render.collect_hits.display_signatures",
+                );
+                display_signatures(analyzer, &candidate.code_unit)
+            };
+            let line = {
+                let _scope = profiling::scope(
+                    "searchtools::search_symbols.render.collect_hits.declaration_name_range",
+                );
+                search_symbol_display_range(candidate, render_context).start_line
+            };
+            signatures
                 .into_iter()
                 .map(move |signature| SearchSymbolHit {
                     symbol: display_symbol_for_target(&candidate.code_unit),
                     signature,
-                    line: search_symbol_display_range(analyzer, candidate, render_context)
-                        .start_line,
+                    line,
                     is_type_alias,
                     semantic_model: semantic_model.clone(),
                 })
@@ -2582,12 +2630,12 @@ pub(super) fn load_declaration_name_context(
 }
 
 pub(super) fn search_symbol_display_range(
-    analyzer: &dyn IAnalyzer,
     candidate: &RankedSearchCandidate,
     render_context: Option<&DeclarationNameRangeContext>,
 ) -> Range {
-    let name_range =
-        render_context.and_then(|context| context.name_range(analyzer, &candidate.code_unit));
+    let name_range = render_context.and_then(|context| {
+        context.name_range_for_declaration(&candidate.code_unit, candidate.primary_range)
+    });
     if let Some(mut name_range) = name_range {
         name_range.start_line += 1;
         name_range.end_line += 1;

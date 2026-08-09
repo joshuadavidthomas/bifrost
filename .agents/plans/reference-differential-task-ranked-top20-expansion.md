@@ -211,7 +211,7 @@ the focus.
     `fd816b03037760fde6fa5f2b0df1bd776859f18b9da63816467ad163d3169e72`.
     Final live GitHub audit confirms #1433, #1465, and #1467 are closed and
     assigned only to `jbellis`.
-- [ ] Complete C++ ranks eleven through twenty and publish its evidence and
+- [x] Complete C++ ranks eleven through twenty and publish its evidence and
   user summary.
   - [x] (2026-08-02 17:04Z) Completed C++ rank eleven
     `libarchive__libarchive` at pinned head `40a71c83`. The live selector
@@ -320,6 +320,21 @@ the focus.
     `9226096a6e139deb4c29c52096b13cf825a55a0249dcca7f891f4bfdf24fbfa7`
     and
     `3ca260b1e163edd3916a0f6310ea15ab767ad38cc40445e3acb5a624e2cfeee3`.
+  - [x] (2026-08-05) Revalidated C++ rank fifteen after later C++ resolver
+    changes at Bifrost `e926cd4d`. The new baseline audited 168 files and
+    10,000 sites against 941 inverse target groups. It exposed 27 missing
+    rows in four related structured C++ root causes. Jonathan-assigned issues
+    #1684 through #1687 cover partial-specialization alias ownership, owner
+    qualifiers, template forward-declaration names, and class-owned aliases.
+    The grouped fixes were pushed through commits `0e6df36d` and `780cacc6`.
+    Exact probes for `invalid_iterator`, `error_handler_t`, `value_t`, and the
+    final `error_type` witness are consistent. The stable featureless CLI
+    suite, six focused BehaviorTree tests, and strict workspace all-target,
+    all-feature Clippy pass. The final clean replay at pushed head `780cacc6`
+    audited all 168 files, 10,000 sites, and 944 target groups with zero
+    missing, skipped, truncated, or file-error rows. Its JSONL SHA-256 was
+    `54c0858e85ff10d1cf564562ce82db39f38a804412524fc98e64c304dbc457a3`.
+    Issues #1684 through #1687 are closed with the clean evidence.
   - [x] (2026-08-03 03:21Z) Completed C++ rank sixteen
     `GoogleCloudPlatform__esp-v2` at pinned head `1c176f5a`. Its starting
     81/81-file, 10,000-site envelope queried 535 inverse targets and exposed
@@ -386,8 +401,299 @@ the focus.
     `81e80740bdda0b4017d1bde7e84d9f78ad470ff6987e451db8ca5ca7cf16d915`
     and
     `2592520007ef93b828ff6a5e10e9c56d0714c55055776ac3fc63bda9397a23b7`.
+  - [x] (2026-08-06) Completed C++ rank twenty
+    `cppcheck-opensource__cppcheck` at pinned head `4517bc76`. Its fresh
+    persisted-cache replay at pushed Bifrost `1f0bd3ac` audited 290 files,
+    296,420 structured candidates, 10,000 sites, and all 1,226 inverse target
+    groups. It reported 3,137 consistent, 110 editor-only, 33 honestly
+    unproven, 6,720 inconclusive, and zero missing rows, with no file errors,
+    skipped targets, or truncation. The report SHA-256 is
+    `8b6aeab029f8a4ceff0998f07c679dce38e6eeb5e95b6e18bae18041273c7768`;
+    the exact-head release runner SHA-256 is
+    `59c352607e9c57c171c2a654fb1e0773bf0f5dff8079803bbeecfdae4dcc5363`.
+    Jonathan-assigned issue #1691 fixed exhaustive conditional same-FQN alias
+    families, physical alias ranges, branch isolation, and C++ store
+    invalidation. Jonathan-assigned issue #1694 made cache mode part of the
+    repository and corpus completion fingerprint. Both issues are closed and
+    assigned only to `jbellis`. Formatting, 233 C++ usage tests, all nine
+    differential runner tests, the persisted-cache epoch test, and strict
+    workspace all-target/all-feature Clippy pass. The broad featureless run
+    reached one unrelated C# wall-clock failure after 1,529 sibling tests;
+    that exact test passed alone.
+  - [x] (2026-08-06) Complete the fresh-epoch language certification and
+    reclose earlier ranks in repository order. The first ten-repository replay
+    at clean pushed head `1f0bd3ac` queried every configured target with no
+    file errors, skips, or truncation, but it correctly rejected the language
+    envelope. Fresh C++ blobs exposed 34 missing rows in rank-eleven
+    libarchive, 16 in rank-thirteen open62541, 7 in rank-fourteen Wuffs, 5 in
+    rank-sixteen esp-v2, and 8 in rank-seventeen Abseil. Ranks twelve,
+    fifteen, eighteen, nineteen, and twenty remained clean. Triage resumed at
+    libarchive; later repositories remain read-only until each earlier rank is
+    closed.
+    - [x] (2026-08-06 08:11Z) Revalidated rank eleven
+      `libarchive__libarchive` at pinned head `40a71c83`. All 34 fresh-epoch
+      misses shared one structured cause: a tagged type use with a declarator
+      was treated as a local tag declaration. Jonathan-assigned issue #1697
+      corrected that shadow test and selected a physically visible peer from
+      each repeated same-logical tag group. The fix is closed and pushed to
+      `origin/master` at `668af778`. Its regression covers repeated visible
+      forward declarations, a hidden-only definition, and a true block-scope
+      tag shadow. Formatting, all 234 C++ usage tests, and strict workspace
+      all-target/all-feature Clippy pass. The clean-head persisted replay
+      audited 98 files and 8,212 sites, then queried all 330 targets. It
+      reported 1,632 consistent, 91 honestly unproven, 6,489 inconclusive,
+      and zero missing rows, errors, skips, or truncation. Repeated physical
+      declarations keep the corrected exact-range rows unproven; the result
+      restores inverse presence without claiming one physical identity. The
+      report and runner SHA-256 values are
+      `1447fac16c2f1fb306245f13c71c921d2b14b34a465d03da1ff080c75725837e`
+      and
+      `533eb542663ff104142e628503dcc1db8957510005b285decc0705df87df7bac`.
+      Rank twelve remains clean in the fresh certification, so the next
+      active triage repository is rank thirteen `open62541__open62541`.
+    - [x] (2026-08-06 08:29Z) Revalidated rank thirteen
+      `open62541__open62541` at pinned head `1fe3a857`. The rank-eleven fix
+      removed 15 of its 16 fresh-epoch missing rows. The residual body use was
+      hidden because the callable-local shadow scan treated the function's
+      tagged return type as a body-local declaration. Jonathan-assigned issue
+      #1699 now requires both the declaration and queried reference to be in
+      the callable's structured body. It preserves namespace-scope return-tag
+      declarations and true block-scope shadows. The fix is closed and pushed
+      to `origin/master` at `c628a36c`. The exact witness is consistent, and
+      the focused regression, all 235 C++ usage tests, formatting, and strict
+      workspace all-target/all-feature Clippy pass. The clean-head persisted
+      replay audited 78 files and 10,000 sites, then queried all 302 targets.
+      It reported 2,976 consistent, 44 honestly unproven, 6,980 inconclusive,
+      and zero missing rows, errors, skips, or truncation. The report and
+      runner SHA-256 values are
+      `32dc6dfc9abcc2f32935ad0509dd486f3966ad641225c1c6eb1a01d850e08b04`
+      and
+      `63efc0366803e9bdbe3680f646bcad991ad9d99ab4c1e923b9c963ecde9b090e`.
+      The next active triage repository is rank fourteen `google__wuffs`.
+    - [x] (2026-08-06 12:00Z) Rank fourteen `google__wuffs` completed
+      depth-first repair at pinned head `46ac36bd`. A clean fresh-epoch
+      baseline had seven missing rows. The repeated-tag visibility correction
+      then changed 37 prior unproven source-fragment rows to missing because
+      those generated fragments omit local include envelopes. Jonathan-assigned
+      issue #1702 now retains these structured matches as unproven when no
+      queried target peer is physically visible. It still rejects a hidden-only
+      target group when a different same-logical peer is visible. The fix is
+      closed and pushed to `origin/master` through merge head `f1bb2c6f`.
+      Focused visibility, repeated-tag, and return-tag tests pass. The full
+      featureless gate passed all suites except one known timing-sensitive C#
+      truncation test under full load; that exact test passed alone in 0.75
+      seconds. The clean-head exact `MemOwner` witness is an exact unproven hit.
+      The clean-head full replay audited 36 files and 10,000 sites, then queried
+      all 606 targets. It reported 2,142 consistent, 17 editor-only, 75
+      honestly unproven, 7,759 inconclusive, and seven missing rows, with no
+      file errors, skips, or truncation. The exact report, full report, and
+      runner SHA-256 values are
+      `50d596748b4cb816f3f1728284bf021fd15de1ec676efc532291ec936469d1d0`,
+      `03a81d43dce5f3b9746767d8b0dd0dc511cc6b5d912ee108d2b576742340da67`,
+      and
+      `407306979b7168b49e71c0b61a070368496f48344729b3f427922896a2b8868b`.
+      Assigned issues #1703 and #1704 shared the guarded C++ type-resolution
+      path, so one grouped implementation retained both shapes as exact
+      unproven evidence. It requires a physically visible target and exact
+      structured owner or alias identity. It excludes template alias
+      applications and does not relax normal visibility. Commit `98dd40a3`
+      reached `origin/master` through merge head `d11ccdb0`; both issues are
+      closed and have clean evidence comments. All 239 C++ usage tests pass.
+      The four clean exact reports have SHA-256 values
+      `598ff6f419973d1c819fb911d86bd104e4ea5355d962f088e236b41ddbc1dbaa`,
+      `5c7e5766a24804f3e3695d6c09b65ed872bdf5a5d7ceb06991137eaf11e3d0b2`,
+      `72428b588efeac7d86088369c315deb09b461b6f10b0496b38e91ccfe90310e9`,
+      and
+      `f0a89f823f55b84cdc1d1778b58778dc7125b41bb353d21160c4b46325b7bcc0`.
+      The clean full replay now reports 2,142 consistent, 17 editor-only, 79
+      honestly unproven, 7,759 inconclusive, and three missing rows. Its
+      SHA-256 is
+      `abafd6611d0a02daf0638590a74cf0c9fbb51fb5da6942b2bac75860868265c7`.
+      Jonathan-assigned issue #1705 found that tree-sitter split a
+      function-like macro typedef into a partial `type_definition` and a
+      following identifier statement. Bifrost published the macro argument as
+      a false alias, which hid the real tagged typedef and three `repr` field
+      uses. Commit `507b0bab` now reads structured declarator fields, recovers
+      the real sibling alias with its complete signature and range, rejects a
+      non-macro near-miss, and invalidates stale C++ parsed blobs. It reached
+      `origin/master` through merge head `327a6217`; issue #1705 is closed and
+      assigned only to `jbellis`. All 240 C++ usage tests, the focused stale
+      generation test, formatting, and diff checks pass.
+      The three clean pushed-head exact witnesses are consistent. Their report
+      SHA-256 values are
+      `c241157503e852cfde7e7a5379a63e148d3bfe6b3814603ff13d0dc5144a1aed`,
+      `1c7e430a51eae972ab4ec47b11ac81b42a6e58fd3c687a076d1de2902e4b393d`,
+      and
+      `1fe79ce07f4f958d2e14f348fe393115b82a92c2726cbfb73a6ae8a9bd548510`.
+      The clean full replay audited 36 files and 10,000 sites, then queried all
+      622 targets. It reported 2,219 consistent, 17 editor-only, 70 honestly
+      unproven, 7,694 inconclusive, and zero missing rows, with no file errors,
+      skips, or truncation. The full report and runner SHA-256 values are
+      `112bd4443f86683b0ce66ec539103a5d97a405305c17d6c8d74ecbd4d56626cf`
+      and
+      `6bf35bd98b235d7460aac5cb3ee31cd97870cf8c14b38edbdc08447165df1ff0`.
+      The next active repository is rank fifteen.
+    - [x] (2026-08-06 12:57Z) Rank fifteen
+      `BehaviorTree__BehaviorTree.CPP` completed at pinned head `4630e066`.
+      The fresh pushed-head baseline kept zero missing rows across all 957
+      inverse targets. It exposed nine `invalid_location` rows for compound C++
+      operator names. Seven were declaration-like sites in the vendored JSON
+      header. Two were explicit `operator[]` calls. The reference candidate
+      frontier retained each complete structured operator range, but the
+      differential sent that range through the single lexical-token definition
+      location contract. Jonathan-assigned issue #1716 grouped these related
+      forms. An oldskool implementation pass and an independent oldskool review
+      identified the existing structured point-lookup rule used by call
+      relations. Root review moved that rule to the shared reference-candidate
+      API, retained complete report and inverse ranges, and preserved the full
+      operator evidence text. Commit `a3f77da9` reached `origin/master` through
+      merge head `a45fcbab`; issue #1716 is closed and remains assigned only to
+      `jbellis`. The focused end-to-end `operator[]` regression passes. It proves
+      exact inverse round-trip, declaration exclusion, and the unchanged normal
+      identifier path. The featureless workspace library gate passed after the
+      one Java parity fixture was skipped because this host lacks `javac` and
+      `jar`; the initial unskipped gate passed 1,821 analyzer tests before that
+      environment-only failure. The final clean replay audited all 168 files,
+      2,181,895 source bytes, 85,336 candidates, and 10,000 sites. It queried all
+      957 targets and reported 4,801 resolved forward sites, zero invalid
+      locations, 1,920 consistent, 194 editor-only, 110 honestly unproven,
+      7,776 inconclusive, and zero missing rows. It had no file errors, skipped
+      targets, truncation, or configured-limit failures. The report and exact
+      pushed-head runner SHA-256 values are
+      `ca5fb63150d88e911b80f405002e28cac50723bf6c514e44cd8ac2748f88e6cb`
+      and
+      `81f90974a3c547077cef72e35ef4cb23b739964b8dd5c3059ec8561f11ced92a`.
+      The next active repository is rank sixteen
+      `GoogleCloudPlatform__esp-v2`.
+    - [x] (2026-08-06 13:13Z) Rank sixteen
+      `GoogleCloudPlatform__esp-v2` completed at pinned head `1c176f5a`.
+      The fresh clean replay at Bifrost `4f7218b7` audited all 81 files,
+      367,301 source bytes, 14,846 structured candidates, and 10,000 sites.
+      It queried all 540 inverse targets. It reported 4,014 resolved forward
+      sites, 1,661 consistent, 71 editor-only, 34 honestly unproven, 8,234
+      inconclusive, and zero missing rows. It had no invalid locations, file
+      errors, skipped targets, truncation, or configured-limit failures. The
+      report and exact runner SHA-256 values are
+      `9825ce8980dca0b82acc9099641f20c3cd373a8f128c909897171bcff4c44b49`
+      and
+      `ab8e8801562ec1a967107ded8ef6eff06fdb358aac52a330a88658a46e4a81e8`.
+      No new issue was necessary. The next active repository is rank seventeen
+      `abseil__abseil-cpp`.
+    - [x] (2026-08-06 15:33Z) Rank seventeen `abseil__abseil-cpp`
+      completed at pinned head `e65a8cbf`. The fresh baseline at Bifrost
+      `f3ceca2c` audited all 614 files and 10,000 sites. It exposed six missing
+      rows across one recovered namespace-sentinel root cause. Two were
+      qualified `EnableIf` template-alias references. One was a nested
+      `StructuredProtoField::Varint` alias. Three were out-of-line
+      `ElfMemImage` and `Win32Waiter` owner qualifiers under unknown guards.
+      Jonathan-assigned issue #1728 grouped these related forms. An oldskool
+      implementation pass, an independent oldskool owner review, and a final
+      oldskool cycle review informed the change. Root review retained exact
+      structured alias identity, required unique visible candidates, reused
+      recovered lexical scope, rejected alias cycles, and kept incompatible
+      unknown guards unproven. Implementation commit `0b70286f` reached
+      `origin/master` through merge head `46be6d27`; issue #1728 is closed and
+      remains assigned only to `jbellis`.
+      All 241 C++ usage tests and featureless workspace Clippy pass. The
+      featureless workspace unit gate also passes. The full 1,539-test usage
+      suite passed 1,538 tests; its unrelated C# wall-clock test failed under
+      load and passed alone in 1.04 seconds. All six clean exact probes report
+      zero missing. Both `EnableIf` rows and `Varint` are consistent. Both
+      Win32 rows retain exact unproven inverse hits. The `ElfMemImage` probe is
+      honestly inconclusive because the inverse unproven sample is truncated.
+      The exact-report SHA-256 values are
+      `d0319c1c0f19be270aebbee396db05895730bd45884289e4fbe18edff69efee4`,
+      `38ec5b3b40d560cacfb185a1ba9e1a674977aa4b44630d3ebbf0aec4225bcc64`,
+      `ede17800771976dfbf8b7043779a32a32fc6dd599ded9cd410545fdc789ddea3`,
+      `c4eed47284d36cafa8a75ede7b335660e0246476313535dcf555924487622a76`,
+      `c867c4f4bef75554c023b781fcac40180efe8356b98f097704205522cd4332ea`,
+      and
+      `74c9fec06db36ba2465c6c41ce0ec7b8cdb6a3796d69d7f91fbae4b804ea528d`.
+      The final clean replay at pushed head `46be6d27` audited 614/614 files,
+      6,233,064 source bytes, 211,947 candidates, and 10,000 sites. It resolved
+      4,912 forward sites and queried 1,000 of 1,143 target groups. It reported
+      1,357 consistent, 73 editor-only, 97 honestly unproven, 8,473
+      inconclusive, and zero missing rows, with no file errors or configured
+      limit failures. The final report and runner SHA-256 values are
+      `6fd1ee1ad37ec964ebbf04fe57cbe48c67a7184b7eb967b586085fd24d3fd75c`
+      and
+      `5508ea3494449e8c8d8b44e0c3e53c37a12a11e2cfae8899d2b60d577ac4c611`.
+      The next active repository is rank eighteen `Mbed-TLS__mbedtls`.
+    - [x] (2026-08-06 15:39Z) Rank eighteen `Mbed-TLS__mbedtls`
+      completed at pinned head `9e9eb069`. The live `tasks.py` selector assigns
+      it 16 qualifying C++ tasks after the `large-repos.csv` exclusion. The
+      fresh clean replay at Bifrost `939c64e9` audited all 57 eligible files,
+      743,297 source bytes, all 6,716 candidates, and all 4,521 sites. It
+      resolved 2,283 forward sites and queried all 91 inverse targets. It
+      reported 407 consistent, 148 honestly unproven, 3,966 inconclusive, and
+      zero editor-only or missing rows. It had no invalid locations, file
+      errors, skipped targets, truncation, or configured-limit failures. No
+      issue was necessary. The report and exact-head runner SHA-256 values are
+      `cc757db21e7e9e065700aa5899aa1d71a5d263d5c0a0a506f45cb28e3ba2aafb`
+      and
+      `133f08a76c7db61e02603f1570624f5a15da980c13578301985fcbab1c307493`.
+      The next active repository is rank nineteen `pyro-ppl__pyro`.
+    - [x] (2026-08-05) Rank nineteen `pyro-ppl__pyro` completed at pinned
+      head `6cc3ecdc`. Its complete C++ surface is one source file. The final
+      clean certification audited all 589 candidates and all 581 sites. It
+      queried all four inverse targets and reported six consistent and 575
+      inconclusive rows. It had zero missing rows, errors, skips, truncation,
+      or candidate exclusions. No issue was necessary.
+    - [x] (2026-08-05) Rank twenty `cppcheck-opensource__cppcheck` completed
+      at pinned head `4517bc76`. The uncapped replay exposed one valid missing
+      type reference after the earlier 1,000-target boundary. Jonathan-assigned
+      issue #1734 grouped the forward-route and inverse-parity symptom because
+      both came from one visible same-FQN declaration defect. Commit `9c45dacc`
+      retains physically visible same-FQN type declarations while it preserves
+      alias identity. The public symbols API resolves the witness to the real
+      `XMLDocument` body. The final-head exact report has an exact inverse hit
+      and zero missing rows. Issue #1734 is closed and assigned only to
+      `jbellis`. The final clean repository replay audited 290 files, 296,420
+      candidates, and 10,000 sites. It queried all 1,225 inverse targets and
+      reported 3,136 consistent, 110 editor-only, 34 honestly unproven, 6,720
+      inconclusive, and zero missing rows. It had no file errors, skips,
+      truncation, or candidate exclusions.
+    - [x] (2026-08-05) Rebuilt at clean published head `1ed3c614` and
+      certified all ten selected C++ repositories with a 2,000-target cap.
+      The accepted envelope contains 1,425 files, 667,798 candidates, 73,885
+      sites, and 5,214/5,214 inverse targets. It has zero missing rows, file
+      errors, candidate exclusions, skipped targets, or truncation. The raw
+      JSONL SHA-256 is
+      `4dd1200ac582e9954dd2b2d786d3225055c12f54f9f708f311a78d4db31c270e`.
+      The durable manifest and summary are
+      `.agents/docs/reference-differential/cpp-task-ranks11-20-1ed3c614.jsonl`
+      and its `-summary.md` companion. A later fast-forward to `8c107ce1`
+      changed repository cloning, dependency checks, and license generation.
+      It did not change C++ or shared symbol behavior. The focused #1734
+      regression passed again after that fast-forward.
 - [ ] Complete C# ranks eleven through twenty and publish its evidence and user
   summary.
+  - [x] (2026-08-06) Completed C# rank eleven `NLog__NLog` at pinned head
+    `a342b92b`. Its starting 10,000-site envelope had two missing rows. Issue
+    #1735 now records `OptionalAttribute` parameters as omittable and advances
+    the C# analysis epoch so persisted caches rebuild the changed callable
+    metadata. Issue #1736 keeps constructor fallback on the exact structured
+    generic owner and returns that owner for its implicit zero-argument
+    constructor. Both issues were assigned only to `jbellis`, fixed, pushed,
+    and closed. The final clean persisted replay at Bifrost `6f998f39` audited
+    494/494 files, 88,765 candidates, 10,000 sites, and all 1,135 inverse
+    targets. It reported 2,274 consistent, 277 editor-only, 14 honestly
+    unproven, 7,435 inconclusive, and zero missing rows. It had no file errors,
+    candidate exclusions, skips, or truncation. Its JSONL SHA-256 is
+    `a897f68c5a3296fdeab3771c4859076829dc69c4dcd0c3647905c26fb98b5e81`.
+    Final exact #1735 and #1736 probes are each 1/1 consistent. Their SHA-256
+    values are
+    `2bc031af7a7ed1dad89abdc40a3d0d57a428785714287b04d16cbac144887f5f`
+    and
+    `e3ba2d02573db0160b935a247357eeee26c18b7ce3cf5a2ccd6b0392932b3e1f`.
+  - [x] (2026-08-06) Completed C# rank twelve
+    `openbullet__OpenBullet2` at pinned head `6b244ac7`. The clean persisted
+    envelope audited 978/978 files, 137,240 candidates, 10,000 sites, and all
+    1,604 inverse targets. It reported 2,553 consistent, 267 editor-only, 38
+    honestly unproven, 7,142 inconclusive, and zero missing rows. It had no
+    file errors, candidate exclusions, skips, or truncation. An independent
+    review found no legitimate new issue. The final JSONL SHA-256 is
+    `becc998d68c02405d7062ffcaf851063321236d0bc214dd4af3426480f413754`.
 - [ ] Complete Go ranks eleven through twenty and publish its evidence and user
   summary.
 - [ ] Complete Java ranks eleven through twenty and publish its evidence and
@@ -545,6 +851,38 @@ the focus.
   `operator_name` and a constructor `identifier`, retain the OpenJDK control,
   and bump the C++ persistence epoch.
 
+- Observation: the rank-twenty C++ epoch bump invalidated all older C++
+  persisted blobs, so the final language certification became the first
+  same-head fresh extraction for several earlier ranks. It exposed 70 raw
+  missing rows across libarchive, open62541, Wuffs, esp-v2, and Abseil while
+  cppcheck, cJSON, BehaviorTree, Mbed TLS, and Pyro stayed clean. This proves
+  that a clean replay from an older analyzer blob is not final evidence after
+  a declaration-extraction epoch change. The campaign therefore returned to
+  rank eleven and will repeat repository-depth-first closure before it accepts
+  a C++ language manifest.
+
+- Observation: all 34 fresh libarchive misses formed one root-cause group.
+  The local-shadow scan treated `struct Foo *value` as if it declared a local
+  `Foo` tag. The existing structured declaration predicate distinguishes that
+  use from a real block-scope `struct Foo;` declaration. A second visibility
+  guard is necessary because type scan keys collapse repeated physical
+  declarations with one logical name. A consumer can use that group only when
+  at least one physical peer is in its include closure.
+
+- Observation: repository-depth-first replay can still reuse a prior fix.
+  The libarchive correction removed 15 of open62541's 16 initial misses. The
+  one residual had a separate scope boundary and warranted issue #1699. This
+  kept the grouping useful without combining two different root causes in one
+  ticket.
+
+- Observation: an ephemeral exact probe can pass while a persisted repository
+  replay still reads stale declaration metadata. NLog's #1735 exact probe was
+  consistent after the extractor fix, but the warm full replay retained the
+  old exact arity and reproduced one missing row. Advancing the C# analysis
+  epoch forced a fresh extraction; the next persisted replay was clean across
+  all 1,135 targets. Declaration-metadata fixes therefore require an epoch
+  review before repository acceptance.
+
 ## Decision Log
 
 - Decision: Treat this as a new ranks-eleven-through-twenty expansion rather
@@ -596,11 +934,12 @@ the focus.
 
 ## Outcomes & Retrospective
 
-The expansion is in progress. The exact 110-repository scope has been derived
-from the live filtered selector. C rank eleven is locally complete as an honest
-zero-file envelope with no issue scope; the remaining 109 repository
-transitions, C final certification, durable evidence publication, and campaign
-gates remain.
+The expansion is in progress. The exact 110-repository scope comes from the
+live filtered selector. C and C++ ranks eleven through twenty are complete and
+have published language manifests. C# ranks eleven and twelve are complete.
+NLog closed issues #1735 and #1736. OpenBullet2 needed no issue. Both final
+persisted envelopes are clean at the pushed Bifrost head. The campaign
+continues with C# rank thirteen.
 
 ## Context and Orientation
 

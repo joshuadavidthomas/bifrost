@@ -369,8 +369,6 @@ jobs:
 
       - name: Smoke staged agent plugin with built binary
         shell: bash
-        env:
-          BIFROST_MCP_RMCP: 'on'
         run: >
           node scripts/smoke-agent-plugin-release.mjs
           --plugin-dir "${RUNNER_TEMP}/bifrost-agent-prepublish/bifrost-agent"
@@ -487,9 +485,126 @@ jobs:
       contents: read
       id-token: write
 
-  publish-crate-analysis:
-    name: publish analysis crate after core
+  publish-crate-go:
+    name: publish go language crate after core
     needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-go
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-cpp:
+    name: publish cpp language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-cpp
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-js-ts:
+    name: publish js-ts language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-js-ts
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-jvm:
+    name: publish jvm language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-jvm
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-csharp:
+    name: publish csharp language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-csharp
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-php:
+    name: publish php language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-php
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-python:
+    name: publish python language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-python
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-ruby:
+    name: publish ruby language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-ruby
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-rust:
+    name: publish rust language crate after core
+    needs: [release-context, promotion-evidence, publish-crate-core]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-rust
+    permissions:
+      contents: read
+      id-token: write
+
+  publish-crate-analysis:
+    name: publish analysis crate after core, cpp, csharp, go, js-ts, jvm, php, python, ruby and rust
+    needs: [release-context, promotion-evidence, publish-crate-core, publish-crate-cpp, publish-crate-csharp, publish-crate-go, publish-crate-js-ts, publish-crate-jvm, publish-crate-php, publish-crate-python, publish-crate-ruby, publish-crate-rust]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -1072,8 +1187,6 @@ jobs:
 
       - name: Smoke packaged launcher and MCP
         shell: bash
-        env:
-          BIFROST_MCP_RMCP: 'on'
         run: >
           node scripts/smoke-agent-plugin-release.mjs
           --plugin-dir "${RUNNER_TEMP}/bifrost-agent-release/bifrost-agent"

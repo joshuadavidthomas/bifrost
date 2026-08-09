@@ -60,7 +60,7 @@ const CROSS_LANGUAGE_ACQUIRE_ENDPOINT: &str = r#"(endpoint
   :categories [resource.lifecycle resource.acquire]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (union
         (language typescript (call :callee (name "openResource")))
         (language java (call :callee (name "openResource")))))
@@ -75,7 +75,7 @@ const CROSS_LANGUAGE_CLOSE_ENDPOINT: &str = r#"(endpoint
   :categories [resource.lifecycle resource.close]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (union
         (language typescript (call :callee (name "closeResource")))
         (language java (call :callee (name "closeResource")))))
@@ -90,7 +90,7 @@ const DOMINANT_CLOSE_ENDPOINT: &str = r#"(endpoint
   :categories [resource.lifecycle resource.close]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (language typescript
         (call :callee (name "closeResource"))))
   :binding (argument :index 0)
@@ -104,7 +104,7 @@ const DOMINANT_ACQUIRE_ENDPOINT: &str = r#"(endpoint
   :categories [resource.lifecycle resource.acquire]
   :selector
     (rql
-      :schema-version 2
+      :schema-version 1
       (language typescript
         (call :callee (name "openResource"))))
   :binding return-value
@@ -891,7 +891,7 @@ fn strict_versions_endpoint_roots_and_typestate_execution_have_typed_statuses() 
     assert!(
         String::from_utf8_lossy(&accepted_inference.stdout)
             .contains(
-                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 12"
+                "policy bifrost.security.inferred-dynamic-eval inferred policy schema 1 and RQL schema 1"
             )
     );
 
@@ -1697,6 +1697,57 @@ fn policy_mode_is_exclusive_and_output_failures_use_status_two_without_clobberin
         vec![
             "--policy-file",
             "policies/dynamic-eval.rqlp",
+            "--diff-base",
+            "HEAD",
+            "--diff-base",
+            "HEAD~1",
+        ],
+        vec!["--policy-file", "policies/dynamic-eval.rqlp", "--diff-base"],
+        vec!["--list-policies", "--diff-base", "HEAD"],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--accept-current",
+            "--fail-on",
+            "warning",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--accept-current",
+            "--diff-base",
+            "HEAD",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--accept-current",
+            "--accept-current",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--baseline-file",
+            "reviews/one.json",
+            "--baseline-file",
+            "reviews/two.json",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--baseline-file",
+        ],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--baseline-file",
+            "/outside/baseline.json",
+        ],
+        vec!["--list-policies", "--accept-current"],
+        vec!["--list-policies", "--baseline-file", "reviews/one.json"],
+        vec![
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
             "--format",
             "json",
             "--verbose",
@@ -1842,5 +1893,1074 @@ fn output_path_may_be_outside_the_analyzed_workspace() {
         String::from_utf8(file_output)
             .unwrap()
             .contains("Dynamic evaluation is forbidden")
+    );
+}
+
+const DIFF_GATE_POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "test.diff-gate"
+  :name "Diff gate"
+  :message "Avoid target"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql :schema-version 1
+          (language typescript (function :name "target")))))"#;
+
+const DIFF_GATE_ARGS: &[&str] = &[
+    "--policy-file",
+    "policies/diff-gate.rqlp",
+    "--evaluation-date",
+    "2026-07-27",
+    "--fail-on",
+    "warning",
+];
+
+/// One committed finding in `app.ts`; the policy file itself is committed too.
+fn committed_diff_project() -> BuiltInlineTestProject {
+    let project = InlineTestProject::new()
+        .file("app.ts", "export function target() { return 1; }\n")
+        .file("policies/diff-gate.rqlp", DIFF_GATE_POLICY)
+        .build();
+    crate::common::init_git_repo_with_identity(project.root());
+    crate::common::run_git(project.root(), &["add", "."]);
+    crate::common::run_git(project.root(), &["commit", "-m", "base"]);
+    project
+}
+
+fn diff_args<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = DIFF_GATE_ARGS.to_vec();
+    args.extend_from_slice(extra);
+    args
+}
+
+#[test]
+fn diff_base_narrows_the_gate_to_new_findings_across_formats() {
+    let project = committed_diff_project();
+
+    // Committed-only worktree: the persisting finding gates without the flag
+    // and stops gating with it.
+    let full = run(project.root(), &diff_args(&["--format", "json"]));
+    assert_status(&full, 1);
+    let full = json_stdout(&full);
+    assert!(full.get("diff").is_none());
+    assert!(full["runs"][0]["findings"][0].get("diff").is_none());
+    let clean = run(project.root(), &diff_args(&["--diff-base", "HEAD"]));
+    assert_status(&clean, 0);
+    assert!(
+        String::from_utf8_lossy(&clean.stdout)
+            .contains("; diff: 0 new, 1 persisting, 0 fixed against HEAD")
+    );
+
+    // One new uncommitted finding gates, and all three formats agree on the
+    // classification.
+    fs::write(
+        project.root().join("extra.ts"),
+        "export function target() { return 2; }\n",
+    )
+    .expect("new offending source");
+    let json = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "json"]),
+    );
+    assert_status(&json, 1);
+    let report = json_stdout(&json);
+    assert_eq!(report["diff"]["new_count"], 1);
+    assert_eq!(report["diff"]["persisting_count"], 1);
+    assert_eq!(report["diff"]["fixed_count"], 0);
+    assert_eq!(report["diff"]["degraded"], false);
+    for finding in report["runs"][0]["findings"].as_array().expect("findings") {
+        let expected = match finding["primary"]["path"].as_str().expect("path") {
+            "app.ts" => "persisting",
+            "extra.ts" => "new",
+            other => panic!("unexpected finding path {other}"),
+        };
+        assert_eq!(finding["diff"]["disposition"], expected);
+    }
+
+    let sarif = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "sarif"]),
+    );
+    assert_status(&sarif, 1);
+    let sarif = json_stdout(&sarif);
+    for result in sarif["runs"][0]["results"].as_array().expect("results") {
+        let uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+            .as_str()
+            .expect("uri");
+        let expected = match uri {
+            "app.ts" => "unchanged",
+            "extra.ts" => "new",
+            other => panic!("unexpected result uri {other}"),
+        };
+        assert_eq!(result["baselineState"], expected, "{result:#}");
+    }
+    assert_eq!(
+        sarif["runs"][0]["properties"]["bifrost.diffBaseline"]["new_count"],
+        1
+    );
+
+    let human = run(project.root(), &diff_args(&["--diff-base", "HEAD"]));
+    assert_status(&human, 1);
+    let human = String::from_utf8(human.stdout).expect("UTF-8 human output");
+    assert!(human.contains("extra.ts"), "{human}");
+    assert!(!human.contains("app.ts"), "{human}");
+    assert!(
+        human.contains("; diff: 1 new, 1 persisting, 0 fixed against HEAD"),
+        "{human}"
+    );
+}
+
+#[test]
+fn suppressed_new_finding_does_not_gate_in_diff_mode() {
+    let project = committed_diff_project();
+    fs::write(
+        project.root().join("extra.ts"),
+        "export function target() { return 2; }\n",
+    )
+    .expect("new offending source");
+    let baseline = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "json"]),
+    );
+    assert_status(&baseline, 1);
+    let baseline = json_stdout(&baseline);
+    let new_finding = baseline["runs"][0]["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .find(|finding| finding["diff"]["disposition"] == "new")
+        .expect("one new finding");
+    let suppression_path = project.root().join(".bifrost/suppressions.json");
+    fs::create_dir_all(suppression_path.parent().unwrap()).unwrap();
+    fs::write(
+        &suppression_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "suppressions": [{
+                "policy_id": "test.diff-gate",
+                "finding_id": new_finding["id"],
+                "identity_stability": "strong",
+                "status": "accepted",
+                "reason": "Reviewed compatibility boundary",
+                "policy_hash_at_acceptance": baseline["rules"][0]["policy_hash"],
+                "accepted_by": "security-review",
+                "accepted_at": "2026-07-01",
+                "expires_at": "2026-07-27"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let suppressed = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "json"]),
+    );
+    assert_status(&suppressed, 0);
+    let suppressed = json_stdout(&suppressed);
+    // The classification is unchanged; only the gate is.
+    assert_eq!(suppressed["diff"]["new_count"], 1);
+    assert_eq!(suppressed["diff"]["persisting_count"], 1);
+}
+
+#[test]
+fn unreliable_diff_base_degrades_to_full_gating_with_a_loud_diagnostic() {
+    // The committed suppressions document is invalid, so the base evaluation
+    // is unreliable; the repaired working tree keeps the head reliable.
+    let project = InlineTestProject::new()
+        .file("app.ts", "export function target() { return 1; }\n")
+        .file("policies/diff-gate.rqlp", DIFF_GATE_POLICY)
+        .file(".bifrost/suppressions.json", "{ not json")
+        .build();
+    crate::common::init_git_repo_with_identity(project.root());
+    crate::common::run_git(project.root(), &["add", "."]);
+    crate::common::run_git(project.root(), &["commit", "-m", "base"]);
+    fs::remove_file(project.root().join(".bifrost/suppressions.json"))
+        .expect("repair working tree");
+
+    let output = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "json"]),
+    );
+    assert_status(&output, 2);
+    let report = json_stdout(&output);
+    assert_eq!(report["diff"]["degraded"], true);
+    assert_eq!(report["diff"]["new_count"], 0);
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "diff-base-unreliable"),
+        "{report:#}"
+    );
+    // Full gating: the finding carries no diff decision and still counts.
+    assert!(report["runs"][0]["findings"][0].get("diff").is_none());
+}
+
+#[test]
+fn unresolvable_diff_base_and_non_git_root_exit_two() {
+    let project = committed_diff_project();
+    let unresolvable = run(
+        project.root(),
+        &diff_args(&["--diff-base", "does-not-exist"]),
+    );
+    assert_status(&unresolvable, 2);
+    assert!(unresolvable.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&unresolvable.stderr).contains("does-not-exist"),
+        "{}",
+        String::from_utf8_lossy(&unresolvable.stderr)
+    );
+
+    let plain = InlineTestProject::new()
+        .file("app.ts", "export function target() { return 1; }\n")
+        .file("policies/diff-gate.rqlp", DIFF_GATE_POLICY)
+        .build();
+    let non_git = run(plain.root(), &diff_args(&["--diff-base", "HEAD"]));
+    assert_status(&non_git, 2);
+    assert!(
+        String::from_utf8_lossy(&non_git.stderr).contains("not inside a git repository"),
+        "{}",
+        String::from_utf8_lossy(&non_git.stderr)
+    );
+}
+
+/// Documents the accepted rename limitation: a pure rename re-keys every
+/// finding in the file, so the diff reports one fixed plus one new pair. A
+/// future rename-tracking improvement must change this test deliberately.
+#[test]
+fn pure_rename_currently_reports_fixed_plus_new() {
+    let project = committed_diff_project();
+    fs::rename(
+        project.root().join("app.ts"),
+        project.root().join("renamed.ts"),
+    )
+    .expect("rename tracked source");
+
+    let output = run(
+        project.root(),
+        &diff_args(&["--diff-base", "HEAD", "--format", "json"]),
+    );
+    assert_status(&output, 1);
+    let report = json_stdout(&output);
+    assert_eq!(report["diff"]["new_count"], 1);
+    assert_eq!(report["diff"]["persisting_count"], 0);
+    assert_eq!(report["diff"]["fixed_count"], 1);
+    assert_eq!(
+        report["runs"][0]["findings"][0]["primary"]["path"],
+        "renamed.ts"
+    );
+    assert_eq!(
+        report["runs"][0]["findings"][0]["diff"]["disposition"],
+        "new"
+    );
+}
+
+const BASELINE_GATE_ARGS: &[&str] = &[
+    "--policy-file",
+    "policies/dynamic-eval.rqlp",
+    "--evaluation-date",
+    "2026-08-08",
+    "--fail-on",
+    "warning",
+];
+
+/// One Python workspace with `count` distinct offending call sites.
+fn bulk_finding_project(count: usize) -> BuiltInlineTestProject {
+    let mut source = String::new();
+    for index in 0..count {
+        source.push_str(&format!(
+            "def run_{index}(value):\n    return eval(value)\n\n"
+        ));
+    }
+    InlineTestProject::new()
+        .file("src/bulk.py", source)
+        .file("policies/dynamic-eval.rqlp", DYNAMIC)
+        .build()
+}
+
+#[test]
+fn accept_current_onboards_beyond_the_suppression_cap_and_new_findings_still_gate() {
+    // 600 findings: beyond the 512-record suppression cap, within the
+    // 1000-findings-per-policy retention budget.
+    let project = bulk_finding_project(600);
+    let gating = run(project.root(), BASELINE_GATE_ARGS);
+    assert_status(&gating, 1);
+
+    let accepted = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-08-08",
+            "--accept-current",
+        ],
+    );
+    assert_status(&accepted, 0);
+    let stderr = String::from_utf8_lossy(&accepted.stderr);
+    assert!(
+        stderr.contains(
+            "baseline accepted 600 findings into .bifrost/baseline.json \
+             (0 weak-identity findings excluded)"
+        ),
+        "{stderr}"
+    );
+    let document: Value = serde_json::from_str(
+        &fs::read_to_string(project.root().join(".bifrost/baseline.json"))
+            .expect("baseline document written"),
+    )
+    .expect("baseline document is JSON");
+    assert_eq!(document["schema_version"], 1);
+    let finding_ids = document["policies"][0]["finding_ids"]
+        .as_array()
+        .expect("finding ids");
+    assert_eq!(finding_ids.len(), 600);
+
+    let clean = run(project.root(), BASELINE_GATE_ARGS);
+    assert_status(&clean, 0);
+    let summary = String::from_utf8_lossy(&clean.stdout).to_string();
+    assert!(
+        summary.contains("; baseline: 600 accepted of 600 entries via .bifrost/baseline.json"),
+        "{summary}"
+    );
+    assert!(summary.contains("0 active findings"), "{summary}");
+
+    // Regeneration is explicit and idempotent: a second acceptance rewrites
+    // the same document.
+    let reaccepted = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-08-08",
+            "--accept-current",
+        ],
+    );
+    assert_status(&reaccepted, 0);
+    let rewritten: Value = serde_json::from_str(
+        &fs::read_to_string(project.root().join(".bifrost/baseline.json"))
+            .expect("baseline document rewritten"),
+    )
+    .expect("rewritten baseline is JSON");
+    assert_eq!(rewritten, document);
+
+    // A finding introduced after acceptance still gates.
+    fs::write(
+        project.root().join("src/regression.py"),
+        "def run_more(value):\n    return eval(value)\n",
+    )
+    .expect("new offending source");
+    let regressed = run(
+        project.root(),
+        &extended_args(BASELINE_GATE_ARGS, &["--format", "json"]),
+    );
+    assert_status(&regressed, 1);
+    let report = json_stdout(&regressed);
+    assert_eq!(report["baseline"]["entry_count"], 600);
+    assert_eq!(report["baseline"]["applied_count"], 600);
+    assert_eq!(report["baseline"]["result_omitted_count"], 0);
+}
+
+fn extended_args<'a>(base: &[&'a str], extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = base.to_vec();
+    args.extend_from_slice(extra);
+    args
+}
+
+#[test]
+fn baseline_review_agrees_across_json_and_sarif_and_drift_does_not_reactivate() {
+    let project = bulk_finding_project(1);
+    let accepted = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-08-08",
+            "--accept-current",
+        ],
+    );
+    assert_status(&accepted, 0);
+
+    // Edit the policy's presentation: the semantic hash changes, the entries
+    // drift, and the accepted finding stays accepted.
+    let changed_policy = DYNAMIC
+        .replace(
+            ":message \"Dynamic evaluation is forbidden\"",
+            ":message \"Dynamic evaluation requires review\"",
+        )
+        .replace(":severity warning", ":severity error");
+    assert_ne!(changed_policy, DYNAMIC);
+    fs::write(
+        project.root().join("policies/dynamic-eval.rqlp"),
+        changed_policy,
+    )
+    .expect("edit policy presentation");
+
+    let json = run(
+        project.root(),
+        &extended_args(BASELINE_GATE_ARGS, &["--format", "json"]),
+    );
+    assert_status(&json, 0);
+    let json = json_stdout(&json);
+    assert_eq!(json["baseline"]["entry_count"], 1);
+    assert_eq!(json["baseline"]["applied_count"], 1);
+    assert_eq!(json["baseline"]["drifted_count"], 1);
+    assert_eq!(
+        json["baseline"]["entries"][0]["policy_hash_state"],
+        "drifted"
+    );
+    assert_eq!(json["baseline"]["entries"][0]["applied"], true);
+    assert_eq!(
+        json["runs"][0]["findings"][0]["baseline"]["policy_hash_state"],
+        "drifted"
+    );
+
+    let sarif = run(
+        project.root(),
+        &extended_args(BASELINE_GATE_ARGS, &["--format", "sarif"]),
+    );
+    assert_status(&sarif, 0);
+    let sarif = json_stdout(&sarif);
+    // Cross-format agreement: the SARIF run property is the same canonical
+    // review object the JSON report carries.
+    assert_eq!(
+        sarif["runs"][0]["properties"]["bifrost.baseline"],
+        json["baseline"]
+    );
+    let suppression = &sarif["runs"][0]["results"][0]["suppressions"][0];
+    assert_eq!(suppression["kind"], "external");
+    assert_eq!(suppression["status"], "accepted");
+    assert_eq!(suppression["properties"]["bifrost.decision"], "baseline");
+    assert_eq!(
+        suppression["properties"]["bifrost.policyHashState"],
+        "drifted"
+    );
+}
+
+#[test]
+fn malformed_baseline_is_exit_two_and_an_unreliable_run_refuses_acceptance() {
+    // A malformed baseline document is a diagnostic and exit 2 on every run,
+    // including an acceptance run, which must not overwrite it.
+    let project = bulk_finding_project(1);
+    let baseline_path = project.root().join(".bifrost/baseline.json");
+    fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+    fs::write(&baseline_path, "{ not json").unwrap();
+
+    let gating = run(
+        project.root(),
+        &extended_args(BASELINE_GATE_ARGS, &["--format", "json"]),
+    );
+    assert_status(&gating, 2);
+    let report = json_stdout(&gating);
+    assert!(report.get("baseline").is_none());
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "baseline-load-failed"),
+        "{report:#}"
+    );
+
+    let refused = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-08-08",
+            "--accept-current",
+        ],
+    );
+    assert_status(&refused, 2);
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("no baseline was written"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&baseline_path).unwrap(),
+        "{ not json",
+        "a refused acceptance must not touch the document"
+    );
+
+    // Any other unreliability refuses acceptance the same way and writes
+    // nothing at all.
+    fs::remove_file(&baseline_path).unwrap();
+    fs::write(
+        project.root().join(".bifrost/suppressions.json"),
+        "{ not json",
+    )
+    .unwrap();
+    let unreliable = run(
+        project.root(),
+        &[
+            "--policy-file",
+            "policies/dynamic-eval.rqlp",
+            "--evaluation-date",
+            "2026-08-08",
+            "--accept-current",
+        ],
+    );
+    assert_status(&unreliable, 2);
+    assert!(
+        !baseline_path.exists(),
+        "an unreliable run cannot define a baseline"
+    );
+}
+
+/// A minimal JDK stdlib pack pinned to exactly 21.0.2, installable into a
+/// workspace-configured catalog so a CI-shaped run can activate it (#1868).
+const JDK_21_FIXTURE_PACK: &str = r#"{
+  "schema_version": 1,
+  "pack_id": "fixture.jdk",
+  "version": "21.0.2",
+  "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "jdk", "requirement": "=21.0.2" }]
+  },
+  "provenance": { "source": "checked-in test source", "revision": "fixture-v1" },
+  "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "jdk.core",
+    "activation": [{
+      "toolchain": { "name": "jdk", "version": "=21.0.2" },
+      "targets": ["jvm"]
+    }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "jdk.java-util-arraylist",
+        "name": "java.util.ArrayList",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/ArrayList.java",
+          "symbol": "java.util.ArrayList"
+        }
+      }],
+      "members": [],
+      "relations": []
+    }
+  }]
+}"#;
+
+/// One Java workspace whose packs document opts into the jvm ecosystem and
+/// names a catalog pre-loaded with the JDK 21 fixture pack.
+fn packs_document_project() -> BuiltInlineTestProject {
+    let project = InlineTestProject::new()
+        .file("src/Main.java", JAVA_RESOURCE_SOURCE)
+        .file(
+            ".bifrost/packs.json",
+            r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#,
+        )
+        .build();
+    install_jdk_fixture_pack(project.root());
+    project
+}
+
+/// Compile the JDK 21 fixture pack and install it into the workspace's
+/// configured catalog directory.
+fn install_jdk_fixture_pack(root: &Path) {
+    install_fixture_pack(root, JDK_21_FIXTURE_PACK);
+}
+
+/// Compile `source` as a fixture pack and install it into the workspace's
+/// configured catalog directory.
+fn install_fixture_pack(root: &Path, source: &str) {
+    use brokk_bifrost::analyzer::semantic_model::{
+        CatalogOpenMode, CatalogOptions, CompilerOptions, DurablePackSource, DurablePackSourceKind,
+        SemanticPackCatalog, SourceFormat, compile_source,
+    };
+    let compiled = compile_source(
+        SourceFormat::Json,
+        source.as_bytes(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("fixture pack compilation failed: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open(
+        &root.join(".bifrost/packs-catalog"),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .expect("open the workspace-configured catalog");
+    catalog
+        .install(
+            &compiled,
+            &DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: "test:fixture.jdk@21.0.2".to_owned(),
+            },
+        )
+        .expect("install the fixture pack");
+}
+
+/// One fake JDK home: a `release` file with the exact version and no
+/// `src.zip`, so discovery must select an installed pack or reject loudly.
+fn fake_jdk_home(root: &Path, version: &str) -> PathBuf {
+    let home = root.join(format!("jdk-{version}"));
+    fs::create_dir_all(&home).expect("create fake JDK home");
+    fs::write(
+        home.join("release"),
+        format!("JAVA_VERSION=\"{version}\"\n"),
+    )
+    .expect("write JDK release file");
+    home
+}
+
+fn run_with_java_home(root: &Path, home: &Path, args: &[&str]) -> Output {
+    bifrost(root)
+        .env("JAVA_HOME", home)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run bifrost {args:?}: {error}"))
+}
+
+const PACKS_RUN_ARGS: &[&str] = &[
+    "--policy-id",
+    "bifrost.correctness.dynamic-evaluation",
+    "--evaluation-date",
+    "2026-07-28",
+    "--fail-on",
+    "never",
+    "--format",
+    "json",
+];
+
+#[test]
+fn packs_document_activation_decisions_appear_in_the_policy_report() {
+    let project = packs_document_project();
+    let homes = tempfile::tempdir().expect("fake JDK home root");
+
+    // Exact toolchain match: the installed pack is selected and the report
+    // says so.
+    let matched = run_with_java_home(
+        project.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        PACKS_RUN_ARGS,
+    );
+    assert_status(&matched, 0);
+    let report = json_stdout(&matched);
+    assert_eq!(report["packs"]["document_path"], ".bifrost/packs.json");
+    assert_eq!(report["packs"]["ecosystems"], serde_json::json!(["jvm"]));
+    assert_eq!(report["packs"]["complete"], true);
+    let decisions = report["packs"]["decisions"].as_array().expect("decisions");
+    assert!(
+        decisions.iter().any(|decision| {
+            decision["pack"] == "fixture.jdk@21.0.2" && decision["status"] == "selected"
+        }),
+        "{decisions:#?}"
+    );
+
+    // Near miss: a JDK 17 workspace against the JDK 21 pack never activates
+    // silently; the decision names the installed and required versions.
+    let near_miss = run_with_java_home(
+        project.root(),
+        &fake_jdk_home(homes.path(), "17.0.10"),
+        PACKS_RUN_ARGS,
+    );
+    let report = json_stdout(&near_miss);
+    assert_eq!(report["packs"]["complete"], false);
+    let decisions = report["packs"]["decisions"].as_array().expect("decisions");
+    let mismatch = decisions
+        .iter()
+        .find(|decision| decision["status"] == "version_mismatch")
+        .unwrap_or_else(|| panic!("{decisions:#?}"));
+    let reason = mismatch["reason"].as_str().expect("mismatch reason");
+    assert!(
+        reason.contains("17.0.10") && reason.contains("=21.0.2"),
+        "the decision must name the installed and required versions: {reason}"
+    );
+    assert!(
+        !decisions
+            .iter()
+            .any(|decision| decision["status"] == "selected"),
+        "a near miss must not select any pack: {decisions:#?}"
+    );
+
+    // SARIF surfaces the same review as a run property.
+    let sarif = run_with_java_home(
+        project.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        &[
+            "--policy-id",
+            "bifrost.correctness.dynamic-evaluation",
+            "--evaluation-date",
+            "2026-07-28",
+            "--fail-on",
+            "never",
+            "--format",
+            "sarif",
+        ],
+    );
+    assert_status(&sarif, 0);
+    let log = json_stdout(&sarif);
+    let properties = &log["runs"][0]["properties"];
+    assert_eq!(
+        properties["bifrost.packActivation"]["ecosystems"],
+        serde_json::json!(["jvm"])
+    );
+    assert_eq!(properties["bifrost.packActivation"]["complete"], true);
+}
+
+#[test]
+fn a_run_without_a_packs_document_reports_no_packs_field() {
+    let project = policy_project(&[]);
+    let output = run(project.root(), PACKS_RUN_ARGS);
+    assert_status(&output, 0);
+    let report = json_stdout(&output);
+    assert!(
+        report.get("packs").is_none(),
+        "a run without a packs document keeps the exact schema-version-3 shape"
+    );
+}
+
+#[test]
+fn a_malformed_packs_document_is_loud_and_makes_the_run_unreliable() {
+    let project = InlineTestProject::new()
+        .file("src/app.py", APP)
+        .file(
+            ".bifrost/packs.json",
+            r#"{ "schema_version": 1, "ecosystems": ["jdk"] }"#,
+        )
+        .build();
+    let output = run(project.root(), PACKS_RUN_ARGS);
+    assert_status(&output, 2);
+    let report = json_stdout(&output);
+    let diagnostics = report["diagnostics"].as_array().expect("diagnostics");
+    let failure = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "packs-load-failed")
+        .unwrap_or_else(|| panic!("{diagnostics:#?}"));
+    let message = failure["message"].as_str().expect("diagnostic message");
+    assert!(
+        message.contains("unknown ecosystem") && message.contains("jdk"),
+        "the diagnostic must name the invalid ecosystem: {message}"
+    );
+    assert!(report.get("packs").is_none());
+}
+
+/// One Java file whose only unresolved references are standard-library: the
+/// probe workspace for the epic #1877 acceptance shape. `ArrayList` is a
+/// type-position reference and `Collections` a static receiver, so the file
+/// carries both site shapes the resolution asserts can examine.
+const STDLIB_PROBE_SOURCE: &str = r#"import java.util.ArrayList;
+import java.util.Collections;
+
+class Main {
+  int run() {
+    ArrayList<String> names = new ArrayList<>();
+    names.add("x");
+    Collections.sort(names);
+    return names.size();
+  }
+}
+"#;
+
+/// The JDK fixture pack extended with every standard-library type the probe
+/// workspace names, so an exhaustive assertion over that workspace has a
+/// declaration to reach for each one.
+const STDLIB_PROBE_PACK: &str = r#"{
+  "schema_version": 1,
+  "pack_id": "fixture.jdk",
+  "version": "21.0.2",
+  "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "jdk", "requirement": "=21.0.2" }]
+  },
+  "provenance": { "source": "checked-in test source", "revision": "fixture-v1" },
+  "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "jdk.core",
+    "activation": [{
+      "toolchain": { "name": "jdk", "version": "=21.0.2" },
+      "targets": ["jvm"]
+    }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "jdk.java-util-arraylist",
+        "name": "java.util.ArrayList",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": ["E"],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/ArrayList.java",
+          "symbol": "java.util.ArrayList"
+        }
+      }, {
+        "id": "jdk.java-util-collections",
+        "name": "java.util.Collections",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/Collections.java",
+          "symbol": "java.util.Collections"
+        }
+      }],
+      "members": [{
+        "id": "jdk.java-util-collections.sort",
+        "owner": "jdk.java-util-collections",
+        "name": "sort",
+        "member_kind": "method",
+        "visibility": "public",
+        "is_static": true,
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/Collections.java",
+          "symbol": "java.util.Collections.sort"
+        }
+      }],
+      "relations": []
+    }
+  }]
+}"#;
+
+/// The epic #1877 contract over the stdlib reference: the site resolves
+/// through a real route (`external_root` or stronger, never name fallback),
+/// and the winning selection never falls back past an authoritative boundary.
+///
+/// The asserted site is the type-position `ArrayList`, so this policy measures
+/// the *type* half of the external surface. [`STDLIB_MEMBER_POLICY`] asserts
+/// the same contract over the member half.
+const STDLIB_BOUNDARY_POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "probe.stdlib.boundary"
+  :name "Stdlib references resolve without name fallback"
+  :message "a standard-library reference did not resolve through a real route"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    :subject (rql (identifier :text/regex "^ArrayList$" :capture "target"))
+    :asserts [(assert-resolution :id stdlib-route :at "target" :role type_operand
+                :expect-tier external_root :at-least true)
+              (assert-boundary :id stdlib-boundary :at "target" :role type_operand
+                :forbid-fallback-past external_declared_unindexed)]))
+"#;
+
+/// The same epic #1877 contract asserted over the *member* half of the
+/// external surface (#1900).
+///
+/// The subject is the static receiver `Collections`, whose reference site spans
+/// the whole written name `Collections.sort`: a type for its head and a member
+/// for its last segment. The fixture pack declares both, and only the member
+/// declaration can carry this assertion -- the type alone leaves the spelling
+/// unresolved, which is exactly why #1893 had to assert the type-position site.
+const STDLIB_MEMBER_POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "probe.stdlib.member"
+  :name "Stdlib member references resolve without name fallback"
+  :message "a standard-library member reference did not resolve through a real route"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    :subject (rql (identifier :text/regex "^Collections$" :capture "target"))
+    :asserts [(assert-resolution :id stdlib-member-route :at "target" :role receiver_position
+                :expect-tier external_root :at-least true)
+              (assert-boundary :id stdlib-member-boundary :at "target" :role receiver_position
+                :forbid-fallback-past external_declared_unindexed)]))
+"#;
+
+const STDLIB_PROBE_ARGS: &[&str] = &[
+    "--policy-file",
+    "policies/stdlib-boundary.rqlp",
+    "--evaluation-date",
+    "2026-07-28",
+    "--fail-on",
+    "warning",
+    "--format",
+    "json",
+];
+
+const STDLIB_MEMBER_ARGS: &[&str] = &[
+    "--policy-file",
+    "policies/stdlib-member.rqlp",
+    "--evaluation-date",
+    "2026-07-28",
+    "--fail-on",
+    "warning",
+    "--format",
+    "json",
+];
+
+/// The epic #1877 acceptance shape, end to end: a fixture that references a
+/// standard-library API runs an exhaustive resolution-and-boundary assertion
+/// to completion. With the JDK fixture pack selected the run concludes (exit
+/// 0 or 1, never 2). Without a packs document the same policy is inconclusive
+/// and the run honestly exits 2 instead of passing vacuously.
+///
+/// The whole chain runs here: the packs document opts the workspace in, the
+/// catalog serves the installed pack, the fake JDK home satisfies the
+/// toolchain gate, the pack's declaration facts reach the JVM external
+/// declaration surface, and the resolver selects the external route they name
+/// (#1893). No jar and no `src.zip` exists anywhere in the fixture, so the
+/// pack is the only thing that can carry the assertion.
+#[test]
+fn packs_document_lets_a_stdlib_boundary_assertion_conclude() {
+    let with_pack = InlineTestProject::new()
+        .file("src/Main.java", STDLIB_PROBE_SOURCE)
+        .file("policies/stdlib-boundary.rqlp", STDLIB_BOUNDARY_POLICY)
+        .file(
+            ".bifrost/packs.json",
+            r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#,
+        )
+        .build();
+    install_fixture_pack(with_pack.root(), STDLIB_PROBE_PACK);
+    let homes = tempfile::tempdir().expect("fake JDK home root");
+    let concluded = run_with_java_home(
+        with_pack.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        STDLIB_PROBE_ARGS,
+    );
+    let code = concluded.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "with the pack selected the assertion must conclude, not report \
+         unreliable: exit {code:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&concluded.stdout),
+        String::from_utf8_lossy(&concluded.stderr)
+    );
+    let report = json_stdout(&concluded);
+    assert_eq!(report["packs"]["complete"], true, "report: {report}");
+    assert_eq!(
+        report["runs"][0]["completion"]["type"], "complete",
+        "report: {report}"
+    );
+    // A prohibition over zero rows is complete-and-clean by design, so
+    // "complete" alone could also describe a run that concluded vacuously.
+    // The paired run below is the discriminator: the same policy over the same
+    // workspace is inconclusive without the pack, so only the pack can have
+    // carried this conclusion.
+    let without_pack = InlineTestProject::new()
+        .file("src/Main.java", STDLIB_PROBE_SOURCE)
+        .file("policies/stdlib-boundary.rqlp", STDLIB_BOUNDARY_POLICY)
+        .build();
+    let degraded = run(without_pack.root(), STDLIB_PROBE_ARGS);
+    assert_status(&degraded, 2);
+    let degraded_report = json_stdout(&degraded);
+    assert_eq!(
+        degraded_report["runs"][0]["completion"]["type"], "inconclusive",
+        "without the pack the assertion must be inconclusive, not vacuously \
+         clean: {degraded_report}"
+    );
+}
+
+/// The same acceptance shape over the member half of the JVM external surface
+/// (#1900): the asserted site is the static receiver of `Collections.sort`,
+/// whose written name spells a member rather than a type.
+///
+/// #1893 had to assert a type-position site because no JVM external surface
+/// carried member declarations at all. With the pack's `sort` member reaching
+/// the surface, the receiver-position assertion concludes; the paired run
+/// without a packs document stays honestly inconclusive, so only the pack's
+/// member declaration can have carried it.
+#[test]
+fn packs_document_lets_a_stdlib_member_assertion_conclude() {
+    let with_pack = InlineTestProject::new()
+        .file("src/Main.java", STDLIB_PROBE_SOURCE)
+        .file("policies/stdlib-member.rqlp", STDLIB_MEMBER_POLICY)
+        .file(
+            ".bifrost/packs.json",
+            r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#,
+        )
+        .build();
+    install_fixture_pack(with_pack.root(), STDLIB_PROBE_PACK);
+    let homes = tempfile::tempdir().expect("fake JDK home root");
+    let concluded = run_with_java_home(
+        with_pack.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        STDLIB_MEMBER_ARGS,
+    );
+    let code = concluded.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "with the pack's member declaration the assertion must conclude: exit \
+         {code:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&concluded.stdout),
+        String::from_utf8_lossy(&concluded.stderr)
+    );
+    let report = json_stdout(&concluded);
+    assert_eq!(report["packs"]["complete"], true, "report: {report}");
+    assert_eq!(
+        report["runs"][0]["completion"]["type"], "complete",
+        "report: {report}"
+    );
+
+    let without_pack = InlineTestProject::new()
+        .file("src/Main.java", STDLIB_PROBE_SOURCE)
+        .file("policies/stdlib-member.rqlp", STDLIB_MEMBER_POLICY)
+        .build();
+    let degraded = run(without_pack.root(), STDLIB_MEMBER_ARGS);
+    assert_status(&degraded, 2);
+    let degraded_report = json_stdout(&degraded);
+    assert_eq!(
+        degraded_report["runs"][0]["completion"]["type"], "inconclusive",
+        "without the pack the member assertion must be inconclusive, not \
+         vacuously clean: {degraded_report}"
+    );
+
+    // The discriminator that names the *member*: the very same pack with its
+    // members emptied still declares `java.util.Collections` and is still
+    // selected, and the assertion still cannot conclude. So the conclusion
+    // above rests on the `sort` declaration and not on the type, and a pack
+    // that declares no members proves nothing about them.
+    let mut types_only: serde_json::Value =
+        serde_json::from_str(STDLIB_PROBE_PACK).expect("the fixture pack is JSON");
+    types_only["shards"][0]["payload"]["members"] = serde_json::json!([]);
+    let without_member = InlineTestProject::new()
+        .file("src/Main.java", STDLIB_PROBE_SOURCE)
+        .file("policies/stdlib-member.rqlp", STDLIB_MEMBER_POLICY)
+        .file(
+            ".bifrost/packs.json",
+            r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#,
+        )
+        .build();
+    install_fixture_pack(without_member.root(), &types_only.to_string());
+    let type_only = run_with_java_home(
+        without_member.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        STDLIB_MEMBER_ARGS,
+    );
+    assert_status(&type_only, 2);
+    let type_only_report = json_stdout(&type_only);
+    assert_eq!(
+        type_only_report["packs"]["complete"], true,
+        "the type-only pack still activates: {type_only_report}"
+    );
+    assert_eq!(
+        type_only_report["runs"][0]["completion"]["type"], "inconclusive",
+        "a pack that declares the owner type and no members must not carry a \
+         member assertion: {type_only_report}"
     );
 }

@@ -40,7 +40,9 @@ impl DiagnosticPublisher {
         .file("src/unrelated.rs", "pub fn unrelated() {}\n")
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
 
     let search = search_symbols(
         &analyzer,
@@ -57,7 +59,7 @@ impl DiagnosticPublisher {
     );
 
     assert_eq!(
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         1,
         "one request must share one persisted candidate scan across every pattern"
     );
@@ -94,7 +96,9 @@ fn issue_1199_cancelled_symbol_search_returns_explicit_partial_result() {
         .file("src/lib.rs", "pub fn semantic_diagnostics() {}\n")
         .build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
     let cancellation = CancellationToken::new();
     cancellation.cancel();
 
@@ -119,7 +123,7 @@ fn issue_1199_cancelled_symbol_search_returns_explicit_partial_result() {
         "{search:#?}"
     );
     assert_eq!(
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         0,
         "a request cancelled before dispatch must not start a persisted scan"
     );
@@ -1838,6 +1842,32 @@ doc! {macro_rules! join {
 }
 
 #[test]
+fn rust_crate_qualified_suffix_lookup_returns_indexed_location() {
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file(
+            "Cargo.toml",
+            "[package]\nname = \"serde-json\"\nversion = \"1.0.0\"\n",
+        )
+        .file("src/lib.rs", "pub mod value;\n")
+        .file("src/value.rs", "pub fn to_value() {}\n")
+        .build();
+    let analyzer = RustAnalyzer::from_project(project.project().clone());
+
+    let locations = get_symbol_locations(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["value.to_value".to_string()],
+        },
+    );
+
+    assert!(locations.not_found.is_empty(), "{locations:#?}");
+    assert!(locations.ambiguous.is_empty(), "{locations:#?}");
+    assert_eq!(1, locations.locations.len(), "{locations:#?}");
+    assert_eq!("serde_json.value.to_value", locations.locations[0].symbol);
+    assert_eq!("src/value.rs", locations.locations[0].path);
+}
+
+#[test]
 fn search_symbols_ranks_cpp_implementations_ahead_of_headers_and_noise() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -2284,7 +2314,9 @@ fn issue_1688_qualified_go_selector_resolves_without_a_full_declaration_scan() {
     let project = issue_1688_multi_language_project();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
 
     let result = source_for(analyzer, "kvserver/Replica.handleRaftReady");
 
@@ -2294,7 +2326,7 @@ fn issue_1688_qualified_go_selector_resolves_without_a_full_declaration_scan() {
     assert_eq!("kvserver/replica.go", result.sources[0].path);
     assert_eq!(
         0,
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         "resolving one qualified selector must not read any language's whole declaration table"
     );
 }
@@ -2305,7 +2337,9 @@ fn issue_1688_unresolvable_qualified_selector_stays_not_found() {
     let project = issue_1688_multi_language_project();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
 
     let result = source_for(analyzer, "kvserver/Replica.handleRaftNotReady");
 
@@ -2335,13 +2369,15 @@ fn php_in_a_mixed_workspace_keeps_the_conclusive_miss_gate() {
     assert_eq!(1, resolved.sources.len(), "{resolved:#?}");
     assert_eq!("src/Legacy.php", resolved.sources[0].path);
 
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
     let missing = source_for(analyzer, "App/Legacy.neverDeclared");
 
     assert_eq!(1, missing.not_found.len(), "{missing:#?}");
     assert_eq!(
         0,
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         "a qualified miss must stay conclusive on the identifier index, not fall through to a workspace scan"
     );
 }
@@ -2442,7 +2478,9 @@ fn issue_1063_decorated_identifier_spellings_resolve_without_a_full_declaration_
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
 
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
 
     let arity_free = source_for(analyzer, "CountingCollection");
     assert!(arity_free.not_found.is_empty(), "{arity_free:#?}");
@@ -2467,7 +2505,7 @@ fn issue_1063_decorated_identifier_spellings_resolve_without_a_full_declaration_
 
     assert_eq!(
         0,
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         "reaching a decorated identifier spelling must stay an index seek"
     );
 }
@@ -2489,7 +2527,9 @@ fn issue_1758_fuzzy_resolution_decides_ambiguity_without_a_full_declaration_scan
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
 
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
     let hit = source_for(analyzer, "Gauge.calibrate");
     assert!(hit.not_found.is_empty(), "{hit:#?}");
     assert!(hit.ambiguous.is_empty(), "{hit:#?}");
@@ -2523,7 +2563,7 @@ fn issue_1758_fuzzy_resolution_decides_ambiguity_without_a_full_declaration_scan
 
     assert_eq!(
         0,
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         "deciding fuzzy ambiguity must not read any language's whole declaration table"
     );
 }

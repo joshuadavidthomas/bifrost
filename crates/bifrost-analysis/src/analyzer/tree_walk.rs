@@ -7,79 +7,26 @@
 //! duplication survey, Concern 5, Tier 1): visibility (`pub(super)`) was the only
 //! reason most of them existed as separate copies rather than calling a shared
 //! helper.
+//!
+//! The preorder family -- `WalkControl`, `walk_tree_preorder`,
+//! `walk_named_tree_preorder` and its fallible counterpart -- plus
+//! `collect_parse_errors` and `expanded_comment_start` live in
+//! [`brokk_bifrost_core::analyzer::tree_walk`] and are re-exported by
+//! [`crate::analyzer::tree_sitter_analyzer`], where their callers already reach
+//! them. The enter/exit iterative walker joined them there when the Ruby scans
+//! moved into `brokk-bifrost-ruby`; java and js_ts reach it at this path. The
+//! three direct-child readers -- `named_children`, `first_named_child_of_kind`
+//! and `has_token_child` -- followed when Kotlin's declaration walk moved into
+//! `brokk-bifrost-jvm`, since a language crate reads its own grammar's child
+//! slots with them; the first two are re-exported here for the callers already
+//! at this path, and `has_token_child` has no analysis-side caller left.
 
 use tree_sitter::Node;
 
-/// What [`walk_tree_iterative`] should do after visiting a node on entry.
-pub(crate) enum TreeWalkAction {
-    /// Descend into the node's named children; do not call `exit` for this node.
-    Descend,
-    /// Descend into the node's named children, then call `exit` once all
-    /// descendants have been visited.
-    DescendWithExit,
-    /// Do not descend into this node's children.
-    Skip,
-    /// Stop the entire traversal immediately without firing pending exits.
-    Stop,
-}
-
-enum TreeWalkFrame<'tree> {
-    Enter(Node<'tree>),
-    Exit,
-}
-
-/// Iterative (stack-based) enter/exit tree-sitter walk over `root`'s named
-/// descendants (root included). `enter` is called on the way down and decides
-/// whether to descend and whether an `exit` callback should fire on the way back
-/// up (`DescendWithExit`) once all of that node's descendants have been visited.
-///
-/// Children are visited in source order; `exit` calls nest correctly with
-/// `enter`/`exit` pairs from descendants firing before their ancestor's `exit`.
-pub(crate) fn walk_tree_iterative<State>(
-    root: Node<'_>,
-    state: &mut State,
-    mut enter: impl FnMut(Node<'_>, &mut State) -> TreeWalkAction,
-    mut exit: impl FnMut(&mut State),
-) {
-    let mut stack = vec![TreeWalkFrame::Enter(root)];
-    while let Some(frame) = stack.pop() {
-        match frame {
-            TreeWalkFrame::Enter(node) => match enter(node, state) {
-                TreeWalkAction::Descend => push_named_children(node, &mut stack),
-                TreeWalkAction::DescendWithExit => {
-                    stack.push(TreeWalkFrame::Exit);
-                    push_named_children(node, &mut stack);
-                }
-                TreeWalkAction::Skip => {}
-                TreeWalkAction::Stop => break,
-            },
-            TreeWalkFrame::Exit => exit(state),
-        }
-    }
-}
-
-fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<TreeWalkFrame<'tree>>) {
-    for index in (0..node.named_child_count()).rev() {
-        if let Some(child) = node.named_child(index) {
-            stack.push(TreeWalkFrame::Enter(child));
-        }
-    }
-}
-
-/// Whether the subtree rooted at `node` (including `node` itself) contains a
-/// descendant matching `predicate`, short-circuiting on the first match. Iterative
-/// (explicit stack) depth-first search; visit order does not affect the result.
-pub(crate) fn subtree_contains(node: Node<'_>, predicate: impl Fn(Node<'_>) -> bool) -> bool {
-    let mut stack = vec![node];
-    while let Some(candidate) = stack.pop() {
-        if predicate(candidate) {
-            return true;
-        }
-        let mut cursor = candidate.walk();
-        stack.extend(candidate.named_children(&mut cursor));
-    }
-    false
-}
+pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
+    TreeWalkAction, first_named_child_of_kind, named_children, node_for_exact_range,
+    subtree_contains, walk_tree_iterative,
+};
 
 /// All descendants of `node` (not including `node` itself) whose `kind()` equals
 /// `kind`, in pre-order (a node before its own descendants), iterative (explicit
@@ -105,37 +52,6 @@ pub(crate) fn descendants_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Vec<N
         }
     }
     out
-}
-
-/// The direct named children of `node`, in source order.
-pub(crate) fn named_children<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor).collect()
-}
-
-/// The first direct named child of `node` whose kind is `kind`.
-///
-/// Distinct from a bare "first named child": this selects by kind, which is how
-/// declaration walks reach a specific grammar slot (a `class_body`, a
-/// `type_identifier`) without assuming child order.
-pub(crate) fn first_named_child_of_kind<'tree>(
-    node: Node<'tree>,
-    kind: &str,
-) -> Option<Node<'tree>> {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .find(|child| child.kind() == kind)
-}
-
-/// Whether `node` has an anonymous (token) child spelled `token`.
-///
-/// Restricted to anonymous children on purpose: grammars can spell the same
-/// text as either a keyword token or a named node, and callers asking this
-/// question want the keyword.
-pub(crate) fn has_token_child(node: Node<'_>, token: &str) -> bool {
-    let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| !child.is_named() && child.kind() == token)
 }
 
 #[cfg(test)]

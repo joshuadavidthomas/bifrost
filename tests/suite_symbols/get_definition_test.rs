@@ -2,6 +2,7 @@ use crate::common::{
     CSHARP_NESTED_PARTIAL_MAPPER, InlineTestProject, call_search_tool_json,
     csharp_nested_partial_cacheinfo_project,
 };
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{ExplicitCandidateProvider, UsageFinder};
 use brokk_bifrost::{
     AnalyzerConfig, CppAnalyzer, IAnalyzer, Language, SearchToolsService, WorkspaceAnalyzer,
@@ -352,6 +353,46 @@ bool ValueFlow::isLifetimeBorrowed() {
         assert_eq!(definitions.len(), 1, "{value}");
         assert_eq!(definitions[0]["fqn"], "ValueType", "{value}");
     }
+}
+
+#[test]
+fn cpp_incomparable_partial_specializations_report_each_contender() {
+    // `<T*, U>` and `<T, int>` are incomparable for `<int*, int>`: neither
+    // pattern is strictly more specialized, so resolution must report an
+    // ambiguity that names both contenders rather than a bare "ambiguous".
+    let header = r#"#pragma once
+template <typename T, typename U> struct Holder {};
+template <typename T, typename U> struct Holder<T*, U> { int by_pointer; };
+template <typename T> struct Holder<T, int> { int by_int; };
+"#;
+    let source = r#"#include "holder.h"
+void consume() {
+    Holder<int*, int> value;
+    (void)value;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("holder.h", header)
+        .file("consumer.cc", source)
+        .build();
+    let reference = source
+        .find("Holder<int*, int>")
+        .expect("declaration type reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("consumer.cc", source, reference),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    let message = result["diagnostics"][0]["message"]
+        .as_str()
+        .expect("diagnostic message");
+    assert!(
+        message.contains("ambiguous between C++ template specializations"),
+        "{value}"
+    );
+    let contenders = message.split(':').next_back().expect("contender list");
+    assert_eq!(contenders.matches("holder.h").count(), 2, "{value}");
 }
 
 #[test]
@@ -3863,6 +3904,184 @@ fn csharp_nested_sibling_type_resolves_from_property_type_position() {
     );
 }
 
+// #1802 (naps2 `XmlSerializer.cs`): C# simple-name lookup continues into every
+// ENCLOSING type declaration after the innermost type and its base chain are
+// exhausted. The nested caller's own base chain is empty here, so only the
+// enclosing scope can supply `Helper`.
+#[test]
+fn csharp_bare_call_resolves_to_an_enclosing_types_member() {
+    let source = "namespace N\n{\n    public abstract class Outer\n    {\n        protected static object Helper(object a, object b) { return a; }\n\n        protected class Inner\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("enclosing-type call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "N.Outer.Helper", "{value}");
+    assert_eq!(result["definitions"][0]["path"], "P.cs", "{value}");
+}
+
+// The same shape with an INSTANCE member on the enclosing type. C# puts the
+// name in scope and binds it; the call is an error only because a nested type
+// has no implicit outer instance (CS0120). get_definition answers the
+// declaration the name binds to, exactly as it does for an instance member
+// reached through the base chain from a static context, so this resolves.
+#[test]
+fn csharp_bare_call_resolves_to_an_enclosing_types_instance_member() {
+    let source = "namespace N\n{\n    public abstract class Outer\n    {\n        protected object Helper(object a, object b) { return a; }\n\n        protected class Inner\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("enclosing-type call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "N.Outer.Helper", "{value}");
+}
+
+// The walk continues past the first enclosing type: `Inner` is nested in `Mid`
+// which is nested in `Outer`, and only `Outer` declares `Helper`.
+#[test]
+fn csharp_bare_call_resolves_to_an_enclosing_type_two_levels_out() {
+    let source = "namespace N\n{\n    public abstract class Outer\n    {\n        protected static object Helper(object a, object b) { return a; }\n\n        protected class Mid\n        {\n            protected class Inner\n            {\n                public object Use(object a, object b) { return Helper(a, b); }\n            }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("enclosing-type call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "N.Outer.Helper", "{value}");
+}
+
+// The faithful naps2 shape: the nested caller DOES have a base class, and that
+// base edge resolves fine, but the base declares nothing named
+// `DeserializeInternal`. Only the enclosing type does. This removes the
+// confound with #1801's nested-base-resolution defect.
+#[test]
+fn csharp_bare_call_reaches_the_enclosing_type_past_an_unrelated_base() {
+    let source = "namespace NAPS2.Serialization;\n\npublic abstract class XmlSerializer\n{\n    protected static object DeserializeInternal(object element, System.Type type)\n    {\n        return element;\n    }\n\n    protected class CollectionSerializer : CustomXmlSerializer\n    {\n        public override object DeserializeObject(object element, System.Type type)\n        {\n            return DeserializeInternal(element, type);\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("XmlSerializer.cs", source)
+        .file(
+            "CustomXmlSerializer.cs",
+            "namespace NAPS2.Serialization;\n\npublic abstract class CustomXmlSerializer\n{\n    public abstract object DeserializeObject(object element, System.Type type);\n}\n",
+        )
+        .build();
+
+    let call = source
+        .rfind("DeserializeInternal(element, type)")
+        .expect("enclosing-type call");
+    let value = lookup(
+        project.root(),
+        &location_reference("XmlSerializer.cs", source, call),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "NAPS2.Serialization.XmlSerializer.DeserializeInternal",
+        "{value}"
+    );
+}
+
+// #1802's ordering constraint. `Helper` is declared BOTH on `Inner`'s base and
+// on the enclosing `Outer`. C# exhausts the innermost type's whole base chain
+// before it looks at any enclosing type, so the base member wins. Merging the
+// enclosing types into one owners vector would let `Outer.Helper` win at depth
+// 0 and break this.
+#[test]
+fn csharp_base_chain_member_beats_an_enclosing_types_member() {
+    let source = "namespace N\n{\n    public class Base\n    {\n        protected static object Helper(object a, object b) { return b; }\n    }\n\n    public class Outer\n    {\n        protected static object Helper(object a, object b) { return a; }\n\n        public class Inner : Base\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("shadowed call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"].as_array().map(Vec::len),
+        Some(1),
+        "the base-chain member must win outright, not tie: {value}"
+    );
+    assert_eq!(result["definitions"][0]["fqn"], "N.Base.Helper", "{value}");
+}
+
+// The non-invocation half of the same rule: a bare FIELD read reaches the
+// enclosing type through the identifier branch, not the invocation branch.
+#[test]
+fn csharp_bare_field_read_resolves_to_an_enclosing_types_field() {
+    let source = "namespace N\n{\n    public class Outer\n    {\n        protected static int Counter = 1;\n\n        public class Inner\n        {\n            public int Use() { return Counter; }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let read = source.rfind("Counter;").expect("enclosing-type field read");
+    let value = lookup(project.root(), &location_reference("P.cs", source, read));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "N.Outer.Counter",
+        "{value}"
+    );
+}
+
+// Near miss: a SIBLING nested type is not an enclosing type. `Sibling.Helper`
+// is not in scope for a bare call written inside `Inner`.
+#[test]
+fn csharp_bare_call_does_not_reach_a_sibling_nested_types_member() {
+    let source = "namespace N\n{\n    public class Outer\n    {\n        public class Sibling\n        {\n            public static object Helper(object a, object b) { return a; }\n        }\n\n        public class Inner\n        {\n            public object Use(object a, object b) { return Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("sibling call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_ne!(result["status"], "resolved", "{value}");
+}
+
+// #1801 (nunit `TestNameGenerator`): a bare call to a member inherited from a
+// nested base type spelled by its simple name. Supertype resolution searched
+// only the file's namespace and `using` scopes, so `Derived : Base` inside
+// `Outer` had no ancestors at all and `Helper(a, b)` was unreachable.
+// `Other.Base.Helper` is the near miss: a same-short-name type in another
+// namespace must not supply the definition.
+#[test]
+fn csharp_bare_call_resolves_through_a_nested_base_spelled_by_simple_name() {
+    let source = "namespace N\n{\n    public class Outer\n    {\n        private abstract class Base\n        {\n            protected static string Helper(object a, int b) { return \"x\"; }\n        }\n\n        private sealed class Derived : Base\n        {\n            public void Use(object a, int b) { var s = Helper(a, b); }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("P.cs", source)
+        .file(
+            "Other.cs",
+            "namespace Other\n{\n    public class Base\n    {\n        public static string Helper(object a, int b) { return \"y\"; }\n    }\n}\n",
+        )
+        .build();
+
+    let call = source.rfind("Helper(a, b)").expect("inherited call");
+    let value = lookup(project.root(), &location_reference("P.cs", source, call));
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "N.Outer$Base.Helper",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["path"], "P.cs", "{value}");
+}
+
 // A bare field reference inside a method must resolve through the enclosing
 // class's members, not fall through to the type path and claim a using
 // boundary for a field declared in the same class (tier-3 CsvHelper:
@@ -3883,6 +4102,98 @@ fn csharp_private_field_reference_resolves_via_enclosing_class() {
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
         result["definitions"][0]["fqn"], "Ns.CsvParser.delimiterPosition",
+        "{value}"
+    );
+}
+
+// A C# statement label is not a member reference. `goto Render;` and the
+// `Render:` label declaration must not forward-resolve to a same-named method
+// of the enclosing class, while a real call to that method in the same body
+// still resolves (census-seeded FIRD on markdig RendererBase.cs, #1799).
+#[test]
+fn csharp_goto_label_and_label_declaration_are_not_member_references() {
+    let source = "namespace Demo\n{\n    public abstract class RendererBase\n    {\n        public abstract object Render(object o);\n\n        public object Write(object obj, bool flag)\n        {\n            if (flag)\n            {\n                goto Render;\n            }\n\n            obj = null;\n\n        Render:\n            return Render(obj);\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/RendererBase.cs", source)
+        .build();
+
+    let goto_target = source.find("goto Render;").expect("goto statement") + "goto ".len();
+    let label = source.find("\n        Render:").expect("label declaration") + "\n        ".len();
+    let call = source.find("return Render(obj);").expect("call") + "return ".len();
+
+    for (start, position) in [(goto_target, "goto target"), (label, "label declaration")] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/RendererBase.cs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{position}: {value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "statement_label_site",
+            "{position}: {value}"
+        );
+    }
+
+    let value = lookup(
+        project.root(),
+        &location_reference("src/RendererBase.cs", source, call),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.RendererBase.Render",
+        "{value}"
+    );
+}
+
+// The label answer must not depend on a same-named method existing: a label the
+// workspace has no member for is still a label site, not an unresolved member
+// reference (#1799).
+#[test]
+fn csharp_goto_label_without_a_same_named_member_is_still_a_label_site() {
+    let source = "namespace Demo\n{\n    public class Loader\n    {\n        public void Load(bool flag)\n        {\n            if (flag)\n            {\n                goto Cleanup;\n            }\n\n        Cleanup:\n            return;\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Loader.cs", source)
+        .build();
+
+    let goto_target = source.find("goto Cleanup;").expect("goto statement") + "goto ".len();
+    let label = source
+        .find("\n        Cleanup:")
+        .expect("label declaration")
+        + "\n        ".len();
+
+    for (start, position) in [(goto_target, "goto target"), (label, "label declaration")] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/Loader.cs", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "no_definition", "{position}: {value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "statement_label_site",
+            "{position}: {value}"
+        );
+    }
+}
+
+// `goto case <constant>;` names a constant, not a statement label, so the label
+// exclusion must leave that expression a live reference (#1799).
+#[test]
+fn csharp_goto_case_constant_stays_a_member_reference() {
+    let source = "namespace Demo\n{\n    public class Router\n    {\n        public const int Retry = 1;\n        public const int Fallback = 2;\n\n        public string Route(int value)\n        {\n            switch (value)\n            {\n                case Retry:\n                    goto case Fallback;\n                case Fallback:\n                    return \"fallback\";\n                default:\n                    return \"none\";\n            }\n        }\n    }\n}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Router.cs", source)
+        .build();
+
+    let start = source.find("goto case Fallback;").expect("goto case") + "goto case ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/Router.cs", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.Router.Fallback",
         "{value}"
     );
 }
@@ -4413,6 +4724,255 @@ func Run() {
     );
 }
 
+/// The four languages whose bounded receiver cores predate their tool wiring
+/// (#1879): routing get_type_by_location through the bounded receiver contract
+/// is what makes each of them answer at all.
+#[test]
+fn cpp_type_lookup_resolves_explicit_local_binding_type() {
+    let header = "#pragma once\nclass Widget {\npublic:\n    void paint();\n};\n";
+    let source = r#"#include "widget.hpp"
+void run() {
+    Widget value;
+    value.paint();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("widget.hpp", header)
+        .file("use.cpp", source)
+        .build();
+
+    let line = "    value.paint();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"use.cpp","line":4,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "widget.hpp",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_type_lookup_resolves_annotated_parameter_type() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"class Widget:
+    def paint(self):
+        pass
+
+
+def render(value: Widget):
+    return value
+"#,
+        )
+        .build();
+
+    let line = "    return value";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":7,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "app.Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "app.py",
+        "{value}"
+    );
+}
+
+/// A caret on the member of `car.engine` asks for the member's type, not the
+/// receiver's: the bounded core types the receiver, resolves the member the
+/// receiver's class owns, and answers with what that member declares (#1887).
+#[test]
+fn python_type_lookup_resolves_member_expression_through_receiver_type() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"class Engine:
+    def start(self):
+        pass
+
+
+class Car:
+    def __init__(self, engine: Engine):
+        self.engine = engine
+
+
+def drive(car: Car):
+    car.engine.start()
+"#,
+        )
+        .build();
+
+    let line = "    car.engine.start()";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":12,"column":{}}}]}}"#,
+            column_of(line, "engine")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "app.Engine", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "app.py",
+        "{value}"
+    );
+}
+
+/// The annotation names a class this file imports from another workspace file,
+/// so the bounded core reads the import binder and asks the index for the
+/// module-qualified declaration rather than giving up at the file edge (#1887).
+#[test]
+fn python_type_lookup_resolves_imported_annotation_from_another_file() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "widget.py",
+            r#"class Widget:
+    def paint(self):
+        pass
+"#,
+        )
+        .file(
+            "app.py",
+            r#"from widget import Widget
+
+
+def render(value: Widget):
+    return value
+"#,
+        )
+        .build();
+
+    let line = "    return value";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":5,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "widget.Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "widget.py",
+        "{value}"
+    );
+}
+
+#[test]
+fn php_type_lookup_resolves_typed_parameter_type() {
+    let project = InlineTestProject::with_language(Language::Php)
+        .file(
+            "src/Service.php",
+            "<?php\nnamespace App;\nclass Service {\n    public function run(): void {}\n}\n",
+        )
+        .file(
+            "src/Caller.php",
+            r#"<?php
+namespace App;
+
+function call(Service $service): void {
+    $service->run();
+}
+"#,
+        )
+        .build();
+
+    let line = "    $service->run();";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"src/Caller.php","line":5,"column":{}}}]}}"#,
+            column_of(line, "$service")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "App.Service", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "src/Service.php",
+        "{value}"
+    );
+}
+
+#[test]
+fn ruby_type_lookup_resolves_constructed_local_type() {
+    let project = InlineTestProject::with_language(Language::Ruby)
+        .file("widget.rb", "class Widget\n  def paint\n  end\nend\n")
+        .file(
+            "app.rb",
+            r#"require_relative "widget"
+
+value = Widget.new
+value.paint
+"#,
+        )
+        .build();
+
+    let line = "value.paint";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.rb","line":4,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "widget.rb",
+        "{value}"
+    );
+}
+
+/// Plain C keeps its explicit refusal: the C++ bounded core refuses `.c`
+/// files by design, and the refusal names itself instead of pretending the
+/// location has no type.
+#[test]
+fn c_type_lookup_keeps_the_explicit_plain_c_refusal() {
+    let source = "struct widget { int id; };\nvoid run(void) {\n    struct widget value;\n    value.id = 1;\n}\n";
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.c", source)
+        .build();
+
+    let line = "    value.id = 1;";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.c","line":4,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unsupported_language", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "cpp_c_receiver_unsupported",
+        "{value}"
+    );
+}
+
 #[test]
 fn type_lookup_rejects_oversized_batches() {
     let project = InlineTestProject::with_language(Language::Rust)
@@ -4583,7 +5143,7 @@ mod tests {
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["fqn"], "tokio-test.src.task",
+        result["definitions"][0]["fqn"], "tokio_test.task",
         "{value}"
     );
 }
@@ -4691,7 +5251,7 @@ fn run() {
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["fqn"], "examples.shared",
+        result["definitions"][0]["fqn"], "examples.examples.first.shared",
         "{value}"
     );
     assert_eq!(
@@ -5521,12 +6081,12 @@ fn imports() {
     for (needle, expected_fqn, expected_path) in [
         (
             "error::GritResult",
-            "grit-util.src.error",
+            "grit_util.error",
             "grit-util/src/lib.rs",
         ),
         (
             "Auth, Other",
-            "grit-util.src.auth.Auth",
+            "grit_util.auth.Auth",
             "grit-util/src/auth.rs",
         ),
     ] {
@@ -5570,7 +6130,7 @@ fn imports() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "grit-util.src.error",
+        result["definitions"][0]["fqn"], "grit_util.error",
         "{value}"
     );
     assert_eq!(
@@ -5603,7 +6163,10 @@ fn rust_focused_reexport_module_segment_does_not_collapse_to_terminal_function()
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
     assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "copy", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "focused_use.copy",
+        "{value}"
+    );
 }
 
 #[test]
@@ -6018,10 +6581,7 @@ mod child {
             result["definitions"][0]["path"], "app/src/lib.rs",
             "{value}"
         );
-        assert_eq!(
-            result["definitions"][0]["fqn"], "app.src.toml_edit",
-            "{value}"
-        );
+        assert_eq!(result["definitions"][0]["fqn"], "app.toml_edit", "{value}");
     }
 
     let legacy_root = legacy
@@ -6113,7 +6673,7 @@ mod test {
     );
     assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "non_blocking.test",
+        result["definitions"][0]["fqn"], "appender.non_blocking.test",
         "{value}"
     );
 
@@ -6133,7 +6693,10 @@ mod test {
     );
     assert_eq!(result["definitions"][0]["path"], "src/lib.rs", "{value}");
     assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
-    assert_eq!(result["definitions"][0]["fqn"], "non_blocking", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "appender.non_blocking",
+        "{value}"
+    );
 }
 
 #[test]
@@ -6170,7 +6733,10 @@ fn consume(_: types::Item) {}
         Some(1),
         "{value}"
     );
-    assert_eq!(result["definitions"][0]["fqn"], "types.Item", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "namespace_expansion.types.Item",
+        "{value}"
+    );
     assert_eq!(result["definitions"][0]["kind"], "class", "{value}");
 }
 
@@ -6380,17 +6946,17 @@ pub enum ListStyleType {
     for (start, expected_fqn, expected_kind) in [
         (
             main.find("-> Self").expect("bare Self return type") + "-> ".len(),
-            "parser.options.ListStyleType",
+            "comrak.parser.options.ListStyleType",
             "class",
         ),
         (
             main.find("Self::Plus").expect("associated owner"),
-            "parser.options.ListStyleType",
+            "comrak.parser.options.ListStyleType",
             "class",
         ),
         (
             main.find("Self::Plus").expect("associated item") + "Self::".len(),
-            "parser.options.ListStyleType.Plus",
+            "comrak.parser.options.ListStyleType.Plus",
             "field",
         ),
     ] {
@@ -6676,10 +7242,10 @@ impl Service for Svc {
     let reference = first.rfind("Self::Future").expect("Self associated type");
 
     for (start, fqn, kind) in [
-        (reference, "examples.examples.Svc", "class"),
+        (reference, "examples.examples.first.Svc", "class"),
         (
             reference + "Self::".len(),
-            "examples.examples.Svc.Future",
+            "examples.examples.first.Svc.Future",
             "field",
         ),
     ] {
@@ -6749,7 +7315,7 @@ impl Service for &[SocketAddr] {
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["fqn"], "SocketAddr.Future",
+        result["definitions"][0]["fqn"], "self_impl_identity.SocketAddr.Future",
         "{value}"
     );
     assert_eq!(
@@ -7100,7 +7666,7 @@ mod child {
 
     assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "child.Local.name",
+        value["results"][0]["definitions"][0]["fqn"], "app.child.Local.name",
         "{value}"
     );
 }
@@ -7139,7 +7705,7 @@ mod child {
 
     assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "child.Local.name",
+        value["results"][0]["definitions"][0]["fqn"], "app.child.Local.name",
         "{value}"
     );
 }
@@ -7180,7 +7746,7 @@ use crate::hidden::Hidden;
 
     assert_eq!(value["results"][0]["status"], "resolved", "{value}");
     assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "hidden.Hidden.name",
+        value["results"][0]["definitions"][0]["fqn"], "app.hidden.Hidden.name",
         "{value}"
     );
 }
@@ -7223,7 +7789,8 @@ fn run() {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "route.RouteCheapnessEstimate.input_price_per_mtok_micros",
+        result["definitions"][0]["fqn"],
+        "app.route.RouteCheapnessEstimate.input_price_per_mtok_micros",
         "{value}"
     );
 }
@@ -7448,7 +8015,7 @@ fn fit_to_json(fit: &ModelFit) {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "fit.ModelFit.model",
+        result["definitions"][0]["fqn"], "app.fit.ModelFit.model",
         "{value}"
     );
 }
@@ -7487,7 +8054,7 @@ pub struct Service {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "models.MemoryRepository",
+        result["definitions"][0]["fqn"], "app.models.MemoryRepository",
         "{value}"
     );
 }
@@ -7526,7 +8093,7 @@ pub fn build() -> MemoryRepository {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "models.MemoryRepository",
+        result["definitions"][0]["fqn"], "app.models.MemoryRepository",
         "{value}"
     );
 }
@@ -7589,7 +8156,7 @@ pub struct MemoryRepository {
         let result = &value["results"][0];
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(
-            result["definitions"][0]["fqn"], "models.MemoryRepository.name",
+            result["definitions"][0]["fqn"], "app.models.MemoryRepository.name",
             "{value}"
         );
     }
@@ -8407,7 +8974,7 @@ pub fn build_service(repository: MemoryRepository) -> Service {
     let result = &value["results"][0];
     assert_eq!(result["status"], "resolved", "{value}");
     assert_eq!(
-        result["definitions"][0]["fqn"], "service.Service.execute",
+        result["definitions"][0]["fqn"], "app.service.Service.execute",
         "{value}"
     );
     assert_eq!(
@@ -9805,8 +10372,10 @@ mod edit {
             );
             assert_eq!(result["definitions"][0]["path"], path, "{value}");
             assert_eq!(result["definitions"][0]["kind"], "field", "{value}");
+            let stem = path.trim_start_matches("benches/").trim_end_matches(".rs");
             assert_eq!(
-                result["definitions"][0]["fqn"], "benches._module_.NUM_ENTRIES",
+                result["definitions"][0]["fqn"],
+                format!("demo.benches.{stem}._module_.NUM_ENTRIES"),
                 "{value}"
             );
         }
@@ -9845,8 +10414,10 @@ fn run() {
         );
         assert_eq!(result["definitions"][0]["path"], path, "{value}");
         assert_eq!(result["definitions"][0]["kind"], "module", "{value}");
+        let stem = path.trim_start_matches("examples/").trim_end_matches(".rs");
         assert_eq!(
-            result["definitions"][0]["fqn"], "examples.yak_shave",
+            result["definitions"][0]["fqn"],
+            format!("demo.examples.{stem}.yak_shave"),
             "{value}"
         );
     }
@@ -11628,6 +12199,259 @@ function shadowed(Promise) { return Promise; }
         value["results"][0]["definitions"][0].get("fqn").is_none(),
         "{value}"
     );
+}
+
+/// The angular.js shape: script files share one global scope, so a bare call
+/// reaches a program-scope declaration in another script (#1787).
+#[test]
+fn javascript_bare_name_resolves_through_the_shared_script_global_scope() {
+    let angular = r#"function isNumber(value) { return typeof value === 'number'; }
+class Registry {}
+var isFunction = function(value) { return typeof value === 'function'; };
+"#;
+    let parse = r#"function parse(value) {
+  return isNumber(value) && isFunction(value) && Registry;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/Angular.js", angular)
+        .file("src/ng/parse.js", parse)
+        .build();
+
+    for (needle, fqn, kind, start_line) in [
+        ("isNumber(value) &&", "isNumber", "function", 1),
+        ("isFunction(value) &&", "isFunction", "function", 3),
+        ("Registry;", "Registry", "class", 2),
+    ] {
+        let start = parse.find(needle).expect("script global reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/ng/parse.js", parse, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["kind"], kind, "{needle}: {value}");
+        assert_eq!(
+            result["definitions"][0]["path"], "src/Angular.js",
+            "{needle}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["start_line"], start_line,
+            "{needle}: {value}"
+        );
+    }
+}
+
+/// A module's top-level binding is file-private, so neither side of a
+/// script-global read may be a module (#1787).
+#[test]
+fn javascript_module_files_stay_outside_the_script_global_scope() {
+    let script_declaration = "function isNumber(value) { return typeof value === 'number'; }\n";
+    let module_declaration =
+        "export function isString(value) { return typeof value === 'string'; }\n";
+    let importing_module = r#"import { unrelated } from "./other.js";
+
+function parse(value) {
+  return isNumber(value);
+}
+"#;
+    let exporting_module = r#"export function parse(value) {
+  return isNumber(value);
+}
+"#;
+    let commonjs_module = r#"module.exports = function parse(value) {
+  return isNumber(value);
+};
+"#;
+    let script_reading_module = r#"function parse(value) {
+  return isString(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/Angular.js", script_declaration)
+        .file("src/strings.js", module_declaration)
+        .file("src/other.js", "export function unrelated() {}\n")
+        .file("src/importing.js", importing_module)
+        .file("src/exporting.js", exporting_module)
+        .file("src/commonjs.js", commonjs_module)
+        .file("src/reader.js", script_reading_module)
+        .build();
+
+    for (path, source, needle) in [
+        ("src/importing.js", importing_module, "isNumber(value)"),
+        ("src/exporting.js", exporting_module, "isNumber(value)"),
+        ("src/commonjs.js", commonjs_module, "isNumber(value)"),
+        ("src/reader.js", script_reading_module, "isString(value)"),
+    ] {
+        let start = source.find(needle).expect("cross-file bare reference");
+        let value = lookup(project.root(), &location_reference(path, source, start));
+        assert_eq!(
+            value["results"][0]["status"], "no_definition",
+            "{path}: {value}"
+        );
+        assert!(
+            value["results"][0]["definitions"].is_null(),
+            "{path}: {value}"
+        );
+    }
+}
+
+/// The workspace is the program, so two scripts that declare the same global
+/// really are two contenders and both are reported (#1787, #1811).
+#[test]
+fn javascript_competing_script_globals_report_every_contender() {
+    let first = "function isNumber(value) { return typeof value === 'number'; }\n";
+    let second = "function isNumber(value) { return value === +value; }\n";
+    let parse = r#"function parse(value) {
+  return isNumber(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/a.js", first)
+        .file("src/b.js", second)
+        .file("src/ng/parse.js", parse)
+        .build();
+
+    let start = parse.find("isNumber(value)").expect("ambiguous reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/ng/parse.js", parse, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "ambiguous", "{value}");
+    assert_eq!(
+        result["definitions"]
+            .as_array()
+            .expect("definition array")
+            .iter()
+            .map(|definition| definition["path"].as_str().expect("definition path"))
+            .collect::<Vec<_>>(),
+        vec!["src/a.js", "src/b.js"],
+        "{value}"
+    );
+}
+
+/// Only a program-scope binding joins the shared global scope: a member and a
+/// function nested in another function do not (#1787).
+#[test]
+fn javascript_script_global_scope_excludes_members_and_nested_functions() {
+    let members = r#"function Ctor() {}
+Ctor.prototype.isNumber = function(value) { return typeof value === 'number'; };
+var holder = { isString: function(value) { return typeof value === 'string'; } };
+function outer() {
+  function isArray(value) { return Array.isArray(value); }
+  return isArray;
+}
+"#;
+    let parse = r#"function parse(value) {
+  return isNumber(value) || isString(value) || isArray(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/Angular.js", members)
+        .file("src/ng/parse.js", parse)
+        .build();
+
+    for needle in ["isNumber(value)", "isString(value)", "isArray(value)"] {
+        let start = parse.find(needle).expect("member-shaped reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/ng/parse.js", parse, start),
+        );
+        assert_eq!(
+            value["results"][0]["status"], "no_definition",
+            "{needle}: {value}"
+        );
+        assert!(
+            value["results"][0]["definitions"].is_null(),
+            "{needle}: {value}"
+        );
+    }
+}
+
+/// A lexically visible binding shadows the shared global (#1787).
+#[test]
+fn javascript_local_binding_shadows_the_script_global() {
+    let angular = "function isNumber(value) { return typeof value === 'number'; }\n";
+    let parse = r#"function parse(value) {
+  function isNumber(candidate) { return candidate === 0; }
+  return isNumber(value);
+}
+
+function check(value, isNumber) {
+  return isNumber(value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("src/Angular.js", angular)
+        .file("src/ng/parse.js", parse)
+        .build();
+
+    let nested_declaration = parse
+        .find("return isNumber(value);")
+        .expect("nested-declaration read")
+        + "return ".len();
+    let parameter = parse
+        .rfind("return isNumber(value);")
+        .expect("parameter read")
+        + "return ".len();
+    assert_ne!(nested_declaration, parameter);
+    for start in [nested_declaration, parameter] {
+        let value = lookup(
+            project.root(),
+            &location_reference("src/ng/parse.js", parse, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{start}: {value}");
+        assert!(
+            result["definitions"][0].get("fqn").is_none(),
+            "{start}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["path"], "src/ng/parse.js",
+            "{start}: {value}"
+        );
+    }
+}
+
+/// A `.ts` file without an import or an export is a script too, so the same
+/// route serves both languages and both spaces (#1787).
+#[test]
+fn typescript_script_global_scope_serves_values_and_types() {
+    let globals = r#"interface Numeric { value: number; }
+function isNumber(value: unknown): boolean { return typeof value === 'number'; }
+"#;
+    let parse = r#"function parse(value: Numeric): boolean {
+  return isNumber(value.value);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("src/globals.ts", globals)
+        .file("src/ng/parse.ts", parse)
+        .build();
+
+    for (needle, fqn, start_line) in [
+        ("Numeric)", "Numeric", 1),
+        ("isNumber(value.value)", "isNumber", 2),
+    ] {
+        let start = parse.find(needle).expect("script global reference");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/ng/parse.ts", parse, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
+        assert_eq!(
+            result["definitions"][0]["path"], "src/globals.ts",
+            "{needle}: {value}"
+        );
+        assert_eq!(
+            result["definitions"][0]["start_line"], start_line,
+            "{needle}: {value}"
+        );
+    }
 }
 
 #[test]
@@ -15906,8 +16730,14 @@ public class RegExpInspectionConfigurationCellRenderer extends ColoredListCellRe
     );
 }
 
+/// The parameterless `repaint()` cannot bind the five-parameter local override,
+/// and `ExternalBaseList` is outside the indexed workspace, so the accepting
+/// declaration is on the far side of that boundary. The case pinned
+/// `no_definition` until #1755 taught the arity refusal to say which of the two
+/// it is; the load-bearing half -- never binding the wrong-arity override -- is
+/// unchanged.
 #[test]
-fn java_unqualified_inherited_method_call_with_only_external_base_match_returns_no_definition() {
+fn java_unqualified_inherited_method_call_with_only_external_base_match_reports_the_boundary() {
     let project = InlineTestProject::with_language(Language::Java)
         .file(
             "pkg/JBList.java",
@@ -15939,7 +16769,12 @@ public class JBList extends ExternalBaseList {
         ),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "the five-parameter override must never be bound: {value}"
+    );
 }
 
 #[test]
@@ -17689,6 +18524,120 @@ fn python_namespace_import_resolves_to_definition() {
 }
 
 #[test]
+fn python_fstring_interpolation_call_resolves_to_same_file_definition() {
+    let source = concat!(
+        "def d(value):\n",
+        "    return value.decode()\n",
+        "\n",
+        "\n",
+        "def parse(request_line):\n",
+        "    raise ValueError(f\"invalid HTTP request line: {d(request_line)}\")\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("http11.py", source)
+        .build();
+    let reference = source
+        .find("{d(request_line)}")
+        .expect("interpolation hole")
+        + 1;
+
+    let value = lookup(
+        project.root(),
+        &location_reference("http11.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "http11.d",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_fstring_interpolation_attribute_call_resolves_to_definition() {
+    let source = concat!(
+        "class Holder:\n",
+        "    def render(self):\n",
+        "        return \"x\"\n",
+        "\n",
+        "\n",
+        "def show(obj: Holder):\n",
+        "    return f\"value: {obj.render()}\"\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("holder.py", source)
+        .build();
+    let reference = source
+        .find("obj.render()")
+        .expect("interpolated attribute call")
+        + "obj.".len();
+
+    let value = lookup(
+        project.root(),
+        &location_reference("holder.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "holder.Holder.render",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_fstring_format_spec_interpolation_resolves_to_definition() {
+    let source = concat!(
+        "def width():\n",
+        "    return 3\n",
+        "\n",
+        "\n",
+        "def render(value):\n",
+        "    return f\"{value:{width()}}\"\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("fmt.py", source)
+        .build();
+    let reference = source.find("width()}}").expect("format-spec interpolation");
+
+    let value = lookup(
+        project.root(),
+        &location_reference("fmt.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(
+        value["results"][0]["definitions"][0]["fqn"], "fmt.width",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_plain_string_identifier_text_does_not_resolve_to_definition() {
+    let source = concat!(
+        "def d(value):\n",
+        "    return value\n",
+        "\n",
+        "\n",
+        "def parse(request_line):\n",
+        "    raise ValueError(\"invalid d(request_line) here\")\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("plain.py", source)
+        .build();
+    let reference = source
+        .find("invalid d(request_line)")
+        .expect("plain string text")
+        + "invalid ".len();
+
+    let value = lookup(
+        project.root(),
+        &location_reference("plain.py", source, reference),
+    );
+
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
 fn python_attribute_object_resolves_to_namespace_not_member() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("pkg/util.py", "def helper():\n    pass\n")
@@ -19381,9 +20330,18 @@ fn csharp_inapplicable_direct_member_rejects_unrelated_extension_receiver() {
         ),
     );
 
-    assert_eq!(
-        value["results"][0]["definitions"][0]["fqn"], "Demo.Listener.Signal",
-        "an extension with an incompatible known receiver must not replace the legacy direct fallback: {value}"
+    // The direct member is the only same-named declaration the receiver's type
+    // offers, and its three parameters cannot accept a one-argument call, so
+    // nothing here is the target: the extension's receiver is a `string`, and
+    // binding the inapplicable direct member was the #1797 defect. `Listener`
+    // is sealed and derives from nothing indexed-or-otherwise, so the missing
+    // overload is a workspace fact rather than a boundary.
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    assert!(
+        value["results"][0]["definitions"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "an extension with an incompatible known receiver must not be the answer either: {value}"
     );
 }
 
@@ -19512,14 +20470,16 @@ fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration()
     let project = project.build();
     let analyzer = brokk_bifrost::CSharpAnalyzer::new(project.project_dyn());
     let extension_file = project.file("Visible/Extensions.cs");
-    let extension = brokk_bifrost::IAnalyzer::declarations(&analyzer, &extension_file)
+    let extension = brokk_bifrost::CodeUnitIndex::declarations(&analyzer, &extension_file)
         .into_iter()
         .find(|unit| unit.fq_name() == "Visible.Extensions.Convert")
         .expect("visible extension declaration");
-    let owner = brokk_bifrost::IAnalyzer::parent_of(&analyzer, &extension)
+    let owner = brokk_bifrost::CodeUnitIndex::parent_of(&analyzer, &extension)
         .expect("extension method structural owner");
     assert_eq!(owner.fq_name(), "Visible.Extensions");
-    analyzer.reset_full_declaration_scan_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
     analyzer.reset_full_hydration_count_for_test();
     let line = "namespace App { public class Runner { public int Run(IDbConnection value) { return value.Convert(10); } } }";
 
@@ -19550,7 +20510,7 @@ fn csharp_extension_lookup_uses_visibility_indexes_without_unrelated_hydration()
         Some("(IDbConnection, int)")
     );
     assert_eq!(
-        analyzer.full_declaration_scan_count_for_test(),
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
         0,
         "extension lookup must use persisted visibility indexes"
     );
@@ -19891,21 +20851,35 @@ namespace App {
 }
 "#;
 
+    let definition_at = |needle: &str| {
+        let start = source.find(needle).expect("constructor site") + "new ".len();
+        lookup(
+            project.root(),
+            &location_reference("App/Controller.cs", source, start),
+        )
+    };
+
     for (needle, expected) in [
         ("new PixelRect()", "Lib.PixelRect"),
         ("new PixelRect(pixels)", "Lib.PixelRect.PixelRect"),
         ("new ExplicitZero()", "Lib.ExplicitZero.ExplicitZero"),
-        ("new Service()", "Lib.Service.Service"),
     ] {
-        let start = source.find(needle).expect("constructor site") + "new ".len();
-        let value = lookup(
-            project.root(),
-            &location_reference("App/Controller.cs", source, start),
-        );
+        let value = definition_at(needle);
         let result = &value["results"][0];
         assert_eq!(result["status"], "resolved", "{value}");
         assert_eq!(result["definitions"][0]["fqn"], expected, "{value}");
     }
+
+    // Only a value type has the implicit parameterless constructor, so this
+    // class's single one-parameter constructor cannot accept `new Service()` --
+    // and handing it back anyway was the #1797 defect.
+    let value = definition_at("new Service()");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert_eq!(
+        result["diagnostics"][0]["kind"], "no_applicable_overload",
+        "{value}"
+    );
 }
 
 #[test]
@@ -20052,8 +21026,12 @@ public static class ImmutableEquatableArray
     }
 }
 
+/// #1797: a call no indexed overload can accept is not resolved by handing back
+/// the overloads that rejected it. `Service` is declared in this workspace and
+/// derives from nothing, so the three-argument call has no target here and none
+/// beyond the workspace either.
 #[test]
-fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
+fn csharp_typed_receiver_method_wrong_arity_reports_no_applicable_overload() {
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "Lib/Service.cs",
@@ -20075,19 +21053,13 @@ fn csharp_typed_receiver_method_wrong_arity_returns_overload_definitions() {
     );
 
     let result = &value["results"][0];
-    assert_eq!(result["status"], "ambiguous", "{value}");
-    assert_eq!(
-        result["definitions"].as_array().unwrap().len(),
-        2,
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
         "{value}"
     );
     assert_eq!(
-        result["definitions"][0]["fqn"], "Lib.Service.GetFilePaths",
-        "{value}"
-    );
-    assert_eq!(result["definitions"][0]["signature"], "(string)", "{value}");
-    assert_eq!(
-        result["definitions"][1]["signature"], "(string, bool)",
+        result["diagnostics"][0]["kind"], "no_applicable_overload",
         "{value}"
     );
 }
@@ -20359,6 +21331,70 @@ fn csharp_external_using_reports_boundary() {
         value["results"][0]["status"], "unresolvable_import_boundary",
         "{value}"
     );
+}
+
+#[test]
+fn csharp_namespace_using_target_does_not_resolve_same_named_type() {
+    let global_source = "global using Ocelot;\ninternal class GlobalConsumer {}\n";
+    let plain_source = "using Ocelot;\ninternal class PlainConsumer {}\n";
+    let controls_source =
+        "using Alias = Demo.AliasTarget;\nusing static Demo.StaticTarget;\nclass Consumer {}\n";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "testing/Ocelot.cs",
+            "namespace Ocelot.Testing { internal class Ocelot {} }\n",
+        )
+        .file(
+            "Demo/Targets.cs",
+            "namespace Demo { public class AliasTarget {} public static class StaticTarget { public static void Run() {} } }\n",
+        )
+        .file("acceptance/GlobalUsings.cs", global_source)
+        .file("manual/Usings.cs", plain_source)
+        .file("controls/Usings.cs", controls_source)
+        .build();
+
+    for (path, source) in [
+        ("acceptance/GlobalUsings.cs", global_source),
+        ("manual/Usings.cs", plain_source),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference(
+                path,
+                source,
+                source.find("Ocelot").expect("namespace using target"),
+            ),
+        );
+
+        assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+        assert!(
+            value["results"][0]["definitions"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "a namespace using target must not resolve to a same-named type: {value}"
+        );
+    }
+
+    for (needle, expected_fqn) in [
+        ("Demo.AliasTarget", "Demo.AliasTarget"),
+        ("Demo.StaticTarget", "Demo.StaticTarget"),
+    ] {
+        let value = lookup(
+            project.root(),
+            &location_reference(
+                "controls/Usings.cs",
+                controls_source,
+                controls_source
+                    .find(needle)
+                    .expect("structured using target"),
+            ),
+        );
+        assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+        assert_eq!(
+            value["results"][0]["definitions"][0]["fqn"], expected_fqn,
+            "{value}"
+        );
+    }
 }
 
 #[test]
@@ -20690,6 +21726,85 @@ void Scoped<P>::g() {
 }
 
 #[test]
+fn cpp_macro_namespace_out_of_line_alias_uses_callable_parent_owner() {
+    let source = r#"
+namespace unrelated {
+struct iterator {};
+}
+using namespace unrelated;
+
+namespace absl {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+template <typename P>
+struct btree {
+    using iterator = int;
+    void take(iterator* value);
+};
+
+template <typename P>
+void btree<P>::take(iterator* value) {
+    (void)value;
+}
+}
+ABSL_NAMESPACE_END
+}
+
+namespace other {
+ABSL_NAMESPACE_BEGIN
+namespace container_internal {
+template <typename P>
+struct btree {
+    using iterator = long;
+    void take(iterator* value);
+};
+
+template <typename P>
+void btree<P>::take(iterator* value) {
+    (void)value;
+}
+}
+ABSL_NAMESPACE_END
+}
+
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+    let reference = source
+        .find("void btree<P>::take(iterator* value)")
+        .expect("out-of-line iterator alias reference")
+        + "void btree<P>::take(".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("app.cpp", source, reference),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "absl::container_internal.btree$iterator",
+        "the nested alias must win over an unrelated visible iterator type: {value}"
+    );
+
+    let other_start = source.find("namespace other {").expect("other namespace");
+    let other_reference = other_start
+        + source[other_start..]
+            .find("void btree<P>::take(iterator* value)")
+            .expect("second out-of-line iterator alias reference")
+        + "void btree<P>::take(".len();
+    let other_value = lookup(
+        project.root(),
+        &location_reference("app.cpp", source, other_reference),
+    );
+    let other_result = &other_value["results"][0];
+    assert_eq!(other_result["status"], "resolved", "{other_value}");
+    assert_eq!(
+        other_result["definitions"][0]["fqn"], "other::container_internal.btree$iterator",
+        "owner recovery must not cross to the same-named btree in another namespace: {other_value}"
+    );
+}
+
+#[test]
 fn cpp_recovered_class_alias_scope_does_not_leak_or_shadow_later_types() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file(
@@ -20911,6 +22026,103 @@ private:
 }
 
 #[test]
+fn cpp_template_argument_alias_uses_partial_specialization_owner() {
+    let source = r#"
+namespace lib {
+using error_type = short;
+template<typename T, typename E> class expected {
+public:
+    using error_type = E;
+};
+
+template<typename E>
+class expected<void, E> {
+public:
+    using error_type = E;
+
+    template<typename F>
+    expected<void, error_type> transform(F&&) const & {
+        return expected<void, error_type>();
+    }
+
+    template<typename F>
+    expected<F, error_type> dependent_transform(F&&) const & {
+        return expected<F, error_type>();
+    }
+
+    void local_alias() const {
+        using error_type = long;
+        (void)sizeof(expected<void, error_type>);
+    }
+};
+}
+
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("expected.hpp", source)
+        .build();
+    let return_error = source
+        .find("expected<void, error_type> transform")
+        .expect("dependent return alias")
+        + "expected<void, ".len();
+    let body_error = source
+        .rfind("expected<void, error_type>()")
+        .expect("dependent body alias")
+        + "expected<void, ".len();
+    let local_error = source
+        .find("sizeof(expected<void, error_type>)")
+        .expect("local alias")
+        + "sizeof(expected<void, ".len();
+    let dependent_return_error = source
+        .find("expected<F, error_type> dependent_transform")
+        .expect("dependent return alias")
+        + "expected<F, ".len();
+    let dependent_body_error = source
+        .rfind("expected<F, error_type>()")
+        .expect("dependent body alias")
+        + "expected<F, ".len();
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("expected.hpp", source, return_error),
+                location_query("expected.hpp", source, body_error),
+                location_query("expected.hpp", source, local_error),
+                location_query("expected.hpp", source, dependent_return_error),
+                location_query("expected.hpp", source, dependent_body_error),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "resolved", "{value}");
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(results[2]["status"], "no_definition", "{value}");
+    assert_eq!(results[3]["status"], "resolved", "{value}");
+    assert_eq!(results[4]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[0]["definitions"][0]["fqn"], "lib.expected<void, E>$error_type",
+        "{value}"
+    );
+    assert_eq!(
+        results[1]["definitions"][0]["fqn"], "lib.expected<void, E>$error_type",
+        "{value}"
+    );
+    assert_eq!(
+        results[2]["diagnostics"][0]["kind"], "unresolved_local_type",
+        "{value}"
+    );
+    assert_eq!(
+        results[3]["definitions"][0]["fqn"], "lib.expected<void, E>$error_type",
+        "{value}"
+    );
+    assert_eq!(
+        results[4]["definitions"][0]["fqn"], "lib.expected<void, E>$error_type",
+        "{value}"
+    );
+}
+
+#[test]
 fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
     const HIDDEN_DUPLICATES: usize = 16;
     const EXACT_CANDIDATES: usize = HIDDEN_DUPLICATES + 1;
@@ -20950,9 +22162,11 @@ fn cpp_exact_fqn_candidate_ordering_does_not_hydrate_hidden_duplicate_files() {
             .expect("persisted analyzer should reopen");
     let analyzer = warm_workspace.analyzer();
 
-    analyzer.reset_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_candidate_hydration_count_for_test();
     let definitions = analyzer.definitions("demo.Shared").collect::<Vec<_>>();
-    let candidate_hydrations = analyzer.candidate_hydration_count_for_test();
+    let candidate_hydrations = analyzer.test_hooks().candidate_hydration_count_for_test();
 
     let actual_paths = definitions
         .iter()
@@ -21086,7 +22300,9 @@ fn cpp_repeated_qualifier_alias_checks_bound_candidate_hydration() {
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let analyzer = workspace.analyzer();
-    analyzer.reset_candidate_hydration_count_for_test();
+    analyzer
+        .test_hooks()
+        .reset_candidate_hydration_count_for_test();
     let value = brokk_bifrost::searchtools::get_definitions_by_location(
         analyzer,
         brokk_bifrost::searchtools::GetDefinitionParams {
@@ -21110,7 +22326,7 @@ fn cpp_repeated_qualifier_alias_checks_bound_candidate_hydration() {
             .all(|result| result.status == "no_definition" && result.definitions.is_empty()),
         "{value:#?}"
     );
-    let hydrations = analyzer.candidate_hydration_count_for_test();
+    let hydrations = analyzer.test_hooks().candidate_hydration_count_for_test();
     assert!(
         hydrations <= 2,
         "repeated focused qualifiers should reuse the batch source/tree cache; observed {hydrations} candidate hydrations for {REFERENCE_COUNT} references"
@@ -22567,6 +23783,140 @@ template <> struct context<link> {
     assert_eq!(results[1]["status"], "resolved", "{value}");
     assert_eq!(
         results[1]["definitions"][0]["fqn"], "link_context",
+        "{value}"
+    );
+}
+
+#[test]
+fn cpp_template_forward_declaration_name_is_not_reference() {
+    let source = r#"
+template <typename T, typename E>
+class Box;
+
+template <typename T, typename E>
+class Box {};
+
+template <typename T>
+struct Defined {};
+
+void use(Box<int, short>* value) { (void)value; }
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("forward.hpp", source)
+        .build();
+    let forward_name = source.find("class Box").expect("forward declaration") + "class ".len();
+    let use_name = source.find("Box<int, short>").expect("reference");
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("forward.hpp", source, forward_name),
+                location_query("forward.hpp", source, use_name),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    assert_eq!(results[0]["status"], "no_definition", "{value}");
+    assert_eq!(
+        results[0]["diagnostics"][0]["kind"], "declaration_or_import_site",
+        "{value}"
+    );
+    assert_eq!(results[1]["status"], "resolved", "{value}");
+    assert_eq!(results[1]["definitions"][0]["fqn"], "Box", "{value}");
+}
+
+#[test]
+fn cpp_macro_namespace_template_forward_declaration_name_is_not_reference() {
+    let source = format!(
+        "{}\n{}",
+        // A macro-heavy header can leave the C++ parser at an ERROR root.
+        "{".repeat(32),
+        r#"
+#define NLOHMANN_JSON_NAMESPACE_BEGIN                \
+    namespace nlohmann                               \
+    {                                                \
+    inline namespace json_abi_v3_11_3                \
+    {
+#define NLOHMANN_JSON_NAMESPACE_END                 \
+    }                                                \
+    }
+
+NLOHMANN_JSON_NAMESPACE_BEGIN
+namespace detail
+{
+template<typename IteratorType> class iteration_proxy;
+template<typename IteratorType> class iteration_proxy_value;
+template<typename IteratorType> class iteration_proxy_value {};
+
+void use(iteration_proxy_value<int>* value) { (void)value; }
+}
+NLOHMANN_JSON_NAMESPACE_END
+"#
+    );
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("json.hpp", source.clone())
+        .build();
+    let forward_name = source
+        .find("class iteration_proxy;")
+        .expect("forward declaration")
+        + "class ".len();
+    let forward_value_name = source
+        .find("class iteration_proxy_value;")
+        .expect("forward declaration")
+        + "class ".len();
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .expect("C++ parser");
+    let tree = parser.parse(&source, None).expect("C++ tree");
+    let mut node = tree
+        .root_node()
+        .named_descendant_for_byte_range(forward_name, forward_name + 1)
+        .expect("forward declaration node");
+    let mut actual_kinds = Vec::new();
+    while let Some(parent) = node.parent() {
+        actual_kinds.push(node.kind());
+        node = parent;
+    }
+    actual_kinds.push(node.kind());
+    assert_eq!(
+        actual_kinds,
+        [
+            "type_identifier",
+            "class_specifier",
+            "template_declaration",
+            "compound_statement",
+            "function_definition",
+            "ERROR",
+        ],
+        "recovered declaration AST"
+    );
+    let use_name = source
+        .find("iteration_proxy_value<int>")
+        .expect("reference");
+    let value = lookup(
+        project.root(),
+        &json!({
+            "references": [
+                location_query("json.hpp", &source, forward_name),
+                location_query("json.hpp", &source, forward_value_name),
+                location_query("json.hpp", &source, use_name),
+            ]
+        })
+        .to_string(),
+    );
+    let results = value["results"].as_array().expect("definition results");
+    for result in &results[..2] {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "declaration_or_import_site",
+            "{value}"
+        );
+    }
+    assert_eq!(results[2]["status"], "resolved", "{value}");
+    assert_eq!(
+        results[2]["definitions"][0]["name"], "iteration_proxy_value",
         "{value}"
     );
 }
@@ -27916,7 +29266,7 @@ object Controller {
 }
 
 #[test]
-fn scala_compound_infix_dispatch_fails_closed_without_precedence_reconstruction() {
+fn scala_compound_infix_dispatch_uses_structured_precedence() {
     let source = r#"
 package app
 
@@ -27937,13 +29287,9 @@ object Controller {
         &location_reference("app/Compound.scala", source, start),
     );
 
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
-    assert!(
-        value["results"][0]["diagnostics"][0]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("precedence-aware receiver reconstruction")),
-        "{value}"
-    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "app.B.*", "{value}");
 }
 
 #[test]
@@ -31986,4 +33332,1054 @@ fun use(value: Shared) {
         result["diagnostics"][0]["kind"], "ambiguous_kotlin_type",
         "{value}"
     );
+}
+
+/// #644: Rust forward definition lookup must honor the focused token and treat
+/// local binding/declaration names as declarations, not references, so a
+/// receiver, `self`, `Self`, a parameter, or a `let` binding never resolves to
+/// an unrelated same-named field/method/variant. Each case reproduces one of
+/// the failure modes the gritql forward/inverse differential reported.
+#[test]
+fn rust_focus_never_resolves_bindings_to_unrelated_members_issue_644() {
+    // (source, click marker at the focused token, wrong fqn that #644 reported)
+    let s1 = "pub struct ApplyPatternArgs { pub dry_run: bool }\npub fn run(arg: ApplyPatternArgs) -> bool {\n    arg.dry_run\n}\n";
+    let s2 = "pub struct Problem;\nimpl Problem {\n    pub fn execute_shared(&self) -> u8 { 0 }\n    pub fn run(&self) -> u8 {\n        self.execute_shared()\n    }\n}\n";
+    let s3 = "pub enum Node {\n    Pattern,\n}\nimpl Node {\n    pub fn make() -> Self {\n        Self::Pattern\n    }\n}\n";
+    let s4 = "pub struct CallbackPattern;\npub struct BuiltIns;\nimpl BuiltIns {\n    pub fn call(&self) {}\n}\npub fn run(call: &CallbackPattern) { let _ = call; }\n";
+    let s5 = "pub struct WrappedResult { pub actual_sample: u8 }\npub fn run() {\n    let mut actual_sample = 1u8;\n    actual_sample += 1;\n}\n";
+
+    let cases = [
+        (s1, "arg.dry_run", "dry_run"),
+        (s2, "self.execute_shared", "execute_shared"),
+        (s3, "Self::Pattern", "Node.Pattern"),
+        (s4, "call: &CallbackPattern", "BuiltIns.call"),
+        (s5, "actual_sample = 1", "actual_sample"),
+    ];
+    for (src, click, forbidden) in cases {
+        let project = InlineTestProject::with_language(Language::Rust)
+            .file("src/lib.rs", src)
+            .build();
+        let at = src.find(click).unwrap();
+        let value = lookup(project.root(), &location_reference("src/lib.rs", src, at));
+        let result = &value["results"][0];
+        let defs: Vec<String> = result["definitions"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry["name"].as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            defs.iter().all(|name| !name.contains(forbidden)),
+            "issue #644: focused token {click:?} must not resolve to the unrelated `{forbidden}`, got {defs:?} ({value})"
+        );
+    }
+
+    // Positive control: `Self::Pattern`'s `Self` still resolves to the enclosing
+    // type, so rejecting the variant did not blind the enclosing-type lookup.
+    let project = InlineTestProject::with_language(Language::Rust)
+        .file("src/lib.rs", s3)
+        .build();
+    let at = s3.find("Self::Pattern").unwrap();
+    let value = lookup(project.root(), &location_reference("src/lib.rs", s3, at));
+    let defs: Vec<String> = value["results"][0]["definitions"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        defs.iter().any(|name| name == "Node"),
+        "issue #644: `Self` must resolve to the enclosing type Node, got {defs:?} ({value})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1754: JLS 6.4.2 obscuring / 6.5.2 ambiguous names on the forward
+// occurrence surface. A simple name in an expression context denotes the
+// variable whenever one is in scope; the same-named type wins only in a type
+// context.
+// ---------------------------------------------------------------------------
+
+const JAVA_OBSCURING_WIDGET: &str = r#"package fixture;
+
+public class Widget {
+    public static String type(Class<?> c) {
+        return c.getName();
+    }
+}
+"#;
+
+const JAVA_OBSCURING_FACTORY: &str = r#"package fixture;
+
+public class Factory {
+    static final String Widget = fixture.Widget.type(Widget.class);
+
+    String describe() {
+        return "L" + Widget + ";";
+    }
+}
+"#;
+
+fn java_obscuring_project() -> crate::common::BuiltInlineTestProject {
+    InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/fixture/Widget.java", JAVA_OBSCURING_WIDGET)
+        .file("src/main/java/fixture/Factory.java", JAVA_OBSCURING_FACTORY)
+        .build()
+}
+
+#[test]
+fn java_value_position_bare_name_resolves_the_obscuring_field_not_the_type() {
+    let project = java_obscuring_project();
+    let concatenation = JAVA_OBSCURING_FACTORY
+        .find("+ Widget +")
+        .expect("string concatenation operand")
+        + "+ ".len();
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "src/main/java/fixture/Factory.java",
+            JAVA_OBSCURING_FACTORY,
+            concatenation,
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fixture.Factory.Widget",
+        "the concatenation operand reads the field, not the same-named class: {value}"
+    );
+}
+
+#[test]
+fn java_class_literal_keeps_naming_the_type_an_enclosing_field_obscures() {
+    let project = java_obscuring_project();
+    let literal = JAVA_OBSCURING_FACTORY
+        .find("Widget.class")
+        .expect("class literal");
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "src/main/java/fixture/Factory.java",
+            JAVA_OBSCURING_FACTORY,
+            literal,
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fixture.Widget",
+        "`X.class` qualifies a type, so obscuring does not apply: {value}"
+    );
+}
+
+#[test]
+fn java_type_positions_keep_naming_the_type_an_enclosing_field_obscures() {
+    let source = r#"package fixture;
+
+import java.util.List;
+
+public class Holder extends Widget {
+    static final String Widget = "obscured";
+
+    List<Widget> items;
+
+    Widget make(Widget seed) {
+        Object cast = (Widget) seed;
+        return new Widget();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/fixture/Widget.java", JAVA_OBSCURING_WIDGET)
+        .file("src/main/java/fixture/Holder.java", source)
+        .build();
+    for (label, needle) in [
+        ("superclass", "extends Widget"),
+        ("generic argument", "List<Widget>"),
+        ("declared return type", "Widget make("),
+        ("parameter type", "Widget seed"),
+        ("cast", "(Widget) seed"),
+        ("object creation", "new Widget()"),
+    ] {
+        let at = source.find(needle).expect("type position")
+            + needle.find("Widget").expect("type name in needle");
+        let value = lookup(
+            project.root(),
+            &location_reference("src/main/java/fixture/Holder.java", source, at),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{label}: {value}");
+        assert_eq!(
+            result["definitions"][0]["fqn"], "fixture.Widget",
+            "{label} is a type context, so the same-named field does not obscure it: {value}"
+        );
+    }
+}
+
+#[test]
+fn java_annotation_name_keeps_naming_the_type_an_enclosing_field_obscures() {
+    let marker = "package fixture;\n\npublic @interface Marker {\n}\n";
+    let source = r#"package fixture;
+
+public class Annotated {
+    static final String Marker = "obscured";
+
+    @Marker
+    void run() {
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/fixture/Marker.java", marker)
+        .file("src/main/java/fixture/Annotated.java", source)
+        .build();
+    let at = source.find("@Marker").expect("annotation") + "@".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("src/main/java/fixture/Annotated.java", source, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fixture.Marker",
+        "an annotation name is a type context: {value}"
+    );
+}
+
+#[test]
+fn java_enum_constant_obscures_a_same_package_class_of_that_name() {
+    let placeholder = "package fixture;\n\npublic class UnknownRecordPlaceholder {\n}\n";
+    let source = r#"package fixture;
+
+public enum RecordTypes {
+    UnknownRecordPlaceholder;
+
+    static RecordTypes forTypeID(RecordTypes rt) {
+        return (rt != null) ? rt : UnknownRecordPlaceholder;
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file(
+            "src/main/java/fixture/UnknownRecordPlaceholder.java",
+            placeholder,
+        )
+        .file("src/main/java/fixture/RecordTypes.java", source)
+        .build();
+    let at = source
+        .rfind("UnknownRecordPlaceholder")
+        .expect("conditional operand");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/main/java/fixture/RecordTypes.java", source, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fixture.RecordTypes.UnknownRecordPlaceholder",
+        "the enum constant obscures the same-package class: {value}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1755: a forward occurrence must not bind a call to an overload whose
+// arity cannot accept the argument list.
+// ---------------------------------------------------------------------------
+
+const JAVA_ARITY_APP: &str = r#"package fixture;
+
+import external.framework.Application;
+
+public class App extends Application {
+    @Override
+    public void run(int count, String phase) {
+    }
+
+    public static void main(String[] args) {
+        new App().run(args);
+    }
+}
+"#;
+
+#[test]
+fn java_call_behind_an_unindexed_superclass_does_not_bind_a_wrong_arity_overload() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/fixture/App.java", JAVA_ARITY_APP)
+        .build();
+    let at = JAVA_ARITY_APP.find("run(args)").expect("one-argument call");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/main/java/fixture/App.java", JAVA_ARITY_APP, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(
+        result["status"], "unresolvable_import_boundary",
+        "the only indexed `run` takes two parameters and the superclass is external: {value}"
+    );
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "a wrong-arity overload must never be bound: {value}"
+    );
+}
+
+#[test]
+fn java_call_resolves_the_accepting_overload_on_an_indexed_superclass() {
+    let base = r#"package fixture;
+
+public abstract class Base {
+    public final void run(String[] args) {
+    }
+
+    public abstract void run(int count, String phase);
+}
+"#;
+    let app = r#"package fixture;
+
+public class App extends Base {
+    @Override
+    public void run(int count, String phase) {
+    }
+
+    public static void main(String[] args) {
+        new App().run(args);
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/main/java/fixture/Base.java", base)
+        .file("src/main/java/fixture/App.java", app)
+        .build();
+    let at = app.find("run(args)").expect("one-argument call");
+    let value = lookup(
+        project.root(),
+        &location_reference("src/main/java/fixture/App.java", app, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "fixture.Base.run",
+        "the one-argument call binds the inherited `run(String[])`: {value}"
+    );
+    assert_eq!(
+        result["definitions"][0]["signature"], "(String[])",
+        "{value}"
+    );
+}
+
+// Issue #1762: `from P import S` where `P.S` is a submodule binds the module,
+// even when `P.S` re-exports a member whose name equals the submodule's.
+const PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER: &str =
+    "from pkg import backend\n\n\ndef f(dtype):\n    return backend.standardize_dtype(dtype)\n";
+
+fn python_submodule_self_named_member_project() -> crate::common::BuiltInlineTestProject {
+    InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "from pkg import backend\n")
+        .file(
+            "pkg/backend/__init__.py",
+            "from pkg.backend.config import backend\n\n\ndef standardize_dtype(dtype):\n    return dtype\n",
+        )
+        .file("pkg/backend/config.py", "def backend():\n    return \"tf\"\n")
+        .file("user.py", PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER)
+        .build()
+}
+
+#[test]
+fn python_from_import_of_submodule_resolves_head_to_the_module() {
+    let project = python_submodule_self_named_member_project();
+    let source = PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER;
+    let at = source
+        .find("backend.standardize_dtype")
+        .expect("attribute head");
+    let value = lookup(project.root(), &location_reference("user.py", source, at));
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "pkg.backend",
+        "the head names the submodule, not its same-named re-export: {value}"
+    );
+}
+
+#[test]
+fn python_from_import_of_submodule_resolves_member_through_the_module() {
+    let project = python_submodule_self_named_member_project();
+    let source = PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER;
+    let at = source
+        .find("standardize_dtype(dtype)")
+        .expect("member site");
+    let value = lookup(project.root(), &location_reference("user.py", source, at));
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "pkg.backend.standardize_dtype",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_plain_import_of_submodule_resolves_head_to_the_module() {
+    // Perturbation p8: the same package shape read through `import pkg.backend`
+    // was always correct and must stay correct.
+    let source =
+        "import pkg.backend\n\n\ndef f(dtype):\n    return pkg.backend.standardize_dtype(dtype)\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "from pkg import backend\n")
+        .file(
+            "pkg/backend/__init__.py",
+            "from pkg.backend.config import backend\n\n\ndef standardize_dtype(dtype):\n    return dtype\n",
+        )
+        .file("pkg/backend/config.py", "def backend():\n    return \"tf\"\n")
+        .file("pkg/user.py", source)
+        .build();
+    let at = source
+        .find("pkg.backend.standardize_dtype")
+        .expect("qualified call");
+    let value = lookup(
+        project.root(),
+        &location_reference("pkg/user.py", source, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "pkg", "{value}");
+}
+
+#[test]
+fn python_submodule_declaring_its_own_name_still_resolves_to_the_module() {
+    // Perturbation p11: the subpackage declares `backend` itself instead of
+    // re-exporting it. `from pkg import backend` still binds the submodule -
+    // the declaration is `pkg.backend.backend`, a different name - so the head
+    // is the module. Before issue #1762 this reported an ambiguity between the
+    // module and that declaration.
+    let source = PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER;
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "from pkg import backend\n")
+        .file(
+            "pkg/backend/__init__.py",
+            "def backend():\n    return \"tf\"\n\n\ndef standardize_dtype(dtype):\n    return dtype\n",
+        )
+        .file("user.py", source)
+        .build();
+    let at = source
+        .find("backend.standardize_dtype")
+        .expect("attribute head");
+    let value = lookup(project.root(), &location_reference("user.py", source, at));
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "pkg.backend", "{value}");
+}
+
+// Issue #1764, secondary observation: `compute_export_index_of` backs forward
+// export resolution and always used the AST re-export collector, so a
+// block-nested re-export was dropped for every file, not only colliding ones.
+const PYTHON_NESTED_REEXPORT_CONSUMER: &str =
+    "from .compatibility import timeout\n\n\ndef go():\n    with timeout(5):\n        pass\n";
+
+fn python_nested_reexport_definition(compatibility: &str) -> serde_json::Value {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("src/ws/__init__.py", "")
+        .file(
+            "src/ws/async_timeout.py",
+            "def timeout(delay):\n    return delay\n",
+        )
+        .file("src/ws/compatibility.py", compatibility)
+        .file("src/ws/server.py", PYTHON_NESTED_REEXPORT_CONSUMER)
+        .build();
+    let at = PYTHON_NESTED_REEXPORT_CONSUMER
+        .find("timeout(5)")
+        .expect("call site");
+    lookup(
+        project.root(),
+        &location_reference("src/ws/server.py", PYTHON_NESTED_REEXPORT_CONSUMER, at),
+    )
+}
+
+#[test]
+fn python_flat_reexport_after_a_declaration_resolves_to_the_later_binding() {
+    // Control: the same shadowing without nesting was always read in order.
+    let value = python_nested_reexport_definition(
+        "def timeout(delay):\n    return delay\n\n\nfrom .async_timeout import timeout\n",
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ws.async_timeout.timeout",
+        "{value}"
+    );
+}
+
+#[test]
+fn python_block_nested_reexport_after_a_declaration_resolves_to_the_later_binding() {
+    let value = python_nested_reexport_definition(
+        "def timeout(delay):\n    return delay\n\n\nif True:\n    from .async_timeout import timeout\n",
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "ws.async_timeout.timeout",
+        "{value}"
+    );
+}
+
+// Issue #1782: JavaScript hoists a `var` binder to its enclosing function, so a
+// use before the declaration, or after a block that declares it, still names
+// the same binder. `let`/`const` keep block scoping and their TDZ.
+fn javascript_var_scoping_definition(source: &str, reference: &str) -> serde_json::Value {
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("mod.js", source)
+        .build();
+    let at = source.find(reference).expect("reference marker");
+    lookup(project.root(), &location_reference("mod.js", source, at))
+}
+
+const JAVASCRIPT_VAR_USE_BEFORE_DECLARATION: &str = r#"function outer() {
+    var use = function (value) {
+        return toBigNumber(value);
+    };
+    var toBigNumber = function (number) {
+        return number;
+    };
+    return use;
+}
+"#;
+
+const JAVASCRIPT_LEXICAL_USE_BEFORE_DECLARATION: &str = r#"function outer() {
+    var use = function (value) {
+        return toBigNumber(value);
+    };
+    const toBigNumber = function (number) {
+        return number;
+    };
+    return use;
+}
+"#;
+
+const JAVASCRIPT_FUNCTION_USE_BEFORE_DECLARATION: &str = r#"function outer() {
+    var use = function (value) {
+        return toBigNumber(value);
+    };
+    function toBigNumber(number) {
+        return number;
+    }
+    return use;
+}
+"#;
+
+const JAVASCRIPT_VAR_IN_INNER_BLOCK: &str = r#"function outer(flag) {
+    if (flag) {
+        var toBigNumber = function (number) {
+            return number;
+        };
+    }
+    return toBigNumber(1);
+}
+"#;
+
+const JAVASCRIPT_LEXICAL_IN_INNER_BLOCK: &str = r#"function outer(flag) {
+    if (flag) {
+        const toBigNumber = function (number) {
+            return number;
+        };
+    }
+    return toBigNumber(1);
+}
+"#;
+
+const JAVASCRIPT_VAR_IN_SIBLING_FUNCTION: &str = r#"function first() {
+    var toBigNumber = function (number) {
+        return number;
+    };
+    return toBigNumber;
+}
+
+function second() {
+    return toBigNumber(1);
+}
+"#;
+
+#[test]
+fn javascript_var_binder_hoists_above_its_use_in_the_same_function() {
+    let value =
+        javascript_var_scoping_definition(JAVASCRIPT_VAR_USE_BEFORE_DECLARATION, "toBigNumber(val");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 5, "{value}");
+}
+
+#[test]
+fn javascript_var_binder_in_an_inner_block_resolves_after_that_block() {
+    let value = javascript_var_scoping_definition(JAVASCRIPT_VAR_IN_INNER_BLOCK, "toBigNumber(1)");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 3, "{value}");
+}
+
+#[test]
+fn javascript_function_declaration_hoists_above_its_use_in_the_same_function() {
+    let value = javascript_var_scoping_definition(
+        JAVASCRIPT_FUNCTION_USE_BEFORE_DECLARATION,
+        "toBigNumber(val",
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 5, "{value}");
+}
+
+#[test]
+fn javascript_lexical_binder_used_before_its_declaration_reports_no_definition() {
+    let value = javascript_var_scoping_definition(
+        JAVASCRIPT_LEXICAL_USE_BEFORE_DECLARATION,
+        "toBigNumber(val",
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn javascript_lexical_binder_in_an_inner_block_reports_no_definition_after_that_block() {
+    let value =
+        javascript_var_scoping_definition(JAVASCRIPT_LEXICAL_IN_INNER_BLOCK, "toBigNumber(1)");
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn javascript_var_binder_in_a_sibling_function_reports_no_definition() {
+    let value =
+        javascript_var_scoping_definition(JAVASCRIPT_VAR_IN_SIBLING_FUNCTION, "toBigNumber(1)");
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+/// nunit's `ExtendedTextWriter` shape (#1797): the receiver's own type declares
+/// only a two-parameter `WriteLine`, and the parameterless call the site makes
+/// is `System.IO.TextWriter.WriteLine()`, on the far side of a base type this
+/// workspace does not index.
+const CSHARP_UNINDEXED_BASE_WRITER: &str = r#"using System.IO;
+
+namespace Demo
+{
+    public abstract class ExtendedTextWriter : TextWriter
+    {
+        public abstract void WriteLine(int style, string value);
+        public abstract void WriteLabel(string label, object option = null);
+        public abstract void WriteAll(string label, params object[] values);
+    }
+}
+"#;
+
+const CSHARP_UNINDEXED_BASE_CALLER: &str = r#"namespace Demo
+{
+    public class TextUI
+    {
+        public ExtendedTextWriter Writer { get; }
+
+        public void Show()
+        {
+            Writer.WriteLine();
+            Writer.WriteLine(1, "hello");
+            Writer.WriteLabel("a");
+            Writer.WriteAll("a", 1, 2, 3);
+        }
+    }
+}
+"#;
+
+fn csharp_unindexed_base_definition(needle: &str) -> Value {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Writer.cs", CSHARP_UNINDEXED_BASE_WRITER)
+        .file("src/Ui.cs", CSHARP_UNINDEXED_BASE_CALLER)
+        .build();
+    lookup(
+        project.root(),
+        &location_reference(
+            "src/Ui.cs",
+            CSHARP_UNINDEXED_BASE_CALLER,
+            CSHARP_UNINDEXED_BASE_CALLER
+                .find(needle)
+                .expect("call site in source"),
+        ),
+    )
+}
+
+#[test]
+fn csharp_arity_inapplicable_call_through_an_unindexed_base_answers_boundary() {
+    let value = csharp_unindexed_base_definition("WriteLine();");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "the two-parameter overload cannot accept a parameterless call: {value}"
+    );
+}
+
+#[test]
+fn csharp_applicable_call_through_an_unindexed_base_still_resolves() {
+    let value = csharp_unindexed_base_definition("WriteLine(1,");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.ExtendedTextWriter.WriteLine",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_omitted_optional_argument_through_an_unindexed_base_still_resolves() {
+    let value = csharp_unindexed_base_definition("WriteLabel(\"a\")");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.ExtendedTextWriter.WriteLabel",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_params_array_call_through_an_unindexed_base_still_resolves() {
+    let value = csharp_unindexed_base_definition("WriteAll(\"a\"");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.ExtendedTextWriter.WriteAll",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_arity_inapplicable_call_with_an_indexed_base_chain_answers_no_definition() {
+    let source = r#"namespace Demo
+{
+    public class BaseWriter
+    {
+        public void Flush() {}
+    }
+
+    public class LocalWriter : BaseWriter
+    {
+        public void WriteLine(int style, string value) {}
+    }
+
+    public class Caller
+    {
+        public void Show(LocalWriter writer)
+        {
+            writer.WriteLine();
+            writer.WriteLine(1, "hello");
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Local.cs", source)
+        .build();
+
+    let value = lookup(
+        project.root(),
+        &location_reference(
+            "src/Local.cs",
+            source,
+            source.find("WriteLine();").expect("parameterless call"),
+        ),
+    );
+    let result = &value["results"][0];
+    assert_eq!(
+        result["status"], "no_definition",
+        "every type in the receiver's base chain is indexed, so the missing overload is a workspace fact: {value}"
+    );
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "{value}"
+    );
+
+    let control = lookup(
+        project.root(),
+        &location_reference(
+            "src/Local.cs",
+            source,
+            source.find("WriteLine(1,").expect("two-argument call"),
+        ),
+    );
+    assert_eq!(control["results"][0]["status"], "resolved", "{control}");
+    assert_eq!(
+        control["results"][0]["definitions"][0]["fqn"], "Demo.LocalWriter.WriteLine",
+        "{control}"
+    );
+}
+
+/// neo's `WitnessCondition` shape (#1810): the class declares only the one-argument
+/// `Equals` override, and the bare two-argument call in a static member is the
+/// external `static object.Equals(object, object)` -- inherited from the implicit
+/// `object` base every C# type has and no workspace indexes.
+const CSHARP_IMPLICIT_OBJECT_BASE_SOURCE: &str = r#"namespace Demo
+{
+    public abstract class WitnessCondition
+    {
+        public abstract override bool Equals(object obj);
+
+        public override string ToString()
+        {
+            return "witness";
+        }
+
+        public static bool NotEqual(WitnessCondition left, WitnessCondition right)
+        {
+            return !Equals(left, right);
+        }
+
+        public bool Same(WitnessCondition other)
+        {
+            return Equals(other);
+        }
+
+        public string Describe()
+        {
+            return ToString();
+        }
+    }
+}
+"#;
+
+fn csharp_implicit_object_base_definition(needle: &str, offset: usize) -> Value {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file(
+            "src/WitnessCondition.cs",
+            CSHARP_IMPLICIT_OBJECT_BASE_SOURCE,
+        )
+        .build();
+    let start = CSHARP_IMPLICIT_OBJECT_BASE_SOURCE
+        .find(needle)
+        .expect("call site in source")
+        + offset;
+    lookup(
+        project.root(),
+        &location_reference(
+            "src/WitnessCondition.cs",
+            CSHARP_IMPLICIT_OBJECT_BASE_SOURCE,
+            start,
+        ),
+    )
+}
+
+#[test]
+fn csharp_arity_rejected_object_member_call_answers_boundary() {
+    let value = csharp_implicit_object_base_definition("Equals(left, right)", 0);
+    let result = &value["results"][0];
+    assert_eq!(
+        result["status"], "unresolvable_import_boundary",
+        "the one-argument override cannot accept two arguments, and the accepting \
+         `static object.Equals(object, object)` lives beyond the implicit object base: {value}"
+    );
+    assert!(
+        result["definitions"].as_array().is_none_or(Vec::is_empty),
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_correct_arity_object_member_override_still_resolves() {
+    let value = csharp_implicit_object_base_definition("Equals(other)", 0);
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.WitnessCondition.Equals",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_bare_object_member_call_matching_a_same_class_override_still_resolves() {
+    let value = csharp_implicit_object_base_definition("return ToString();", "return ".len());
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Demo.WitnessCondition.ToString",
+        "{value}"
+    );
+}
+
+/// jint's `IsoDateTime` shape (#1797, face 2): a record's primary constructor is
+/// a real constructor with its own arity, and an explicit constructor beside it
+/// is a distinct overload.
+const CSHARP_PRIMARY_CONSTRUCTOR_SOURCE: &str = r#"namespace Demo
+{
+    internal readonly record struct IsoDate(int Year, int Month, int Day);
+
+    internal readonly record struct IsoDateTime(IsoDate Date, int Hour)
+    {
+        public IsoDateTime(int year, int month, int day, int hour)
+            : this(new IsoDate(year, month, day), hour)
+        {
+        }
+    }
+
+    internal record Simple(int A, int B);
+
+    internal record class Titled(string Name);
+
+    public class Widget(int size)
+    {
+        public int Size => size;
+    }
+
+    public static class Use
+    {
+        public static void Go()
+        {
+            var pair = new IsoDateTime(new IsoDate(1, 2, 3), 4);
+            var parts = new IsoDateTime(1, 2, 3, 4);
+            var simple = new Simple(1, 2);
+            var titled = new Titled("name");
+            var widget = new Widget(3);
+        }
+    }
+}
+"#;
+
+fn csharp_primary_constructor_definition(needle: &str) -> Value {
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("src/Records.cs", CSHARP_PRIMARY_CONSTRUCTOR_SOURCE)
+        .build();
+    let start = CSHARP_PRIMARY_CONSTRUCTOR_SOURCE
+        .find(needle)
+        .expect("creation site in source")
+        + "new ".len();
+    lookup(
+        project.root(),
+        &location_reference("src/Records.cs", CSHARP_PRIMARY_CONSTRUCTOR_SOURCE, start),
+    )
+}
+
+#[test]
+fn csharp_record_struct_primary_constructor_wins_the_arity_match() {
+    let value = csharp_primary_constructor_definition("new IsoDateTime(new IsoDate");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(
+        definitions[0]["fqn"], "Demo.IsoDateTime.IsoDateTime",
+        "{value}"
+    );
+    assert_eq!(
+        definitions[0]["signature"], "(IsoDate, int)",
+        "the primary constructor, not the four-parameter explicit one: {value}"
+    );
+}
+
+#[test]
+fn csharp_record_explicit_constructor_still_wins_its_own_arity() {
+    let value = csharp_primary_constructor_definition("new IsoDateTime(1, 2, 3, 4)");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    let definitions = result["definitions"].as_array().expect("definitions");
+    assert_eq!(definitions.len(), 1, "{value}");
+    assert_eq!(
+        definitions[0]["fqn"], "Demo.IsoDateTime.IsoDateTime",
+        "{value}"
+    );
+    assert_eq!(
+        definitions[0]["signature"], "(int, int, int, int)",
+        "{value}"
+    );
+}
+
+#[test]
+fn csharp_record_only_primary_constructor_resolves_to_it_not_the_type() {
+    for (needle, fqn) in [
+        ("new Simple(1, 2)", "Demo.Simple.Simple"),
+        ("new Titled(\"name\")", "Demo.Titled.Titled"),
+        ("new Widget(3)", "Demo.Widget.Widget"),
+    ] {
+        let value = csharp_primary_constructor_definition(needle);
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
+    }
+}
+
+/// Pillow's `src/Tk/_tkmini.h` declares `typedef Tcl_Command
+/// (*Tcl_CreateCommand_t)(...)`. Recovering the alias target from the
+/// declaration text served `Tcl_Command`, the return type, so the alias
+/// resolved to `struct Tcl_Command_` (issue #1815). A function-pointer typedef
+/// names a function type, which the analyzer's type model cannot name, so the
+/// alias has no canonical target and the typedef itself is the definition.
+#[test]
+fn cpp_function_pointer_typedef_does_not_resolve_to_its_return_type() {
+    let source = r#"
+struct Tcl_Command_ { int value; };
+typedef struct Tcl_Command_ *Tcl_Command;
+struct Tcl_Interp_ { int value; };
+typedef struct Tcl_Interp_ Tcl_Interp;
+typedef Tcl_Command (*Tcl_CreateCommand_t)(Tcl_Interp *interp, const char *cmdName);
+typedef Tcl_Command Tcl_CreateCommandDirect_t(Tcl_Interp *interp);
+struct impl_s { int value; };
+typedef struct impl_s alias_t;
+struct S { int value; };
+typedef struct S *A;
+typedef int arr_t[4];
+typedef const struct S *csp_t;
+void use(Tcl_CreateCommand_t fp, Tcl_CreateCommandDirect_t *direct, alias_t plain,
+         A pointer, arr_t array, csp_t qualified, Tcl_Command command) {
+    (void)fp; (void)direct; (void)plain; (void)pointer;
+    (void)array; (void)qualified; (void)command;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.c", source)
+        .build();
+
+    // Each alias use resolves to the definition its declaration names. A
+    // function-type alias names no declared type, so it resolves to itself.
+    for (needle, fqn) in [
+        ("Tcl_CreateCommand_t fp", "Tcl_CreateCommand_t"),
+        (
+            "Tcl_CreateCommandDirect_t *direct",
+            "Tcl_CreateCommandDirect_t",
+        ),
+        ("alias_t plain", "impl_s"),
+        ("A pointer", "S"),
+        ("arr_t array", "arr_t"),
+        ("csp_t qualified", "S"),
+        ("Tcl_Command command", "Tcl_Command_"),
+    ] {
+        let start = source.find(needle).expect("alias use in fixture");
+        let value = lookup(project.root(), &location_reference("app.c", source, start));
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        let definitions = result["definitions"].as_array().expect("definitions array");
+        assert_eq!(definitions.len(), 1, "{needle}: {value}");
+        assert_eq!(definitions[0]["fqn"], fqn, "{needle}: {value}");
+    }
+}
+
+/// The C++ `using` spelling of a function-pointer alias has the same target:
+/// the aliased type is a function type, not the return type.
+#[test]
+fn cpp_using_function_pointer_alias_does_not_resolve_to_its_return_type() {
+    let source = r#"namespace app {
+struct Command { int value; };
+using CommandPtr = Command *;
+using Handler = Command (*)(int);
+void use(Handler handler, CommandPtr pointer) { (void)handler; (void)pointer; }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Cpp)
+        .file("app.cpp", source)
+        .build();
+
+    for (needle, fqn) in [
+        ("Handler handler", "app.Handler"),
+        ("CommandPtr pointer", "app.Command"),
+    ] {
+        let start = source.find(needle).expect("alias use in fixture");
+        let value = lookup(
+            project.root(),
+            &location_reference("app.cpp", source, start),
+        );
+        let result = &value["results"][0];
+        assert_eq!(result["status"], "resolved", "{needle}: {value}");
+        assert_eq!(result["definitions"][0]["fqn"], fqn, "{needle}: {value}");
+    }
 }

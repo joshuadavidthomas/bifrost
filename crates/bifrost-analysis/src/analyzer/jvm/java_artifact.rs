@@ -1,5 +1,4 @@
 use crate::CancellationToken;
-use crate::analyzer::java::declarations::{determine_package_name, node_text, parse_tree};
 use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
@@ -10,6 +9,7 @@ use crate::analyzer::semantic_model::{
     type_declaration_id,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::java::declarations::{determine_package_name, node_text, parse_tree};
 use jclassfile::attributes::{Attribute, NestedClassFlags};
 use jclassfile::class_file::{ClassFile, ClassFlags};
 use jclassfile::constant_pool::ConstantPool;
@@ -103,7 +103,7 @@ impl JavaJarPackProducer {
         self.produce_loaded_artifact(request, limits, cancellation, &artifact)
     }
 
-    pub(crate) fn produce_loaded_artifact(
+    pub fn produce_loaded_artifact(
         &self,
         request: &ArtifactProductionRequest,
         limits: &ArtifactProducerLimits,
@@ -201,7 +201,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::GoSourceSet
                 | ExternalArtifactKind::PythonStub
                 | ExternalArtifactKind::PythonSource
-                | ExternalArtifactKind::RubyGemArchive => false,
+                | ExternalArtifactKind::RubyGemArchive
+                | ExternalArtifactKind::ComposerPackageSourceSet => false,
             };
             if !selected {
                 continue;
@@ -220,7 +221,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::GoSourceSet
                 | ExternalArtifactKind::PythonStub
                 | ExternalArtifactKind::PythonSource
-                | ExternalArtifactKind::RubyGemArchive => unreachable!(),
+                | ExternalArtifactKind::RubyGemArchive
+                | ExternalArtifactKind::ComposerPackageSourceSet => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
             if entry.size() > entry_limit || next_total > MAX_TOTAL_ARCHIVE_BYTES {
@@ -284,7 +286,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::GoSourceSet
                 | ExternalArtifactKind::PythonStub
                 | ExternalArtifactKind::PythonSource
-                | ExternalArtifactKind::RubyGemArchive => unreachable!(),
+                | ExternalArtifactKind::RubyGemArchive
+                | ExternalArtifactKind::ComposerPackageSourceSet => unreachable!(),
             }
         }
         if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {
@@ -554,6 +557,7 @@ pub(super) fn java_api_facts(
             hierarchy: declaration.hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: declaration.locator,
         });
         for member in declaration.members {
@@ -608,6 +612,7 @@ pub(super) fn java_api_facts(
                 extension_receiver: None,
                 extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
+                guard: None,
                 locator: member.locator,
             });
         }

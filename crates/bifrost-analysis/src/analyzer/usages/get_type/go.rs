@@ -12,20 +12,6 @@ use crate::analyzer::{GoAnalyzer, IAnalyzer, ProjectFile, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use tree_sitter::Tree;
 
-pub(super) fn resolve_go_type(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    tree: Option<&Tree>,
-    site: &ResolvedReferenceSite,
-) -> TypeLookupOutcome {
-    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
-        return no_type("go_analyzer_unavailable", "Go analyzer is unavailable");
-    };
-    let support = AnalyzerGoDefinitionProvider::new(go, analyzer.semantic_model_overlay());
-    resolve_go_type_with_provider(analyzer, &support, file, source, tree, site)
-}
-
 pub(crate) fn resolve_go_type_bounded(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,

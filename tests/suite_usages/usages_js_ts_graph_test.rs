@@ -1,4 +1,5 @@
 use crate::common::{InlineTestProject, js_fixture_project, ts_fixture_project};
+use brokk_bifrost::CodeUnitIndex;
 use brokk_bifrost::usages::{
     ExplicitCandidateProvider, FuzzyResult, JsTsExportUsageGraphStrategy, UsageAnalyzer,
     UsageFinder, UsageHitKind,
@@ -524,6 +525,58 @@ fn authoritative_js_hits(
     }
 }
 
+fn authoritative_js_hits_across(
+    analyzer: &JavascriptAnalyzer,
+    target: &CodeUnit,
+    candidates: impl IntoIterator<Item = ProjectFile>,
+) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
+    let candidates: brokk_bifrost::hash::HashSet<ProjectFile> = candidates.into_iter().collect();
+    let max_files = candidates.len();
+    let provider = ExplicitCandidateProvider::new(Arc::new(candidates));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            analyzer,
+            std::slice::from_ref(target),
+            Some(&provider),
+            max_files,
+            100,
+        );
+    match query.result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload.get(target).cloned().unwrap_or_default(),
+        other => panic!("expected authoritative JS usage success, got {other:#?}"),
+    }
+}
+
+/// Usages found through the shipped candidate-selection path (no explicit
+/// scope), which is what `scan_usages` runs.
+fn default_scope_js_hits(
+    analyzer: &JavascriptAnalyzer,
+    target: &CodeUnit,
+) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
+    let query = UsageFinder::new().query(analyzer, std::slice::from_ref(target), 100, 100);
+    match query.result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload.get(target).cloned().unwrap_or_default(),
+        other => panic!("expected default-scope JS usage success, got {other:#?}"),
+    }
+}
+
+fn hit_sites(hits: &BTreeSet<brokk_bifrost::usages::UsageHit>) -> BTreeSet<(String, usize, usize)> {
+    hits.iter()
+        .map(|hit| {
+            (
+                hit.file.rel_path().to_string_lossy().replace('\\', "/"),
+                hit.start_offset,
+                hit.end_offset,
+            )
+        })
+        .collect()
+}
+
 fn authoritative_ts_hits(
     analyzer: &TypescriptAnalyzer,
     target: &CodeUnit,
@@ -649,6 +702,147 @@ function readBeforeFunctionBinding() {
             "TDZ and var-hoisted bindings must shadow earlier reads: {hits:#?}"
         );
     }
+}
+
+/// #1778: `window.X = ...` declares browser global `X`, so a bare `X` is a read
+/// of that field in every position -- including the object slot of a member
+/// expression, which the identifier visitor suppresses to avoid double-counting.
+#[test]
+fn js_window_global_property_counts_bare_read_in_receiver_position() {
+    let source = r#"window.zqxfoo = 1;
+function readReceiver() { return zqxfoo.bar; }
+function readValue() { return helper(zqxfoo); }
+function callIt() { return zqxfoo(); }
+function readQualified() { return window.zqxfoo; }
+function shadowedReceiver() { const zqxfoo = { bar: 2 }; return zqxfoo.bar; }
+function otherReceiver() { return holder.zqxfoo.bar; }
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("globals.js", source).build());
+    let file = project.file("globals.js");
+    let target = find_js_target(&analyzer, &file, |unit| {
+        unit.is_field() && unit.fq_name() == "window.zqxfoo"
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+    let ranges: BTreeSet<_> = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([
+            identifier_occurrence_range(source, "zqxfoo", 1),
+            identifier_occurrence_range(source, "zqxfoo", 2),
+            identifier_occurrence_range(source, "zqxfoo", 3),
+            identifier_occurrence_range(source, "zqxfoo", 4),
+        ]),
+        ranges,
+        "the receiver, value, callee and qualified reads are the browser global; the local shadow and the unrelated receiver's property are not: {hits:#?}"
+    );
+}
+
+const NAMESPACE_BASE_JS: &str = r#"var WLT = WLT || {};
+WLT.Utils = (() => ({ markFuzzy: 1 }))();
+function sameFile() { return WLT.Utils; }
+"#;
+
+const NAMESPACE_FULL_JS: &str = r#"function go() { helper(WLT.Utils.markFuzzy); }
+function other() { return WLT.Other; }
+"#;
+
+fn namespace_field_target(analyzer: &JavascriptAnalyzer, base: &ProjectFile) -> CodeUnit {
+    find_js_definition(analyzer, base, "WLT.Utils", |unit| {
+        unit.fq_name() == "WLT.Utils" && unit.is_field()
+    })
+}
+
+/// #1777: `WLT.Utils = ...` under a plain-local root is a definition-lookup-only
+/// unit, and forward resolves a cross-file read of it through the browser-script
+/// global model. The inverse must report the same reads.
+#[test]
+fn js_lookup_only_namespace_field_counts_cross_file_browser_script_read() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("base.js", NAMESPACE_BASE_JS)
+            .file("full.js", NAMESPACE_FULL_JS)
+            .build()
+    });
+    let base = project.file("base.js");
+    let full = project.file("full.js");
+    let target = namespace_field_target(&analyzer, &base);
+
+    let hits = authoritative_js_hits_across(&analyzer, &target, [base, full]);
+    let (base_start, base_end) = identifier_occurrence_range(NAMESPACE_BASE_JS, "Utils", 1);
+    let (full_start, full_end) = identifier_occurrence_range(NAMESPACE_FULL_JS, "Utils", 0);
+
+    assert_eq!(
+        BTreeSet::from([
+            ("base.js".to_string(), base_start, base_end),
+            ("full.js".to_string(), full_start, full_end),
+        ]),
+        hit_sites(&hits),
+        "the same-file read and the cross-file script read are usages; `WLT.Other` is not: {hits:#?}"
+    );
+}
+
+/// The cross-file admission carries forward's proof, so it must die with it:
+/// an external module's members are not browser-script globals, and a reading
+/// file that binds the receiver root reads its own object.
+#[test]
+fn js_lookup_only_namespace_field_cross_file_read_requires_global_identity() {
+    let external_module_base = format!("{NAMESPACE_BASE_JS}export const z = 1;\n");
+    let shadowing_full = format!("const WLT = {{ Utils: {{}} }};\n{NAMESPACE_FULL_JS}");
+    for (base_source, full_source, reason) in [
+        (
+            external_module_base.as_str(),
+            NAMESPACE_FULL_JS,
+            "an external module's namespace field is not a browser-script global",
+        ),
+        (
+            NAMESPACE_BASE_JS,
+            shadowing_full.as_str(),
+            "a reading file that binds the receiver root reads its own object",
+        ),
+    ] {
+        let (project, analyzer) = js_inline_analyzer(|p| {
+            p.file("base.js", base_source)
+                .file("full.js", full_source)
+                .build()
+        });
+        let base = project.file("base.js");
+        let full = project.file("full.js");
+        let target = namespace_field_target(&analyzer, &base);
+
+        let hits = authoritative_js_hits_across(&analyzer, &target, [base, full]);
+        let (base_start, base_end) = identifier_occurrence_range(base_source, "Utils", 1);
+
+        assert_eq!(
+            BTreeSet::from([("base.js".to_string(), base_start, base_end)]),
+            hit_sites(&hits),
+            "{reason}: {hits:#?}"
+        );
+    }
+}
+
+/// The same read, discovered through the shipped candidate selection rather
+/// than an explicit scope: the reader is in another directory, so only the
+/// text-candidate union puts it in front of the matcher at all.
+#[test]
+fn js_lookup_only_namespace_field_cross_file_read_survives_candidate_selection() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file("static/base.js", NAMESPACE_BASE_JS)
+            .file("app/full.js", NAMESPACE_FULL_JS)
+            .build()
+    });
+    let base = project.file("static/base.js");
+    let target = namespace_field_target(&analyzer, &base);
+
+    let hits = default_scope_js_hits(&analyzer, &target);
+    let (full_start, full_end) = identifier_occurrence_range(NAMESPACE_FULL_JS, "Utils", 0);
+
+    assert!(
+        hit_sites(&hits).contains(&("app/full.js".to_string(), full_start, full_end)),
+        "default candidate selection must reach the cross-directory reader: {hits:#?}"
+    );
 }
 
 #[test]
@@ -2977,6 +3171,93 @@ fn js_commonjs_exports_named_function_expression_resolves_module_object_usage() 
 }
 
 #[test]
+fn js_named_commonjs_function_expression_name_is_not_a_usage_but_recursion_is() {
+    let source = r#"
+exports.accepts = function accepts(depth) {
+  if (depth > 0) return accepts(depth - 1);
+  return true;
+};
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("request.js", source).build());
+    let target = find_js_target(&analyzer, &project.file("request.js"), |cu| {
+        cu.short_name() == "accepts" && cu.is_function()
+    });
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    assert!(result.all_hits().is_empty(), "external hits: {result:?}");
+    let editor_hits = result.all_hits_including_imports();
+    assert_eq!(1, editor_hits.len(), "editor hits: {editor_hits:?}");
+    let editor_hit = editor_hits
+        .iter()
+        .next()
+        .expect("the recursive call must be an editor hit");
+    assert_eq!(UsageHitKind::SelfReceiver, editor_hit.kind);
+    assert!(
+        editor_hit.snippet.contains("accepts(depth - 1)"),
+        "only the recursive call is an editor hit: {editor_hits:?}"
+    );
+}
+
+#[test]
+fn ts_promise_callback_binding_does_not_impersonate_outer_function() {
+    let source = r#"export function onMessage(depth: number): Promise<number> {
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      proc.off("message", onMessage);
+    };
+    const onMessage = () => {
+      resolve(depth);
+    };
+    proc.on("message", onMessage);
+  });
+}
+
+function use(): Promise<number> { return onMessage(1); }
+"#;
+    let (project, analyzer) = ts_inline_analyzer(|p| p.file("wrapper.ts", source).build());
+    let target = find_ts_target(&analyzer, &project.file("wrapper.ts"), |cu| {
+        cu.short_name() == "onMessage" && cu.is_function()
+    });
+
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let external_hits = result.all_hits();
+    assert_eq!(1, external_hits.len(), "external hits: {external_hits:?}");
+    let external_lines: BTreeSet<_> = external_hits
+        .iter()
+        .map(|hit| {
+            source[..hit.start_offset]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1
+        })
+        .collect();
+    assert_eq!(
+        BTreeSet::from([13]),
+        external_lines,
+        "only the external call may remain: {external_hits:?}"
+    );
+
+    let editor_hits = result.all_hits_including_imports();
+    assert_eq!(1, editor_hits.len(), "editor hits: {editor_hits:?}");
+    let editor_lines: BTreeSet<_> = editor_hits
+        .iter()
+        .map(|hit| {
+            source[..hit.start_offset]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1
+        })
+        .collect();
+    assert_eq!(
+        BTreeSet::from([13]),
+        editor_lines,
+        "only the external call may remain: {editor_hits:?}"
+    );
+}
+
+#[test]
 fn js_commonjs_module_exports_local_object_resolves_later_member_declaration() {
     let (project, analyzer) = js_inline_analyzer(|p| {
         p.file(
@@ -3485,5 +3766,805 @@ fn jsts_usage_index_invalidates_when_reexport_removed_on_update_javascript() {
     assert!(
         !widget_usages_in_consumer(&updated, &consumer),
         "after removing the re-export and updating, the stale Widget usage must be gone (JS)"
+    );
+}
+
+// #1769: a module-level destructuring pattern binds ordinary declarations. Their
+// uses must appear on every surface, exactly as a plain `const name = ...`
+// binding's uses do.
+
+#[test]
+fn ts_module_shorthand_destructured_binding_resolves_same_file_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "colors.ts",
+            "const palette = {\n\
+               cyan: (s: string) => s,\n\
+             };\n\
+             \n\
+             const { cyan } = palette;\n\
+             \n\
+             export function banner(): string {\n\
+               return cyan('hello');\n\
+             }\n\
+             \n\
+             export function footer(): string {\n\
+               return cyan('bye');\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("colors.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "colors.ts.cyan"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([8, 12]),
+        "both reads of the shorthand-destructured module binding must be external usages: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_module_renamed_destructured_binding_resolves_uses_of_the_local_name() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "colors.ts",
+            "const palette = {\n\
+               cyan: (s: string) => s,\n\
+             };\n\
+             \n\
+             const { cyan: teal } = palette;\n\
+             \n\
+             export function banner(): string {\n\
+               return teal('hello');\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("colors.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "colors.ts.teal"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([8]),
+        "the renamed binder's local name is the declaration name: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_module_array_destructured_binding_resolves_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "pair.ts",
+            "const items: string[] = ['a', 'b'];\n\
+             \n\
+             const [first, second] = items;\n\
+             \n\
+             export function head(): string {\n\
+               return first;\n\
+             }\n\
+             \n\
+             export function tail(): string {\n\
+               return second;\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("pair.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "pair.ts.first"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([6]),
+        "the array binder's single read must be listed, and `second` must not be: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_module_destructured_binding_of_imported_object_resolves_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "vendor.ts",
+            "const colors = {\n\
+               cyan: (s: string) => s,\n\
+             };\n\
+             export default colors;\n",
+        )
+        .file(
+            "colors.ts",
+            "import colors from './vendor';\n\
+             \n\
+             const { cyan } = colors;\n\
+             \n\
+             export function banner(): string {\n\
+               return cyan('hello');\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("colors.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "colors.ts.cyan"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([6]),
+        "an imported source object does not change the binder's own declaration: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_module_shorthand_destructured_binding_resolves_uses() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "colors.js",
+            "const palette = {\n\
+               cyan: (s) => s,\n\
+             };\n\
+             \n\
+             const { cyan } = palette;\n\
+             \n\
+             export function banner() {\n\
+               return cyan('hello');\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_js_target(&analyzer, &project.file("colors.js"), |cu| {
+        cu.is_field() && cu.short_name() == "colors.js.cyan"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([8]),
+        "the shared js-ts graph must list the JavaScript binder's read too: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_plain_module_const_binding_keeps_resolving_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "theme.ts",
+            "const resolvedTheme = 'dark';\n\
+             \n\
+             export function isDark(): boolean {\n\
+               return resolvedTheme === 'dark';\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("theme.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "theme.ts.resolvedTheme"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([4]),
+        "the plain module const control must keep its single read: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_function_local_destructuring_does_not_match_a_same_named_module_binding() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "colors.ts",
+            "const palette = {\n\
+               cyan: (s: string) => s,\n\
+             };\n\
+             \n\
+             const { cyan } = palette;\n\
+             \n\
+             export function banner(): string {\n\
+               return cyan('hello');\n\
+             }\n\
+             \n\
+             export function shadowed(other: { cyan: (s: string) => string }): string {\n\
+               const { cyan } = other;\n\
+               return cyan('shadow');\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("colors.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "colors.ts.cyan"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([8]),
+        "a function-body destructuring binds a local that shadows the module binding: {hits:#?}"
+    );
+}
+
+#[test]
+fn ts_module_nested_destructured_binding_resolves_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "config.ts",
+            "const config = {\n\
+               theme: { primary: 'blue' },\n\
+             };\n\
+             \n\
+             const {\n\
+               theme: { primary },\n\
+             } = config;\n\
+             \n\
+             export function accent(): string {\n\
+               return primary;\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("config.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "config.ts.primary"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([10]),
+        "a nested pattern binder is a declaration like any other binder: {hits:#?}"
+    );
+}
+
+/// The woodpecker `useTheme` composition shape from #1769: several renamed
+/// binders destructured from a call on an unresolvable external import.
+#[test]
+fn ts_module_renamed_binders_from_unresolved_import_call_resolve_uses() {
+    let (project, analyzer) = ts_inline_analyzer(|p| {
+        p.file(
+            "useTheme.ts",
+            "import { useColorMode } from '@vueuse/core';\n\
+             \n\
+             const {\n\
+               store: storeTheme,\n\
+               state: resolvedTheme,\n\
+             } = useColorMode({ storageKey: 'theme' });\n\
+             \n\
+             function updateTheme() {\n\
+               if (resolvedTheme.value === 'dark') {\n\
+                 return storeTheme;\n\
+               }\n\
+               return resolvedTheme;\n\
+             }\n\
+             \n\
+             export function useTheme() {\n\
+               return { theme: resolvedTheme, storeTheme, updateTheme };\n\
+             }\n",
+        )
+        .build()
+    });
+
+    let target = find_ts_target(&analyzer, &project.file("useTheme.ts"), |cu| {
+        cu.is_field() && cu.short_name() == "useTheme.ts.resolvedTheme"
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    let lines: BTreeSet<usize> = hits.iter().map(|hit| hit.line).collect();
+    assert_eq!(
+        lines,
+        BTreeSet::from([9, 12, 16]),
+        "every read of the renamed binder must be listed, and storeTheme's must not: {hits:#?}"
+    );
+}
+
+// --- issue #1780: object-literal keys minted under a member assignment ---
+//
+// `X.y = { key: ... }` mints the field `X.y.key`, and the forward side resolves
+// `X.y.key` reads to it. Before #1780 the inverse never reported those reads,
+// because the definition side accepted an object literal only as the value of a
+// `variable_declarator` and only for a bare receiver.
+
+/// The one-based number of the first line that contains `needle`, matching the
+/// `UsageHit::line` convention.
+fn line_number_of(source: &str, needle: &str) -> usize {
+    let offset = source
+        .find(needle)
+        .unwrap_or_else(|| panic!("fixture line not found: {needle}"));
+    source[..offset]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+fn reference_lines(hits: &BTreeSet<brokk_bifrost::usages::UsageHit>) -> BTreeSet<usize> {
+    hits.iter()
+        .filter(|hit| hit.kind == UsageHitKind::Reference)
+        .map(|hit| hit.line)
+        .collect()
+}
+
+const MEMBER_ASSIGNMENT_LITERAL_SOURCE: &str = r#"const viaDeclarator = { key: 1 };
+const readDeclarator = viaDeclarator.key;
+const host = {};
+host.viaAssignment = { key: 2 };
+const readAssignment = host.viaAssignment.key;
+const readAssignmentAgain = host.viaAssignment.key;
+const nearMissProperty = host.viaAssignment.other;
+host.otherBranch = { key: 3 };
+const nearMissBranch = host.otherBranch.key;
+const rival = {};
+rival.viaAssignment = { key: 4 };
+const nearMissReceiver = rival.viaAssignment.key;
+"#;
+
+#[test]
+fn js_object_literal_key_under_member_assignment_reports_its_reads() {
+    let source = MEMBER_ASSIGNMENT_LITERAL_SOURCE;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("p8.js", source).build());
+    let file = project.file("p8.js");
+    let target = find_js_definition(&analyzer, &file, "host.viaAssignment.key", |cu| {
+        cu.is_field()
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([
+            line_number_of(source, "const readAssignment ="),
+            line_number_of(source, "const readAssignmentAgain ="),
+        ]),
+        "every read of the assignment-minted key must be listed, and no other receiver's: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_object_literal_key_under_variable_declarator_still_reports_its_reads() {
+    let source = MEMBER_ASSIGNMENT_LITERAL_SOURCE;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("p8.js", source).build());
+    let file = project.file("p8.js");
+    let target = find_js_target(&analyzer, &file, |cu| {
+        cu.is_field() && cu.fq_name() == "p8.js.viaDeclarator.key"
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([line_number_of(source, "const readDeclarator =")]),
+        "the declarator-minted key keeps exactly its own read: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_object_literal_key_under_member_assignment_forward_resolves_its_reads() {
+    let source = MEMBER_ASSIGNMENT_LITERAL_SOURCE;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("p8.js", source).build());
+    let _ = project;
+
+    let read_line = line_number_of(source, "const readAssignment =");
+    let column = "const readAssignment = host.viaAssignment.".chars().count() + 1;
+    let forward = brokk_bifrost::searchtools::get_definitions_by_location(
+        &analyzer,
+        brokk_bifrost::searchtools::GetDefinitionParams {
+            references: vec![brokk_bifrost::searchtools::DefinitionReferenceQuery {
+                path: "p8.js".to_string(),
+                line: Some(read_line),
+                column: Some(column),
+            }],
+        },
+    );
+
+    assert_eq!(forward.results[0].status, "resolved", "{forward:#?}");
+    assert!(
+        forward.results[0]
+            .definitions
+            .iter()
+            .any(|definition| definition.fqn.as_deref() == Some("host.viaAssignment.key")),
+        "the read must still forward-resolve to the assignment-minted key: {forward:#?}"
+    );
+}
+
+#[test]
+fn js_object_literal_key_under_nested_member_assignment_reports_its_reads() {
+    let source = r#"const innerFieldRef = {};
+innerFieldRef.acls = {};
+innerFieldRef.acls.rules = { max: 1, min: 2 };
+const readDeep = innerFieldRef.acls.rules.max;
+const nearMissDepth = innerFieldRef.acls.max;
+const readDeepAgain = innerFieldRef.acls.rules.max;
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("state.js", source).build());
+    let file = project.file("state.js");
+    let target = find_js_definition(&analyzer, &file, "innerFieldRef.acls.rules.max", |cu| {
+        cu.is_field()
+    });
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([
+            line_number_of(source, "const readDeep ="),
+            line_number_of(source, "const readDeepAgain ="),
+        ]),
+        "a two-member receiver chain must match element-wise, not by root alone: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_object_literal_keys_under_parameter_member_assignments_report_their_reads() {
+    let source = r#"function buildState(stateData, al, value) {
+  stateData.icmp = { type: null, code: null };
+  const kind = stateData.icmp.type;
+  const code = stateData.icmp.code;
+  al.description = { text: value };
+  return [kind, code, al.description.text];
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("fields.js", source).build());
+    let file = project.file("fields.js");
+
+    let icmp_type = find_js_definition(&analyzer, &file, "stateData.icmp.type", |cu| cu.is_field());
+    let icmp_type_hits = authoritative_js_hits(&analyzer, &icmp_type, file.clone());
+    assert_eq!(
+        reference_lines(&icmp_type_hits),
+        BTreeSet::from([line_number_of(source, "const kind =")]),
+        "`stateData.icmp.type` must list its read and not the sibling `.code` read: {icmp_type_hits:#?}"
+    );
+
+    let description_text =
+        find_js_definition(&analyzer, &file, "al.description.text", |cu| cu.is_field());
+    let description_text_hits = authoritative_js_hits(&analyzer, &description_text, file);
+    assert_eq!(
+        reference_lines(&description_text_hits),
+        BTreeSet::from([line_number_of(source, "  return [kind, code,")]),
+        "`al.description.text` must list the read that follows the write: {description_text_hits:#?}"
+    );
+}
+
+/// A chained receiver must not be exported as if the imported binding owned the
+/// property directly. Seeding importers with `host` for the target
+/// `host.viaAssignment.key` reports `imported.key`, which is not that field, and
+/// still misses `imported.viaAssignment.key`; the bare-receiver restriction in
+/// `exported_local_property_binding` is what keeps that from happening.
+#[test]
+fn js_object_literal_key_under_member_assignment_reports_no_importer_property_of_the_root() {
+    let (project, analyzer) = js_inline_analyzer(|p| {
+        p.file(
+            "state.js",
+            "export const host = {};\nhost.viaAssignment = { key: 2 };\n",
+        )
+        .file(
+            "consumer.js",
+            r#"import { host } from "./state.js";
+export function nearMiss() {
+  return host.key;
+}
+"#,
+        )
+        .build()
+    });
+    let file = project.file("state.js");
+    let target = find_js_definition(&analyzer, &file, "host.viaAssignment.key", |cu| {
+        cu.is_field()
+    });
+
+    let hits = flatten_hits(
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target)),
+    );
+
+    assert!(
+        hits.iter()
+            .all(|hit| hit.file != project.file("consumer.js")),
+        "`imported.key` is a different property from `host.viaAssignment.key`: {hits:#?}"
+    );
+}
+
+const MULTI_COPY_BUNDLE_SOURCE: &str = r#"(function (global, factory) {
+  typeof exports === 'object' ? factory(exports) : factory((global.bootstrap = {}));
+})(this, function (exports) {
+  var NAME = 'alert';
+  var $ = { fn: {} };
+
+  var Alert = function () {
+    function Alert(element) {
+      this._element = element;
+    }
+
+    return Alert;
+  }();
+
+  Alert._jQueryInterface = function _jQueryInterface(config) {
+    return config;
+  };
+
+  $.fn[NAME] = Alert._jQueryInterface;
+
+  exports.Alert = Alert;
+});
+"#;
+
+const MULTI_COPY_SRC_SOURCE: &str = r#"const NAME = 'alert';
+const $ = { fn: {} };
+
+class Alert {
+  static _jQueryInterface(config) {
+    return config;
+  }
+}
+
+$.fn[NAME] = Alert._jQueryInterface;
+
+export default Alert;
+"#;
+
+/// A reported site: the workspace-relative file it sits in, and its line.
+type HitSite = (String, usize);
+type HitSites = BTreeSet<HitSite>;
+
+/// The `(file, line)` of every proven and every unproven site a usage query
+/// reports, so a multi-candidate answer can be compared site for site.
+fn multi_copy_sites(
+    analyzer: &JavascriptAnalyzer,
+    overloads: &[CodeUnit],
+    candidates: &brokk_bifrost::hash::HashSet<ProjectFile>,
+) -> (HitSites, HitSites) {
+    let result =
+        JsTsExportUsageGraphStrategy::new().find_usages(analyzer, overloads, candidates, 1000);
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } => (
+            candidate_hit_sites(hits_by_overload.into_values().flatten()),
+            candidate_hit_sites(unproven_by_overload.into_values().flatten()),
+        ),
+        other => panic!("expected Success, got {other:#?}"),
+    }
+}
+
+fn candidate_hit_sites(
+    hits: impl IntoIterator<Item = brokk_bifrost::usages::UsageHit>,
+) -> HitSites {
+    hits.into_iter()
+        .map(|hit| {
+            (
+                hit.file.rel_path().to_string_lossy().replace('\\', "/"),
+                hit.line,
+            )
+        })
+        .collect()
+}
+
+fn multi_copy_project() -> (crate::common::BuiltInlineTestProject, JavascriptAnalyzer) {
+    js_inline_analyzer(|p| {
+        p.file("dist/bundle.js", MULTI_COPY_BUNDLE_SOURCE)
+            .file("src/alert.js", MULTI_COPY_SRC_SOURCE)
+            .build()
+    })
+}
+
+fn multi_copy_targets(
+    analyzer: &JavascriptAnalyzer,
+    project: &crate::common::BuiltInlineTestProject,
+) -> (CodeUnit, CodeUnit) {
+    let units: Vec<_> = analyzer.all_declarations().collect();
+    let dist = project.file("dist/bundle.js");
+    let src = project.file("src/alert.js");
+    let dist_target = definition_in(units.iter(), |cu| {
+        cu.source() == &dist && cu.short_name() == "Alert._jQueryInterface"
+    });
+    let src_target = definition_in(units.iter(), |cu| {
+        cu.source() == &src && cu.short_name() == "Alert._jQueryInterface"
+    });
+    (dist_target, src_target)
+}
+
+/// #1779: a vendored bundle and the source it was built from both declare
+/// `Alert._jQueryInterface`, so forward resolution answers with a two-candidate
+/// group. The bundle copy proves only its own read and knows nothing of the
+/// source file, so a strategy that scans just the first candidate loses the
+/// source read entirely -- and which copy sorts first decides that.
+#[test]
+fn js_multi_copy_target_group_unions_every_candidate_scan() {
+    let (project, analyzer) = multi_copy_project();
+    let (dist_target, src_target) = multi_copy_targets(&analyzer, &project);
+    let candidates: brokk_bifrost::hash::HashSet<ProjectFile> =
+        analyzer.get_analyzed_files().into_iter().collect();
+
+    let (bundle_read, source_read, bundle_assignment) = multi_copy_site_lines();
+
+    let (proven, unproven) = multi_copy_sites(
+        &analyzer,
+        &[dist_target.clone(), src_target.clone()],
+        &candidates,
+    );
+    assert_eq!(
+        proven,
+        BTreeSet::from([bundle_read.clone(), source_read.clone()]),
+        "the group's proven sites must include the source copy's read, not only the bundle's"
+    );
+    assert_eq!(
+        unproven,
+        BTreeSet::from([bundle_assignment.clone()]),
+        "the bundle read is proven for the bundle candidate, so the source candidate's \
+         unproven reading of the same site must not be reported a second time"
+    );
+
+    // Perturbation control: the answer must not depend on which copy sorts
+    // first. Renaming the bundle directory was what flipped this site from
+    // missing to reported before the union.
+    let source_first = multi_copy_sites(&analyzer, &[src_target, dist_target], &candidates);
+    assert_eq!(
+        source_first,
+        (proven, unproven),
+        "candidate order must not change the reported sites"
+    );
+}
+
+/// Control: a single-candidate query is unchanged by the union. Each copy still
+/// proves only what it can see and reports the other copy's sites as unproven.
+#[test]
+fn js_single_copy_target_keeps_its_own_proven_and_unproven_split() {
+    let (project, analyzer) = multi_copy_project();
+    let (dist_target, src_target) = multi_copy_targets(&analyzer, &project);
+    let candidates: brokk_bifrost::hash::HashSet<ProjectFile> =
+        analyzer.get_analyzed_files().into_iter().collect();
+
+    let (bundle_read, source_read, bundle_assignment) = multi_copy_site_lines();
+
+    assert_eq!(
+        multi_copy_sites(&analyzer, &[dist_target], &candidates),
+        (BTreeSet::from([bundle_read.clone()]), BTreeSet::new()),
+        "the bundle candidate alone still proves only its own read"
+    );
+    assert_eq!(
+        multi_copy_sites(&analyzer, &[src_target], &candidates),
+        (
+            BTreeSet::from([source_read]),
+            BTreeSet::from([bundle_assignment, bundle_read])
+        ),
+        "the source candidate alone still reports the bundle sites as unproven"
+    );
+}
+
+/// The bundle's read, the source copy's read, and the bundle's own
+/// assignment-minted declaration, as `(file, line)` sites.
+fn multi_copy_site_lines() -> (HitSite, HitSite, HitSite) {
+    (
+        (
+            "dist/bundle.js".to_string(),
+            line_number_of(MULTI_COPY_BUNDLE_SOURCE, "  $.fn[NAME] = Alert."),
+        ),
+        (
+            "src/alert.js".to_string(),
+            line_number_of(MULTI_COPY_SRC_SOURCE, "$.fn[NAME] = Alert."),
+        ),
+        (
+            "dist/bundle.js".to_string(),
+            line_number_of(
+                MULTI_COPY_BUNDLE_SOURCE,
+                "  Alert._jQueryInterface = function",
+            ),
+        ),
+    )
+}
+// --- issue #1792: optional-chain reads of a local property ---
+//
+// `?.` is an `optional_chain` child that sits between a member expression's
+// `object` and `property` fields, so every receiver-chain walk that reads those
+// fields already steps over it. These two tests pin that down: the inverse
+// matcher reports an optional-chain read of the same field its plain spelling
+// reports, in every operator position, and still rejects a different chain.
+// The reported witness of #1792 was a forward defect instead -- a caret on a
+// chain segment after a `?.` named the whole chain -- and is pinned by
+// `tests/suite_symbols/optional_chain_reference_site.rs`.
+
+#[test]
+fn js_optional_chain_reads_of_a_declarator_minted_property_are_usages() {
+    let source = r#"function shapes(host) {
+  host.chain = { key: 1 };
+  const plain = host.chain.key;
+  const optionalRoot = host?.chain.key;
+  const optionalMember = host.chain?.key;
+  const optionalBoth = host?.chain?.key;
+  const nearMiss = host?.other.key;
+  return [plain, optionalRoot, optionalMember, optionalBoth, nearMiss];
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("shapes.js", source).build());
+    let file = project.file("shapes.js");
+    let target = find_js_definition(&analyzer, &file, "host.chain.key", |cu| cu.is_field());
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([
+            line_number_of(source, "const plain ="),
+            line_number_of(source, "const optionalRoot ="),
+            line_number_of(source, "const optionalMember ="),
+            line_number_of(source, "const optionalBoth ="),
+        ]),
+        "every optional spelling of `host.chain.key` reads it, and `host?.other.key` does not: {hits:#?}"
+    );
+}
+
+#[test]
+fn js_optional_chain_reads_of_a_member_assignment_minted_property_are_usages() {
+    let source = r#"function shapes(row, data) {
+  row.dataset.raw = JSON.stringify(data);
+  const plain = row.dataset.raw;
+  const optionalRoot = row?.dataset.raw;
+  const optionalMember = row.dataset?.raw;
+  const optionalBoth = row?.dataset?.raw;
+  const nearMiss = row?.other.raw;
+  return [plain, optionalRoot, optionalMember, optionalBoth, nearMiss];
+}
+"#;
+    let (project, analyzer) = js_inline_analyzer(|p| p.file("dataset.js", source).build());
+    let file = project.file("dataset.js");
+    let target = find_js_definition(&analyzer, &file, "row.dataset.raw", |cu| cu.is_field());
+
+    let hits = authoritative_js_hits(&analyzer, &target, file);
+
+    assert_eq!(
+        reference_lines(&hits),
+        BTreeSet::from([
+            line_number_of(source, "const plain ="),
+            line_number_of(source, "const optionalRoot ="),
+            line_number_of(source, "const optionalMember ="),
+            line_number_of(source, "const optionalBoth ="),
+        ]),
+        "every optional spelling of `row.dataset.raw` reads it, and `row?.other.raw` does not: {hits:#?}"
     );
 }

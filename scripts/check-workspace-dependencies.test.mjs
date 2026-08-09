@@ -6,6 +6,15 @@ import { validateWorkspaceGraph } from "./check-workspace-dependencies.mjs";
 const names = [
   "brokk-bifrost",
   "brokk-bifrost-core",
+  "brokk-bifrost-cpp",
+  "brokk-bifrost-csharp",
+  "brokk-bifrost-go",
+  "brokk-bifrost-js-ts",
+  "brokk-bifrost-jvm",
+  "brokk-bifrost-php",
+  "brokk-bifrost-python",
+  "brokk-bifrost-ruby",
+  "brokk-bifrost-rust",
   "brokk-bifrost-analysis",
   "brokk-bifrost-nlp",
   "brokk-bifrost-policy",
@@ -23,7 +32,27 @@ function metadata(overrides = {}) {
   const dependencies = {
     "brokk-bifrost": [],
     "brokk-bifrost-core": [],
-    "brokk-bifrost-analysis": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-cpp": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-csharp": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-go": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-js-ts": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-jvm": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-php": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-python": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-ruby": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-rust": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-analysis": [
+      dependency("brokk-bifrost-core"),
+      dependency("brokk-bifrost-cpp"),
+      dependency("brokk-bifrost-csharp"),
+      dependency("brokk-bifrost-go"),
+      dependency("brokk-bifrost-js-ts"),
+      dependency("brokk-bifrost-jvm"),
+      dependency("brokk-bifrost-php"),
+      dependency("brokk-bifrost-python"),
+      dependency("brokk-bifrost-ruby"),
+      dependency("brokk-bifrost-rust"),
+    ],
     "brokk-bifrost-nlp": [dependency("brokk-bifrost-analysis")],
     "brokk-bifrost-policy": [dependency("brokk-bifrost-analysis")],
     "brokk-bifrost-runtime": [
@@ -85,6 +114,15 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
         dependencies: {
           "brokk-bifrost-analysis": [
             dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-cpp"),
+            dependency("brokk-bifrost-csharp"),
+            dependency("brokk-bifrost-go"),
+            dependency("brokk-bifrost-js-ts"),
+      dependency("brokk-bifrost-jvm"),
+            dependency("brokk-bifrost-php"),
+            dependency("brokk-bifrost-python"),
+            dependency("brokk-bifrost-ruby"),
+            dependency("brokk-bifrost-rust"),
             dependency("brokk-bifrost-semantic-packs"),
           ],
         },
@@ -170,5 +208,85 @@ test("rejects unexpected workspace members", () => {
   assert.deepEqual(
     validateWorkspaceGraph(metadata({ names: [...names, "surprise-package"] })),
     ["unexpected workspace package surprise-package"],
+  );
+});
+
+test("rejects a language crate reaching back up to analysis", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-rust": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-analysis"),
+          ],
+        },
+      }),
+    ),
+    ["brokk-bifrost-rust must not depend on workspace package brokk-bifrost-analysis"],
+  );
+});
+
+test("rejects one language crate depending on another", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-rust": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-go"),
+          ],
+        },
+      }),
+    ),
+    ["brokk-bifrost-rust must not depend on workspace package brokk-bifrost-go"],
+  );
+});
+
+test("rejects a cpp crate reaching back up to analysis", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-cpp": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-analysis"),
+          ],
+        },
+      }),
+    ),
+    ["brokk-bifrost-cpp must not depend on workspace package brokk-bifrost-analysis"],
+  );
+});
+
+test("rejects a jvm crate reaching back up to analysis", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-jvm": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-analysis"),
+          ],
+        },
+      }),
+    ),
+    ["brokk-bifrost-jvm must not depend on workspace package brokk-bifrost-analysis"],
+  );
+});
+
+test("rejects a php crate reaching back up to analysis", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-php": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-analysis"),
+          ],
+        },
+      }),
+    ),
+    ["brokk-bifrost-php must not depend on workspace package brokk-bifrost-analysis"],
   );
 });

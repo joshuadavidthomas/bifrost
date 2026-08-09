@@ -4,13 +4,17 @@
 //! invalidate previously-persisted analyzer payloads. It folds in:
 //!
 //! - the analyzer store epoch salt
-//! - the analyzer crate version (`CARGO_PKG_VERSION`)
 //! - the language adapter's actual `tree_sitter::Language` fingerprint
 //!   (ABI version + every node kind name + every field name)
 //! - the contents of the language's bundled `.scm` query files
 //!
 //! When any of these change, every row written under the previous epoch is
 //! treated as logically dirty regardless of mtime/size.
+//!
+//! The crate version is deliberately not an input. Analyzer behavior changes
+//! are tracked by the store salt, the per-language salts, the grammar
+//! fingerprint, and the query files. A release that changes none of these
+//! keeps the warm cache valid.
 //!
 //! The grammar fingerprint is taken from the live `Language` rather than a
 //! hard-coded crate version literal: Cargo.toml uses semver ranges, so a
@@ -24,14 +28,14 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
-const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
-// v8: migration 0018 merged `import_details` into `import_statements`, so an
+// v9: migration 0019 merged `import_details` into `import_statements`, so an
 // import is one row per binding instead of a raw statement plus a bincode
 // `ImportInfo`. What the writer records changed as well as where: Go segments
 // its import path, C# records a structured path and its `global using` flag,
 // and Scala and TypeScript now emit one row per binding rather than one per
-// declaration.
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v8-import-bindings";
+// declaration. `binder_span` (#1600) rides along as a column on that row
+// rather than as a bincode field, because the blob it used to live in is gone.
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v9-import-bindings-with-binder-span";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
@@ -74,8 +78,6 @@ fn epoch_cell<L: LanguageEpoch>(ts_language: &TsLanguage) -> &'static str {
 fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"bifrost-analyzer-epoch-v2\n");
-    hasher.update(ANALYZER_VERSION.as_bytes());
-    hasher.update(b"\n");
     hasher.update(STORE_EPOCH_SALT.as_bytes());
     hasher.update(b"\n");
     hasher.update(L::NAME.as_bytes());
@@ -84,7 +86,18 @@ fn compute_epoch<L: LanguageEpoch>(ts_language: &TsLanguage, language_salt: &str
     hasher.update(b"\n");
     hash_grammar(&mut hasher, ts_language);
     hasher.update(b"\n");
-    for (path, contents) in EMBEDDED_QUERIES {
+    for (path, contents) in EMBEDDED_QUERIES
+        .iter()
+        .chain(brokk_bifrost_cpp::queries::CPP_QUERY_ASSETS)
+        .chain(brokk_bifrost_csharp::queries::CSHARP_QUERY_ASSETS)
+        .chain(brokk_bifrost_go::queries::GO_QUERY_ASSETS)
+        .chain(brokk_bifrost_js_ts::queries::JS_TS_QUERY_ASSETS)
+        .chain(brokk_bifrost_jvm::queries::JVM_QUERY_ASSETS)
+        .chain(brokk_bifrost_php::queries::PHP_QUERY_ASSETS)
+        .chain(brokk_bifrost_python::queries::PYTHON_QUERY_ASSETS)
+        .chain(brokk_bifrost_ruby::queries::RUBY_QUERY_ASSETS)
+        .chain(brokk_bifrost_rust::queries::RUST_QUERY_ASSETS)
+    {
         if path.starts_with(L::QUERY_DIR) {
             hasher.update(path.as_bytes());
             hasher.update(b"\0");
@@ -152,134 +165,23 @@ fn hash_grammar(hasher: &mut Sha256, lang: &TsLanguage) {
 /// Compile-time embedded `.scm` query files. Each entry is `(relative_path,
 /// contents)`. Adding/removing or editing a query file rebuilds the crate and
 /// changes the per-language epoch.
+///
+/// This table is now empty: every language's assets moved with its language
+/// knowledge into its own crate, and they are chained in above under the same
+/// `treesitter/<lang>/` prefixes they had here, so the per-language filter stays
+/// one rule. JavaScript's and TypeScript's were the last two, and their
+/// departure also removed `brokk-bifrost-analysis/resources/` entirely.
+///
+/// The table and the loader stay so that a future analysis-resident asset has a
+/// home; the comment stubs record where each language's went.
 const EMBEDDED_QUERIES: &[(&str, &str)] = &[
-    // Java
-    (
-        "treesitter/java/definitions.scm",
-        include_str!("../../../resources/treesitter/java/definitions.scm"),
-    ),
-    (
-        "treesitter/java/imports.scm",
-        include_str!("../../../resources/treesitter/java/imports.scm"),
-    ),
-    (
-        "treesitter/java/identifiers.scm",
-        include_str!("../../../resources/treesitter/java/identifiers.scm"),
-    ),
-    // Python
-    (
-        "treesitter/python/definitions.scm",
-        include_str!("../../../resources/treesitter/python/definitions.scm"),
-    ),
-    (
-        "treesitter/python/imports.scm",
-        include_str!("../../../resources/treesitter/python/imports.scm"),
-    ),
-    (
-        "treesitter/python/identifiers.scm",
-        include_str!("../../../resources/treesitter/python/identifiers.scm"),
-    ),
-    // Go
-    (
-        "treesitter/go/definitions.scm",
-        include_str!("../../../resources/treesitter/go/definitions.scm"),
-    ),
-    (
-        "treesitter/go/imports.scm",
-        include_str!("../../../resources/treesitter/go/imports.scm"),
-    ),
-    (
-        "treesitter/go/identifiers.scm",
-        include_str!("../../../resources/treesitter/go/identifiers.scm"),
-    ),
-    // Rust
-    (
-        "treesitter/rust/definitions.scm",
-        include_str!("../../../resources/treesitter/rust/definitions.scm"),
-    ),
-    (
-        "treesitter/rust/imports.scm",
-        include_str!("../../../resources/treesitter/rust/imports.scm"),
-    ),
-    // JavaScript
-    (
-        "treesitter/javascript/definitions.scm",
-        include_str!("../../../resources/treesitter/javascript/definitions.scm"),
-    ),
-    (
-        "treesitter/javascript/imports.scm",
-        include_str!("../../../resources/treesitter/javascript/imports.scm"),
-    ),
-    (
-        "treesitter/javascript/identifiers.scm",
-        include_str!("../../../resources/treesitter/javascript/identifiers.scm"),
-    ),
-    // TypeScript
-    (
-        "treesitter/typescript/definitions.scm",
-        include_str!("../../../resources/treesitter/typescript/definitions.scm"),
-    ),
-    (
-        "treesitter/typescript/imports.scm",
-        include_str!("../../../resources/treesitter/typescript/imports.scm"),
-    ),
-    (
-        "treesitter/typescript/identifiers.scm",
-        include_str!("../../../resources/treesitter/typescript/identifiers.scm"),
-    ),
     // C++
-    (
-        "treesitter/cpp/definitions.scm",
-        include_str!("../../../resources/treesitter/cpp/definitions.scm"),
-    ),
-    (
-        "treesitter/cpp/imports.scm",
-        include_str!("../../../resources/treesitter/cpp/imports.scm"),
-    ),
-    (
-        "treesitter/cpp/identifiers.scm",
-        include_str!("../../../resources/treesitter/cpp/identifiers.scm"),
-    ),
     // C#
-    (
-        "treesitter/c_sharp/definitions.scm",
-        include_str!("../../../resources/treesitter/c_sharp/definitions.scm"),
-    ),
-    (
-        "treesitter/c_sharp/imports.scm",
-        include_str!("../../../resources/treesitter/c_sharp/imports.scm"),
-    ),
+    // Java
+    // JavaScript
     // PHP
-    (
-        "treesitter/php/definitions.scm",
-        include_str!("../../../resources/treesitter/php/definitions.scm"),
-    ),
-    (
-        "treesitter/php/imports.scm",
-        include_str!("../../../resources/treesitter/php/imports.scm"),
-    ),
     // Scala
-    (
-        "treesitter/scala/definitions.scm",
-        include_str!("../../../resources/treesitter/scala/definitions.scm"),
-    ),
-    (
-        "treesitter/scala/imports.scm",
-        include_str!("../../../resources/treesitter/scala/imports.scm"),
-    ),
-    // Ruby
-    (
-        "treesitter/ruby/definitions.scm",
-        include_str!("../../../resources/treesitter/ruby/definitions.scm"),
-    ),
-    (
-        "treesitter/ruby/imports.scm",
-        include_str!("../../../resources/treesitter/ruby/imports.scm"),
-    ),
-    (
-        "treesitter/ruby/identifiers.scm",
-        include_str!("../../../resources/treesitter/ruby/identifiers.scm"),
-    ),
+    // TypeScript
 ];
 
 macro_rules! lang_epoch {
@@ -304,19 +206,28 @@ macro_rules! lang_epoch {
 // `StructuredImportPathKind::StaticMember`. Rows persisted before this change
 // labeled every import `Namespace`, and consumers that now branch on the kind
 // would read a warm workspace's static imports as ordinary type imports.
+// Salt bumped again (#1548 stage 3 fleet): the Java `.scm` query assets moved
+// from this crate's `resources/treesitter/java/` into `brokk-bifrost-jvm`, so
+// the salted content now comes from a different crate's `include_str!`. The
+// bytes are unchanged, which is exactly why the salt has to carry the
+// relocation.
 lang_epoch!(
     Java,
     "java",
     "treesitter/java/",
-    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08"
+    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
 );
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
+// Salt bumped again (#1548 stage 3 pilot): the Go `.scm` query assets moved
+// from this crate's `resources/treesitter/go/` into `brokk-bifrost-go`, so the
+// salted content now comes from a different crate's `include_str!`. The bytes
+// are unchanged, which is exactly why the salt has to carry the relocation.
 lang_epoch!(
     Go,
     "go",
     "treesitter/go/",
-    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07"
+    "go-canonical-import-path-fqn-2026-06;synthetic-file-scope-code-units-2026-07;raw-package-qualifier-2026-07;fq-interned-segments-2026-07;return-expression-list-value-identity-2026-07;go-query-assets-in-brokk-bifrost-go-2026-08"
 );
 // Salt bumped: out-of-line member definitions whose owner class is named with
 // no namespace segment of its own (`Class::method` under an in-effect `using
@@ -361,11 +272,29 @@ lang_epoch!(
 // invalidating blobs written before the final recovery boundary.
 // Salt bumped again (#1665): a later macro-export class lifted through a
 // preprocessor container keeps the namespace scope of its preceding sibling.
+// Salt bumped again (#1670): macro-decorated template classes recovered from
+// sentinel envelopes now retain their real class identity and member scope.
+// Salt bumped again (#1548 stage 3 fleet): the C++ `.scm` query assets moved
+// from this crate's `resources/treesitter/cpp/` into `brokk-bifrost-cpp`, so
+// the salted content now comes from that crate's `resources/`.
+// Salt bumped again (#1705): typedef extraction now reads tree-sitter's
+// declarator fields and recovers a split macro typedef from its structured
+// sibling. This removes false aliases and changes persisted ranges.
+// Salt bumped again: enum enumerators are owned children of their enum, no
+// longer duplicated into the persisted top-level declaration list, and an
+// ERROR-envelope sentinel class recovery no longer drops the envelope's
+// sibling declarations after the recovered class close.
+// Salt bumped again (#1827): the C++ identity signature now reads a callable's
+// trailing cv/ref/noexcept qualifiers from the declarator's grammar fields
+// instead of splitting its text, and drops the top-level cv-qualifiers on a
+// value parameter per [dcl.fct]/5. Both change persisted signatures, and rows
+// written under the old rules would keep a declaration and its out-of-line
+// definition apart.
 lang_epoch!(
     Cpp,
     "cpp",
     "treesitter/cpp/",
-    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-ownership-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08"
+    "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08;macro-argument-typedef-declarator-2026-08;enum-enumerator-child-ownership-2026-08;sentinel-error-envelope-sibling-recovery-2026-08;cpp-query-assets-in-brokk-bifrost-cpp-2026-08;structural-declarator-qualifier-suffix-and-top-level-parameter-cv-2026-08"
 );
 
 #[cfg(test)]
@@ -393,6 +322,14 @@ pub(super) fn cpp_epoch_before_fragmented_export_sibling_class_parent_scope() ->
 }
 
 #[cfg(test)]
+pub(super) fn cpp_epoch_before_macro_decorated_template_class_scope() -> String {
+    compute_epoch::<Cpp>(
+        &tree_sitter_cpp::LANGUAGE.into(),
+        "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-ownership-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08",
+    )
+}
+
+#[cfg(test)]
 pub(super) fn cpp_epoch_before_recovered_typedef_base() -> String {
     compute_epoch::<Cpp>(
         &tree_sitter_cpp::LANGUAGE.into(),
@@ -409,10 +346,34 @@ pub(super) fn cpp_epoch_before_complete_sentinel_class_tail() -> String {
 }
 
 #[cfg(test)]
+pub(super) fn cpp_epoch_before_conditional_alias_physical_ranges() -> String {
+    compute_epoch::<Cpp>(
+        &tree_sitter_cpp::LANGUAGE.into(),
+        "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08",
+    )
+}
+
+#[cfg(test)]
+pub(super) fn cpp_epoch_before_macro_argument_typedef_declarator() -> String {
+    compute_epoch::<Cpp>(
+        &tree_sitter_cpp::LANGUAGE.into(),
+        "synthetic-file-scope-code-units-2026-07;recovered-designator-declarations-2026-07;fielded-declarator-routing-2026-07;bare-exported-class-declarators-2026-07;function-like-exported-class-declarators-2026-07;malformed-multiple-base-exported-class-declarators-2026-07;template-alias-declarations-2026-07;structured-return-type-metadata-2026-07;class-owned-alias-identity-2026-07;templated-out-of-line-owner-identity-2026-07;macro-exported-class-field-owner-2026-07;cpp-partial-specialization-ownership-dispatch-2026-07;abstract-parameter-declarator-signatures-2026-07;cpp-template-alias-specialization-dispatch-2026-07;single-base-exported-class-identity-2026-07;callable-linkage-metadata-2026-07;callable-declaration-role-metadata-2026-07;cpp-parameter-type-qualifiers-2026-07;macro-sentinel-region-reparse-2026-07;fragmented-export-class-member-recovery-2026-07;using-directive-owner-namespace-recovery-2026-07;bare-call-global-namespace-lookup-2026-07;nested-class-out-of-line-owner-identity-2026-07;fq-interned-segments-2026-07;recovered-typedef-base-alias-identity-2026-07;inline-classlike-and-macro-prefix-declarations-2026-08;template-parameter-pack-binding-and-qualified-base-initializers-2026-08;recovered-partial-specialization-member-ownership-2026-08;macro-field-terminator-scope-2026-08;complete-sentinel-class-tail-2026-08;sentinel-class-before-member-callable-2026-08;fragmented-class-signature-error-members-2026-08;plain-fragmented-class-constraint-constructor-2026-08;plain-fragmented-class-sibling-ownership-2026-08;fragmented-export-constructor-initializer-2026-08;fragmented-export-constructor-structured-sibling-boundary-2026-08;fragmented-export-sibling-class-parent-scope-2026-08;macro-decorated-template-class-scope-2026-08;conditional-alias-physical-ranges-2026-08",
+    )
+}
+
+#[cfg(test)]
 pub(super) fn scala_epoch_before_scalachess_fqn_recovery() -> String {
     compute_epoch::<Scala>(
         &crate::analyzer::scala::language::LANGUAGE.into(),
         "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07",
+    )
+}
+
+#[cfg(test)]
+pub(super) fn scala_epoch_before_tree_sitter_scala_0_26_2() -> String {
+    compute_epoch::<Scala>(
+        &crate::analyzer::scala::language::LANGUAGE.into(),
+        "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08",
     )
 }
 
@@ -435,11 +396,15 @@ mod query_content_tests {
 // shape-preserving field indexing, same as TS already did - previously such
 // locals materialized no child fields at all. Changes the persisted unit set
 // for files with local schema-builder bindings.
+// Salt bumped again (#1548 stage 3 fleet): the JavaScript `.scm` query assets
+// moved from this crate's `resources/treesitter/javascript/` into
+// `brokk-bifrost-js-ts`, so the salted content now comes from a different
+// crate's `include_str!`.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08"
 );
 // TS salt bumped again (#1167): `is_simple_ts_initializer` now includes
 // `regex` (a regex-initialized binding renders its initializer inline in the
@@ -448,33 +413,75 @@ lang_epoch!(
 // Field (matching JS's `arrow_function | function_expression` check).
 // The classification change alters CodeUnitType, short_name/fq shape, and
 // signature rendering for every such binding.
+// Salt bumped again (#1548 stage 3 fleet): the TypeScript `.scm` query assets
+// moved from this crate's `resources/treesitter/typescript/` into
+// `brokk-bifrost-js-ts` alongside JavaScript's -- one crate holds both dialects.
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08"
 );
+// Salt bumped (#1548 stage 3 fleet): the Python `.scm` query assets moved from
+// this crate's `resources/treesitter/python/` into `brokk-bifrost-python`, so
+// the salted content now comes from a different crate's `include_str!`. The
+// bytes are unchanged, which is exactly why the salt has to carry the
+// relocation.
 lang_epoch!(
     Python,
     "python",
     "treesitter/python/",
-    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;structured-python-import-paths-2026-07;fq-interned-segments-2026-07;python-query-assets-in-brokk-bifrost-python-2026-08"
 );
+// Salt bumped (#1548 stage 3 fleet): the Rust `.scm` query assets moved from
+// this crate's `resources/treesitter/rust/` into `brokk-bifrost-rust`, so the
+// salted content now comes from a different crate's `include_str!`. The bytes
+// are unchanged, which is exactly why the salt has to carry the relocation.
+// Rust salt bumped twice: impl owners and their members now persist an anchor plus a
+// content-stable tail instead of the extracting mount's path-derived package
+// text, so cached Rust rows carry package prefixes the new reader will not
+// reproduce; and Rust packages are now anchored on the Cargo crate name rather
+// than the extracting mount's directory path, so cached names differ outright.
+// No other language's persisted encoding changed.
+// Rust salt bumped again (#1898): an `impl` owner path rooted at a renamed
+// import (`use crate::model as m;` then `impl Trait for m::Writer`) now routes
+// through the binding's module and imported name. Rows written while that root
+// resolved as a bare module name carry the phantom owner package (`impls.m`)
+// for every member of such an impl, so a warm workspace would answer the alias
+// spelling and never the real owner (`model.Writer.act`).
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08"
 );
+
+#[cfg(test)]
+pub(super) fn rust_epoch_before_anchored_fq_encoding() -> String {
+    compute_epoch::<Rust>(
+        &tree_sitter_rust::LANGUAGE.into(),
+        "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08",
+    )
+}
 // Salt bumped after #1420: namespace-level structural traversal now emits
 // conditionally declared free functions that older PHP blobs omitted.
+// Salt bumped again (#1548 stage 3 fleet): the PHP `.scm` query assets moved from
+// this crate's `resources/treesitter/php/` into `brokk-bifrost-php`, so the
+// salted content now comes from a different crate's `include_str!`. The bytes are
+// unchanged, which is exactly why the salt has to carry the relocation.
 lang_epoch!(
     Php,
     "php",
     "treesitter/php/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08"
 );
 
+/// The PHP epoch as it stood before the #1420 conditional-free-function bump.
+///
+/// The literal below is a historical pin and must never be edited: it is what
+/// `php_conditional_free_function_epoch_invalidates_prior_parsed_blobs` writes a
+/// blob under before asserting the current epoch evicts it. Later salt segments
+/// (the 2026-08 asset relocation above) are deliberately absent from it.
 #[cfg(test)]
 pub(super) fn php_epoch_before_conditional_free_function_declarations() -> String {
     compute_epoch::<Php>(
@@ -482,26 +489,42 @@ pub(super) fn php_epoch_before_conditional_free_function_declarations() -> Strin
         "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07",
     )
 }
-// The live grammar fingerprint does not include parser tables. Keep the
-// vendored Scala revision in the salt so conflict-resolution-only grammar
-// changes cannot reuse analysis produced by an older parser.
+// The live grammar fingerprint does not include parser tables. Keep the Scala
+// release revision in the salt so grammar changes cannot reuse analysis
+// produced by an older parser.
+// Salt bumped (#1548 stage 3 fleet): the Scala `.scm` query assets and the
+// Scala grammar itself moved from this crate into `brokk-bifrost-jvm`, so
+// the salted content now comes from a different crate's `include_str!`. The
+// bytes are unchanged, which is exactly why the salt has to carry the
+// relocation.
 lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08"
 );
+// Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
+// crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the
+// salted content now comes from a different crate's `include_str!`. The bytes
+// are unchanged, which is exactly why the salt has to carry the relocation.
+// Salt bumped again (#1735): C# callable metadata now treats the interop
+// OptionalAttribute as omittable. Warm rows recorded the old exact arity and
+// would make persisted inverse usage search reject valid omitted arguments.
 lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08"
 );
+// Salt bumped (#1548 stage 3 fleet): the Ruby `.scm` query assets moved from
+// this crate's `resources/treesitter/ruby/` into `brokk-bifrost-ruby`, so the
+// salted content now comes from a different crate's `include_str!`. The bytes
+// are unchanged, which is exactly why the salt has to carry the relocation.
 lang_epoch!(
     Ruby,
     "ruby",
     "treesitter/ruby/",
-    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07"
+    "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07;ruby-query-assets-in-brokk-bifrost-ruby-2026-08"
 );
 // The live grammar fingerprint does not include parser tables. Keep the
 // vendored Kotlin revision in the salt so conflict-resolution-only grammar
@@ -517,11 +540,17 @@ lang_epoch!(
 // own name without re-parsing the declaring file. A companion indexed before
 // this change carries no metadata at all, and a warm workspace would read every
 // companion as an ordinary nested object — losing every `Base.of()` edge.
+// Salt bumped (#1548 stage 3 fleet): Kotlin's `highlights.scm` and the vendored
+// grammar moved from this crate into `brokk-bifrost-jvm`. Unlike Java's and
+// Scala's, this bump is not forced by the mechanism -- `treesitter/kotlin/`
+// selects no entry in the salted asset set, because Kotlin is
+// declaration-walk-only and neither of its `.scm` files has ever been in
+// `EMBEDDED_QUERIES`. It is here for consistency with its two realm peers.
 lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07"
+    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
 );
 
 #[cfg(test)]

@@ -1,19 +1,23 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
-use crate::analyzer::reference_candidates::{ReferenceCandidateRanges, reference_candidate_ranges};
+use crate::analyzer::reference_candidates::{
+    CensusBareNameBindings, ReferenceCandidateRanges, census_identifier_ranges,
+    reference_candidate_ranges, reference_candidate_requires_point_lookup,
+};
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
 #[cfg(test)]
 use crate::analyzer::usages::cpp_graph::cpp_type_owner_for_test;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, PARTIAL_SELECTOR_CHAIN_DIAGNOSTIC_KIND,
-    resolve_definition_batch_with_source,
+    is_adjudicated_answer_diagnostic_kind, resolve_definition_batch_with_source,
 };
 use crate::analyzer::usages::{
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind,
 };
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range, rust_is_field_declaration_name,
+    CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile, Range,
+    cpp_is_constructor_or_destructor_declarator_name, rust_is_field_declaration_name,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
@@ -42,6 +46,67 @@ pub struct ReferenceDifferentialConfig {
     pub seed: u64,
     pub include_tests: bool,
     pub exact_site: Option<ExactReferenceSite>,
+    /// Which probe frontier proposes reference sites. `Index` (default) is the
+    /// analyzer's filtered candidate frontier; `Census` is the raw tree-sitter
+    /// identifier census that also reaches sites the index never proposes.
+    #[serde(default)]
+    pub probe_seed: ProbeSeed,
+    /// Which deterministic evidence tiers a forward-unresolvable census site may
+    /// be reported under. Only consulted for `probe_seed == Census`.
+    #[serde(default)]
+    pub tiers: TierSelection,
+}
+
+/// The probe frontier that proposes reference sites to the differential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeSeed {
+    /// The analyzer's index-filtered candidate frontier (`reference_candidate_ranges`).
+    #[default]
+    Index,
+    /// The raw tree-sitter identifier census (`census_identifier_ranges`).
+    Census,
+}
+
+impl ProbeSeed {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeSeed::Index => "index",
+            ProbeSeed::Census => "census",
+        }
+    }
+}
+
+/// Which census gap tiers to report. A census site that forward-resolves is
+/// always reported (it is a forward-adjudicated finding, tier-independent);
+/// this selection only gates forward-*unresolvable* census sites, whose only
+/// evidence is the deterministic tier grade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierSelection {
+    pub tier1: bool,
+    pub tier2: bool,
+    pub tier3: bool,
+}
+
+impl Default for TierSelection {
+    fn default() -> Self {
+        Self {
+            tier1: true,
+            tier2: true,
+            tier3: true,
+        }
+    }
+}
+
+impl TierSelection {
+    pub fn includes(self, tier: u8) -> bool {
+        match tier {
+            1 => self.tier1,
+            2 => self.tier2,
+            3 => self.tier3,
+            _ => false,
+        }
+    }
 }
 
 impl Default for ReferenceDifferentialConfig {
@@ -59,6 +124,8 @@ impl Default for ReferenceDifferentialConfig {
             seed: 0,
             include_tests: true,
             exact_site: None,
+            probe_seed: ProbeSeed::Index,
+            tiers: TierSelection::default(),
         }
     }
 }
@@ -151,6 +218,17 @@ pub struct ReferenceDifferentialSite {
     pub note: Option<String>,
     pub inverse_hit: Option<InverseHitEvidence>,
     pub diagnostics: Vec<ReferenceDiagnostic>,
+    /// The probe frontier that proposed this site: `"index"` or `"census"`.
+    #[serde(default = "default_seed_tag")]
+    pub seed: String,
+    /// The census gap tier (1, 2, or 3) for a forward-unresolvable census site;
+    /// `None` for forward-resolved sites and for the index seed.
+    #[serde(default)]
+    pub tier: Option<u8>,
+}
+
+fn default_seed_tag() -> String {
+    "index".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -230,6 +308,7 @@ struct SampledSite {
     file: ProjectFile,
     range: Range,
     csharp_nameof_argument: bool,
+    point_lookup: bool,
 }
 
 impl Ord for SampledSite {
@@ -351,6 +430,12 @@ pub fn run_reference_differential_with_progress(
         progress,
         &worker_pool,
     )?;
+    if config.probe_seed == ProbeSeed::Census {
+        for record in &mut records {
+            record.seed = ProbeSeed::Census.as_str().to_string();
+        }
+        classify_census_gaps(analyzer, config, &mut records);
+    }
     recompute_classifications(&records, &mut summary.classifications);
 
     Ok(ReferenceDifferentialReport {
@@ -387,7 +472,8 @@ fn eligible_files_with_inventory(
             ));
         }
         if !config.include_tests
-            && test_paths::is_test_like_path(&rel_path_string(&file), language_for_file(&file))
+            && (test_paths::is_test_like_path(&rel_path_string(&file), language_for_file(&file))
+                || (requested_language == Language::Rust && analyzer.file_is_test_only(&file)))
         {
             return Err(format!(
                 "exact site path `{}` is excluded because test paths are disabled",
@@ -408,7 +494,8 @@ fn eligible_files_with_inventory(
         .filter(|file| corpus_file_matches(file, &config.corpus_language, requested_language))
         .filter(|file| {
             config.include_tests
-                || !test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
+                || !(test_paths::is_test_like_path(&rel_path_string(file), language_for_file(file))
+                    || requested_language == Language::Rust && analyzer.file_is_test_only(file))
         })
         .collect();
     eligible.sort();
@@ -549,28 +636,51 @@ fn collect_sampled_sites(
             ));
             continue;
         };
-        let ranges =
-            match reference_candidate_ranges(root, language, config.max_candidates_per_file) {
-                ReferenceCandidateRanges::Complete(ranges) => ranges,
-                ReferenceCandidateRanges::LimitExceeded { limit, .. } => {
-                    summary.candidate_limit_exceeded_files += 1;
-                    summary.candidate_limit_excluded_candidates_lower_bound = summary
-                        .candidate_limit_excluded_candidates_lower_bound
-                        .saturating_add(limit.saturating_add(1) as u64);
-                    file_errors.push(file_error(
-                        &path,
-                        "candidate_limit_exceeded",
-                        &format!("more than {limit} structured identifier candidates"),
-                    ));
-                    continue;
-                }
-            };
-        let declaration_ranges: HashSet<(usize, usize)> = analyzer
-            .declarations(file)
-            .into_iter()
-            .flat_map(|unit| context.name_ranges(analyzer, &unit))
+        let candidate_ranges = match config.probe_seed {
+            ProbeSeed::Index => {
+                reference_candidate_ranges(root, language, config.max_candidates_per_file)
+            }
+            ProbeSeed::Census => {
+                census_identifier_ranges(root, language, config.max_candidates_per_file)
+            }
+        };
+        let ranges = match candidate_ranges {
+            ReferenceCandidateRanges::Complete(ranges) => ranges,
+            ReferenceCandidateRanges::LimitExceeded { limit, .. } => {
+                summary.candidate_limit_exceeded_files += 1;
+                summary.candidate_limit_excluded_candidates_lower_bound = summary
+                    .candidate_limit_excluded_candidates_lower_bound
+                    .saturating_add(limit.saturating_add(1) as u64);
+                file_errors.push(file_error(
+                    &path,
+                    "candidate_limit_exceeded",
+                    &format!("more than {limit} structured identifier candidates"),
+                ));
+                continue;
+            }
+        };
+        let declarations = analyzer.declarations(file);
+        let declaration_ranges: HashSet<(usize, usize)> = declarations
+            .iter()
+            .flat_map(|unit| context.name_ranges(analyzer, unit))
             .map(|range| (range.start_byte, range.end_byte))
             .collect();
+        // `include_tests=false` is a source-scope filter, not only a file-path
+        // filter. Rust commonly keeps production code and an inline
+        // `#[cfg(test)] mod tests` in one file. The analyzer records the full
+        // declaration range for each test-region unit, so use those structured
+        // ranges to drop every census/index occurrence inside the nested test
+        // module while retaining production occurrences in the same file.
+        let test_region_ranges: Vec<Range> = if !config.include_tests && language == Language::Rust
+        {
+            declarations
+                .iter()
+                .filter(|unit| analyzer.in_test_region(unit))
+                .flat_map(|unit| analyzer.ranges(unit))
+                .collect()
+        } else {
+            Vec::new()
+        };
         for range in ranges {
             summary.structured_candidates = summary.structured_candidates.saturating_add(1);
             if declaration_ranges.contains(&(range.start_byte, range.end_byte)) {
@@ -578,11 +688,41 @@ fn collect_sampled_sites(
                     summary.declaration_sites_excluded.saturating_add(1);
                 continue;
             }
+            if test_region_ranges
+                .iter()
+                .any(|test_region| test_region.contains(&range))
+            {
+                continue;
+            }
             if language == Language::Rust
                 && root
                     .descendant_for_byte_range(range.start_byte, range.end_byte)
                     .is_some_and(|node| {
                         rust_is_field_declaration_name(node, range.start_byte, range.end_byte)
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            // A constructor or destructor declarator is a declaration occurrence,
+            // never a reference (#1834). The indexed-name filter above misses two
+            // of them: the identifier inside a `~Foo` destructor name, whose
+            // indexed range covers the tilde too, and any declarator the parse
+            // recovered as something other than a declaration -- a macro between
+            // `class` and the class name turns the whole class body into a
+            // function body, and every constructor declaration in it into a call.
+            // Graded, they became tier-1 forward gaps against their own class.
+            if language == Language::Cpp
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && cpp_is_constructor_or_destructor_declarator_name(
+                                node,
+                                context.content(),
+                            )
                     })
             {
                 summary.declaration_sites_excluded =
@@ -605,6 +745,7 @@ fn collect_sampled_sites(
                             context.content(),
                         )
                     });
+            let point_lookup = reference_candidate_requires_point_lookup(root, language, &range);
             let priority = site_priority(config.seed, &path, &range);
             push_bounded(
                 &mut heap,
@@ -613,6 +754,7 @@ fn collect_sampled_sites(
                     file: file.clone(),
                     range,
                     csharp_nameof_argument,
+                    point_lookup,
                 },
                 config.max_sites,
             );
@@ -708,7 +850,7 @@ fn forward_resolve_file(
             line: None,
             column: None,
             start_byte: Some(site.range.start_byte),
-            end_byte: Some(site.range.end_byte),
+            end_byte: (!site.point_lookup).then_some(site.range.end_byte),
         })
         .collect();
     let outcomes =
@@ -726,9 +868,13 @@ fn forward_resolve_file(
                 matches!(target.kind(), CodeUnitType::Field | CodeUnitType::Function)
             });
         let reference = outcome.reference.as_ref();
-        let text = reference
-            .map(|reference| reference.text.clone())
-            .unwrap_or_else(|| source[site.range.start_byte..site.range.end_byte].to_string());
+        let text = if site.point_lookup {
+            source[site.range.start_byte..site.range.end_byte].to_string()
+        } else {
+            reference
+                .map(|reference| reference.text.clone())
+                .unwrap_or_else(|| source[site.range.start_byte..site.range.end_byte].to_string())
+        };
         let stable_targets = outcome
             .definitions
             .iter()
@@ -770,6 +916,8 @@ fn forward_resolve_file(
             },
             inverse_hit: None,
             diagnostics,
+            seed: default_seed_tag(),
+            tier: None,
         });
         if outcome.status == DefinitionLookupStatus::Resolved {
             let mut targets = outcome.definitions;
@@ -1209,6 +1357,249 @@ fn set_group_inconclusive(
     }
 }
 
+/// The tree-sitter role of a census occurrence, used to grade census gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CensusSiteRole {
+    /// `self.N(...)` / `this.N(...)`: a same-owner receiver member call.
+    SelfMemberCall,
+    /// `N(...)`: a bare (unqualified) call.
+    BareCall,
+    /// `recv.N` / `recv.N(...)` on some other receiver, or `N` in a value/type
+    /// position: a weaker reference role.
+    Other,
+}
+
+/// Classify a census occurrence's syntactic role from its tree-sitter context.
+/// Language-agnostic: it keys on node-kind substrings shared across the corpus
+/// grammars (`call`/`invocation` for calls; `field`/`member`/`selector`/
+/// `attribute` for member access; `self`/`this` receiver text for same-owner).
+fn census_site_role(
+    root: tree_sitter::Node<'_>,
+    source: &str,
+    start: usize,
+    end: usize,
+) -> CensusSiteRole {
+    let Some(node) = root.named_descendant_for_byte_range(start, end) else {
+        return CensusSiteRole::Other;
+    };
+    let Some(parent) = node.parent() else {
+        return CensusSiteRole::Other;
+    };
+    let parent_kind = parent.kind();
+    let is_member = parent_kind.contains("field")
+        || parent_kind.contains("member")
+        || parent_kind.contains("selector")
+        || parent_kind.contains("attribute");
+    if is_member {
+        // The receiver is the member access's first named child that is not the
+        // property name itself.
+        let receiver_is_self = (0..parent.named_child_count())
+            .filter_map(|index| parent.named_child(index))
+            .find(|child| child.start_byte() != start || child.end_byte() != end)
+            .map(|receiver| &source[receiver.start_byte()..receiver.end_byte()])
+            .is_some_and(|text| text == "self" || text == "this");
+        let member_call = parent.parent().is_some_and(|grandparent| {
+            grandparent.kind().contains("call") || grandparent.kind().contains("invocation")
+        });
+        if receiver_is_self && member_call {
+            return CensusSiteRole::SelfMemberCall;
+        }
+        return CensusSiteRole::Other;
+    }
+    let bare_call = (parent_kind.contains("call") || parent_kind.contains("invocation"))
+        && parent
+            .child_by_field_name("function")
+            .or_else(|| parent.child_by_field_name("callee"))
+            .is_some_and(|callee| callee.start_byte() == start && callee.end_byte() == end);
+    if bare_call {
+        return CensusSiteRole::BareCall;
+    }
+    CensusSiteRole::Other
+}
+
+/// Whether a same-file declaration named `name` is evidence that the BARE call
+/// at `byte` could have bound to it.
+///
+/// Same-file evidence is collected by terminal identifier, so it matches
+/// declarations a bare name can never reach (#1783): a JavaScript
+/// `Lexer.prototype.isNumber` member answered for a bare `isNumber(value)` that
+/// only a receiver could reach, promoting an exploration-grade site to an
+/// actionable tier-1 gap. Whether a bare call reaches an owned member is a
+/// per-language question, so each language answers it explicitly rather than
+/// through one blanket owner test.
+fn bare_call_reaches_same_file_declaration(
+    language: Language,
+    bindings: Option<&CensusBareNameBindings>,
+    name: &str,
+    byte: usize,
+) -> bool {
+    match language {
+        // JavaScript and TypeScript bind a bare name lexically, and nothing
+        // else: object-literal, prototype and class members need a receiver.
+        // The lexical index the forward resolver binds with answers the site
+        // directly, so the census grades against the same notion of scope --
+        // including the local and nested binders an owner test cannot see. The
+        // index models value binders (imports, `var`/`let`/`const`, functions,
+        // classes, parameters, catch clauses); a TypeScript-only binder it does
+        // not model yet, such as an ambient `declare function`, grades its bare
+        // call one tier lower rather than reporting a gap the site cannot show.
+        Language::JavaScript | Language::TypeScript => bindings
+            .expect("a JS/TS census site with a parsed tree carries a bare-name binding index")
+            .is_bound_at(name, byte),
+        // Scala is an implicit-receiver language whose scope is nonetheless
+        // decidable from the parse tree, so it answers with the declarations
+        // actually visible at the site (#1858): the members of the templates
+        // enclosing it, of their same-file supertypes and self-types, and of a
+        // same-file object one of them imports. The two answers a name set
+        // cannot give are the reason: a `type Left = A1` member lives in the
+        // type namespace, which no application expression reaches, and
+        // `class Oneshot(var more: ...)` owns `more` only inside `Oneshot`.
+        Language::Scala => bindings
+            .expect("a Scala census site with a parsed tree carries a bare-name binding index")
+            .is_bound_at(name, byte),
+        // PHP has NO implicit-receiver call: `foo()` inside a class never means
+        // `$this->foo()`. It binds to a function in the current namespace, to a
+        // `use function` alias, or -- failing both -- to the global function
+        // (#1866). So the only same-file declaration a bare PHP call can reach
+        // is a free FUNCTION, which is what this index holds (#1867). Grouping
+        // PHP with Ruby graded all 59 php-census sites tier 1: 40 against a
+        // method that needs a receiver, 5 against a property that is not
+        // callable at all, and the rest the same shape.
+        Language::Php => bindings
+            .expect("a PHP census site with a parsed tree carries a bare-name binding index")
+            .is_bound_at(name, byte),
+        // Implicit-receiver languages: a bare call legitimately reaches a
+        // member of the enclosing type, so an owned same-file declaration is
+        // real evidence. Java, C# and Kotlin reach the enclosing class through
+        // implicit `this` (plus inherited and statically imported members);
+        // Ruby reaches it through implicit `self`.
+        Language::Java | Language::CSharp | Language::Kotlin | Language::Ruby => true,
+        // No lexical-binding index yet, and no cheap sound approximation. An
+        // owner test would be wrong here for two independent reasons: these
+        // analyzers qualify module-scope declarations with the module or
+        // package (Python `src.mod.outer` owns `mod`), so almost nothing is
+        // owner-free, and a bare call still reaches local, nested and imported
+        // binders the declaration index does not spell as owner-free. Keeping
+        // the name-set answer preserves today's recall; the fix for these
+        // languages is a lexical index of their own, not a coarser filter.
+        Language::Python | Language::Rust | Language::Go | Language::Cpp | Language::None => true,
+    }
+}
+
+/// Whether a census site is the joint-blindness residue the tier classifier
+/// grades, or an answer the forward resolver already gave.
+///
+/// Only a site forward could not answer is a candidate gap. A resolved site
+/// flowed through the inverse comparison; an ADJUDICATED site was answered too,
+/// just negatively: the resolver named what the site is and why no indexed
+/// declaration is the target. Grading an adjudicated answer manufactures a gap
+/// nothing can close, and the same-file name it grades against is the artifact:
+/// IBM CRAIG's `const { snakeCase } = require("lazy-z")` binder doubled as the
+/// "same-file declaration" behind 203 tier-1 boundary gaps (366ece87), and
+/// twitter/util's `class Oneshot(var more: ...)` doubled as the one behind a
+/// `case Cons(fa, more) => more()` pattern binder the resolver had already
+/// proven local (#1858).
+fn census_gap_is_gradable(record: &ReferenceDifferentialSite) -> bool {
+    record.forward_status != DefinitionLookupStatus::Resolved.as_str()
+        && record.forward_status != DefinitionLookupStatus::UnresolvableImportBoundary.as_str()
+        && !record
+            .diagnostics
+            .iter()
+            .any(|diagnostic| is_adjudicated_answer_diagnostic_kind(&diagnostic.kind))
+}
+
+/// Grade forward-unresolvable census sites into deterministic evidence tiers.
+///
+/// A census site that forward RESOLVES already flowed through the inverse
+/// comparison (a forward-adjudicated finding or consistent), so it keeps
+/// `tier == None`, and so does every other site forward already answered --
+/// [`census_gap_is_gradable`] decides. This pass grades only what is left, the
+/// joint-blindness residue:
+///
+/// - tier 1: a `self`/`this`-receiver member call or a bare call of name N,
+///   whose declaration exists in the same file AND is reachable from the site.
+///   Forward found nothing yet the declaration is indexed in the same file -- a
+///   high-precision forward gap.
+/// - tier 2: some same-file declaration of N exists, but the occurrence is a
+///   weaker reference role (member access on another receiver, value/type use).
+/// - tier 3: no same-file declaration of N reaches the site; exploration-grade.
+///
+/// Reachability is what [`bare_call_reaches_same_file_declaration`] decides: a
+/// same-file name match is not by itself evidence that a BARE call could have
+/// bound to that declaration (#1783).
+///
+/// A selected tier-1/2 site becomes `Missing` (actionable). Tier 3 (and any
+/// unselected tier) stays `Inconclusive`. The site's `tier` is always recorded.
+fn classify_census_gaps(
+    analyzer: &dyn IAnalyzer,
+    config: &ReferenceDifferentialConfig,
+    records: &mut [ReferenceDifferentialSite],
+) {
+    use std::collections::BTreeMap;
+    let mut by_path: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if census_gap_is_gradable(record) {
+            by_path.entry(record.path.clone()).or_default().push(index);
+        }
+    }
+    for (path, indexes) in by_path {
+        let Some(file) = analyzer
+            .analyzed_files()
+            .into_iter()
+            .find(|file| rel_path_string(file) == path)
+        else {
+            continue;
+        };
+        let Some(source) = analyzer.indexed_source(&file) else {
+            continue;
+        };
+        let same_file_names: HashSet<String> = analyzer
+            .declarations(&file)
+            .into_iter()
+            .map(|unit| unit.identifier().to_string())
+            .collect();
+        let context = DeclarationNameRangeContext::new(&file, source);
+        let root = context.root_node();
+        let content = context.content();
+        let language = language_for_file(&file);
+        let bindings = root.and_then(|root| CensusBareNameBindings::build(root, content, language));
+        for index in indexes {
+            let record = &mut records[index];
+            let name = record.text.clone();
+            let role = root
+                .map(|root| census_site_role(root, content, record.start_byte, record.end_byte))
+                .unwrap_or(CensusSiteRole::Other);
+            let same_file_evidence = same_file_names.contains(&name)
+                && (role != CensusSiteRole::BareCall
+                    || bare_call_reaches_same_file_declaration(
+                        language,
+                        bindings.as_ref(),
+                        &name,
+                        record.start_byte,
+                    ));
+            let tier = if same_file_evidence
+                && matches!(
+                    role,
+                    CensusSiteRole::SelfMemberCall | CensusSiteRole::BareCall
+                ) {
+                1
+            } else if same_file_evidence {
+                2
+            } else {
+                3
+            };
+            record.tier = Some(tier);
+            if config.tiers.includes(tier) && matches!(tier, 1 | 2) {
+                record.classification = ReferenceClassification::Missing;
+                record.note = Some(format!(
+                    "census tier-{tier} gap: same-file declaration `{name}` exists but forward lookup returned {}",
+                    record.forward_status
+                ));
+            }
+        }
+    }
+}
+
 fn recompute_classifications(
     records: &[ReferenceDifferentialSite],
     counts: &mut ReferenceClassificationCounts,
@@ -1378,7 +1769,8 @@ fn file_error(path: &str, kind: &str, message: &str) -> ReferenceDifferentialFil
 mod tests {
     use super::*;
     use crate::analyzer::{
-        AnalyzerConfig, CppAnalyzer, TestProject, WorkspaceAnalyzer, resolve_analyzer,
+        AnalyzerConfig, CodeUnitIndex, CppAnalyzer, TestProject, WorkspaceAnalyzer,
+        resolve_analyzer,
     };
     use std::cell::Cell;
     use std::fs;
@@ -2998,6 +3390,88 @@ public sealed class Model {
             site.inverse_hit.as_ref().map(|hit| hit.exact_range),
             Some(true),
             "{site:#?}"
+        );
+        assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
+        assert!(!report.has_actionable_findings(), "{report:#?}");
+    }
+
+    #[test]
+    fn cpp_compound_operator_uses_point_lookup_and_preserves_full_range() {
+        let fixture = RoundTripFixture {
+            corpus_language: "cpp",
+            analyzer_language: Language::Cpp,
+            file_name: "operator.cpp",
+            source: concat!(
+                "struct Index {\n",
+                "    int operator[](int value) const { return value; }\n",
+                "    int value() const { return 0; }\n",
+                "};\n",
+                "int use(Index index) {\n",
+                "    return index.operator[](0) + index.value();\n",
+                "}\n",
+            ),
+            call_line: "return index.operator[](0) + index.value();",
+        };
+
+        let report = audit_fixture(&fixture);
+        assert_eq!(report.summary.forward.invalid_location, 0, "{report:#?}");
+        assert!(
+            report.summary.declaration_sites_excluded >= 2,
+            "operator and near-miss declarations must use existing declaration metadata: {report:#?}"
+        );
+        let operator_declaration_start = fixture
+            .source
+            .find("operator[]")
+            .expect("operator declaration text");
+        assert!(
+            report
+                .sites
+                .iter()
+                .all(|site| site.start_byte != operator_declaration_start),
+            "operator declaration must not be sampled: {report:#?}"
+        );
+
+        let operator_start = fixture
+            .source
+            .rfind("operator[]")
+            .expect("operator call text");
+        let operator_site = report
+            .sites
+            .iter()
+            .find(|site| site.start_byte == operator_start)
+            .unwrap_or_else(|| panic!("operator call site was not sampled: {report:#?}"));
+        assert_eq!(
+            &fixture.source[operator_site.start_byte..operator_site.end_byte],
+            "operator[]",
+            "report must retain the structured compound range: {operator_site:#?}"
+        );
+        assert_eq!(operator_site.text, "operator[]", "{operator_site:#?}");
+        assert_eq!(
+            operator_site.forward_status, "resolved",
+            "{operator_site:#?}"
+        );
+        assert_eq!(
+            operator_site.classification,
+            ReferenceClassification::Consistent,
+            "{operator_site:#?}"
+        );
+
+        let value_start = fixture.source.rfind("value").expect("near-miss call text");
+        let value_site = report
+            .sites
+            .iter()
+            .find(|site| site.start_byte == value_start)
+            .unwrap_or_else(|| panic!("near-miss value site was not sampled: {report:#?}"));
+        assert_eq!(
+            &fixture.source[value_site.start_byte..value_site.end_byte],
+            "value",
+            "ordinary member references must retain their normal range: {value_site:#?}"
+        );
+        assert_eq!(value_site.forward_status, "resolved", "{value_site:#?}");
+        assert_eq!(
+            value_site.classification,
+            ReferenceClassification::Consistent,
+            "{value_site:#?}"
         );
         assert_eq!(report.summary.classifications.missing, 0, "{report:#?}");
         assert!(!report.has_actionable_findings(), "{report:#?}");

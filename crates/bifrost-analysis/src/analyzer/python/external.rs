@@ -13,12 +13,12 @@ use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
-    CatalogCoordinate, Compatibility, Completeness, DependencyArtifactRole,
+    CatalogCoordinate, Compatibility, Completeness, DeclarationGuard, DependencyArtifactRole,
     DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackAdapter,
     DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
     DependencyPackProduction, DependencyProvenance, ExactArtifact, ExactDependencyArtifact,
-    ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, Locator, MemberFact,
-    MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
+    ExternalArtifactKind, ExternalArtifactPackProducer, GuardVersion, HierarchyFact, Locator,
+    MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
     SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
     Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
@@ -130,10 +130,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                 suppressed_diagnostics,
             };
         }
-        types.sort_by(|left, right| left.id.cmp(&right.id));
-        types.dedup_by(|left, right| left.id == right.id);
-        members.sort_by(|left, right| left.id.cmp(&right.id));
-        members.dedup_by(|left, right| left.id == right.id);
+        dedup_declarations(&mut types, &mut members);
         let mut activation = request.activation.clone();
         for selector in &mut activation {
             selector.artifact_sha256 = None;
@@ -258,7 +255,7 @@ impl PythonArtifactPackProducer {
                 );
             }
         };
-        let Some(tree) = super::declarations::parse_python_tree(source) else {
+        let Some(tree) = brokk_bifrost_python::declarations::parse_python_tree(source) else {
             return ArtifactProduction::failed(
                 ProducerDiagnostic {
                     severity: ProducerDiagnosticSeverity::Error,
@@ -270,12 +267,19 @@ impl PythonArtifactPackProducer {
             );
         };
         let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-        let (types, members) = {
-            let mut collector =
-                PythonApiCollector::new(module, artifact.path(), source, limits, &mut diagnostics);
+        let (mut types, mut members) = {
+            let mut collector = PythonApiCollector::new(
+                module,
+                artifact.path(),
+                python_locator_file_name(artifact.path()),
+                source,
+                limits,
+                &mut diagnostics,
+            );
             collector.collect(tree.root_node(), cancellation);
             (collector.types, collector.members)
         };
+        dedup_declarations(&mut types, &mut members);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             diagnostics.error(
                 "artifact.cancelled",
@@ -283,6 +287,140 @@ impl PythonArtifactPackProducer {
                 "Python artifact production was cancelled",
             );
         }
+        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        };
+        let mut activation = request.activation.clone();
+        for selector in &mut activation {
+            selector.artifact_sha256 = Some(artifact.sha256().to_owned());
+        }
+        ArtifactProduction {
+            artifact_sha256: Some(artifact.sha256().to_owned()),
+            pack: Some(AuthoredSemanticModelPack {
+                schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+                pack_id: request.pack_id.clone(),
+                version: request.pack_version.clone(),
+                producer: Producer {
+                    name: "bifrost-python-stub".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                },
+                language: "python".to_owned(),
+                ecosystem: request.ecosystem.clone(),
+                compatibility: request.compatibility.clone(),
+                provenance: request.provenance.clone(),
+                license: request.license.clone(),
+                completeness,
+                safety: request.safety.clone(),
+                shards: vec![AuthoredShard {
+                    id: "declarations.external".to_owned(),
+                    activation,
+                    payload: AuthoredPayload::DeclarationFacts {
+                        types,
+                        members,
+                        relations: Vec::new(),
+                    },
+                }],
+            }),
+            completeness,
+            diagnostics,
+            suppressed_diagnostics,
+        }
+    }
+
+    /// Produce one pack from an exact source set of Python stub files.
+    ///
+    /// Each entry's import-module identity comes from its relative path under
+    /// the set root, exactly as an installed package tree derives it. Entries
+    /// without a module identity, with invalid encoding, or with source the
+    /// pinned parser rejects become bounded reject diagnostics and make the
+    /// pack honestly partial.
+    pub fn produce_loaded_source_set(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::PythonStub {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.kind".to_owned(),
+                    location: None,
+                    message: "Python stub source-set producer requires a python_stub artifact"
+                        .to_owned(),
+                },
+                limits,
+            );
+        }
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        let mut types = Vec::new();
+        let mut members = Vec::new();
+        for entry in artifact.source_entries() {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                diagnostics.error(
+                    "artifact.cancelled",
+                    None,
+                    "Python stub source-set production was cancelled",
+                );
+                break;
+            }
+            let relative = Path::new(entry.relative_path());
+            let Some(module) = python_module_name_from_relative(relative) else {
+                diagnostics.warning(
+                    "python.artifact_module",
+                    Some(entry.relative_path().to_owned()),
+                    "Python stub entry has no import-module identity",
+                );
+                continue;
+            };
+            let Ok(source) = std::str::from_utf8(entry.bytes()) else {
+                diagnostics.warning(
+                    "python.source.encoding",
+                    Some(entry.relative_path().to_owned()),
+                    "Python stub entry is not UTF-8",
+                );
+                continue;
+            };
+            let Some(tree) = brokk_bifrost_python::declarations::parse_python_tree(source) else {
+                diagnostics.warning(
+                    "python.source.parse",
+                    Some(entry.relative_path().to_owned()),
+                    "Python parser did not produce a syntax tree",
+                );
+                continue;
+            };
+            let mut collector = PythonApiCollector::new(
+                &module,
+                relative,
+                entry.relative_path().to_owned(),
+                source,
+                limits,
+                &mut diagnostics,
+            );
+            collector.collect(tree.root_node(), cancellation);
+            types.extend(collector.types);
+            members.extend(collector.members);
+        }
+        if types.is_empty() {
+            diagnostics.error(
+                "python.source_set.no_external_declarations",
+                None,
+                "stub source set contains no externally visible Python declarations",
+            );
+            let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+            return ArtifactProduction {
+                artifact_sha256: Some(artifact.sha256().to_owned()),
+                pack: None,
+                completeness: Completeness::Partial,
+                diagnostics,
+                suppressed_diagnostics,
+            };
+        }
+        dedup_declarations(&mut types, &mut members);
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
         let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
             Completeness::Complete
@@ -435,7 +573,10 @@ fn python_module_name_for_artifact(path: &Path) -> String {
 }
 
 fn python_module_name_from_import_root(import_root: &Path, path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(import_root).ok()?;
+    python_module_name_from_relative(path.strip_prefix(import_root).ok()?)
+}
+
+fn python_module_name_from_relative(relative: &Path) -> Option<String> {
     let mut components = relative
         .components()
         .map(|component| component.as_os_str().to_str().map(str::to_owned))
@@ -446,6 +587,14 @@ fn python_module_name_from_import_root(import_root: &Path, path: &Path) -> Optio
         components.push(stem.to_owned());
     }
     (!components.is_empty()).then(|| components.join("."))
+}
+
+fn python_locator_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("__external__.pyi")
+        .to_owned()
 }
 
 fn python_artifact_precedence(
@@ -471,12 +620,49 @@ struct PythonApiCollector<'a, 'd> {
     diagnostics: &'d mut BoundedProducerDiagnostics,
     types: Vec<TypeFact>,
     members: Vec<MemberFact>,
+    /// Every distinct guard this file's conditional blocks produced. A walk
+    /// frame and a declaration name one by index, so an enclosing block's
+    /// guard is not cloned once per statement it contains.
+    guards: Vec<DeclarationGuard>,
+    /// `owner.name` for every binding an import already contributed, mapped to
+    /// that member's position, so a conditional import cannot mint one member
+    /// identity twice and a second binding can widen the first one's guard.
+    imported_names: std::collections::HashMap<String, usize>,
 }
+
+/// One pending subtree in the collector's iterative walk.
+struct PendingNode<'tree> {
+    node: Node<'tree>,
+    owner: String,
+    class_scope: bool,
+    /// Index into [`PythonApiCollector::guards`], or `None` when no enclosing
+    /// conditional block guards this subtree.
+    guard: Option<usize>,
+}
+
+/// How deep a conditional expression this producer reads before it records the
+/// condition as uninterpreted.
+///
+/// A real version or platform guard nests two or three operators. The bound
+/// keeps a hostile stub's deeply nested condition from recursing without end.
+const MAX_GUARD_CONDITION_DEPTH: usize = 32;
+
+/// The member name a Python surface carries when it binds names this producer
+/// cannot enumerate, e.g. `from ._impl import *` in a package's `__init__`.
+///
+/// `*` is not a Python identifier, so this member can never collide with a
+/// real name. Its presence is the module-level fact that the listed members
+/// are not the whole surface. A wildcard is a property of the surface, not a
+/// fault in producing the pack, so it is recorded rather than reported as a
+/// producer diagnostic: a diagnostic would make the production partial and
+/// stop the whole environment from activating.
+pub(crate) const PYTHON_UNENUMERATED_BINDING: &str = "*";
 
 impl<'a, 'd> PythonApiCollector<'a, 'd> {
     fn new(
         module: &'a str,
         path: &'a Path,
+        locator_path: String,
         source: &'a str,
         limits: &'a ArtifactProducerLimits,
         diagnostics: &'d mut BoundedProducerDiagnostics,
@@ -484,30 +670,46 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         let mut collector = Self {
             module,
             path,
-            locator_path: path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty())
-                .unwrap_or("__external__.pyi")
-                .to_owned(),
+            locator_path,
             source,
             limits,
             diagnostics,
             types: Vec::new(),
             members: Vec::new(),
+            guards: Vec::new(),
+            imported_names: std::collections::HashMap::new(),
         };
-        collector.push_type(module.to_owned(), TypeKind::Module, Vec::new(), Vec::new());
+        collector.push_type(
+            module.to_owned(),
+            TypeKind::Module,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
         collector
     }
 
     fn collect(&mut self, root: Node<'_>, cancellation: Option<&CancellationToken>) {
-        let mut stack = vec![(root, self.module.to_owned(), false)];
-        while let Some((node, owner, class_scope)) = stack.pop() {
+        let mut stack = vec![PendingNode {
+            node: root,
+            owner: self.module.to_owned(),
+            class_scope: false,
+            guard: None,
+        }];
+        while let Some(PendingNode {
+            node,
+            owner,
+            class_scope,
+            guard,
+        }) = stack.pop()
+        {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;
             }
             match node.kind() {
-                "module" | "block" => self.push_children(&mut stack, node, &owner, class_scope),
+                "module" | "block" => {
+                    self.push_children(&mut stack, node, &owner, class_scope, guard)
+                }
                 "decorated_definition" => {
                     if let Some(definition) = node.child_by_field_name("definition") {
                         self.visit_definition(
@@ -516,20 +718,40 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                             Some(node),
                             owner,
                             class_scope,
+                            guard,
                         );
                     }
                 }
                 "class_definition" | "function_definition" => {
-                    self.visit_definition(&mut stack, node, None, owner, class_scope);
+                    self.visit_definition(&mut stack, node, None, owner, class_scope, guard);
                 }
-                "expression_statement" => self.visit_assignment(node, &owner, class_scope),
-                "type_alias_statement" => self.visit_type_alias(node, &owner),
-                // Module control blocks do not make declarations dynamic by
-                // themselves. The emitted pack remains a static surface and
-                // never evaluates a guard.
-                "if_statement" | "try_statement" | "with_statement" | "for_statement"
-                | "while_statement" | "elif_clause" | "else_clause" | "except_clause"
-                | "finally_clause" => self.push_children(&mut stack, node, &owner, class_scope),
+                "expression_statement" => self.visit_assignment(node, &owner, class_scope, guard),
+                "import_statement" | "import_from_statement" => {
+                    self.visit_import(node, &owner, guard)
+                }
+                "type_alias_statement" => self.visit_type_alias(node, &owner, guard),
+                // A conditional block does not make its declarations dynamic.
+                // The emitted pack stays a static surface and never evaluates
+                // a condition; it records the condition on the declarations
+                // the block encloses so activation can (#1899).
+                "if_statement" => {
+                    self.visit_if_statement(&mut stack, node, &owner, class_scope, guard)
+                }
+                // The declarations an `except` body binds exist only when the
+                // matching `try` body raised, which no static reader decides.
+                "except_clause" => {
+                    let guard = self.intern_guard(
+                        self.guard_of(guard)
+                            .cloned()
+                            .unwrap_or_default()
+                            .and(&DeclarationGuard::uninterpreted()),
+                    );
+                    self.push_children(&mut stack, node, &owner, class_scope, guard);
+                }
+                "try_statement" | "with_statement" | "for_statement" | "while_statement"
+                | "else_clause" | "finally_clause" => {
+                    self.push_children(&mut stack, node, &owner, class_scope, guard)
+                }
                 _ => {}
             }
         }
@@ -537,25 +759,107 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
 
     fn push_children<'tree>(
         &self,
-        stack: &mut Vec<(Node<'tree>, String, bool)>,
+        stack: &mut Vec<PendingNode<'tree>>,
         node: Node<'tree>,
         owner: &str,
         class_scope: bool,
+        guard: Option<usize>,
     ) {
         let mut cursor = node.walk();
         let children = node.named_children(&mut cursor).collect::<Vec<_>>();
         for child in children.into_iter().rev() {
-            stack.push((child, owner.to_owned(), class_scope));
+            stack.push(PendingNode {
+                node: child,
+                owner: owner.to_owned(),
+                class_scope,
+                guard,
+            });
         }
+    }
+
+    /// Walk one `if`/`elif`/`else` chain, recording on each branch's body the
+    /// condition that reaches it: the enclosing guard, this branch's own
+    /// condition, and the negation of every condition an earlier branch of the
+    /// same chain already claimed.
+    fn visit_if_statement<'tree>(
+        &mut self,
+        stack: &mut Vec<PendingNode<'tree>>,
+        node: Node<'tree>,
+        owner: &str,
+        class_scope: bool,
+        guard: Option<usize>,
+    ) {
+        let mut branches = vec![(
+            node.child_by_field_name("condition"),
+            node.child_by_field_name("consequence"),
+        )];
+        let mut cursor = node.walk();
+        for alternative in node.children_by_field_name("alternative", &mut cursor) {
+            match alternative.kind() {
+                "elif_clause" => branches.push((
+                    alternative.child_by_field_name("condition"),
+                    alternative.child_by_field_name("consequence"),
+                )),
+                "else_clause" => branches.push((None, alternative.child_by_field_name("body"))),
+                _ => {}
+            }
+        }
+        // The guard of the path that reaches the next branch: nothing earlier
+        // in the chain was taken.
+        let mut untaken = self.guard_of(guard).cloned().unwrap_or_default();
+        let mut bodies = Vec::with_capacity(branches.len());
+        for (condition, body) in branches {
+            let branch = match condition {
+                Some(condition) => {
+                    let constraint =
+                        condition_guard(condition, self.source, MAX_GUARD_CONDITION_DEPTH);
+                    let branch = untaken.and(&constraint);
+                    untaken = untaken.and(
+                        &constraint
+                            .negated()
+                            .unwrap_or_else(DeclarationGuard::uninterpreted),
+                    );
+                    branch
+                }
+                None => untaken.clone(),
+            };
+            let Some(body) = body else {
+                continue;
+            };
+            bodies.push((body, self.intern_guard(branch)));
+        }
+        for (body, guard) in bodies.into_iter().rev() {
+            stack.push(PendingNode {
+                node: body,
+                owner: owner.to_owned(),
+                class_scope,
+                guard,
+            });
+        }
+    }
+
+    fn guard_of(&self, guard: Option<usize>) -> Option<&DeclarationGuard> {
+        guard.map(|index| &self.guards[index])
+    }
+
+    /// Retain one branch guard and name it by index. A guard that constrains
+    /// nothing is not recorded: an unguarded declaration must stay unguarded.
+    fn intern_guard(&mut self, guard: DeclarationGuard) -> Option<usize> {
+        if guard == DeclarationGuard::default() {
+            return None;
+        }
+        self.guards.push(guard);
+        Some(self.guards.len() - 1)
     }
 
     fn visit_definition<'tree>(
         &mut self,
-        stack: &mut Vec<(Node<'tree>, String, bool)>,
+        stack: &mut Vec<PendingNode<'tree>>,
         definition: Node<'tree>,
         decorated: Option<Node<'tree>>,
         owner: String,
         class_scope: bool,
+        guard: Option<usize>,
     ) {
         let Some(name) = node_identifier(definition.child_by_field_name("name"), self.source)
         else {
@@ -582,20 +886,22 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 .unwrap_or_default();
             let type_parameters = definition
                 .child_by_field_name("type_parameters")
-                .map(|parameters| {
-                    named_children(parameters)
-                        .filter_map(|node| node_identifier(Some(node), self.source))
-                        .collect()
-                })
+                .map(|list| type_parameter_names(list, self.source))
                 .unwrap_or_default();
             self.push_type(
                 qualified.clone(),
                 TypeKind::Class,
                 type_parameters,
                 hierarchy,
+                guard,
             );
             if let Some(body) = definition.child_by_field_name("body") {
-                stack.push((body, qualified, true));
+                stack.push(PendingNode {
+                    node: body,
+                    owner: qualified,
+                    class_scope: true,
+                    guard,
+                });
             }
             return;
         }
@@ -614,10 +920,16 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             .any(|decorator| decorator == "staticmethod");
         let signature =
             function_signature(definition, self.source, self.limits.max_signature_depth);
-        self.push_member(owner, name, member_kind, is_static, signature);
+        self.push_member(owner, name, member_kind, is_static, signature, guard);
     }
 
-    fn visit_assignment(&mut self, node: Node<'_>, owner: &str, class_scope: bool) {
+    fn visit_assignment(
+        &mut self,
+        node: Node<'_>,
+        owner: &str,
+        class_scope: bool,
+        guard: Option<usize>,
+    ) {
         let Some(assignment) = node.named_child(0) else {
             return;
         };
@@ -643,6 +955,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 TypeKind::TypeAlias,
                 Vec::new(),
                 Vec::new(),
+                guard,
             );
             return;
         }
@@ -656,18 +969,84 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             },
             false,
             None,
+            guard,
         );
     }
 
-    fn visit_type_alias(&mut self, node: Node<'_>, owner: &str) {
-        let Some(name) = node_identifier(node.child_by_field_name("name"), self.source) else {
+    /// An import inside a module or class body binds a name on that surface:
+    /// `from .sessions import Session` in `requests/__init__.pyi` is how
+    /// `requests.Session` exists at all. One artifact is produced without a
+    /// view of the modules it imports, so the binding is recorded by name
+    /// alone. That is what an absence proof needs -- "does this surface bind
+    /// that name" -- and recording it is what makes a surface marked complete
+    /// actually complete.
+    ///
+    /// A wildcard binds a set this producer cannot enumerate, and so does a
+    /// form that spells no single bound name. Either one is recorded as the
+    /// [`PYTHON_UNENUMERATED_BINDING`] member, which is not a Python
+    /// identifier and so can never be confused with a real name. A consumer
+    /// that finds it knows this surface binds more than it lists, and that a
+    /// name missing from it is therefore not proof of absence.
+    fn visit_import(&mut self, node: Node<'_>, owner: &str, guard: Option<usize>) {
+        for import in
+            brokk_bifrost_python::imports::python_import_infos_from_node(node, self.source)
+        {
+            let name = match import.local_name().filter(|_| !import.is_wildcard) {
+                Some(name) => name,
+                None => PYTHON_UNENUMERATED_BINDING,
+            };
+            // Two branches of a `try`/`except ImportError` pair bind the same
+            // name; recording it twice would mint one identity twice and mark
+            // the surface ambiguous. The surviving binding takes the union of
+            // the two branches' guards, so a name one branch binds
+            // unconditionally is never hidden by the other branch's condition.
+            let key = format!("{owner}.{name}", name = name);
+            if let Some(&index) = self.imported_names.get(&key) {
+                let recorded = self.guard_of(guard).cloned();
+                self.members[index].guard =
+                    DeclarationGuard::union(self.members[index].guard.take(), recorded);
+                continue;
+            }
+            let index = self.members.len();
+            self.push_member(
+                owner.to_owned(),
+                name.to_owned(),
+                MemberKind::Constant,
+                false,
+                None,
+                guard,
+            );
+            if self.members.len() > index {
+                self.imported_names.insert(key, index);
+            }
+        }
+    }
+
+    /// A PEP 695 `type Alias[T] = ...` statement spells its declared name in
+    /// the `left` field, not a `name` field, and wraps it in a `type` node.
+    /// Reading that wrapper is what makes the alias exist in the pack at all.
+    fn visit_type_alias(&mut self, node: Node<'_>, owner: &str, guard: Option<usize>) {
+        let Some(left) = node.child_by_field_name("left") else {
             return;
         };
+        let Some(name) = type_name(left, self.source) else {
+            return;
+        };
+        // The statement has no `type_parameters` field: an alias spells its
+        // list inside its declared name, as `Alias[T]`.
+        let type_parameters = named_children(left)
+            .find(|child| child.kind() == "generic_type")
+            .and_then(|generic| {
+                named_children(generic).find(|child| child.kind() == "type_parameter")
+            })
+            .map(|list| type_parameter_names(list, self.source))
+            .unwrap_or_default();
         self.push_type(
             format!("{owner}.{name}"),
             TypeKind::TypeAlias,
+            type_parameters,
             Vec::new(),
-            Vec::new(),
+            guard,
         );
     }
 
@@ -677,6 +1056,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         type_kind: TypeKind,
         type_parameters: Vec<String>,
         hierarchy: Vec<crate::analyzer::semantic_model::HierarchyFact>,
+        guard: Option<usize>,
     ) {
         if self.types.len().saturating_add(self.members.len()) >= self.limits.max_records {
             self.diagnostics.error(
@@ -689,6 +1069,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             );
             return;
         }
+        let guard = self.guard_of(guard).cloned();
         self.types.push(TypeFact {
             id: type_declaration_id(TypeIdentity {
                 ecosystem: "python",
@@ -707,6 +1088,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            guard,
             locator: Locator::Artifact {
                 path: self.locator_path.clone(),
                 symbol: name,
@@ -721,6 +1103,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         member_kind: MemberKind,
         is_static: bool,
         signature: Option<Signature>,
+        guard: Option<usize>,
     ) {
         if self.types.len().saturating_add(self.members.len()) >= self.limits.max_records {
             self.diagnostics.error(
@@ -733,6 +1116,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             );
             return;
         }
+        let guard = self.guard_of(guard).cloned();
         let owner_id = type_declaration_id(TypeIdentity {
             ecosystem: "python",
             name: &owner,
@@ -775,12 +1159,216 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            guard,
             locator: Locator::Artifact {
                 path: self.locator_path.clone(),
                 symbol: format!("{owner}.{name}"),
             },
         });
     }
+}
+
+/// Collapse declarations that share one identity, keeping the guard that is
+/// true wherever either record's guard is.
+///
+/// Two branches of one conditional block can declare the same name with the
+/// same shape, which mints one identity twice. Keeping only the first record
+/// would keep only that branch's condition and would hide the declaration from
+/// every activation the other branch covers (#1899).
+fn dedup_declarations(types: &mut Vec<TypeFact>, members: &mut Vec<MemberFact>) {
+    types.sort_by(|left, right| left.id.cmp(&right.id));
+    types.dedup_by(|later, kept| {
+        if later.id != kept.id {
+            return false;
+        }
+        kept.guard = DeclarationGuard::union(kept.guard.take(), later.guard.take());
+        true
+    });
+    members.sort_by(|left, right| left.id.cmp(&right.id));
+    members.dedup_by(|later, kept| {
+        if later.id != kept.id {
+            return false;
+        }
+        kept.guard = DeclarationGuard::union(kept.guard.take(), later.guard.take());
+        true
+    });
+}
+
+/// The condition one conditional block places on the declarations inside it.
+///
+/// The returned guard is a conjunction of necessary conditions. A condition
+/// this reader cannot express returns [`DeclarationGuard::uninterpreted`],
+/// which keeps every declaration in the block and states that the pack read
+/// less than the whole condition rather than dropping the declarations or
+/// claiming they are unconditional.
+fn condition_guard(node: Node<'_>, source: &str, depth: usize) -> DeclarationGuard {
+    if depth == 0 {
+        return DeclarationGuard::uninterpreted();
+    }
+    match node.kind() {
+        "parenthesized_expression" => node
+            .named_child(0)
+            .map(|inner| condition_guard(inner, source, depth - 1))
+            .unwrap_or_else(DeclarationGuard::uninterpreted),
+        // `A and B` holds only where both hold, so both sides stay necessary.
+        // `A or B` makes neither side necessary, so it records nothing.
+        "boolean_operator" => {
+            let operator = node.child_by_field_name("operator").map(|node| node.kind());
+            let left = node.child_by_field_name("left");
+            let right = node.child_by_field_name("right");
+            match (operator, left, right) {
+                (Some("and"), Some(left), Some(right)) => condition_guard(left, source, depth - 1)
+                    .and(&condition_guard(right, source, depth - 1)),
+                _ => DeclarationGuard::uninterpreted(),
+            }
+        }
+        "not_operator" => node
+            .child_by_field_name("argument")
+            .map(|argument| condition_guard(argument, source, depth - 1))
+            .and_then(|guard| guard.negated())
+            .unwrap_or_else(DeclarationGuard::uninterpreted),
+        "comparison_operator" => comparison_guard(node, source),
+        _ => DeclarationGuard::uninterpreted(),
+    }
+}
+
+/// The constraint one comparison spells, for the two interpreter coordinates a
+/// stub can branch on: `sys.version_info` and `sys.platform`.
+///
+/// A chained comparison such as `a < b < c` carries more than one operator and
+/// more than two operands; it is not one of the two forms, so it records
+/// nothing.
+fn comparison_guard(node: Node<'_>, source: &str) -> DeclarationGuard {
+    let mut cursor = node.walk();
+    let operators = node
+        .children_by_field_name("operators", &mut cursor)
+        .map(|operator| operator.kind())
+        .collect::<Vec<_>>();
+    let operands = named_children(node).collect::<Vec<_>>();
+    let ([operator], [left, right]) = (operators.as_slice(), operands.as_slice()) else {
+        return DeclarationGuard::uninterpreted();
+    };
+    match type_name(*left, source).as_deref() {
+        Some("sys.version_info") => version_info_guard(operator, *right, source),
+        Some("sys.platform") => platform_guard(operator, *right, source),
+        _ => DeclarationGuard::uninterpreted(),
+    }
+}
+
+/// The version bound one `sys.version_info` comparison places on a block.
+///
+/// `sys.version_info` is a five-component tuple, so a comparison against a
+/// shorter tuple with an equal prefix always makes the interpreter's own value
+/// the greater one: `(3, 14, 0, 'final', 0) > (3, 14)`. `>` therefore admits
+/// exactly the versions `>=` admits, and `<=` excludes exactly the versions
+/// `<` excludes.
+fn version_info_guard(operator: &str, bound: Node<'_>, source: &str) -> DeclarationGuard {
+    let Some(bound) = version_tuple(bound, source) else {
+        return DeclarationGuard::uninterpreted();
+    };
+    match operator {
+        ">=" | ">" => DeclarationGuard {
+            min_toolchain_version: Some(bound),
+            ..DeclarationGuard::default()
+        },
+        "<" | "<=" => DeclarationGuard {
+            max_toolchain_version_exclusive: Some(bound),
+            ..DeclarationGuard::default()
+        },
+        _ => DeclarationGuard::uninterpreted(),
+    }
+}
+
+/// The target constraint one `sys.platform` comparison places on a block.
+///
+/// A Python environment's activation target is the interpreter's
+/// `sys.platform` value, so the literal the condition names is the target name
+/// the guard records.
+fn platform_guard(operator: &str, value: Node<'_>, source: &str) -> DeclarationGuard {
+    let targets = match operator {
+        "==" | "!=" => string_literal(value, source).map(|value| vec![value]),
+        "in" | "not in" => string_sequence(value, source),
+        _ => None,
+    };
+    let Some(targets) = targets.filter(|targets| !targets.is_empty()) else {
+        return DeclarationGuard::uninterpreted();
+    };
+    match operator {
+        "==" | "in" => DeclarationGuard {
+            required_targets: targets,
+            ..DeclarationGuard::default()
+        },
+        _ => DeclarationGuard {
+            excluded_targets: targets,
+            ..DeclarationGuard::default()
+        },
+    }
+}
+
+/// The version a `(3, 14)` literal names, padded to three components.
+fn version_tuple(node: Node<'_>, source: &str) -> Option<GuardVersion> {
+    if node.kind() != "tuple" {
+        return None;
+    }
+    let components = named_children(node)
+        .map(|child| {
+            (child.kind() == "integer")
+                .then(|| child.utf8_text(source.as_bytes()).ok()?.parse::<u64>().ok())
+                .flatten()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    match components.as_slice() {
+        [major] => Some(GuardVersion::new(*major, 0, 0)),
+        [major, minor] => Some(GuardVersion::new(*major, *minor, 0)),
+        [major, minor, patch] => Some(GuardVersion::new(*major, *minor, *patch)),
+        _ => None,
+    }
+}
+
+/// The text one plain string literal spells.
+///
+/// The grammar puts a literal's text in a `string_content` child between a
+/// `string_start` and a `string_end`. A prefixed literal, an interpolation, and
+/// an escape all mean the text is not the value, so each one reads as no
+/// literal at all.
+fn string_literal(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut content = None;
+    for child in named_children(node) {
+        match child.kind() {
+            "string_start" | "string_end" => {
+                let delimiter = child.utf8_text(source.as_bytes()).ok()?;
+                if delimiter
+                    .chars()
+                    .any(|character| character != '"' && character != '\'')
+                {
+                    return None;
+                }
+            }
+            "string_content" if child.named_child_count() == 0 => {
+                if content
+                    .replace(child.utf8_text(source.as_bytes()).ok()?.to_owned())
+                    .is_some()
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    content
+}
+
+/// The texts one literal sequence of plain strings spells.
+fn string_sequence(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    if !matches!(node.kind(), "tuple" | "list" | "set") {
+        return None;
+    }
+    named_children(node)
+        .map(|child| string_literal(child, source))
+        .collect()
 }
 
 fn named_children(node: Node<'_>) -> impl Iterator<Item = Node<'_>> {
@@ -830,34 +1418,39 @@ fn is_type_alias_annotation(node: Node<'_>, source: &str) -> bool {
     false
 }
 
+/// Read one function's declared signature.
+///
+/// The grammar spells a parameter's binding name as a plain child rather than
+/// a `name` field on `typed_parameter` and on the two splat patterns, so the
+/// binding is read through the shared parameter-label reader that every other
+/// Python surface already uses. A parameter that reads its name from a
+/// missing field loses it silently, and an annotated parameter that loses its
+/// annotation makes two overloads of one name indistinguishable.
 fn function_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<Signature> {
     let parameters = node.child_by_field_name("parameters")?;
     let parameters = named_children(parameters)
         .filter_map(|parameter| {
-            let (name, annotation, optional, variadic) = match parameter.kind() {
-                "identifier" => (node_identifier(Some(parameter), source), None, false, false),
+            let (annotation, optional, variadic) = match parameter.kind() {
+                "identifier" => (None, false, false),
                 "typed_parameter" => (
-                    node_identifier(parameter.child_by_field_name("name"), source),
                     parameter.child_by_field_name("type"),
                     false,
-                    false,
+                    named_children(parameter).any(|child| {
+                        matches!(
+                            child.kind(),
+                            "list_splat_pattern" | "dictionary_splat_pattern"
+                        )
+                    }),
                 ),
-                "default_parameter" | "typed_default_parameter" => (
-                    node_identifier(parameter.child_by_field_name("name"), source),
-                    parameter.child_by_field_name("type"),
-                    true,
-                    false,
-                ),
-                "list_splat_pattern" | "dictionary_splat_pattern" => (
-                    node_identifier(parameter.child_by_field_name("name"), source),
-                    parameter.child_by_field_name("type"),
-                    false,
-                    true,
-                ),
+                "default_parameter" | "typed_default_parameter" => {
+                    (parameter.child_by_field_name("type"), true, false)
+                }
+                "list_splat_pattern" | "dictionary_splat_pattern" => (None, false, true),
                 _ => return None,
             };
             Some(Parameter {
-                name,
+                name: brokk_bifrost_python::declarations::python_parameter_label_node(parameter)
+                    .and_then(|label| node_identifier(Some(label), source)),
                 r#type: annotation
                     .map(|annotation| type_ref(annotation, source, max_depth))
                     .unwrap_or_else(any_type),
@@ -869,11 +1462,7 @@ fn function_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
     Some(Signature {
         type_parameters: node
             .child_by_field_name("type_parameters")
-            .map(|parameters| {
-                named_children(parameters)
-                    .filter_map(|parameter| node_identifier(Some(parameter), source))
-                    .collect()
-            })
+            .map(|list| type_parameter_names(list, source))
             .unwrap_or_default(),
         parameters,
         returns: node
@@ -882,18 +1471,45 @@ fn function_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
     })
 }
 
+/// The names a PEP 695 `[T, S]` type-parameter list declares.
+///
+/// Every entry is a `type` node, so a declared parameter name comes from the
+/// same reader as any other annotation.
+fn type_parameter_names(list: Node<'_>, source: &str) -> Vec<String> {
+    named_children(list)
+        .filter_map(|parameter| type_name(parameter, source))
+        .collect()
+}
+
+/// Read one type reference.
+///
+/// Two spellings reach this function. A base-class list or an assignment
+/// annotation is an ordinary expression, so `os.PathLike` is an `attribute`
+/// and `list[int]` is a `subscript`. A parameter, return, or alias
+/// annotation is wrapped in a `type` node and uses the grammar's
+/// annotation-only kinds instead, so the same two shapes arrive as
+/// `member_type` and `generic_type`. Handling only the expression spelling
+/// degrades every annotated parameter and return to `Any`, which erases the
+/// difference between two overloads of one name.
 fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
     if max_depth == 0 {
         return any_type();
     }
     match node.kind() {
+        // An annotation wraps its shape in one `type` node. A PEP 695 bound
+        // and a `*Ts` unpack wrap the constrained or unpacked type the same
+        // way, and the shape is the first named child in each case.
+        "type" | "constrained_type" | "splat_type" => node
+            .named_child(0)
+            .map(|inner| type_ref(inner, source, max_depth - 1))
+            .unwrap_or_else(any_type),
         "identifier" => TypeRef::Named {
             name: node_identifier(Some(node), source).unwrap_or_else(|| "Any".to_owned()),
             arguments: Vec::new(),
             nullable: false,
         },
-        "attribute" => TypeRef::Named {
-            name: attribute_name(node, source).unwrap_or_else(|| "Any".to_owned()),
+        "attribute" | "member_type" => TypeRef::Named {
+            name: type_name(node, source).unwrap_or_else(|| "Any".to_owned()),
             arguments: Vec::new(),
             nullable: false,
         },
@@ -922,6 +1538,26 @@ fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
                 _ => any_type(),
             }
         }
+        // `list[int]` in an annotation: the generic name comes first and the
+        // bracketed arguments follow as one `type_parameter` list.
+        "generic_type" => {
+            let mut children = named_children(node);
+            let name = children
+                .next()
+                .map(|name| type_ref(name, source, max_depth - 1));
+            let arguments = children
+                .flat_map(named_children)
+                .map(|argument| type_ref(argument, source, max_depth - 1))
+                .collect();
+            match name {
+                Some(TypeRef::Named { name, .. }) => TypeRef::Named {
+                    name,
+                    arguments,
+                    nullable: false,
+                },
+                _ => any_type(),
+            }
+        }
         "union_type" => TypeRef::Named {
             name: "Union".to_owned(),
             arguments: named_children(node)
@@ -938,16 +1574,43 @@ fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
     }
 }
 
-fn attribute_name(node: Node<'_>, source: &str) -> Option<String> {
-    let object = node.child_by_field_name("object")?;
-    let attribute = node.child_by_field_name("attribute")?;
-    let object = match object.kind() {
-        "identifier" => node_identifier(Some(object), source),
-        "attribute" => attribute_name(object, source),
-        _ => None,
-    }?;
-    let attribute = node_identifier(Some(attribute), source)?;
-    Some(format!("{object}.{attribute}"))
+/// The dotted name a type reference spells, e.g. `int`, `os.PathLike`, or
+/// the `list` of `list[int]`.
+///
+/// The walk is iterative because an annotation nests its qualifier on the
+/// left: `a.b.c` is `member_type(member_type(a, b), c)`.
+fn type_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut segments = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" => {
+                segments.push(node_identifier(Some(current), source)?);
+                break;
+            }
+            // One wrapper around the shape, and the generic name of a
+            // subscripted annotation, are both the first named child.
+            "type" | "generic_type" => current = current.named_child(0)?,
+            "attribute" => {
+                segments.push(node_identifier(
+                    current.child_by_field_name("attribute"),
+                    source,
+                )?);
+                current = current.child_by_field_name("object")?;
+            }
+            // `member_type` carries no fields: its children are the
+            // qualifying type and the member identifier, in that order.
+            "member_type" => {
+                let mut children = named_children(current);
+                let qualifier = children.next()?;
+                segments.push(node_identifier(children.next(), source)?);
+                current = qualifier;
+            }
+            _ => return None,
+        }
+    }
+    segments.reverse();
+    Some(segments.join("."))
 }
 
 fn any_type() -> TypeRef {

@@ -12,6 +12,7 @@ use serde::{Serialize, Serializer};
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::structural::CodeQueryDiagnosticCode;
 
+use super::baseline::PolicyFindingBaseline;
 use super::budget::PolicyBudget;
 use super::classification::{
     ClassificationProvenance, FindingClassification, OrganizationalRiskAssessment,
@@ -1885,6 +1886,51 @@ pub enum PolicyWorkUnit {
     Rows,
 }
 
+/// Whether a head finding's identity also existed at the diff base revision.
+///
+/// This is not [`crate::classification::FindingClassification`], the CWE-style
+/// taxonomy; it is the per-revision disposition of one finding identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FindingDiffDisposition {
+    /// The identity is absent from the base revision.
+    New,
+    /// The identity also exists at the base revision.
+    Persisting,
+}
+
+/// Diff decision attached to a retained finding when a diff base was evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PolicyFindingDiff {
+    disposition: FindingDiffDisposition,
+    /// Weak identities are snapshot-local by construction, so they never join
+    /// across revisions and always classify as new.
+    weak_identity: bool,
+}
+
+impl PolicyFindingDiff {
+    pub(crate) const fn new(disposition: FindingDiffDisposition, weak_identity: bool) -> Self {
+        Self {
+            disposition,
+            weak_identity,
+        }
+    }
+
+    pub const fn disposition(&self) -> FindingDiffDisposition {
+        self.disposition
+    }
+
+    pub const fn weak_identity(&self) -> bool {
+        self.weak_identity
+    }
+}
+
+impl RetainedSize for PolicyFindingDiff {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+    }
+}
+
 /// One normalized finding in the canonical schema-version-2 report model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolicyFinding {
@@ -1913,6 +1959,10 @@ pub struct PolicyFinding {
     omitted_witnesses_lower_bound: u64,
     suppression: Option<PolicyFindingSuppression>,
     scope: Option<PolicyFindingScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff: Option<PolicyFindingDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseline: Option<PolicyFindingBaseline>,
 }
 
 impl PolicyFinding {
@@ -2063,6 +2113,8 @@ impl PolicyFinding {
             omitted_witnesses_lower_bound,
             suppression: None,
             scope: None,
+            diff: None,
+            baseline: None,
         };
         finding.validate_against_budget(budget)?;
         Ok(finding)
@@ -2176,6 +2228,49 @@ impl PolicyFinding {
 
     pub(crate) fn clear_scope(&mut self) {
         self.scope = None;
+    }
+
+    pub const fn diff(&self) -> Option<&PolicyFindingDiff> {
+        self.diff.as_ref()
+    }
+
+    pub(crate) fn attach_diff(
+        &mut self,
+        diff: PolicyFindingDiff,
+    ) -> Result<(), PolicyFindingError> {
+        if self.diff.is_some() {
+            return Err(PolicyFindingError::DuplicateDiffAttachment);
+        }
+        self.diff = Some(diff);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_diff(&mut self) {
+        self.diff = None;
+    }
+
+    pub const fn baseline(&self) -> Option<&PolicyFindingBaseline> {
+        self.baseline.as_ref()
+    }
+
+    pub(crate) fn attach_baseline(
+        &mut self,
+        baseline: PolicyFindingBaseline,
+    ) -> Result<(), PolicyFindingError> {
+        if self.identity_stability != FindingIdentityStability::Strong {
+            return Err(PolicyFindingError::BaselineRequiresStrongIdentity);
+        }
+        if self.baseline.is_some() {
+            return Err(PolicyFindingError::DuplicateBaselineAttachment);
+        }
+        self.baseline = Some(baseline);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_baseline(&mut self) {
+        self.baseline = None;
     }
 
     pub(crate) fn validate_against_budget(
@@ -2316,6 +2411,8 @@ impl RetainedSize for PolicyFinding {
             .saturating_add(retained_extra(&self.witnesses))
             .saturating_add(retained_extra(&self.suppression))
             .saturating_add(retained_extra(&self.scope))
+            .saturating_add(retained_extra(&self.diff))
+            .saturating_add(retained_extra(&self.baseline))
     }
 }
 
@@ -2334,6 +2431,9 @@ pub enum PolicyFindingError {
     SuppressionRequiresStrongIdentity,
     DuplicateSuppressionAttachment,
     DuplicateScopeAttachment,
+    DuplicateDiffAttachment,
+    BaselineRequiresStrongIdentity,
+    DuplicateBaselineAttachment,
 }
 
 impl PolicyFindingError {
@@ -2391,6 +2491,15 @@ impl fmt::Display for PolicyFindingError {
             }
             Self::DuplicateScopeAttachment => {
                 formatter.write_str("finding already carries a scope decision")
+            }
+            Self::DuplicateDiffAttachment => {
+                formatter.write_str("finding already carries a diff decision")
+            }
+            Self::BaselineRequiresStrongIdentity => {
+                formatter.write_str("only a strong finding identity can carry a baseline decision")
+            }
+            Self::DuplicateBaselineAttachment => {
+                formatter.write_str("finding already carries a baseline decision")
             }
         }
     }

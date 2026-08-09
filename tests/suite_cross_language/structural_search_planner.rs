@@ -13,8 +13,8 @@ use brokk_bifrost::analyzer::structural::{
     StructuralSearchProvider, execute, execute_with_limits,
 };
 use brokk_bifrost::{
-    AnalyzerConfig, CodeUnit, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
-    WorkspaceAnalyzer,
+    AnalyzerConfig, CodeUnit, CodeUnitIndex, DeclarationInfo, IAnalyzer, Language, Project,
+    ProjectFile, Range, WorkspaceAnalyzer,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -169,45 +169,7 @@ impl NoProviderAnalyzer {
     }
 }
 
-impl IAnalyzer for NoProviderAnalyzer {
-    fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
-        None
-    }
-
-    fn analyzed_files(&self) -> Vec<ProjectFile> {
-        self.files.iter().cloned().collect()
-    }
-
-    fn languages(&self) -> BTreeSet<Language> {
-        self.languages.clone()
-    }
-
-    fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self
-    where
-        Self: Sized,
-    {
-        self.clone()
-    }
-
-    fn update_all(&self) -> Self
-    where
-        Self: Sized,
-    {
-        self.clone()
-    }
-
-    fn project(&self) -> &dyn Project {
-        self.project.as_ref()
-    }
-
-    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        Box::new(std::iter::empty())
-    }
-
-    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
-        None
-    }
-
+impl CodeUnitIndex for NoProviderAnalyzer {
     fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
         None
     }
@@ -221,23 +183,24 @@ impl IAnalyzer for NoProviderAnalyzer {
         None
     }
 
-    fn is_access_expression(
-        &self,
-        _file: &ProjectFile,
-        _start_byte: usize,
-        _end_byte: usize,
-    ) -> bool {
-        false
+    fn indexed_source(&self, _file: &ProjectFile) -> Option<String> {
+        None
     }
 
-    fn find_nearest_declaration(
-        &self,
-        _file: &ProjectFile,
-        _start_byte: usize,
-        _end_byte: usize,
-        _ident: &str,
-    ) -> Option<DeclarationInfo> {
-        None
+    fn analyzed_files(&self) -> Vec<ProjectFile> {
+        self.files.iter().cloned().collect()
+    }
+
+    fn languages(&self) -> BTreeSet<Language> {
+        self.languages.clone()
+    }
+
+    fn project(&self) -> &dyn Project {
+        self.project.as_ref()
+    }
+
+    fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        Box::new(std::iter::empty())
     }
 
     fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
@@ -258,6 +221,45 @@ impl IAnalyzer for NoProviderAnalyzer {
 
     fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
         BTreeSet::new()
+    }
+}
+
+impl IAnalyzer for NoProviderAnalyzer {
+    fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self
+    where
+        Self: Sized,
+    {
+        self.clone()
+    }
+
+    fn update_all(&self) -> Self
+    where
+        Self: Sized,
+    {
+        self.clone()
+    }
+
+    fn extract_call_receiver(&self, _reference: &str) -> Option<String> {
+        None
+    }
+
+    fn is_access_expression(
+        &self,
+        _file: &ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+    ) -> bool {
+        false
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        _file: &ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+        _ident: &str,
+    ) -> Option<DeclarationInfo> {
+        None
     }
 
     fn structural_search_providers(&self) -> Vec<&dyn StructuralSearchProvider> {

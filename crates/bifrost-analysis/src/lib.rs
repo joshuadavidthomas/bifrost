@@ -1,5 +1,8 @@
 //! Protocol-neutral analysis engine for Bifrost hosts and runtimes.
 //!
+//! Internal implementation detail of `brokk-bifrost`; no stability guarantees --
+//! depend on `brokk-bifrost` instead.
+//!
 //! The foundation layer -- the analyzer data model, the project abstraction,
 //! the structural kind/role vocabulary, and the process-wide utilities -- lives
 //! in [`brokk_bifrost_core`]. Every item it owns is re-exported here at its
@@ -41,23 +44,30 @@ pub use analyzer::structural::{
 pub use analyzer::usages;
 pub use analyzer::{
     AnalyzerConfig, AnalyzerDelegate, BIFROST_IGNORE_FILE_NAME, CSharpAnalyzer, CapabilityProvider,
-    CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CppAnalyzer,
-    DeclarationInfo, DeclarationKind, EmptyAnalyzer, ExceptionHandlingAnalysis,
-    ExceptionHandlingSmell, ExceptionSmellWeights, FileSetProject, FilesystemProject, GoAnalyzer,
-    IAnalyzer, ImportAnalysisProvider, ImportInfo, IngestedSource, JavaAnalyzer,
-    JavascriptAnalyzer, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
-    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
-    JvmStandardLibraryDiscoveryConfig, KotlinAnalyzer, Language, MultiAnalyzer, MultiRootProject,
-    OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer,
-    Range, RubyAnalyzer, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyDependencyPackAdapter,
-    RubyGemApiArtifact, RustAnalyzer, RustAnalyzerConfig, RustDependencyApiEvidence,
-    RustDependencyPackAdapter, RustPackageApiArtifact, RustSelectedTarget, RustdocJsonPackProducer,
-    ScalaAnalyzer, SourceContent, SourceIngestionError, SourceIngestionKind, TestAssertionAnalysis,
+    CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitIndex, CodeUnitType,
+    CppAnalyzer, DeclarationInfo, DeclarationKind, DependencyPackActivationOutcome,
+    DependencyPackEcosystem, DependencyPackEcosystemOutcome, DependencyPackWorkspaceContext,
+    EmptyAnalyzer, ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights,
+    FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo,
+    ImportReachability, IngestedSource, JavaAnalyzer, JavascriptAnalyzer, JvmAnalyzerConfig,
+    JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
+    JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig, KotlinAnalyzer,
+    Language, MultiAnalyzer, MultiRootProject, OverlayProject, ParseError, ParseErrorKind,
+    PhpAnalyzer, PhpAnalyzerConfig, PhpDependencyApiEvidence, PhpDependencyPackAdapter, Project,
+    ProjectFile, PythonAnalyzer, PythonSemanticModelWorkspaceContext, Range, RubyAnalyzer,
+    RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact,
+    RustAnalyzer, RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
+    RustPackageApiArtifact, RustSelectedTarget, RustdocJsonPackProducer, ScalaAnalyzer,
+    SourceContent, SourceIngestionError, SourceIngestionKind, TestAssertionAnalysis,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
     WorkspaceAnalyzer, WorkspaceFileListingCache, collect_workspace_files, ingest_source_bytes,
-    reset_rust_tree_parse_counters_for_test, resolve_ruby_semantic_pack_dependencies,
-    resolve_rust_semantic_pack_dependencies, rust_tree_parse_count_for_test,
+    resolve_php_semantic_pack_dependencies, resolve_ruby_semantic_pack_dependencies,
+    resolve_rust_semantic_pack_dependencies,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use analyzer::{
+    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
 pub use cancellation::CancellationToken;

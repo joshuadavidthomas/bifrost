@@ -3,7 +3,12 @@ use crate::analyzer::{CodeUnit, DirectDescendantIndex, PoolSafeMemo, ProjectFile
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::mem::size_of;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+
+use crate::analyzer::weighted_cache::{
+    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
+    weight_project_file_set,
+};
 
 /// Analyzer-cached query-time state shared by the JavaScript and TypeScript
 /// adapters. Both hold this behind a single `Arc<JsTsMemoCaches>` (so every
@@ -28,7 +33,12 @@ pub(crate) struct JsTsMemoCaches {
     /// Resolved direct supertypes of a class-like code unit.
     pub(crate) direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     /// Whole-workspace class descendant index, built once per bucket.
-    pub(crate) direct_descendant_index: OnceLock<DirectDescendantIndex>,
+    /// `PoolSafeMemo`, not `OnceLock`: the build walks every workspace class
+    /// through `get_direct_ancestors`, whose misses reach `usage_index`
+    /// and its rayon fan-out -- a blocking `get_or_init` held across that is
+    /// the #1416 self-deadlock shape its two sibling cells below already
+    /// migrated away from.
+    pub(crate) direct_descendant_index: PoolSafeMemo<DirectDescendantIndex>,
     /// Reverse import edges (importer files by imported file), built once per bucket.
     pub(crate) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     /// JS/TS usage-resolution maps, built once per bucket and reused across queries.
@@ -43,25 +53,11 @@ impl JsTsMemoCaches {
             referencing_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(budget_bytes / 6, weight_string_set),
             direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec_by_unit),
-            direct_descendant_index: OnceLock::new(),
+            direct_descendant_index: PoolSafeMemo::new(),
             reverse_import_index: PoolSafeMemo::new(),
             jsts_usage_index: PoolSafeMemo::new(),
         }
     }
-}
-
-pub(crate) fn build_weighted_cache<K, V>(
-    budget_bytes: u64,
-    weigher: impl Fn(&K, &V) -> u32 + Send + Sync + 'static,
-) -> Cache<K, V>
-where
-    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
-{
-    Cache::builder()
-        .max_capacity(budget_bytes.max(1))
-        .weigher(weigher)
-        .build()
 }
 
 pub(crate) fn weight_string_set(_key: &CodeUnit, value: &Arc<HashSet<String>>) -> u32 {
@@ -71,40 +67,4 @@ pub(crate) fn weight_string_set(_key: &CodeUnit, value: &Arc<HashSet<String>>) -
         .sum::<usize>()
         + size_of::<HashSet<String>>();
     size.min(u32::MAX as usize) as u32
-}
-
-pub(crate) fn weight_project_file_set(
-    _key: &ProjectFile,
-    value: &Arc<HashSet<ProjectFile>>,
-) -> u32 {
-    let size = value
-        .iter()
-        .map(|item| item.rel_path().to_string_lossy().len() + size_of::<ProjectFile>())
-        .sum::<usize>()
-        + size_of::<HashSet<ProjectFile>>();
-    size.min(u32::MAX as usize) as u32
-}
-
-pub(crate) fn weight_code_unit_set(_key: &ProjectFile, value: &Arc<HashSet<CodeUnit>>) -> u32 {
-    let size = value
-        .iter()
-        .map(|item| item.fq_name().len() + size_of::<CodeUnit>())
-        .sum::<usize>()
-        + size_of::<HashSet<CodeUnit>>();
-    size.min(u32::MAX as usize) as u32
-}
-
-pub(crate) fn weight_code_unit_vec_by_unit(_key: &CodeUnit, value: &Arc<Vec<CodeUnit>>) -> u32 {
-    weight_bytes(size_of::<Vec<CodeUnit>>() + value.iter().map(estimate_code_unit).sum::<usize>())
-}
-
-fn estimate_code_unit(code_unit: &CodeUnit) -> usize {
-    size_of::<CodeUnit>()
-        + code_unit.fq_name().len()
-        + code_unit.signature().map_or(0, str::len)
-        + code_unit.source().rel_path().to_string_lossy().len()
-}
-
-fn weight_bytes(bytes: usize) -> u32 {
-    bytes.clamp(1, u32::MAX as usize) as u32
 }

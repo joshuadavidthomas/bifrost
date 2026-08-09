@@ -503,9 +503,59 @@ pub(super) fn selected_site_quality(
                 ProofStatus::Unproven("selector evidence is not exact".into()),
                 EvidenceCompleteness::Partial("selector evidence is not exhaustive".into()),
             ),
+            CodeQueryResultValue::CallShape { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "exact" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("call shape coverage is {}", value.coverage).into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::CallArgumentGroup { .. }
+            | CodeQueryResultValue::CallArgument { .. } => (
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+            ),
+            CodeQueryResultValue::ReceiverOutcome { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("receiver outcome coverage is {}", value.coverage).into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::ReceiverEvidence { value } => (
+                proof_from_label(value.proof),
+                if value.completeness == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("receiver evidence is {}", value.completeness).into(),
+                    )
+                },
+            ),
+            CodeQueryResultValue::MemberSelection { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "exhaustive" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("member selection coverage is {}", value.coverage).into(),
+                    )
+                },
+            ),
             CodeQueryResultValue::StructuralMatch { .. }
             | CodeQueryResultValue::Declaration { .. }
             | CodeQueryResultValue::File { .. }
+            | CodeQueryResultValue::CandidateHop { .. }
+            | CodeQueryResultValue::DispatchOutcome { .. }
+            | CodeQueryResultValue::DispatchTarget { .. }
+            | CodeQueryResultValue::MemberFamily { .. }
+            | CodeQueryResultValue::MemberFamilyEdge { .. }
             | CodeQueryResultValue::ExpressionSite { .. }
             // An occurrence row is an exact parser fact about one token. Its
             // completeness question is per role and is answered by the query's

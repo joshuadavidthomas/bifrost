@@ -1,18 +1,31 @@
 use super::*;
-use crate::analyzer::rust::field_roles::{
-    RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
-};
-use crate::analyzer::rust::lexical_scope;
+use crate::analyzer::CodeUnitIndex;
+use crate::analyzer::TypeHierarchyProvider;
 use crate::analyzer::rust::rust_focused_use_path;
+use crate::analyzer::rust::{canonical_rust_hierarchy_type, usage_crate_export_targets};
+use crate::analyzer::rust::{
+    forward_export_fqn_from_files, has_rust_value_constructor,
+    resolve_imported_export_from_binder_forward, resolve_module_files, resolve_module_package,
+    resolve_visible_import_targets_forward, rust_associated_type_declaration_for_exact_node,
+};
 use crate::analyzer::rust::{
     resolve_rust_import_package_scoped, resolve_rust_module_segments_with_crate,
     rust_crate_root_package, rust_package_name,
 };
+use crate::analyzer::structural::resolution::{HierarchyRelation, MemberDispatchTier};
 use crate::analyzer::usages::rust_graph::{
     RustDefinitionProvider, resolve_rust_path_fqn, rust_smallest_named_node_covering,
 };
 use crate::analyzer::{RustReferenceContext, SignatureMetadata, StructuredTypeIdentity};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_rust::field_roles::{
+    RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
+};
+use brokk_bifrost_rust::graph_support::{
+    RustUsageSource, is_rust_trait_declaration, is_rust_trait_impl_member_declaration,
+};
+use brokk_bifrost_rust::lexical_scope;
 use std::cell::RefCell;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +66,7 @@ impl<'a> AnalyzerRustDefinitionProvider<'a> {
         }
     }
 
-    fn cancellable_full(rust: &'a RustAnalyzer, session: &'a ResolutionSession) -> Self {
+    pub(crate) fn cancellable_full(rust: &'a RustAnalyzer, session: &'a ResolutionSession) -> Self {
         Self {
             rust,
             session: Some(session),
@@ -79,40 +92,37 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
             .is_none_or(ResolutionSession::observe_cancellation)
     }
 
-    fn forward_reference_context<'r>(
-        &'r self,
-        rust: &'r RustAnalyzer,
+    fn forward_reference_context(
+        &self,
+        rust: &dyn RustUsageSource,
         file: &ProjectFile,
-    ) -> Option<RustReferenceContext<'r>> {
+    ) -> Option<std::sync::Arc<RustReferenceContext>> {
         match self.session {
-            // The session's predicate is threaded into the resolver rather than
-            // checked once around it, so a cancelled request stops inside a
-            // re-export walk instead of after it.
-            Some(session) => session.observe_cancellation().then(|| {
-                rust.forward_reference_context_of_while(file, || session.observe_cancellation())
+            Some(session) => rust.forward_reference_context_of_with_progress(file, &|| {
+                session.observe_cancellation()
             }),
             None => Some(rust.forward_reference_context_of(file)),
         }
     }
 
-    fn ranges(&self, analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Vec<Range> {
+    fn ranges(&self, index: &dyn CodeUnitIndex, unit: &CodeUnit) -> Vec<Range> {
         match self.session {
             Some(session) => {
                 session.query_limited_rows(|limit| self.rust.ranges_limited(unit, limit))
             }
-            None => analyzer.ranges(unit),
+            None => index.ranges(unit),
         }
     }
 
     fn signature_metadata(
         &self,
-        analyzer: &dyn IAnalyzer,
+        index: &dyn CodeUnitIndex,
         unit: &CodeUnit,
     ) -> Vec<SignatureMetadata> {
         match self.session {
             Some(session) => session
                 .query_limited_rows(|limit| self.rust.signature_metadata_limited(unit, limit)),
-            None => analyzer.signature_metadata(unit),
+            None => index.signature_metadata(unit),
         }
     }
 
@@ -494,8 +504,7 @@ fn rust_cargo_reference_scope(
     let root = rust_node_text(root, source).trim();
     if !root.is_empty() {
         for binder in lexical_scope::visible_import_binders_at(source, site.focus_start_byte) {
-            let mut targets = rust
-                .resolve_visible_import_targets_forward(file, &binder, root)
+            let mut targets = resolve_visible_import_targets_forward(rust, file, &binder, root)
                 .into_iter()
                 .map(|(target, _)| target)
                 .collect::<Vec<_>>();
@@ -531,7 +540,7 @@ fn rust_import_path_target_files(
 ) -> Option<Vec<ProjectFile>> {
     for prefix_len in (1..=segments.len()).rev() {
         let module_specifier = segments[..prefix_len].join("::");
-        let targets = rust.resolve_module_files(file, &module_specifier);
+        let targets = resolve_module_files(rust, file, &module_specifier);
         if !targets.is_empty() {
             return Some(targets);
         }
@@ -582,8 +591,7 @@ fn rust_scope_forward_candidates_to_cargo_target(
 ) -> DefinitionLookupOutcome {
     if let Some((name, role)) = direct_crate_reference.as_ref() {
         let roots = rust.cargo_target_roots_for_file(file);
-        let mut candidates = rust
-            .usage_crate_export_targets(file, name)
+        let mut candidates = usage_crate_export_targets(rust, file, name)
             .into_iter()
             .flat_map(|(target_file, target_name)| {
                 support.file_identifier(&target_file, &target_name)
@@ -953,7 +961,7 @@ fn resolve_rust_unscoped(
     }
     if let Some(tree) = tree
         && let Some(outcome) = rust_focused_terminal_scoped_declaration_outcome(
-            analyzer, rust, support, file, source, tree, site,
+            analyzer, rust, support, file, source, tree, site, cache,
         )
     {
         return outcome;
@@ -1030,7 +1038,7 @@ fn resolve_rust_unscoped(
         if resolved.is_empty()
             && let Some(tree) = tree
             && let Some(local) = rust_local_scoped_owner_member_candidates(
-                analyzer, rust, support, file, source, tree, site, name, role,
+                analyzer, rust, support, file, source, tree, site, name, role, cache,
             )
         {
             resolved = local;
@@ -1215,7 +1223,7 @@ fn resolve_rust_unscoped(
                 return no_definition("cancelled", "Rust definition resolution was cancelled");
             };
             refs.resolve_bare(reference)
-                .map(|fqn| support.fqn(&fqn))
+                .map(|fqn| support.fqn(fqn))
                 .unwrap_or_default()
         };
         (resolved, false)
@@ -1235,7 +1243,14 @@ fn resolve_rust_unscoped(
         // issue_1162's rust pin), so this fires only as the #1126 safety net for
         // a future upstream regression — a genuinely-external `::` path yields
         // `None` here and still draws the boundary.
-        if let Some(unit) =
+        if rust_qualified_head_is_proven_route(
+            analyzer,
+            rust,
+            file,
+            source,
+            reference,
+            site.focus_start_byte,
+        ) && let Some(unit) =
             rust_enclosing_scope_type_fallback(analyzer, file, reference, site.focus_start_byte)
         {
             return candidates_outcome(vec![unit]);
@@ -1724,6 +1739,8 @@ fn rust_visible_import_resolution(
     {
         let explicitly_bound = rust_binder_has_external_binding(&binder, reference);
         let mut expected_fqns = HashSet::default();
+        let mut expected_routes: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+        let mut preserve_unqualified_namespace_candidates = false;
         if explicitly_bound {
             for (local_name, binding) in &binder.bindings {
                 if local_name != reference {
@@ -1744,13 +1761,39 @@ fn rust_visible_import_resolution(
                             scope_start,
                             &binding.module_specifier,
                         ) {
-                            expected_fqns.insert(format!("{package}.{imported}"));
+                            let mut module_files =
+                                resolve_module_files(rust, file, &binding.module_specifier);
+                            if module_files.is_empty() {
+                                module_files = rust
+                                    .get_analyzed_files()
+                                    .into_iter()
+                                    .filter(|candidate| rust_package_name(candidate) == package)
+                                    .collect();
+                            }
+                            let expected_fqn = if let Some(export_fqn) =
+                                forward_export_fqn_from_files(rust, &module_files, imported)
+                            {
+                                export_fqn
+                            } else {
+                                format!("{package}.{imported}")
+                            };
+                            expected_routes
+                                .entry(expected_fqn.clone())
+                                .or_default()
+                                .extend(module_files.iter().cloned());
+                            expected_fqns.insert(expected_fqn);
                             if role == RustBareReferenceRole::Value {
-                                expected_fqns.insert(format!("{package}._module_.{imported}"));
+                                let module_value_fqn = format!("{package}._module_.{imported}");
+                                expected_routes
+                                    .entry(module_value_fqn.clone())
+                                    .or_default()
+                                    .extend(module_files.iter().cloned());
+                                expected_fqns.insert(module_value_fqn);
                             }
                         }
                     }
                     ImportKind::Namespace => {
+                        preserve_unqualified_namespace_candidates = true;
                         if let Some(fqn) = resolve_rust_import_package_scoped(
                             rust,
                             file,
@@ -1758,6 +1801,9 @@ fn rust_visible_import_resolution(
                             scope_start,
                             &binding.module_specifier,
                         ) {
+                            expected_routes.entry(fqn.clone()).or_default().extend(
+                                resolve_module_files(rust, file, &binding.module_specifier),
+                            );
                             expected_fqns.insert(fqn);
                         }
                     }
@@ -1856,14 +1902,35 @@ fn rust_visible_import_resolution(
                 .collect();
             if !exact.is_empty() {
                 candidates = exact;
-            } else if candidates.is_empty() {
-                candidates = expected_fqns
+            } else {
+                let expected: Vec<_> = expected_fqns
                     .iter()
                     .flat_map(|fqn| support.fqn(fqn))
                     .filter(|candidate| rust_role_accepts_imported(rust, role, candidate))
                     .collect();
+                if !expected.is_empty() {
+                    candidates = expected;
+                } else if !preserve_unqualified_namespace_candidates {
+                    candidates.clear();
+                }
             }
         }
+        candidates.retain(|candidate| language_for_file(candidate.source()) == Language::Rust);
+        candidates.retain(|candidate| {
+            let candidate_fqn = candidate.fq_name();
+            let Some(module_files) = expected_routes.get(&candidate_fqn) else {
+                return true;
+            };
+            let mut saw_disjoint = false;
+            for module_file in module_files {
+                match rust.files_share_cargo_target(module_file, candidate.source()) {
+                    Some(true) => return true,
+                    Some(false) => saw_disjoint = true,
+                    None => {}
+                }
+            }
+            !saw_disjoint
+        });
         sort_units(&mut candidates);
         candidates.dedup();
         if !candidates.is_empty() {
@@ -1903,8 +1970,8 @@ fn rust_glob_forward_export_candidates(
         if matches!(segments.first().map(String::as_str), Some("self" | "super")) {
             continue;
         }
-        let module_files = rust.resolve_module_files(file, &binding.module_specifier);
-        let Some(fqn) = rust.forward_export_fqn_from_files(&module_files, reference) else {
+        let module_files = resolve_module_files(rust, file, &binding.module_specifier);
+        let Some(fqn) = forward_export_fqn_from_files(rust, &module_files, reference) else {
             continue;
         };
         let definitions = rust.get_definitions(&fqn);
@@ -1967,9 +2034,9 @@ fn rust_glob_import_exposes_candidate(
                 })
                 .unwrap_or_default();
             if module_files.is_empty() {
-                module_files = rust.resolve_module_files(file, &binding.module_specifier);
+                module_files = resolve_module_files(rust, file, &binding.module_specifier);
             }
-            rust.forward_export_fqn_from_files(&module_files, reference)
+            forward_export_fqn_from_files(rust, &module_files, reference)
                 .is_some_and(|export_fqn| export_fqn == candidate.fq_name())
         })
 }
@@ -2023,7 +2090,7 @@ fn rust_scoped_glob_forward_import_candidates(
                     .reference_context_of(&target_file)
                     .resolve_bare(reference)
                     .into_iter()
-                    .flat_map(|fqn| support.fqn(&fqn))
+                    .flat_map(|fqn| support.fqn(fqn))
                     .filter(|candidate| rust_role_accepts_imported(rust, role, candidate))
                     .collect::<Vec<_>>();
                 if imported.is_empty() {
@@ -2162,7 +2229,7 @@ fn rust_import_target_candidates(
             if let Some(fqn) = rust.reference_context_of(&file).resolve_bare(&name) {
                 candidates.extend(
                     support
-                        .fqn(&fqn)
+                        .fqn(fqn)
                         .into_iter()
                         .filter(|candidate| rust_role_accepts_imported(rust, role, candidate)),
                 );
@@ -2185,7 +2252,7 @@ fn rust_forward_import_targets(
     binder: &ImportBinder,
     reference: &str,
 ) -> Vec<(ProjectFile, String)> {
-    rust.resolve_visible_import_targets_forward(file, binder, reference)
+    resolve_visible_import_targets_forward(rust, file, binder, reference)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2316,7 +2383,7 @@ fn rust_role_accepts_current_module(
             candidate.is_class() || rust_declaration_is_module_type_alias(rust, candidate)
         }
         RustBareReferenceRole::Value => {
-            (candidate.is_class() && rust.has_rust_value_constructor(candidate))
+            (candidate.is_class() && has_rust_value_constructor(rust, candidate))
                 || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
                 || (candidate.is_field() && rust_declaration_is_module_value_item(rust, candidate))
         }
@@ -2412,7 +2479,7 @@ fn rust_role_accepts_scoped(
 }
 
 fn rust_value_namespace_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
-    (candidate.is_class() && rust.has_rust_value_constructor(candidate))
+    (candidate.is_class() && has_rust_value_constructor(rust, candidate))
         || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
         || (candidate.is_field()
             && (rust_declaration_is_value_item(rust, candidate)
@@ -2512,7 +2579,14 @@ fn rust_declaration_is_module_value_item(rust: &RustAnalyzer, candidate: &CodeUn
 }
 
 fn rust_declaration_is_enum_variant(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
-    rust_declaration_matches(rust, candidate, |node| node.kind() == "enum_variant")
+    let support = AnalyzerRustDefinitionProvider::new(rust, false);
+    let Some(source) = rust.indexed_source(candidate.source()) else {
+        return false;
+    };
+    let Some(tree) = lexical_scope::parse_rust_tree(&source) else {
+        return false;
+    };
+    rust_code_unit_range_is_enum_variant(rust, &support, candidate, tree.root_node())
 }
 
 fn rust_declaration_matches(
@@ -2551,8 +2625,12 @@ fn rust_impl_associated_type_declaration_outcome(
     }
     let impl_item = rust_enclosing_ancestor(type_item, "impl_item")?;
     if operation == Some(NavigationOperation::Definition) {
-        let candidate =
-            rust.rust_associated_type_declaration_for_exact_node(file, type_item, associated_type)?;
+        let candidate = rust_associated_type_declaration_for_exact_node(
+            rust,
+            file,
+            type_item,
+            associated_type,
+        )?;
         return Some(candidates_outcome(vec![candidate]));
     }
     let trait_type = impl_item.child_by_field_name("trait")?;
@@ -2791,6 +2869,7 @@ fn rust_local_scoped_owner_member_candidates(
     site: &ResolvedReferenceSite,
     member: &str,
     role: RustBareReferenceRole,
+    cache: &mut RustTypeLookupCache,
 ) -> Option<Vec<CodeUnit>> {
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
@@ -2804,7 +2883,7 @@ fn rust_local_scoped_owner_member_candidates(
     if owner_text.is_empty() {
         return None;
     }
-    let owners = rust_current_module_candidates(
+    let mut owners = rust_current_module_candidates(
         analyzer,
         rust,
         support,
@@ -2815,14 +2894,79 @@ fn rust_local_scoped_owner_member_candidates(
         owner_text,
         RustBareReferenceRole::Owner,
     );
+    if !owners.iter().any(|owner| rust.is_type_alias(owner)) {
+        match rust_visible_import_resolution(
+            rust,
+            support,
+            file,
+            source,
+            site.focus_start_byte,
+            owner_text,
+            RustBareReferenceRole::Owner,
+        ) {
+            RustVisibleImportResolution::Resolved(imported)
+            | RustVisibleImportResolution::GlobResolved(imported) => owners.extend(imported),
+            RustVisibleImportResolution::BoundButUnindexed
+            | RustVisibleImportResolution::GlobBoundButUnindexed
+            | RustVisibleImportResolution::Unbound => {}
+        }
+    }
+    sort_units(&mut owners);
+    owners.dedup();
+    let alias_owner_present = owners.iter().any(|owner| rust.is_type_alias(owner));
     let mut candidates = owners
         .into_iter()
-        .flat_map(|owner| support.members_for_owner_name(&owner.fq_name(), member))
+        .filter(|owner| !alias_owner_present || rust.is_type_alias(owner))
+        .flat_map(|owner| {
+            let is_type_alias = rust.is_type_alias(&owner);
+            let canonical_owner = if is_type_alias {
+                rust_code_unit_type_fqn(
+                    analyzer,
+                    support,
+                    owner.source(),
+                    None,
+                    &owner,
+                    "type",
+                    RustTypeMode::Direct,
+                    cache,
+                )
+            } else {
+                None
+            };
+            canonical_owner
+                .into_iter()
+                .flat_map(|owner_fqn| {
+                    let owner_sources = support
+                        .fqn(&owner_fqn)
+                        .into_iter()
+                        .filter(|candidate| rust_is_type_definition(analyzer, candidate))
+                        .map(|candidate| candidate.source().clone())
+                        .collect::<Vec<_>>();
+                    let mut members = support.members_for_owner_name(&owner_fqn, member);
+                    if !owner_sources.is_empty() {
+                        members.retain(|member| {
+                            owner_sources.iter().any(|owner_source| {
+                                rust.files_share_cargo_target(owner_source, member.source())
+                                    != Some(false)
+                            })
+                        });
+                    }
+                    members
+                })
+                .chain(
+                    (!is_type_alias)
+                        .then(|| owner.fq_name())
+                        .into_iter()
+                        .flat_map(|owner_fqn| support.members_for_owner_name(&owner_fqn, member)),
+                )
+        })
         .filter(|candidate| rust_role_accepts_scoped(rust, role, candidate))
         .collect::<Vec<_>>();
-    candidates.extend(rust_cargo_root_member_candidates(
-        rust, support, file, source, path, member,
-    ));
+    if !alias_owner_present {
+        candidates.extend(rust_cargo_root_member_candidates(
+            rust, support, file, source, path, member,
+        ));
+    }
     candidates.retain(|candidate| rust_role_accepts_scoped(rust, role, candidate));
     sort_units(&mut candidates);
     candidates.dedup();
@@ -2907,7 +3051,7 @@ fn rust_scoped_owner_candidates_from_path(
     file: &ProjectFile,
     source: &str,
     path: Node<'_>,
-    refs: &RustReferenceContext<'_>,
+    refs: &RustReferenceContext,
 ) -> Option<Vec<CodeUnit>> {
     let owner_text = rust_node_text(path, source).trim();
     if owner_text.is_empty() {
@@ -2948,7 +3092,7 @@ fn rust_scoped_owner_candidates_from_path(
         let cargo_root_in_scope = !rust_2015 || explicit_extern_route.is_some();
         let cargo_route = explicit_extern_route.as_deref().unwrap_or(owner_text);
         let external = cargo_root_in_scope
-            .then(|| rust.resolve_module_package(file, cargo_route))
+            .then(|| resolve_module_package(rust, file, cargo_route))
             .flatten()
             .into_iter()
             .flat_map(|package| support.fqn(&package))
@@ -2959,7 +3103,7 @@ fn rust_scoped_owner_candidates_from_path(
         if let Some(routed) = rust.candidates_in_cargo_library_route(file, cargo_route, external) {
             candidates.extend(routed);
         }
-        if let Some(fqn) = rust.resolve_module_package(file, owner_text) {
+        if let Some(fqn) = resolve_module_package(rust, file, owner_text) {
             candidates.extend(support.fqn(&fqn));
         }
     }
@@ -3029,6 +3173,27 @@ fn rust_rooted_use_prefix_outcome(
     (!candidates.is_empty()).then(|| candidates_outcome(candidates))
 }
 
+/// Return the structured target path for a focused renamed import binder.
+///
+/// The alias token itself is not part of the use path tree. Without this
+/// lookup, a site on `linear` in `use ...::linear_no_bias as linear` is
+/// resolved as a bare local path and can select an unrelated `linear` item.
+fn rust_focused_import_alias_path(focused: Node<'_>, source: &str) -> Option<String> {
+    let use_declaration = rust_enclosing_ancestor(focused, "use_declaration")?;
+    brokk_bifrost_rust::imports::rust_imports_from_use_declaration(use_declaration, source)
+        .into_iter()
+        .filter(|import| import.alias.is_some())
+        .find_map(|import| {
+            let span = import.binder_span?;
+            if span.start_byte <= focused.start_byte() && focused.end_byte() <= span.end_byte {
+                import.path.map(|path| path.segments.join("::"))
+            } else {
+                None
+            }
+        })
+        .filter(|path| !path.is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rust_focused_use_path_outcome(
     analyzer: &dyn IAnalyzer,
@@ -3043,6 +3208,8 @@ fn rust_focused_use_path_outcome(
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
     let focused_path = rust_focused_use_path(focused, source)?;
     let focused_text = rust_node_text(focused, source).trim();
+    let alias_path = rust_focused_import_alias_path(focused, source);
+    let resolution_path = alias_path.as_deref().unwrap_or(&focused_path.full_path);
     let role = if rust_focused_nonterminal_prefix(focused).is_some() {
         RustFocusedPathRole::Owner
     } else {
@@ -3050,7 +3217,7 @@ fn rust_focused_use_path_outcome(
     };
     let refs = support.forward_reference_context(rust, file)?;
     let rooted_segments =
-        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, &focused_path.full_path);
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, resolution_path);
     let resolved_fqn = if matches!(
         rooted_segments.first().map(String::as_str),
         Some("self" | "super")
@@ -3060,14 +3227,14 @@ fn rust_focused_use_path_outcome(
             file,
             source,
             focused.start_byte(),
-            &focused_path.full_path,
+            resolution_path,
         )
     } else {
         crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(
             rust,
             &refs,
             file,
-            &focused_path.full_path,
+            resolution_path,
         )
     };
     Some(rust_focused_prefix_resolution_outcome(
@@ -3080,7 +3247,7 @@ fn rust_focused_use_path_outcome(
         &refs,
         focused_path.root,
         focused_text,
-        &focused_path.full_path,
+        resolution_path,
         role,
         resolved_fqn.as_deref(),
         false,
@@ -3096,6 +3263,7 @@ fn rust_focused_terminal_scoped_declaration_outcome(
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
+    cache: &mut RustTypeLookupCache,
 ) -> Option<DefinitionLookupOutcome> {
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
@@ -3107,6 +3275,19 @@ fn rust_focused_terminal_scoped_declaration_outcome(
     }
 
     let owner_path = scoped.child_by_field_name("path")?;
+    if owner_path.kind() == "identifier"
+        && lexical_scope::local_item_name_shadowed_in_tree(
+            tree.root_node(),
+            source,
+            &owner,
+            site.focus_start_byte,
+        )
+    {
+        return Some(no_definition(
+            "local_binding",
+            format!("`{owner}` is a local Rust item, which is not indexed"),
+        ));
+    }
     let owner_root = rust_scoped_path_root(owner_path);
     let owner_root_name = rust_node_text(owner_root, source).trim();
     let owner_availability = rust_owner_root_availability(
@@ -3120,8 +3301,13 @@ fn rust_focused_terminal_scoped_declaration_outcome(
         owner_root_name,
     );
 
-    let refs = support.forward_reference_context(rust, file)?;
     let role = rust_bare_reference_role(tree, site, source).unwrap_or(RustBareReferenceRole::Value);
+    if let Some(local) = rust_local_scoped_owner_member_candidates(
+        analyzer, rust, support, file, source, tree, site, &member, role, cache,
+    ) {
+        return Some(candidates_outcome(local));
+    }
+    let refs = support.forward_reference_context(rust, file)?;
     let mut candidates = refs
         .resolve_scoped(&owner, &member)
         .into_iter()
@@ -3155,7 +3341,7 @@ fn rust_focused_terminal_scoped_declaration_outcome(
     }
     if candidates.is_empty()
         && let Some(local) = rust_local_scoped_owner_member_candidates(
-            analyzer, rust, support, file, source, tree, site, &member, role,
+            analyzer, rust, support, file, source, tree, site, &member, role, cache,
         )
     {
         candidates = local;
@@ -3300,6 +3486,15 @@ fn rust_focused_token_tree_prefix_outcome(
 ) -> Option<DefinitionLookupOutcome> {
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
+    if focused.kind() == "crate"
+        && std::iter::successors(focused.parent(), Node::parent)
+            .any(|ancestor| ancestor.kind() == "token_tree")
+    {
+        return Some(no_definition(
+            "crate_root_segment",
+            "the focused Rust crate root is a path segment, not the terminal declaration",
+        ));
+    }
     let token_tree = focused.parent()?;
     if !rust_path_segment_node(focused) || token_tree.kind() != "token_tree" {
         return None;
@@ -3433,9 +3628,7 @@ fn rust_owner_root_availability(
         .any(|binder| {
             binder.bindings.get(root_name).is_some_and(|binding| {
                 binding.kind == ImportKind::Namespace
-                    && !rust
-                        .resolve_module_files(file, &binding.module_specifier)
-                        .is_empty()
+                    && !resolve_module_files(rust, file, &binding.module_specifier).is_empty()
             })
         })
     {
@@ -3471,7 +3664,7 @@ fn rust_owner_root_availability(
 fn rust_scoped_prefix_uses_module_package_fallback(
     rust: &RustAnalyzer,
     file: &ProjectFile,
-    refs: &RustReferenceContext<'_>,
+    refs: &RustReferenceContext,
     prefix: Node<'_>,
     source: &str,
 ) -> bool {
@@ -3487,9 +3680,7 @@ fn rust_scoped_prefix_uses_module_package_fallback(
     let path = rust_node_text(path, source).trim();
     let name = rust_node_text(name, source).trim();
     refs.resolve_scoped(path, name).is_none()
-        && rust
-            .resolve_module_package(file, rust_node_text(prefix, source).trim())
-            .is_some()
+        && resolve_module_package(rust, file, rust_node_text(prefix, source).trim()).is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3500,7 +3691,7 @@ fn rust_focused_prefix_resolution_outcome(
     file: &ProjectFile,
     source: &str,
     site: &ResolvedReferenceSite,
-    refs: &RustReferenceContext<'_>,
+    refs: &RustReferenceContext,
     root: Node<'_>,
     focused_text: &str,
     focused_path: &str,
@@ -3616,7 +3807,14 @@ fn rust_focused_prefix_resolution_outcome(
                 if !local.is_empty() {
                     return candidates_outcome(local);
                 }
-                if let Some(unit) = rust_enclosing_scope_type_fallback(
+                if rust_qualified_head_is_proven_route(
+                    analyzer,
+                    rust,
+                    file,
+                    source,
+                    focused_path,
+                    site.focus_start_byte,
+                ) && let Some(unit) = rust_enclosing_scope_type_fallback(
                     analyzer,
                     file,
                     focused_text,
@@ -3680,7 +3878,7 @@ fn rust_focused_prefix_resolution_outcome(
         let cargo_root_in_scope = !rust_2015 || explicit_extern_route.is_some();
         let cargo_route = explicit_extern_route.as_deref().unwrap_or(focused_text);
         let external = cargo_root_in_scope
-            .then(|| rust.resolve_module_package(file, cargo_route))
+            .then(|| resolve_module_package(rust, file, cargo_route))
             .flatten()
             .into_iter()
             .flat_map(|package| support.fqn(&package))
@@ -3742,7 +3940,7 @@ fn rust_focused_prefix_resolution_outcome(
         let mut candidates = if enclosing_module_self_root || skip_unavailable_scoped_fallback {
             Vec::new()
         } else {
-            rust.resolve_module_package(file, focused_path)
+            resolve_module_package(rust, file, focused_path)
                 .into_iter()
                 .flat_map(|fqn| support.fqn(&fqn))
                 .filter(|candidate| {
@@ -3785,7 +3983,14 @@ fn rust_focused_prefix_resolution_outcome(
         // the associated type `Connection::TransactionManager`, which shares its
         // spelling with an imported trait but is a distinct namespace and lives
         // in this file (issue #1126 diesel `TransactionManager`).
-        if let Some(unit) =
+        if rust_qualified_head_is_proven_route(
+            analyzer,
+            rust,
+            file,
+            source,
+            focused_path,
+            site.focus_start_byte,
+        ) && let Some(unit) =
             rust_enclosing_scope_type_fallback(analyzer, file, focused_text, site.focus_start_byte)
         {
             return candidates_outcome(vec![unit]);
@@ -3933,17 +4138,25 @@ fn rust_extern_prelude_root(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
-    refs: &RustReferenceContext<'_>,
+    refs: &RustReferenceContext,
     root: Node<'_>,
     root_name: &str,
 ) -> bool {
     matches!(root.kind(), "identifier" | "type_identifier")
         && refs.resolve_bare(root_name).is_none_or(|fqn| {
-            !support.fqn(&fqn).into_iter().any(|candidate| {
+            !support.fqn(fqn).into_iter().any(|candidate| {
                 rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, &candidate)
             })
         })
-        && rust.resolve_module_files(file, root_name).is_empty()
+        && resolve_module_files(rust, file, root_name).is_empty()
+        // A module of this crate is evidence that the name is not an extern
+        // crate, even where the bare spelling does not reach it (Rust 2018+
+        // needs `crate::`). Crate-aware naming made that spelling explicit: the
+        // crate-root prefix used to be empty, so the bare lookup above answered
+        // for both. Without this the workspace's own `src/http.rs` would look
+        // like an unindexed `http` dependency and turn a plain miss into a
+        // confident boundary claim.
+        && resolve_module_files(rust, file, &format!("crate::{root_name}")).is_empty()
 }
 
 fn rust_focused_nonterminal_prefix<'tree>(focused: Node<'tree>) -> Option<Node<'tree>> {
@@ -3980,7 +4193,7 @@ fn rust_focused_nonterminal_prefix<'tree>(focused: Node<'tree>) -> Option<Node<'
 fn rust_scoped_prefix_fqn(
     rust: &RustAnalyzer,
     file: &ProjectFile,
-    refs: &RustReferenceContext<'_>,
+    refs: &RustReferenceContext,
     prefix: Node<'_>,
     source: &str,
 ) -> Option<String> {
@@ -3991,16 +4204,17 @@ fn rust_scoped_prefix_fqn(
             let path = rust_node_text(path, source).trim();
             let name = rust_node_text(name, source).trim();
             refs.resolve_scoped(path, name).or_else(|| {
-                rust.resolve_module_package(file, rust_node_text(prefix, source).trim())
+                resolve_module_package(rust, file, rust_node_text(prefix, source).trim())
             })
         }
         "identifier" | "type_identifier" => {
             let name = rust_node_text(prefix, source).trim();
             refs.resolve_bare(name)
-                .or_else(|| rust.resolve_module_package(file, name))
+                .map(str::to_string)
+                .or_else(|| resolve_module_package(rust, file, name))
         }
         "crate" | "self" | "super" => {
-            rust.resolve_module_package(file, rust_node_text(prefix, source).trim())
+            resolve_module_package(rust, file, rust_node_text(prefix, source).trim())
         }
         _ => None,
     }
@@ -4086,8 +4300,20 @@ fn resolve_rust_field(
             ));
         };
         let member_kind = rust_field_expression_member_kind(support, field_expression)?;
-        let candidates =
-            rust_member_candidates(support.members_for_owner_name(&owner, member), member_kind);
+        let member_trace = RustMemberTrace::begin(analyzer, &owner);
+        let considered = support.members_for_owner_name(&owner, member);
+        let candidates = match member_trace.as_ref() {
+            // Same filter, kept as a partition so the namespace losers the
+            // untraced path drops are still named while the seam holds them.
+            Some(state) => {
+                let (candidates, rejected): (Vec<CodeUnit>, Vec<CodeUnit>) = considered
+                    .into_iter()
+                    .partition(|unit| rust_member_kind_matches(unit, member_kind));
+                state.stage_direct(&candidates, &rejected);
+                candidates
+            }
+            None => rust_member_candidates(considered, member_kind),
+        };
         if candidates.is_empty()
             && !support.is_bounded()
             && member_kind == RustMemberKind::Function
@@ -4113,6 +4339,9 @@ fn resolve_rust_field(
                     | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
                 };
             if !trait_candidates.is_empty() {
+                if let Some(state) = member_trace.as_ref() {
+                    state.stage_trait(&trait_candidates);
+                }
                 return Some(candidates_outcome(trait_candidates));
             }
         }
@@ -4255,8 +4484,18 @@ fn rust_token_tree_dotted_member_outcome(
     } else {
         RustMemberKind::Field
     };
-    let mut candidates =
-        rust_member_candidates(support.fqn(&format!("{owner}.{member}")), member_kind);
+    let member_trace = RustMemberTrace::begin(analyzer, &owner);
+    let considered = support.fqn(&format!("{owner}.{member}"));
+    let mut candidates = match member_trace.as_ref() {
+        Some(state) => {
+            let (candidates, rejected): (Vec<CodeUnit>, Vec<CodeUnit>) = considered
+                .into_iter()
+                .partition(|unit| rust_member_kind_matches(unit, member_kind));
+            state.stage_direct(&candidates, &rejected);
+            candidates
+        }
+        None => rust_member_candidates(considered, member_kind),
+    };
     if candidates.is_empty() && member_kind == RustMemberKind::Function {
         let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
         let refs = support.forward_reference_context(rust, file)?;
@@ -4279,6 +4518,9 @@ fn rust_token_tree_dotted_member_outcome(
                 | ReceiverAnalysisOutcome::Unsupported { .. }
                 | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
             };
+        if let Some(state) = member_trace.as_ref() {
+            state.stage_trait(&candidates);
+        }
     }
     if candidates.is_empty() {
         Some(no_definition(
@@ -4456,14 +4698,161 @@ fn rust_field_expression_member_kind(
     }
 }
 
+fn rust_member_kind_matches(unit: &CodeUnit, kind: RustMemberKind) -> bool {
+    match kind {
+        RustMemberKind::Field => unit.is_field(),
+        RustMemberKind::Function => unit.is_function(),
+    }
+}
+
 fn rust_member_candidates(candidates: Vec<CodeUnit>, kind: RustMemberKind) -> Vec<CodeUnit> {
     candidates
         .into_iter()
-        .filter(|unit| match kind {
-            RustMemberKind::Field => unit.is_field(),
-            RustMemberKind::Function => unit.is_function(),
-        })
+        .filter(|unit| rust_member_kind_matches(unit, kind))
         .collect()
+}
+
+/// The per-candidate member attribution the Rust `receiver.member` seams record
+/// while they run (#1477).
+///
+/// It is built only while a trace is being recorded, and only from facts the
+/// seam that builds it already holds: the receiver type the resolver looked the
+/// member up on, and -- for the trait fallback -- the ancestor the production
+/// walk expanded to reach it. Nothing here decides anything; the walk is
+/// unchanged whether or not a recorder is installed.
+///
+/// Rust's two member seams are attributed differently on purpose:
+///
+/// - The direct lookup asks the declaration store for `owner.member`. It walks
+///   no hierarchy, so every candidate it admits is depth zero with an empty
+///   route. Its dispatch bucket is still not always the inherent one: a member
+///   an `impl Trait for Type` block declares is indexed under `Type` and found
+///   here, and the tree-sitter shape of its declaration is what says so.
+/// - The trait fallback runs only when the direct lookup found nothing. It
+///   expands the owner's direct ancestors and takes members declared by one of
+///   them, which is exactly one hierarchy hop across an implementation edge.
+struct RustMemberTrace<'a> {
+    rust: &'a RustAnalyzer,
+    /// The receiver's declared owner type, named by the same filters the trait
+    /// fallback uses to pick its walk root. `None` when the owner name does not
+    /// identify exactly one hierarchy-bearing non-trait declaration, which
+    /// leaves the seam's candidates unattributed rather than guessed.
+    owner: Option<CodeUnit>,
+}
+
+impl<'a> RustMemberTrace<'a> {
+    /// `None` when nothing is recording, or when the analyzer is not the Rust
+    /// analyzer whose hierarchy the attribution reads.
+    ///
+    /// The owner lookup deliberately goes to the analyzer's store rather than
+    /// through `RustDefinitionProvider`. A provider lookup is charged against
+    /// the resolution session's scope budget, so a recording run would spend
+    /// budget the untraced run does not spend, and a request near its
+    /// scope-node limit would exhaust the budget inside the real member lookup
+    /// and answer differently while recording. The trace must explain the
+    /// decision the product made, never change it, so every read this type
+    /// performs -- this one, `get_direct_ancestors`, `structural_parent_of`,
+    /// `parent_of` -- is a session-free store read. `definitions` is an exact
+    /// indexed FQN lookup, so leaving it uncharged does not hide unbounded
+    /// work either.
+    fn begin(analyzer: &'a dyn IAnalyzer, owner_fqn: &str) -> Option<Self> {
+        if !trace::recording() {
+            return None;
+        }
+        let rust = resolve_analyzer::<RustAnalyzer>(analyzer)?;
+        // Deduplicated exactly as the provider deduplicates its own store
+        // results, so "names exactly one owner" means the same thing here as it
+        // did when this lookup went through the provider.
+        let mut declarations: Vec<CodeUnit> = rust.definitions(owner_fqn).collect();
+        sort_units(&mut declarations);
+        declarations.dedup();
+        let mut owners = declarations
+            .into_iter()
+            .filter(|unit| rust.supports_type_hierarchy(unit))
+            .filter(|unit| !is_rust_trait_declaration(rust, unit));
+        let owner = owners.next().filter(|_| owners.next().is_none());
+        Some(Self { rust, owner })
+    }
+
+    fn direct_enrichment(&self, owner: &CodeUnit, unit: &CodeUnit) -> trace::MemberEnrichment {
+        let dispatch_tier = if is_rust_trait_impl_member_declaration(self.rust, unit) {
+            MemberDispatchTier::TraitOrInterface
+        } else {
+            MemberDispatchTier::InherentOrDirect
+        };
+        trace::MemberEnrichment {
+            owner: owner.clone(),
+            hierarchy_depth: 0,
+            dispatch_tier,
+            // The Rust member seams check the member's namespace and nothing
+            // about the call shape, so the applicability axis (#1478) is
+            // untested here, which is what `Unknown` states.
+            applicability: ApplicabilityVerdict::Unknown,
+            route: Vec::new(),
+        }
+    }
+
+    /// Stage attribution for the candidates the direct-owner lookup admitted,
+    /// and record the ones its namespace filter discarded while the seam still
+    /// knows them.
+    fn stage_direct(&self, selected: &[CodeUnit], rejected: &[CodeUnit]) {
+        let Some(owner) = self.owner.as_ref() else {
+            return;
+        };
+        for loser in rejected {
+            trace::record(
+                trace::TraceCandidate::rejected(
+                    trace::TraceCandidateRef::Unit(loser.clone()),
+                    None,
+                    RejectionReason::WrongNamespace,
+                )
+                .with_member(self.direct_enrichment(owner, loser)),
+            );
+        }
+        trace::stage_member_context(
+            selected
+                .iter()
+                .map(|unit| (unit.fq_name(), self.direct_enrichment(owner, unit)))
+                .collect(),
+        );
+    }
+
+    /// Stage attribution for the candidates the trait fallback admitted. A
+    /// candidate whose declaring ancestor cannot be confirmed -- the same
+    /// parent-of-candidate identity the fallback itself filtered on, checked
+    /// against the same direct-ancestor set it expanded -- is left
+    /// unattributed instead of being given a route it may not have taken.
+    fn stage_trait(&self, selected: &[CodeUnit]) {
+        let Some(owner) = self.owner.as_ref() else {
+            return;
+        };
+        let ancestors = self.rust.get_direct_ancestors(owner);
+        trace::stage_member_context(
+            selected
+                .iter()
+                .filter_map(|unit| {
+                    let found_on = self
+                        .rust
+                        .structural_parent_of(unit)
+                        .or_else(|| self.rust.parent_of(unit))
+                        .filter(|parent| ancestors.contains(parent))?;
+                    let enrichment = trace::MemberEnrichment {
+                        owner: found_on.clone(),
+                        hierarchy_depth: 1,
+                        dispatch_tier: MemberDispatchTier::TraitOrInterface,
+                        applicability: ApplicabilityVerdict::Unknown,
+                        route: vec![trace::HierarchyHopRecord {
+                            hop: 0,
+                            from: owner.clone(),
+                            to: found_on,
+                            relation: HierarchyRelation::TraitImpl,
+                        }],
+                    };
+                    Some((unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5577,7 +5966,9 @@ fn rust_code_unit_range_is_enum_variant(
             }
             if node.kind() == "enum_variant"
                 && node.child_by_field_name("name").is_some_and(|name| {
-                    name.start_byte() <= range.start_byte && range.end_byte <= name.end_byte()
+                    (range.start_byte <= name.start_byte() && name.end_byte() <= range.end_byte)
+                        || (name.start_byte() <= range.start_byte
+                            && range.end_byte <= name.end_byte())
                 })
             {
                 return true;
@@ -5648,12 +6039,12 @@ pub(crate) fn rust_resolve_type_node_fqn(
             }
         } else if let Some(resolved) = refs.resolve_bare(name)
             && support
-                .fqn(&resolved)
+                .fqn(resolved)
                 .into_iter()
                 .any(|unit| rust_is_type_definition(analyzer, &unit))
-            && rust_type_fqn_visible_from_file(file, &resolved)
+            && rust_type_fqn_visible_from_file(file, resolved)
         {
-            return Some(resolved);
+            return Some(resolved.to_string());
         }
         if let Some(imported) = rust_import_type_fqn(rust, support, file, name, reference_byte) {
             return Some(imported);
@@ -6270,8 +6661,7 @@ fn rust_enclosing_impl_type_fqn(
             if support.is_bounded() {
                 return Some(candidate.fq_name());
             }
-            return rust
-                .canonical_rust_hierarchy_type(candidate)
+            return canonical_rust_hierarchy_type(rust, candidate)
                 .map(|unit| unit.fq_name())
                 .or(Some(resolved));
         }
@@ -6383,7 +6773,7 @@ fn rust_imported_export_candidates(
         } else {
             let binder = lexical_scope::visible_import_binder_at(&source, reference_byte);
             let targets =
-                rust.resolve_imported_export_from_binder_forward(file, &binder, reference);
+                resolve_imported_export_from_binder_forward(rust, file, &binder, reference);
             if targets.is_empty() && rust_binder_has_external_binding(&binder, reference) {
                 return Vec::new();
             }
@@ -6391,7 +6781,7 @@ fn rust_imported_export_candidates(
         }
     } else {
         let binder = rust.import_binder_of(file);
-        let targets = rust.resolve_imported_export_from_binder_forward(file, &binder, reference);
+        let targets = resolve_imported_export_from_binder_forward(rust, file, &binder, reference);
         if targets.is_empty() && rust_binder_has_external_binding(&binder, reference) {
             return Vec::new();
         }
@@ -6453,6 +6843,53 @@ fn rust_enclosing_scope_type_fallback(
     resolve_in_enclosing_scopes(analyzer, file, name, byte, CodeUnit::is_class)
 }
 
+/// Whether the head of a `::`-qualified unrooted path names a route that is
+/// actually in scope here: a visible `use` binding, or a module this file
+/// declares outright.
+///
+/// The enclosing-scope fallback below composes `{enclosing scope prefix} +
+/// reference`, so at a crate root file it would spell the crate-relative path
+/// that Rust 2018+ requires an explicit `crate::` for -- and would answer with
+/// a same-named module the reference never named (`http::Version` inside
+/// `src/http.rs` with no `http` dependency), or with a module that exists only
+/// inside unproven macro content. Both are boundaries, not definitions. Before
+/// crate-aware naming the composed candidate had an empty crate-root prefix and
+/// could not match anything, which hid this route by accident; the predicate
+/// makes the requirement explicit.
+fn rust_qualified_head_is_proven_route(
+    analyzer: &dyn IAnalyzer,
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    path: &str,
+    byte: usize,
+) -> bool {
+    let Some((head, _)) = path.split_once("::") else {
+        // An unqualified name carries no route to prove; the enclosing-scope
+        // walk is then the ordinary lexical rule.
+        return true;
+    };
+    let head = head.trim();
+    // Rooted and lexical heads name a scope directly rather than going through
+    // the crate-root-relative route this gate is about.
+    if matches!(head, "crate" | "self" | "super" | "Self") {
+        return true;
+    }
+    if head.is_empty() {
+        return false;
+    }
+    if analyzer
+        .declarations(file)
+        .into_iter()
+        .any(|unit| unit.is_module() && unit.identifier() == head)
+    {
+        return true;
+    }
+    lexical_scope::visible_import_binders_at(source, byte)
+        .into_iter()
+        .any(|binder| !resolve_visible_import_targets_forward(rust, file, &binder, head).is_empty())
+}
+
 /// True when the focused owner/qualifier resolves to a Rust crate or module that
 /// is indexed in this workspace — e.g. a `use forc_pkg::{self as pkg}` alias
 /// whose `pkg` root routes through cargo to a workspace crate. Such a qualifier
@@ -6464,11 +6901,7 @@ fn rust_focused_is_workspace_module_namespace(
     file: &ProjectFile,
     focused_text: &str,
 ) -> bool {
-    !rust.resolve_module_files(file, focused_text).is_empty()
-}
-
-pub(super) fn parse_rust_tree(source: &str) -> Option<Tree> {
-    lexical_scope::parse_rust_tree(source)
+    !resolve_module_files(rust, file, focused_text).is_empty()
 }
 
 #[cfg(test)]
@@ -6551,7 +6984,7 @@ fn use_service(service: Service) {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let call_start = source.rfind("service.run()").expect("member call");
         let start_byte = call_start + "service.".len();
         let end_byte = start_byte + "run".len();
@@ -6591,7 +7024,7 @@ fn use_service(service: Service) {
         );
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let call_start = source.rfind(&expression).expect("member call");
         let start_byte = call_start + expression.rfind("run").expect("member name");
         let end_byte = start_byte + "run".len();
@@ -6642,6 +7075,91 @@ fn use_service(service: Service) {
         );
     }
 
+    /// The #1477 member trace is emission-only: recording explains the decision
+    /// the resolver made and must never change it. Under a bounded session the
+    /// only way it could is by spending scope budget, because a request that
+    /// runs out of budget answers `Exceeded` with no definitions. So the pin is
+    /// exact: at *every* scope-node budget from one up to the amount the
+    /// unrecorded lookup spends, the recorded run must charge the same work and
+    /// reach the same answer. A budget-charging owner lookup in the trace fails
+    /// this at the budgets near the top of the range, where the extra charge is
+    /// what exhausts the budget inside the real member lookup.
+    #[test]
+    fn recording_a_member_lookup_charges_the_same_bounded_budget() {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Answer {
+            Complete(DefinitionLookupStatus, Vec<String>),
+            Exceeded(ReceiverBudgetLimit),
+            Cancelled,
+        }
+
+        let (fixture, file, source, tree, site) = member_fixture();
+        let resolve = |max_scope_nodes: usize| {
+            let outcome = resolve_rust_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                &source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget {
+                    max_scope_nodes,
+                    ..ReceiverAnalysisBudget::default()
+                },
+                None,
+            );
+            let work = outcome.work();
+            let answer = match outcome {
+                BoundedResolution::Complete { value, .. } => Answer::Complete(
+                    value.status,
+                    value
+                        .definitions
+                        .iter()
+                        .map(|definition| definition.fq_name())
+                        .collect(),
+                ),
+                BoundedResolution::Exceeded { limit, .. } => Answer::Exceeded(limit),
+                BoundedResolution::Cancelled { .. } => Answer::Cancelled,
+            };
+            (answer, work)
+        };
+
+        let spent = {
+            let (answer, work) = resolve(ReceiverAnalysisBudget::default().max_scope_nodes);
+            assert_eq!(
+                answer,
+                Answer::Complete(
+                    DefinitionLookupStatus::Resolved,
+                    vec!["Service.run".to_string()]
+                )
+            );
+            assert!(work.scope_nodes > 0);
+            work.scope_nodes
+        };
+
+        for max_scope_nodes in 1..=spent {
+            let untraced = resolve(max_scope_nodes);
+            let traced = {
+                let _recorder = trace::TraceSession::install();
+                assert!(trace::recording());
+                resolve(max_scope_nodes)
+            };
+            assert_eq!(
+                traced, untraced,
+                "recording changed the answer or the charged work at a scope budget of {max_scope_nodes}"
+            );
+        }
+
+        // The range is only a real test if its top end actually resolves the
+        // member, which is what makes the budgets just below it the tight ones.
+        assert_eq!(
+            resolve(spent).0,
+            Answer::Complete(
+                DefinitionLookupStatus::Resolved,
+                vec!["Service.run".to_string()]
+            )
+        );
+    }
+
     #[test]
     fn issue_1228_bounded_definition_lookup_resolves_imported_bare_call() {
         let source = r#"
@@ -6664,7 +7182,7 @@ pub fn dispatch() {
             ],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/service.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "get_definitions_by_location");
 
         let outcome = resolve_rust_bounded(
@@ -6712,7 +7230,7 @@ mod tests {
             ],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/domain_events/planner.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_expression(&source, &file, "use super::*", "super");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -6763,7 +7281,7 @@ fn consume(_: assets::Table, _: accounts::Table) {}
             ],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/app.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_expression(&source, &file, "assets::Table", "assets");
         let rust =
             resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
@@ -6797,6 +7315,169 @@ fn consume(_: assets::Table, _: accounts::Table) {}
     }
 
     #[test]
+    fn full_definition_lookup_resolves_lowercase_alias_to_its_imported_function() {
+        let source = r#"
+use crate::with_tracing::linear_no_bias as linear;
+
+fn call() {
+    linear();
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod consumer;\npub mod with_tracing;\n"),
+                (
+                    "src/with_tracing.rs",
+                    "pub fn linear_no_bias() {}\npub fn linear() {}\n",
+                ),
+                ("src/consumer.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/consumer.rs");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_last(&source, &file, "linear");
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let mut cache = RustTypeLookupCache::default();
+        let value = resolve_rust(
+            fixture.analyzer.analyzer(),
+            &support,
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            &mut cache,
+            None,
+        );
+
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.fq_name() == "with_tracing.linear_no_bias"),
+            "the alias must resolve to the imported function: {value:#?}"
+        );
+        assert!(
+            value
+                .definitions
+                .iter()
+                .all(|definition| definition.fq_name() != "with_tracing.linear"),
+            "the same-named sibling must remain a near-miss: {value:#?}"
+        );
+    }
+
+    #[test]
+    fn full_definition_lookup_resolves_alias_binder_to_its_imported_function() {
+        let source = r#"
+use crate::with_tracing::linear_no_bias as linear;
+
+fn call() {
+    linear();
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod consumer;\npub mod with_tracing;\n"),
+                (
+                    "src/with_tracing.rs",
+                    "pub fn linear_no_bias() {}\npub fn linear() {}\n",
+                ),
+                ("src/consumer.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/consumer.rs");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_expression(
+            &source,
+            &file,
+            "use crate::with_tracing::linear_no_bias as linear",
+            "linear",
+        );
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let mut cache = RustTypeLookupCache::default();
+        let value = resolve_rust(
+            fixture.analyzer.analyzer(),
+            &support,
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            &mut cache,
+            None,
+        );
+
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.fq_name() == "with_tracing.linear_no_bias"),
+            "the alias binder must resolve to the imported function: {value:#?}"
+        );
+        assert!(
+            value
+                .definitions
+                .iter()
+                .all(|definition| definition.fq_name() != "with_tracing.linear"),
+            "the same-named sibling must remain a near-miss: {value:#?}"
+        );
+    }
+
+    #[test]
+    fn full_definition_lookup_keeps_multi_segment_module_aliases() {
+        let source = r#"
+use crate::options as package;
+
+fn call() {
+    let _ = package::Options;
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod consumer;\npub mod options;\n"),
+                ("src/options.rs", "pub struct Options;\n"),
+                ("src/consumer.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/consumer.rs");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_expression(&source, &file, "package::Options", "Options");
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let mut cache = RustTypeLookupCache::default();
+        let value = resolve_rust(
+            fixture.analyzer.analyzer(),
+            &support,
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            &mut cache,
+            None,
+        );
+
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.fq_name() == "options.Options"),
+            "the module alias must still route to its nested type: {value:#?}"
+        );
+    }
+
+    #[test]
     fn grouped_unindexed_import_does_not_fall_back_to_same_named_crate_module() {
         let source = r#"
 use crate::schema::{accounts, activities};
@@ -6826,7 +7507,7 @@ mod tests {
             ],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/app.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_expression(
             &source,
             &file,
@@ -6874,7 +7555,7 @@ mod tests {
             ],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/app.rs");
-        let tree = parse_rust_tree(source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(source).expect("Rust tree");
         let site = site_for_expression(source, &file, "crate::schema::{self, assets}", "self");
         let rust =
             resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
@@ -6942,7 +7623,7 @@ fn outside_scope() {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -6985,7 +7666,7 @@ pub fn use_service(service: Service) {
             &[("src/lib.rs", root), ("src/foo.rs", &source)],
         );
         let file = ProjectFile::new(fixture.project_root(), "src/foo.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -7026,7 +7707,7 @@ mod nested {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -7067,7 +7748,7 @@ mod nested {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -7110,7 +7791,7 @@ mod nested {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -7151,7 +7832,7 @@ fn use_service(service: crate::Service) {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/foo.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/foo.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let outcome = resolve_rust_bounded(
             fixture.analyzer.analyzer(),
@@ -7208,7 +7889,7 @@ fn use_state() {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
 
         for expression in [
             "State::Unit.run()",
@@ -7261,7 +7942,7 @@ fn use_state() {
         .to_string();
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_expression(&source, &file, "State::Tuple(1).run()", "run");
 
         let tiny = resolve_rust_bounded(
@@ -7303,7 +7984,7 @@ fn use_state() {
         );
         let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", &source)]);
         let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
-        let tree = parse_rust_tree(&source).expect("Rust tree");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
         let site = site_for_last(&source, &file, "run");
         let budget = ReceiverAnalysisBudget {
             max_scope_nodes: 100_000,

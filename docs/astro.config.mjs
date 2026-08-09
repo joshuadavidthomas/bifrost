@@ -119,8 +119,10 @@ export default defineConfig({
           label: 'Code Querying',
           items: [
             { label: 'Overview', slug: 'code-querying' },
+            { label: 'Data Flow and Typestate', slug: 'data-flow-and-typestate' },
             { label: 'Build a Rule', slug: 'build-static-analysis-rule' },
             { label: 'Static-Analysis Policies', slug: 'static-analysis-policies' },
+            { label: 'CI Gating with GitHub Actions', slug: 'ci-github-actions' },
             { label: 'Semantic-Model Packs', slug: 'semantic-model-packs' },
             { label: 'Agent Result Safety', slug: 'agent-result-safety' },
             { label: 'Semantic Search', slug: 'semantic-search' },

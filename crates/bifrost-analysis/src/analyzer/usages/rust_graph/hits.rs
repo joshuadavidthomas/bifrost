@@ -1,3 +1,4 @@
+use crate::analyzer::rust::usage_declaration_visible_at;
 use crate::analyzer::rust::{RustReferenceNamespace, rust_focused_use_path, rust_package_name};
 use crate::analyzer::usages::common::{SNIPPET_CONTEXT_LINES, reclassify_import_hit_at, usage_hit};
 use crate::analyzer::usages::model::UsageHit;
@@ -300,8 +301,7 @@ fn structured_scoped_type_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Strin
                 candidate.is_module() || candidate.is_class() || ctx.rust.is_type_alias(candidate)
             })
             .filter(|candidate| {
-                ctx.rust
-                    .usage_declaration_visible_at(candidate, ctx.file, path.start_byte())
+                usage_declaration_visible_at(ctx.rust, candidate, ctx.file, path.start_byte())
             })
             .collect::<BTreeSet<_>>();
         if owners.len() != 1 {
@@ -314,8 +314,7 @@ fn structured_scoped_type_fqn(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Strin
         )
         .into_iter()
         .filter(|candidate| {
-            ctx.rust
-                .usage_declaration_visible_at(candidate, ctx.file, name.start_byte())
+            usage_declaration_visible_at(ctx.rust, candidate, ctx.file, name.start_byte())
         })
         .map(|candidate| candidate.fq_name())
         .collect();
@@ -364,67 +363,9 @@ fn focused_use_path_matches(
     )
 }
 
-pub(super) fn rust_path_segments(mut node: Node<'_>) -> Option<Vec<Node<'_>>> {
-    let mut reversed = Vec::new();
-    loop {
-        match node.kind() {
-            "scoped_identifier" | "scoped_type_identifier" => {
-                reversed.push(node.child_by_field_name("name")?);
-                let Some(path) = node.child_by_field_name("path") else {
-                    if node.child(0).is_some_and(|child| child.kind() == "::") {
-                        break;
-                    }
-                    return None;
-                };
-                node = path;
-            }
-            "generic_type" => node = node.child_by_field_name("type")?,
-            "generic_function" => node = node.child_by_field_name("function")?,
-            "identifier" | "type_identifier" | "self" | "super" | "crate" => {
-                reversed.push(node);
-                break;
-            }
-            _ => return None,
-        }
-    }
-    reversed.reverse();
-    Some(reversed)
-}
-
-pub(super) fn rust_path_is_leading_absolute(mut node: Node<'_>) -> bool {
-    while let Some(parent) = node.parent()
-        && matches!(
-            parent.kind(),
-            "scoped_identifier" | "scoped_type_identifier" | "generic_type" | "generic_function"
-        )
-    {
-        node = parent;
-    }
-    loop {
-        match node.kind() {
-            "generic_type" => {
-                let Some(inner) = node.child_by_field_name("type") else {
-                    return false;
-                };
-                node = inner;
-            }
-            "generic_function" => {
-                let Some(inner) = node.child_by_field_name("function") else {
-                    return false;
-                };
-                node = inner;
-            }
-            "scoped_identifier" | "scoped_type_identifier" => {
-                if let Some(path) = node.child_by_field_name("path") {
-                    node = path;
-                } else {
-                    return node.child(0).is_some_and(|child| child.kind() == "::");
-                }
-            }
-            _ => return false,
-        }
-    }
-}
+pub(super) use brokk_bifrost_rust::graph::ast::{
+    rust_path_is_leading_absolute, rust_path_segments,
+};
 
 pub(super) fn path_segment_texts<'a>(path: &[Node<'_>], source: &'a str) -> Vec<&'a str> {
     path.iter()
@@ -482,7 +423,7 @@ fn has_ancestor_kind(mut node: Node<'_>, kind: &str) -> bool {
 /// `node` is one of tree-sitter-rust's identifier leaf kinds, so a usage site
 /// like `self.r#type` compares equal to the (also-normalized) declaration
 /// name `type` (#1128). See
-/// `crate::analyzer::rust::declarations::rust_node_text` for the extraction
+/// `brokk_bifrost_rust::declarations::rust_node_text` for the extraction
 /// side of the same normalization.
 fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     crate::analyzer::common::node_ident_text(

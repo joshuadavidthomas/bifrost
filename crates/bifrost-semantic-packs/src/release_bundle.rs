@@ -1,4 +1,32 @@
-//! Reproducible, content-addressed release bundles for pinned JVM API packs.
+//! Reproducible, content-addressed release bundles for pinned API packs.
+//!
+//! The pinned-spec schema is ecosystem neutral. One spec kind exists for each
+//! producer family that can consume one pinned exact artifact today: the JVM
+//! source archives, Java class JARs, TypeScript declaration files, .NET
+//! assemblies, rustdoc JSON documents, Python stub trees, npm packages, Go
+//! modules, Ruby gem archives, and Composer packages. A spec that names an
+//! unknown family fails parsing, it is never skipped.
+//!
+//! Four of those families -- npm, Go, Ruby, Composer -- have no on-disk
+//! installed layout to derive their structure from when a pinned spec is
+//! authored, unlike a workspace dependency adapter, which learns that
+//! structure from a lockfile or `go list`. Their pinned kinds name the
+//! structure explicitly instead: `NpmPackage` and `GoModule` name each
+//! declaration file's or source file's owning module/package, and
+//! `ComposerPackage` names each autoload rule's admitted files. `RubyGemArchive`
+//! needs none of this: a `.gem` file is already the exact artifact its
+//! dependency adapter reads, so it is promoted unchanged.
+//!
+//! The three JVM spec files in `semantic-packs/jvm/` were kept as-is instead
+//! of adding a compatibility path: the JSON vocabulary (field names, tags,
+//! `schema_version` 1) is unchanged by the generalization, so every existing
+//! spec still parses with the same meaning. Only the Rust-level type names
+//! dropped their JVM prefix.
+//!
+//! Extraction rejects are a structured burn-down artifact: `rejects.json`
+//! lists every rejected entry with its reject reason, is content-addressed by
+//! `SHA256SUMS`, and is validated by `verify` so pack completeness converges
+//! release over release.
 
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
@@ -9,34 +37,44 @@ use std::time::Instant;
 
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    ActivationSelector, ArtifactEncoding, ArtifactProducerLimits, CatalogCoordinate,
-    CatalogOptions, Compatibility, CompiledSemanticModelPack, CompilerOptions, Completeness,
-    DecodeLimits, DurablePackSource, DurablePackSourceKind, ExternalArtifactKind,
-    ProducerDiagnostic, Provenance, ResolvedActiveSemanticModels, Safety,
+    ActivationSelector, ArtifactEncoding, ArtifactProducerLimits, ArtifactProduction,
+    ArtifactProductionRequest, CatalogCoordinate, CatalogOptions, Compatibility,
+    CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits, DurablePackSource,
+    DurablePackSourceKind, ExactArtifact, ExternalArtifactKind, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels, Safety,
     SemanticModelActivationEvidence, SemanticModelActivationRequest,
     SemanticModelResolutionOutcome, SemanticPackCatalog, compile_pack, decode_manifest,
-    decode_shard_for_manifest, read_exact_artifact, resolve_active_semantic_models,
+    decode_shard_for_manifest, read_exact_artifact, read_exact_source_set,
+    resolve_active_semantic_models,
 };
 use brokk_bifrost_analysis::analyzer::{
+    CSharpAssemblyPackProducer, ComposerPackagePackProducer, ComposerPinnedAutoloadRule,
+    GoModulePackProducer, GoPinnedPackage as AnalysisGoPinnedPackage, JavaJarPackProducer,
     JdkSourceArchiveLayout, JdkSourceArchivePackProducer, KotlinSourceJarPackProducer,
-    ScalaSourceJarPackProducer,
+    PythonArtifactPackProducer, RubyGemArchivePackProducer, RustdocJsonPackProducer,
+    ScalaSourceJarPackProducer, TypeScriptDeclarationPackProducer,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-pub const JVM_PACK_SPEC_SCHEMA_VERSION: u32 = 1;
+pub const PACK_SPEC_SCHEMA_VERSION: u32 = 1;
 pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 1;
+
+/// Bounds for pinned source-set inputs, matching the workspace dependency
+/// scanner's `DependencyPackLimits` defaults.
+const MAX_SOURCE_SET_FILES: usize = 100_000;
+const MAX_SOURCE_SET_PATH_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PinnedJvmPackSpec {
+pub struct PinnedPackSpec {
     pub schema_version: u32,
     pub pack_id: String,
     pub pack_version: String,
     pub ecosystem: String,
-    pub kind: PinnedJvmPackKind,
+    pub kind: PinnedPackKind,
     pub artifact: PinnedArtifact,
     pub compatibility: Compatibility,
     pub activation: Vec<ActivationSelector>,
@@ -57,10 +95,132 @@ pub enum PinnedLookupQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "artifact_kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PinnedJvmPackKind {
-    JdkSourceZip { layout: PinnedJdkSourceLayout },
+pub enum PinnedPackKind {
+    JdkSourceZip {
+        layout: PinnedJdkSourceLayout,
+    },
     KotlinSourceJar,
     ScalaSourceJar,
+    JavaSourceJar,
+    JavaClassJar,
+    TypeScriptDeclarationFile,
+    DotNetAssembly,
+    RustdocJson,
+    /// One pinned Python stub tree. The generate artifact argument names the
+    /// tree root directory; `stubs` lists the pinned `.pyi` files relative to
+    /// that root. The pinned artifact digest is the canonical source-set
+    /// digest over the listed paths and bytes.
+    PythonStub {
+        stubs: Vec<String>,
+    },
+    /// One pinned npm package: its manifest plus the pinned TypeScript
+    /// declaration files that make up its public surface. `manifest` names
+    /// the pinned `package.json` path; each entry in `declarations` names its
+    /// own importable module explicitly, mirroring how npm's subpath exports
+    /// work, since a pinned tree has no installed `node_modules` layout to
+    /// derive that mapping from.
+    NpmPackage {
+        manifest: String,
+        declarations: Vec<PinnedNpmDeclaration>,
+    },
+    /// One pinned Go module's exact `.go` source set, grouped into the
+    /// packages the spec names explicitly. There is no `go list` invocation
+    /// available to derive package boundaries from a bare source tree, so the
+    /// spec names each package's import path, declared name, and files the
+    /// same way `PythonStub` names its files.
+    GoModule {
+        packages: Vec<PinnedGoPackage>,
+    },
+    /// One pinned `.gem` archive, read and projected exactly as the Ruby
+    /// dependency adapter projects an installed gem: RBS is authoritative
+    /// where present, Sorbet RBI and plain Ruby fill the remainder.
+    RubyGemArchive,
+    /// One pinned Composer package's exact PHP source set, grouped into the
+    /// autoload rules the spec names explicitly. There is no installed vendor
+    /// tree available to derive PSR-4/classmap/files rules from, so the spec
+    /// names each rule and the files it admits directly.
+    ComposerPackage {
+        rules: Vec<PinnedComposerAutoloadRule>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedNpmDeclaration {
+    pub module: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedGoPackage {
+    pub import_path: String,
+    pub name: String,
+    pub files: Vec<String>,
+}
+
+/// `namespace_prefix` is Bifrost's canonical dotted namespace form (e.g.
+/// `Vendor.Widget`, not `Vendor\Widget\`), matching how the pack's declared
+/// type names are stored and how a measurement query names them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "rule", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PinnedComposerAutoloadRule {
+    Psr4 {
+        namespace_prefix: String,
+        files: Vec<String>,
+    },
+    Classmap {
+        files: Vec<String>,
+    },
+    Files {
+        files: Vec<String>,
+    },
+}
+
+impl PinnedComposerAutoloadRule {
+    fn files(&self) -> &[String] {
+        match self {
+            Self::Psr4 { files, .. } | Self::Classmap { files } | Self::Files { files } => files,
+        }
+    }
+
+    fn to_producer_rule(&self) -> ComposerPinnedAutoloadRule {
+        match self {
+            Self::Psr4 {
+                namespace_prefix,
+                files,
+            } => ComposerPinnedAutoloadRule::Psr4 {
+                namespace_prefix: namespace_prefix.clone(),
+                files: files.clone(),
+            },
+            Self::Classmap { files } => ComposerPinnedAutoloadRule::Classmap {
+                files: files.clone(),
+            },
+            Self::Files { files } => ComposerPinnedAutoloadRule::Files {
+                files: files.clone(),
+            },
+        }
+    }
+}
+
+impl PinnedPackKind {
+    fn artifact_kind(&self) -> ExternalArtifactKind {
+        match self {
+            Self::JdkSourceZip { .. } => ExternalArtifactKind::JdkSourceZip,
+            Self::KotlinSourceJar => ExternalArtifactKind::KotlinSourceJar,
+            Self::ScalaSourceJar => ExternalArtifactKind::ScalaSourceJar,
+            Self::JavaSourceJar => ExternalArtifactKind::JavaSourceJar,
+            Self::JavaClassJar => ExternalArtifactKind::JavaClassJar,
+            Self::TypeScriptDeclarationFile => ExternalArtifactKind::TypeScriptDeclarationFile,
+            Self::DotNetAssembly => ExternalArtifactKind::DotNetAssembly,
+            Self::RustdocJson => ExternalArtifactKind::RustdocJson,
+            Self::PythonStub { .. } => ExternalArtifactKind::PythonStub,
+            Self::NpmPackage { .. } => ExternalArtifactKind::NpmPackageManifest,
+            Self::GoModule { .. } => ExternalArtifactKind::GoSourceSet,
+            Self::RubyGemArchive => ExternalArtifactKind::RubyGemArchive,
+            Self::ComposerPackage { .. } => ExternalArtifactKind::ComposerPackageSourceSet,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +310,63 @@ pub struct ReleaseShard {
     pub content_sha256: String,
 }
 
+/// The structured extraction burn-down artifact stored as `rejects.json`.
+///
+/// One entry exists for every producer diagnostic recorded while extracting a
+/// pinned artifact, so a partial pack names exactly which inputs it dropped
+/// and why. The file is deterministic for the same pinned inputs and is part
+/// of the checksummed release inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseBundleRejects {
+    pub schema_version: u32,
+    pub generator: ReleaseGenerator,
+    pub packs: Vec<ReleasePackRejects>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleasePackRejects {
+    pub pack_id: String,
+    pub pack_version: String,
+    pub completeness: Completeness,
+    pub rejects: Vec<ReleaseReject>,
+    pub suppressed_rejects: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseReject {
+    pub severity: ReleaseRejectSeverity,
+    pub code: String,
+    pub location: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseRejectSeverity {
+    Warning,
+    Error,
+}
+
+impl Display for ReleaseRejectSeverity {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Warning => "warning",
+            Self::Error => "error",
+        })
+    }
+}
+
+/// One verified release bundle: the canonical index and the structured
+/// extraction burn-down report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseBundle {
+    pub index: ReleaseBundleIndex,
+    pub rejects: ReleaseBundleRejects,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseBundleMeasurements {
@@ -180,8 +397,6 @@ pub struct ReleasePackMeasurement {
     pub matcher_index_entries: u64,
     pub retained_model_bytes: u64,
     pub lookups: Vec<ReleaseLookupMeasurement>,
-    pub diagnostics: Vec<String>,
-    pub suppressed_diagnostics: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,7 +453,7 @@ impl Error for BundleError {}
 pub fn generate_release_bundle(
     output_root: &Path,
     inputs: &[BundleInput],
-) -> Result<ReleaseBundleIndex, BundleError> {
+) -> Result<ReleaseBundle, BundleError> {
     if inputs.is_empty() {
         return Err(BundleError::new(
             "at least one spec/artifact pair is required",
@@ -252,15 +467,20 @@ pub fn generate_release_bundle(
     };
     let mut packs = Vec::with_capacity(inputs.len());
     let mut measurements = Vec::with_capacity(inputs.len());
+    let mut rejects = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let (pack, measurement) = generate_one(output_root, input)?;
+        let (pack, measurement, pack_rejects) = generate_one(output_root, input)?;
         packs.push(pack);
         measurements.push(measurement);
+        rejects.push(pack_rejects);
     }
     packs.sort_unstable_by(|left, right| {
         (&left.pack_id, &left.pack_version).cmp(&(&right.pack_id, &right.pack_version))
     });
     measurements.sort_unstable_by(|left, right| {
+        (&left.pack_id, &left.pack_version).cmp(&(&right.pack_id, &right.pack_version))
+    });
+    rejects.sort_unstable_by(|left, right| {
         (&left.pack_id, &left.pack_version).cmp(&(&right.pack_id, &right.pack_version))
     });
     for pair in packs.windows(2) {
@@ -277,6 +497,16 @@ pub fn generate_release_bundle(
         packs,
     };
     write_new_or_identical(output_root, Path::new("index.json"), &json_bytes(&index)?)?;
+    let rejects = ReleaseBundleRejects {
+        schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
+        generator: generator.clone(),
+        packs: rejects,
+    };
+    write_new_or_identical(
+        output_root,
+        Path::new("rejects.json"),
+        &json_bytes(&rejects)?,
+    )?;
     let measurements = ReleaseBundleMeasurements {
         schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
         generator,
@@ -288,24 +518,22 @@ pub fn generate_release_bundle(
         &json_bytes(&measurements)?,
     )?;
     write_checksums(output_root, &index)?;
-    verify_release_bundle(output_root)?;
-    Ok(index)
+    verify_release_bundle(output_root)
 }
 
 fn generate_one(
     output_root: &Path,
     input: &BundleInput,
-) -> Result<(ReleasePack, ReleasePackMeasurement), BundleError> {
+) -> Result<(ReleasePack, ReleasePackMeasurement, ReleasePackRejects), BundleError> {
     let spec_bytes = fs::read(&input.spec_path).map_err(|error| {
         BundleError::new(format!("read spec {}: {error}", input.spec_path.display()))
     })?;
-    let spec: PinnedJvmPackSpec = serde_json::from_slice(&spec_bytes).map_err(|error| {
+    let spec: PinnedPackSpec = serde_json::from_slice(&spec_bytes).map_err(|error| {
         BundleError::new(format!("parse spec {}: {error}", input.spec_path.display()))
     })?;
     validate_spec(&spec, &input.spec_path)?;
     let producer_limits = ArtifactProducerLimits::default();
-    let artifact = read_exact_artifact(&input.artifact_path, &producer_limits)
-        .map_err(|diagnostic| BundleError::new(render_diagnostics(&[diagnostic])))?;
+    let artifact = read_pinned_artifact(&spec, &input.artifact_path, &producer_limits)?;
     if artifact.sha256() != spec.artifact.sha256 {
         return Err(BundleError::new(format!(
             "artifact {} SHA-256 {} does not match pinned {}",
@@ -326,13 +554,9 @@ fn generate_one(
         )));
     }
 
-    let request = brokk_bifrost_analysis::analyzer::semantic_model::ArtifactProductionRequest {
+    let request = ArtifactProductionRequest {
         path: input.artifact_path.clone(),
-        artifact_kind: match &spec.kind {
-            PinnedJvmPackKind::JdkSourceZip { .. } => ExternalArtifactKind::JdkSourceZip,
-            PinnedJvmPackKind::KotlinSourceJar => ExternalArtifactKind::KotlinSourceJar,
-            PinnedJvmPackKind::ScalaSourceJar => ExternalArtifactKind::ScalaSourceJar,
-        },
+        artifact_kind: spec.kind.artifact_kind(),
         pack_id: spec.pack_id.clone(),
         pack_version: spec.pack_version.clone(),
         ecosystem: spec.ecosystem.clone(),
@@ -344,32 +568,13 @@ fn generate_one(
     };
     let started = Instant::now();
     let cancellation = CancellationToken::default();
-    let production = match &spec.kind {
-        PinnedJvmPackKind::JdkSourceZip { layout } => {
-            JdkSourceArchivePackProducer::new(match *layout {
-                PinnedJdkSourceLayout::ModulePrefixed => JdkSourceArchiveLayout::ModulePrefixed,
-                PinnedJdkSourceLayout::Flat => JdkSourceArchiveLayout::Flat,
-            })
-            .produce_loaded_artifact(
-                &request,
-                &producer_limits,
-                Some(&cancellation),
-                &artifact,
-            )
-        }
-        PinnedJvmPackKind::ScalaSourceJar => ScalaSourceJarPackProducer.produce_loaded_artifact(
-            &request,
-            &producer_limits,
-            Some(&cancellation),
-            &artifact,
-        ),
-        PinnedJvmPackKind::KotlinSourceJar => KotlinSourceJarPackProducer.produce_loaded_artifact(
-            &request,
-            &producer_limits,
-            Some(&cancellation),
-            &artifact,
-        ),
-    };
+    let production = produce_pinned_pack(
+        &spec.kind,
+        &request,
+        &producer_limits,
+        &cancellation,
+        &artifact,
+    );
     if production.artifact_sha256.as_deref() != Some(spec.artifact.sha256.as_str()) {
         return Err(BundleError::new(
             "producer did not retain the pinned artifact identity",
@@ -419,9 +624,29 @@ fn generate_one(
         &compiled,
         elapsed.as_millis().try_into().unwrap_or(u64::MAX),
         runtime_measurement,
-        &production.diagnostics,
-        production.suppressed_diagnostics,
     );
+    let pack_rejects = ReleasePackRejects {
+        pack_id: spec.pack_id.clone(),
+        pack_version: spec.pack_version.clone(),
+        completeness: compiled.manifest.completeness,
+        rejects: production
+            .diagnostics
+            .iter()
+            .map(|diagnostic| ReleaseReject {
+                severity: match diagnostic.severity {
+                    ProducerDiagnosticSeverity::Warning => ReleaseRejectSeverity::Warning,
+                    ProducerDiagnosticSeverity::Error => ReleaseRejectSeverity::Error,
+                },
+                code: diagnostic.code.clone(),
+                location: diagnostic.location.clone(),
+                message: diagnostic.message.clone(),
+            })
+            .collect(),
+        suppressed_rejects: production
+            .suppressed_diagnostics
+            .try_into()
+            .unwrap_or(u64::MAX),
+    };
     Ok((
         ReleasePack {
             pack_id: spec.pack_id,
@@ -445,11 +670,184 @@ fn generate_one(
             shards,
         },
         measurement,
+        pack_rejects,
     ))
 }
 
-fn validate_spec(spec: &PinnedJvmPackSpec, spec_path: &Path) -> Result<(), BundleError> {
-    if spec.schema_version != JVM_PACK_SPEC_SCHEMA_VERSION {
+/// Read the pinned input exactly as the spec kind defines it: a single
+/// artifact file for archive and document kinds, or a canonical source set
+/// for tree kinds.
+fn read_pinned_artifact(
+    spec: &PinnedPackSpec,
+    artifact_path: &Path,
+    limits: &ArtifactProducerLimits,
+) -> Result<ExactArtifact, BundleError> {
+    match &spec.kind {
+        PinnedPackKind::PythonStub { stubs } => {
+            let relative_paths = stubs.iter().map(PathBuf::from).collect::<Vec<_>>();
+            read_exact_source_set(
+                artifact_path,
+                &relative_paths,
+                MAX_SOURCE_SET_FILES,
+                MAX_SOURCE_SET_PATH_DEPTH,
+                limits,
+            )
+        }
+        PinnedPackKind::NpmPackage {
+            manifest,
+            declarations,
+        } => {
+            let mut relative_paths = vec![PathBuf::from(manifest)];
+            relative_paths.extend(
+                declarations
+                    .iter()
+                    .map(|declaration| PathBuf::from(&declaration.path)),
+            );
+            read_exact_source_set(
+                artifact_path,
+                &relative_paths,
+                MAX_SOURCE_SET_FILES,
+                MAX_SOURCE_SET_PATH_DEPTH,
+                limits,
+            )
+        }
+        PinnedPackKind::GoModule { packages } => {
+            let relative_paths = packages
+                .iter()
+                .flat_map(|package| package.files.iter().map(PathBuf::from))
+                .collect::<Vec<_>>();
+            read_exact_source_set(
+                artifact_path,
+                &relative_paths,
+                MAX_SOURCE_SET_FILES,
+                MAX_SOURCE_SET_PATH_DEPTH,
+                limits,
+            )
+        }
+        PinnedPackKind::ComposerPackage { rules } => {
+            let relative_paths = rules
+                .iter()
+                .flat_map(|rule| rule.files().iter().map(PathBuf::from))
+                .collect::<Vec<_>>();
+            read_exact_source_set(
+                artifact_path,
+                &relative_paths,
+                MAX_SOURCE_SET_FILES,
+                MAX_SOURCE_SET_PATH_DEPTH,
+                limits,
+            )
+        }
+        _ => read_exact_artifact(artifact_path, limits),
+    }
+    .map_err(|diagnostic| BundleError::new(render_diagnostics(&[diagnostic])))
+}
+
+fn produce_pinned_pack(
+    kind: &PinnedPackKind,
+    request: &ArtifactProductionRequest,
+    limits: &ArtifactProducerLimits,
+    cancellation: &CancellationToken,
+    artifact: &ExactArtifact,
+) -> ArtifactProduction {
+    let cancellation = Some(cancellation);
+    match kind {
+        PinnedPackKind::JdkSourceZip { layout } => {
+            JdkSourceArchivePackProducer::new(match *layout {
+                PinnedJdkSourceLayout::ModulePrefixed => JdkSourceArchiveLayout::ModulePrefixed,
+                PinnedJdkSourceLayout::Flat => JdkSourceArchiveLayout::Flat,
+            })
+            .produce_loaded_artifact(request, limits, cancellation, artifact)
+        }
+        PinnedPackKind::KotlinSourceJar => KotlinSourceJarPackProducer.produce_loaded_artifact(
+            request,
+            limits,
+            cancellation,
+            artifact,
+        ),
+        PinnedPackKind::ScalaSourceJar => ScalaSourceJarPackProducer.produce_loaded_artifact(
+            request,
+            limits,
+            cancellation,
+            artifact,
+        ),
+        PinnedPackKind::JavaSourceJar | PinnedPackKind::JavaClassJar => {
+            JavaJarPackProducer.produce_loaded_artifact(request, limits, cancellation, artifact)
+        }
+        PinnedPackKind::TypeScriptDeclarationFile => TypeScriptDeclarationPackProducer
+            .produce_loaded_artifact(request, limits, cancellation, artifact),
+        PinnedPackKind::DotNetAssembly => CSharpAssemblyPackProducer.produce_loaded_artifact(
+            request,
+            limits,
+            cancellation,
+            artifact,
+        ),
+        PinnedPackKind::RustdocJson => {
+            RustdocJsonPackProducer.produce_loaded_artifact(request, limits, cancellation, artifact)
+        }
+        PinnedPackKind::PythonStub { .. } => PythonArtifactPackProducer.produce_loaded_source_set(
+            request,
+            limits,
+            cancellation,
+            artifact,
+        ),
+        PinnedPackKind::NpmPackage {
+            manifest,
+            declarations,
+        } => {
+            let declarations = declarations
+                .iter()
+                .map(|declaration| (declaration.module.clone(), declaration.path.clone()))
+                .collect::<Vec<_>>();
+            TypeScriptDeclarationPackProducer.produce_loaded_source_set(
+                request,
+                limits,
+                cancellation,
+                artifact,
+                manifest,
+                &declarations,
+            )
+        }
+        PinnedPackKind::GoModule { packages } => {
+            let packages = packages
+                .iter()
+                .map(|package| AnalysisGoPinnedPackage {
+                    import_path: package.import_path.clone(),
+                    name: package.name.clone(),
+                    files: package.files.clone(),
+                })
+                .collect::<Vec<_>>();
+            GoModulePackProducer.produce_loaded_source_set(
+                request,
+                limits,
+                cancellation,
+                artifact,
+                &packages,
+            )
+        }
+        PinnedPackKind::RubyGemArchive => RubyGemArchivePackProducer.produce_loaded_artifact(
+            request,
+            limits,
+            cancellation,
+            artifact,
+        ),
+        PinnedPackKind::ComposerPackage { rules } => {
+            let rules = rules
+                .iter()
+                .map(PinnedComposerAutoloadRule::to_producer_rule)
+                .collect::<Vec<_>>();
+            ComposerPackagePackProducer.produce_loaded_source_set(
+                request,
+                limits,
+                cancellation,
+                artifact,
+                &rules,
+            )
+        }
+    }
+}
+
+fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleError> {
+    if spec.schema_version != PACK_SPEC_SCHEMA_VERSION {
         return Err(BundleError::new(format!(
             "spec {} has unsupported schema version {}",
             spec_path.display(),
@@ -462,11 +860,144 @@ fn validate_spec(spec: &PinnedJvmPackSpec, spec_path: &Path) -> Result<(), Bundl
             spec_path.display()
         )));
     }
+    if spec.license.trim().is_empty() || spec.license == "NOASSERTION" {
+        return Err(BundleError::new(format!(
+            "spec {} must name the upstream license as an SPDX expression",
+            spec_path.display()
+        )));
+    }
+    if spec.provenance.source.trim().is_empty() {
+        return Err(BundleError::new(format!(
+            "spec {} must name its upstream provenance source",
+            spec_path.display()
+        )));
+    }
     if spec.notices.is_empty() {
         return Err(BundleError::new(format!(
             "spec {} must name at least one license or notice file",
             spec_path.display()
         )));
+    }
+    if let PinnedPackKind::PythonStub { stubs } = &spec.kind {
+        if stubs.is_empty() {
+            return Err(BundleError::new(format!(
+                "spec {} must list at least one pinned stub file",
+                spec_path.display()
+            )));
+        }
+        for stub in stubs {
+            let stub_path = Path::new(stub);
+            require_safe_relative(stub_path)?;
+            if stub_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("pyi")
+            {
+                return Err(BundleError::new(format!(
+                    "spec {} pins non-stub source {stub}; every pinned stub must be a .pyi file",
+                    spec_path.display()
+                )));
+            }
+        }
+    }
+    if let PinnedPackKind::NpmPackage {
+        manifest,
+        declarations,
+    } = &spec.kind
+    {
+        require_safe_relative(Path::new(manifest))?;
+        if declarations.is_empty() {
+            return Err(BundleError::new(format!(
+                "spec {} must list at least one pinned npm declaration file",
+                spec_path.display()
+            )));
+        }
+        for declaration in declarations {
+            if declaration.module.trim().is_empty() {
+                return Err(BundleError::new(format!(
+                    "spec {} pins declaration {} with no importable module name",
+                    spec_path.display(),
+                    declaration.path
+                )));
+            }
+            let declaration_path = Path::new(&declaration.path);
+            require_safe_relative(declaration_path)?;
+            if !declaration.path.ends_with(".d.ts") {
+                return Err(BundleError::new(format!(
+                    "spec {} pins non-declaration source {}; every pinned npm declaration must be a .d.ts file",
+                    spec_path.display(),
+                    declaration.path
+                )));
+            }
+        }
+    }
+    if let PinnedPackKind::GoModule { packages } = &spec.kind {
+        if packages.is_empty() {
+            return Err(BundleError::new(format!(
+                "spec {} must list at least one pinned Go package",
+                spec_path.display()
+            )));
+        }
+        for package in packages {
+            if package.import_path.trim().is_empty() || package.name.trim().is_empty() {
+                return Err(BundleError::new(format!(
+                    "spec {} pins a Go package with no import path or declared name",
+                    spec_path.display()
+                )));
+            }
+            if package.files.is_empty() {
+                return Err(BundleError::new(format!(
+                    "spec {} pins Go package {} with no files",
+                    spec_path.display(),
+                    package.import_path
+                )));
+            }
+            for file in &package.files {
+                let file_path = Path::new(file);
+                require_safe_relative(file_path)?;
+                if file_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("go")
+                {
+                    return Err(BundleError::new(format!(
+                        "spec {} pins non-Go source {file} in package {}; every pinned file must be a .go file",
+                        spec_path.display(),
+                        package.import_path
+                    )));
+                }
+            }
+        }
+    }
+    if let PinnedPackKind::ComposerPackage { rules } = &spec.kind {
+        if rules.is_empty() {
+            return Err(BundleError::new(format!(
+                "spec {} must list at least one pinned Composer autoload rule",
+                spec_path.display()
+            )));
+        }
+        for rule in rules {
+            if rule.files().is_empty() {
+                return Err(BundleError::new(format!(
+                    "spec {} pins a Composer autoload rule with no files",
+                    spec_path.display()
+                )));
+            }
+            for file in rule.files() {
+                let file_path = Path::new(file);
+                require_safe_relative(file_path)?;
+                if file_path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("php")
+                {
+                    return Err(BundleError::new(format!(
+                        "spec {} pins non-PHP source {file}; every pinned Composer file must be a .php file",
+                        spec_path.display()
+                    )));
+                }
+            }
+        }
     }
     if spec.measurement_queries.is_empty() {
         return Err(BundleError::new(format!(
@@ -565,13 +1096,11 @@ fn copy_notices(
 }
 
 fn measurement(
-    spec: &PinnedJvmPackSpec,
+    spec: &PinnedPackSpec,
     artifact_bytes: u64,
     compiled: &CompiledSemanticModelPack,
     generation_millis: u64,
     runtime: RuntimeMeasurement,
-    diagnostics: &[ProducerDiagnostic],
-    suppressed_diagnostics: usize,
 ) -> ReleasePackMeasurement {
     ReleasePackMeasurement {
         pack_id: spec.pack_id.clone(),
@@ -605,24 +1134,11 @@ fn measurement(
         matcher_index_entries: runtime.matcher_index_entries,
         retained_model_bytes: runtime.retained_model_bytes,
         lookups: runtime.lookups,
-        diagnostics: diagnostics
-            .iter()
-            .map(|diagnostic| {
-                format!(
-                    "{:?} {} {}: {}",
-                    diagnostic.severity,
-                    diagnostic.code,
-                    diagnostic.location.as_deref().unwrap_or("<pack>"),
-                    diagnostic.message
-                )
-            })
-            .collect(),
-        suppressed_diagnostics,
     }
 }
 
 fn measure_runtime(
-    spec: &PinnedJvmPackSpec,
+    spec: &PinnedPackSpec,
     compiled: &CompiledSemanticModelPack,
     cancellation: &CancellationToken,
 ) -> Result<RuntimeMeasurement, BundleError> {
@@ -745,7 +1261,7 @@ fn lookup_record_count(active: &ResolvedActiveSemanticModels, query: &PinnedLook
     count.try_into().unwrap_or(u64::MAX)
 }
 
-pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundleIndex, BundleError> {
+pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, BundleError> {
     let index_path = output_root.join("index.json");
     let index_bytes = fs::read(&index_path)
         .map_err(|error| BundleError::new(format!("read {}: {error}", index_path.display())))?;
@@ -758,6 +1274,7 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundleIndex, B
         )));
     }
     verify_checksums(output_root, &index)?;
+    let rejects = verify_rejects(output_root, &index)?;
     let measurements_path = output_root.join("measurements.json");
     if measurements_path.exists() {
         verify_measurements(&measurements_path, &index)?;
@@ -815,7 +1332,45 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundleIndex, B
             verify_asset(output_root, &notice.asset)?;
         }
     }
-    Ok(index)
+    Ok(ReleaseBundle { index, rejects })
+}
+
+/// Read and cross-check the structured extraction burn-down report.
+///
+/// The report is a mandatory release asset: a bundle without it, or with
+/// packs that do not match the index exactly, fails verification.
+fn verify_rejects(
+    output_root: &Path,
+    index: &ReleaseBundleIndex,
+) -> Result<ReleaseBundleRejects, BundleError> {
+    let rejects_path = output_root.join("rejects.json");
+    let rejects_bytes = fs::read(&rejects_path)
+        .map_err(|error| BundleError::new(format!("read {}: {error}", rejects_path.display())))?;
+    let rejects: ReleaseBundleRejects = serde_json::from_slice(&rejects_bytes)
+        .map_err(|error| BundleError::new(format!("parse {}: {error}", rejects_path.display())))?;
+    if rejects.schema_version != RELEASE_BUNDLE_SCHEMA_VERSION {
+        return Err(BundleError::new(format!(
+            "unsupported release rejects schema {}",
+            rejects.schema_version
+        )));
+    }
+    if rejects.generator != index.generator
+        || rejects.packs.len() != index.packs.len()
+        || rejects
+            .packs
+            .iter()
+            .zip(&index.packs)
+            .any(|(rejects, pack)| {
+                rejects.pack_id != pack.pack_id
+                    || rejects.pack_version != pack.pack_version
+                    || rejects.completeness != pack.completeness
+            })
+    {
+        return Err(BundleError::new(
+            "release rejects do not match the indexed packs",
+        ));
+    }
+    Ok(rejects)
 }
 
 /// Verify and install every compiled pack in a downloaded release bundle.
@@ -827,7 +1382,7 @@ pub fn install_release_bundle(
     bundle_root: &Path,
     catalog: &SemanticPackCatalog,
 ) -> Result<Vec<ReleasePackInstallation>, BundleError> {
-    let index = verify_release_bundle(bundle_root)?;
+    let index = verify_release_bundle(bundle_root)?.index;
     let limits = DecodeLimits::default();
     index
         .packs
@@ -1109,7 +1664,7 @@ fn write_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<(),
 }
 
 fn release_asset_paths(index: &ReleaseBundleIndex) -> Vec<String> {
-    let mut paths = vec!["index.json".to_owned()];
+    let mut paths = vec!["index.json".to_owned(), "rejects.json".to_owned()];
     for pack in &index.packs {
         paths.push(pack.manifest.path.clone());
         paths.extend(pack.shards.iter().map(|shard| shard.asset.path.clone()));
@@ -1192,52 +1747,49 @@ mod tests {
     use tempfile::tempdir;
     use zip::write::SimpleFileOptions;
 
-    #[test]
-    fn release_bundle_is_deterministic_and_verifiable() {
-        let fixture = tempdir().unwrap();
-        let artifact = fixture.path().join("scala-library-sources.jar");
-        write_zip(
-            &artifact,
-            "scala/Core.scala",
-            "package scala\ntrait Any\nobject Predef { def identity[A](value: A): A = value }\n",
-        );
-        let notice = fixture.path().join("NOTICE.txt");
-        fs::write(&notice, "fixture notice\n").unwrap();
-        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
-        let spec = fixture.path().join("scala.json");
-        let pinned = PinnedJvmPackSpec {
-            schema_version: JVM_PACK_SPEC_SCHEMA_VERSION,
-            pack_id: "scala-library-fixture".to_owned(),
-            pack_version: "2.13.16".to_owned(),
-            ecosystem: "maven".to_owned(),
-            kind: PinnedJvmPackKind::ScalaSourceJar,
-            artifact: PinnedArtifact {
-                file_name: "scala-library-sources.jar".to_owned(),
-                sha256: artifact_sha256,
-                url: Some("https://example.invalid/scala-library-sources.jar".to_owned()),
-                container: None,
-            },
+    fn selector(package: &str, toolchain: &str, version: &str) -> ActivationSelector {
+        ActivationSelector {
+            package: Some(NameSelector {
+                name: package.to_owned(),
+                version: Some(format!("={version}")),
+            }),
+            module: None,
+            toolchain: Some(NameSelector {
+                name: toolchain.to_owned(),
+                version: Some(format!("={version}")),
+            }),
+            targets: Vec::new(),
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pinned_spec(
+        pack_id: &str,
+        version: &str,
+        ecosystem: &str,
+        kind: PinnedPackKind,
+        artifact: PinnedArtifact,
+        toolchain: &str,
+        package: &str,
+        measurement_queries: Vec<PinnedLookupQuery>,
+    ) -> PinnedPackSpec {
+        PinnedPackSpec {
+            schema_version: PACK_SPEC_SCHEMA_VERSION,
+            pack_id: pack_id.to_owned(),
+            pack_version: version.to_owned(),
+            ecosystem: ecosystem.to_owned(),
+            kind,
+            artifact,
             compatibility: Compatibility {
                 bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
                 toolchains: vec![VersionConstraint {
-                    name: "scala".to_owned(),
-                    requirement: "=2.13.16".to_owned(),
+                    name: toolchain.to_owned(),
+                    requirement: format!("={version}"),
                 }],
             },
-            activation: vec![ActivationSelector {
-                package: Some(NameSelector {
-                    name: "org.scala-lang:scala-library".to_owned(),
-                    version: Some("=2.13.16".to_owned()),
-                }),
-                module: None,
-                toolchain: Some(NameSelector {
-                    name: "scala".to_owned(),
-                    version: Some("=2.13.16".to_owned()),
-                }),
-                targets: Vec::new(),
-                configurations: Vec::new(),
-                artifact_sha256: None,
-            }],
+            activation: vec![selector(package, toolchain, version)],
             provenance: Provenance {
                 source: "fixture".to_owned(),
                 revision: Some("fixture-v1".to_owned()),
@@ -1248,43 +1800,26 @@ mod tests {
                 review_required: false,
             },
             notices: vec!["NOTICE.txt".to_owned()],
-            measurement_activation: ActivationSelector {
-                package: Some(NameSelector {
-                    name: "org.scala-lang:scala-library".to_owned(),
-                    version: Some("=2.13.16".to_owned()),
-                }),
-                module: None,
-                toolchain: Some(NameSelector {
-                    name: "scala".to_owned(),
-                    version: Some("=2.13.16".to_owned()),
-                }),
-                targets: Vec::new(),
-                configurations: Vec::new(),
-                artifact_sha256: None,
-            },
-            measurement_queries: vec![PinnedLookupQuery::Type {
-                name: "scala.Any".to_owned(),
-            }],
-        };
-        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
-        let input = BundleInput {
-            spec_path: spec,
-            artifact_path: artifact,
-        };
-        let first = fixture.path().join("first");
-        let second = fixture.path().join("second");
-        let first_index = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
-        let second_index = generate_release_bundle(&second, &[input]).unwrap();
-        assert_eq!(first_index, second_index);
-        assert_eq!(
-            fs::read(first.join("index.json")).unwrap(),
-            fs::read(second.join("index.json")).unwrap()
-        );
-        assert_eq!(
-            fs::read(first.join("SHA256SUMS")).unwrap(),
-            fs::read(second.join("SHA256SUMS")).unwrap()
-        );
-        for pack in &first_index.packs {
+            measurement_activation: selector(package, toolchain, version),
+            measurement_queries,
+        }
+    }
+
+    fn assert_deterministic_and_installable(
+        first: &Path,
+        second: &Path,
+        first_bundle: &ReleaseBundle,
+        second_bundle: &ReleaseBundle,
+    ) {
+        assert_eq!(first_bundle, second_bundle);
+        for asset in ["index.json", "rejects.json", "SHA256SUMS"] {
+            assert_eq!(
+                fs::read(first.join(asset)).unwrap(),
+                fs::read(second.join(asset)).unwrap(),
+                "{asset} must be deterministic"
+            );
+        }
+        for pack in &first_bundle.index.packs {
             assert_eq!(
                 fs::read(first.join(&pack.manifest.path)).unwrap(),
                 fs::read(second.join(&pack.manifest.path)).unwrap()
@@ -1296,7 +1831,53 @@ mod tests {
                 );
             }
         }
-        assert_eq!(verify_release_bundle(&first).unwrap(), first_index);
+        assert_eq!(&verify_release_bundle(first).unwrap(), first_bundle);
+    }
+
+    #[test]
+    fn release_bundle_is_deterministic_and_verifiable() {
+        let fixture = tempdir().unwrap();
+        let artifact = fixture.path().join("scala-library-sources.jar");
+        write_zip(
+            &artifact,
+            &[(
+                "scala/Core.scala",
+                "package scala\ntrait Any\nobject Predef { def identity[A](value: A): A = value }\n",
+            )],
+        );
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let spec = fixture.path().join("scala.json");
+        let pinned = pinned_spec(
+            "scala-library-fixture",
+            "2.13.16",
+            "maven",
+            PinnedPackKind::ScalaSourceJar,
+            PinnedArtifact {
+                file_name: "scala-library-sources.jar".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/scala-library-sources.jar".to_owned()),
+                container: None,
+            },
+            "scala",
+            "org.scala-lang:scala-library",
+            vec![PinnedLookupQuery::Type {
+                name: "scala.Any".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let input = BundleInput {
+            spec_path: spec,
+            artifact_path: artifact,
+        };
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
+        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
+        assert_eq!(first_bundle.rejects.packs.len(), 1);
+        assert!(first_bundle.rejects.packs[0].rejects.is_empty());
+        assert_eq!(first_bundle.rejects.packs[0].suppressed_rejects, 0);
         let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
         let installed = install_release_bundle(&first, &catalog).unwrap();
         assert_eq!(installed.len(), 1);
@@ -1318,7 +1899,7 @@ mod tests {
                     }),
                     target: Some("jvm".to_owned()),
                     configuration: None,
-                    artifact_sha256: Some(first_index.packs[0].artifact.sha256.clone()),
+                    artifact_sha256: Some(first_bundle.index.packs[0].artifact.sha256.clone()),
                 }],
                 controls: Vec::new(),
                 limits: Default::default(),
@@ -1330,6 +1911,634 @@ mod tests {
         assert_eq!(active.types_named("scala.Any").records.len(), 1);
         fs::write(first.join("SHA256SUMS"), "invalid\n").unwrap();
         assert!(verify_release_bundle(&first).is_err());
+    }
+
+    #[test]
+    fn python_stub_tree_bundle_round_trips_through_generate_verify_install() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("stubs");
+        fs::create_dir_all(root.join("collections")).unwrap();
+        fs::write(
+            root.join("builtins.pyi"),
+            "class object: ...\ndef len(sized: object) -> int: ...\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("collections/__init__.pyi"),
+            "from . import abc\nclass deque: ...\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("collections/abc.pyi"),
+            "class Iterable: ...\nclass Iterator(Iterable): ...\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.path().join("NOTICE.txt"),
+            "typeshed fixture notice\n",
+        )
+        .unwrap();
+        let stubs = vec![
+            "builtins.pyi".to_owned(),
+            "collections/__init__.pyi".to_owned(),
+            "collections/abc.pyi".to_owned(),
+        ];
+        let relative_paths = stubs.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let artifact_sha256 = read_exact_source_set(
+            &root,
+            &relative_paths,
+            MAX_SOURCE_SET_FILES,
+            MAX_SOURCE_SET_PATH_DEPTH,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let spec = fixture.path().join("python-stubs.json");
+        let pinned = pinned_spec(
+            "python-stubs-fixture",
+            "1.0.0",
+            "pypi",
+            PinnedPackKind::PythonStub { stubs },
+            PinnedArtifact {
+                file_name: "stubs".to_owned(),
+                sha256: artifact_sha256.clone(),
+                url: Some("https://example.invalid/typeshed-fixture".to_owned()),
+                container: None,
+            },
+            "python",
+            "typeshed-fixture",
+            vec![
+                PinnedLookupQuery::Type {
+                    name: "collections.abc.Iterable".to_owned(),
+                },
+                PinnedLookupQuery::Member {
+                    owner: "builtins".to_owned(),
+                    name: "len".to_owned(),
+                },
+            ],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let input = BundleInput {
+            spec_path: spec,
+            artifact_path: root,
+        };
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
+        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
+        let pack = &first_bundle.index.packs[0];
+        assert_eq!(pack.language, "python");
+        assert_eq!(pack.completeness, Completeness::Complete);
+        assert!(!pack.notices.is_empty());
+        assert_eq!(first_bundle.rejects.packs[0].rejects, Vec::new());
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle(&first, &catalog).unwrap();
+        assert_eq!(installed.len(), 1);
+        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
+            &catalog,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "python".to_owned(),
+                    ecosystem: "pypi".to_owned(),
+                    package: Some(CatalogCoordinate {
+                        name: "typeshed-fixture".to_owned(),
+                        version: Some(Version::parse("1.0.0").unwrap()),
+                    }),
+                    module: None,
+                    toolchain: Some(CatalogCoordinate {
+                        name: "python".to_owned(),
+                        version: Some(Version::parse("1.0.0").unwrap()),
+                    }),
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: Some(artifact_sha256),
+                }],
+                controls: Vec::new(),
+                limits: Default::default(),
+            },
+            &CancellationToken::default(),
+        ) else {
+            panic!("installed Python stub pack must resolve through normal activation");
+        };
+        assert_eq!(
+            active.types_named("collections.abc.Iterable").records.len(),
+            1
+        );
+        assert_eq!(active.types_named("collections.deque").records.len(), 1);
+    }
+
+    #[test]
+    fn ruby_gem_archive_bundle_round_trips_through_generate_verify_install() {
+        let fixture = tempdir().unwrap();
+        let artifact = fixture.path().join("widget-1.2.3.gem");
+        fs::write(
+            &artifact,
+            ruby_gem_archive(&[(
+                "sig/widget.rbs",
+                b"class Widget\n  def call: (String value) -> Integer\nend",
+            )]),
+        )
+        .unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let spec = fixture.path().join("widget.json");
+        let pinned = pinned_spec(
+            "widget-gem-fixture",
+            "1.2.3",
+            "rubygems",
+            PinnedPackKind::RubyGemArchive,
+            PinnedArtifact {
+                file_name: "widget-1.2.3.gem".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/widget-1.2.3.gem".to_owned()),
+                container: None,
+            },
+            "ruby",
+            "widget",
+            vec![PinnedLookupQuery::Type {
+                name: "Widget".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let input = BundleInput {
+            spec_path: spec,
+            artifact_path: artifact,
+        };
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
+        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
+        let pack = &first_bundle.index.packs[0];
+        assert_eq!(pack.language, "ruby");
+        assert_eq!(pack.completeness, Completeness::Complete);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle(&first, &catalog).unwrap();
+        assert_eq!(installed.len(), 1);
+        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
+            &catalog,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "ruby".to_owned(),
+                    ecosystem: "rubygems".to_owned(),
+                    package: Some(CatalogCoordinate {
+                        name: "widget".to_owned(),
+                        version: Some(Version::parse("1.2.3").unwrap()),
+                    }),
+                    module: None,
+                    toolchain: Some(CatalogCoordinate {
+                        name: "ruby".to_owned(),
+                        version: Some(Version::parse("1.2.3").unwrap()),
+                    }),
+                    target: Some("ruby".to_owned()),
+                    configuration: None,
+                    artifact_sha256: Some(first_bundle.index.packs[0].artifact.sha256.clone()),
+                }],
+                controls: Vec::new(),
+                limits: Default::default(),
+            },
+            &CancellationToken::default(),
+        ) else {
+            panic!("installed Ruby gem pack must resolve through normal activation");
+        };
+        assert_eq!(active.types_named("Widget").records.len(), 1);
+    }
+
+    #[test]
+    fn npm_package_bundle_round_trips_through_generate_verify_install() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("widget");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"widget","version":"1.2.3","types":"index.d.ts"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.d.ts"),
+            "export declare class Widget {\n  render(width: number): string;\n}\n",
+        )
+        .unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let relative_paths = vec![PathBuf::from("package.json"), PathBuf::from("index.d.ts")];
+        let artifact_sha256 = read_exact_source_set(
+            &root,
+            &relative_paths,
+            MAX_SOURCE_SET_FILES,
+            MAX_SOURCE_SET_PATH_DEPTH,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let spec = fixture.path().join("widget.json");
+        let pinned = pinned_spec(
+            "widget-npm-fixture",
+            "1.2.3",
+            "npm",
+            PinnedPackKind::NpmPackage {
+                manifest: "package.json".to_owned(),
+                declarations: vec![PinnedNpmDeclaration {
+                    module: "widget".to_owned(),
+                    path: "index.d.ts".to_owned(),
+                }],
+            },
+            PinnedArtifact {
+                file_name: "widget".to_owned(),
+                sha256: artifact_sha256.clone(),
+                url: Some("https://example.invalid/widget-1.2.3.tgz".to_owned()),
+                container: None,
+            },
+            "node",
+            "widget",
+            vec![PinnedLookupQuery::Member {
+                owner: "widget.Widget".to_owned(),
+                name: "render".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let input = BundleInput {
+            spec_path: spec,
+            artifact_path: root,
+        };
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
+        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
+        let pack = &first_bundle.index.packs[0];
+        assert_eq!(pack.language, "typescript");
+        assert_eq!(pack.completeness, Completeness::Complete);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle(&first, &catalog).unwrap();
+        assert_eq!(installed.len(), 1);
+        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
+            &catalog,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "typescript".to_owned(),
+                    ecosystem: "npm".to_owned(),
+                    package: Some(CatalogCoordinate {
+                        name: "widget".to_owned(),
+                        version: Some(Version::parse("1.2.3").unwrap()),
+                    }),
+                    module: None,
+                    toolchain: Some(CatalogCoordinate {
+                        name: "node".to_owned(),
+                        version: Some(Version::parse("1.2.3").unwrap()),
+                    }),
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: Some(artifact_sha256),
+                }],
+                controls: Vec::new(),
+                limits: Default::default(),
+            },
+            &CancellationToken::default(),
+        ) else {
+            panic!("installed npm declaration pack must resolve through normal activation");
+        };
+        assert_eq!(active.types_named("widget.Widget").records.len(), 1);
+    }
+
+    #[test]
+    fn go_module_bundle_round_trips_through_generate_verify_install() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("widget-src");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("widget.go"),
+            "package widget\n\ntype Widget struct {\n\tLabel string\n}\n\nfunc (w Widget) Render(width int) string { return w.Label }\n",
+        )
+        .unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let relative_paths = vec![PathBuf::from("widget.go")];
+        let artifact_sha256 = read_exact_source_set(
+            &root,
+            &relative_paths,
+            MAX_SOURCE_SET_FILES,
+            MAX_SOURCE_SET_PATH_DEPTH,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let spec = fixture.path().join("widget.json");
+        let pinned = pinned_spec(
+            "widget-go-fixture",
+            "1.2.3",
+            "go",
+            PinnedPackKind::GoModule {
+                packages: vec![PinnedGoPackage {
+                    import_path: "example.com/widget".to_owned(),
+                    name: "widget".to_owned(),
+                    files: vec!["widget.go".to_owned()],
+                }],
+            },
+            PinnedArtifact {
+                file_name: "widget-src".to_owned(),
+                sha256: artifact_sha256.clone(),
+                url: Some("https://example.invalid/example.com/widget/@v/v1.2.3.zip".to_owned()),
+                container: None,
+            },
+            "go",
+            "example.com/widget",
+            vec![PinnedLookupQuery::Member {
+                owner: "example.com/widget.Widget".to_owned(),
+                name: "Render".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let input = BundleInput {
+            spec_path: spec,
+            artifact_path: root,
+        };
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
+        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
+        let pack = &first_bundle.index.packs[0];
+        assert_eq!(pack.language, "go");
+        assert_eq!(pack.completeness, Completeness::Complete);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle(&first, &catalog).unwrap();
+        assert_eq!(installed.len(), 1);
+        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
+            &catalog,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "go".to_owned(),
+                    ecosystem: "go".to_owned(),
+                    package: Some(CatalogCoordinate {
+                        name: "example.com/widget".to_owned(),
+                        version: Some(Version::parse("1.2.3").unwrap()),
+                    }),
+                    module: None,
+                    toolchain: Some(CatalogCoordinate {
+                        name: "go".to_owned(),
+                        version: Some(Version::parse("1.2.3").unwrap()),
+                    }),
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: Some(artifact_sha256),
+                }],
+                controls: Vec::new(),
+                limits: Default::default(),
+            },
+            &CancellationToken::default(),
+        ) else {
+            panic!("installed Go module pack must resolve through normal activation");
+        };
+        assert_eq!(
+            active
+                .types_named("example.com/widget.Widget")
+                .records
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn composer_package_bundle_round_trips_through_generate_verify_install() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("widget-src");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("Widget.php"),
+            "<?php\nnamespace Vendor\\Widget;\n\nclass Widget {\n    public function render(int $width): string { return 'ok'; }\n}\n",
+        )
+        .unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let relative_paths = vec![PathBuf::from("Widget.php")];
+        let artifact_sha256 = read_exact_source_set(
+            &root,
+            &relative_paths,
+            MAX_SOURCE_SET_FILES,
+            MAX_SOURCE_SET_PATH_DEPTH,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let spec = fixture.path().join("widget.json");
+        let pinned = pinned_spec(
+            "widget-composer-fixture",
+            "1.2.3",
+            "composer",
+            PinnedPackKind::ComposerPackage {
+                rules: vec![PinnedComposerAutoloadRule::Psr4 {
+                    namespace_prefix: "Vendor.Widget".to_owned(),
+                    files: vec!["Widget.php".to_owned()],
+                }],
+            },
+            PinnedArtifact {
+                file_name: "widget-src".to_owned(),
+                sha256: artifact_sha256.clone(),
+                url: Some("https://example.invalid/vendor-widget-1.2.3.zip".to_owned()),
+                container: None,
+            },
+            "php",
+            "vendor/widget",
+            vec![PinnedLookupQuery::Member {
+                owner: "Vendor.Widget.Widget".to_owned(),
+                name: "render".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let input = BundleInput {
+            spec_path: spec,
+            artifact_path: root,
+        };
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
+        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
+        let pack = &first_bundle.index.packs[0];
+        assert_eq!(pack.language, "php");
+        assert_eq!(pack.completeness, Completeness::Complete);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle(&first, &catalog).unwrap();
+        assert_eq!(installed.len(), 1);
+        let SemanticModelResolutionOutcome::Ready(active) = resolve_active_semantic_models(
+            &catalog,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "php".to_owned(),
+                    ecosystem: "composer".to_owned(),
+                    package: Some(CatalogCoordinate {
+                        name: "vendor/widget".to_owned(),
+                        version: Some(Version::parse("1.2.3").unwrap()),
+                    }),
+                    module: None,
+                    toolchain: Some(CatalogCoordinate {
+                        name: "php".to_owned(),
+                        version: Some(Version::parse("1.2.3").unwrap()),
+                    }),
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: Some(artifact_sha256),
+                }],
+                controls: Vec::new(),
+                limits: Default::default(),
+            },
+            &CancellationToken::default(),
+        ) else {
+            panic!("installed Composer package pack must resolve through normal activation");
+        };
+        assert_eq!(active.types_named("Vendor.Widget.Widget").records.len(), 1);
+    }
+
+    #[test]
+    fn extraction_rejects_are_reported_structurally_and_checksummed() {
+        let fixture = tempdir().unwrap();
+        let artifact = fixture.path().join("kotlin-fixture-sources.jar");
+        write_zip(
+            &artifact,
+            &[
+                ("kotlin/Bad.kt", "class {{{ fun ]] broken"),
+                ("kotlin/Good.kt", "package fixture\nclass Good\n"),
+            ],
+        );
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let spec = fixture.path().join("kotlin.json");
+        let pinned = pinned_spec(
+            "kotlin-fixture",
+            "2.2.20",
+            "maven",
+            PinnedPackKind::KotlinSourceJar,
+            PinnedArtifact {
+                file_name: "kotlin-fixture-sources.jar".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/kotlin-fixture-sources.jar".to_owned()),
+                container: None,
+            },
+            "kotlin",
+            "org.jetbrains.kotlin:kotlin-stdlib",
+            vec![PinnedLookupQuery::Type {
+                name: "fixture.Good".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let output = fixture.path().join("bundle");
+        let bundle = generate_release_bundle(
+            &output,
+            &[BundleInput {
+                spec_path: spec,
+                artifact_path: artifact,
+            }],
+        )
+        .unwrap();
+
+        let pack_rejects = &bundle.rejects.packs[0];
+        assert_eq!(pack_rejects.completeness, Completeness::Partial);
+        assert_eq!(
+            pack_rejects.rejects,
+            vec![ReleaseReject {
+                severity: ReleaseRejectSeverity::Warning,
+                code: "kotlin.source.parse".to_owned(),
+                location: Some("kotlin/Bad.kt".to_owned()),
+                message: "Kotlin source entry contains syntax unsupported by the pinned parser"
+                    .to_owned(),
+            }]
+        );
+        assert_eq!(pack_rejects.suppressed_rejects, 0);
+        assert_eq!(verify_release_bundle(&output).unwrap(), bundle);
+
+        // The burn-down report is part of the checksummed inventory: dropping
+        // one reject from it must fail verification.
+        let mut tampered: ReleaseBundleRejects =
+            serde_json::from_slice(&fs::read(output.join("rejects.json")).unwrap()).unwrap();
+        tampered.packs[0].rejects.clear();
+        fs::write(output.join("rejects.json"), json_bytes(&tampered).unwrap()).unwrap();
+        assert!(verify_release_bundle(&output).is_err());
+    }
+
+    #[test]
+    fn spec_validation_rejects_unknown_family_and_missing_or_placeholder_license() {
+        let fixture = tempdir().unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let artifact = fixture.path().join("artifact.jar");
+        write_zip(
+            &artifact,
+            &[("scala/Core.scala", "package scala\ntrait Any\n")],
+        );
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let valid = pinned_spec(
+            "fixture",
+            "1.0.0",
+            "maven",
+            PinnedPackKind::ScalaSourceJar,
+            PinnedArtifact {
+                file_name: "artifact.jar".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/artifact.jar".to_owned()),
+                container: None,
+            },
+            "scala",
+            "org.scala-lang:scala-library",
+            vec![PinnedLookupQuery::Type {
+                name: "scala.Any".to_owned(),
+            }],
+        );
+        let generate_with = |name: &str, spec_json: &serde_json::Value| {
+            let spec_path = fixture.path().join(name);
+            fs::write(&spec_path, serde_json::to_vec_pretty(spec_json).unwrap()).unwrap();
+            generate_release_bundle(
+                &fixture.path().join("out").join(name),
+                &[BundleInput {
+                    spec_path,
+                    artifact_path: artifact.clone(),
+                }],
+            )
+        };
+        let valid_json = serde_json::to_value(&valid).unwrap();
+
+        let mut unknown_family = valid_json.clone();
+        unknown_family["kind"] = serde_json::json!({ "artifact_kind": "nuget_package" });
+        let error = generate_with("unknown-family.json", &unknown_family).unwrap_err();
+        assert!(error.to_string().contains("parse spec"), "{error}");
+
+        let mut missing_license = valid_json.clone();
+        missing_license
+            .as_object_mut()
+            .unwrap()
+            .remove("license")
+            .unwrap();
+        let error = generate_with("missing-license.json", &missing_license).unwrap_err();
+        assert!(error.to_string().contains("license"), "{error}");
+
+        let mut placeholder_license = valid_json.clone();
+        placeholder_license["license"] = serde_json::json!("NOASSERTION");
+        let error = generate_with("placeholder-license.json", &placeholder_license).unwrap_err();
+        assert!(error.to_string().contains("SPDX"), "{error}");
+
+        let mut empty_provenance = valid_json.clone();
+        empty_provenance["provenance"]["source"] = serde_json::json!("");
+        let error = generate_with("empty-provenance.json", &empty_provenance).unwrap_err();
+        assert!(error.to_string().contains("provenance"), "{error}");
+
+        let mut empty_stubs = valid_json.clone();
+        empty_stubs["kind"] = serde_json::json!({ "artifact_kind": "python_stub", "stubs": [] });
+        let error = generate_with("empty-stubs.json", &empty_stubs).unwrap_err();
+        assert!(error.to_string().contains("stub"), "{error}");
+
+        let mut non_stub_source = valid_json.clone();
+        non_stub_source["kind"] = serde_json::json!({
+            "artifact_kind": "python_stub",
+            "stubs": ["module.py"]
+        });
+        let error = generate_with("non-stub-source.json", &non_stub_source).unwrap_err();
+        assert!(error.to_string().contains(".pyi"), "{error}");
     }
 
     #[test]
@@ -1345,12 +2554,46 @@ mod tests {
         assert!(verify_asset(fixture.path(), &asset).is_err());
     }
 
-    fn write_zip(path: &Path, entry_name: &str, source: &str) {
+    fn write_zip(path: &Path, entries: &[(&str, &str)]) {
         let mut writer = zip::ZipWriter::new(File::create(path).unwrap());
-        writer
-            .start_file(entry_name, SimpleFileOptions::default())
-            .unwrap();
-        writer.write_all(source.as_bytes()).unwrap();
+        for (entry_name, source) in entries {
+            writer
+                .start_file(*entry_name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(source.as_bytes()).unwrap();
+        }
         writer.finish().unwrap();
+    }
+
+    /// Build a `.gem` archive: an outer tar containing one `data.tar.gz`
+    /// entry, itself a gzip-compressed tar of the gem's declaration files.
+    fn ruby_gem_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        {
+            let encoder =
+                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::default());
+            let mut data = tar::Builder::new(encoder);
+            for (path, bytes) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                data.append_data(&mut header, path, *bytes).unwrap();
+            }
+            data.into_inner().unwrap().finish().unwrap();
+        }
+        let mut gem = Vec::new();
+        {
+            let mut outer = tar::Builder::new(&mut gem);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(compressed.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            outer
+                .append_data(&mut header, "data.tar.gz", compressed.as_slice())
+                .unwrap();
+            outer.finish().unwrap();
+        }
+        gem
     }
 }

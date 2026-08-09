@@ -13,7 +13,7 @@
 //! (ancestors and descendants). Kotlin also joins the shared JVM realm here:
 //! it reads the same jar-backed dependency index Java and Scala use, and
 //! `MultiAnalyzer` widens its import and hierarchy resolution across Java and
-//! Scala sources through `crate::analyzer::jvm::realm` (issue #1237).
+//! Scala sources through `brokk_bifrost_jvm::realm` (issue #1237).
 //!
 //! Deliberate boundaries within Kotlin/JVM name resolution: Kotlin/JS and
 //! Kotlin/Native default imports are not modelled, `expect`/`actual` pairs are
@@ -52,39 +52,59 @@
 
 mod adapter;
 mod clones;
-pub(crate) mod declarations;
 pub(crate) mod diagnostics;
 mod hierarchy;
 pub(crate) mod imports;
 pub(crate) mod language;
 mod semantic;
-pub(crate) mod structural;
-mod supertypes;
-pub(crate) mod syntax;
-mod tests;
+mod structural;
 pub(crate) mod types;
+
+use crate::analyzer::Range;
+use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::structural::BoundaryStatus;
+use brokk_bifrost_jvm::kotlin::graph_support::KotlinSource;
+use brokk_bifrost_jvm::kotlin::imports::build_kotlin_top_level_declarations_by_package;
+use brokk_bifrost_jvm::kotlin::syntax;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::cache::{
+use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
+use crate::analyzer::jvm::external::{JvmExternalDeclarationIndex, JvmExternalDeclarations};
+use crate::analyzer::jvm::retained_external_index_state;
+use crate::analyzer::languages::{
+    BoundedReceiverQuery, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
+    StructuralReceiverResolver,
+};
+use crate::analyzer::pool_memo::PoolSafeMemo;
+use crate::analyzer::usages::GraphUsageAnalyzer;
+use crate::analyzer::usages::get_definition::{
+    BoundedResolution, DefinitionLookupOutcome, resolve_kotlin_bounded,
+};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_kotlin_type_bounded};
+use crate::analyzer::usages::kotlin_graph::{
+    KotlinUsageGraphStrategy, build_kotlin_usage_edge_weights, build_kotlin_usage_edges,
+};
+use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+use crate::analyzer::weighted_cache::{
     build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
     weight_project_file_set,
 };
-use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
-use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
-use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project, ProjectFile,
-    SemanticDiagnostic, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project,
+    ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    UsageFactsIndex,
+    UsageFactsIndex, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_jvm::kotlin::test_detection::detect_kotlin_test_assertion_smells;
+use brokk_bifrost_jvm::proof::JvmRetainedExternalIndex;
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
-use tests::detect_kotlin_test_assertion_smells;
+use tree_sitter::Node;
 
 pub(crate) use adapter::KotlinAdapter;
 use clones::build_kotlin_clone_candidate_data;
@@ -112,8 +132,12 @@ pub struct KotlinAnalyzer {
     top_level_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     realm_direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    direct_descendant_index: Arc<OnceLock<crate::analyzer::DirectDescendantIndex>>,
-    realm_direct_descendant_index: Arc<OnceLock<crate::analyzer::DirectDescendantIndex>>,
+    /// `PoolSafeMemo`, not `OnceLock`, for the same reason as the two sibling
+    /// index cells above: these whole-workspace builds are reached from rayon
+    /// workers during cold scans, and a blocking `get_or_init` parks every one
+    /// of them behind the single initializer for its full duration.
+    direct_descendant_index: Arc<PoolSafeMemo<crate::analyzer::DirectDescendantIndex>>,
+    realm_direct_descendant_index: Arc<PoolSafeMemo<crate::analyzer::DirectDescendantIndex>>,
 }
 
 crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
@@ -189,8 +213,8 @@ impl KotlinAnalyzer {
                 memo_budget / 16,
                 weight_code_unit_vec_by_unit,
             ),
-            direct_descendant_index: Arc::new(OnceLock::new()),
-            realm_direct_descendant_index: Arc::new(OnceLock::new()),
+            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
+            realm_direct_descendant_index: Arc::new(PoolSafeMemo::new()),
         }
     }
 
@@ -236,6 +260,92 @@ impl KotlinAnalyzer {
         })
     }
 
+    /// The external declaration surface Kotlin resolution reads: the shared
+    /// jar-backed index plus the declaration facts the activated semantic packs
+    /// publish (#1893).
+    ///
+    /// `packs` is the *dispatching* analyzer's overlay; see
+    /// [`crate::analyzer::JavaAnalyzer::resolve_type_name_with_external`] on
+    /// why activation state arrives as a parameter.
+    pub(crate) fn external_declarations(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> JvmExternalDeclarations<'_> {
+        JvmExternalDeclarations::new(self.external_declaration_index(), packs)
+    }
+
+    /// How far a lookup for `name` from `file` could see past the workspace,
+    /// and the external type it landed on when it landed on one.
+    ///
+    /// The JVM half of boundary refinement, mirroring
+    /// `JavaAnalyzer::external_boundary_evidence`: the name is resolved through
+    /// Kotlin's own import ladder against the shared external declaration
+    /// surface, so the trace classifies a spelling exactly as the
+    /// resolver would see it. A hit is [`BoundaryStatus::ExternalIndexed`] with
+    /// the resolved external type; a miss against an index whose producers
+    /// reported truncation is [`BoundaryStatus::ExternalDeclaredUnindexed`],
+    /// because the build declared artifacts the index never finished reading.
+    pub(crate) fn external_boundary_evidence(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        file: &ProjectFile,
+        name: &str,
+    ) -> (BoundaryStatus, Option<String>) {
+        use brokk_bifrost_jvm::kotlin::types::{
+            KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name,
+        };
+
+        let external = self.external_declarations(packs);
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        let imports = self.inner.import_info_of(file);
+        let scope = KotlinNameScope {
+            package_name: &package_name,
+            imports: &imports,
+            // The trace hands over a reference spelling without its enclosing
+            // declaration; a file-level scope is the resolution every import
+            // tier still sees.
+            scope_owners: Vec::new(),
+        };
+        let declares = |candidate: &str| {
+            external
+                .resolve_qualified_name(candidate, &package_name)
+                .is_some()
+        };
+        let external_type =
+            |spelling: &str| match resolve_kotlin_type_name(spelling, &scope, declares) {
+                KotlinTypeName::Resolved(fqn) => {
+                    external.resolve_qualified_name(&fqn, &package_name)
+                }
+                KotlinTypeName::Ambiguous | KotlinTypeName::Unresolved => None,
+            };
+        match resolve_kotlin_type_name(name, &scope, declares) {
+            KotlinTypeName::Resolved(fqn) => {
+                return (BoundaryStatus::ExternalIndexed, Some(fqn));
+            }
+            // Two star imports both name an indexed external type: the name is
+            // certainly indexed, but no single target can be reported.
+            KotlinTypeName::Ambiguous => return (BoundaryStatus::ExternalIndexed, None),
+            KotlinTypeName::Unresolved => {}
+        }
+        // A member spelling leaves the workspace exactly as its owner type
+        // does, so the member tier runs where the type tier found nothing
+        // (#1900). A member the surface does not declare changes nothing.
+        if let Some(member) = external.resolve_member_spelling(name, &package_name, external_type) {
+            return (
+                BoundaryStatus::ExternalIndexed,
+                Some(member.fqn().to_owned()),
+            );
+        }
+        if self
+            .external_declaration_index()
+            .production_diagnostic_count()
+            > 0
+        {
+            return (BoundaryStatus::ExternalDeclaredUnindexed, None);
+        }
+        (BoundaryStatus::ExternalUnknown, None)
+    }
+
     /// Row-capped projections for bounded receiver queries (issue #1242).
     ///
     /// A bounded query must be able to observe exhaustion before an unbounded
@@ -247,6 +357,14 @@ impl KotlinAnalyzer {
         limit: usize,
     ) -> crate::analyzer::store::LimitedQueryRows<SignatureMetadata> {
         self.inner.signature_metadata_limited(code_unit, limit)
+    }
+
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> crate::analyzer::store::LimitedQueryRows<String> {
+        self.inner.signatures_limited(code_unit, limit)
     }
 
     pub(crate) fn ranges_limited(
@@ -264,29 +382,77 @@ impl TypeAliasProvider for KotlinAnalyzer {
     }
 }
 
-impl IAnalyzer for KotlinAnalyzer {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.begin_query(context);
+impl KotlinSource for KotlinAnalyzer {
+    fn all_files(&self) -> Vec<ProjectFile> {
+        self.inner.all_files()
     }
 
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        self.inner.end_query(context);
+    fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
+        self.inner.package_name_of(file)
     }
 
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
+    fn usage_definitions(&self) -> &dyn crate::analyzer::BoundedDefinitionLookup {
+        self.inner.global_usage_definition_index_ref()
     }
 
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
+    fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>> {
+        self.inner.type_identifiers_of(file)
     }
 
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
+    fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.inner.raw_supertypes_of(code_unit)
     }
 
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.inner.workspace_file_index_cell()
+    /// Built once per analyzer generation: a star import has to widen to a
+    /// whole package, and repeating that scan per file would be quadratic in
+    /// workspace size.
+    fn top_level_declarations_by_package(&self) -> &HashMap<String, Arc<Vec<CodeUnit>>> {
+        self.top_level_declarations_by_package
+            .get_or_init(|| build_kotlin_top_level_declarations_by_package(self))
+    }
+
+    fn external_index_is_empty(&self) -> bool {
+        self.external_declaration_index().is_empty()
+    }
+
+    fn external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool {
+        self.external_declaration_index()
+            .resolve_qualified_name(fqn, access_package)
+            .is_some()
+    }
+
+    fn retained_external_index(&self) -> JvmRetainedExternalIndex {
+        retained_external_index_state(self.external_index.get())
+    }
+
+    fn retained_external_qualified_name_exists(&self, fqn: &str, access_package: &str) -> bool {
+        self.external_index.get().is_some_and(|external| {
+            external
+                .resolve_qualified_name(fqn, access_package)
+                .is_some()
+        })
+    }
+}
+
+use crate::analyzer::CodeUnitIndex;
+
+impl CodeUnitIndex for KotlinAnalyzer {
+    fn enclosing_code_unit(
+        &self,
+        file: &ProjectFile,
+        range: &crate::analyzer::Range,
+    ) -> Option<CodeUnit> {
+        self.inner.enclosing_code_unit(file, range)
+    }
+
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        self.inner
+            .enclosing_code_unit_for_lines(file, start_line, end_line)
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
@@ -306,6 +472,14 @@ impl IAnalyzer for KotlinAnalyzer {
 
     fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
         self.inner.indexed_source(file)
+    }
+
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.inner.location_declarations(file)
+    }
+
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
+        self.inner.location_ranges(code_unit)
     }
 
     fn indexed_source_matches(&self, file: &ProjectFile, source: &str) -> bool {
@@ -328,58 +502,6 @@ impl IAnalyzer for KotlinAnalyzer {
         self.inner.definitions(fq_name)
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .global_usage_definition_index_build_count_for_test()
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        self.inner.reset_full_declaration_scan_count_for_test();
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        self.inner.full_declaration_scan_count_for_test()
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        self.inner.reset_full_hydration_count_for_test();
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
-    }
-
-    fn reset_workspace_path_scan_count_for_test(&self) {
-        self.inner.reset_workspace_path_scan_count_for_test();
-    }
-
-    fn workspace_path_scan_count_for_test(&self) -> usize {
-        self.inner.workspace_path_scan_count_for_test()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        self.inner.global_usage_definition_index()
-    }
-
-    fn usage_facts_index(&self) -> &UsageFactsIndex {
-        self.inner.usage_facts_index()
-    }
-
-    fn structural_search_providers(
-        &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
-    }
-
-    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
-        Some(self.inner.snapshot_caches())
-    }
-
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         self.inner
             .direct_children(code_unit)
@@ -389,11 +511,7 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        IAnalyzer::parent_of(&self.inner, code_unit)
-    }
-
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.inner.import_statements(file)
+        CodeUnitIndex::parent_of(&self.inner, code_unit)
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<crate::analyzer::Range> {
@@ -410,23 +528,12 @@ impl IAnalyzer for KotlinAnalyzer {
             .ranges_with_limit(code_unit, max_ranges, cancellation)
     }
 
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        self.inner.compute_cognitive_complexities(file)
-    }
-
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
         self.inner.signatures(code_unit)
     }
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
         self.inner.signature_metadata(code_unit)
-    }
-
-    fn semantic_diagnostics(&self, file: &ProjectFile, source: &str) -> Vec<SemanticDiagnostic> {
-        diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
-            .into_iter()
-            .map(SemanticDiagnostic::from)
-            .collect()
     }
 
     fn get_analyzed_files(&self) -> BTreeSet<ProjectFile> {
@@ -437,46 +544,8 @@ impl IAnalyzer for KotlinAnalyzer {
         self.inner.languages()
     }
 
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        // Every import- and package-derived index is rebuilt from the new
-        // generation: an edit anywhere can add, remove, or rename a
-        // declaration that some other file's import resolves to.
-        let mut updated = Self::from_inner(
-            self.inner.update(changed_files),
-            self.memo_budget,
-            self.jvm_config.clone(),
-        );
-        // A touched build manifest can add or drop dependencies, so the
-        // jar-backed index is discarded and rebuilt on demand; every other
-        // edit leaves the classpath alone and the existing index stands.
-        if !changed_files.iter().any(is_jvm_dependency_input) {
-            updated.external_index = Arc::clone(&self.external_index);
-        }
-        updated
-    }
-
-    fn update_all(&self) -> Self {
-        Self::from_inner(
-            self.inner.update_all(),
-            self.memo_budget,
-            self.jvm_config.clone(),
-        )
-    }
-
     fn project(&self) -> &dyn Project {
         self.inner.project()
-    }
-
-    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
-        Some(self)
-    }
-
-    fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
-        Some(self)
-    }
-
-    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
-        Some(self)
     }
 
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
@@ -485,47 +554,6 @@ impl IAnalyzer for KotlinAnalyzer {
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
         self.inner.get_definitions(fq_name)
-    }
-
-    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
-        self.inner.parse_errors(file)
-    }
-
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.inner.extract_call_receiver(reference)
-    }
-
-    fn enclosing_code_unit(
-        &self,
-        file: &ProjectFile,
-        range: &crate::analyzer::Range,
-    ) -> Option<CodeUnit> {
-        self.inner.enclosing_code_unit(file, range)
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        self.inner
-            .enclosing_code_unit_for_lines(file, start_line, end_line)
-    }
-
-    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
-        self.inner.is_access_expression(file, start_byte, end_byte)
-    }
-
-    fn find_nearest_declaration(
-        &self,
-        file: &ProjectFile,
-        start_byte: usize,
-        end_byte: usize,
-        ident: &str,
-    ) -> Option<crate::analyzer::DeclarationInfo> {
-        self.inner
-            .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
@@ -564,12 +592,154 @@ impl IAnalyzer for KotlinAnalyzer {
         self.inner.lookup_candidates_by_short_name(symbol)
     }
 
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        self.inner.has_complete_symbol_lookup_index()
+    }
+
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_declarations_by_identifier(identifier)
     }
+}
 
-    fn has_complete_symbol_lookup_index(&self) -> bool {
-        self.inner.has_complete_symbol_lookup_index()
+impl IAnalyzer for KotlinAnalyzer {
+    fn invalidate_cached_file_identities(&self) {
+        self.inner.invalidate_cached_file_identities();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.begin_query(context);
+    }
+
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        self.inner.end_query(context);
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.inner.release_streaming_readers();
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.inner.workspace_file_index_cell()
+    }
+
+    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
+        self.inner.global_usage_definition_index()
+    }
+
+    fn usage_facts_index(&self) -> &UsageFactsIndex {
+        self.inner.usage_facts_index()
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        self.inner.structural_search_providers()
+    }
+
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(self.inner.snapshot_caches())
+    }
+
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        self.inner.import_statements(file)
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        self.inner.compute_cognitive_complexities(file)
+    }
+
+    fn semantic_diagnostics(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+    ) -> crate::analyzer::SemanticDiagnosticReport {
+        diagnostics::collect_kotlin_semantic_diagnostics(self, file, source, None)
+    }
+
+    /// Build the jar-backed external declaration index off the request path.
+    /// See `JavaAnalyzer::warm_query_indexes`; the three JVM analyzers share
+    /// one dependency universe and one reason not to build it under a
+    /// diagnostic.
+    fn warm_query_indexes(&self) {
+        self.external_declaration_index();
+    }
+
+    fn query_indexes_warm(&self) -> bool {
+        self.external_index.get().is_some()
+    }
+
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        // Every import- and package-derived index is rebuilt from the new
+        // generation: an edit anywhere can add, remove, or rename a
+        // declaration that some other file's import resolves to.
+        let mut updated = Self::from_inner(
+            self.inner.update(changed_files),
+            self.memo_budget,
+            self.jvm_config.clone(),
+        );
+        // A touched build manifest can add or drop dependencies, so the
+        // jar-backed index is discarded and rebuilt on demand; every other
+        // edit leaves the classpath alone and the existing index stands.
+        if !changed_files.iter().any(is_jvm_dependency_input) {
+            updated.external_index = Arc::clone(&self.external_index);
+        }
+        updated
+    }
+
+    fn update_all(&self) -> Self {
+        Self::from_inner(
+            self.inner.update_all(),
+            self.memo_budget,
+            self.jvm_config.clone(),
+        )
+    }
+
+    fn import_analysis_provider(&self) -> Option<&dyn ImportAnalysisProvider> {
+        Some(self)
+    }
+
+    fn type_alias_provider(&self) -> Option<&dyn TypeAliasProvider> {
+        Some(self)
+    }
+
+    fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
+        Some(self)
+    }
+
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.inner.parse_errors(file)
+    }
+
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        self.inner.extract_call_receiver(reference)
+    }
+
+    fn is_access_expression(&self, file: &ProjectFile, start_byte: usize, end_byte: usize) -> bool {
+        self.inner.is_access_expression(file, start_byte, end_byte)
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        file: &ProjectFile,
+        start_byte: usize,
+        end_byte: usize,
+        ident: &str,
+    ) -> Option<crate::analyzer::DeclarationInfo> {
+        self.inner
+            .find_nearest_declaration(file, start_byte, end_byte, ident)
     }
 
     fn search_symbol_candidates(
@@ -629,4 +799,208 @@ impl IAnalyzer for KotlinAnalyzer {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl crate::analyzer::AnalyzerTestHooks for KotlinAnalyzer {
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+    }
+
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .global_usage_definition_index_build_count_for_test()
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .full_declaration_scan_count_for_test()
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        self.inner.reset_full_hydration_count_for_test();
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        self.inner.full_hydration_count_for_test() + self.inner.bulk_hydration_count_for_test()
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_workspace_path_scan_count_for_test();
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        self.inner.test_hooks().workspace_path_scan_count_for_test()
+    }
+}
+
 impl TestDetectionProvider for KotlinAnalyzer {}
+
+static KOTLIN_USAGE_STRATEGY: KotlinUsageGraphStrategy = KotlinUsageGraphStrategy::new();
+
+pub(crate) struct KotlinSupport;
+
+impl LanguageSupport for KotlinSupport {
+    fn language(&self) -> Language {
+        Language::Kotlin
+    }
+
+    /// Kotlin's grammar names neither the callee of a call nor the member of a
+    /// navigation, so both are read through the positional readers the Kotlin adapters
+    /// already use.
+    fn call_callee_node<'t>(&self, call: Node<'t>) -> Option<Node<'t>> {
+        syntax::kotlin_callee(call)
+    }
+
+    /// The argument list is `value_arguments`, which an ordinary call nests one level
+    /// down inside `call_suffix`.
+    fn call_argument_nodes<'t>(&self, call: Node<'t>) -> Option<Vec<Node<'t>>> {
+        Some(syntax::kotlin_value_arguments(call).into_iter().collect())
+    }
+
+    fn factory_name_node<'t>(&self, call: Node<'t>) -> Option<Node<'t>> {
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let callee = syntax::kotlin_callee(call)?;
+        match callee.kind() {
+            "navigation_expression" => syntax::kotlin_navigation_member(callee),
+            "simple_identifier" => Some(callee),
+            _ => None,
+        }
+    }
+
+    fn signature_metadata_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<SignatureMetadata>> {
+        resolve_analyzer::<KotlinAnalyzer>(analyzer)
+            .map(|kotlin| kotlin.signature_metadata_limited(unit, limit))
+    }
+
+    fn signatures_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<String>> {
+        resolve_analyzer::<KotlinAnalyzer>(analyzer)
+            .map(|kotlin| kotlin.signatures_limited(unit, limit))
+    }
+
+    fn declaration_ranges_limited(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        unit: &CodeUnit,
+        limit: usize,
+    ) -> Option<LimitedQueryRows<Range>> {
+        resolve_analyzer::<KotlinAnalyzer>(analyzer)
+            .map(|kotlin| kotlin.ranges_limited(unit, limit))
+    }
+
+    fn forward_query_provider<'a>(
+        &self,
+        analyzer: &'a dyn IAnalyzer,
+    ) -> Option<&'a dyn ForwardQueryProvider> {
+        resolve_analyzer::<KotlinAnalyzer>(analyzer).map(|value| value as _)
+    }
+
+    fn ecosystem(&self) -> UsageEcosystem {
+        UsageEcosystem::Jvm
+    }
+
+    fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer {
+        &KOTLIN_USAGE_STRATEGY
+    }
+
+    fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
+        Some(&KotlinEdgePass)
+    }
+
+    fn dead_code(&self) -> DeadCodeSupport {
+        DeadCodeSupport {
+            strategy: Some(&KOTLIN_USAGE_STRATEGY),
+            bulk: None,
+        }
+    }
+
+    fn structural_receiver(&self) -> Option<&'static dyn StructuralReceiverResolver> {
+        Some(&KotlinSupport)
+    }
+
+    fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
+        language::LANGUAGE.into()
+    }
+
+    fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
+        &brokk_bifrost_jvm::kotlin::structural::KOTLIN_STRUCTURAL_SPEC
+    }
+
+    fn highlight_query(&self) -> Option<&'static str> {
+        Some(brokk_bifrost_jvm::queries::KOTLIN_HIGHLIGHTS_QUERY)
+    }
+}
+
+/// One of three distinct JVM passes. Java, Scala and Kotlin resolve over the same
+/// candidate space but scan only files of their own language, so the three passes cover
+/// disjoint call sites and merge without double counting.
+struct KotlinEdgePass;
+
+impl LanguageEdgePass for KotlinEdgePass {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Kotlin
+    }
+
+    fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
+        build_kotlin_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+    }
+
+    fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
+        build_kotlin_usage_edge_weights(ctx.analyzer, ctx.fqns, ctx.keep_file)
+            .map(LanguageEdgeWeights::Fqn)
+    }
+}
+
+impl StructuralReceiverResolver for KotlinSupport {
+    fn resolve_type_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<TypeLookupOutcome> {
+        resolve_kotlin_type_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+
+    fn resolve_definition_bounded(
+        &self,
+        query: BoundedReceiverQuery<'_>,
+    ) -> BoundedResolution<DefinitionLookupOutcome> {
+        resolve_kotlin_bounded(
+            query.analyzer,
+            query.file,
+            query.source,
+            query.tree,
+            query.site,
+            query.budget,
+            query.cancellation,
+        )
+    }
+}

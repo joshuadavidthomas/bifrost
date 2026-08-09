@@ -17,7 +17,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.8.22"
+brokk-bifrost = "0.8.24"
 ```
 
 For local development against a checkout, use a path dependency:
@@ -36,8 +36,34 @@ use brokk_bifrost::{AnalyzerConfig, FilesystemProject, WorkspaceAnalyzer};
 
 `brokk-bifrost` is the supported default dependency. It is the compatibility
 facade: it re-exports the analyzer and service API, and Cargo resolves the
-analysis, runtime, MCP, and LSP implementation crates automatically. Most
-applications should depend on this package alone.
+analysis, language-adapter, runtime, MCP, and LSP implementation crates
+automatically. Most applications should depend on this package alone.
+
+### Language Adapters
+
+Each language family is now a separate published adapter crate. This split
+keeps language-specific parser and resolver code separate from the shared
+analysis engine.
+
+| Source language | Cargo package | Rust crate |
+| --- | --- | --- |
+| C and C++ | `brokk-bifrost-cpp` | `brokk_bifrost_cpp` |
+| C# | `brokk-bifrost-csharp` | `brokk_bifrost_csharp` |
+| Go | `brokk-bifrost-go` | `brokk_bifrost_go` |
+| JavaScript and TypeScript | `brokk-bifrost-js-ts` | `brokk_bifrost_js_ts` |
+| Java, Kotlin, and Scala | `brokk-bifrost-jvm` | `brokk_bifrost_jvm` |
+| PHP | `brokk-bifrost-php` | `brokk_bifrost_php` |
+| Python | `brokk-bifrost-python` | `brokk_bifrost_python` |
+| Ruby | `brokk-bifrost-ruby` | `brokk_bifrost_ruby` |
+| Rust | `brokk-bifrost-rust` | `brokk_bifrost_rust` |
+
+`brokk-bifrost` and `brokk-bifrost-analysis` currently depend on all of these
+adapters. Adding one adapter directly does not limit the languages that
+`WorkspaceAnalyzer` loads or reduce the facade dependency set.
+
+Use a direct adapter dependency only when you own a focused host or an adapter
+integration. Keep every direct Bifrost dependency on the same release version.
+The adapter APIs are internal and can change between releases.
 
 For an application that only hosts Bifrost over the Language Server Protocol,
 depend directly on the focused LSP host instead:
@@ -60,12 +86,30 @@ The LSP client can replace that fallback with its advertised workspace folders
 during initialization. Reserve the process's standard input and output for LSP
 messages, and follow the [LSP server guide](/lsp/) for protocol configuration.
 
-`brokk-bifrost-core`, `brokk-bifrost-analysis`, `brokk-bifrost-policy`,
-`brokk-bifrost-nlp`, `brokk-bifrost-runtime`, and `brokk-bifrost-mcp` are
-lower-level workspace components. They are published
+`brokk-bifrost-core`, the language adapters above, `brokk-bifrost-analysis`,
+`brokk-bifrost-policy`, `brokk-bifrost-nlp`, `brokk-bifrost-runtime`, and
+`brokk-bifrost-mcp` are lower-level workspace components. They are published
 so focused hosts can compose them, but they are not necessary for ordinary
-library consumers; prefer the facade unless you specifically own one of those
-protocol boundaries.
+library consumers. Prefer the facade unless you own one of those boundaries.
+
+## Stability
+
+`brokk-bifrost`'s exported surface is the supported tier. While the project is
+pre-1.0 nothing is contractually frozen, but that surface is curated
+item by item, and we do not break it gratuitously: changes to it are
+deliberate, and release notes call them out.
+
+Everything beneath the facade may change in any release, including in a patch.
+The lower-level packages listed above exist so that a host owning one of those
+protocol boundaries can compose them, not as a general-purpose API; their types,
+traits, module paths, and crate boundaries move whenever the internal design
+calls for it. Each of them carries the same note on its crates.io and docs.rs
+page. `brokk-bifrost-lsp` is the one documented exception: its stdio server
+entry point above is a supported way to host Bifrost over LSP.
+
+There is no sealing and no `#[doc(hidden)]` sweep enforcing this. Depending
+directly on an internal package compiles and works; it just means you are
+tracking our internals, and an upgrade may require source changes.
 
 ## Minimal Analyzer
 

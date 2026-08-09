@@ -5,14 +5,15 @@ use super::declarations::{
 use super::dependency_discovery::DiscoveredGoPackage;
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
-    ActivationSelector, ArtifactProducerLimits, AuthoredPayload, AuthoredSemanticModelPack,
-    AuthoredShard, BoundedProducerDiagnostics, ChannelDirection, Compatibility, Completeness,
-    DependencyPackAdapter, DependencyPackProduction, EmbeddedTypeFact, ExactDependencyArtifact,
-    ExternalArtifactKind, HierarchyFact, HierarchyKind, Locator, MemberFact, MemberIdentity,
-    MemberKind, NameSelector, Parameter, Producer, Provenance, ReceiverFact, ResolvedDependency,
-    Safety, Signature, StructuredTypeExpression, TypeFact, TypeIdentity, TypeKind,
-    TypeParameterConstraint, TypeRef, VersionConstraint, Visibility, member_declaration_id,
-    type_declaration_id,
+    ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
+    AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
+    ChannelDirection, Compatibility, Completeness, DependencyPackAdapter, DependencyPackProduction,
+    EmbeddedTypeFact, ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind, HierarchyFact,
+    HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter,
+    Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance, ReceiverFact,
+    ResolvedDependency, Safety, Signature, StructuredTypeExpression, TypeFact, TypeIdentity,
+    TypeKind, TypeParameterConstraint, TypeRef, VersionConstraint, Visibility,
+    member_declaration_id, type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::{WalkControl, walk_named_tree_preorder};
 use crate::hash::{HashMap, HashSet};
@@ -172,6 +173,122 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
     }
 }
 
+/// One Go package as a pinned release spec declares it.
+///
+/// A workspace dependency learns its packages from `go list`, which is not
+/// available when authoring a pinned release bundle from a bare source tree.
+/// The spec names each package's import path, declared package name, and
+/// owned `.go` files explicitly instead, exactly as a pinned Python stub tree
+/// names its files: the structure is spec-authored, not toolchain-derived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoPinnedPackage {
+    pub import_path: String,
+    pub name: String,
+    pub files: Vec<String>,
+}
+
+/// Produce one pack from a pinned exact source set of `.go` files, grouped
+/// into packages the spec names explicitly.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GoModulePackProducer;
+
+impl GoModulePackProducer {
+    pub fn produce_loaded_source_set(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+        packages: &[GoPinnedPackage],
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::GoSourceSet {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.kind".to_owned(),
+                    location: None,
+                    message: "Go module producer requires a Go source-set artifact".to_owned(),
+                },
+                limits,
+            );
+        }
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        let discovered = packages
+            .iter()
+            .map(|package| DiscoveredGoPackage {
+                import_path: package.import_path.clone(),
+                name: package.name.clone(),
+                directory: String::new(),
+                files: package.files.clone(),
+                ignored_go_files: Vec::new(),
+                cgo_files: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let facts = produce_go_facts(
+            &discovered,
+            &HashMap::default(),
+            artifact
+                .source_entries()
+                .iter()
+                .map(|entry| (entry.relative_path(), entry.bytes())),
+            limits,
+            cancellation,
+            &mut diagnostics,
+        );
+        let Some((types, members)) = facts else {
+            let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+            return ArtifactProduction {
+                artifact_sha256: Some(artifact.sha256().to_owned()),
+                pack: None,
+                completeness: Completeness::Partial,
+                diagnostics,
+                suppressed_diagnostics,
+            };
+        };
+        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        };
+        let mut activation = request.activation.clone();
+        for selector in &mut activation {
+            selector.artifact_sha256 = Some(artifact.sha256().to_owned());
+        }
+        ArtifactProduction {
+            artifact_sha256: Some(artifact.sha256().to_owned()),
+            pack: Some(AuthoredSemanticModelPack {
+                schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+                pack_id: request.pack_id.clone(),
+                version: request.pack_version.clone(),
+                producer: Producer {
+                    name: "bifrost-go-module".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                },
+                language: "go".to_owned(),
+                ecosystem: request.ecosystem.clone(),
+                compatibility: request.compatibility.clone(),
+                provenance: request.provenance.clone(),
+                license: request.license.clone(),
+                completeness,
+                safety: request.safety.clone(),
+                shards: vec![AuthoredShard {
+                    id: "declarations.external".to_owned(),
+                    activation,
+                    payload: AuthoredPayload::DeclarationFacts {
+                        types,
+                        members,
+                        relations: Vec::new(),
+                    },
+                }],
+            }),
+            completeness,
+            diagnostics,
+            suppressed_diagnostics,
+        }
+    }
+}
+
 struct ProductionRequest {
     pack_id: String,
     version: String,
@@ -241,6 +358,31 @@ fn produce_go_facts<'a>(
     let entries = entries.into_iter().collect::<HashMap<_, _>>();
     let mut parsed_sources = Vec::new();
     for package in packages {
+        // A package whose surface the toolchain reported but this producer
+        // does not model keeps the pack explicitly partial. Both conditions
+        // hide exported declarations: cgo files declare Go surface this
+        // producer cannot parse, and a build constraint excluded the ignored
+        // files from this target's build. Absence proofs read the resulting
+        // completeness, so a member miss against such a package is suppressed
+        // rather than reported (#1623). Test files never contribute exported
+        // API, so an excluded `_test.go` does not reduce the surface.
+        let constrained = package
+            .ignored_go_files
+            .iter()
+            .filter(|path| !path.ends_with("_test.go"))
+            .chain(package.cgo_files.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !constrained.is_empty() {
+            diagnostics.warning(
+                "go.constrained_surface",
+                Some(package.import_path.clone()),
+                format!(
+                    "Go package {} has sources this producer does not model, so its exported surface is explicitly partial: {constrained:?}",
+                    package.import_path
+                ),
+            );
+        }
         for path in &package.files {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 diagnostics.error(
@@ -826,6 +968,7 @@ fn module_type_drafts(
                         hierarchy: Vec::new(),
                         aliases,
                         extension_surfaces: Vec::new(),
+                        guard: None,
                         locator: artifact_locator(&path, &name),
                     },
                     exported: false,
@@ -1085,6 +1228,7 @@ fn collect_type_draft(
                 .into_iter()
                 .collect(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: artifact_locator(&parsed.path, &canonical_name),
         },
         exported,
@@ -1494,6 +1638,7 @@ fn push_member(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            guard: None,
             locator,
         },
         surface,
@@ -2581,6 +2726,48 @@ var privateValue int
                 .any(|diagnostic| diagnostic.code == "go.generated_surface"),
             "{diagnostics:#?}"
         );
+    }
+
+    #[test]
+    fn producer_marks_cgo_and_build_constrained_sources_as_partial_coverage() {
+        let constrained = |ignored: &[&str], cgo: &[&str]| {
+            let mut package = package(&["api.go"]);
+            package.ignored_go_files = ignored.iter().map(|file| file.to_string()).collect();
+            package.cgo_files = cgo.iter().map(|file| file.to_string()).collect();
+            let limits = ArtifactProducerLimits::default();
+            let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+            produce_go_facts(
+                &[package],
+                &HashMap::default(),
+                [(
+                    "api/api.go",
+                    b"package api\ntype Exported struct{}\n".as_slice(),
+                )],
+                &limits,
+                None,
+                &mut diagnostics,
+            )
+            .unwrap();
+            diagnostics.finish().0
+        };
+        // Both conditions hide exported declarations from the produced pack,
+        // so its completeness must stay partial and a member miss against it
+        // must be suppressed rather than reported (#1623).
+        for (ignored, cgo) in [
+            (&["api/linux.go"][..], &[][..]),
+            (&[][..], &["api/bridge.go"][..]),
+        ] {
+            let diagnostics = constrained(ignored, cgo);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "go.constrained_surface"),
+                "{diagnostics:#?}"
+            );
+        }
+        // An excluded test file never contributed exported API, so it does not
+        // reduce the surface and must leave the pack complete.
+        assert!(constrained(&["api/api_test.go"], &[]).is_empty());
     }
 
     #[test]

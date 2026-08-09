@@ -1,6 +1,6 @@
 use brokk_bifrost::usages::{ExplicitCandidateProvider, FuzzyResult, UsageFinder};
 use brokk_bifrost::{
-    CodeUnit, CodeUnitType, CppAnalyzer, IAnalyzer, Language, ProjectFile, TestProject,
+    CodeUnit, CodeUnitIndex, CodeUnitType, CppAnalyzer, Language, ProjectFile, TestProject,
 };
 use std::collections::BTreeSet;
 use std::fs;

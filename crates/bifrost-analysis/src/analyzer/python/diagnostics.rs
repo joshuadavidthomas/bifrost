@@ -1,699 +1,345 @@
-use crate::analyzer::semantic_diagnostics::{
-    ScopeStack, contains_node, node_range, node_text, same_node,
+//! The analysis-side entry point for Python's semantic diagnostics.
+//!
+//! The language logic lives in [`brokk_bifrost_python::diagnostics`]. What
+//! stays here is what that crate cannot name: the downcast that produces the
+//! Python analysis source, and the retained environment surface -- the
+//! published semantic-model overlay plus the dependency-discovery evidence --
+//! that answers what the activated environment packs prove about an imported
+//! module.
+//!
+//! Both call sites pass the *dispatching* analyzer, because the overlay and
+//! the discovery evidence are published on the analyzer a host activated packs
+//! against, which in a workspace is the composite one, not the Python
+//! delegate.
+
+use std::sync::Arc;
+
+use crate::analyzer::python::external::PYTHON_UNENUMERATED_BINDING;
+use crate::analyzer::semantic_model::{
+    DependencyDiscoveryEvidence, RetainedDiscoveryVerdict, SemanticModelCompleteness,
+    SemanticModelOverlay, SemanticModelOverlayDisposition, SemanticModelSymbol,
+    SemanticModelSymbolKind, TypeIdentity, retained_discovery_verdict, type_declaration_id,
+    universal_root_name_for_language,
 };
-use crate::analyzer::tree_sitter_analyzer::collect_parse_errors;
-use crate::analyzer::tree_walk::subtree_contains;
+use crate::analyzer::structural::BoundaryStatus;
 use crate::analyzer::{
-    DefinitionIndexHandle, IAnalyzer, ImportAnalysisProvider, ProjectFile, PythonAnalyzer, Range,
-    SemanticDiagnostic, resolve_analyzer,
+    IAnalyzer, Language, ProjectFile, PythonAnalyzer, SemanticDiagnosticIncompleteReason,
+    SemanticDiagnosticReport, resolve_analyzer,
 };
-use crate::text_utils::compute_line_starts;
-use tree_sitter::{Node, Parser, Tree};
+use brokk_bifrost_python::diagnostics::{PythonEnvironmentBoundary, PythonEnvironmentSurface};
 
-pub(crate) const PYTHON_UNRECOGNIZED_SYMBOL: &str = "python_unrecognized_symbol";
-pub(crate) const PYTHON_SEMANTIC_DIAGNOSTIC_SOURCE: &str = "bifrost-python";
-const MAX_PYTHON_SEMANTIC_DIAGNOSTIC_BYTES: usize = 512 * 1024;
-const MAX_PYTHON_SEMANTIC_DIAGNOSTICS: usize = 200;
+/// The ecosystem every Python declaration identity is minted under, in the
+/// environment pack producer and here.
+const PYTHON_ECOSYSTEM: &str = "python";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PythonSemanticDiagnostic {
-    pub(crate) range: Range,
-    pub(crate) kind: &'static str,
-    pub(crate) message: String,
-}
+/// PEP 562's module-level attribute hook, which a class also uses to answer
+/// names its own surface does not list.
+const PYTHON_MODULE_GETATTR: &str = "__getattr__";
 
-impl From<PythonSemanticDiagnostic> for SemanticDiagnostic {
-    fn from(diagnostic: PythonSemanticDiagnostic) -> Self {
-        Self {
-            range: diagnostic.range,
-            source: PYTHON_SEMANTIC_DIAGNOSTIC_SOURCE,
-            kind: diagnostic.kind,
-            message: diagnostic.message,
-        }
-    }
-}
+/// The class hook that replaces attribute lookup outright.
+const PYTHON_CLASS_GETATTRIBUTE: &str = "__getattribute__";
 
-/// Collect conservative Python unresolved-name diagnostics.
-///
-/// This pass intentionally emits only for bare-name references. It suppresses
-/// files that use dynamic namespace features or unresolved wildcard imports,
-/// and it never diagnoses attribute/member names. Python programs commonly use
-/// optional imports, `sys.path` mutation, module `__getattr__`, monkey-patched
-/// attributes, and dynamic imports; those cases make absence unknowable without
-/// a fuller Python runtime model.
 pub(crate) fn collect_python_semantic_diagnostics(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
-) -> Vec<PythonSemanticDiagnostic> {
+) -> SemanticDiagnosticReport {
     let Some(py) = resolve_analyzer::<PythonAnalyzer>(analyzer) else {
-        return Vec::new();
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "no Python analyzer serves this file".to_string(),
+            }],
+        );
+        return report;
     };
-    if source.len() > MAX_PYTHON_SEMANTIC_DIAGNOSTIC_BYTES {
-        return Vec::new();
-    }
-    let Some(tree) = parse_python_tree(source) else {
-        return Vec::new();
-    };
-    let mut parse_errors = Vec::new();
-    collect_parse_errors(tree.root_node(), &mut parse_errors);
-    if !parse_errors.is_empty() || file_has_dynamic_unknowns(py, file, source, tree.root_node()) {
-        return Vec::new();
-    }
-
     let support = analyzer.global_usage_definition_index();
-    let line_starts = compute_line_starts(source);
-    let module_name = super::python_module_name(file);
-    let mut collector = PythonDiagnosticCollector {
+    let environment = RetainedPythonEnvironment {
+        overlay: analyzer.semantic_model_overlay(),
+        evidence: analyzer.dependency_discovery_evidence(Language::Python),
+    };
+    brokk_bifrost_python::diagnostics::collect_python_semantic_diagnostics(
         py,
-        analyzer,
-        support: &support,
+        &support,
+        &environment,
         file,
         source,
-        line_starts: &line_starts,
-        module_name,
-        diagnostics: Vec::new(),
-    };
-    collector.scan_tree(tree.root_node());
-    collector.diagnostics
+    )
 }
 
-fn parse_python_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source, None)
+/// The environment facts a diagnostic request is allowed to read: what an
+/// activation published, and what a discovery run retained. Both are analyzer
+/// state a host produced earlier. Nothing here starts discovery, reads a
+/// distribution, or executes Python.
+struct RetainedPythonEnvironment {
+    overlay: Option<Arc<SemanticModelOverlay>>,
+    evidence: Option<Arc<DependencyDiscoveryEvidence>>,
 }
 
-struct PythonDiagnosticCollector<'a> {
-    py: &'a PythonAnalyzer,
-    analyzer: &'a dyn IAnalyzer,
-    support: &'a DefinitionIndexHandle<'a>,
-    file: &'a ProjectFile,
-    source: &'a str,
-    line_starts: &'a [usize],
-    module_name: String,
-    diagnostics: Vec<PythonSemanticDiagnostic>,
-}
-
-enum ScanFrame<'tree> {
-    Node(Node<'tree>),
-    ExitScope,
-    SeedTargets(Node<'tree>),
-}
-
-impl PythonDiagnosticCollector<'_> {
-    fn scan_tree(&mut self, root: Node<'_>) {
-        let mut scopes = ScopeStack::default();
-        scopes.enter();
-        self.seed_module_scope(&mut scopes);
-        let mut stack = vec![ScanFrame::Node(root)];
-        while let Some(frame) = stack.pop() {
-            if self.diagnostics.len() >= MAX_PYTHON_SEMANTIC_DIAGNOSTICS {
-                break;
-            }
-            match frame {
-                ScanFrame::Node(node) => self.scan_node(node, &mut scopes, &mut stack),
-                ScanFrame::ExitScope => scopes.exit(),
-                ScanFrame::SeedTargets(node) => self.seed_assignment_targets(node, &mut scopes),
-            }
-        }
-    }
-
-    fn scan_node<'tree>(
-        &mut self,
-        node: Node<'tree>,
-        scopes: &mut ScopeStack,
-        stack: &mut Vec<ScanFrame<'tree>>,
-    ) {
-        match node.kind() {
-            "module" => push_named_children(stack, node),
-            "function_definition" | "lambda" => {
-                self.seed_named_declaration(node, scopes);
-                scopes.enter();
-                self.seed_parameters(node, scopes);
-                stack.push(ScanFrame::ExitScope);
-                push_named_children_except(stack, node, node.child_by_field_name("name"));
-            }
-            "class_definition" => {
-                self.seed_named_declaration(node, scopes);
-                self.push_field_if_present(stack, node, "superclasses");
-                scopes.enter();
-                stack.push(ScanFrame::ExitScope);
-                if let Some(body) = node.child_by_field_name("body") {
-                    stack.push(ScanFrame::Node(body));
+impl RetainedPythonEnvironment {
+    /// Why a module no active pack publishes cannot be judged.
+    fn missing_evidence(&self, module_path: &str) -> PythonEnvironmentBoundary {
+        let reason = match retained_discovery_verdict(self.evidence.as_deref(), module_path) {
+            RetainedDiscoveryVerdict::NoDiscovery | RetainedDiscoveryVerdict::Undeclared => {
+                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                    boundary: BoundaryStatus::ExternalUnknown,
                 }
             }
-            "list_comprehension"
-            | "set_comprehension"
-            | "dictionary_comprehension"
-            | "generator_expression" => {
-                scopes.enter();
-                self.seed_comprehension_targets(node, scopes);
-                stack.push(ScanFrame::ExitScope);
-                push_named_children(stack, node);
-            }
-            "match_statement" => {}
-            "import_statement" | "import_from_statement" => {}
-            "assignment" | "augmented_assignment" | "named_expression" => {
-                stack.push(ScanFrame::SeedTargets(node));
-                self.push_field_if_present(stack, node, "right");
-                self.push_field_if_present(stack, node, "value");
-            }
-            "for_statement" | "for_in_clause" => {
-                if let Some(body) = node.child_by_field_name("body") {
-                    stack.push(ScanFrame::Node(body));
-                }
-                stack.push(ScanFrame::SeedTargets(node));
-                self.push_field_if_present(stack, node, "right");
-            }
-            "with_statement" | "with_item" => {
-                stack.push(ScanFrame::SeedTargets(node));
-                push_named_children(stack, node);
-            }
-            "except_clause" => {
-                self.seed_except_alias(node, scopes);
-                push_named_children(stack, node);
-            }
-            "identifier" => self.check_identifier(node, scopes),
-            "attribute" => {
-                if let Some(object) = node.child_by_field_name("object") {
-                    stack.push(ScanFrame::Node(object));
+            RetainedDiscoveryVerdict::Truncated => SemanticDiagnosticIncompleteReason::Truncated,
+            RetainedDiscoveryVerdict::Declared => {
+                SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                    boundary: BoundaryStatus::ExternalDeclaredUnindexed,
                 }
             }
-            "string" | "string_content" | "comment" => {}
-            _ => push_named_children(stack, node),
+        };
+        PythonEnvironmentBoundary::Incomplete(reason)
+    }
+
+    /// The declaration an active pack publishes for `path`, or the verdict that
+    /// stands in for it.
+    ///
+    /// The lookup is by declaration identity rather than by name, so it cannot
+    /// be satisfied by a same-named symbol from another module.
+    fn published_declaration<'a>(
+        &self,
+        overlay: &'a SemanticModelOverlay,
+        path: &str,
+    ) -> Result<&'a SemanticModelSymbol, PythonEnvironmentBoundary> {
+        let matched = overlay.symbols_with_id(&python_declaration_id(path));
+        match matched.disposition {
+            SemanticModelOverlayDisposition::Empty => Err(self.missing_evidence(path)),
+            SemanticModelOverlayDisposition::Conflict => {
+                Err(PythonEnvironmentBoundary::Incomplete(
+                    SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                        detail: format!(
+                            "more than one active semantic pack declares Python `{path}`"
+                        ),
+                    },
+                ))
+            }
+            SemanticModelOverlayDisposition::Unique => Ok(matched
+                .records
+                .first()
+                .expect("a unique overlay match has one record")),
         }
     }
 
-    fn seed_module_scope(&self, scopes: &mut ScopeStack) {
-        for import in self.py.import_info_of(self.file) {
-            if let Some(local_name) = import.alias.as_ref().or(import.identifier.as_ref()) {
-                scopes.declare(local_name.clone());
-            }
+    /// The module surface an active pack publishes for `module_path`.
+    fn module_surface<'a>(
+        &self,
+        overlay: &'a SemanticModelOverlay,
+        module_path: &str,
+    ) -> Result<&'a SemanticModelSymbol, PythonEnvironmentBoundary> {
+        let symbol = self.published_declaration(overlay, module_path)?;
+        if symbol.kind != SemanticModelSymbolKind::Module {
+            return Err(PythonEnvironmentBoundary::Incomplete(
+                SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                    detail: format!(
+                        "`{module_path}` is an indexed Python type, not a module surface"
+                    ),
+                },
+            ));
         }
-        for (binding, _) in self.py.resolve_import_bindings(self.file) {
-            scopes.declare(binding);
-        }
-        for unit in self.analyzer.declarations(self.file) {
-            if !unit.identifier().is_empty() {
-                scopes.declare(unit.identifier().to_string());
-            }
-        }
+        Ok(symbol)
     }
 
-    fn seed_named_declaration(&self, node: Node<'_>, scopes: &mut ScopeStack) {
-        if let Some(name) = node.child_by_field_name("name") {
-            let text = node_text(name, self.source).trim();
-            if !text.is_empty() {
-                scopes.declare(text.to_string());
-            }
-        }
-    }
-
-    fn seed_parameters(&self, node: Node<'_>, scopes: &mut ScopeStack) {
-        if let Some(parameters) = node.child_by_field_name("parameters") {
-            collect_parameter_names(parameters, self.source, scopes);
-        }
-    }
-
-    fn seed_assignment_targets(&self, node: Node<'_>, scopes: &mut ScopeStack) {
-        for field in ["left", "name", "alias"] {
-            if let Some(target) = node.child_by_field_name(field) {
-                collect_bound_identifiers(target, self.source, scopes);
-            }
-        }
-        if node.kind() == "with_item" || node.kind() == "with_statement" {
-            collect_alias_children(node, self.source, scopes);
-        }
-    }
-
-    fn seed_except_alias(&self, node: Node<'_>, scopes: &mut ScopeStack) {
-        if let Some(alias) = node.child_by_field_name("alias") {
-            collect_bound_identifiers(alias, self.source, scopes);
-            return;
-        }
-        let mut identifiers = Vec::new();
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            if current.kind() == "identifier" {
-                let text = node_text(current, self.source).trim();
-                if !text.is_empty() {
-                    identifiers.push(text.to_string());
-                }
-                continue;
-            }
-            let mut cursor = current.walk();
-            for child in current.named_children(&mut cursor) {
-                stack.push(child);
-            }
-        }
-        if identifiers.len() >= 2
-            && let Some(alias) = identifiers.into_iter().next()
-        {
-            scopes.declare(alias);
-        }
-    }
-
-    fn seed_comprehension_targets(&self, node: Node<'_>, scopes: &mut ScopeStack) {
-        let mut stack = vec![node];
-        while let Some(current) = stack.pop() {
-            if matches!(current.kind(), "for_statement" | "for_in_clause")
-                && let Some(left) = current.child_by_field_name("left")
-            {
-                collect_bound_identifiers(left, self.source, scopes);
-            }
-            let mut cursor = current.walk();
-            for child in current.named_children(&mut cursor) {
-                stack.push(child);
-            }
-        }
-    }
-
-    fn check_identifier(&mut self, node: Node<'_>, scopes: &ScopeStack) {
-        if !self.is_reference_identifier(node) {
-            return;
-        }
-        let name = node_text(node, self.source);
-        if name.is_empty() || name == "_" || is_python_builtin_or_constant(name) {
-            return;
-        }
-        if scopes.contains(name) || self.name_resolves_project_locally(name) {
-            return;
-        }
-        self.diagnostics.push(PythonSemanticDiagnostic {
-            range: node_range(node, self.line_starts),
-            kind: PYTHON_UNRECOGNIZED_SYMBOL,
-            message: format!("Unrecognized Python symbol `{name}`"),
-        });
-    }
-
-    fn is_reference_identifier(&self, node: Node<'_>) -> bool {
-        if is_declaration_identifier(node)
-            || is_import_identifier(node)
-            || is_attribute_identifier(node)
-            || is_pattern_identifier(node)
-        {
-            return false;
-        }
-        let mut current = node;
-        while let Some(parent) = current.parent() {
-            if matches!(parent.kind(), "string" | "string_content" | "comment") {
-                return false;
-            }
-            current = parent;
-        }
-        true
-    }
-
-    fn name_resolves_project_locally(&self, name: &str) -> bool {
-        if !self.support.file_identifier(self.file, name).is_empty() {
-            return true;
-        }
-        if !self
-            .support
-            .fqn(&format!("{}.{}", self.module_name, name))
+    /// Judge `member` against a published module's surface.
+    fn module_member(
+        &self,
+        overlay: &SemanticModelOverlay,
+        module: &SemanticModelSymbol,
+        module_path: &str,
+        member: &str,
+    ) -> PythonEnvironmentBoundary {
+        // A submodule, class, or type alias the module declares is published
+        // as its own qualified declaration.
+        if !overlay
+            .symbols_with_id(&python_declaration_id(&format!("{module_path}.{member}")))
+            .records
             .is_empty()
         {
-            return true;
+            return PythonEnvironmentBoundary::Indexed;
         }
-        let bindings = self.py.resolve_import_bindings(self.file);
-        if bindings.contains_key(name) {
-            return true;
+        let members = overlay.members_of(&module.id);
+        if members.records.iter().any(|record| record.name == member) {
+            return PythonEnvironmentBoundary::Indexed;
         }
-        false
+        // PEP 562: a module `__getattr__` answers any name at run time, so a
+        // miss against the published surface proves nothing.
+        if members
+            .records
+            .iter()
+            .any(|record| record.name == PYTHON_MODULE_GETATTR)
+        {
+            return PythonEnvironmentBoundary::Incomplete(
+                SemanticDiagnosticIncompleteReason::DynamicBehavior {
+                    detail: format!("Python module `{module_path}` defines `__getattr__`"),
+                },
+            );
+        }
+        // The producer recorded that this surface binds names it could not
+        // enumerate, e.g. a wildcard re-export in the package's `__init__`.
+        if members
+            .records
+            .iter()
+            .any(|record| record.name == PYTHON_UNENUMERATED_BINDING)
+        {
+            return PythonEnvironmentBoundary::Incomplete(
+                SemanticDiagnosticIncompleteReason::DynamicBehavior {
+                    detail: format!(
+                        "Python module `{module_path}` re-exports names its semantic pack could not enumerate"
+                    ),
+                },
+            );
+        }
+        // A member identity duplicated inside one module says nothing about a
+        // name that is not there; two packs declaring the whole module is the
+        // conflict that matters, and `published_declaration` already reported
+        // it.
+        if module.provenance.completeness != SemanticModelCompleteness::Complete {
+            // A partial surface is exactly the missing or dynamic-only stub
+            // case: what it does publish is true, what it omits is unknown.
+            return PythonEnvironmentBoundary::Incomplete(
+                SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                    detail: format!(
+                        "the active semantic pack for Python module `{module_path}` is partial"
+                    ),
+                },
+            );
+        }
+        PythonEnvironmentBoundary::Absent
     }
 
-    fn push_field_if_present<'tree>(
+    /// Judge `member` against a published type's whole inherited surface.
+    ///
+    /// This is the #1622 remainder. It answers `Absent` only behind the
+    /// overlay's three-layer owner-surface gate, so a type whose base no pack
+    /// published, or whose closure comes from a partial pack, suppresses with a
+    /// reason that names the gap instead of claiming a member is missing from a
+    /// surface Bifrost has not seen.
+    fn type_member(
         &self,
-        stack: &mut Vec<ScanFrame<'tree>>,
-        node: Node<'tree>,
-        field_name: &str,
-    ) {
-        if let Some(child) = node.child_by_field_name(field_name) {
-            stack.push(ScanFrame::Node(child));
+        overlay: &SemanticModelOverlay,
+        owner: &SemanticModelSymbol,
+        owner_path: &str,
+        member: &str,
+    ) -> PythonEnvironmentBoundary {
+        let surface = overlay.owner_surface(owner);
+        if let Some(gap) = surface.gaps.first() {
+            return PythonEnvironmentBoundary::Incomplete(
+                SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                    detail: format!(
+                        "the inherited surface of Python type `{owner_path}` is incomplete: {gap}"
+                    ),
+                },
+            );
         }
-    }
-}
-
-fn file_has_dynamic_unknowns(
-    py: &PythonAnalyzer,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-) -> bool {
-    has_unresolved_wildcard_import(py, file)
-        || has_module_getattr(source, root)
-        || has_dynamic_namespace_call(source, root)
-}
-
-fn has_unresolved_wildcard_import(py: &PythonAnalyzer, file: &ProjectFile) -> bool {
-    py.import_info_of(file)
-        .iter()
-        .filter(|import| import.is_wildcard)
-        .any(|import| py.resolve_import(file, import).is_empty())
-}
-
-fn has_module_getattr(source: &str, root: Node<'_>) -> bool {
-    let mut cursor = root.walk();
-    root.named_children(&mut cursor).any(|child| {
-        child.kind() == "function_definition"
-            && child
-                .child_by_field_name("name")
-                .is_some_and(|name| node_text(name, source) == "__getattr__")
-    })
-}
-
-fn has_dynamic_namespace_call(source: &str, root: Node<'_>) -> bool {
-    subtree_contains(root, |node| {
-        node.kind() == "call"
-            && node
-                .child_by_field_name("function")
-                .is_some_and(|function| is_dynamic_function(function, source))
-    })
-}
-
-fn is_dynamic_function(node: Node<'_>, source: &str) -> bool {
-    match node.kind() {
-        "identifier" => matches!(node_text(node, source), "globals" | "locals" | "__import__"),
-        "attribute" => node_text(node, source) == "importlib.import_module",
-        _ => false,
-    }
-}
-
-fn collect_bound_identifiers(node: Node<'_>, source: &str, scopes: &mut ScopeStack) {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        match current.kind() {
-            "identifier" => {
-                let text = node_text(current, source).trim();
-                if !text.is_empty() {
-                    scopes.declare(text.to_string());
-                }
+        // A hook found on one class still does not matter if another class in
+        // the closure declares the member, so the whole closure is scanned
+        // before a dynamic verdict is returned.
+        let mut dynamic = None;
+        for record in &surface.closure {
+            // A nested class or type alias is published as its own qualified
+            // declaration rather than as a member of its owner.
+            if !overlay
+                .symbols_with_id(&python_declaration_id(&format!(
+                    "{}.{member}",
+                    record.qualified_name
+                )))
+                .records
+                .is_empty()
+            {
+                return PythonEnvironmentBoundary::Indexed;
             }
-            "attribute" | "call" => {}
-            _ => {
-                let mut cursor = current.walk();
-                for child in current.named_children(&mut cursor) {
-                    stack.push(child);
+            for published in overlay.members_of(&record.id).records {
+                if published.name == member {
+                    return PythonEnvironmentBoundary::Indexed;
+                }
+                if dynamic.is_none() {
+                    dynamic = dynamic_surface_detail(record, &published.name);
                 }
             }
         }
-    }
-}
-
-fn collect_parameter_names(node: Node<'_>, source: &str, scopes: &mut ScopeStack) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(name) = python_parameter_name(child, source) {
-            scopes.declare(name);
+        match dynamic {
+            Some(detail) => PythonEnvironmentBoundary::Incomplete(
+                SemanticDiagnosticIncompleteReason::DynamicBehavior { detail },
+            ),
+            None => PythonEnvironmentBoundary::Absent,
         }
     }
 }
 
-fn python_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
-    match node.kind() {
-        "identifier" => Some(node_text(node, source).trim().to_string()),
-        "typed_parameter"
-        | "typed_default_parameter"
-        | "default_parameter"
-        | "list_splat_pattern"
-        | "dictionary_splat_pattern" => node
-            .child_by_field_name("name")
-            .or_else(|| {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .find(|child| child.kind() == "identifier")
-            })
-            .and_then(|name| python_parameter_name(name, source)),
+/// Why one published member name makes its owner's attribute lookup dynamic,
+/// or `None` when it does not.
+///
+/// `object` supplies the default attribute lookup, so its own
+/// `__getattribute__` is not an override and does not make every Python class
+/// unprovable. An override on any other class does.
+fn dynamic_surface_detail(owner: &SemanticModelSymbol, member_name: &str) -> Option<String> {
+    let owner_name = &owner.qualified_name;
+    let is_universal_root =
+        universal_root_name_for_language(&owner.language) == Some(owner_name.as_str());
+    match member_name {
+        PYTHON_MODULE_GETATTR => Some(format!(
+            "Python type `{owner_name}` defines `{PYTHON_MODULE_GETATTR}`"
+        )),
+        PYTHON_CLASS_GETATTRIBUTE if !is_universal_root => Some(format!(
+            "Python type `{owner_name}` overrides `{PYTHON_CLASS_GETATTRIBUTE}`"
+        )),
+        PYTHON_UNENUMERATED_BINDING => Some(format!(
+            "Python type `{owner_name}` binds names its semantic pack could not enumerate"
+        )),
         _ => None,
     }
-    .filter(|name| !name.is_empty())
 }
 
-fn collect_alias_children(node: Node<'_>, source: &str, scopes: &mut ScopeStack) {
-    let mut cursor = node.walk();
-    for alias in node.children_by_field_name("alias", &mut cursor) {
-        collect_bound_identifiers(alias, source, scopes);
+impl PythonEnvironmentSurface for RetainedPythonEnvironment {
+    fn module_boundary(&self, module_path: &str) -> PythonEnvironmentBoundary {
+        let Some(overlay) = self.overlay.as_deref() else {
+            return self.missing_evidence(module_path);
+        };
+        match self.module_surface(overlay, module_path) {
+            Ok(_) => PythonEnvironmentBoundary::Indexed,
+            Err(boundary) => boundary,
+        }
     }
-    let mut cursor = node.walk();
-    for item in node.named_children(&mut cursor) {
-        let mut item_cursor = item.walk();
-        for alias in item.children_by_field_name("alias", &mut item_cursor) {
-            collect_bound_identifiers(alias, source, scopes);
+
+    fn attribute_boundary(&self, owner_path: &str, member: &str) -> PythonEnvironmentBoundary {
+        let Some(overlay) = self.overlay.as_deref() else {
+            return self.missing_evidence(owner_path);
+        };
+        let owner = match self.published_declaration(overlay, owner_path) {
+            Ok(owner) => owner,
+            Err(boundary) => return boundary,
+        };
+        if owner.kind == SemanticModelSymbolKind::Module {
+            self.module_member(overlay, owner, owner_path, member)
+        } else {
+            self.type_member(overlay, owner, owner_path, member)
         }
     }
 }
 
-fn push_named_children<'tree>(stack: &mut Vec<ScanFrame<'tree>>, node: Node<'tree>) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node.named_children(&mut cursor).collect();
-    for child in children.into_iter().rev() {
-        stack.push(ScanFrame::Node(child));
-    }
-}
-
-fn push_named_children_except<'tree>(
-    stack: &mut Vec<ScanFrame<'tree>>,
-    node: Node<'tree>,
-    excluded: Option<Node<'tree>>,
-) {
-    let mut cursor = node.walk();
-    let children: Vec<_> = node
-        .named_children(&mut cursor)
-        .filter(|child| excluded.is_none_or(|excluded| !same_node(*child, excluded)))
-        .collect();
-    for child in children.into_iter().rev() {
-        stack.push(ScanFrame::Node(child));
-    }
-}
-
-fn is_declaration_identifier(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    match parent.kind() {
-        "function_definition" | "class_definition" => parent
-            .child_by_field_name("name")
-            .is_some_and(|name| same_node(name, node)),
-        "parameters" | "list_splat_pattern" | "dictionary_splat_pattern" => true,
-        "default_parameter" | "typed_parameter" | "typed_default_parameter" => parent
-            .child_by_field_name("name")
-            .is_some_and(|name| contains_node(name, node)),
-        "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => parent
-            .child_by_field_name("left")
-            .is_some_and(|left| contains_node(left, node)),
-        "named_expression" => parent
-            .child_by_field_name("name")
-            .is_some_and(|name| contains_node(name, node)),
-        _ => false,
-    }
-}
-
-fn is_import_identifier(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if matches!(parent.kind(), "import_statement" | "import_from_statement") {
-            return true;
-        }
-        current = parent;
-    }
-    false
-}
-
-fn is_attribute_identifier(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    parent.kind() == "attribute"
-        && parent
-            .child_by_field_name("attribute")
-            .is_some_and(|attribute| same_node(attribute, node))
-}
-
-fn is_pattern_identifier(node: Node<'_>) -> bool {
-    let mut current = node;
-    while let Some(parent) = current.parent() {
-        if parent.kind().contains("pattern") {
-            return true;
-        }
-        current = parent;
-    }
-    false
-}
-
-fn is_python_builtin_or_constant(name: &str) -> bool {
-    matches!(
+fn python_declaration_id(name: &str) -> String {
+    type_declaration_id(TypeIdentity {
+        ecosystem: PYTHON_ECOSYSTEM,
         name,
-        "None"
-            | "True"
-            | "False"
-            | "NotImplemented"
-            | "Ellipsis"
-            | "__annotations__"
-            | "__builtins__"
-            | "__debug__"
-            | "__doc__"
-            | "__file__"
-            | "__loader__"
-            | "__name__"
-            | "__package__"
-            | "__spec__"
-            | "ArithmeticError"
-            | "AssertionError"
-            | "AttributeError"
-            | "BaseException"
-            | "BaseExceptionGroup"
-            | "BlockingIOError"
-            | "BrokenPipeError"
-            | "BufferError"
-            | "BytesWarning"
-            | "ChildProcessError"
-            | "ConnectionAbortedError"
-            | "ConnectionError"
-            | "ConnectionRefusedError"
-            | "ConnectionResetError"
-            | "DeprecationWarning"
-            | "EOFError"
-            | "EncodingWarning"
-            | "EnvironmentError"
-            | "Exception"
-            | "ExceptionGroup"
-            | "FileExistsError"
-            | "FileNotFoundError"
-            | "FloatingPointError"
-            | "FutureWarning"
-            | "GeneratorExit"
-            | "IOError"
-            | "ImportError"
-            | "ImportWarning"
-            | "IndentationError"
-            | "IndexError"
-            | "InterruptedError"
-            | "IsADirectoryError"
-            | "KeyError"
-            | "KeyboardInterrupt"
-            | "LookupError"
-            | "MemoryError"
-            | "ModuleNotFoundError"
-            | "NameError"
-            | "NotADirectoryError"
-            | "NotImplementedError"
-            | "OSError"
-            | "OverflowError"
-            | "PendingDeprecationWarning"
-            | "PermissionError"
-            | "ProcessLookupError"
-            | "RecursionError"
-            | "ReferenceError"
-            | "ResourceWarning"
-            | "RuntimeError"
-            | "RuntimeWarning"
-            | "StopAsyncIteration"
-            | "StopIteration"
-            | "SyntaxError"
-            | "SyntaxWarning"
-            | "SystemError"
-            | "SystemExit"
-            | "TabError"
-            | "TimeoutError"
-            | "TypeError"
-            | "UnboundLocalError"
-            | "UnicodeDecodeError"
-            | "UnicodeEncodeError"
-            | "UnicodeError"
-            | "UnicodeTranslateError"
-            | "UnicodeWarning"
-            | "UserWarning"
-            | "ValueError"
-            | "Warning"
-            | "ZeroDivisionError"
-            | "abs"
-            | "aiter"
-            | "all"
-            | "anext"
-            | "any"
-            | "ascii"
-            | "bin"
-            | "bool"
-            | "breakpoint"
-            | "bytearray"
-            | "bytes"
-            | "callable"
-            | "chr"
-            | "classmethod"
-            | "compile"
-            | "complex"
-            | "copyright"
-            | "credits"
-            | "delattr"
-            | "dict"
-            | "dir"
-            | "divmod"
-            | "enumerate"
-            | "eval"
-            | "exec"
-            | "exit"
-            | "filter"
-            | "float"
-            | "format"
-            | "frozenset"
-            | "getattr"
-            | "hasattr"
-            | "hash"
-            | "help"
-            | "hex"
-            | "id"
-            | "input"
-            | "int"
-            | "isinstance"
-            | "issubclass"
-            | "iter"
-            | "len"
-            | "license"
-            | "list"
-            | "locals"
-            | "map"
-            | "max"
-            | "memoryview"
-            | "min"
-            | "next"
-            | "object"
-            | "oct"
-            | "open"
-            | "ord"
-            | "pow"
-            | "print"
-            | "property"
-            | "quit"
-            | "range"
-            | "repr"
-            | "reversed"
-            | "round"
-            | "set"
-            | "setattr"
-            | "slice"
-            | "sorted"
-            | "staticmethod"
-            | "str"
-            | "sum"
-            | "super"
-            | "tuple"
-            | "type"
-            | "vars"
-            | "zip"
-            | "__import__"
-    )
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_PYTHON_SEMANTIC_DIAGNOSTICS, PYTHON_UNRECOGNIZED_SYMBOL,
-        collect_python_semantic_diagnostics,
+    use super::collect_python_semantic_diagnostics;
+    use crate::analyzer::structural::BoundaryStatus;
+    use crate::analyzer::{
+        Language, ProjectFile, PythonAnalyzer, SemanticDiagnostic, SemanticDiagnosticDomain,
+        SemanticDiagnosticIncompleteReason, SemanticDiagnosticOutcome, SemanticDiagnosticReport,
+        SemanticDiagnosticReportStatus, TestProject,
     };
-    use crate::analyzer::{Language, ProjectFile, PythonAnalyzer, TestProject};
+    use brokk_bifrost_python::diagnostics::{
+        MAX_PYTHON_SEMANTIC_DIAGNOSTICS, PYTHON_UNRECOGNIZED_SYMBOL,
+    };
     use tempfile::TempDir;
 
     struct Fixture {
@@ -703,10 +349,14 @@ mod tests {
     }
 
     impl Fixture {
-        fn diagnostics_for(&self, rel_path: &str) -> Vec<super::PythonSemanticDiagnostic> {
+        fn report_for(&self, rel_path: &str) -> SemanticDiagnosticReport {
             let file = self.file(rel_path);
             let source = file.read_to_string().expect("read source");
             collect_python_semantic_diagnostics(&self.analyzer, &file, &source)
+        }
+
+        fn diagnostics_for(&self, rel_path: &str) -> Vec<SemanticDiagnostic> {
+            self.report_for(rel_path).into_diagnostics()
         }
 
         fn file(&self, rel_path: &str) -> ProjectFile {
@@ -731,6 +381,19 @@ mod tests {
         }
     }
 
+    fn incomplete_details(report: &SemanticDiagnosticReport) -> Vec<String> {
+        report
+            .outcomes()
+            .iter()
+            .filter_map(|outcome| match outcome {
+                SemanticDiagnosticOutcome::Incomplete { reasons, .. } => Some(reasons),
+                _ => None,
+            })
+            .flatten()
+            .map(|reason| format!("{reason:?}"))
+            .collect()
+    }
+
     #[test]
     fn python_semantic_diagnostics_report_unknown_local_identifier() {
         let fixture = fixture(&[(
@@ -741,10 +404,19 @@ def run():
 "#,
         )]);
 
-        let diagnostics = fixture.diagnostics_for("app.py");
-        assert_eq!(1, diagnostics.len(), "{diagnostics:#?}");
-        assert_eq!(PYTHON_UNRECOGNIZED_SYMBOL, diagnostics[0].kind);
-        assert!(diagnostics[0].message.contains("missing_value"));
+        let report = fixture.report_for("app.py");
+        assert_eq!(1, report.diagnostics().len(), "{report:#?}");
+        assert_eq!(PYTHON_UNRECOGNIZED_SYMBOL, report.diagnostics()[0].kind);
+        assert!(report.diagnostics()[0].message.contains("missing_value"));
+        assert!(
+            report.outcomes().iter().any(|outcome| matches!(
+                outcome,
+                SemanticDiagnosticOutcome::Absent(proof)
+                    if proof.boundary == BoundaryStatus::WorkspaceLocal
+                        && matches!(proof.domain, SemanticDiagnosticDomain::LexicalScope { .. })
+            )),
+            "{report:#?}"
+        );
     }
 
     #[test]
@@ -785,8 +457,19 @@ def run(param):
             ),
         ]);
 
-        let diagnostics = fixture.diagnostics_for("app.py");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let report = fixture.report_for("app.py");
+        assert!(report.diagnostics().is_empty(), "{report:#?}");
+        assert_eq!(SemanticDiagnosticReportStatus::Complete, report.status());
+        assert!(
+            report.outcomes().iter().any(|outcome| matches!(
+                outcome,
+                SemanticDiagnosticOutcome::Resolved {
+                    boundary: BoundaryStatus::WorkspaceLocal,
+                    ..
+                }
+            )),
+            "{report:#?}"
+        );
     }
 
     #[test]
@@ -816,8 +499,8 @@ def run():
             ),
         ]);
 
-        let diagnostics = fixture.diagnostics_for("app.py");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let report = fixture.report_for("app.py");
+        assert!(report.diagnostics().is_empty(), "{report:#?}");
     }
 
     #[test]
@@ -864,7 +547,7 @@ def run(value: MissingType = missing_default):
     }
 
     #[test]
-    fn python_semantic_diagnostics_check_attribute_receiver_but_not_member() {
+    fn python_semantic_diagnostics_check_attribute_receiver_but_not_unproven_member() {
         let fixture = fixture(&[(
             "app.py",
             r#"
@@ -896,7 +579,7 @@ def run(rows):
     }
 
     #[test]
-    fn python_semantic_diagnostics_suppress_match_pattern_uncertainty() {
+    fn python_semantic_diagnostics_state_match_pattern_uncertainty() {
         let fixture = fixture(&[(
             "app.py",
             r#"
@@ -907,12 +590,19 @@ def run(value):
 "#,
         )]);
 
-        let diagnostics = fixture.diagnostics_for("app.py");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let report = fixture.report_for("app.py");
+        assert!(report.diagnostics().is_empty(), "{report:#?}");
+        assert_eq!(SemanticDiagnosticReportStatus::Incomplete, report.status());
+        assert!(
+            incomplete_details(&report)
+                .iter()
+                .any(|detail| detail.contains("match statement")),
+            "{report:#?}"
+        );
     }
 
     #[test]
-    fn python_semantic_diagnostics_suppress_builtin_exceptions() {
+    fn python_semantic_diagnostics_resolve_builtins() {
         let fixture = fixture(&[(
             "app.py",
             r#"
@@ -924,12 +614,22 @@ def run():
 "#,
         )]);
 
-        let diagnostics = fixture.diagnostics_for("app.py");
-        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let report = fixture.report_for("app.py");
+        assert!(report.diagnostics().is_empty(), "{report:#?}");
+        assert!(
+            report.outcomes().iter().any(|outcome| matches!(
+                outcome,
+                SemanticDiagnosticOutcome::Resolved {
+                    boundary: BoundaryStatus::ExternalIndexed,
+                    ..
+                }
+            )),
+            "{report:#?}"
+        );
     }
 
     #[test]
-    fn python_semantic_diagnostics_suppress_unresolved_import_boundaries() {
+    fn python_semantic_diagnostics_state_unresolved_import_boundaries() {
         let fixture = fixture(&[
             (
                 "external.py",
@@ -951,12 +651,34 @@ def run():
             ),
         ]);
 
-        assert!(fixture.diagnostics_for("external.py").is_empty());
-        assert!(fixture.diagnostics_for("named.py").is_empty());
+        let wildcard = fixture.report_for("external.py");
+        assert!(wildcard.diagnostics().is_empty(), "{wildcard:#?}");
+        assert!(
+            incomplete_details(&wildcard)
+                .iter()
+                .any(|detail| detail.contains("DynamicBehavior")),
+            "{wildcard:#?}"
+        );
+
+        let named = fixture.report_for("named.py");
+        assert!(named.diagnostics().is_empty(), "{named:#?}");
+        assert!(
+            named.outcomes().iter().any(|outcome| matches!(
+                outcome,
+                SemanticDiagnosticOutcome::Incomplete { reasons, .. }
+                    if reasons.iter().any(|reason| matches!(
+                        reason,
+                        SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                            boundary: BoundaryStatus::ExternalUnknown,
+                        }
+                    ))
+            )),
+            "{named:#?}"
+        );
     }
 
     #[test]
-    fn python_semantic_diagnostics_suppress_dynamic_constructs_and_attributes() {
+    fn python_semantic_diagnostics_state_dynamic_constructs() {
         let fixture = fixture(&[
             (
                 "dynamic.py",
@@ -985,13 +707,32 @@ def run(obj):
             ),
         ]);
 
-        assert!(fixture.diagnostics_for("dynamic.py").is_empty());
-        assert!(fixture.diagnostics_for("module_getattr.py").is_empty());
-        assert!(fixture.diagnostics_for("attribute.py").is_empty());
+        let dynamic = fixture.report_for("dynamic.py");
+        assert!(dynamic.diagnostics().is_empty(), "{dynamic:#?}");
+        assert!(
+            incomplete_details(&dynamic)
+                .iter()
+                .any(|detail| detail.contains("globals")),
+            "{dynamic:#?}"
+        );
+
+        let getattr = fixture.report_for("module_getattr.py");
+        assert!(getattr.diagnostics().is_empty(), "{getattr:#?}");
+        assert!(
+            incomplete_details(&getattr)
+                .iter()
+                .any(|detail| detail.contains("__getattr__")),
+            "{getattr:#?}"
+        );
+
+        // An attribute on an unproven receiver is not a candidate here: the
+        // receiver's own binding resolves, the member is not judged.
+        let attribute = fixture.report_for("attribute.py");
+        assert!(attribute.diagnostics().is_empty(), "{attribute:#?}");
     }
 
     #[test]
-    fn python_semantic_diagnostics_suppress_malformed_files() {
+    fn python_semantic_diagnostics_state_malformed_files() {
         let fixture = fixture(&[(
             "broken.py",
             r#"
@@ -1000,7 +741,15 @@ def run(
 "#,
         )]);
 
-        assert!(fixture.diagnostics_for("broken.py").is_empty());
+        let report = fixture.report_for("broken.py");
+        assert!(report.diagnostics().is_empty(), "{report:#?}");
+        assert_eq!(SemanticDiagnosticReportStatus::Incomplete, report.status());
+        assert!(
+            incomplete_details(&report)
+                .iter()
+                .any(|detail| detail.contains("parse errors")),
+            "{report:#?}"
+        );
     }
 
     #[test]
@@ -1011,7 +760,15 @@ def run(
         }
         let fixture = fixture(&[("app.py", &source)]);
 
-        let diagnostics = fixture.diagnostics_for("app.py");
-        assert_eq!(MAX_PYTHON_SEMANTIC_DIAGNOSTICS, diagnostics.len());
+        let report = fixture.report_for("app.py");
+        assert_eq!(MAX_PYTHON_SEMANTIC_DIAGNOSTICS, report.diagnostics().len());
+        assert!(
+            report.outcomes().iter().any(|outcome| matches!(
+                outcome,
+                SemanticDiagnosticOutcome::Incomplete { reasons, .. }
+                    if reasons.contains(&SemanticDiagnosticIncompleteReason::Truncated)
+            )),
+            "truncation must be stated"
+        );
     }
 }

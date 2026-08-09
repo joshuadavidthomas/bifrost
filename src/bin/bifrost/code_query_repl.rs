@@ -1249,6 +1249,235 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         out.push_str(&format!("  {}\n", sanitize_terminal_text(&detail)));
                     }
                 }
+                CodeQueryResultValue::MemberSelection { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let member = sanitize_terminal_text(&value.member);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} `{}` {} ({}; {} selected of {} candidate{})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "member selection:", use_color),
+                        member,
+                        value.outcome,
+                        value.coverage,
+                        value.selected_count,
+                        value.candidate_count,
+                        if value.candidate_count == 1 { "" } else { "s" },
+                    ));
+                }
+                CodeQueryResultValue::CandidateHop { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let from = value
+                        .from
+                        .as_ref()
+                        .map(|unit| sanitize_terminal_text(&unit.fq_name))
+                        .unwrap_or_else(|| "<unlocatable>".to_string());
+                    let to = value
+                        .to
+                        .as_ref()
+                        .map(|unit| sanitize_terminal_text(&unit.fq_name))
+                        .unwrap_or_else(|| "<unlocatable>".to_string());
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} hop {}: {} -> {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "candidate hop:", use_color),
+                        value.hop,
+                        from,
+                        to,
+                        value.relation,
+                    ));
+                }
+                CodeQueryResultValue::DispatchOutcome { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {}; coverage {}; calls {}; targets {}{}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "dispatch outcome:", use_color),
+                        value.outcome,
+                        value.coverage,
+                        value.call_site_count,
+                        value.target_count,
+                        if value.targets_truncated {
+                            " (truncated)"
+                        } else {
+                            ""
+                        },
+                    ));
+                }
+                CodeQueryResultValue::DispatchTarget { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let target = value.target_declaration.as_ref().map_or_else(
+                        || sanitize_terminal_text(&value.target_path),
+                        |unit| sanitize_terminal_text(&unit.fq_name),
+                    );
+                    out.push_str(&format!(
+                        "{}\n  {} #{} {} -> {} ({}; {}; coverage {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(Style::new().fg(Color::Blue), "dispatch target:", use_color),
+                        value.ordinal,
+                        value.boundary_kind.unwrap_or("candidate"),
+                        target,
+                        value.dispatch,
+                        value.proof,
+                        value.coverage,
+                    ));
+                }
+                CodeQueryResultValue::MemberFamily { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {}{}; {}; coverage {}; overrides {}; implements {}; overridden_by {}; implemented_by {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "member family:", use_color),
+                        value.outcome,
+                        value
+                            .reason
+                            .map(|reason| format!(" ({reason})"))
+                            .unwrap_or_default(),
+                        value.capability,
+                        value.coverage,
+                        value.overrides_count,
+                        value.implements_count,
+                        value.overridden_by_count,
+                        value.implemented_by_count,
+                    ));
+                }
+                CodeQueryResultValue::MemberFamilyEdge { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let source = value.source.as_ref().map_or_else(
+                        || sanitize_terminal_text(&value.member_id),
+                        |unit| sanitize_terminal_text(&unit.fq_name),
+                    );
+                    let target = value.target.as_ref().map_or_else(
+                        || sanitize_terminal_text(&value.target_id),
+                        |unit| sanitize_terminal_text(&unit.fq_name),
+                    );
+                    out.push_str(&format!(
+                        "{}\n  {} #{} {} {} {} (depth {}; {}; coverage {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(Style::new().fg(Color::Blue), "family edge:", use_color),
+                        value.ordinal,
+                        source,
+                        value.relation,
+                        target,
+                        value.hierarchy_depth,
+                        value.proof,
+                        value.coverage,
+                    ));
+                }
+                CodeQueryResultValue::ReceiverOutcome { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let site_id = sanitize_terminal_text(&value.site_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} {} ({}; {} candidate{})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "receiver outcome:", use_color),
+                        value.analysis_kind,
+                        value.outcome,
+                        value.coverage,
+                        value.candidate_count,
+                        if value.candidate_count == 1 { "" } else { "s" },
+                    ));
+                    out.push_str(&format!("  site {site_id}\n"));
+                    if let Some(reason) = value.reason {
+                        out.push_str(&format!("  reason: {reason}\n"));
+                    }
+                    if let Some(limit) = value.limit {
+                        out.push_str(&format!("  limit: {limit}\n"));
+                    }
+                    if let Some(unsupported) = value.semantic_unsupported {
+                        out.push_str(&format!("  semantic unsupported: {unsupported}\n"));
+                    }
+                }
+                CodeQueryResultValue::ReceiverEvidence { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let site_id = sanitize_terminal_text(&value.site_id);
+                    out.push_str(&format!(
+                        "{}\n  {} {} #{} ({}; {})\n  site {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "receiver evidence:",
+                            use_color
+                        ),
+                        value.evidence_kind,
+                        value.ordinal,
+                        value.proof,
+                        value.completeness,
+                        site_id,
+                    ));
+                    if let Some(declaration) = &value.declaration_fq_name {
+                        out.push_str(&format!(
+                            "  declaration: {}\n",
+                            sanitize_terminal_text(declaration)
+                        ));
+                    }
+                    if let Some(factory_id) = &value.factory_id {
+                        out.push_str(&format!(
+                            "  factory: {}\n",
+                            sanitize_terminal_text(factory_id)
+                        ));
+                    }
+                }
+                CodeQueryResultValue::CallShape { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let site_id = sanitize_terminal_text(&value.site_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({}; {} group{})\n  site {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "call shape:", use_color),
+                        value.call_kind,
+                        value.coverage,
+                        value.group_count,
+                        if value.group_count == 1 { "" } else { "s" },
+                        site_id,
+                    ));
+                }
+                CodeQueryResultValue::CallArgumentGroup { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let site_id = sanitize_terminal_text(&value.site_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} #{} {} ({} argument{})\n  site {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "argument group:", use_color),
+                        value.group_index,
+                        value.kind,
+                        value.argument_count,
+                        if value.argument_count == 1 { "" } else { "s" },
+                        site_id,
+                    ));
+                }
+                CodeQueryResultValue::CallArgument { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let group_id = sanitize_terminal_text(&value.group_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} #{}{}{}\n  group {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "argument:", use_color),
+                        value.argument_index,
+                        value
+                            .name
+                            .as_deref()
+                            .map(|name| format!(" name={}", sanitize_terminal_text(name)))
+                            .unwrap_or_default(),
+                        if value.spread { " spread" } else { "" },
+                        group_id,
+                    ));
+                }
                 CodeQueryResultValue::Occurrence { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let spelling = sanitize_terminal_text(

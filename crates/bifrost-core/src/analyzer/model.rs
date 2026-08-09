@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
+use crate::analyzer::structural::resolution::{BoundaryStatus, DeclaredVisibility};
 use crate::hash::{HashMap, HashSet};
 use crate::path_normalization::NormalizePath;
 
@@ -38,6 +39,27 @@ pub enum RubyMethodDispatchMode {
     Instance,
     Singleton,
     ModuleFunction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScalaExportSelector {
+    Wildcard,
+    GivenWildcard,
+    Named {
+        source_name: String,
+        visible_name: Option<String>,
+    },
+}
+
+/// One Scala `export` clause recorded against the template that owns it.
+///
+/// Scala-shaped by content: the selector vocabulary is the language's own, so
+/// the name stays as it is rather than becoming a false generalization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScalaExportInfo {
+    pub owner_path: Vec<String>,
+    pub selectors: Vec<ScalaExportSelector>,
+    pub declaration_start_byte: usize,
 }
 
 impl Language {
@@ -145,6 +167,97 @@ impl Language {
     }
 }
 
+/// A source language plus the parser dialect needed to interpret one file.
+///
+/// Most languages have one grammar. TypeScript is the exception because `.ts`
+/// and `.tsx` files use distinct tree-sitter grammars while sharing the same
+/// normalized language adapter.
+///
+/// Resolving a dialect to an actual `tree_sitter::Language` needs the grammar
+/// registry, which is `brokk-bifrost-analysis` machinery: see
+/// `crate::analyzer::parser_language_for_dialect` there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LanguageDialect {
+    Standard(Language),
+    TypeScriptTsx,
+}
+
+impl LanguageDialect {
+    /// Parse a user-facing language or dialect label.
+    pub fn from_config_label(label: &str) -> Option<Self> {
+        let normalized = label
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .replace(['_', '-'], "");
+        if matches!(
+            normalized.as_str(),
+            "tsx" | "typescriptreact" | "typescripttsx"
+        ) {
+            return Some(Self::TypeScriptTsx);
+        }
+        Language::from_config_label(label).map(Self::Standard)
+    }
+
+    /// Select the parser dialect used by the indexed analyzer for `path`.
+    pub fn for_path(language: Language, path: &Path) -> Self {
+        if language == Language::TypeScript
+            && path
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("tsx"))
+        {
+            Self::TypeScriptTsx
+        } else {
+            Self::Standard(language)
+        }
+    }
+
+    pub const fn language(self) -> Language {
+        match self {
+            Self::Standard(language) => language,
+            Self::TypeScriptTsx => Language::TypeScript,
+        }
+    }
+
+    /// Canonical durable identity label. Unlike [`Self::config_label`], this
+    /// makes the TypeScript language explicit rather than using the `tsx`
+    /// shorthand.
+    pub fn stable_label(self) -> &'static str {
+        match self {
+            Self::Standard(language) => language.config_label(),
+            Self::TypeScriptTsx => "typescript-tsx",
+        }
+    }
+
+    /// Short user-facing configuration label retained by Rune IR and the CLI.
+    pub fn config_label(self) -> &'static str {
+        match self {
+            Self::Standard(language) => language.config_label(),
+            Self::TypeScriptTsx => "tsx",
+        }
+    }
+
+    pub fn config_labels() -> impl Iterator<Item = &'static str> {
+        Language::ANALYZABLE
+            .iter()
+            .map(|language| language.config_label())
+            .chain(std::iter::once("tsx"))
+    }
+}
+
+impl From<Language> for LanguageDialect {
+    fn from(language: Language) -> Self {
+        Self::Standard(language)
+    }
+}
+
+impl fmt::Display for LanguageDialect {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.stable_label())
+    }
+}
+
 /// Coarse declaration categories used across analyzers, lookup, usages, and
 /// serialized state. Keep this enum lean and language-agnostic: prefer mapping
 /// syntax-specific distinctions onto an existing high-level kind unless callers
@@ -243,6 +356,21 @@ impl CallableArity {
     }
 }
 
+/// What a workspace-wide usage-facts index knows about one callable
+/// declaration: how many arguments it accepts, in both the legacy flat and the
+/// required/total/repeated spelling, and the fq name of the type it returns.
+///
+/// Pure data over [`CallableArity`], so it sits beside it rather than in the
+/// analysis-side index that builds it; the language crates that read the facts
+/// through a narrow accessor need the shape, not the index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallableFacts {
+    pub arity: Option<usize>,
+    pub callable_arity: Option<CallableArity>,
+    pub return_type_fqn: Option<String>,
+    pub is_function: bool,
+}
+
 impl ParameterMetadata {
     pub fn new(label: impl Into<String>, start_byte: usize, end_byte: usize) -> Self {
         Self {
@@ -271,6 +399,18 @@ impl ParameterMetadata {
 pub enum CallableLinkage {
     External,
     Internal,
+}
+
+/// Linkage carried by C++ global-field metadata.
+///
+/// C++ `const` and `constexpr` fields are internal unless an exact peer is
+/// explicitly external. Consumers must inspect those peers before they treat
+/// this variant as internal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CppFieldLinkage {
+    External,
+    Internal,
+    InternalUnlessExternalPeer,
 }
 
 /// Whether one callable declaration proves that runtime dispatch is closed.
@@ -325,6 +465,8 @@ pub struct SignatureMetadata {
     field_is_static: bool,
     #[serde(default)]
     field_is_final: bool,
+    #[serde(default)]
+    cpp_field_linkage: Option<CppFieldLinkage>,
     /// Whether this class-like declaration is a Kotlin `companion object`.
     ///
     /// A companion and an ordinary nested `object` are both nested classes, and
@@ -336,6 +478,40 @@ pub struct SignatureMetadata {
     /// usage-edge builder asks once per callee owner.
     #[serde(default)]
     companion_object: bool,
+    /// Whether this callable declares the `static` modifier, read from the
+    /// declaration's modifier nodes rather than from its rendered header.
+    ///
+    /// A language that does not publish the fact leaves it `false`, which is
+    /// why [`Self::callable_modifiers_recorded`] exists: a consumer that must
+    /// distinguish "not static" from "nobody looked" reads that flag first.
+    #[serde(default)]
+    callable_is_static: bool,
+    /// Whether this callable is a constructor rather than a method.
+    #[serde(default)]
+    callable_is_constructor: bool,
+    /// The visibility the callable declares. `Unknown` when the adapter did
+    /// not read modifiers at all.
+    #[serde(default)]
+    callable_declared_visibility: Option<DeclaredVisibility>,
+    /// Whether the adapter that produced this metadata actually inspected the
+    /// callable's modifier nodes. Absent modifiers and unread modifiers are
+    /// different answers, and an override rule must not confuse them.
+    #[serde(default)]
+    callable_modifiers_recorded: bool,
+    /// The declared parameter types of this callable, in order, exactly as the
+    /// declaration's parameter `type` nodes spell them (array dimensions and
+    /// varargs folded in). `None` means the adapter records no per-parameter
+    /// type at all; `Some(vec![])` means a proven-empty parameter list.
+    ///
+    /// These are source spellings, not resolved or erased types: two equal
+    /// spellings in files with different imports are not proof of the same
+    /// type. Consumers must treat this as a discriminator inside an already
+    /// bounded candidate set, never as an identity.
+    #[serde(default)]
+    callable_parameter_types: Option<Vec<String>>,
+    /// Whether this class-like declaration is an interface.
+    #[serde(default)]
+    class_like_is_interface: bool,
 }
 
 /// A parser-derived nominal type name, including the lexical scope in which an
@@ -1509,7 +1685,14 @@ impl SignatureMetadata {
             extension_receiver_is_unconstrained_type_parameter: false,
             field_is_static: false,
             field_is_final: false,
+            cpp_field_linkage: None,
             companion_object: false,
+            callable_is_static: false,
+            callable_is_constructor: false,
+            callable_declared_visibility: None,
+            callable_modifiers_recorded: false,
+            callable_parameter_types: None,
+            class_like_is_interface: false,
         }
     }
 
@@ -1541,24 +1724,59 @@ impl SignatureMetadata {
                 ))
             })
             .collect();
-        Self {
-            label,
-            parameters,
-            return_type_text: None,
-            return_type_identity: None,
-            declaration_only: false,
-            callable_arity: None,
-            type_parameters: Vec::new(),
-            bare_return_type_parameter: None,
-            callable_linkage: None,
-            dispatch_extensibility: None,
-            extension_receiver_type: None,
-            extension_receiver_type_identity: None,
-            extension_receiver_is_unconstrained_type_parameter: false,
-            field_is_static: false,
-            field_is_final: false,
-            companion_object: false,
-        }
+        Self::new(label, parameters)
+    }
+
+    /// Record the modifier facts an adapter read from the declaration's own
+    /// modifier nodes. Calling this is what makes
+    /// [`Self::callable_modifiers_recorded`] true, so a consumer can tell a
+    /// declared-absent modifier from an unread one.
+    pub fn with_callable_modifiers(
+        mut self,
+        is_static: bool,
+        is_constructor: bool,
+        visibility: DeclaredVisibility,
+    ) -> Self {
+        self.callable_is_static = is_static;
+        self.callable_is_constructor = is_constructor;
+        self.callable_declared_visibility = Some(visibility);
+        self.callable_modifiers_recorded = true;
+        self
+    }
+
+    /// Record the declaration's per-parameter type spellings, in order.
+    pub fn with_callable_parameter_types(mut self, parameter_types: Vec<String>) -> Self {
+        self.callable_parameter_types = Some(parameter_types);
+        self
+    }
+
+    pub fn with_class_like_interface(mut self, is_interface: bool) -> Self {
+        self.class_like_is_interface = is_interface;
+        self
+    }
+
+    pub fn callable_is_static(&self) -> bool {
+        self.callable_is_static
+    }
+
+    pub fn callable_is_constructor(&self) -> bool {
+        self.callable_is_constructor
+    }
+
+    pub fn callable_declared_visibility(&self) -> Option<DeclaredVisibility> {
+        self.callable_declared_visibility
+    }
+
+    pub fn callable_modifiers_recorded(&self) -> bool {
+        self.callable_modifiers_recorded
+    }
+
+    pub fn callable_parameter_types(&self) -> Option<&[String]> {
+        self.callable_parameter_types.as_deref()
+    }
+
+    pub fn class_like_is_interface(&self) -> bool {
+        self.class_like_is_interface
     }
 
     pub fn with_return_type_text(mut self, return_type_text: Option<impl Into<String>>) -> Self {
@@ -1572,6 +1790,11 @@ impl SignatureMetadata {
     pub fn with_field_modifiers(mut self, is_static: bool, is_final: bool) -> Self {
         self.field_is_static = is_static;
         self.field_is_final = is_final;
+        self
+    }
+
+    pub fn with_cpp_field_linkage(mut self, linkage: CppFieldLinkage) -> Self {
+        self.cpp_field_linkage = Some(linkage);
         self
     }
 
@@ -1674,6 +1897,10 @@ impl SignatureMetadata {
 
     pub fn field_is_final(&self) -> bool {
         self.field_is_final
+    }
+
+    pub const fn cpp_field_linkage(&self) -> Option<CppFieldLinkage> {
+        self.cpp_field_linkage
     }
 
     pub fn return_type_identity(&self) -> Option<&StructuredTypeIdentity> {
@@ -1997,7 +2224,20 @@ impl fmt::Display for ProjectFile {
     }
 }
 
-#[derive(Debug)]
+/// Where a persisted unit's package prefix is anchored when it is re-resolved
+/// at hydration time. `None` on the unit means "use the language adapter's
+/// default anchor". This is process-local provenance recorded by the extractor;
+/// it is never itself persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PackageAnchor {
+    /// Anchored at the file's own module package, popped up `pop` levels
+    /// (`pop` is relative to the file-package boundary, floor 0).
+    OwnModule { pop: u8 },
+    /// Anchored at the crate root of the file's crate.
+    CrateRoot,
+}
+
+#[derive(Debug, Clone)]
 struct CodeUnitInner {
     source: ProjectFile,
     kind: CodeUnitType,
@@ -2005,10 +2245,11 @@ struct CodeUnitInner {
     synthetic: bool,
     fq: FqName,
     package_segment_count: usize,
+    package_anchor: Option<PackageAnchor>,
     rendered_name: RenderedCodeUnitName,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RenderedCodeUnitName {
     display: String,
     package_end: usize,
@@ -2019,7 +2260,7 @@ struct RenderedCodeUnitName {
 
 impl RenderedCodeUnitName {
     fn new(source: &ProjectFile, fq: &FqName, package_segment_count: usize) -> Self {
-        let language = crate::analyzer::common::language_for_file(source);
+        let language = crate::analyzer::common::declaration_language_for_file(source);
         let interner = segment_interner();
         let package = fq
             .prefix(package_segment_count)
@@ -2129,7 +2370,7 @@ impl CodeUnit {
             !fq.is_empty() && !short_name.is_empty(),
             "short_name must not be empty (kind={kind:?}, package_name={package_name:?}, source={source}, signature={signature:?}, synthetic={synthetic})"
         );
-        let language = crate::analyzer::common::language_for_file(&source);
+        let language = crate::analyzer::common::declaration_language_for_file(&source);
         let interner = segment_interner();
         let package_segment_count = (0..=fq.len())
             .find(|&prefix_len| {
@@ -2178,6 +2419,7 @@ impl CodeUnit {
             synthetic,
             fq,
             package_segment_count,
+            package_anchor: None,
             rendered_name,
         }))
     }
@@ -2287,26 +2529,32 @@ impl CodeUnit {
             .map(|(start, end)| &self.0.rendered_name.display[start..end])
     }
 
+    /// Record where this unit's package prefix is anchored, so persistence can
+    /// store a content-stable tail instead of a path-derived absolute prefix.
+    pub fn with_package_anchor(mut self, anchor: PackageAnchor) -> Self {
+        Arc::make_mut(&mut self.0).package_anchor = Some(anchor);
+        self
+    }
+
+    /// The extractor-recorded anchor, or `None` to mean "use the language
+    /// adapter's default anchor".
+    pub fn package_anchor(&self) -> Option<PackageAnchor> {
+        self.0.package_anchor
+    }
+
+    // Rebuilders clone the inner and mutate one field: reconstructing via
+    // `from_fq` would silently drop `package_anchor` and re-persist a
+    // path-derived absolute prefix.
     pub fn without_signature(&self) -> Self {
-        Self::from_fq(
-            self.0.source.clone(),
-            self.0.kind,
-            self.0.fq.clone(),
-            self.0.package_segment_count,
-            None,
-            self.0.synthetic,
-        )
+        let mut inner = (*self.0).clone();
+        inner.signature = None;
+        Self(Arc::new(inner))
     }
 
     pub fn with_synthetic(&self, synthetic: bool) -> Self {
-        Self::from_fq(
-            self.0.source.clone(),
-            self.0.kind,
-            self.0.fq.clone(),
-            self.0.package_segment_count,
-            self.0.signature.clone(),
-            synthetic,
-        )
+        let mut inner = (*self.0).clone();
+        inner.synthetic = synthetic;
+        Self(Arc::new(inner))
     }
 
     pub fn is_class(&self) -> bool {
@@ -2421,6 +2669,9 @@ pub struct SummaryFileProjection {
 pub struct SearchSymbolCandidate {
     pub code_unit: CodeUnit,
     pub primary_range: Option<Range>,
+    /// Whether the persisted declaration represents a type alias. This keeps
+    /// `search_symbols` rendering out of the complete file-state path.
+    pub is_type_alias: bool,
     /// Per-declaration test-region taint (issue #1102): whether this specific
     /// symbol is inside a structurally-evidenced test region. `search_symbols`
     /// combines it with a path-based test check to decide test filtering, so a
@@ -2847,6 +3098,351 @@ pub struct SemanticDiagnostic {
     pub message: String,
 }
 
+/// The structured surface that a semantic name lookup checked.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDiagnosticDomain {
+    LexicalScope { file: PathBuf, range: Range },
+    Module { name: String },
+    Package { name: String },
+    Type { name: String },
+    MemberSurface { owner: String, member: String },
+}
+
+/// Complete evidence that a symbol does not exist in a checked domain.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SemanticAbsenceProof {
+    pub range: Range,
+    pub domain: SemanticDiagnosticDomain,
+    pub boundary: BoundaryStatus,
+}
+
+/// A typed cause that prevents a semantic lookup from proving absence.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDiagnosticIncompleteReason {
+    MissingDependencyDiscovery { boundary: BoundaryStatus },
+    StaleGeneration { expected: u64, actual: u64 },
+    Cancelled,
+    Truncated,
+    UnsupportedSemantics { detail: String },
+    DynamicBehavior { detail: String },
+    RuntimeUnavailable { detail: String },
+    CorruptSemanticPack { detail: String },
+    UnsupportedGeneratedSurface { detail: String },
+}
+
+/// The result of one structured lookup made while collecting diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDiagnosticOutcome {
+    Resolved {
+        range: Range,
+        boundary: BoundaryStatus,
+    },
+    Ambiguous {
+        range: Range,
+        boundaries: Vec<BoundaryStatus>,
+    },
+    Absent(SemanticAbsenceProof),
+    Incomplete {
+        range: Option<Range>,
+        reasons: Vec<SemanticDiagnosticIncompleteReason>,
+    },
+}
+
+/// Whether every diagnostic candidate in one request had complete evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticDiagnosticReportStatus {
+    Complete,
+    Incomplete,
+}
+
+/// Semantic diagnostics and the structured proof or suppression result behind them.
+///
+/// The fields stay private so a caller cannot add an error without a complete
+/// [`SemanticAbsenceProof`]. Parse diagnostics use a separate LSP path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticDiagnosticReport {
+    diagnostics: Vec<SemanticDiagnostic>,
+    outcomes: Vec<SemanticDiagnosticOutcome>,
+    status: SemanticDiagnosticReportStatus,
+}
+
+impl Default for SemanticDiagnosticReport {
+    fn default() -> Self {
+        Self {
+            diagnostics: Vec::new(),
+            outcomes: Vec::new(),
+            status: SemanticDiagnosticReportStatus::Complete,
+        }
+    }
+}
+
+impl SemanticDiagnosticReport {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Convert diagnostics that a language collector proved absent from the
+    /// complete workspace-local lexical surface it checked.
+    pub fn from_workspace_absences(
+        file: &ProjectFile,
+        diagnostics: Vec<SemanticDiagnostic>,
+    ) -> Self {
+        let mut report = Self::new();
+        for diagnostic in diagnostics {
+            let range = diagnostic.range;
+            report.push_absent(
+                SemanticAbsenceProof {
+                    range,
+                    domain: SemanticDiagnosticDomain::LexicalScope {
+                        file: file.rel_path().to_path_buf(),
+                        range,
+                    },
+                    boundary: BoundaryStatus::WorkspaceLocal,
+                },
+                diagnostic,
+            );
+        }
+        report
+    }
+
+    pub fn push_resolved(&mut self, range: Range, boundary: BoundaryStatus) {
+        self.outcomes
+            .push(SemanticDiagnosticOutcome::Resolved { range, boundary });
+    }
+
+    pub fn push_ambiguous(&mut self, range: Range, boundaries: Vec<BoundaryStatus>) {
+        assert!(!boundaries.is_empty(), "ambiguity must name a boundary");
+        self.outcomes
+            .push(SemanticDiagnosticOutcome::Ambiguous { range, boundaries });
+    }
+
+    pub fn push_absent(&mut self, proof: SemanticAbsenceProof, diagnostic: SemanticDiagnostic) {
+        assert!(
+            matches!(
+                proof.boundary,
+                BoundaryStatus::WorkspaceLocal | BoundaryStatus::ExternalIndexed
+            ),
+            "absence proof requires a complete boundary"
+        );
+        assert_eq!(
+            proof.range, diagnostic.range,
+            "absence proof and diagnostic must identify the same source range"
+        );
+        self.outcomes.push(SemanticDiagnosticOutcome::Absent(proof));
+        self.diagnostics.push(diagnostic);
+    }
+
+    pub fn push_incomplete(
+        &mut self,
+        range: Option<Range>,
+        reasons: Vec<SemanticDiagnosticIncompleteReason>,
+    ) {
+        assert!(
+            !reasons.is_empty(),
+            "incomplete outcome must state a reason"
+        );
+        self.outcomes
+            .push(SemanticDiagnosticOutcome::Incomplete { range, reasons });
+        self.status = SemanticDiagnosticReportStatus::Incomplete;
+    }
+
+    pub fn diagnostics(&self) -> &[SemanticDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn outcomes(&self) -> &[SemanticDiagnosticOutcome] {
+        &self.outcomes
+    }
+
+    pub fn status(&self) -> SemanticDiagnosticReportStatus {
+        self.status
+    }
+
+    pub fn into_diagnostics(self) -> Vec<SemanticDiagnostic> {
+        self.diagnostics
+    }
+}
+
+impl std::ops::Deref for SemanticDiagnosticReport {
+    type Target = [SemanticDiagnostic];
+
+    fn deref(&self) -> &Self::Target {
+        self.diagnostics()
+    }
+}
+
+impl IntoIterator for SemanticDiagnosticReport {
+    type Item = SemanticDiagnostic;
+    type IntoIter = std::vec::IntoIter<SemanticDiagnostic>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.diagnostics.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod semantic_diagnostic_report_tests {
+    use super::*;
+
+    fn range(start_byte: usize) -> Range {
+        Range {
+            start_byte,
+            end_byte: start_byte + 1,
+            start_line: 1,
+            end_line: 1,
+        }
+    }
+
+    fn diagnostic(range: Range) -> SemanticDiagnostic {
+        SemanticDiagnostic {
+            range,
+            source: "test",
+            kind: "unrecognized_symbol",
+            message: "Unrecognized symbol `Missing`".to_string(),
+        }
+    }
+
+    #[test]
+    fn report_emits_only_a_diagnostic_with_complete_absence_proof() {
+        let location = range(2);
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_resolved(location, BoundaryStatus::ExternalIndexed);
+        report.push_ambiguous(
+            location,
+            vec![
+                BoundaryStatus::WorkspaceLocal,
+                BoundaryStatus::ExternalIndexed,
+            ],
+        );
+        report.push_incomplete(
+            Some(location),
+            vec![SemanticDiagnosticIncompleteReason::Cancelled],
+        );
+
+        assert!(report.diagnostics().is_empty());
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+
+        report.push_absent(
+            SemanticAbsenceProof {
+                range: location,
+                domain: SemanticDiagnosticDomain::Type {
+                    name: "example.Owner".to_string(),
+                },
+                boundary: BoundaryStatus::ExternalIndexed,
+            },
+            diagnostic(location),
+        );
+
+        assert_eq!(report.diagnostics(), &[diagnostic(location)]);
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Incomplete);
+        assert_eq!(report.outcomes().len(), 4);
+        assert!(matches!(
+            report.outcomes().last(),
+            Some(SemanticDiagnosticOutcome::Absent(proof))
+                if proof.boundary == BoundaryStatus::ExternalIndexed
+        ));
+    }
+
+    #[test]
+    fn report_retains_each_typed_incomplete_reason_without_an_error() {
+        let reasons = vec![
+            SemanticDiagnosticIncompleteReason::MissingDependencyDiscovery {
+                boundary: BoundaryStatus::ExternalDeclaredUnindexed,
+            },
+            SemanticDiagnosticIncompleteReason::StaleGeneration {
+                expected: 4,
+                actual: 3,
+            },
+            SemanticDiagnosticIncompleteReason::Cancelled,
+            SemanticDiagnosticIncompleteReason::Truncated,
+            SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: "macro expansion".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::DynamicBehavior {
+                detail: "runtime member".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::RuntimeUnavailable {
+                detail: "pack activation unavailable".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::CorruptSemanticPack {
+                detail: "invalid manifest".to_string(),
+            },
+            SemanticDiagnosticIncompleteReason::UnsupportedGeneratedSurface {
+                detail: "generated sources are not indexed".to_string(),
+            },
+        ];
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_incomplete(Some(range(7)), reasons.clone());
+
+        assert!(report.diagnostics().is_empty());
+        assert_eq!(
+            report.outcomes(),
+            &[SemanticDiagnosticOutcome::Incomplete {
+                range: Some(range(7)),
+                reasons,
+            }]
+        );
+    }
+
+    #[test]
+    fn workspace_conversion_records_the_checked_lexical_domain() {
+        let file = ProjectFile::new(std::env::current_dir().unwrap(), "src/Main.java");
+        let location = range(11);
+        let report =
+            SemanticDiagnosticReport::from_workspace_absences(&file, vec![diagnostic(location)]);
+
+        assert_eq!(report.diagnostics(), &[diagnostic(location)]);
+        assert_eq!(report.status(), SemanticDiagnosticReportStatus::Complete);
+        assert!(matches!(
+            report.outcomes(),
+            [SemanticDiagnosticOutcome::Absent(SemanticAbsenceProof {
+                range,
+                domain: SemanticDiagnosticDomain::LexicalScope { file, range: domain_range },
+                boundary: BoundaryStatus::WorkspaceLocal,
+            })] if *range == location
+                && file == &PathBuf::from("src/Main.java")
+                && *domain_range == location
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "absence proof and diagnostic must identify the same source range")]
+    fn report_rejects_an_error_without_matching_absence_evidence() {
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_absent(
+            SemanticAbsenceProof {
+                range: range(1),
+                domain: SemanticDiagnosticDomain::Module {
+                    name: "example".to_string(),
+                },
+                boundary: BoundaryStatus::WorkspaceLocal,
+            },
+            diagnostic(range(2)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "absence proof requires a complete boundary")]
+    fn report_rejects_absence_at_an_unknown_boundary() {
+        let location = range(3);
+        let mut report = SemanticDiagnosticReport::new();
+        report.push_absent(
+            SemanticAbsenceProof {
+                range: location,
+                domain: SemanticDiagnosticDomain::Package {
+                    name: "unknown.external".to_string(),
+                },
+                boundary: BoundaryStatus::ExternalUnknown,
+            },
+            diagnostic(location),
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeclarationKind {
     Parameter,
@@ -2907,6 +3503,59 @@ pub fn metrics_from_declarations(
         .collect::<BTreeSet<_>>()
         .len();
     CodeBaseMetrics::new(file_count, declarations.len())
+}
+
+#[cfg(test)]
+mod package_anchor_tests {
+    use super::*;
+
+    fn anchored_unit() -> CodeUnit {
+        let source = ProjectFile::new(PathBuf::from("/repo"), PathBuf::from("src/describe.rs"));
+        CodeUnit::with_signature(
+            source,
+            CodeUnitType::Function,
+            "demo",
+            "JsError.describe",
+            Some("fn describe()".to_string()),
+            false,
+        )
+        .with_package_anchor(PackageAnchor::CrateRoot)
+    }
+
+    #[test]
+    fn rebuilders_preserve_the_package_anchor() {
+        let unit = anchored_unit();
+        assert_eq!(unit.package_anchor(), Some(PackageAnchor::CrateRoot));
+
+        let stripped = unit.without_signature();
+        assert_eq!(stripped.signature(), None);
+        assert_eq!(stripped.package_anchor(), Some(PackageAnchor::CrateRoot));
+
+        let synthetic = unit.with_synthetic(true);
+        assert!(synthetic.is_synthetic());
+        assert_eq!(synthetic.package_anchor(), Some(PackageAnchor::CrateRoot));
+
+        // Chained rebuilds keep it too, including a non-unit-variant anchor.
+        let popped = unit
+            .clone()
+            .with_package_anchor(PackageAnchor::OwnModule { pop: 2 })
+            .with_synthetic(true)
+            .without_signature();
+        assert_eq!(
+            popped.package_anchor(),
+            Some(PackageAnchor::OwnModule { pop: 2 })
+        );
+        assert_eq!(popped.fq(), unit.fq());
+        assert_eq!(popped.package_name(), unit.package_name());
+    }
+
+    #[test]
+    fn units_default_to_the_adapter_anchor() {
+        let source = ProjectFile::new(PathBuf::from("/repo"), PathBuf::from("src/lib.rs"));
+        let unit = CodeUnit::new(source, CodeUnitType::Class, "demo", "JsError");
+        assert_eq!(unit.package_anchor(), None);
+        assert_eq!(unit.without_signature().package_anchor(), None);
+    }
 }
 
 #[cfg(test)]

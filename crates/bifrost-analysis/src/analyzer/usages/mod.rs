@@ -13,39 +13,43 @@
 //!   Java, Kotlin, C#, C++, Go, Ruby, and Scala targets.
 
 pub mod call_relations;
+pub mod call_shape;
 mod candidates;
-mod common;
-mod cpp_call_match;
+pub(crate) mod common;
 pub mod cpp_graph;
 pub(crate) mod csharp_graph;
+pub(crate) mod file_usage_graph;
 mod finder;
 pub mod get_definition;
 pub mod get_type;
 pub(crate) mod go_graph;
-mod graph_core;
 pub(crate) mod inverted_edges;
 pub(crate) mod java_graph;
 pub(crate) mod js_ts_graph;
 pub(crate) mod kotlin_graph;
-mod local_inference;
-mod model;
-pub mod outcome;
+pub mod member_family;
 pub(crate) mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;
-pub(crate) mod receiver_analysis;
 pub(crate) mod receiver_query;
 pub(crate) mod receiver_sites;
-mod reexport_seeds;
-pub mod reference_site;
 pub(crate) mod ruby_graph;
 pub(crate) mod rust_graph;
-pub(crate) mod same_owner;
 pub(crate) mod scala_graph;
 pub mod target_kind;
 mod traits;
 pub(crate) mod workspace_graph;
 pub(crate) mod workspace_graph_cache;
+
+// The language-blind half of this subsystem moved to `brokk-bifrost-core`: the
+// usage products (`model`), the graph outcome wrapper, the pure local-inference
+// engine, reference-site resolution, receiver-analysis vocabulary, the import
+// edge types, the same-owner routing policy, and the re-export seed walk. Each
+// module keeps the visibility its `mod` declaration had here, except where every
+// item it holds was already crate-private, in which case the alias narrows to
+// `pub(crate)` rather than re-publishing core's promoted `pub` items.
+use brokk_bifrost_core::analyzer::usages::{local_inference, model};
+pub(crate) use brokk_bifrost_core::analyzer::usages::{outcome, receiver_analysis, reference_site};
 
 #[cfg(test)]
 pub(crate) use call_relations::CallArgument;
@@ -65,12 +69,15 @@ pub use finder::{
     DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, QueryResult, UsageFinder, UsageQueryCompletion,
 };
 pub use go_graph::GoUsageGraphStrategy;
-pub(crate) use graph_core::{ImportEdge, ImportEdgeKind};
 pub use java_graph::JavaUsageGraphStrategy;
 pub use js_ts_graph::JsTsExportUsageGraphStrategy;
 pub use kotlin_graph::KotlinUsageGraphStrategy;
 pub use local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
+};
+pub use member_family::{
+    MemberFamilyAnswer, MemberFamilyEdge, MemberFamilyProvider, java_member_family,
+    java_member_family_capability, member_family_id,
 };
 pub use model::{
     CONFIDENCE_THRESHOLD, ExportEntry, ExportIndex, FuzzyResult, ImportBinder, ImportBinding,
@@ -83,6 +90,7 @@ pub use python_graph::PythonExportUsageGraphStrategy;
 pub use ruby_graph::RubyUsageGraphStrategy;
 pub use rust_graph::RustExportUsageGraphStrategy;
 pub use scala_graph::ScalaUsageGraphStrategy;
+pub(crate) use traits::GraphUsageAnalyzer;
 pub use traits::{CandidateFileProvider, UsageAnalyzer};
 
 use crate::analyzer::{CodeUnit, IAnalyzer};

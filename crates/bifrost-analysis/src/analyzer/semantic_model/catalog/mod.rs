@@ -86,7 +86,8 @@ pub struct SessionPackSource {
     pub source_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CatalogPackSourceKind {
     Installed,
     Generated,
@@ -419,6 +420,55 @@ pub enum CatalogMiss {
     NotFound,
     Quarantined { reason: String },
     Incompatible { reason: String },
+}
+
+/// One pack that names a queried coordinate but rejects its exact version.
+///
+/// `required` is the exact requirement the pack declares for `coordinate`;
+/// `installed` is the version the query carried, absent when discovery found
+/// the coordinate without an exact version (#1884).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SemanticPackVersionNearMiss {
+    pub pack_id: String,
+    pub pack_version: String,
+    pub manifest_digest: String,
+    /// The rejecting coordinate, for example `toolchain jdk` or
+    /// `package com.acme:widget`.
+    pub coordinate: String,
+    pub installed: Option<String>,
+    pub required: String,
+}
+
+impl SemanticPackVersionNearMiss {
+    /// The one-line statement of this rejection, naming both versions.
+    pub fn describe(&self) -> String {
+        match &self.installed {
+            Some(installed) => format!(
+                "semantic pack {}@{} requires {} {}, but the workspace {} is {}",
+                self.pack_id,
+                self.pack_version,
+                self.coordinate,
+                self.required,
+                self.coordinate,
+                installed
+            ),
+            None => format!(
+                "semantic pack {}@{} requires {} {}, but discovery found no exact {} version",
+                self.pack_id, self.pack_version, self.coordinate, self.required, self.coordinate
+            ),
+        }
+    }
+}
+
+/// One raw `catalog_selectors` join row, before compatibility filtering.
+struct DurableSelectorRow {
+    manifest_digest: String,
+    manifest_bytes: Vec<u8>,
+    shard_id: String,
+    descriptor_json: Vec<u8>,
+    selector_json: Vec<u8>,
+    source_kind: String,
+    source_id: String,
 }
 
 #[derive(Debug)]
@@ -1659,140 +1709,7 @@ impl SemanticPackCatalog {
         query: &SemanticPackSelectorQuery,
         max_rows: usize,
     ) -> Result<Vec<CatalogCandidate>, CatalogError> {
-        let selector_source = if query.package.is_some() {
-            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
-             WHERE package_name IS NULL
-             UNION ALL
-             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
-             WHERE package_name = ?3"
-        } else if query.module.is_some() {
-            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_module
-             WHERE module_name IS NULL
-             UNION ALL
-             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_module
-             WHERE module_name = ?4"
-        } else if query.toolchain.is_some() {
-            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
-             WHERE toolchain_name IS NULL
-             UNION ALL
-             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
-             WHERE toolchain_name = ?5"
-        } else if query.artifact_sha256.is_some() {
-            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
-             WHERE artifact_sha256 IS NULL
-             UNION ALL
-             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
-             WHERE artifact_sha256 = ?8"
-        } else {
-            "SELECT * FROM catalog_selectors"
-        };
-        let candidate_sql = format!(
-            "SELECT p.manifest_digest, p.manifest_bytes, ps.shard_id,
-                    ps.descriptor_json, s.selector_json,
-                    source.source_kind, source.source_id
-             FROM catalog_packs AS p
-             JOIN catalog_pack_shards AS ps
-               ON ps.manifest_digest = p.manifest_digest
-             JOIN ({selector_source}) AS s
-               ON s.manifest_digest = ps.manifest_digest
-              AND s.shard_id = ps.shard_id
-             JOIN catalog_sources AS source
-               ON source.manifest_digest = p.manifest_digest
-             WHERE p.state = 'verified'
-               AND p.language = ?1
-               AND p.ecosystem = ?2
-               AND (?3 IS NULL OR s.package_name IS NULL OR s.package_name = ?3)
-               AND (?4 IS NULL OR s.module_name IS NULL OR s.module_name = ?4)
-               AND (?5 IS NULL OR s.toolchain_name IS NULL OR s.toolchain_name = ?5)
-               AND (
-                 ?6 IS NULL
-                 OR NOT EXISTS(
-                   SELECT 1 FROM catalog_selector_targets AS targets
-                   WHERE targets.manifest_digest = s.manifest_digest
-                     AND targets.shard_id = s.shard_id
-                     AND targets.selector_ordinal = s.selector_ordinal
-                 )
-                 OR EXISTS(
-                   SELECT 1 FROM catalog_selector_targets AS targets
-                   WHERE targets.manifest_digest = s.manifest_digest
-                     AND targets.shard_id = s.shard_id
-                     AND targets.selector_ordinal = s.selector_ordinal
-                     AND targets.target = ?6
-                 )
-               )
-               AND (
-                 ?7 IS NULL
-                 OR NOT EXISTS(
-                   SELECT 1 FROM catalog_selector_configurations AS configurations
-                   WHERE configurations.manifest_digest = s.manifest_digest
-                     AND configurations.shard_id = s.shard_id
-                     AND configurations.selector_ordinal = s.selector_ordinal
-                 )
-                 OR EXISTS(
-                   SELECT 1 FROM catalog_selector_configurations AS configurations
-                   WHERE configurations.manifest_digest = s.manifest_digest
-                     AND configurations.shard_id = s.shard_id
-                     AND configurations.selector_ordinal = s.selector_ordinal
-                     AND configurations.configuration = ?7
-                 )
-               )
-               AND (
-                 ?8 IS NULL OR s.artifact_sha256 IS NULL OR s.artifact_sha256 = ?8
-               )
-             ORDER BY p.manifest_digest, ps.shard_id,
-                      source.source_kind, source.source_id, s.selector_ordinal
-             LIMIT ?9"
-        );
-        let connection = self
-            .connection
-            .lock()
-            .expect("semantic-pack catalog connection mutex poisoned");
-        self.sql_statements.fetch_add(1, Ordering::Relaxed);
-        let mut statement = connection
-            .prepare(&candidate_sql)
-            .map_err(|error| CatalogError::sqlite("prepare candidate lookup", error))?;
-        let rows = statement
-            .query_map(
-                params![
-                    &query.language,
-                    &query.ecosystem,
-                    query
-                        .package
-                        .as_ref()
-                        .map(|coordinate| coordinate.name.as_str()),
-                    query
-                        .module
-                        .as_ref()
-                        .map(|coordinate| coordinate.name.as_str()),
-                    query
-                        .toolchain
-                        .as_ref()
-                        .map(|coordinate| coordinate.name.as_str()),
-                    query.target.as_deref(),
-                    query.configuration.as_deref(),
-                    query.artifact_sha256.as_deref(),
-                    i64::try_from(max_rows).unwrap_or(i64::MAX)
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                    ))
-                },
-            )
-            .map_err(|error| CatalogError::sqlite("query candidates", error))?;
-        let mut durable_rows = Vec::new();
-        for row in rows {
-            durable_rows
-                .push(row.map_err(|error| CatalogError::sqlite("read candidate row", error))?);
-        }
-        drop(statement);
-        drop(connection);
+        let durable_rows = self.durable_selector_rows(query, max_rows)?;
 
         let mut candidates = Vec::new();
         let rejected_manifests = self
@@ -1802,7 +1719,7 @@ impl SemanticPackCatalog {
         let mut corrupt = Vec::new();
         let mut corrupt_digests = HashSet::new();
         for row in durable_rows {
-            let (
+            let DurableSelectorRow {
                 manifest_digest,
                 manifest_bytes,
                 shard_id,
@@ -1810,7 +1727,7 @@ impl SemanticPackCatalog {
                 selector_json,
                 source_kind,
                 source_id,
-            ) = row;
+            } = row;
             if rejected_manifests.contains(&manifest_digest)
                 || corrupt_digests.contains(&manifest_digest)
             {
@@ -1931,6 +1848,213 @@ impl SemanticPackCatalog {
             self.lookup_misses.fetch_add(1, Ordering::Relaxed);
         }
         Ok(candidates)
+    }
+
+    /// Name every pack that `candidates` rejected for `query` only because an
+    /// exact version requirement did not accept the queried version.
+    ///
+    /// Candidate selection deliberately drops such a pack in silence: a wrong
+    /// version must never activate. Attribution needs the opposite: a
+    /// workspace on JDK 17 with only a JDK 21 pack installed must hear "the
+    /// pack requires =21.0.2, the workspace has 17.0.10", not a bare
+    /// "no pack found". A pack rejected for a non-version reason (name,
+    /// target, configuration, artifact digest, Bifrost compatibility) is not
+    /// reported here.
+    pub fn version_near_misses(
+        &self,
+        query: &SemanticPackSelectorQuery,
+    ) -> Result<Vec<SemanticPackVersionNearMiss>, CatalogError> {
+        let rows = self.durable_selector_rows(query, usize::MAX)?;
+        let mut misses: Vec<SemanticPackVersionNearMiss> = Vec::new();
+        {
+            let rejected_manifests = self
+                .rejected_manifests
+                .lock()
+                .expect("semantic-pack rejection mutex poisoned");
+            for row in rows {
+                if rejected_manifests.contains(&row.manifest_digest)
+                    || misses
+                        .iter()
+                        .any(|miss| miss.manifest_digest == row.manifest_digest)
+                {
+                    continue;
+                }
+                let manifest = decode_manifest(&row.manifest_bytes, &self.options.decode_limits)
+                    .map_err(|error| CatalogError::Artifact(error.to_string()))?;
+                let selector: ActivationSelector = serde_json::from_slice(&row.selector_json)
+                    .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+                if let Some(miss) =
+                    version_near_miss(&manifest, std::slice::from_ref(&selector), query)?
+                {
+                    misses.push(miss);
+                }
+            }
+        }
+        let session_packs = self
+            .session_packs
+            .lock()
+            .expect("semantic-pack session mutex poisoned");
+        for pack in session_packs.iter() {
+            if pack.manifest.language != query.language
+                || pack.manifest.ecosystem != query.ecosystem
+                || misses
+                    .iter()
+                    .any(|miss| miss.manifest_digest == pack.manifest.content_sha256)
+            {
+                continue;
+            }
+            let selectors = pack
+                .shards
+                .iter()
+                .flat_map(|shard| shard.selectors.iter().cloned())
+                .collect::<Vec<_>>();
+            if let Some(miss) = version_near_miss(&pack.manifest, &selectors, query)? {
+                misses.push(miss);
+            }
+        }
+        drop(session_packs);
+        misses.sort();
+        Ok(misses)
+    }
+
+    fn durable_selector_rows(
+        &self,
+        query: &SemanticPackSelectorQuery,
+        max_rows: usize,
+    ) -> Result<Vec<DurableSelectorRow>, CatalogError> {
+        let selector_source = if query.package.is_some() {
+            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
+             WHERE package_name IS NULL
+             UNION ALL
+             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_package
+             WHERE package_name = ?3"
+        } else if query.module.is_some() {
+            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_module
+             WHERE module_name IS NULL
+             UNION ALL
+             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_module
+             WHERE module_name = ?4"
+        } else if query.toolchain.is_some() {
+            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
+             WHERE toolchain_name IS NULL
+             UNION ALL
+             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_toolchain
+             WHERE toolchain_name = ?5"
+        } else if query.artifact_sha256.is_some() {
+            "SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
+             WHERE artifact_sha256 IS NULL
+             UNION ALL
+             SELECT * FROM catalog_selectors INDEXED BY catalog_selectors_artifact
+             WHERE artifact_sha256 = ?8"
+        } else {
+            "SELECT * FROM catalog_selectors"
+        };
+        let candidate_sql = format!(
+            "SELECT p.manifest_digest, p.manifest_bytes, ps.shard_id,
+                    ps.descriptor_json, s.selector_json,
+                    source.source_kind, source.source_id
+             FROM catalog_packs AS p
+             JOIN catalog_pack_shards AS ps
+               ON ps.manifest_digest = p.manifest_digest
+             JOIN ({selector_source}) AS s
+               ON s.manifest_digest = ps.manifest_digest
+              AND s.shard_id = ps.shard_id
+             JOIN catalog_sources AS source
+               ON source.manifest_digest = p.manifest_digest
+             WHERE p.state = 'verified'
+               AND p.language = ?1
+               AND p.ecosystem = ?2
+               AND (?3 IS NULL OR s.package_name IS NULL OR s.package_name = ?3)
+               AND (?4 IS NULL OR s.module_name IS NULL OR s.module_name = ?4)
+               AND (?5 IS NULL OR s.toolchain_name IS NULL OR s.toolchain_name = ?5)
+               AND (
+                 ?6 IS NULL
+                 OR NOT EXISTS(
+                   SELECT 1 FROM catalog_selector_targets AS targets
+                   WHERE targets.manifest_digest = s.manifest_digest
+                     AND targets.shard_id = s.shard_id
+                     AND targets.selector_ordinal = s.selector_ordinal
+                 )
+                 OR EXISTS(
+                   SELECT 1 FROM catalog_selector_targets AS targets
+                   WHERE targets.manifest_digest = s.manifest_digest
+                     AND targets.shard_id = s.shard_id
+                     AND targets.selector_ordinal = s.selector_ordinal
+                     AND targets.target = ?6
+                 )
+               )
+               AND (
+                 ?7 IS NULL
+                 OR NOT EXISTS(
+                   SELECT 1 FROM catalog_selector_configurations AS configurations
+                   WHERE configurations.manifest_digest = s.manifest_digest
+                     AND configurations.shard_id = s.shard_id
+                     AND configurations.selector_ordinal = s.selector_ordinal
+                 )
+                 OR EXISTS(
+                   SELECT 1 FROM catalog_selector_configurations AS configurations
+                   WHERE configurations.manifest_digest = s.manifest_digest
+                     AND configurations.shard_id = s.shard_id
+                     AND configurations.selector_ordinal = s.selector_ordinal
+                     AND configurations.configuration = ?7
+                 )
+               )
+               AND (
+                 ?8 IS NULL OR s.artifact_sha256 IS NULL OR s.artifact_sha256 = ?8
+               )
+             ORDER BY p.manifest_digest, ps.shard_id,
+                      source.source_kind, source.source_id, s.selector_ordinal
+             LIMIT ?9"
+        );
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        self.sql_statements.fetch_add(1, Ordering::Relaxed);
+        let mut statement = connection
+            .prepare(&candidate_sql)
+            .map_err(|error| CatalogError::sqlite("prepare candidate lookup", error))?;
+        let rows = statement
+            .query_map(
+                params![
+                    &query.language,
+                    &query.ecosystem,
+                    query
+                        .package
+                        .as_ref()
+                        .map(|coordinate| coordinate.name.as_str()),
+                    query
+                        .module
+                        .as_ref()
+                        .map(|coordinate| coordinate.name.as_str()),
+                    query
+                        .toolchain
+                        .as_ref()
+                        .map(|coordinate| coordinate.name.as_str()),
+                    query.target.as_deref(),
+                    query.configuration.as_deref(),
+                    query.artifact_sha256.as_deref(),
+                    i64::try_from(max_rows).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok(DurableSelectorRow {
+                        manifest_digest: row.get::<_, String>(0)?,
+                        manifest_bytes: row.get::<_, Vec<u8>>(1)?,
+                        shard_id: row.get::<_, String>(2)?,
+                        descriptor_json: row.get::<_, Vec<u8>>(3)?,
+                        selector_json: row.get::<_, Vec<u8>>(4)?,
+                        source_kind: row.get::<_, String>(5)?,
+                        source_id: row.get::<_, String>(6)?,
+                    })
+                },
+            )
+            .map_err(|error| CatalogError::sqlite("query candidates", error))?;
+        let mut durable_rows = Vec::new();
+        for row in rows {
+            durable_rows
+                .push(row.map_err(|error| CatalogError::sqlite("read candidate row", error))?);
+        }
+        Ok(durable_rows)
     }
 
     pub fn load(&self, candidate: &CatalogCandidate) -> Result<LoadedCatalogShard, CatalogMiss> {
@@ -2973,6 +3097,129 @@ fn coordinate_matches(
                 .map(|requirement| requirement.matches(version))
                 .map_err(|error| CatalogError::Integrity(error.to_string())),
         },
+    }
+}
+
+/// Classify one pack as a version near miss for `query`: every non-version
+/// predicate accepts the query, and an exact version requirement rejects it.
+/// A pack rejected for a non-version reason is not a near miss and returns
+/// `None`.
+fn version_near_miss(
+    manifest: &CompiledPackManifest,
+    selectors: &[ActivationSelector],
+    query: &SemanticPackSelectorQuery,
+) -> Result<Option<SemanticPackVersionNearMiss>, CatalogError> {
+    let bifrost = VersionReq::parse(&manifest.compatibility.bifrost)
+        .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+    if !bifrost.matches(&query.bifrost_version) {
+        return Ok(None);
+    }
+    if let Some(toolchain) = &query.toolchain {
+        for constraint in &manifest.compatibility.toolchains {
+            if constraint.name != toolchain.name {
+                continue;
+            }
+            let requirement = VersionReq::parse(&constraint.requirement)
+                .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+            let satisfied = toolchain
+                .version
+                .as_ref()
+                .is_some_and(|version| requirement.matches(version));
+            if !satisfied {
+                return Ok(Some(near_miss(
+                    manifest,
+                    format!("toolchain {}", constraint.name),
+                    toolchain.version.as_ref(),
+                    &constraint.requirement,
+                )));
+            }
+        }
+    }
+    for selector in selectors {
+        if !coordinate_names_match(selector.package.as_ref(), query.package.as_ref())
+            || !coordinate_names_match(selector.module.as_ref(), query.module.as_ref())
+            || !coordinate_names_match(selector.toolchain.as_ref(), query.toolchain.as_ref())
+        {
+            continue;
+        }
+        if let Some(target) = &query.target
+            && !selector.targets.is_empty()
+            && !selector.targets.contains(target)
+        {
+            continue;
+        }
+        if let Some(configuration) = &query.configuration
+            && !selector.configurations.is_empty()
+            && !selector.configurations.contains(configuration)
+        {
+            continue;
+        }
+        if let (Some(expected), Some(actual)) = (&query.artifact_sha256, &selector.artifact_sha256)
+            && actual != expected
+        {
+            continue;
+        }
+        for (axis, coordinate_selector, coordinate_query) in [
+            ("package", selector.package.as_ref(), query.package.as_ref()),
+            ("module", selector.module.as_ref(), query.module.as_ref()),
+            (
+                "toolchain",
+                selector.toolchain.as_ref(),
+                query.toolchain.as_ref(),
+            ),
+        ] {
+            let (Some(coordinate_selector), Some(coordinate_query)) =
+                (coordinate_selector, coordinate_query)
+            else {
+                continue;
+            };
+            let Some(requirement_source) = &coordinate_selector.version else {
+                continue;
+            };
+            let requirement = VersionReq::parse(requirement_source)
+                .map_err(|error| CatalogError::Integrity(error.to_string()))?;
+            let satisfied = coordinate_query
+                .version
+                .as_ref()
+                .is_some_and(|version| requirement.matches(version));
+            if !satisfied {
+                return Ok(Some(near_miss(
+                    manifest,
+                    format!("{axis} {}", coordinate_selector.name),
+                    coordinate_query.version.as_ref(),
+                    requirement_source,
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn near_miss(
+    manifest: &CompiledPackManifest,
+    coordinate: String,
+    installed: Option<&Version>,
+    required: &str,
+) -> SemanticPackVersionNearMiss {
+    SemanticPackVersionNearMiss {
+        pack_id: manifest.pack_id.clone(),
+        pack_version: manifest.version.clone(),
+        manifest_digest: manifest.content_sha256.clone(),
+        coordinate,
+        installed: installed.map(Version::to_string),
+        required: required.to_owned(),
+    }
+}
+
+/// The name half of `coordinate_matches`: whether the selector could apply to
+/// the queried coordinate at some version.
+fn coordinate_names_match(
+    selector: Option<&NameSelector>,
+    query: Option<&CatalogCoordinate>,
+) -> bool {
+    match (selector, query) {
+        (None, _) | (_, None) => true,
+        (Some(selector), Some(query)) => selector.name == query.name,
     }
 }
 

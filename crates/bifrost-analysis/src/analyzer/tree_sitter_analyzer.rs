@@ -1,4 +1,29 @@
+// The traversal primitives and the two byte-range readers below them are pure
+// tree-sitter node arithmetic, so they live in `brokk-bifrost-core` and are
+// re-exported here at the paths every caller already uses. The budgeted walk
+// followed them there with the receiver-facts vocabulary it serves: its counter
+// is its own and its cancellation token is a core type. What stays is
+// everything built on `FileState`.
+pub use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
+pub(crate) use brokk_bifrost_core::analyzer::tree_walk::{
+    BoundedNamedTreeWalk, WalkControl, expanded_comment_start, try_walk_named_tree_preorder,
+    walk_named_tree_preorder, walk_named_tree_preorder_bounded, walk_tree_preorder,
+};
+
+// `PreparedSyntaxTree` and its source backing hold model data plus a live
+// `tree_sitter::Tree`, so they live in `brokk-bifrost-core` where a language
+// crate can consume them, and are re-exported here at the paths their callers
+// already use. What stays is the preparation pipeline below: the parse, the
+// per-request single-flight cell, the byte-bounded cross-request store, and
+// `FileState`'s implementation of the core index contract.
+use brokk_bifrost_core::analyzer::prepared_syntax::{IndexedFileFacts, PreparedSourceIndex};
+pub(crate) use brokk_bifrost_core::analyzer::prepared_syntax::{
+    PreparedSourceOrigin, PreparedSyntaxSource, PreparedSyntaxTree,
+};
+
+use crate::analyzer::CodeUnitIndex;
 use arc_swap::ArcSwapOption;
+use brokk_bifrost_core::analyzer::code_unit_index::file_namespace_from_top_level_declarations;
 
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::common::{
@@ -18,9 +43,9 @@ use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::{
     AnalyzerConfig, CodeBaseMetrics, CodeUnit, CodeUnitType, CppTemplateMetadata, DeclarationInfo,
     DefinitionIndexHandle, FqName, GlobalUsageDefinitionIndex, IAnalyzer, ImportInfo, Language,
-    LanguageDialect, Project, ProjectFile, Range, RubyMethodDispatchMode, SearchSymbolCandidate,
-    SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata, SummaryFileProjection,
-    UsageFactsIndex,
+    LanguageDialect, PackageAnchor, Project, ProjectFile, Range, RubyMethodDispatchMode,
+    SearchSymbolCandidate, SearchSymbolCandidates, SearchSymbolPatternBatch, SignatureMetadata,
+    SummaryFileProjection, UsageFactsIndex,
 };
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
@@ -33,28 +58,59 @@ use regex::RegexBuilder;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
-use tree_sitter::{Language as TsLanguage, Node, ParseOptions, Parser, Tree};
+use tree_sitter::{Language as TsLanguage, ParseOptions, Parser, Tree};
 
 // `FileState` holds the full parsed source (`source: String`) plus every
 // declaration-shaped collection derived from it (imports, signatures,
 // supertypes, ranges, children, ...) keyed by `CodeUnit`. For a typical
-// source file (a few KB to tens of KB of text, tens to low hundreds of
-// declarations) that's conservatively ~50-100 KB per entry once the
-// per-CodeUnit maps are counted; large files run higher. This cache is
-// shared across all concurrent calls behind one `Arc<Mutex<..>>>`, so its
-// capacity is a single shared budget, not per-call: at 1024 entries the
-// worst-case footprint is on the order of ~50-100 MB, which is an
-// acceptable trade against the O(n) `VecDeque::retain` this cache used to
-// pay on every touch under that same shared lock.
-const TRANSIENT_FILE_STATE_CACHE_CAPACITY: usize = 1_024;
-// A broad usage traversal may visit more files than the small cross-request
-// cache holds. Retain hydrated states for one request, then release them.
-const QUERY_FILE_STATE_CACHE_CAPACITY: usize = 1_024;
+// FileState values have widely different retained sizes. A generated
+// amalgamation can be orders of magnitude larger than an ordinary source file,
+// so an entry-count limit gives neither a useful RSS limit nor useful cache
+// admission. Keep the shared and query-local caches within this one slice of
+// the existing analyzer memo budget.
+const FILE_STATE_CACHE_BUDGET_DIVISOR: u64 = 2;
+const QUERY_FILE_STATE_CACHE_BUDGET_DIVISOR: usize = 4;
+const MIN_FILE_STATE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const FILE_STATE_CACHE_CORPUS_FRACTION_DIVISOR: usize = 10;
+const FILE_STATE_BYTES_PER_PERSISTED_BYTE: usize = 4;
+const SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY: usize = 1_024;
+const BULK_FILE_STATE_QUERY_LIMIT: usize = 1_024;
+
+fn file_state_cache_ceiling_bytes(config: &AnalyzerConfig) -> usize {
+    let total = usize::try_from(config.memo_cache_budget_bytes()).unwrap_or(usize::MAX);
+    let share = usize::try_from(config.memo_cache_budget_bytes() / FILE_STATE_CACHE_BUDGET_DIVISOR)
+        .unwrap_or(usize::MAX);
+    if share < MIN_FILE_STATE_CACHE_BYTES {
+        total
+    } else {
+        share
+    }
+}
+
+fn file_state_cache_budget_bytes(
+    config: &AnalyzerConfig,
+    active_persisted_payload_bytes: Option<usize>,
+) -> usize {
+    let ceiling = file_state_cache_ceiling_bytes(config);
+    let minimum = ceiling.min(MIN_FILE_STATE_CACHE_BYTES);
+    let Some(payload_bytes) = active_persisted_payload_bytes else {
+        return ceiling;
+    };
+    payload_bytes
+        .saturating_mul(FILE_STATE_BYTES_PER_PERSISTED_BYTE)
+        .saturating_div(FILE_STATE_CACHE_CORPUS_FRACTION_DIVISOR)
+        .max(minimum)
+        .min(ceiling)
+}
+
+fn query_file_state_cache_budget_bytes(file_state_cache_budget: usize) -> usize {
+    file_state_cache_budget / QUERY_FILE_STATE_CACHE_BUDGET_DIVISOR
+}
 const QUERY_PREPARED_SYNTAX_CACHE_CAPACITY: usize = 1_024;
 // Retained bytes per source byte for a prepared tree. The tree pins its source
 // text (1x), the tree-sitter subtree arena (8-11x source for the Rust and
@@ -90,6 +146,22 @@ const IMPORT_INFO_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
 // enormous headroom for a workspace of this shape while still capping a
 // Trino-class workspace by recency instead of letting it grow without bound.
 const IMPORT_INFO_STORE_MAX_BYTES: usize = 64 * 1024 * 1024;
+// Type-alias checks need only a small set of `CodeUnit` values per file. Keep
+// these persisted projections separate from complete FileState values so a
+// broad C++ visibility walk does not retain every source and side table.
+const TYPE_ALIAS_STORE_TEXT_BYTES_MULTIPLIER: usize = 2;
+const TYPE_ALIAS_STORE_UNIT_OVERHEAD_BYTES: usize = 256;
+const TYPE_ALIAS_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
+const TYPE_ALIAS_STORE_MAX_BYTES: usize = 32 * 1024 * 1024;
+// A large generated file can have thousands of declaration ranges. A linear
+// scan for every reference makes lexical-owner lookup quadratic in that file.
+// Keep an interval index only for these large states and bound its retained
+// `CodeUnit` copies independently from complete FileState values.
+const ENCLOSING_CODE_UNIT_INDEX_MIN_DECLARATIONS: usize = 128;
+const ENCLOSING_CODE_UNIT_INDEX_TEXT_BYTES_MULTIPLIER: usize = 2;
+const ENCLOSING_CODE_UNIT_INDEX_ENTRY_OVERHEAD_BYTES: usize = 128;
+const ENCLOSING_CODE_UNIT_INDEX_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
+const ENCLOSING_CODE_UNIT_INDEX_STORE_MAX_BYTES: usize = 32 * 1024 * 1024;
 // `SummaryFileProjection` is much lighter than `FileState`: no source text,
 // just the declaration/signature/range/children maps used to render
 // `get_summaries`. Call it a few KB per entry; 128 entries is a small,
@@ -195,20 +267,6 @@ pub(crate) enum BulkFileStateSource {
     Omit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WalkControl {
-    Continue,
-    SkipChildren,
-    Break,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BoundedNamedTreeWalk {
-    Complete { visited: usize },
-    Exceeded { visited: usize },
-    Cancelled,
-}
-
 #[derive(Clone)]
 pub(crate) struct AnalyzerStoreContext {
     pub(crate) store: Arc<AnalyzerStore>,
@@ -269,128 +327,6 @@ fn store_context_from_store(project: &dyn Project, store: AnalyzerStore) -> Anal
     }
 }
 
-pub(crate) fn walk_tree_preorder<'tree>(
-    root: Node<'tree>,
-    include_root: bool,
-    mut visit: impl FnMut(Node<'tree>) -> WalkControl,
-) {
-    let mut cursor = root.walk();
-    let mut is_root = true;
-
-    loop {
-        let node = cursor.node();
-        let should_descend = if include_root || !is_root {
-            match visit(node) {
-                WalkControl::Continue => true,
-                WalkControl::SkipChildren => false,
-                WalkControl::Break => return,
-            }
-        } else {
-            true
-        };
-
-        if should_descend && cursor.goto_first_child() {
-            is_root = false;
-            continue;
-        }
-
-        loop {
-            if cursor.goto_next_sibling() {
-                is_root = false;
-                break;
-            }
-            if !cursor.goto_parent() {
-                return;
-            }
-        }
-    }
-}
-
-pub(crate) fn walk_named_tree_preorder<'tree>(
-    root: Node<'tree>,
-    include_root: bool,
-    mut visit: impl FnMut(Node<'tree>) -> WalkControl,
-) {
-    let result: Result<(), std::convert::Infallible> =
-        try_walk_named_tree_preorder(root, include_root, |node| Ok(visit(node)));
-    match result {
-        Ok(()) => {}
-        Err(error) => match error {},
-    }
-}
-
-/// Fallible counterpart to [`walk_named_tree_preorder`]. Both helpers retain
-/// source-order preorder traversal while allowing visitors to prune or stop.
-pub(crate) fn try_walk_named_tree_preorder<'tree, Error>(
-    root: Node<'tree>,
-    include_root: bool,
-    mut visit: impl FnMut(Node<'tree>) -> Result<WalkControl, Error>,
-) -> Result<(), Error> {
-    enum Frame<'tree> {
-        Enter(Node<'tree>, bool),
-        NextChild(Node<'tree>, usize),
-    }
-
-    let mut stack = vec![Frame::Enter(root, true)];
-    while let Some(frame) = stack.pop() {
-        match frame {
-            Frame::Enter(node, is_root) => {
-                if node.is_named() && (include_root || !is_root) {
-                    match visit(node)? {
-                        WalkControl::Continue => {}
-                        WalkControl::SkipChildren => continue,
-                        WalkControl::Break => return Ok(()),
-                    }
-                }
-                stack.push(Frame::NextChild(node, 0));
-            }
-            Frame::NextChild(node, index) => {
-                if index >= node.named_child_count() {
-                    continue;
-                }
-                stack.push(Frame::NextChild(node, index + 1));
-                if let Some(child) = node.named_child(index) {
-                    stack.push(Frame::Enter(child, false));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Visit named nodes in source-order preorder while applying the shared
-/// receiver/setup traversal budget and cancellation policy.
-pub(crate) fn walk_named_tree_preorder_bounded<'tree>(
-    root: Node<'tree>,
-    include_root: bool,
-    max_named_nodes: usize,
-    cancellation: Option<&CancellationToken>,
-    mut visit: impl FnMut(Node<'tree>),
-) -> BoundedNamedTreeWalk {
-    enum Stop {
-        Exceeded,
-        Cancelled,
-    }
-
-    let mut visited = 0usize;
-    let result = try_walk_named_tree_preorder(root, include_root, |node| {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(Stop::Cancelled);
-        }
-        visited = visited.saturating_add(1);
-        if visited > max_named_nodes {
-            return Err(Stop::Exceeded);
-        }
-        visit(node);
-        Ok(WalkControl::Continue)
-    });
-    match result {
-        Ok(()) => BoundedNamedTreeWalk::Complete { visited },
-        Err(Stop::Exceeded) => BoundedNamedTreeWalk::Exceeded { visited },
-        Err(Stop::Cancelled) => BoundedNamedTreeWalk::Cancelled,
-    }
-}
-
 pub trait LanguageAdapter: Send + Sync + 'static {
     fn language(&self) -> Language;
     fn query_directory(&self) -> &'static str;
@@ -412,9 +348,65 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     /// Multi-key adapters (e.g. TypeScript, which splits `.ts`/`.tsx`
     /// into distinct storage keys) override this.
     fn storage_language_key_for_file(&self, file: &ProjectFile) -> String {
+        // An include-claimed file (#1837) has an extension no language owns, so
+        // the file-derived key would be `Language::None` and its rows would
+        // land under a storage key this adapter never serves a generation for.
+        // Claiming adapters own that whole unclaimed-extension key namespace,
+        // which is sound exactly while one language infers claims -- the
+        // invariant `LanguageAdapter::infer_claimed_files` documents.
+        if self.claims_included_files() && crate::analyzer::common::has_unclaimed_extension(file) {
+            return self.language().config_label().to_string();
+        }
         crate::analyzer::common::language_for_file(file)
             .config_label()
             .to_string()
+    }
+    /// Whether this adapter infers additional analyzable files from the imports
+    /// of the files its extension list already selects (#1837).
+    ///
+    /// The gate exists so the generic pipeline can skip the whole inference
+    /// stage -- a workspace listing scan plus one import-fact hydration -- for
+    /// the eleven languages that do not infer.
+    fn claims_included_files(&self) -> bool {
+        false
+    }
+    /// The claim edges this adapter contributes: for each source file, the
+    /// workspace files it references that no language's extension registry
+    /// claims and that this adapter therefore adopts for indexing (#1837).
+    ///
+    /// `sources` pairs each analyzed file of this adapter with the imports
+    /// recorded for it. `claimable` is every workspace file whose extension no
+    /// language owns (extensionless files included); returning anything outside
+    /// it is a contract violation the caller asserts against. A source with no
+    /// claimable reference contributes no entry.
+    ///
+    /// Edges, not a flat set: the caller closes the relation transitively and
+    /// drops a claim when the last reference to it disappears, and both need
+    /// the attribution. The caller also drives the closure -- it calls this
+    /// with the files it has just adopted and repeats until the set stops
+    /// growing, so an implementation answers only for the `sources` it is
+    /// handed and never walks the graph itself.
+    ///
+    /// Determinism: the answer must be a pure function of `sources`,
+    /// `claimable` and the static extension registry. No discovery order, no
+    /// first-claimant-wins.
+    ///
+    /// CLAIMS SEAM -- single claimant. C++ is the only implementor today, and
+    /// [`crate::analyzer::languages::claim_inferring_languages`] is the registry
+    /// that says so. If a second language ever infers claims, a file both
+    /// languages claim must be dropped from BOTH sets and reported by a
+    /// diagnostic naming the claimants, and
+    /// [`LanguageAdapter::storage_language_key_for_file`] above must stop
+    /// handing the unclaimed-extension key namespace to whichever adapter is
+    /// asking. The registry's own assertion pins the single-claimant premise;
+    /// no multi-claimant machinery exists yet on purpose.
+    fn infer_claimed_files(
+        &self,
+        sources: &[(ProjectFile, Vec<ImportInfo>)],
+        claimable: &BTreeSet<ProjectFile>,
+    ) -> HashMap<ProjectFile, BTreeSet<ProjectFile>> {
+        let _ = (sources, claimable);
+        HashMap::default()
     }
     fn storage_language_keys(&self) -> Vec<(String, TsLanguage)> {
         vec![(
@@ -481,23 +473,20 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn hydrate_content_qualifier(&self, content_qualifier: &str, _file: &ProjectFile) -> String {
         content_qualifier.to_string()
     }
-    /// Whether this unit's structured package prefix must be rebuilt from its
-    /// live path when hydrating a content-addressed blob. This is distinct from
-    /// the persisted qualifier text: an explicitly root-qualified declaration
-    /// may legitimately have an empty package without being path-derived.
-    fn code_unit_package_is_path_derived(
-        &self,
-        code_unit: &CodeUnit,
-        content_qualifier: &str,
-    ) -> bool {
-        self.path_derived_package_fq(content_qualifier, code_unit.source())
-            .is_some()
+    /// The anchor a unit's persisted package prefix is resolved against when
+    /// the extractor recorded none. `None` means this language's packages are
+    /// intrinsic to the blob and must be persisted in full.
+    fn default_package_anchor(&self) -> Option<PackageAnchor> {
+        None
     }
-    /// Return the structured package/module prefix when it depends on the
-    /// live path rather than solely on the persisted source blob. `None` means
-    /// the complete structured name can be persisted with the blob.
-    fn path_derived_package_fq(
+    /// Resolve `anchor` to the live package prefix it names for `file`. `None`
+    /// means this adapter cannot place that anchor, which makes the unit fall
+    /// back to a fully persisted name. `content_qualifier` is the unit's stored
+    /// qualifier text, which some languages (Go) need to reconstruct the
+    /// prefix.
+    fn resolve_package_anchor(
         &self,
+        _anchor: PackageAnchor,
         _content_qualifier: &str,
         _file: &ProjectFile,
     ) -> Option<FqName> {
@@ -633,14 +622,7 @@ pub struct FileState {
     pub(crate) declarations: HashSet<CodeUnit>,
     pub(crate) definition_lookup_units: HashSet<CodeUnit>,
     pub(crate) imports: Vec<ImportInfo>,
-    pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>,
-    /// Per-file Rust usage facts on their way to the `rust_*` fact tables (see
-    /// `crate::analyzer::rust::facts`). Empty for every other language, and
-    /// empty on a `FileState` hydrated from the store: the query side reads
-    /// those rows straight from SQL by blob oid rather than through a
-    /// materialized `FileState`, so hydrating them here would be dead weight
-    /// on every cache hit. Same rule as `parse_errors` below.
-    pub(crate) rust_usage_facts: crate::analyzer::rust::facts::RustUsageFacts,
+    pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::ScalaExportInfo>>,
     pub(crate) raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     pub(crate) supertype_lookup_paths: HashMap<CodeUnit, Vec<String>>,
     pub(crate) type_identifiers: HashSet<String>,
@@ -671,95 +653,177 @@ pub struct FileState {
     pub(crate) parse_errors: Option<Vec<crate::analyzer::ParseError>>,
 }
 
-/// Source backing for an immutable prepared syntax tree.
-///
-/// Ordinary unbounded queries retain the indexed [`FileState`] needed by
-/// declaration-oriented helpers. Bounded syntax-only queries retain just the
-/// exact admitted source snapshot, avoiding analyzer hydration and store
-/// writes before their cancellable parse.
-#[derive(Debug)]
-enum PreparedSyntaxSource {
-    Indexed(Arc<FileState>),
-    Exact(Arc<str>),
+impl FileState {
+    /// Return a conservative retained-byte estimate for cache admission.
+    ///
+    /// Rust cannot report heap allocation sizes. This accounts for owned
+    /// buffers and map slots, then charges a fixed allocator allowance. The
+    /// value is a cache budget estimate, not an RSS measurement.
+    fn estimated_retained_bytes(&self) -> usize {
+        const ALLOCATION_ALLOWANCE_NUMERATOR: usize = 3;
+        const ALLOCATION_ALLOWANCE_DENOMINATOR: usize = 2;
+
+        let strings = self
+            .imports
+            .iter()
+            .map(|import| import.raw_snippet.capacity())
+            .chain(self.type_identifiers.iter().map(|value| value.capacity()))
+            .chain(self.raw_supertypes.iter().flat_map(|(unit, values)| {
+                std::iter::once(unit.fq_name().capacity())
+                    .chain(values.iter().map(|value| value.capacity()))
+            }))
+            .chain(
+                self.supertype_lookup_paths
+                    .values()
+                    .flat_map(|values| values.iter().map(|value| value.capacity())),
+            )
+            .chain(
+                self.signatures
+                    .values()
+                    .flat_map(|values| values.iter().map(|value| value.capacity())),
+            )
+            .fold(0usize, usize::saturating_add);
+        let collection_slots = self
+            .top_level_declarations
+            .capacity()
+            .saturating_mul(std::mem::size_of::<CodeUnit>())
+            .saturating_add(
+                self.declarations
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CodeUnit>()),
+            )
+            .saturating_add(
+                self.definition_lookup_units
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CodeUnit>()),
+            )
+            .saturating_add(
+                self.imports
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ImportInfo>()),
+            )
+            .saturating_add(
+                self.scala_exports
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(
+                        CodeUnit,
+                        Vec<crate::analyzer::ScalaExportInfo>,
+                    )>()),
+            )
+            .saturating_add(
+                self.raw_supertypes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<String>)>()),
+            )
+            .saturating_add(
+                self.supertype_lookup_paths
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<String>)>()),
+            )
+            .saturating_add(
+                self.type_identifiers
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            )
+            .saturating_add(
+                self.signatures
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<String>)>()),
+            )
+            .saturating_add(
+                self.signature_metadata
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<SignatureMetadata>)>()),
+            )
+            .saturating_add(
+                self.cpp_template_metadata
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, CppTemplateMetadata)>()),
+            )
+            .saturating_add(
+                self.ruby_method_dispatch_modes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, RubyMethodDispatchMode)>()),
+            )
+            .saturating_add(
+                self.ranges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<Range>)>()),
+            )
+            .saturating_add(
+                self.children
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(CodeUnit, Vec<CodeUnit>)>()),
+            )
+            .saturating_add(
+                self.scala_traits
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CodeUnit>()),
+            )
+            .saturating_add(
+                self.type_aliases
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CodeUnit>()),
+            )
+            .saturating_add(
+                self.test_region_units
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<CodeUnit>()),
+            )
+            .saturating_add(
+                self.materialization_records
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<MaterializationRecord>()),
+            )
+            .saturating_add(
+                self.parse_errors
+                    .as_ref()
+                    .map(|errors| {
+                        errors
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<crate::analyzer::ParseError>())
+                    })
+                    .unwrap_or_default(),
+            );
+        let direct = std::mem::size_of::<Self>()
+            .saturating_add(self.source.capacity())
+            .saturating_add(self.package_name.capacity())
+            .saturating_add(self.content_qualifier.capacity())
+            .saturating_add(strings)
+            .saturating_add(collection_slots);
+        direct
+            .saturating_mul(ALLOCATION_ALLOWANCE_NUMERATOR)
+            .saturating_div(ALLOCATION_ALLOWANCE_DENOMINATOR)
+    }
 }
 
-impl PreparedSyntaxSource {
+/// The indexed backing a prepared tree consults for declaration facts. The
+/// contract itself is core-owned so a language crate can consume prepared
+/// syntax; `FileState` is the analysis-side storage record that satisfies it.
+impl PreparedSourceIndex for FileState {
     fn source(&self) -> &str {
-        match self {
-            Self::Indexed(file_state) => &file_state.source,
-            Self::Exact(source) => source,
-        }
+        &self.source
     }
 
-    fn file_state(&self) -> Option<&FileState> {
-        match self {
-            Self::Indexed(file_state) => Some(file_state),
-            Self::Exact(_) => None,
-        }
+    fn declaration_ranges(&self, code_unit: &CodeUnit) -> Option<&[Range]> {
+        self.ranges.get(code_unit).map(Vec::as_slice)
+    }
+
+    fn direct_children(&self, owner: &CodeUnit) -> Option<&[CodeUnit]> {
+        self.children.get(owner).map(Vec::as_slice)
     }
 }
 
-/// Immutable syntax prepared from one exact source snapshot. Keeping the
-/// backing alive prevents the source bytes and tree from drifting apart while
-/// concurrent queries reuse it.
-#[derive(Debug)]
-pub(crate) struct PreparedSyntaxTree {
-    source: PreparedSyntaxSource,
-    tree: Tree,
-    line_starts: Vec<usize>,
-    dialect: LanguageDialect,
-    origin: PreparedSourceOrigin,
-    overlay_revision: Option<OverlayRevision>,
-}
-
-impl PreparedSyntaxTree {
-    pub(crate) fn source(&self) -> &str {
-        self.source.source()
+/// The narrowed view a bulk state read hands to a whole-workspace pass; see
+/// [`IndexedFileFacts`].
+impl IndexedFileFacts for FileState {
+    fn top_level_declarations(&self) -> &[CodeUnit] {
+        &self.top_level_declarations
     }
 
-    pub(crate) fn tree(&self) -> &Tree {
-        &self.tree
+    fn imports(&self) -> &[ImportInfo] {
+        &self.imports
     }
-
-    pub(crate) fn declaration_node(&self, code_unit: &CodeUnit) -> Option<Node<'_>> {
-        let range = self.source.file_state()?.ranges.get(code_unit)?.first()?;
-        self.tree
-            .root_node()
-            .descendant_for_byte_range(range.start_byte, range.end_byte)
-    }
-
-    pub(crate) fn direct_children(&self, owner: &CodeUnit) -> &[CodeUnit] {
-        self.source
-            .file_state()
-            .and_then(|file_state| file_state.children.get(owner))
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn line_starts(&self) -> &[usize] {
-        &self.line_starts
-    }
-
-    pub(crate) const fn dialect(&self) -> LanguageDialect {
-        self.dialect
-    }
-
-    pub(crate) const fn origin(&self) -> PreparedSourceOrigin {
-        self.origin
-    }
-
-    pub(crate) const fn overlay_revision(&self) -> Option<OverlayRevision> {
-        self.overlay_revision
-    }
-}
-
-/// How the exact source snapshot selected for a prepared syntax tree entered
-/// the analyzer. The content digest remains authoritative; this marker keeps
-/// disk and unsaved-overlay revisions distinct even when their bytes match.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PreparedSourceOrigin {
-    Disk,
-    Overlay,
 }
 
 /// The requested source snapshot exceeded a caller-supplied preparation cap.
@@ -819,6 +883,14 @@ struct AnalyzerRuntimeState {
     dirty_path_symbol_rows: Mutex<HashMap<ProjectFile, (String, PathSymbolRow)>>,
     seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
     persistence_stats: PersistBatchStats,
+    /// Include-driven claim relation for this generation (#1837): analyzed file
+    /// -> the unclaimed-extension workspace files it references. Empty for the
+    /// eleven adapters that do not infer claims. Retained rather than recomputed
+    /// so an incremental update re-reads imports only for the files that
+    /// changed: everything else's edges are still valid, and the claim set is
+    /// the transitive closure of the whole relation from the
+    /// extension-discovered roots.
+    claim_edges: HashMap<ProjectFile, BTreeSet<ProjectFile>>,
 }
 
 impl AnalyzerRuntimeState {
@@ -834,14 +906,49 @@ impl AnalyzerRuntimeState {
             dirty_path_symbol_rows: Mutex::new(dirty_path_symbol_rows),
             seeded_file_states,
             persistence_stats: PersistBatchStats::default(),
+            claim_edges: HashMap::default(),
         }
+    }
+
+    /// Fold `other`'s parse errors and seeded states into this state. Used when
+    /// a build reconciles include-claimed files in a second pass: the two
+    /// passes produce one generation's runtime state, not two.
+    fn absorb(&mut self, other: AnalyzerRuntimeState) {
+        let AnalyzerRuntimeState {
+            fresh_parse_errors,
+            dirty_file_states,
+            dirty_path_symbol_rows,
+            seeded_file_states,
+            persistence_stats,
+            claim_edges,
+        } = other;
+        self.fresh_parse_errors.extend(fresh_parse_errors);
+        // The second pass was handed this pass's dirty maps as input and
+        // returns the merged result, so it replaces rather than extends.
+        *self
+            .dirty_file_states
+            .lock()
+            .expect("dirty file-state mutex poisoned") = dirty_file_states
+            .into_inner()
+            .expect("dirty file-state mutex poisoned");
+        *self
+            .dirty_path_symbol_rows
+            .lock()
+            .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows
+            .into_inner()
+            .expect("dirty path-symbol mutex poisoned");
+        self.seeded_file_states.extend(seeded_file_states);
+        self.seeded_file_states
+            .truncate(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
+        self.persistence_stats.merge(persistence_stats);
+        self.claim_edges.extend(claim_edges);
     }
 
     fn seed_snapshot_file_states(&self, cache: &mut SourceSnapshotFileStateIndex) {
         for (key, state) in self
             .seeded_file_states
             .iter()
-            .take(TRANSIENT_FILE_STATE_CACHE_CAPACITY)
+            .take(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY)
         {
             cache.insert(key.clone(), Arc::clone(state));
         }
@@ -1005,6 +1112,133 @@ impl ByteBounded for Arc<[ImportInfo]> {
     }
 }
 
+impl ByteBounded for Arc<[CodeUnit]> {
+    fn estimated_bytes(&self) -> usize {
+        self.iter()
+            .map(|unit| {
+                unit.fq_name()
+                    .len()
+                    .saturating_add(unit.short_name().len())
+                    .saturating_add(unit.signature().map_or(0, str::len))
+                    .saturating_mul(TYPE_ALIAS_STORE_TEXT_BYTES_MULTIPLIER)
+                    .saturating_add(TYPE_ALIAS_STORE_UNIT_OVERHEAD_BYTES)
+            })
+            .fold(TYPE_ALIAS_STORE_ENTRY_OVERHEAD_BYTES, usize::saturating_add)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EnclosingCodeUnitRange {
+    range: Range,
+    code_unit: CodeUnit,
+    ordinal: usize,
+}
+
+/// A sorted interval index over the persisted declaration ranges in one
+/// `FileState`. `prefix_max_end_bytes` stops a backwards scan once no earlier
+/// range can contain the requested byte span.
+#[derive(Debug)]
+struct EnclosingCodeUnitIndex {
+    ranges: Vec<EnclosingCodeUnitRange>,
+    prefix_max_end_bytes: Vec<usize>,
+}
+
+impl EnclosingCodeUnitIndex {
+    fn from_file_state(state: &FileState) -> Self {
+        let mut ranges = Vec::new();
+        for code_unit in &state.declarations {
+            for (ordinal, range) in state
+                .ranges
+                .get(code_unit)
+                .into_iter()
+                .flatten()
+                .copied()
+                .enumerate()
+            {
+                ranges.push(EnclosingCodeUnitRange {
+                    range,
+                    code_unit: code_unit.clone(),
+                    ordinal,
+                });
+            }
+        }
+        ranges.sort_unstable_by(|left, right| {
+            left.range
+                .start_byte
+                .cmp(&right.range.start_byte)
+                .then_with(|| left.range.end_byte.cmp(&right.range.end_byte))
+                .then_with(|| left.ordinal.cmp(&right.ordinal))
+                .then_with(|| left.code_unit.cmp(&right.code_unit))
+        });
+        let mut prefix_max_end_bytes = Vec::with_capacity(ranges.len());
+        let mut max_end_byte = 0;
+        for candidate in &ranges {
+            max_end_byte = max_end_byte.max(candidate.range.end_byte);
+            prefix_max_end_bytes.push(max_end_byte);
+        }
+        Self {
+            ranges,
+            prefix_max_end_bytes,
+        }
+    }
+
+    fn enclosing_code_unit(&self, range: &Range) -> Option<CodeUnit> {
+        let upper_bound = self
+            .ranges
+            .partition_point(|candidate| candidate.range.start_byte <= range.start_byte);
+        let mut first_containing_range_by_unit = HashMap::default();
+        for index in (0..upper_bound).rev() {
+            let candidate = &self.ranges[index];
+            if candidate.range.contains(range) {
+                first_containing_range_by_unit
+                    .entry(candidate.code_unit.clone())
+                    .and_modify(|(best_ordinal, best_range)| {
+                        if candidate.ordinal < *best_ordinal {
+                            *best_ordinal = candidate.ordinal;
+                            *best_range = candidate.range;
+                        }
+                    })
+                    .or_insert((candidate.ordinal, candidate.range));
+            }
+            if index == 0 || self.prefix_max_end_bytes[index - 1] < range.end_byte {
+                break;
+            }
+        }
+        select_enclosing_code_unit(
+            first_containing_range_by_unit
+                .into_iter()
+                .map(|(code_unit, (_, candidate_range))| (candidate_range, code_unit)),
+        )
+    }
+}
+
+impl ByteBounded for Arc<EnclosingCodeUnitIndex> {
+    fn estimated_bytes(&self) -> usize {
+        self.ranges
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .code_unit
+                    .fq_name()
+                    .len()
+                    .saturating_add(candidate.code_unit.short_name().len())
+                    .saturating_add(candidate.code_unit.signature().map_or(0, str::len))
+                    .saturating_mul(ENCLOSING_CODE_UNIT_INDEX_TEXT_BYTES_MULTIPLIER)
+                    .saturating_add(std::mem::size_of::<EnclosingCodeUnitRange>())
+                    .saturating_add(ENCLOSING_CODE_UNIT_INDEX_ENTRY_OVERHEAD_BYTES)
+            })
+            .chain(std::iter::once(
+                self.prefix_max_end_bytes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            ))
+            .fold(
+                ENCLOSING_CODE_UNIT_INDEX_STORE_ENTRY_OVERHEAD_BYTES,
+                usize::saturating_add,
+            )
+    }
+}
+
 /// A byte-bounded LRU of content-addressed derivations, retained across
 /// requests behind whatever per-request single-flight layer the caller already
 /// has.
@@ -1045,6 +1279,8 @@ type PreparedSyntaxStore = ByteBoundedStore<PreparedSyntaxCacheKey, Arc<Prepared
 /// scan asked for the same file's imports tens of thousands of times per
 /// request, every one a SQLite hydration.
 type ImportInfoStore = ByteBoundedStore<FileStateCacheKey, Arc<[ImportInfo]>>;
+type TypeAliasStore = ByteBoundedStore<FileStateCacheKey, Arc<[CodeUnit]>>;
+type EnclosingCodeUnitStore = ByteBoundedStore<FileStateCacheKey, Arc<EnclosingCodeUnitIndex>>;
 
 impl<K: Eq + std::hash::Hash + Clone, V: Clone + ByteBounded> ByteBoundedStore<K, V> {
     fn new(max_bytes: usize) -> Self {
@@ -1091,6 +1327,11 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone + ByteBounded> ByteBoundedStore<K
         if self.retained_bytes > self.max_bytes {
             self.evict_to_watermark();
         }
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.entries.len()
     }
 
     /// Evicting past the cap down to a watermark amortizes the recency sort:
@@ -1158,7 +1399,295 @@ struct BoundedFileCache<T> {
     next_stamp: u64,
 }
 
-type FileStateCache = BoundedFileCache<FileState>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileStateCacheSegment {
+    Probation,
+    Protected,
+}
+
+#[derive(Debug)]
+struct FileStateCacheEntry {
+    state: Arc<FileState>,
+    estimated_bytes: usize,
+    stamp: u64,
+    segment: FileStateCacheSegment,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FileStateCacheStats {
+    hits: usize,
+    misses: usize,
+    admissions: usize,
+    promotions: usize,
+    evictions: usize,
+    rejected_admissions: usize,
+}
+
+/// A byte-bounded segmented LRU for complete file states.
+///
+/// One-time scans enter probation. A second access promotes an entry to the
+/// protected segment. This keeps an unrelated scan from displacing an already
+/// useful working set while the byte bound protects whale workspaces.
+#[derive(Debug)]
+struct SegmentedFileStateCache {
+    max_bytes: usize,
+    protected_max_bytes: usize,
+    retained_bytes: usize,
+    probation_bytes: usize,
+    protected_bytes: usize,
+    entries: HashMap<FileStateCacheKey, FileStateCacheEntry>,
+    probation_order: VecDeque<(FileStateCacheKey, u64)>,
+    protected_order: VecDeque<(FileStateCacheKey, u64)>,
+    next_stamp: u64,
+    stats: FileStateCacheStats,
+}
+
+impl SegmentedFileStateCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            protected_max_bytes: max_bytes.saturating_mul(4) / 5,
+            retained_bytes: 0,
+            probation_bytes: 0,
+            protected_bytes: 0,
+            entries: HashMap::default(),
+            probation_order: VecDeque::new(),
+            protected_order: VecDeque::new(),
+            next_stamp: 0,
+            stats: FileStateCacheStats::default(),
+        }
+    }
+
+    fn get(&mut self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        let Some(entry) = self.entries.get(key) else {
+            self.stats.misses = self.stats.misses.saturating_add(1);
+            return None;
+        };
+        self.stats.hits = self.stats.hits.saturating_add(1);
+        let state = Arc::clone(&entry.state);
+        self.touch(key);
+        Some(state)
+    }
+
+    fn insert(&mut self, key: FileStateCacheKey, state: Arc<FileState>) {
+        let estimated_bytes = state.estimated_retained_bytes();
+        if estimated_bytes > self.max_bytes {
+            self.stats.rejected_admissions = self.stats.rejected_admissions.saturating_add(1);
+            return;
+        }
+        if let Some(replaced) = self.entries.remove(&key) {
+            self.remove_accounting(&replaced);
+        }
+        let stamp = self.next_stamp();
+        self.entries.insert(
+            key.clone(),
+            FileStateCacheEntry {
+                state,
+                estimated_bytes,
+                stamp,
+                segment: FileStateCacheSegment::Probation,
+            },
+        );
+        self.retained_bytes = self.retained_bytes.saturating_add(estimated_bytes);
+        self.probation_bytes = self.probation_bytes.saturating_add(estimated_bytes);
+        self.probation_order.push_back((key, stamp));
+        self.stats.admissions = self.stats.admissions.saturating_add(1);
+        self.enforce_bounds();
+        self.maybe_compact();
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: &FileStateCacheKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> FileStateCacheStats {
+        self.stats
+    }
+
+    fn touch(&mut self, key: &FileStateCacheKey) {
+        let stamp = self.next_stamp();
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        if entry.segment == FileStateCacheSegment::Probation {
+            entry.segment = FileStateCacheSegment::Protected;
+            self.probation_bytes = self.probation_bytes.saturating_sub(entry.estimated_bytes);
+            self.protected_bytes = self.protected_bytes.saturating_add(entry.estimated_bytes);
+            self.stats.promotions = self.stats.promotions.saturating_add(1);
+        }
+        entry.stamp = stamp;
+        match entry.segment {
+            FileStateCacheSegment::Probation => {
+                self.probation_order.push_back((key.clone(), stamp))
+            }
+            FileStateCacheSegment::Protected => {
+                self.protected_order.push_back((key.clone(), stamp))
+            }
+        }
+        self.enforce_bounds();
+        self.maybe_compact();
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.wrapping_add(1);
+        stamp
+    }
+
+    fn enforce_bounds(&mut self) {
+        while self.protected_bytes > self.protected_max_bytes {
+            if !self.demote_protected_one() {
+                break;
+            }
+        }
+        while self.retained_bytes > self.max_bytes {
+            if self.evict_one(FileStateCacheSegment::Probation) {
+                continue;
+            }
+            if !self.evict_one(FileStateCacheSegment::Protected) {
+                break;
+            }
+        }
+    }
+
+    fn demote_protected_one(&mut self) -> bool {
+        while let Some((key, stamp)) = self.protected_order.pop_front() {
+            let next_stamp = self.next_stamp();
+            let Some(entry) = self.entries.get_mut(&key) else {
+                continue;
+            };
+            if entry.segment != FileStateCacheSegment::Protected || entry.stamp != stamp {
+                continue;
+            }
+            entry.segment = FileStateCacheSegment::Probation;
+            entry.stamp = next_stamp;
+            self.protected_bytes = self.protected_bytes.saturating_sub(entry.estimated_bytes);
+            self.probation_bytes = self.probation_bytes.saturating_add(entry.estimated_bytes);
+            self.probation_order.push_back((key, entry.stamp));
+            return true;
+        }
+        false
+    }
+
+    fn evict_one(&mut self, segment: FileStateCacheSegment) -> bool {
+        let order = match segment {
+            FileStateCacheSegment::Probation => &mut self.probation_order,
+            FileStateCacheSegment::Protected => &mut self.protected_order,
+        };
+        while let Some((key, stamp)) = order.pop_front() {
+            let is_live = self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.segment == segment && entry.stamp == stamp);
+            if !is_live {
+                continue;
+            }
+            let entry = self
+                .entries
+                .remove(&key)
+                .expect("live file-state cache entry must remain present");
+            self.remove_accounting(&entry);
+            self.stats.evictions = self.stats.evictions.saturating_add(1);
+            return true;
+        }
+        false
+    }
+
+    fn remove_accounting(&mut self, entry: &FileStateCacheEntry) {
+        self.retained_bytes = self.retained_bytes.saturating_sub(entry.estimated_bytes);
+        match entry.segment {
+            FileStateCacheSegment::Probation => {
+                self.probation_bytes = self.probation_bytes.saturating_sub(entry.estimated_bytes);
+            }
+            FileStateCacheSegment::Protected => {
+                self.protected_bytes = self.protected_bytes.saturating_sub(entry.estimated_bytes);
+            }
+        }
+    }
+
+    fn maybe_compact(&mut self) {
+        let threshold = self
+            .entries
+            .len()
+            .saturating_mul(CACHE_ORDER_COMPACT_FACTOR);
+        if self.probation_order.len() > threshold.max(CACHE_ORDER_COMPACT_FACTOR) {
+            self.probation_order.retain(|(key, stamp)| {
+                self.entries.get(key).is_some_and(|entry| {
+                    entry.segment == FileStateCacheSegment::Probation && entry.stamp == *stamp
+                })
+            });
+        }
+        if self.protected_order.len() > threshold.max(CACHE_ORDER_COMPACT_FACTOR) {
+            self.protected_order.retain(|(key, stamp)| {
+                self.entries.get(key).is_some_and(|entry| {
+                    entry.segment == FileStateCacheSegment::Protected && entry.stamp == *stamp
+                })
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.probation_order.clear();
+        self.protected_order.clear();
+        self.retained_bytes = 0;
+        self.probation_bytes = 0;
+        self.protected_bytes = 0;
+    }
+}
+
+#[derive(Debug)]
+struct QueryFileStateCache {
+    entries: HashMap<FileStateCacheKey, Arc<FileState>>,
+    retained_bytes: usize,
+    max_bytes: usize,
+}
+
+impl QueryFileStateCache {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::default(),
+            retained_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&self, key: &FileStateCacheKey) -> Option<Arc<FileState>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn retain(&mut self, key: FileStateCacheKey, state: Arc<FileState>) -> bool {
+        if let Some(existing) = self.entries.get_mut(&key) {
+            *existing = state;
+            return true;
+        }
+        let estimated_bytes = state.estimated_retained_bytes();
+        if estimated_bytes > self.max_bytes
+            || self.retained_bytes.saturating_add(estimated_bytes) > self.max_bytes
+        {
+            return false;
+        }
+        self.entries.insert(key, state);
+        self.retained_bytes = self.retained_bytes.saturating_add(estimated_bytes);
+        true
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.retained_bytes = 0;
+    }
+}
+
+type FileStateCache = SegmentedFileStateCache;
 type SummaryFileProjectionCache = BoundedFileCache<SummaryFileProjection>;
 type PreparedSyntaxRequestCache =
     HashMap<PreparedSyntaxCacheKey, Arc<OnceLock<Option<Arc<PreparedSyntaxTree>>>>>;
@@ -1170,7 +1699,7 @@ type PreparedSyntaxRequestCache =
 type SourceSnapshotFileStateIndex = HashMap<FileStateCacheKey, Arc<FileState>>;
 type TopLevelClassUnitsByPackageCell = Arc<OnceLock<Arc<HashMap<String, Vec<CodeUnit>>>>>;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct QueryReadCache {
     contexts: Vec<Arc<crate::analyzer::AnalyzerQueryContext>>,
     /// Each request memo is independently synchronized. The outer cache lock
@@ -1179,8 +1708,9 @@ struct QueryReadCache {
     /// dropping it, so an insertion in one memo cannot block readers of another.
     analyzed_live_files: Arc<RwLock<Option<Vec<ProjectFile>>>>,
     live_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedLiveSource>>>>,
+    current_sources: Arc<RwLock<HashMap<ProjectFile, Option<String>>>>,
     prepared_sources: Arc<RwLock<HashMap<ProjectFile, Option<ResolvedPreparedSource>>>>,
-    file_states: Arc<RwLock<HashMap<FileStateCacheKey, Arc<FileState>>>>,
+    file_states: Arc<RwLock<QueryFileStateCache>>,
     prepared_syntax: Arc<RwLock<PreparedSyntaxRequestCache>>,
     /// Persisted top-level class declarations bucketed by package, hydrated at
     /// most once per request. `class_declarations_in_package` answers a
@@ -1295,6 +1825,12 @@ impl std::fmt::Debug for WorkspaceModuleWalk {
     }
 }
 
+impl Default for QueryReadCache {
+    fn default() -> Self {
+        Self::new(MIN_FILE_STATE_CACHE_BYTES / QUERY_FILE_STATE_CACHE_BUDGET_DIVISOR)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DefinitionRangeStart {
     Persisted(Option<usize>),
@@ -1308,6 +1844,26 @@ struct DefinitionSortCandidate {
 }
 
 impl QueryReadCache {
+    fn new(file_state_budget_bytes: usize) -> Self {
+        Self {
+            contexts: Vec::new(),
+            analyzed_live_files: Arc::new(RwLock::new(None)),
+            live_sources: Arc::new(RwLock::new(HashMap::default())),
+            current_sources: Arc::new(RwLock::new(HashMap::default())),
+            prepared_sources: Arc::new(RwLock::new(HashMap::default())),
+            file_states: Arc::new(RwLock::new(QueryFileStateCache::new(
+                file_state_budget_bytes,
+            ))),
+            prepared_syntax: Arc::new(RwLock::new(HashMap::default())),
+            top_level_class_units_by_package: Arc::new(OnceLock::new()),
+            workspace_file_index: Arc::new(OnceLock::new()),
+            parent_units: Arc::new(RwLock::new(HashMap::default())),
+            definition_units: Arc::new(RwLock::new(HashMap::default())),
+            definition_candidate_rows: Arc::new(KeyedPoolSafeMemo::new()),
+            workspace_module_walk: Arc::new(RwLock::new(None)),
+        }
+    }
+
     fn begin(&mut self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
         if self.contexts.is_empty() {
             self.reset_request_caches();
@@ -1339,8 +1895,14 @@ impl QueryReadCache {
     fn reset_request_caches(&mut self) {
         self.analyzed_live_files = Arc::new(RwLock::new(None));
         self.live_sources = Arc::new(RwLock::new(HashMap::default()));
+        self.current_sources = Arc::new(RwLock::new(HashMap::default()));
         self.prepared_sources = Arc::new(RwLock::new(HashMap::default()));
-        self.file_states = Arc::new(RwLock::new(HashMap::default()));
+        let max_bytes = self
+            .file_states
+            .read()
+            .expect("query file-state cache read lock poisoned")
+            .max_bytes;
+        self.file_states = Arc::new(RwLock::new(QueryFileStateCache::new(max_bytes)));
         self.prepared_syntax = Arc::new(RwLock::new(HashMap::default()));
         self.parent_units = Arc::new(RwLock::new(HashMap::default()));
         self.definition_units = Arc::new(RwLock::new(HashMap::default()));
@@ -1507,438 +2069,7 @@ impl<T> BoundedFileCache<T> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ParsedFile {
-    pub package_name: String,
-    pub content_qualifier: String,
-    pub top_level_declarations: Vec<CodeUnit>,
-    declarations: HashSet<CodeUnit>,
-    declaration_identities: HashMap<DeclarationIdentity, usize>,
-    pub definition_lookup_units: HashSet<CodeUnit>,
-    pub imports: Vec<ImportInfo>,
-    pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::scala::ScalaExportInfo>>,
-    /// Per-file Rust usage facts (exports, import targets, modules, identifier
-    /// occurrences) recorded by the Rust walk from the tree it already holds,
-    /// and persisted to the `rust_*` fact tables. Empty for every other
-    /// language. See `crate::analyzer::rust::facts`.
-    pub(crate) rust_usage_facts: crate::analyzer::rust::facts::RustUsageFacts,
-    pub raw_supertypes: HashMap<CodeUnit, Vec<String>>,
-    pub supertype_lookup_paths: HashMap<CodeUnit, Vec<String>>,
-    pub type_identifiers: HashSet<String>,
-    pub signatures: HashMap<CodeUnit, Vec<String>>,
-    pub signature_metadata: HashMap<CodeUnit, Vec<SignatureMetadata>>,
-    pub(crate) cpp_template_metadata: HashMap<CodeUnit, CppTemplateMetadata>,
-    pub ruby_method_dispatch_modes: HashMap<CodeUnit, RubyMethodDispatchMode>,
-    pub scala_traits: HashSet<CodeUnit>,
-    pub type_aliases: HashSet<CodeUnit>,
-    pub(crate) ranges: HashMap<CodeUnit, Vec<Range>>,
-    /// Physical declaration occurrences retained only for request-time navigation.
-    ///
-    /// Unlike `ranges`, this collection is not persisted or exposed through
-    /// `IAnalyzer`: broad consumers continue to observe the preferred semantic
-    /// declaration range, while explicit navigation may distinguish prototypes
-    /// and bodies that share one `CodeUnit` identity.
-    pub(crate) navigation_ranges: HashMap<CodeUnit, Vec<Range>>,
-    pub(crate) navigation_ranges_truncated: HashSet<CodeUnit>,
-    pub(crate) children: HashMap<CodeUnit, Vec<CodeUnit>>,
-    /// Declarations that lie in a structurally-evidenced test region: a
-    /// test-attributed item or any declaration nested inside a `#[cfg(test)]`
-    /// (or otherwise test-attributed) module/item. Populated by language walks
-    /// that thread test-region taint through their traversal (currently Rust);
-    /// other languages leave it empty, so their declarations default untainted.
-    pub(crate) test_region_units: HashSet<CodeUnit>,
-    /// Declaration-materialization provenance recorded by the language walk
-    /// that created the declarations it describes (issue #1476): generation
-    /// sites and their generated units, dynamic generation sites, export
-    /// declarations, recovered declarations, and preprocessor-conditional
-    /// intervals. Persisted with the file's other analysis facts.
-    pub(crate) materialization_records: Vec<MaterializationRecord>,
-}
-
-const MAX_NAVIGATION_RANGES_PER_CODE_UNIT: usize = 257;
-
-#[derive(Debug, Clone)]
-struct DeclarationIdentity(CodeUnit);
-
-impl PartialEq for DeclarationIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        #[cfg(test)]
-        DECLARATION_IDENTITY_COMPARISON_PROBE.with(|probe| {
-            if let Some(comparisons) = probe.get() {
-                probe.set(Some(comparisons + 1));
-            }
-        });
-        self.0.source() == other.0.source()
-            && self.0.kind() == other.0.kind()
-            && self.0.package_name() == other.0.package_name()
-            && self.0.short_name() == other.0.short_name()
-    }
-}
-
-impl Eq for DeclarationIdentity {}
-
-impl Hash for DeclarationIdentity {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.source().hash(state);
-        self.0.kind().hash(state);
-        self.0.package_name().hash(state);
-        self.0.short_name().hash(state);
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static DECLARATION_IDENTITY_COMPARISON_PROBE: std::cell::Cell<Option<usize>> = const {
-        std::cell::Cell::new(None)
-    };
-}
-
-#[cfg(test)]
-pub(crate) fn start_declaration_identity_comparison_probe() {
-    DECLARATION_IDENTITY_COMPARISON_PROBE.with(|probe| probe.set(Some(0)));
-}
-
-#[cfg(test)]
-pub(crate) fn finish_declaration_identity_comparison_probe() -> usize {
-    DECLARATION_IDENTITY_COMPARISON_PROBE.with(|probe| {
-        probe
-            .replace(None)
-            .expect("declaration identity comparison probe should be active")
-    })
-}
-
-impl ParsedFile {
-    pub fn new(package_name: String) -> Self {
-        Self {
-            content_qualifier: package_name.clone(),
-            package_name,
-            top_level_declarations: Vec::new(),
-            declarations: HashSet::default(),
-            declaration_identities: HashMap::default(),
-            definition_lookup_units: HashSet::default(),
-            imports: Vec::new(),
-            scala_exports: HashMap::default(),
-            rust_usage_facts: crate::analyzer::rust::facts::RustUsageFacts::default(),
-            raw_supertypes: HashMap::default(),
-            supertype_lookup_paths: HashMap::default(),
-            type_identifiers: HashSet::default(),
-            signatures: HashMap::default(),
-            signature_metadata: HashMap::default(),
-            cpp_template_metadata: HashMap::default(),
-            ruby_method_dispatch_modes: HashMap::default(),
-            scala_traits: HashSet::default(),
-            type_aliases: HashSet::default(),
-            ranges: HashMap::default(),
-            navigation_ranges: HashMap::default(),
-            navigation_ranges_truncated: HashSet::default(),
-            children: HashMap::default(),
-            test_region_units: HashSet::default(),
-            materialization_records: Vec::new(),
-        }
-    }
-
-    /// Records one declaration-materialization provenance fact. Called by the
-    /// language walk at the same point it creates (or, for a dynamic site,
-    /// declines to create) the declarations the record describes.
-    pub fn record_materialization(&mut self, record: MaterializationRecord) {
-        self.materialization_records.push(record);
-    }
-
-    /// Records that `code_unit` sits in a structurally-evidenced test region.
-    /// Idempotent; safe to call after `add_code_unit`.
-    pub fn mark_test_region(&mut self, code_unit: &CodeUnit) {
-        self.test_region_units.insert(code_unit.clone());
-    }
-
-    pub fn add_code_unit(
-        &mut self,
-        code_unit: CodeUnit,
-        node: Node<'_>,
-        _source: &str,
-        parent: Option<CodeUnit>,
-        top_level: Option<CodeUnit>,
-    ) {
-        self.add_code_unit_with_range(code_unit, node_range(node), parent, top_level);
-    }
-
-    pub fn add_code_unit_with_range(
-        &mut self,
-        code_unit: CodeUnit,
-        range: Range,
-        parent: Option<CodeUnit>,
-        top_level: Option<CodeUnit>,
-    ) {
-        self.record_navigation_range(code_unit.clone(), range);
-        let inserted = self.insert_declaration(code_unit.clone());
-
-        if inserted && parent.is_none() {
-            self.top_level_declarations.push(code_unit.clone());
-        }
-
-        let ranges = self.ranges.entry(code_unit.clone()).or_default();
-        if !ranges.contains(&range) {
-            ranges.push(range);
-        }
-
-        if let Some(parent) = parent {
-            let children = self.children.entry(parent).or_default();
-            if !children.contains(&code_unit) {
-                children.push(code_unit.clone());
-            }
-        }
-
-        if let Some(top_level) = top_level {
-            self.children.entry(top_level).or_default();
-        }
-    }
-
-    /// Registers a source-backed lookup fact without exposing it through the
-    /// public declaration surface.
-    pub fn add_definition_lookup_unit(
-        &mut self,
-        code_unit: CodeUnit,
-        node: Node<'_>,
-        _source: &str,
-    ) {
-        self.definition_lookup_units.insert(code_unit.clone());
-        self.ranges
-            .entry(code_unit)
-            .or_default()
-            .push(node_range(node));
-    }
-
-    /// Registers a declaration-like code unit for analysis without giving it a source range.
-    ///
-    /// This is for synthetic owners that should participate in import or usage resolution but
-    /// should not render as user-visible declarations in summary output.
-    pub fn add_synthetic_code_unit(
-        &mut self,
-        code_unit: CodeUnit,
-        parent: Option<CodeUnit>,
-        top_level: Option<CodeUnit>,
-    ) {
-        let inserted = self.insert_declaration(code_unit.clone());
-
-        if inserted && parent.is_none() {
-            self.top_level_declarations.push(code_unit.clone());
-        }
-
-        if let Some(parent) = parent {
-            let children = self.children.entry(parent).or_default();
-            if !children.contains(&code_unit) {
-                children.push(code_unit.clone());
-            }
-        }
-
-        if let Some(top_level) = top_level {
-            self.children.entry(top_level).or_default();
-        }
-    }
-
-    pub fn add_file_scope(&mut self, file: &ProjectFile, source: &str) {
-        let code_unit = CodeUnit::file_scope(file.clone());
-        if !self.insert_declaration(code_unit.clone()) {
-            return;
-        }
-
-        self.top_level_declarations.push(code_unit.clone());
-        let line_starts = compute_line_starts(source);
-        let end_line = line_starts.len().saturating_sub(1);
-        self.ranges.entry(code_unit).or_default().push(Range {
-            start_byte: 0,
-            end_byte: source.len(),
-            start_line: 0,
-            end_line,
-        });
-    }
-
-    pub fn replace_code_unit(
-        &mut self,
-        code_unit: CodeUnit,
-        node: Node<'_>,
-        source: &str,
-        parent: Option<CodeUnit>,
-        top_level: Option<CodeUnit>,
-    ) {
-        self.remove_code_unit(&code_unit);
-        self.add_code_unit(code_unit, node, source, parent, top_level);
-    }
-
-    pub fn replace_code_unit_with_range(
-        &mut self,
-        code_unit: CodeUnit,
-        range: Range,
-        parent: Option<CodeUnit>,
-        top_level: Option<CodeUnit>,
-    ) {
-        self.remove_code_unit(&code_unit);
-        self.add_code_unit_with_range(code_unit, range, parent, top_level);
-    }
-
-    pub(crate) fn record_navigation_range(&mut self, code_unit: CodeUnit, range: Range) {
-        let ranges = self.navigation_ranges.entry(code_unit.clone()).or_default();
-        if ranges.contains(&range) {
-            return;
-        }
-        if ranges.len() < MAX_NAVIGATION_RANGES_PER_CODE_UNIT {
-            ranges.push(range);
-        } else {
-            self.navigation_ranges_truncated.insert(code_unit);
-        }
-    }
-
-    pub(crate) fn declarations(&self) -> &HashSet<CodeUnit> {
-        &self.declarations
-    }
-
-    pub(crate) fn declaration_ranges(&self, code_unit: &CodeUnit) -> &[Range] {
-        self.ranges
-            .get(code_unit)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn contains_declaration(&self, code_unit: &CodeUnit) -> bool {
-        self.declarations.contains(code_unit)
-    }
-
-    pub(crate) fn contains_declaration_identity(&self, code_unit: &CodeUnit) -> bool {
-        self.declaration_identities
-            .contains_key(&DeclarationIdentity(code_unit.clone()))
-    }
-
-    pub fn set_raw_supertypes(&mut self, code_unit: CodeUnit, raw_supertypes: Vec<String>) {
-        self.raw_supertypes.insert(code_unit, raw_supertypes);
-    }
-
-    pub fn set_supertype_lookup_paths(&mut self, code_unit: CodeUnit, lookup_paths: Vec<String>) {
-        self.supertype_lookup_paths.insert(code_unit, lookup_paths);
-    }
-
-    pub fn add_raw_supertypes(&mut self, code_unit: CodeUnit, raw_supertypes: Vec<String>) {
-        let entries = self.raw_supertypes.entry(code_unit).or_default();
-        for raw_supertype in raw_supertypes {
-            if !entries.contains(&raw_supertype) {
-                entries.push(raw_supertype);
-            }
-        }
-    }
-
-    pub fn add_signature(&mut self, code_unit: CodeUnit, signature: String) {
-        let entries = self.signatures.entry(code_unit).or_default();
-        if !entries.contains(&signature) {
-            entries.push(signature);
-        }
-    }
-
-    pub fn add_signature_with_metadata(
-        &mut self,
-        code_unit: CodeUnit,
-        metadata: SignatureMetadata,
-    ) {
-        self.add_signature(code_unit.clone(), metadata.label().to_string());
-        let entries = self.signature_metadata.entry(code_unit).or_default();
-        if !entries.contains(&metadata) {
-            entries.push(metadata);
-        }
-    }
-
-    pub fn set_ruby_method_dispatch_mode(
-        &mut self,
-        code_unit: CodeUnit,
-        mode: RubyMethodDispatchMode,
-    ) {
-        self.ruby_method_dispatch_modes.insert(code_unit, mode);
-    }
-
-    pub(crate) fn set_cpp_template_metadata(
-        &mut self,
-        code_unit: CodeUnit,
-        metadata: CppTemplateMetadata,
-    ) {
-        self.cpp_template_metadata.insert(code_unit, metadata);
-    }
-
-    pub fn set_scala_trait(&mut self, code_unit: CodeUnit) {
-        self.scala_traits.insert(code_unit);
-    }
-
-    pub fn add_child(&mut self, parent: CodeUnit, child: CodeUnit) {
-        self.children.entry(parent).or_default().push(child);
-    }
-
-    pub fn mark_type_alias(&mut self, code_unit: CodeUnit) {
-        self.type_aliases.insert(code_unit);
-    }
-
-    pub fn set_primary_range(&mut self, code_unit: &CodeUnit, range: Range) {
-        self.ranges.insert(code_unit.clone(), vec![range]);
-    }
-
-    pub(crate) fn first_range_start(&self, code_unit: &CodeUnit) -> Option<usize> {
-        self.ranges
-            .get(code_unit)
-            .and_then(|ranges| ranges.iter().map(|range| range.start_byte).min())
-    }
-
-    fn remove_code_unit(&mut self, code_unit: &CodeUnit) {
-        if let Some(children) = self.children.remove(code_unit) {
-            for child in children {
-                self.remove_code_unit(&child);
-            }
-        }
-
-        for siblings in self.children.values_mut() {
-            siblings.retain(|child| child != code_unit);
-        }
-
-        self.top_level_declarations
-            .retain(|existing| existing != code_unit);
-        self.remove_declaration(code_unit);
-        self.definition_lookup_units.remove(code_unit);
-        self.raw_supertypes.remove(code_unit);
-        self.supertype_lookup_paths.remove(code_unit);
-        self.signatures.remove(code_unit);
-        self.signature_metadata.remove(code_unit);
-        self.cpp_template_metadata.remove(code_unit);
-        self.ruby_method_dispatch_modes.remove(code_unit);
-        self.scala_traits.remove(code_unit);
-        self.type_aliases.remove(code_unit);
-        self.ranges.remove(code_unit);
-    }
-
-    fn insert_declaration(&mut self, code_unit: CodeUnit) -> bool {
-        if !self.declarations.insert(code_unit.clone()) {
-            return false;
-        }
-        *self
-            .declaration_identities
-            .entry(DeclarationIdentity(code_unit))
-            .or_default() += 1;
-        true
-    }
-
-    fn remove_declaration(&mut self, code_unit: &CodeUnit) -> bool {
-        if !self.declarations.remove(code_unit) {
-            return false;
-        }
-        let identity = DeclarationIdentity(code_unit.clone());
-        let remove_identity = {
-            let count = self
-                .declaration_identities
-                .get_mut(&identity)
-                .expect("inserted declaration must have a semantic identity count");
-            *count = count
-                .checked_sub(1)
-                .expect("declaration semantic identity count must be positive");
-            *count == 0
-        };
-        if remove_identity {
-            self.declaration_identities.remove(&identity);
-        }
-        true
-    }
-}
+pub use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 
 pub struct TreeSitterAnalyzer<A> {
     project: Arc<dyn Project>,
@@ -1980,6 +2111,12 @@ pub struct TreeSitterAnalyzer<A> {
     /// lexical imports by asking the store for the same file's imports over and
     /// over: 70k hydrations across 1100 distinct files in one request.
     import_info_store: Arc<Mutex<ImportInfoStore>>,
+    /// Cross-request type-alias projections. A type-alias check is common in
+    /// C++ resolution, but it needs only this small persisted fact.
+    type_alias_store: Arc<Mutex<TypeAliasStore>>,
+    /// Cross-request indexes for smallest-enclosing declaration lookup in
+    /// generated files with large declaration sets.
+    enclosing_code_unit_store: Arc<Mutex<EnclosingCodeUnitStore>>,
     /// Import hydrations this analyzer issued to the store, for perf pins. The
     /// call count alone cannot see the #1451 shape -- callers legitimately ask
     /// per reference -- so what must stay bounded is the *store reads* those
@@ -2052,6 +2189,8 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::clone(&self.prepared_syntax_store),
             import_info_store: Arc::clone(&self.import_info_store),
+            type_alias_store: Arc::clone(&self.type_alias_store),
+            enclosing_code_unit_store: Arc::clone(&self.enclosing_code_unit_store),
             import_info_hydration_count: Arc::clone(&self.import_info_hydration_count),
             #[cfg(test)]
             live_oid_validation_counts: Arc::clone(&self.live_oid_validation_counts),
@@ -2221,7 +2360,7 @@ where
             ))
         };
         let mut source_snapshot_file_states =
-            map_with_capacity(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
+            map_with_capacity(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
 
         let structural_cache = Arc::new(Self::build_structural_cache(&config));
@@ -2230,6 +2369,14 @@ where
         let semantic_cache = crate::analyzer::semantic::service::CompleteSemanticArtifactCache::new(
             config.memo_cache_budget_bytes() / 8,
         );
+        let active_persisted_payload_bytes = store_context
+            .store
+            .active_file_state_payload_bytes(&store_context.generations)
+            .ok();
+        let file_state_cache_budget =
+            file_state_cache_budget_bytes(&config, active_persisted_payload_bytes);
+        let query_file_state_cache_budget =
+            query_file_state_cache_budget_bytes(file_state_cache_budget);
         Ok(Self {
             project,
             adapter,
@@ -2240,7 +2387,9 @@ where
             snapshot_caches,
             semantic_cache,
             store_context,
-            query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
+            query_read_cache: Arc::new(RwLock::new(QueryReadCache::new(
+                query_file_state_cache_budget,
+            ))),
             live_source_snapshot: Arc::new(ArcSwapOption::empty()),
             query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
@@ -2249,12 +2398,16 @@ where
             import_info_store: Arc::new(Mutex::new(ImportInfoStore::new(
                 IMPORT_INFO_STORE_MAX_BYTES,
             ))),
+            type_alias_store: Arc::new(Mutex::new(TypeAliasStore::new(TYPE_ALIAS_STORE_MAX_BYTES))),
+            enclosing_code_unit_store: Arc::new(Mutex::new(EnclosingCodeUnitStore::new(
+                ENCLOSING_CODE_UNIT_INDEX_STORE_MAX_BYTES,
+            ))),
             import_info_hydration_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
-                TRANSIENT_FILE_STATE_CACHE_CAPACITY,
+                file_state_cache_budget,
             ))),
             source_snapshot_file_states: Arc::new(source_snapshot_file_states),
             summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
@@ -2426,10 +2579,18 @@ where
         store_context: AnalyzerStoreContext,
     ) -> Self {
         let mut source_snapshot_file_states =
-            map_with_capacity(TRANSIENT_FILE_STATE_CACHE_CAPACITY);
+            map_with_capacity(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
         state.seed_snapshot_file_states(&mut source_snapshot_file_states);
         let structural_index_cache = Arc::new(Self::build_structural_index_cache(&config));
         let snapshot_caches = Arc::new(Self::build_snapshot_caches(&config));
+        let active_persisted_payload_bytes = store_context
+            .store
+            .active_file_state_payload_bytes(&store_context.generations)
+            .ok();
+        let file_state_cache_budget =
+            file_state_cache_budget_bytes(&config, active_persisted_payload_bytes);
+        let query_file_state_cache_budget =
+            query_file_state_cache_budget_bytes(file_state_cache_budget);
         Self {
             project,
             adapter,
@@ -2440,7 +2601,9 @@ where
             snapshot_caches,
             semantic_cache,
             store_context,
-            query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
+            query_read_cache: Arc::new(RwLock::new(QueryReadCache::new(
+                query_file_state_cache_budget,
+            ))),
             live_source_snapshot: Arc::new(ArcSwapOption::empty()),
             query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
             prepared_syntax_store: Arc::new(Mutex::new(PreparedSyntaxStore::new(
@@ -2449,12 +2612,16 @@ where
             import_info_store: Arc::new(Mutex::new(ImportInfoStore::new(
                 IMPORT_INFO_STORE_MAX_BYTES,
             ))),
+            type_alias_store: Arc::new(Mutex::new(TypeAliasStore::new(TYPE_ALIAS_STORE_MAX_BYTES))),
+            enclosing_code_unit_store: Arc::new(Mutex::new(EnclosingCodeUnitStore::new(
+                ENCLOSING_CODE_UNIT_INDEX_STORE_MAX_BYTES,
+            ))),
             import_info_hydration_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             live_oid_validation_counts: Arc::new(Mutex::new(HashMap::default())),
             syntax_parse_counts: Arc::new(Mutex::new(HashMap::default())),
             transient_file_states: Arc::new(Mutex::new(FileStateCache::new(
-                TRANSIENT_FILE_STATE_CACHE_CAPACITY,
+                file_state_cache_budget,
             ))),
             source_snapshot_file_states: Arc::new(source_snapshot_file_states),
             summary_file_projections: Arc::new(Mutex::new(SummaryFileProjectionCache::new(
@@ -2553,22 +2720,28 @@ where
         ))
     }
 
+    /// Assemble a `FileState` from a completed parse.
+    ///
+    /// Shared with the bounded-parse timeout path above, which produces a
+    /// file-scope-only `ParsedFile` rather than reaching the walk at all, and
+    /// must still hand back a `FileState` of exactly the same shape.
     fn file_state_from_parsed(
         source: String,
-        parsed: ParsedFile,
+        mut parsed: ParsedFile,
         contains_tests: bool,
         parse_errors: Option<Vec<crate::analyzer::ParseError>>,
     ) -> FileState {
+        let declarations = parsed.take_declarations();
+
         FileState {
             source,
             content_qualifier: parsed.content_qualifier,
             package_name: parsed.package_name,
             top_level_declarations: parsed.top_level_declarations,
-            declarations: parsed.declarations,
+            declarations,
             definition_lookup_units: parsed.definition_lookup_units,
             imports: parsed.imports,
             scala_exports: parsed.scala_exports,
-            rust_usage_facts: parsed.rust_usage_facts,
             raw_supertypes: parsed.raw_supertypes,
             supertype_lookup_paths: parsed.supertype_lookup_paths,
             type_identifiers: parsed.type_identifiers,
@@ -3023,56 +3196,75 @@ where
         replace_live_paths: bool,
     ) -> Result<HashMap<ProjectFile, Oid>, String> {
         let _scope = profiling::scope("TreeSitterAnalyzer::resolve_live_oids");
-        let mut planned = Vec::with_capacity(files.len());
-        let mut disk_files = Vec::with_capacity(files.len());
-        for file in files {
-            if project.has_overlay(file) {
+        type PlannedLiveOid = Option<(ProjectFile, Oid, LivePathEntry)>;
+
+        let liveness = store_context.liveness.as_ref();
+        let plan_one = |file: &ProjectFile| -> Result<PlannedLiveOid, String> {
+            let has_overlay = project.has_overlay(file);
+            if !file.exists() && !has_overlay {
+                return Ok(None);
+            }
+            let (oid, entry) = if has_overlay {
                 let source = project.read_source(file).map_err(|err| err.to_string())?;
                 let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                     .map_err(|err| err.to_string())?;
-                planned.push((file.clone(), oid, LivePathEntry::overlay(file.clone(), oid)));
-            } else {
-                disk_files.push(file.clone());
-            }
-        }
-
-        if let Some(liveness) = store_context.liveness.as_ref() {
-            for (file, oid) in liveness.oids_for_files(&disk_files)? {
-                planned.push((file.clone(), oid, LivePathEntry::filesystem(file, oid)));
-            }
-        } else {
-            let plan_one = |file: &ProjectFile| -> Result<Option<_>, String> {
-                if !file.exists() {
+                (oid, LivePathEntry::overlay(file.clone(), oid))
+            } else if let Some(liveness) = liveness {
+                // Point resolution hashes the bytes currently on disk, so an
+                // incremental update observes the edit that triggered it.
+                let Some(oid) = liveness.oid_for_path(file)? else {
                     return Ok(None);
-                }
+                };
+                (oid, LivePathEntry::filesystem(file.clone(), oid))
+            } else {
                 let bytes = std::fs::read(file.abs_path()).map_err(|err| err.to_string())?;
                 let oid =
                     Oid::hash_object(ObjectType::Blob, &bytes).map_err(|err| err.to_string())?;
-                Ok(Some((
-                    file.clone(),
-                    oid,
-                    LivePathEntry::overlay(file.clone(), oid),
-                )))
+                (oid, LivePathEntry::overlay(file.clone(), oid))
             };
-            let resolved = if disk_files.len() <= 1 {
-                disk_files.iter().map(&plan_one).collect::<Vec<_>>()
-            } else {
+            Ok(Some((file.clone(), oid, entry)))
+        };
+        let plan_parallel =
+            |subset: &[ProjectFile]| -> Result<Vec<Result<PlannedLiveOid, String>>, String> {
+                if subset.len() <= 1 {
+                    return Ok(subset.iter().map(&plan_one).collect());
+                }
                 let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(config.parallelism().clamp(1, disk_files.len()))
+                    .num_threads(config.parallelism().clamp(1, subset.len()))
                     .build()
                     .map_err(|err| format!("failed to build live OID thread pool: {err}"))?;
-                pool.install(|| disk_files.par_iter().map(&plan_one).collect::<Vec<_>>())
+                Ok(pool.install(|| subset.par_iter().map(&plan_one).collect()))
             };
-            for result in resolved {
-                if let Some(entry) = result? {
-                    planned.push(entry);
-                }
-            }
-        }
+
+        let planned =
+            if replace_live_paths && let Some(liveness) = liveness {
+                // Startup and full-sweep reconciles project every disk file with
+                // one shared Git identity scan instead of hashing each clean file.
+                // Incremental updates stay on point resolution above: they carry
+                // few files and must observe the edit that triggered them without
+                // depending on the startup scan.
+                let (overlay_files, disk_files): (Vec<ProjectFile>, Vec<ProjectFile>) = files
+                    .iter()
+                    .cloned()
+                    .partition(|file| project.has_overlay(file));
+                let mut planned = plan_parallel(&overlay_files)?;
+                planned.extend(liveness.oids_for_files(&disk_files)?.into_iter().map(
+                    |(file, oid)| {
+                        let entry = LivePathEntry::filesystem(file.clone(), oid);
+                        Ok(Some((file, oid, entry)))
+                    },
+                ));
+                planned
+            } else {
+                plan_parallel(files)?
+            };
 
         let mut out = map_with_capacity(files.len());
         let mut live_entries = Vec::with_capacity(files.len());
-        for (file, oid, entry) in planned {
+        for result in planned {
+            let Some((file, oid, entry)) = result? else {
+                continue;
+            };
             live_entries.push(entry);
             out.insert(file, oid);
         }
@@ -3119,7 +3311,7 @@ where
                 None,
             ));
         }
-        let state = {
+        let mut state = {
             let _scope = profiling::scope(format!(
                 "TreeSitterAnalyzer::{:?}::reconcile_file_states",
                 adapter.language()
@@ -3138,6 +3330,20 @@ where
                 },
             )
         };
+        // Include-driven inference runs after the extension-discovered files
+        // are reconciled, because the imports it reads are exactly what that
+        // pass persisted: the closure costs one bulk import-fact hydration per
+        // round instead of a second read of every source in the workspace.
+        let mut indexed_files = analyzable_files.clone();
+        indexed_files.extend(Self::reconcile_claimed_files(
+            project,
+            adapter,
+            config,
+            store_context,
+            &analyzable_files,
+            HashMap::default(),
+            &mut state,
+        ));
         {
             let _scope = profiling::scope(format!(
                 "TreeSitterAnalyzer::{:?}::sync_path_symbol_units",
@@ -3149,13 +3355,13 @@ where
                 .expect("dirty path-symbol mutex poisoned")
                 .extend(Self::sync_path_symbol_units(
                     adapter,
-                    &analyzable_files,
+                    &indexed_files,
                     store_context,
                 ));
         }
 
         if let Some(progress) = progress.as_ref() {
-            let total = analyzable_files.len();
+            let total = indexed_files.len();
             progress(BuildProgressEvent::new(
                 adapter.language(),
                 BuildProgressPhase::Index,
@@ -3168,6 +3374,225 @@ where
             .gc
             .schedule(project.root(), Arc::clone(&store_context.store));
         state
+    }
+
+    /// Every workspace file whose extension no language claims: the universe
+    /// include-driven inference may draw from (#1837).
+    ///
+    /// `.bifrostignore` is applied later, to the files inference actually
+    /// adopts, not here. `Project::is_bifrostignored` answers one path at a time
+    /// off a whole-workspace listing, so asking it about every non-source file
+    /// in the repository would cost a listing per file.
+    fn claimable_workspace_files(project: &dyn Project) -> BTreeSet<ProjectFile> {
+        let Ok(files) = project.all_files_shared() else {
+            return BTreeSet::new();
+        };
+        files
+            .iter()
+            .filter(|file| crate::analyzer::common::has_unclaimed_extension(file))
+            .cloned()
+            .collect()
+    }
+
+    /// The import rows recorded for `files`, read from the store rather than
+    /// re-parsed. Files whose state is dirty (a failed persist) answer from the
+    /// dirty entry so a claim is not lost to a transient write failure.
+    fn stored_import_facts(
+        adapter: &A,
+        store_context: &AnalyzerStoreContext,
+        state: &AnalyzerRuntimeState,
+        files: &[ProjectFile],
+    ) -> Vec<(ProjectFile, Vec<ImportInfo>)> {
+        let snapshot = store_context.live_paths.snapshot();
+        let mut entries = Vec::with_capacity(files.len());
+        let mut out = Vec::with_capacity(files.len());
+        for file in files {
+            let Some(oid) = snapshot.validated_oid_for_path(file) else {
+                continue;
+            };
+            let storage_key = adapter.storage_language_key_for_file(file);
+            let key = Self::transient_cache_key(oid, file);
+            match state.dirty_imports(&key) {
+                Some(imports) => out.push((file.clone(), imports)),
+                None => entries.push((file.clone(), oid, storage_key)),
+            }
+        }
+        if entries.is_empty() {
+            return out;
+        }
+        let facts = store_context
+            .store
+            .hydrate_import_facts_by_key(&entries, store_context.generations.as_ref(), adapter)
+            .unwrap_or_default();
+        out.extend(facts.into_iter().map(|(file, facts)| (file, facts.imports)));
+        out
+    }
+
+    /// The claim set implied by `edges`: every file in `claimable` reachable
+    /// from an extension-discovered file of this adapter's language.
+    ///
+    /// Iterative worklist, never recursion -- an include chain is as deep as the
+    /// workspace makes it. The result is a set keyed by file, so it does not
+    /// depend on the order `edges` iterates in. Intersecting with `claimable`
+    /// retires an edge whose target has left the workspace since the generation
+    /// that recorded it.
+    fn closed_claim_set(
+        adapter: &A,
+        edges: &HashMap<ProjectFile, BTreeSet<ProjectFile>>,
+        claimable: &BTreeSet<ProjectFile>,
+    ) -> BTreeSet<ProjectFile> {
+        let mut claimed = BTreeSet::new();
+        let mut worklist = Vec::new();
+        let push_targets = |targets: &BTreeSet<ProjectFile>,
+                            claimed: &mut BTreeSet<ProjectFile>,
+                            worklist: &mut Vec<ProjectFile>| {
+            for target in targets {
+                if claimable.contains(target) && claimed.insert(target.clone()) {
+                    worklist.push(target.clone());
+                }
+            }
+        };
+        for (source, targets) in edges {
+            // Only an extension-discovered file seeds the closure. A claimed
+            // file's own edges are followed when the closure reaches it, so a
+            // cycle of unreferenced `.inc` files claims nothing.
+            if crate::analyzer::common::language_for_file(source) != adapter.language() {
+                continue;
+            }
+            push_targets(targets, &mut claimed, &mut worklist);
+        }
+        while let Some(file) = worklist.pop() {
+            let Some(targets) = edges.get(&file) else {
+                continue;
+            };
+            push_targets(targets, &mut claimed, &mut worklist);
+        }
+        claimed
+    }
+
+    /// Adopt the files this adapter's analyzed sources pull in and reconcile
+    /// them exactly like extension-discovered files (#1837).
+    ///
+    /// `roots` are the files whose imports seed the relation -- the whole
+    /// extension-discovered set on a build, only the changed files on an update.
+    /// `retained_edges` carries the previous generation's relation forward on an
+    /// update and is empty on a build. `state` receives the merged reconcile
+    /// results and the closed relation.
+    ///
+    /// Cost: one bulk import-fact read per round over the frontier, no source
+    /// reads. A build's first frontier is the whole extension-discovered set,
+    /// which is why the imports come from the store the preceding reconcile just
+    /// filled rather than from a second pass over the workspace's bytes. A
+    /// workspace with no unclaimed-extension file at all pays nothing.
+    ///
+    /// Returns the claimed files, which the caller treats as indexed files from
+    /// here on.
+    fn reconcile_claimed_files(
+        project: &dyn Project,
+        adapter: &A,
+        config: &AnalyzerConfig,
+        store_context: &AnalyzerStoreContext,
+        roots: &[ProjectFile],
+        retained_edges: HashMap<ProjectFile, BTreeSet<ProjectFile>>,
+        state: &mut AnalyzerRuntimeState,
+    ) -> Vec<ProjectFile> {
+        if !adapter.claims_included_files() {
+            return Vec::new();
+        }
+        let _scope = profiling::scope(format!(
+            "TreeSitterAnalyzer::{:?}::reconcile_claimed_files",
+            adapter.language()
+        ));
+        let claimable = Self::claimable_workspace_files(project);
+        let mut edges = retained_edges;
+        // With nothing eligible there is no reason to read anyone's imports.
+        // The closure below still runs, so a claim an earlier generation
+        // recorded retires when its target leaves the workspace.
+        let mut frontier: Vec<ProjectFile> = if claimable.is_empty() {
+            Vec::new()
+        } else {
+            roots.to_vec()
+        };
+        let mut visited: HashSet<ProjectFile> = roots.iter().cloned().collect();
+        let mut claimed_files = Vec::new();
+        // Fixpoint over the claim relation. Each round reads one frontier's
+        // imports, reconciles whatever that frontier newly claims, and makes
+        // those files the next frontier; the visited set bounds the loop by the
+        // workspace file count.
+        while !frontier.is_empty() {
+            let sources = Self::stored_import_facts(adapter, store_context, state, &frontier);
+            let round_edges = adapter.infer_claimed_files(&sources, &claimable);
+            debug_assert!(
+                round_edges
+                    .values()
+                    .flatten()
+                    .all(|target| claimable.contains(target)),
+                "{:?} claimed files outside the claimable set: {:?}",
+                adapter.language(),
+                round_edges
+                    .values()
+                    .flatten()
+                    .filter(|target| !claimable.contains(*target))
+                    .collect::<Vec<_>>()
+            );
+            for source in &frontier {
+                // An import-less source drops out of the relation: the removal
+                // of its last claiming `#include` is what test 6 turns on.
+                edges.remove(source);
+            }
+            edges.extend(round_edges);
+
+            let closed = Self::closed_claim_set(adapter, &edges, &claimable);
+            frontier = closed
+                .into_iter()
+                .filter(|file| visited.insert(file.clone()))
+                // Applied here rather than to the whole claimable universe: this
+                // set is small, and the ignore probe is a per-path listing scan.
+                .filter(|file| !project.is_bifrostignored(file.rel_path()))
+                .collect();
+            if frontier.is_empty() {
+                break;
+            }
+            frontier.sort();
+            let round_state = Self::reconcile_file_states(
+                project,
+                adapter,
+                config,
+                store_context,
+                ReconcileFileStates {
+                    files: frontier.clone(),
+                    // Additive: the extension-discovered pass already replaced
+                    // the live path map, and a claimed file joins it.
+                    replace_live_paths: false,
+                    progress: None,
+                    dirty_file_states: state.dirty_snapshot(),
+                    dirty_path_symbol_rows: state.dirty_path_symbol_snapshot(),
+                },
+            );
+            state.absorb(round_state);
+            claimed_files.extend(frontier.iter().cloned());
+        }
+        let closed = Self::closed_claim_set(adapter, &edges, &claimable);
+        // Files that were claimed by the previous generation's relation and are
+        // not claimed by this one leave the analyzed set: drop their live paths
+        // so the GC can collect their rows and no query serves them.
+        let dropped: Vec<ProjectFile> = store_context
+            .live_paths
+            .snapshot()
+            .all_paths()
+            .filter(|file| crate::analyzer::common::has_unclaimed_extension(file))
+            .filter(|file| !closed.contains(*file))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            store_context.live_paths.remove(dropped.iter().cloned());
+            if let Some(liveness) = store_context.liveness.as_ref() {
+                liveness.remove_overlay_paths(dropped.iter().cloned());
+            }
+        }
+        state.claim_edges = edges;
+        claimed_files.retain(|file| closed.contains(file));
+        claimed_files
     }
 
     fn path_symbol_row(adapter: &A, file: &ProjectFile, blob_oid: Oid) -> Option<PathSymbolRow> {
@@ -3448,7 +3873,9 @@ where
                                 if let Some(errors) = state.parse_errors.clone() {
                                     fresh_parse_errors.insert(file.clone(), errors);
                                 }
-                                if seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY {
+                                if seeded_file_states.len()
+                                    < SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY
+                                {
                                     seeded_file_states.push((key, Arc::clone(&state)));
                                 }
                                 parsed_files.insert(file);
@@ -3512,13 +3939,17 @@ where
                         fresh_parse_errors.insert(file.clone(), errors);
                     }
                     if let Some(key) = seed_key
-                        && seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY
+                        && seeded_file_states.len() < SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY
                     {
                         seeded_file_states.push((key, Arc::new(state)));
                     }
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                profiling::note(format!(
+                    "resolve_live_oids failed; reconciling {:?} without live identities: {error}",
+                    adapter.language()
+                ));
                 for (file, state) in Self::analyze_files(adapter, project, config, files, progress)
                 {
                     let Some(state) = state else {
@@ -3547,7 +3978,7 @@ where
                         fresh_parse_errors.insert(file.clone(), errors);
                     }
                     if let Some(key) = seed_key
-                        && seeded_file_states.len() < TRANSIENT_FILE_STATE_CACHE_CAPACITY
+                        && seeded_file_states.len() < SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY
                     {
                         seeded_file_states.push((key, Arc::new(state)));
                     }
@@ -3576,6 +4007,7 @@ where
     pub(crate) fn file_source(&self, file: &ProjectFile) -> Option<String> {
         self.source_snapshot_file_state(file)
             .or_else(|| self.fetch_file_state(file))
+            .or_else(|| self.fetch_file_state_from_current_source(file))
             .map(|state| state.source.clone())
             .or_else(|| self.project.read_source(file).ok())
     }
@@ -3650,62 +4082,6 @@ where
             }
         }
         Err(last_error.expect("failed store write must retain its error"))
-    }
-
-    /// Re-parse `files` and persist their blobs into the store, without
-    /// producing a new analyzer generation.
-    ///
-    /// This is the catch-up half of ExecPlan Milestone 3
-    /// (`.agents/plans/rust-usage-index-v2.md`): a store-backed query answers
-    /// from a blob's rows, so a live file whose blob was never persisted -- a
-    /// write that failed and left a dirty in-memory state, say -- is invisible
-    /// to it. Running the whole reconcile to repair a handful of files would
-    /// build a new analyzer and drop every memo on it, which is precisely what
-    /// this plan exists to stop.
-    ///
-    /// A file whose current bytes no longer hash to its live oid is skipped:
-    /// persisting it would file the new content's rows under the old blob, and
-    /// blob rows are content-addressed and shared, so a row that lies is worse
-    /// than a row that is missing. The next `update` reconciles those files
-    /// with their real oid anyway.
-    pub(crate) fn persist_live_blobs(&self, files: &[ProjectFile]) {
-        let mut targets = Vec::with_capacity(files.len());
-        // One target per blob key, not per file: byte-identical files share a
-        // blob, and persisting the same key twice in one batch is a hard error
-        // in the persistence layer. Reconcile picks a representative for the
-        // same reason (`representative_by_blob_key`).
-        let mut claimed = HashSet::default();
-        for file in files {
-            let Some(oid) = self.live_snapshot().oid_for_path(file) else {
-                continue;
-            };
-            let Ok(source) = self.project.read_source(file) else {
-                continue;
-            };
-            if !IAnalyzer::indexed_source_matches(self, file, &source) {
-                continue;
-            }
-            let storage_key = self.adapter.storage_language_key_for_file(file);
-            let Some(generation) = self.store_context.generations.get(&storage_key).copied() else {
-                continue;
-            };
-            if !claimed.insert((oid, storage_key.clone())) {
-                continue;
-            }
-            targets.push((file.clone(), oid, storage_key, generation));
-        }
-        if targets.is_empty() {
-            return;
-        }
-        Self::analyze_prepare_and_persist_files(
-            self.adapter.as_ref(),
-            self.project.as_ref(),
-            &self.config,
-            targets,
-            None,
-            &self.store_context,
-            |_, _| {},
-        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3830,6 +4206,31 @@ where
             .any(|(known, _)| known == storage_key)
     }
 
+    /// The storage key and store generation this analyzer would serve `file`
+    /// under, or `None` when `file` belongs to another language.
+    ///
+    /// [`LanguageAdapter::storage_language_key_for_file`] reports the FILE's
+    /// own language rather than this adapter's, on purpose (see its doc), while
+    /// `store_context.generations` is published once at construction from this
+    /// adapter's own [`LanguageAdapter::storage_language_keys`]. The two agree
+    /// only for files this analyzer owns, so a per-file query holding a foreign
+    /// file must not index the map: that is the #1805 "no entry found for key"
+    /// panic, hit by the Scala forward resolver, which asks its own analyzer
+    /// about Java candidates on purpose
+    /// (`ForwardScalaNameResolver::resolve_candidate_tier`), and reachable the
+    /// same way from any multi-analyzer fan-out that asks every provider about
+    /// an arbitrary file. This analyzer holds no rows for a file it never
+    /// analyzed, so those callers answer empty instead.
+    ///
+    /// Construction-time paths do not need this: `reconcile_file_states` drops
+    /// files outside its served keys at its single entry, and the sync and
+    /// prefix-scan paths iterate the adapter's own declared keys.
+    fn storage_key_and_generation(&self, file: &ProjectFile) -> Option<(String, GenerationId)> {
+        let storage_key = self.adapter.storage_language_key_for_file(file);
+        let generation = self.store_context.generations.get(&storage_key).copied()?;
+        Some((storage_key, generation))
+    }
+
     fn streaming_file_read_id(&self) -> usize {
         Arc::as_ptr(&self.adapter) as *const () as usize
     }
@@ -3903,7 +4304,9 @@ where
         }
 
         let oid = self.resolve_live_oid_for_file(file)?;
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // A foreign file has no state here and must not be parsed as this
+        // adapter's language. See `storage_key_and_generation`.
+        let (storage_key, generation) = self.storage_key_and_generation(file)?;
         self.full_hydration_count.fetch_add(1, Ordering::Relaxed);
         let source = self.source_for_oid(file, oid)?;
         let mut state = match self
@@ -3911,7 +4314,7 @@ where
                 self.store_context.store.hydrate_file_state_with_source(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     self.adapter.as_ref(),
                     file,
                     &source,
@@ -3965,6 +4368,52 @@ where
         let oid = self.resolve_live_oid_for_file(file)?;
         let key = Self::transient_cache_key(oid, file);
         self.fetch_file_state_for_key(file, &key)
+    }
+
+    fn current_source(&self, file: &ProjectFile) -> Option<String> {
+        let sources = self.active_query_cache_handle(|cache| &cache.current_sources);
+        if let Some(sources) = sources.as_ref()
+            && let Some(source) = sources
+                .read()
+                .expect("query current-source cache read lock poisoned")
+                .get(file)
+                .cloned()
+        {
+            return source;
+        }
+        let source = self.project.read_source(file).ok();
+        if let Some(sources) = sources {
+            sources
+                .write()
+                .expect("query current-source cache write lock poisoned")
+                .insert(file.clone(), source.clone());
+        }
+        source
+    }
+
+    fn structural_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
+        let indexed = self
+            .source_snapshot_file_state(file)
+            .or_else(|| self.fetch_file_state(file));
+        let Some(source) = self.current_source(file) else {
+            return indexed.or_else(|| self.fetch_file_state_from_current_source(file));
+        };
+        self.fetch_file_state_from_source(file, source).or(indexed)
+    }
+
+    fn fetch_file_state_from_source(
+        &self,
+        file: &ProjectFile,
+        source: String,
+    ) -> Option<Arc<FileState>> {
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).ok()?;
+        let key = Self::transient_cache_key(oid, file);
+        self.fetch_file_state_for_key_with_source(file, &key, Some(&source))
+    }
+
+    fn fetch_file_state_from_current_source(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
+        self.current_source(file)
+            .and_then(|source| self.fetch_file_state_from_source(file, source))
     }
 
     /// The declaration-materialization provenance recorded for `file` by its
@@ -4022,7 +4471,6 @@ where
                 .read()
                 .expect("query file-state cache read lock poisoned")
                 .get(key)
-                .cloned()
         {
             return Some(state);
         }
@@ -4036,11 +4484,7 @@ where
                 let mut file_states = file_states
                     .write()
                     .expect("query file-state cache write lock poisoned");
-                if file_states.contains_key(key)
-                    || file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
-                {
-                    file_states.insert(key.clone(), Arc::clone(&state));
-                }
+                file_states.retain(key.clone(), Arc::clone(&state));
             }
             return Some(state);
         }
@@ -4077,10 +4521,7 @@ where
             let mut file_states = file_states
                 .write()
                 .expect("query file-state cache write lock poisoned");
-            if file_states.contains_key(key) || file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
-            {
-                file_states.insert(key.clone(), Arc::clone(&state));
-            }
+            file_states.retain(key.clone(), Arc::clone(&state));
         }
         Some(state)
     }
@@ -4389,14 +4830,14 @@ where
             return PreparedSyntaxPreparation::Cancelled;
         }
         let line_starts = compute_line_starts(exact_source);
-        PreparedSyntaxPreparation::Complete(Some(Arc::new(PreparedSyntaxTree {
+        PreparedSyntaxPreparation::Complete(Some(Arc::new(PreparedSyntaxTree::new(
             source,
             tree,
             line_starts,
-            dialect: LanguageDialect::for_path(self.adapter.language(), file.rel_path()),
+            LanguageDialect::for_path(self.adapter.language(), file.rel_path()),
             origin,
             overlay_revision,
-        })))
+        ))))
     }
 
     /// How many times `file` has been parsed since the last reset. Pins the
@@ -4425,10 +4866,11 @@ where
         files: impl IntoIterator<Item = ProjectFile>,
         source_mode: BulkFileStateSource,
     ) -> HashMap<ProjectFile, (FileStateCacheKey, FileState)> {
+        let live = self.live_snapshot();
         let mut entries = Vec::new();
         let mut seen = HashSet::default();
         for file in files {
-            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+            if !self.adapter_owns_file(&file, &live) {
                 continue;
             }
             if !seen.insert(file.clone()) {
@@ -4519,26 +4961,20 @@ where
             return;
         };
         let entries = self.bulk_file_state_entries(
-            files.into_iter().take(QUERY_FILE_STATE_CACHE_CAPACITY),
+            files.into_iter().take(BULK_FILE_STATE_QUERY_LIMIT),
             source_mode,
         );
-        let mut snapshot = map_with_capacity(entries.len().min(QUERY_FILE_STATE_CACHE_CAPACITY));
-        for (_, (key, state)) in entries.into_iter().take(QUERY_FILE_STATE_CACHE_CAPACITY) {
-            snapshot.insert(key, Arc::new(state));
-        }
-
-        {
-            let mut file_states = query_file_states
-                .write()
-                .expect("query file-state cache write lock poisoned");
-            for (key, state) in &snapshot {
-                if file_states.contains_key(key)
-                    || file_states.len() < QUERY_FILE_STATE_CACHE_CAPACITY
-                {
-                    file_states.insert(key.clone(), Arc::clone(state));
-                }
+        let mut snapshot = map_with_capacity(entries.len());
+        let mut file_states = query_file_states
+            .write()
+            .expect("query file-state cache write lock poisoned");
+        for (_, (key, state)) in entries {
+            let state = Arc::new(state);
+            if file_states.retain(key.clone(), Arc::clone(&state)) {
+                snapshot.insert(key, state);
             }
         }
+        drop(file_states);
         let cache = self.query_read_cache_lock();
         if cache.is_active() && Arc::ptr_eq(&query_file_states, &cache.file_states) {
             self.query_file_state_snapshot
@@ -4560,10 +4996,11 @@ where
         &self,
         files: impl IntoIterator<Item = ProjectFile>,
     ) -> HashMap<ProjectFile, ImportFileFacts> {
+        let live = self.live_snapshot();
         let mut entries = Vec::new();
         let mut seen = HashSet::default();
         for file in files {
-            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+            if !self.adapter_owns_file(&file, &live) {
                 continue;
             }
             if !seen.insert(file.clone()) {
@@ -4819,8 +5256,10 @@ where
         oid: Oid,
         source: String,
     ) -> Option<FileState> {
-        let storage_key = self.adapter.storage_language_key_for_file(file);
-        let generation = self.store_context.generations[&storage_key];
+        // This parses `file` as this adapter's language and writes the result
+        // under its storage key, so a foreign file must not reach the store at
+        // all. See `storage_key_and_generation`.
+        let (storage_key, generation) = self.storage_key_and_generation(file)?;
         let mut parser = Self::build_parser(self.adapter.parser_language());
         let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
         let key = Self::transient_cache_key(oid, file);
@@ -4871,33 +5310,26 @@ where
         self.store_context.live_paths.snapshot()
     }
 
-    /// The per-workspace analysis store this analyzer reads and writes.
+    /// Whether this adapter analyzes `file`.
     ///
-    /// Language modules that answer a question from persisted rows rather than
-    /// from a materialized in-heap index need the store directly; the
-    /// `IAnalyzer` surface deliberately does not carry it.
-    pub(crate) fn analyzer_store(&self) -> &Arc<AnalyzerStore> {
-        &self.store_context.store
+    /// The extension registry is the rule. Include-driven inference (#1837)
+    /// adds the second arm: a file whose extension no language owns belongs to
+    /// this adapter once inference has adopted it, and membership in this
+    /// analyzer's live path map is what records that adoption -- the map is
+    /// per-language (`build_language_delegate` gives each delegate its own),
+    /// and only `reconcile_claimed_files` puts an unclaimed-extension file in
+    /// it. `live` is a parameter rather than a fresh snapshot because every
+    /// caller is walking one already.
+    fn adapter_owns_file(&self, file: &ProjectFile, live: &LiveSnapshot) -> bool {
+        if crate::analyzer::common::language_for_file(file) == self.adapter.language() {
+            return true;
+        }
+        self.adapter.claims_included_files()
+            && crate::analyzer::common::has_unclaimed_extension(file)
+            && live.oid_for_path(file).is_some()
     }
 
-    /// The current file-to-blob mapping, in both directions.
-    ///
-    /// This is how a caller turns a blob oid an inverted store lookup returned
-    /// into the live `ProjectFile`s that currently have those bytes, and how it
-    /// turns a file back into the blob whose rows describe it. Populated with
-    /// or without a git-backed `Liveness` (see `resolve_live_oids`), so a
-    /// store-backed query works in a plain directory too.
-    pub(crate) fn live_path_snapshot(&self) -> Arc<LiveSnapshot> {
-        self.live_snapshot()
-    }
-
-    /// The analysis generation `lang`'s persisted rows belong to. Cache keys
-    /// that mention it are invalidated for free when the generation moves.
-    pub(crate) fn language_generation(&self, lang: &str) -> Option<GenerationId> {
-        self.store_context.generations.get(lang).copied()
-    }
-
-    /// The persisted half of [`IAnalyzer::parent_of`] — the owner unit named by
+    /// The persisted half of [`CodeUnitIndex::parent_of`] — the owner unit named by
     /// popping `code_unit`'s last fq segment — memoized against the request's
     /// read-cache scope (#1230 item 6).
     ///
@@ -4919,7 +5351,7 @@ where
         if let Some(parent) = cached {
             return parent;
         }
-        let parent = IAnalyzer::definitions(self, &owner_fq_name).next();
+        let parent = CodeUnitIndex::definitions(self, &owner_fq_name).next();
         if let Some(parent_units) = parent_units.as_ref() {
             parent_units
                 .write()
@@ -4969,8 +5401,7 @@ where
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
             };
-            if crate::analyzer::common::language_for_file(&project_file) != self.adapter.language()
-            {
+            if !self.adapter_owns_file(&project_file, &snapshot) {
                 continue;
             }
             // Membership in the analyzed set is keyed on the snapshot's
@@ -5372,8 +5803,7 @@ where
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
             };
-            if crate::analyzer::common::language_for_file(&project_file) != self.adapter.language()
-            {
+            if !self.adapter_owns_file(&project_file, &snapshot) {
                 continue;
             }
             let Some(module) = self.adapter.path_synthetic_module_unit(&project_file) else {
@@ -5505,7 +5935,7 @@ where
         let mut states = Vec::new();
         for (key, _) in dirty {
             let file = ProjectFile::new(self.project.root().to_path_buf(), key.rel_path.clone());
-            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+            if !self.adapter_owns_file(&file, &snapshot) {
                 continue;
             }
             if snapshot.validated_oid_for_path(&file) != Some(key.oid) {
@@ -5576,7 +6006,7 @@ where
             }
             inspected += 1;
             let file = ProjectFile::new(self.project.root().to_path_buf(), key.rel_path.clone());
-            if crate::analyzer::common::language_for_file(&file) != self.adapter.language()
+            if !self.adapter_owns_file(&file, &snapshot)
                 || snapshot.validated_oid_for_path(&file) != Some(key.oid)
             {
                 continue;
@@ -5663,9 +6093,7 @@ where
                 let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
                     continue;
                 };
-                if crate::analyzer::common::language_for_file(&project_file)
-                    != self.adapter.language()
-                {
+                if !self.adapter_owns_file(&project_file, &snapshot) {
                     continue;
                 }
                 let Some(oid) = snapshot.oid_for_path(file) else {
@@ -5935,7 +6363,7 @@ where
     }
 
     pub(crate) fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
-        <Self as IAnalyzer>::direct_children(self, owner)
+        <Self as CodeUnitIndex>::direct_children(self, owner)
     }
 
     /// Return a provider-capped page of one declaration's direct children
@@ -5962,13 +6390,17 @@ where
             return limited_projection_rows(state.children.get(owner).map(Vec::as_slice), limit);
         }
 
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`: `owner` may come from another
+        // language's file, which this analyzer holds no children for.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         let persisted = self
             .store_query_or_record(
                 self.store_context.store.direct_children_for_unit_limited(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     owner,
                     limit,
                 ),
@@ -6503,6 +6935,12 @@ where
         let normalized = self.adapter.normalize_full_name(fq_name);
         let langs = self.storage_language_keys_for_queries();
         let candidate_names = self.definition_candidate_short_names(fq_name);
+        // No per-name profiling scopes here: usage scans resolve thousands of
+        // candidate names per request, and a BEGIN/END pair per name floods
+        // stderr (an unbuffered global-locked write per line) faster than the
+        // benchmark harness's bounded tail can retain anything else. The
+        // `definition_candidates_query_count` counter remains the aggregate
+        // signal.
         let rows = if candidate_names.is_empty() {
             Vec::new()
         } else {
@@ -7399,56 +7837,72 @@ where
         // hydrates the full candidate projection for the keys that matched, so
         // signature text, primary ranges, and `CodeUnit` construction cost
         // proportionally to the answer instead of to the workspace (#1199).
-        let name_rows = self.store_query_or_record(
-            self.store_context
-                .store
-                .search_candidate_name_rows_for_langs(
-                    &langs,
-                    self.store_context.generations.as_ref(),
-                    &active_oids,
-                    literal_substrings.as_deref(),
-                    cancellation,
+        let name_rows = {
+            let _scope = profiling::scope("search_symbols.candidates.load_names");
+            self.store_query_or_record(
+                self.store_context
+                    .store
+                    .search_candidate_name_rows_for_langs(
+                        &langs,
+                        self.store_context.generations.as_ref(),
+                        &active_oids,
+                        literal_substrings.as_deref(),
+                        cancellation,
+                    ),
+                format!(
+                    "searching symbol candidates for {} patterns",
+                    patterns.patterns().len()
                 ),
-            format!(
-                "searching symbol candidates for {} patterns",
-                patterns.patterns().len()
-            ),
-        )?;
+            )?
+        };
         let resolver =
             QueryResolver::from_snapshot(self.adapter.as_ref(), self.project.root(), live_snapshot);
         let mut complete = name_rows.complete;
         let mut inspected = name_rows.inspected;
-        let matched = resolver.match_candidate_names_cancellable(
-            &langs,
-            &name_rows.rows,
-            |package_name, short_name| {
-                self.fq_name_matches(package_name, short_name, |name| patterns.is_match(name))
-            },
-            cancellation,
-        );
-        complete &= matched.complete;
-        let rows = self.store_query_or_record(
-            self.store_context.store.search_candidate_rows_for_keys(
+        let matched = {
+            let _scope = profiling::scope("search_symbols.candidates.match_names");
+            resolver.match_candidate_names_cancellable(
                 &langs,
-                self.store_context.generations.as_ref(),
-                &matched.rows,
+                &name_rows.rows,
+                |package_name, short_name| {
+                    self.fq_name_matches(package_name, short_name, |name| patterns.is_match(name))
+                },
                 cancellation,
-            ),
-            format!("hydrating {} matched symbol candidates", matched.rows.len()),
-        )?;
+            )
+        };
+        complete &= matched.complete;
+        let rows = {
+            let _scope = profiling::scope("search_symbols.candidates.hydrate_rows");
+            self.store_query_or_record(
+                self.store_context.store.search_candidate_rows_for_keys(
+                    &langs,
+                    self.store_context.generations.as_ref(),
+                    &matched.rows,
+                    cancellation,
+                ),
+                format!("hydrating {} matched symbol candidates", matched.rows.len()),
+            )?
+        };
         complete &= rows.complete;
         self.search_candidate_hydration_count
             .fetch_add(rows.rows.len(), Ordering::Relaxed);
-        let resolved = resolver.resolve_rows_with_payload_cancellable(
-            rows.rows
-                .into_iter()
-                .map(|row| (row.candidate, (row.primary_range, row.in_test_region))),
-            cancellation,
-        );
+        let resolved = {
+            let _scope = profiling::scope("search_symbols.candidates.resolve_rows");
+            resolver.resolve_rows_with_payload_cancellable(
+                rows.rows.into_iter().map(|row| {
+                    let is_type_alias = row.candidate.flags.is_type_alias;
+                    (
+                        row.candidate,
+                        (row.primary_range, row.in_test_region, is_type_alias),
+                    )
+                }),
+                cancellation,
+            )
+        };
         inspected = inspected.saturating_add(resolved.inspected);
         complete &= resolved.complete;
         let mut candidates = BTreeMap::new();
-        for (code_unit, (primary_range, in_test_region)) in resolved.rows {
+        for (code_unit, (primary_range, in_test_region, is_type_alias)) in resolved.rows {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 complete = false;
                 break;
@@ -7461,6 +7915,7 @@ where
                         code_unit,
                         primary_range,
                         in_test_region,
+                        is_type_alias,
                     });
             }
         }
@@ -7486,6 +7941,7 @@ where
                         .into_iter()
                         .min_by_key(|range| (range.start_line, range.start_byte)),
                     in_test_region: self.in_test_region(&code_unit),
+                    is_type_alias: self.is_type_alias(&code_unit),
                     code_unit,
                 });
         }
@@ -7510,6 +7966,7 @@ where
                         .into_iter()
                         .min_by_key(|range| (range.start_line, range.start_byte)),
                     in_test_region: self.in_test_region(&code_unit),
+                    is_type_alias: self.is_type_alias(&code_unit),
                     code_unit,
                 });
         }
@@ -7533,13 +7990,13 @@ where
         if let Some(content_qualifier) = self.state.dirty_content_qualifier(&key) {
             return Some(content_qualifier);
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`: a foreign file has no persisted
+        // qualifier here, and the snapshot fallbacks below refuse it too.
+        let (storage_key, generation) = self.storage_key_and_generation(file)?;
         self.store_query_or_record(
-            self.store_context.store.content_package(
-                oid,
-                &storage_key,
-                self.store_context.generations[&storage_key],
-            ),
+            self.store_context
+                .store
+                .content_package(oid, &storage_key, generation),
             format!("querying the content qualifier for `{file}`"),
         )
         .flatten()
@@ -7558,32 +8015,16 @@ where
         file: &ProjectFile,
         limit: usize,
     ) -> LimitedQueryRows<String> {
+        // One shared rule for every namespace-per-file spelling, bounded or not
+        // (#1726): `declarations` is a HashSet and its persisted twin is keyed
+        // by `unit_key`, so stopping at either one's first qualified unit makes
+        // the answer depend on iteration order rather than on the source.
         fn from_state(state: &FileState, limit: usize) -> LimitedQueryRows<String> {
-            if limit == 0 {
-                return LimitedQueryRows::incomplete(Vec::new(), 0);
-            }
-            if !state.package_name.is_empty() {
-                return LimitedQueryRows::complete(vec![state.package_name.clone()], 1);
-            }
-            let mut inspected = 1usize;
-            // `declarations` is a HashSet, so stopping at its first qualified
-            // unit makes bounded work depend on randomized iteration order.
-            // Top-level declarations retain source order and are sufficient
-            // to recover a file-level namespace when the adapter did not
-            // populate `package_name` directly.
-            for unit in &state.top_level_declarations {
-                if inspected == limit {
-                    return LimitedQueryRows::incomplete(Vec::new(), inspected);
-                }
-                inspected += 1;
-                if !unit.package_name().is_empty() {
-                    return LimitedQueryRows::complete(
-                        vec![unit.package_name().to_string()],
-                        inspected,
-                    );
-                }
-            }
-            LimitedQueryRows::complete(vec![String::new()], inspected)
+            file_namespace_from_top_level_declarations(
+                &state.package_name,
+                &state.top_level_declarations,
+                limit,
+            )
         }
 
         if limit == 0 {
@@ -7599,8 +8040,10 @@ where
         if let Some(state) = self.source_snapshot_file_state(file) {
             return from_state(&state, limit);
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
-        let generation = self.store_context.generations[&storage_key];
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         let content_qualifier = self.store_query_or_record(
             self.store_context
                 .store
@@ -7688,14 +8131,17 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context
                 .store
                 .ruby_method_dispatch_modes_for_unit_limited(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     code_unit,
                     limit,
                 ),
@@ -7796,12 +8242,16 @@ where
         if let Some(retained) = self.import_info_store_get(&key) {
             return limited_projection_rows(Some(retained.as_ref()), limit);
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`: `ImportAnalysisProvider` fan-outs
+        // legitimately ask every provider about an arbitrary file.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context.store.import_infos_for_key_limited(
                 oid,
                 &storage_key,
-                self.store_context.generations[&storage_key],
+                generation,
                 limit,
             ),
             format!("querying bounded imports for `{file}`"),
@@ -7842,7 +8292,7 @@ where
             let Some(file) = self.rebase_live_file_to_project_root(file) else {
                 continue;
             };
-            if crate::analyzer::common::language_for_file(&file) != self.adapter.language() {
+            if !self.adapter_owns_file(&file, &snapshot) {
                 continue;
             }
             let imports = self.import_info_for_oid_limited(&file, oid, limit - inspected);
@@ -7902,12 +8352,15 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context.store.raw_supertypes_for_unit_limited(
                 oid,
                 &storage_key,
-                self.store_context.generations[&storage_key],
+                generation,
                 code_unit,
                 limit,
             ),
@@ -7941,14 +8394,17 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context
                 .store
                 .supertype_lookup_paths_for_unit_limited(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     code_unit,
                     limit,
                 ),
@@ -7996,6 +8452,13 @@ where
     ///
     /// The result is a superset of the analyzed set: a file that exists in the
     /// workspace but has not been parsed yet is still a real workspace file.
+    /// Every workspace file this adapter could own, from the workspace listing
+    /// rather than from the analyzed set.
+    ///
+    /// The extension registry is the rule. A caller that also needs the files
+    /// this adapter has *adopted* -- include-driven inference (#1837) gives an
+    /// unclaimed-extension file to the adapter that includes it -- must union
+    /// this with the analyzed set; adoption is not an extension property.
     pub(crate) fn workspace_language_files(&self) -> Vec<ProjectFile> {
         self.project
             .all_files_shared()
@@ -8128,15 +8591,155 @@ where
     }
 
     pub(crate) fn is_type_alias(&self, code_unit: &CodeUnit) -> bool {
-        self.fetch_file_state(code_unit.source())
-            .map(|state| state.type_aliases.contains(code_unit))
-            .unwrap_or(false)
+        let file = code_unit.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return false;
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return state.type_aliases.contains(code_unit);
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return state.type_aliases.contains(code_unit);
+        }
+        if let Some(state) = self.query_file_state_snapshot(&key) {
+            return state.type_aliases.contains(code_unit);
+        }
+        if !self.adapter.should_persist_code_unit(code_unit) {
+            return self
+                .fetch_file_state(file)
+                .is_some_and(|state| state.type_aliases.contains(code_unit));
+        }
+        if let Some(aliases) = self.type_alias_store_get(&key) {
+            return aliases.contains(code_unit);
+        }
+        // A unit from another language's file cannot be one of this analyzer's
+        // type aliases, and its storage key is by design absent from this
+        // adapter's generations (#1805). See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return false;
+        };
+        let aliases = self
+            .store_query_or_record(
+                self.store_context.store.type_aliases_for_file(
+                    oid,
+                    &storage_key,
+                    generation,
+                    self.adapter.as_ref(),
+                    file,
+                ),
+                format!("querying type aliases for `{file}`"),
+            )
+            .and_then(|aliases| aliases.map(Arc::<[CodeUnit]>::from))
+            .or_else(|| {
+                self.fetch_file_state(file)
+                    .map(|state| Arc::from(state.type_aliases.iter().cloned().collect::<Vec<_>>()))
+            });
+        let Some(aliases) = aliases else {
+            return false;
+        };
+        let is_alias = aliases.contains(code_unit);
+        self.type_alias_store_retain(key, aliases);
+        is_alias
+    }
+
+    fn type_alias_store_get(&self, key: &FileStateCacheKey) -> Option<Arc<[CodeUnit]>> {
+        self.type_alias_store
+            .lock()
+            .expect("type alias store mutex poisoned")
+            .get(key)
+    }
+
+    fn type_alias_store_retain(&self, key: FileStateCacheKey, aliases: Arc<[CodeUnit]>) {
+        self.type_alias_store
+            .lock()
+            .expect("type alias store mutex poisoned")
+            .retain(key, aliases);
+    }
+
+    fn enclosing_code_unit_from_cached_state(
+        &self,
+        key: &FileStateCacheKey,
+        state: &FileState,
+        range: &Range,
+    ) -> Option<CodeUnit> {
+        if state.declarations.len() < ENCLOSING_CODE_UNIT_INDEX_MIN_DECLARATIONS {
+            return enclosing_code_unit_from_state(state, range);
+        }
+        if let Some(index) = self
+            .enclosing_code_unit_store
+            .lock()
+            .expect("enclosing code-unit store mutex poisoned")
+            .get(key)
+        {
+            return index.enclosing_code_unit(range);
+        }
+        let index = Arc::new(EnclosingCodeUnitIndex::from_file_state(state));
+        let result = index.enclosing_code_unit(range);
+        self.enclosing_code_unit_store
+            .lock()
+            .expect("enclosing code-unit store mutex poisoned")
+            .retain(key.clone(), index);
+        result
     }
 
     pub(crate) fn signatures_vec_of(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.fetch_file_state(code_unit.source())
-            .and_then(|state| state.signatures.get(code_unit).cloned())
-            .unwrap_or_default()
+        let signatures = self.signatures_limited(code_unit, usize::MAX);
+        if signatures.complete {
+            signatures.rows
+        } else {
+            self.fetch_file_state(code_unit.source())
+                .and_then(|state| state.signatures.get(code_unit).cloned())
+                .unwrap_or_default()
+        }
+    }
+
+    pub(crate) fn signatures_limited(
+        &self,
+        code_unit: &CodeUnit,
+        limit: usize,
+    ) -> LimitedQueryRows<String> {
+        if limit == 0 {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        }
+        let file = code_unit.source();
+        let Some(oid) = self.resolve_live_oid_for_file(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.signatures, code_unit),
+                limit,
+            );
+        }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.signatures, code_unit),
+                limit,
+            );
+        }
+        if let Some(state) = self.query_file_state_snapshot(&key) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.signatures, code_unit),
+                limit,
+            );
+        }
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
+        self.store_query_or_record(
+            self.store_context.store.signatures_for_unit_limited(
+                oid,
+                &storage_key,
+                generation,
+                code_unit,
+                limit,
+            ),
+            format!("querying signatures for `{}`", code_unit.fq_name()),
+        )
+        .unwrap_or_else(|| LimitedQueryRows::incomplete(Vec::new(), 0))
     }
 
     pub(crate) fn signature_metadata_vec_of(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
@@ -8170,14 +8773,23 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        if let Some(state) = self.query_file_state_snapshot(&key) {
+            return limited_projection_rows(
+                projection_rows_for_unit(&state.signature_metadata, code_unit),
+                limit,
+            );
+        }
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context
                 .store
                 .signature_metadata_for_unit_limited(
                     oid,
                     &storage_key,
-                    self.store_context.generations[&storage_key],
+                    generation,
                     code_unit,
                     limit,
                 ),
@@ -8217,12 +8829,15 @@ where
                 limit,
             );
         }
-        let storage_key = self.adapter.storage_language_key_for_file(file);
+        // See `storage_key_and_generation`.
+        let Some((storage_key, generation)) = self.storage_key_and_generation(file) else {
+            return LimitedQueryRows::incomplete(Vec::new(), 0);
+        };
         self.store_query_or_record(
             self.store_context.store.ranges_for_unit_limited(
                 oid,
                 &storage_key,
-                self.store_context.generations[&storage_key],
+                generation,
                 code_unit,
                 limit,
             ),
@@ -8278,11 +8893,11 @@ where
         }
 
         let all_children: Vec<_> =
-            <Self as crate::analyzer::IAnalyzer>::direct_children(self, code_unit)
+            <Self as crate::analyzer::CodeUnitIndex>::direct_children(self, code_unit)
                 .into_iter()
                 .filter(|child| {
                     !child.is_synthetic()
-                        || !<Self as crate::analyzer::IAnalyzer>::ranges(self, child).is_empty()
+                        || !<Self as crate::analyzer::CodeUnitIndex>::ranges(self, child).is_empty()
                 })
                 .collect();
         let field_children: Vec<_> = all_children
@@ -8290,7 +8905,7 @@ where
             .filter(|child| child.is_field())
             .cloned()
             .collect();
-        let parent_start = <Self as crate::analyzer::IAnalyzer>::ranges(self, code_unit)
+        let parent_start = <Self as crate::analyzer::CodeUnitIndex>::ranges(self, code_unit)
             .into_iter()
             .map(|range| range.start_byte)
             .min()
@@ -8362,7 +8977,7 @@ where
     }
 
     fn child_first_start(&self, child: &CodeUnit) -> usize {
-        <Self as crate::analyzer::IAnalyzer>::ranges(self, child)
+        <Self as crate::analyzer::CodeUnitIndex>::ranges(self, child)
             .into_iter()
             .map(|range| range.start_byte)
             .min()
@@ -8374,6 +8989,14 @@ where
     /// analyzer (e.g. Scala's `ProjectTypes` behind `Arc` caches).
     pub(crate) fn global_usage_definition_index_shared(&self) -> Arc<GlobalUsageDefinitionIndex> {
         Arc::clone(self.global_usage_definition_index_handle())
+    }
+
+    /// The same index [`Self::global_usage_definition_index`] wraps in a
+    /// single-shard handle, borrowed rather than wrapped, so a language
+    /// implementation can hand out a `&dyn BoundedDefinitionLookup` without
+    /// allocating a handle per question.
+    pub(crate) fn global_usage_definition_index_ref(&self) -> &GlobalUsageDefinitionIndex {
+        self.global_usage_definition_index_handle().as_ref()
     }
 
     /// Owned handle to the derived callable-facts index; see
@@ -8532,44 +9155,82 @@ where
     }
 }
 
-impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
+impl<A> crate::analyzer::CodeUnitIndex for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
-    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        let mut cache = self.query_read_cache_write();
-        let was_active = cache.is_active();
-        cache.begin(context);
-        if !was_active {
-            self.live_source_snapshot.store(None);
-            self.query_file_state_snapshot.store(None);
+    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        self.enclosing_code_unit_query_count
+            .fetch_add(1, Ordering::Relaxed);
+        if range.start_byte >= range.end_byte {
+            return None;
         }
-    }
 
-    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
-        let mut cache = self.query_read_cache_write();
-        let was_active = cache.is_active();
-        cache.end(context);
-        if was_active && !cache.is_active() {
-            self.live_source_snapshot.store(None);
-            self.query_file_state_snapshot.store(None);
+        let oid = self.resolve_live_oid_for_file(file)?;
+        let key = Self::transient_cache_key(oid, file);
+        if let Some(state) = self.state.dirty_file_state(&key) {
+            return enclosing_code_unit_from_state(&state, range);
         }
+        if let Some(state) = self.source_snapshot_file_state(file) {
+            return self.enclosing_code_unit_from_cached_state(&key, &state, range);
+        }
+        if let Some(state) = self.query_file_state_snapshot(&key) {
+            return self.enclosing_code_unit_from_cached_state(&key, &state, range);
+        }
+
+        // See `storage_key_and_generation`: `CodeUnitIndex` consumers fan a file
+        // out to every provider, and this analyzer encloses nothing in a file
+        // it never analyzed.
+        let (storage_key, generation) = self.storage_key_and_generation(file)?;
+        if let Some(candidates) = self
+            .store_query_or_record(
+                self.store_context.store.enclosing_declarations_for_range(
+                    oid,
+                    &storage_key,
+                    generation,
+                    self.adapter.as_ref(),
+                    file,
+                    range,
+                ),
+                format!("querying enclosing declarations for `{file}`"),
+            )
+            .flatten()
+            .filter(|candidates| !candidates.is_empty())
+        {
+            return select_enclosing_code_unit(
+                candidates
+                    .into_iter()
+                    .map(|(code_unit, candidate_range)| (candidate_range, code_unit)),
+            );
+        }
+
+        self.fetch_file_state(file)
+            .and_then(|state| enclosing_code_unit_from_state(&state, range))
     }
 
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        TreeSitterAnalyzer::begin_streaming_file_read(self, file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        TreeSitterAnalyzer::end_streaming_file_read(self, file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.store_context.store.close_idle_streaming_readers();
-    }
-
-    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
-        self.query_read_cache_lock().workspace_file_index_cell()
+    fn enclosing_code_unit_for_lines(
+        &self,
+        file: &ProjectFile,
+        start_line: usize,
+        end_line: usize,
+    ) -> Option<CodeUnit> {
+        let line_range = Range {
+            start_byte: 0,
+            end_byte: usize::MAX,
+            start_line,
+            end_line,
+        };
+        self.declarations(file)
+            .into_iter()
+            .filter_map(|code_unit| {
+                let best_range = self.ranges(&code_unit).into_iter().find(|candidate| {
+                    candidate.start_line <= line_range.start_line
+                        && candidate.end_line >= line_range.end_line
+                })?;
+                Some((best_range.end_line - best_range.start_line, code_unit))
+            })
+            .min_by_key(|(span, _)| *span)
+            .map(|(_, code_unit)| code_unit)
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
@@ -8583,28 +9244,6 @@ where
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
-        let syntax = self.prepared_syntax(code_unit.source())?;
-        let mut node = syntax.declaration_node(code_unit)?;
-        let fallback = node.kind();
-        loop {
-            if matches!(
-                node.kind(),
-                "class_declaration"
-                    | "interface_declaration"
-                    | "annotation_type_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-            ) {
-                return Some(node.kind());
-            }
-            node = node.parent()?;
-            if node.kind() == "program" {
-                return Some(fallback);
-            }
-        }
     }
 
     fn summary_file_projection(&self, file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
@@ -8681,7 +9320,7 @@ where
         let Some(oid) = self.resolve_live_oid_for_file(file) else {
             return false;
         };
-        crate::analyzer::common::language_for_file(file) == self.adapter.language() && {
+        self.adapter_owns_file(file, &self.live_snapshot()) && {
             let storage_key = self.adapter.storage_language_key_for_file(file);
             let key = Self::transient_cache_key(oid, file);
             self.retry_dirty_file_state(&key, &storage_key).is_some()
@@ -8700,90 +9339,6 @@ where
 
     fn languages(&self) -> BTreeSet<Language> {
         BTreeSet::from([self.adapter.language()])
-    }
-
-    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
-        if changed_files.is_empty() {
-            return self.clone();
-        }
-
-        let mut store_context = self.store_context.clone();
-        store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
-        let mut to_update = Vec::new();
-        let mut dirty_file_states = self.state.dirty_snapshot();
-        let mut dirty_path_symbol_rows = self.state.dirty_path_symbol_snapshot();
-
-        for file in changed_files {
-            Self::remove_dirty_for_file(&mut dirty_file_states, file);
-            if !file.exists() && !self.project.has_overlay(file) {
-                store_context
-                    .live_paths
-                    .remove(std::iter::once(file.clone()));
-                if let Some(liveness) = store_context.liveness.as_ref() {
-                    liveness.remove_overlay_paths(std::iter::once(file.clone()));
-                }
-                continue;
-            }
-            to_update.push(file.clone());
-        }
-
-        let state = Self::reconcile_file_states(
-            self.project.as_ref(),
-            self.adapter.as_ref(),
-            &self.config,
-            &store_context,
-            ReconcileFileStates {
-                files: to_update,
-                replace_live_paths: false,
-                progress: None,
-                dirty_file_states,
-                dirty_path_symbol_rows,
-            },
-        );
-        dirty_path_symbol_rows = state.dirty_path_symbol_snapshot();
-        Self::refresh_path_symbol_units(
-            self.adapter.as_ref(),
-            changed_files,
-            &store_context,
-            &mut dirty_path_symbol_rows,
-        );
-        *state
-            .dirty_path_symbol_rows
-            .lock()
-            .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows;
-        store_context
-            .gc
-            .schedule(self.project.root(), Arc::clone(&store_context.store));
-        Self::from_state(
-            Arc::clone(&self.project),
-            Arc::clone(&self.adapter),
-            self.config.clone(),
-            state,
-            Arc::clone(&self.structural_cache),
-            self.semantic_cache.clone(),
-            store_context,
-        )
-    }
-
-    fn update_all(&self) -> Self {
-        let mut store_context = self.store_context.clone();
-        store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
-        let state = Self::build_state(
-            self.project.as_ref(),
-            self.adapter.as_ref(),
-            &self.config,
-            None,
-            &store_context,
-        );
-        Self::from_state(
-            Arc::clone(&self.project),
-            Arc::clone(&self.adapter),
-            self.config.clone(),
-            state,
-            Arc::clone(&self.structural_cache),
-            self.semantic_cache.clone(),
-            store_context,
-        )
     }
 
     fn project(&self) -> &dyn Project {
@@ -8807,8 +9362,22 @@ where
         self.materialization_records_of(file)
     }
 
+    fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        self.structural_file_state(file)
+            .map(|state| {
+                state
+                    .declarations
+                    .iter()
+                    .filter(|unit| !unit.is_file_scope())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
         self.fetch_file_state(file)
+            .or_else(|| self.fetch_file_state_from_current_source(file))
             .map(|state| {
                 state
                     .declarations
@@ -8831,71 +9400,6 @@ where
         Box::new(definitions.into_iter())
     }
 
-    fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
-        DefinitionIndexHandle::Single(self.global_usage_definition_index_handle().as_ref())
-    }
-
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_global_usage_definition_index_build_count_for_test(self);
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::global_usage_definition_index_build_count_for_test(self)
-    }
-
-    fn reset_definition_candidates_query_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_definition_candidates_query_count_for_test(self);
-    }
-
-    fn definition_candidates_query_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::definition_candidates_query_count_for_test(self)
-    }
-
-    fn reset_full_declaration_scan_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_full_declaration_scan_count_for_test(self);
-    }
-
-    fn full_declaration_scan_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::full_declaration_scan_count_for_test(self)
-    }
-
-    fn reset_package_declaration_scan_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_package_declaration_scan_count_for_test(self);
-    }
-
-    fn package_declaration_scan_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::package_declaration_scan_count_for_test(self)
-    }
-
-    fn reset_candidate_hydration_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_full_hydration_count_for_test(self);
-    }
-
-    fn candidate_hydration_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::full_hydration_count_for_test(self)
-            + TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
-    }
-
-    fn full_candidate_hydration_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::full_hydration_count_for_test(self)
-    }
-
-    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
-    }
-
-    fn reset_workspace_path_scan_count_for_test(&self) {
-        TreeSitterAnalyzer::reset_workspace_path_scan_count_for_test(self);
-    }
-
-    fn workspace_path_scan_count_for_test(&self) -> usize {
-        TreeSitterAnalyzer::workspace_path_scan_count_for_test(self)
-    }
-
-    fn usage_facts_index(&self) -> &UsageFactsIndex {
-        self.usage_facts_index_handle().as_ref()
-    }
-
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         if code_unit.is_module() && self.adapter.language() == Language::Java {
             return self.class_declarations_in_package(&code_unit.fq_name());
@@ -8914,131 +9418,19 @@ where
             .unwrap_or_default()
     }
 
-    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
-        self.state.fresh_parse_errors.get(file).cloned()
-    }
-
-    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
-        self.adapter.extract_call_receiver(reference)
-    }
-
-    /// The file's import statements in source order, one entry per statement.
-    ///
-    /// Since migration 0018 the store holds one row per import BINDING, and a
-    /// declaration that binds several names (`import { A, B } from 'm'`) gives
-    /// each binding the same snippet. Collapsing runs of equal adjacent
-    /// snippets restores "one entry per statement" without keeping a second
-    /// stored list: bindings of one declaration are always contiguous because
-    /// every adapter emits them together while walking that declaration.
-    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        let Some(state) = self.fetch_file_state(file) else {
-            return Vec::new();
-        };
-        let mut statements: Vec<String> = Vec::with_capacity(state.imports.len());
-        for import in &state.imports {
-            if statements
-                .last()
-                .is_some_and(|last| last == &import.raw_snippet)
-            {
-                continue;
-            }
-            statements.push(import.raw_snippet.clone());
-        }
-        statements
-    }
-
-    fn structural_search_providers(
-        &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        if self.adapter.structural_spec().is_some() {
-            vec![self]
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
-        Some(self.snapshot_caches())
-    }
-
-    fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
-        self.enclosing_code_unit_query_count
-            .fetch_add(1, Ordering::Relaxed);
-        if range.start_byte >= range.end_byte {
-            return None;
-        }
-
-        self.fetch_file_state(file)?
-            .declarations
-            .iter()
-            .cloned()
-            .filter_map(|code_unit| {
-                let best_range = self
-                    .ranges(&code_unit)
-                    .into_iter()
-                    .find(|candidate| candidate.contains(range))?;
-                Some((best_range.end_byte - best_range.start_byte, code_unit))
-            })
-            .min_by(|(left_span, left), (right_span, right)| {
-                left_span
-                    .cmp(right_span)
-                    .then_with(|| {
-                        enclosing_code_unit_rank(left).cmp(&enclosing_code_unit_rank(right))
-                    })
-                    .then_with(|| left.fq_name().cmp(&right.fq_name()))
-                    .then_with(|| left.kind().cmp(&right.kind()))
-                    .then_with(|| left.source().rel_path().cmp(right.source().rel_path()))
-            })
-            .map(|(_, code_unit)| code_unit)
-    }
-
-    fn enclosing_code_unit_for_lines(
-        &self,
-        file: &ProjectFile,
-        start_line: usize,
-        end_line: usize,
-    ) -> Option<CodeUnit> {
-        let line_range = Range {
-            start_byte: 0,
-            end_byte: usize::MAX,
-            start_line,
-            end_line,
-        };
-        self.declarations(file)
-            .into_iter()
-            .filter_map(|code_unit| {
-                let best_range = self.ranges(&code_unit).into_iter().find(|candidate| {
-                    candidate.start_line <= line_range.start_line
-                        && candidate.end_line >= line_range.end_line
-                })?;
-                Some((best_range.end_line - best_range.start_line, code_unit))
-            })
-            .min_by_key(|(span, _)| *span)
-            .map(|(_, code_unit)| code_unit)
-    }
-
-    fn is_access_expression(
-        &self,
-        _file: &ProjectFile,
-        _start_byte: usize,
-        _end_byte: usize,
-    ) -> bool {
-        true
-    }
-
-    fn find_nearest_declaration(
-        &self,
-        _file: &ProjectFile,
-        _start_byte: usize,
-        _end_byte: usize,
-        _ident: &str,
-    ) -> Option<DeclarationInfo> {
-        None
-    }
-
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
         self.source_snapshot_file_state(code_unit.source())
             .or_else(|| self.fetch_file_state(code_unit.source()))
+            .and_then(|state| state.ranges.get(code_unit).cloned())
+            .or_else(|| {
+                self.fetch_file_state_from_current_source(code_unit.source())
+                    .and_then(|state| state.ranges.get(code_unit).cloned())
+            })
+            .unwrap_or_default()
+    }
+
+    fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        self.structural_file_state(code_unit.source())
             .and_then(|state| state.ranges.get(code_unit).cloned())
             .unwrap_or_default()
     }
@@ -9058,65 +9450,6 @@ where
             limited.inspected,
             !limited.complete || cancellation.is_cancelled(),
         )
-    }
-
-    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
-        let Some(config) = self.adapter.cognitive_complexity_config() else {
-            return Vec::new();
-        };
-        let Some(file_state) = self.fetch_file_state(file) else {
-            return Vec::new();
-        };
-
-        let source = file_state.source.as_str();
-        if crate::analyzer::common::is_unparseable_source(source) {
-            return Vec::new();
-        }
-        let mut parser = Self::build_parser(self.adapter.parser_language_for_file(file));
-        let Some(tree) = parser.parse(source, None) else {
-            return Vec::new();
-        };
-        let root = tree.root_node();
-
-        // Walk the declared code-unit hierarchy to enumerate every function
-        // in this file in source order (top-level + nested under classes /
-        // modules / impls). Mirrors brokk-shared's
-        // `functionCodeUnitsInFile`.
-        let mut functions: Vec<CodeUnit> = Vec::new();
-        let mut work: VecDeque<CodeUnit> =
-            file_state.top_level_declarations.iter().cloned().collect();
-        while let Some(cu) = work.pop_front() {
-            if cu.is_function() {
-                functions.push(cu.clone());
-            }
-            if let Some(children) = file_state.children.get(&cu) {
-                for child in children {
-                    work.push_back(child.clone());
-                }
-            }
-        }
-
-        let mut result = Vec::with_capacity(functions.len());
-        for cu in functions {
-            let Some(ranges) = file_state.ranges.get(&cu) else {
-                continue;
-            };
-            let Some(primary) = ranges.first() else {
-                continue;
-            };
-            // `descendant_for_byte_range(start, end)` returns the smallest
-            // node fully containing `[start, end)`. With the analyzer's
-            // primary range for the function this lands on the
-            // function/method node itself, which is what the scorer wants
-            // as its root.
-            let Some(node) = root.descendant_for_byte_range(primary.start_byte, primary.end_byte)
-            else {
-                continue;
-            };
-            let complexity = cognitive_complexity::compute(node, source, config);
-            result.push((cu, complexity));
-        }
-        result
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
@@ -9198,6 +9531,345 @@ where
         true
     }
 
+    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+        self.signatures_vec_of(code_unit)
+    }
+
+    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        self.signature_metadata_vec_of(code_unit)
+    }
+}
+
+impl<A> crate::analyzer::IAnalyzer for TreeSitterAnalyzer<A>
+where
+    A: LanguageAdapter,
+{
+    #[cfg(any(test, feature = "test-support"))]
+    fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
+        self
+    }
+
+    fn invalidate_cached_file_identities(&self) {
+        if let Some(liveness) = self.store_context.liveness.as_ref() {
+            liveness.invalidate_startup_oids();
+        }
+    }
+
+    fn begin_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        let mut cache = self.query_read_cache_write();
+        let was_active = cache.is_active();
+        cache.begin(context);
+        if !was_active {
+            self.live_source_snapshot.store(None);
+            self.query_file_state_snapshot.store(None);
+        }
+    }
+
+    fn end_query(&self, context: &Arc<crate::analyzer::AnalyzerQueryContext>) {
+        let mut cache = self.query_read_cache_write();
+        let was_active = cache.is_active();
+        cache.end(context);
+        if was_active && !cache.is_active() {
+            self.live_source_snapshot.store(None);
+            self.query_file_state_snapshot.store(None);
+        }
+    }
+
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        TreeSitterAnalyzer::begin_streaming_file_read(self, file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        TreeSitterAnalyzer::end_streaming_file_read(self, file);
+    }
+
+    fn release_streaming_readers(&self) {
+        self.store_context.store.close_idle_streaming_readers();
+    }
+
+    fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
+        self.query_read_cache_lock().workspace_file_index_cell()
+    }
+
+    fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
+        let syntax = self.prepared_syntax(code_unit.source())?;
+        let mut node = syntax.declaration_node(code_unit)?;
+        let fallback = node.kind();
+        loop {
+            if matches!(
+                node.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "annotation_type_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+            ) {
+                return Some(node.kind());
+            }
+            node = node.parent()?;
+            if node.kind() == "program" {
+                return Some(fallback);
+            }
+        }
+    }
+
+    fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        if changed_files.is_empty() {
+            return self.clone();
+        }
+
+        let mut store_context = self.store_context.clone();
+        store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
+        let mut to_update = Vec::new();
+        let mut claim_roots = Vec::new();
+        let mut new_claimable_file_appeared = false;
+        let mut dirty_file_states = self.state.dirty_snapshot();
+        let mut dirty_path_symbol_rows = self.state.dirty_path_symbol_snapshot();
+        let live = self.live_snapshot();
+
+        for file in changed_files {
+            Self::remove_dirty_for_file(&mut dirty_file_states, file);
+            if !file.exists() && !self.project.has_overlay(file) {
+                store_context
+                    .live_paths
+                    .remove(std::iter::once(file.clone()));
+                if let Some(liveness) = store_context.liveness.as_ref() {
+                    liveness.remove_overlay_paths(std::iter::once(file.clone()));
+                }
+                // A deleted file contributes no claim edges. Feeding it to the
+                // inference roots is what retires the ones it used to own.
+                claim_roots.push(file.clone());
+                continue;
+            }
+            // A changed file whose extension names no language reaches this
+            // adapter only once inference has claimed it (#1837); an unclaimed
+            // one must not be parsed as this language.
+            if !self.adapter_owns_file(file, &live) {
+                // A claimable file that did not exist last generation can turn
+                // an `#include` that resolved to nothing into a claim, and the
+                // includer itself did not change. Re-derive the whole relation
+                // in that case -- rare, and the alternative is leaving the new
+                // file unindexed until the next full build.
+                new_claimable_file_appeared |= self.adapter.claims_included_files()
+                    && crate::analyzer::common::has_unclaimed_extension(file);
+                continue;
+            }
+            to_update.push(file.clone());
+            claim_roots.push(file.clone());
+        }
+
+        let mut state = Self::reconcile_file_states(
+            self.project.as_ref(),
+            self.adapter.as_ref(),
+            &self.config,
+            &store_context,
+            ReconcileFileStates {
+                files: to_update,
+                replace_live_paths: false,
+                progress: None,
+                dirty_file_states,
+                dirty_path_symbol_rows,
+            },
+        );
+        if new_claimable_file_appeared {
+            claim_roots.extend(
+                live.all_paths()
+                    .filter(|file| {
+                        crate::analyzer::common::language_for_file(file) == self.adapter.language()
+                    })
+                    .cloned(),
+            );
+            claim_roots.sort();
+            claim_roots.dedup();
+        }
+        Self::reconcile_claimed_files(
+            self.project.as_ref(),
+            self.adapter.as_ref(),
+            &self.config,
+            &store_context,
+            &claim_roots,
+            self.state.claim_edges.clone(),
+            &mut state,
+        );
+        dirty_path_symbol_rows = state.dirty_path_symbol_snapshot();
+        Self::refresh_path_symbol_units(
+            self.adapter.as_ref(),
+            changed_files,
+            &store_context,
+            &mut dirty_path_symbol_rows,
+        );
+        *state
+            .dirty_path_symbol_rows
+            .lock()
+            .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows;
+        store_context
+            .gc
+            .schedule(self.project.root(), Arc::clone(&store_context.store));
+        Self::from_state(
+            Arc::clone(&self.project),
+            Arc::clone(&self.adapter),
+            self.config.clone(),
+            state,
+            Arc::clone(&self.structural_cache),
+            self.semantic_cache.clone(),
+            store_context,
+        )
+    }
+
+    fn update_all(&self) -> Self {
+        let mut store_context = self.store_context.clone();
+        store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
+        let state = Self::build_state(
+            self.project.as_ref(),
+            self.adapter.as_ref(),
+            &self.config,
+            None,
+            &store_context,
+        );
+        Self::from_state(
+            Arc::clone(&self.project),
+            Arc::clone(&self.adapter),
+            self.config.clone(),
+            state,
+            Arc::clone(&self.structural_cache),
+            self.semantic_cache.clone(),
+            store_context,
+        )
+    }
+
+    fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
+        DefinitionIndexHandle::Single(self.global_usage_definition_index_handle().as_ref())
+    }
+
+    fn usage_facts_index(&self) -> &UsageFactsIndex {
+        self.usage_facts_index_handle().as_ref()
+    }
+
+    fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
+        self.state.fresh_parse_errors.get(file).cloned()
+    }
+
+    fn extract_call_receiver(&self, reference: &str) -> Option<String> {
+        self.adapter.extract_call_receiver(reference)
+    }
+
+    /// The file's import statements in source order, one entry per statement.
+    ///
+    /// Since migration 0019 the store holds one row per import BINDING, and a
+    /// declaration that binds several names (`import { A, B } from 'm'`) gives
+    /// each binding the same snippet. Collapsing runs of equal adjacent
+    /// snippets restores "one entry per statement" without keeping a second
+    /// stored list: bindings of one declaration are always contiguous because
+    /// every adapter emits them together while walking that declaration.
+    fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
+        let Some(state) = self.fetch_file_state(file) else {
+            return Vec::new();
+        };
+        let mut statements: Vec<String> = Vec::with_capacity(state.imports.len());
+        for import in &state.imports {
+            if statements
+                .last()
+                .is_some_and(|last| last == &import.raw_snippet)
+            {
+                continue;
+            }
+            statements.push(import.raw_snippet.clone());
+        }
+        statements
+    }
+
+    fn structural_search_providers(
+        &self,
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+        if self.adapter.structural_spec().is_some() {
+            vec![self]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
+        Some(self.snapshot_caches())
+    }
+
+    fn is_access_expression(
+        &self,
+        _file: &ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+    ) -> bool {
+        true
+    }
+
+    fn find_nearest_declaration(
+        &self,
+        _file: &ProjectFile,
+        _start_byte: usize,
+        _end_byte: usize,
+        _ident: &str,
+    ) -> Option<DeclarationInfo> {
+        None
+    }
+
+    fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        let Some(config) = self.adapter.cognitive_complexity_config() else {
+            return Vec::new();
+        };
+        let Some(file_state) = self.fetch_file_state(file) else {
+            return Vec::new();
+        };
+
+        let source = file_state.source.as_str();
+        if crate::analyzer::common::is_unparseable_source(source) {
+            return Vec::new();
+        }
+        let mut parser = Self::build_parser(self.adapter.parser_language_for_file(file));
+        let Some(tree) = parser.parse(source, None) else {
+            return Vec::new();
+        };
+        let root = tree.root_node();
+
+        // Walk the declared code-unit hierarchy to enumerate every function
+        // in this file in source order (top-level + nested under classes /
+        // modules / impls). Mirrors brokk-shared's
+        // `functionCodeUnitsInFile`.
+        let mut functions: Vec<CodeUnit> = Vec::new();
+        let mut work: VecDeque<CodeUnit> =
+            file_state.top_level_declarations.iter().cloned().collect();
+        while let Some(cu) = work.pop_front() {
+            if cu.is_function() {
+                functions.push(cu.clone());
+            }
+            if let Some(children) = file_state.children.get(&cu) {
+                for child in children {
+                    work.push_back(child.clone());
+                }
+            }
+        }
+
+        let mut result = Vec::with_capacity(functions.len());
+        for cu in functions {
+            let Some(ranges) = file_state.ranges.get(&cu) else {
+                continue;
+            };
+            let Some(primary) = ranges.first() else {
+                continue;
+            };
+            // `descendant_for_byte_range(start, end)` returns the smallest
+            // node fully containing `[start, end)`. With the analyzer's
+            // primary range for the function this lands on the
+            // function/method node itself, which is what the scorer wants
+            // as its root.
+            let Some(node) = root.descendant_for_byte_range(primary.start_byte, primary.end_byte)
+            else {
+                continue;
+            };
+            let complexity = cognitive_complexity::compute(node, source, config);
+            result.push((cu, complexity));
+        }
+        result
+    }
+
     fn search_symbol_candidates(
         &self,
         patterns: &SearchSymbolPatternBatch,
@@ -9224,13 +9896,92 @@ where
         self.fetch_file_state(code_unit.source())
             .is_some_and(|state| state.test_region_units.contains(code_unit))
     }
+}
 
-    fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
-        self.signatures_vec_of(code_unit)
+#[cfg(any(test, feature = "test-support"))]
+impl<A> crate::analyzer::AnalyzerTestHooks for TreeSitterAnalyzer<A>
+where
+    A: LanguageAdapter,
+{
+    fn reset_global_usage_definition_index_build_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_global_usage_definition_index_build_count_for_test(self);
     }
 
-    fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
-        self.signature_metadata_vec_of(code_unit)
+    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::global_usage_definition_index_build_count_for_test(self)
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_definition_candidates_query_count_for_test(self);
+    }
+
+    fn reset_definition_prefetch_batch_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_definition_prefetch_batch_count_for_test(self);
+    }
+
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::definition_prefetch_batch_count_for_test(self)
+    }
+
+    fn reset_definition_candidate_row_read_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_definition_candidate_row_read_count_for_test(self);
+    }
+
+    fn definition_candidate_row_read_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::definition_candidate_row_read_count_for_test(self)
+    }
+
+    fn reset_search_candidate_hydration_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_search_candidate_hydration_count_for_test(self);
+    }
+
+    fn search_candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::search_candidate_hydration_count_for_test(self)
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::definition_candidates_query_count_for_test(self)
+    }
+
+    fn reset_full_declaration_scan_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_full_declaration_scan_count_for_test(self);
+    }
+
+    fn full_declaration_scan_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::full_declaration_scan_count_for_test(self)
+    }
+
+    fn reset_package_declaration_scan_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_package_declaration_scan_count_for_test(self);
+    }
+
+    fn package_declaration_scan_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::package_declaration_scan_count_for_test(self)
+    }
+
+    fn reset_candidate_hydration_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_full_hydration_count_for_test(self);
+    }
+
+    fn candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::full_hydration_count_for_test(self)
+            + TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
+    }
+
+    fn full_candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::full_hydration_count_for_test(self)
+    }
+
+    fn bulk_candidate_hydration_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
+    }
+
+    fn reset_workspace_path_scan_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_workspace_path_scan_count_for_test(self);
+    }
+
+    fn workspace_path_scan_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::workspace_path_scan_count_for_test(self)
     }
 }
 
@@ -9249,137 +10000,40 @@ fn enclosing_code_unit_rank(code_unit: &CodeUnit) -> usize {
     if code_unit.is_file_scope() { 1 } else { 0 }
 }
 
-pub(crate) fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
-}
-
-/// Expand `start_byte` upward to include the declaration's own leading comment
-/// block (its docstring / JSDoc / Rust attributes).
-///
-/// Only a comment block *contiguously attached* to the declaration counts: a
-/// blank line terminates the walk. This is what keeps a file-level license
-/// header — separated from the first declaration by a blank line — from being
-/// misattributed as that declaration's docstring, which previously made chunk
-/// `text` start at the file header while `start_line`/`end_line` still pointed
-/// at the declaration body.
-pub(crate) fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
-    // Tree-sitter can report a byte offset inside a UTF-8 code point for a
-    // malformed or generated source file. The later `str::get` call already
-    // rejects that range, so do not panic while trying to add comments. This
-    // occurred while prewarming Envoy's generated C++ sources.
-    if start_byte > source.len() || !source.is_char_boundary(start_byte) {
-        return start_byte.min(source.len());
-    }
-
-    // Walk backward from the declaration instead of building a line index for
-    // the whole file. Semantic indexing asks for every function body in a
-    // file; rescanning a multi-megabyte generated file once per function made
-    // that extraction path effectively quadratic.
-    let bytes = source.as_bytes();
-    let mut next_line_start = bytes[..start_byte]
-        .iter()
-        .rposition(|byte| matches!(byte, b'\n' | b'\r'))
-        .map_or(0, |separator| separator + 1);
-
-    let mut comment_start = start_byte;
-    while next_line_start > 0 {
-        let mut line_end = next_line_start;
-        if bytes[line_end - 1] == b'\n' {
-            line_end -= 1;
-            if line_end > 0 && bytes[line_end - 1] == b'\r' {
-                line_end -= 1;
-            }
-        } else {
-            debug_assert_eq!(bytes[line_end - 1], b'\r');
-            line_end -= 1;
-        }
-        let line_start = bytes[..line_end]
-            .iter()
-            .rposition(|byte| matches!(byte, b'\n' | b'\r'))
-            .map_or(0, |separator| separator + 1);
-        let line = &source[line_start..line_end];
-        let trimmed = line.trim_start();
-        next_line_start = line_start;
-
-        // A blank line separates the declaration (or its attached comment block)
-        // from whatever precedes it; stop rather than reaching across the gap.
-        if trimmed.trim().is_empty() {
-            break;
-        }
-
-        if is_comment_like(trimmed) {
-            comment_start = line_start;
-            continue;
-        }
-
-        if let Some(offset) = first_comment_offset(line) {
-            comment_start = line_start + offset;
-        }
-        break;
-    }
-
-    comment_start
-}
-
-fn is_comment_like(trimmed_line: &str) -> bool {
-    trimmed_line.starts_with("/**")
-        || trimmed_line.starts_with("/*")
-        || trimmed_line.starts_with("*/")
-        || trimmed_line.starts_with('*')
-        || trimmed_line.starts_with("//")
-        || trimmed_line.strip_prefix('#').is_some_and(|rest| {
-            rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace)
-        })
-        || trimmed_line.starts_with("#[")
-}
-
-fn first_comment_offset(line: &str) -> Option<usize> {
-    ["/**", "/*", "//", "#["]
+fn select_enclosing_code_unit(
+    candidates: impl IntoIterator<Item = (Range, CodeUnit)>,
+) -> Option<CodeUnit> {
+    candidates
         .into_iter()
-        .filter_map(|marker| line.find(marker))
-        .chain(line.find("# "))
-        .min()
+        .min_by(|(left_range, left), (right_range, right)| {
+            (left_range.end_byte - left_range.start_byte)
+                .cmp(&(right_range.end_byte - right_range.start_byte))
+                .then_with(|| enclosing_code_unit_rank(left).cmp(&enclosing_code_unit_rank(right)))
+                .then_with(|| left.fq_name().cmp(&right.fq_name()))
+                .then_with(|| left.kind().cmp(&right.kind()))
+                .then_with(|| left.source().rel_path().cmp(right.source().rel_path()))
+        })
+        .map(|(_, code_unit)| code_unit)
 }
 
-/// Walk `node` and append every `ERROR` / `MISSING` span into `out`. Does NOT
-/// recurse into `ERROR` nodes: every descendant would also report as errored
-/// and the diagnostic list would explode. Used both by `analyze_file` (to
-/// populate the per-file cache) and by `lsp::handlers::diagnostic` (for the
-/// fallback path when the analyzer has no cached state), so the two paths
-/// share one source of truth for the walk semantics and the
-/// `end_byte.max(start_byte)` clamp.
-pub fn collect_parse_errors(node: Node, out: &mut Vec<crate::analyzer::ParseError>) {
-    walk_tree_preorder(node, true, |node| {
-        if node.is_error() || node.is_missing() {
-            let range = Range {
-                start_byte: node.start_byte(),
-                end_byte: node.end_byte().max(node.start_byte()),
-                start_line: node.start_position().row,
-                end_line: node.end_position().row,
-            };
-            let kind = if node.is_missing() {
-                crate::analyzer::ParseErrorKind::Missing(node.kind().to_string())
-            } else {
-                crate::analyzer::ParseErrorKind::Error
-            };
-            out.push(crate::analyzer::ParseError { range, kind });
-            if node.is_error() {
-                return WalkControl::SkipChildren;
-            }
-        }
-        WalkControl::Continue
-    });
+fn enclosing_code_unit_from_state(state: &FileState, range: &Range) -> Option<CodeUnit> {
+    select_enclosing_code_unit(state.declarations.iter().cloned().filter_map(|code_unit| {
+        let best_range = state
+            .ranges
+            .get(&code_unit)
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|candidate| candidate.contains(range))?;
+        Some((best_range, code_unit))
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzer::CodeUnitType;
+    use crate::analyzer::cpp::CppAdapter;
     use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
     use crate::analyzer::javascript::JavascriptAdapter;
@@ -9509,6 +10163,50 @@ mod tests {
             cache.order.len()
         );
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn segmented_file_state_cache_keeps_reused_states_through_a_cold_scan() {
+        let state = Arc::new(empty_file_state("x".repeat(512), false));
+        let weight = state.estimated_retained_bytes();
+        let mut cache = SegmentedFileStateCache::new(weight.saturating_mul(4));
+        let hot_a = cache_key("hot-a");
+        let hot_b = cache_key("hot-b");
+        cache.insert(hot_a.clone(), Arc::clone(&state));
+        cache.insert(hot_b.clone(), Arc::clone(&state));
+        assert!(cache.get(&hot_a).is_some());
+        assert!(cache.get(&hot_b).is_some());
+
+        for index in 0..4 {
+            cache.insert(cache_key(&format!("cold-{index}")), Arc::clone(&state));
+        }
+
+        assert!(cache.contains(&hot_a), "a second use protects hot state a");
+        assert!(cache.contains(&hot_b), "a second use protects hot state b");
+        assert!(cache.retained_bytes() <= cache.max_bytes);
+        assert_eq!(cache.stats().promotions, 2);
+        assert!(cache.stats().evictions > 0);
+    }
+
+    #[test]
+    fn file_state_cache_budget_tracks_corpus_with_a_hard_ceiling() {
+        let config = AnalyzerConfig::default();
+        let ceiling = file_state_cache_ceiling_bytes(&config);
+        assert_eq!(
+            file_state_cache_budget_bytes(&config, None),
+            ceiling,
+            "an unavailable corpus estimate must preserve the safe ceiling"
+        );
+        assert_eq!(
+            file_state_cache_budget_bytes(&config, Some(100 * 1024 * 1024)),
+            40 * 1024 * 1024,
+            "the target is ten percent of the expanded persisted corpus"
+        );
+        assert_eq!(
+            file_state_cache_budget_bytes(&config, Some(usize::MAX)),
+            ceiling,
+            "a whale corpus cannot exceed the configured ceiling"
+        );
     }
 
     #[derive(Clone)]
@@ -10124,7 +10822,6 @@ mod tests {
             definition_lookup_units: HashSet::default(),
             imports: Vec::new(),
             scala_exports: HashMap::default(),
-            rust_usage_facts: crate::analyzer::rust::facts::RustUsageFacts::default(),
             raw_supertypes: HashMap::default(),
             supertype_lookup_paths: HashMap::default(),
             type_identifiers: HashSet::default(),
@@ -10145,123 +10842,6 @@ mod tests {
 
     fn temp_file(root: &Path, rel_path: &str) -> ProjectFile {
         ProjectFile::new(root.to_path_buf(), rel_path)
-    }
-
-    fn test_range(start_byte: usize) -> Range {
-        Range {
-            start_byte,
-            end_byte: start_byte + 1,
-            start_line: 0,
-            end_line: 0,
-        }
-    }
-
-    #[test]
-    fn declaration_identity_multiset_survives_replace_until_last_exact_removal() {
-        let file = ProjectFile::new(std::env::temp_dir(), "identity.cpp");
-        let first = CodeUnit::with_signature(
-            file.clone(),
-            CodeUnitType::Function,
-            "pkg",
-            "overloaded",
-            Some("(int)".to_string()),
-            false,
-        );
-        let synthetic_variant = CodeUnit::with_signature(
-            file.clone(),
-            CodeUnitType::Function,
-            "pkg",
-            "overloaded",
-            Some("(double)".to_string()),
-            true,
-        );
-        let identity_probe =
-            CodeUnit::new(file.clone(), CodeUnitType::Function, "pkg", "overloaded");
-        let mut parsed = ParsedFile::new(String::new());
-        parsed.add_code_unit_with_range(first.clone(), test_range(0), None, None);
-        parsed.add_synthetic_code_unit(synthetic_variant.clone(), None, None);
-        assert!(parsed.contains_declaration_identity(&identity_probe));
-        assert_eq!(
-            Some(&2),
-            parsed
-                .declaration_identities
-                .get(&DeclarationIdentity(identity_probe.clone()))
-        );
-
-        let tree = parse_javascript("const replacement = 1;");
-        let node = tree.root_node().named_child(0).expect("replacement node");
-        parsed.replace_code_unit(first.clone(), node, "const replacement = 1;", None, None);
-        assert_eq!(
-            Some(&2),
-            parsed
-                .declaration_identities
-                .get(&DeclarationIdentity(identity_probe.clone()))
-        );
-
-        parsed.remove_code_unit(&first);
-        assert!(parsed.contains_declaration_identity(&identity_probe));
-        assert_eq!(
-            Some(&1),
-            parsed
-                .declaration_identities
-                .get(&DeclarationIdentity(identity_probe.clone()))
-        );
-        parsed.remove_code_unit(&synthetic_variant);
-        assert!(!parsed.contains_declaration_identity(&identity_probe));
-    }
-
-    #[test]
-    fn declaration_identity_index_tracks_file_scope_and_recursive_removal() {
-        let file = ProjectFile::new(std::env::temp_dir(), "recursive.cpp");
-        let mut parsed = ParsedFile::new(String::new());
-        let file_scope = CodeUnit::file_scope(file.clone());
-        parsed.add_file_scope(&file, "int value;\n");
-        parsed.add_file_scope(&file, "int value;\n");
-        assert_eq!(
-            Some(&1),
-            parsed
-                .declaration_identities
-                .get(&DeclarationIdentity(file_scope.clone()))
-        );
-        parsed.remove_code_unit(&file_scope);
-        assert!(!parsed.contains_declaration_identity(&file_scope));
-
-        let parent = CodeUnit::new(file.clone(), CodeUnitType::Class, "", "Parent");
-        let child_one = CodeUnit::with_signature(
-            file.clone(),
-            CodeUnitType::Function,
-            "Parent",
-            "child",
-            Some("(int)".to_string()),
-            false,
-        );
-        let child_two = CodeUnit::with_signature(
-            file,
-            CodeUnitType::Function,
-            "Parent",
-            "child",
-            Some("(double)".to_string()),
-            true,
-        );
-        let child_identity = CodeUnit::new(
-            child_one.source().clone(),
-            CodeUnitType::Function,
-            "Parent",
-            "child",
-        );
-        parsed.add_code_unit_with_range(parent.clone(), test_range(1), None, None);
-        parsed.add_code_unit_with_range(child_one, test_range(2), Some(parent.clone()), None);
-        parsed.add_synthetic_code_unit(child_two, Some(parent.clone()), None);
-        assert_eq!(
-            Some(&2),
-            parsed
-                .declaration_identities
-                .get(&DeclarationIdentity(child_identity.clone()))
-        );
-
-        parsed.remove_code_unit(&parent);
-        assert!(!parsed.contains_declaration_identity(&parent));
-        assert!(!parsed.contains_declaration_identity(&child_identity));
     }
 
     #[test]
@@ -10509,7 +11089,7 @@ mod tests {
         // Spellings: `probe::inner::Widget`, `inner::Widget`, `Widget`. Only
         // the last can match a stored rust short name.
         let scoped: Vec<CodeUnit> =
-            IAnalyzer::definitions(&analyzer, "probe::inner::Widget").collect();
+            CodeUnitIndex::definitions(&analyzer, "probe::inner::Widget").collect();
         let row_reads = analyzer.definition_candidate_row_read_count_for_test();
         let dropped = analyzer.structural_miss_spelling_count_for_test();
 
@@ -10568,7 +11148,7 @@ mod tests {
 
         analyzer.reset_structural_miss_spelling_count_for_test();
         for name in ["coll.::", "::", "coll.::.:::", "::.head"] {
-            let _ = IAnalyzer::definitions(&analyzer, name).count();
+            let _ = CodeUnitIndex::definitions(&analyzer, name).count();
         }
 
         assert_eq!(
@@ -10588,16 +11168,17 @@ mod tests {
 
         analyzer.reset_definition_candidate_row_read_count_for_test();
         analyzer.reset_structural_miss_spelling_count_for_test();
-        let dotted: Vec<CodeUnit> = IAnalyzer::definitions(&analyzer, "inner.Widget").collect();
+        let dotted: Vec<CodeUnit> =
+            CodeUnitIndex::definitions(&analyzer, "probe.inner.Widget").collect();
 
         assert_eq!(0, analyzer.structural_miss_spelling_count_for_test());
         assert_eq!(
-            2,
+            3,
             analyzer.definition_candidate_row_read_count_for_test(),
-            "`inner.Widget` and `Widget` both remain seekable spellings"
+            "`probe.inner.Widget`, `inner.Widget` and `Widget` all remain seekable spellings"
         );
         assert_eq!(
-            vec!["inner.Widget"],
+            vec!["probe.inner.Widget"],
             dotted
                 .iter()
                 .map(|unit| unit.fq_name())
@@ -10618,8 +11199,10 @@ mod tests {
         analyzer.begin_query(&scope);
         analyzer.reset_workspace_path_scan_count_for_test();
         for index in 0..3 {
-            let _ =
-                IAnalyzer::lookup_candidates_by_identifier(&analyzer, &format!("Widget{index}"));
+            let _ = CodeUnitIndex::lookup_candidates_by_identifier(
+                &analyzer,
+                &format!("Widget{index}"),
+            );
         }
         let scans_in_one_request = analyzer.workspace_path_scan_count_for_test();
         analyzer.end_query(&scope);
@@ -10641,7 +11224,7 @@ mod tests {
         for _ in 0..2 {
             let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
             analyzer.begin_query(&scope);
-            let _ = IAnalyzer::lookup_candidates_by_identifier(&analyzer, "Widget0");
+            let _ = CodeUnitIndex::lookup_candidates_by_identifier(&analyzer, "Widget0");
             analyzer.end_query(&scope);
         }
 
@@ -10661,7 +11244,7 @@ mod tests {
 
         let unscoped: Vec<BTreeSet<CodeUnit>> = (0..3)
             .map(|index| {
-                IAnalyzer::lookup_candidates_by_identifier(&analyzer, &format!("Widget{index}"))
+                CodeUnitIndex::lookup_candidates_by_identifier(&analyzer, &format!("Widget{index}"))
             })
             .collect();
 
@@ -10669,7 +11252,7 @@ mod tests {
         analyzer.begin_query(&scope);
         let scoped: Vec<BTreeSet<CodeUnit>> = (0..3)
             .map(|index| {
-                IAnalyzer::lookup_candidates_by_identifier(&analyzer, &format!("Widget{index}"))
+                CodeUnitIndex::lookup_candidates_by_identifier(&analyzer, &format!("Widget{index}"))
             })
             .collect();
         analyzer.end_query(&scope);
@@ -10695,9 +11278,10 @@ mod tests {
         let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
         analyzer.begin_query(&scope);
         analyzer.reset_definition_candidates_query_count_for_test();
-        let first: Vec<CodeUnit> = IAnalyzer::definitions(&analyzer, "pkg.mod_0.Widget0").collect();
+        let first: Vec<CodeUnit> =
+            CodeUnitIndex::definitions(&analyzer, "pkg.mod_0.Widget0").collect();
         let second: Vec<CodeUnit> =
-            IAnalyzer::definitions(&analyzer, "pkg.mod_0.Widget0").collect();
+            CodeUnitIndex::definitions(&analyzer, "pkg.mod_0.Widget0").collect();
         let queries = analyzer.definition_candidates_query_count_for_test();
         analyzer.end_query(&scope);
 
@@ -10716,8 +11300,8 @@ mod tests {
         let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
 
         analyzer.reset_definition_candidates_query_count_for_test();
-        let _ = IAnalyzer::definitions(&analyzer, "pkg.mod_0.Widget0").count();
-        let _ = IAnalyzer::definitions(&analyzer, "pkg.mod_0.Widget0").count();
+        let _ = CodeUnitIndex::definitions(&analyzer, "pkg.mod_0.Widget0").count();
+        let _ = CodeUnitIndex::definitions(&analyzer, "pkg.mod_0.Widget0").count();
 
         assert_eq!(2, analyzer.definition_candidates_query_count_for_test());
     }
@@ -10755,7 +11339,7 @@ mod tests {
 
         let point: Vec<Vec<CodeUnit>> = names
             .iter()
-            .map(|name| IAnalyzer::definitions(&analyzer, name).collect())
+            .map(|name| CodeUnitIndex::definitions(&analyzer, name).collect())
             .collect();
 
         let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
@@ -10764,7 +11348,7 @@ mod tests {
         analyzer.reset_definition_candidate_row_read_count_for_test();
         let memoized: Vec<Vec<CodeUnit>> = names
             .iter()
-            .map(|name| IAnalyzer::definitions(&analyzer, name).collect())
+            .map(|name| CodeUnitIndex::definitions(&analyzer, name).collect())
             .collect();
         let row_reads = analyzer.definition_candidate_row_read_count_for_test();
         let point_lookups = analyzer.definition_candidates_query_count_for_test();
@@ -10811,7 +11395,7 @@ mod tests {
 
         let sequential: Vec<Vec<CodeUnit>> = names
             .iter()
-            .map(|name| IAnalyzer::definitions(&analyzer, name).collect())
+            .map(|name| CodeUnitIndex::definitions(&analyzer, name).collect())
             .collect();
 
         let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
@@ -10827,7 +11411,8 @@ mod tests {
         let start = std::sync::Barrier::new(WORKERS);
         let concurrent = pool.broadcast(|context| {
             start.wait();
-            IAnalyzer::definitions(&analyzer, &names[context.index()]).collect::<Vec<CodeUnit>>()
+            CodeUnitIndex::definitions(&analyzer, &names[context.index()])
+                .collect::<Vec<CodeUnit>>()
         });
         let row_reads = analyzer.definition_candidate_row_read_count_for_test();
         analyzer.end_query(&scope);
@@ -10857,7 +11442,7 @@ mod tests {
 
         let point: Vec<Vec<CodeUnit>> = names
             .iter()
-            .map(|name| IAnalyzer::definitions(&analyzer, name).collect())
+            .map(|name| CodeUnitIndex::definitions(&analyzer, name).collect())
             .collect();
 
         let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
@@ -10868,7 +11453,7 @@ mod tests {
         let batches = analyzer.definition_prefetch_batch_count_for_test();
         let prefetched: Vec<Vec<CodeUnit>> = names
             .iter()
-            .map(|name| IAnalyzer::definitions(&analyzer, name).collect())
+            .map(|name| CodeUnitIndex::definitions(&analyzer, name).collect())
             .collect();
         let point_lookups = analyzer.definition_candidates_query_count_for_test();
         analyzer.end_query(&scope);
@@ -11160,40 +11745,31 @@ mod tests {
             Some("impl Writer::fn write(&self) { ... }".to_string()),
             false,
         );
-        assert_eq!(
-            rust.storage_content_qualifier(&rust_impl_member, "net"),
-            "model"
-        );
+        // Rust names are persisted as an anchor plus a content-stable tail, so
+        // no unit — however it is qualified — bakes package text into its row.
+        assert_eq!(rust.storage_content_qualifier(&rust_impl_member, "net"), "");
         assert_eq!(rust.hydrate_content_qualifier("model", &rust_file), "model");
-        let local_rust_impl_member = CodeUnit::with_signature(
-            rust_file.clone(),
-            CodeUnitType::Function,
-            "net",
-            "Client.connect",
-            Some("impl Client::fn connect(&self) { ... }".to_string()),
-            false,
+        let file_package = rust
+            .resolve_package_anchor(PackageAnchor::OwnModule { pop: 0 }, "", &rust_file)
+            .expect("Rust resolves its own-module anchor");
+        assert_eq!(
+            file_package.display(crate::analyzer::fq_name::segment_interner()),
+            "net"
         );
         assert_eq!(
-            rust.storage_content_qualifier(&local_rust_impl_member, "net"),
+            rust.resolve_package_anchor(PackageAnchor::OwnModule { pop: 1 }, "", &rust_file)
+                .expect("Rust resolves a popped own-module anchor")
+                .display(crate::analyzer::fq_name::segment_interner()),
             ""
         );
-        assert!(rust.code_unit_package_is_path_derived(&local_rust_impl_member, ""));
-        let explicit_root_rust_impl_member = CodeUnit::with_signature(
-            rust_file.clone(),
-            CodeUnitType::Function,
-            "",
-            "ExplicitPaths.into",
-            Some(
-                "impl core::convert::Into<bool> for crate::ExplicitPaths::fn into(self) -> bool { ... }"
-                    .to_string(),
-            ),
-            false,
-        );
+        // A crate mounted at the repository root has an empty crate-root
+        // prefix; that is a resolved empty prefix, not an unresolvable anchor.
         assert_eq!(
-            rust.storage_content_qualifier(&explicit_root_rust_impl_member, "net"),
+            rust.resolve_package_anchor(PackageAnchor::CrateRoot, "", &rust_file)
+                .expect("Rust resolves its crate-root anchor")
+                .display(crate::analyzer::fq_name::segment_interner()),
             ""
         );
-        assert!(!rust.code_unit_package_is_path_derived(&explicit_root_rust_impl_member, ""));
 
         std::fs::write(root.join("go.mod"), "module example.com/demo\n").unwrap();
         let go_file = temp_file(&root, "internal/service/service.go");
@@ -11304,7 +11880,7 @@ mod tests {
         let root = temp.path().canonicalize().expect("canonical temp dir");
         std::fs::create_dir_all(root.join("src")).expect("source directory");
 
-        for index in 0..=TRANSIENT_FILE_STATE_CACHE_CAPACITY {
+        for index in 0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY {
             std::fs::write(
                 root.join(format!("src/Type{index}.java")),
                 format!(
@@ -11326,6 +11902,173 @@ mod tests {
         );
         assert_eq!(analyzer.full_hydration_count_for_test(), 0);
         assert_eq!(analyzer.bulk_hydration_count_for_test(), 0);
+    }
+
+    #[test]
+    fn type_alias_projection_avoids_full_file_hydration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        for index in 0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY {
+            std::fs::write(
+                root.join(format!("src/Alias{index}.cpp")),
+                format!("using Alias{index} = int;\n"),
+            )
+            .expect("write alias source");
+        }
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = TreeSitterAnalyzer::new(project, CppAdapter);
+        let aliases = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.identifier().starts_with("Alias"))
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1);
+
+        analyzer.reset_full_hydration_count_for_test();
+        assert!(aliases.iter().all(|alias| analyzer.is_type_alias(alias)));
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "persisted type-alias checks must not hydrate a FileState"
+        );
+    }
+
+    #[test]
+    fn signature_projection_avoids_full_file_hydration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        for index in 0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY {
+            std::fs::write(
+                root.join(format!("src/Alias{index}.cpp")),
+                format!("using Alias{index} = int;\n"),
+            )
+            .expect("write alias source");
+        }
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = TreeSitterAnalyzer::new(project, CppAdapter);
+        let aliases = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.identifier().starts_with("Alias"))
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1);
+
+        analyzer.reset_full_hydration_count_for_test();
+        for alias in &aliases {
+            assert!(
+                analyzer
+                    .signatures(alias)
+                    .iter()
+                    .any(|signature| signature.contains(alias.identifier())),
+                "persisted signature must include {}",
+                alias.identifier()
+            );
+        }
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "persisted signature reads must not hydrate a FileState"
+        );
+    }
+
+    #[test]
+    fn enclosing_declaration_projection_avoids_full_file_hydration() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        for index in 0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY {
+            std::fs::write(
+                root.join(format!("src/Owner{index}.cpp")),
+                format!(
+                    "namespace demo {{ struct Owner{index} {{ int method{index}() {{ return {index}; }} }}; }}\n"
+                ),
+            )
+            .expect("write C++ source");
+        }
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = TreeSitterAnalyzer::new(project, CppAdapter);
+        let methods = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.identifier().starts_with("method"))
+            .collect::<Vec<_>>();
+        assert_eq!(methods.len(), SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1);
+
+        analyzer.reset_full_hydration_count_for_test();
+        for method in methods {
+            let file = method.source().clone();
+            let source = std::fs::read_to_string(file.abs_path()).expect("C++ source");
+            let start_byte = source.find("return").expect("return statement");
+            let range = Range {
+                start_byte,
+                end_byte: start_byte + "return".len(),
+                start_line: 0,
+                end_line: 0,
+            };
+            assert_eq!(analyzer.enclosing_code_unit(&file, &range), Some(method));
+        }
+        assert_eq!(
+            analyzer.full_hydration_count_for_test(),
+            0,
+            "persisted owner lookup must not hydrate a FileState"
+        );
+    }
+
+    #[test]
+    fn enclosing_code_unit_interval_index_reuses_large_file_ranges() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let source = (0..=ENCLOSING_CODE_UNIT_INDEX_MIN_DECLARATIONS)
+            .map(|index| format!("int method{index}() {{ return {index}; }}\n"))
+            .collect::<String>();
+        let file = temp_file(&root, "src/methods.cpp");
+        file.write(&source).expect("write C++ source");
+
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
+        let analyzer = TreeSitterAnalyzer::new(project, CppAdapter);
+        let methods = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .filter(|unit| unit.identifier().starts_with("method"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods.len(),
+            ENCLOSING_CODE_UNIT_INDEX_MIN_DECLARATIONS + 1
+        );
+
+        analyzer.reset_full_hydration_count_for_test();
+        for method in methods {
+            let index = method
+                .identifier()
+                .strip_prefix("method")
+                .expect("method declaration")
+                .parse::<usize>()
+                .expect("method index");
+            let needle = format!("return {index}");
+            let start_byte = source.find(&needle).expect("return statement");
+            let range = Range {
+                start_byte,
+                end_byte: start_byte + needle.len(),
+                start_line: 0,
+                end_line: 0,
+            };
+            assert_eq!(analyzer.enclosing_code_unit(&file, &range), Some(method));
+        }
+        assert_eq!(analyzer.full_hydration_count_for_test(), 0);
+        assert_eq!(
+            analyzer
+                .enclosing_code_unit_store
+                .lock()
+                .expect("enclosing code-unit store mutex poisoned")
+                .entry_count(),
+            1,
+            "all large-file owner lookups must reuse one interval index"
+        );
     }
 
     #[test]
@@ -11445,7 +12188,9 @@ mod tests {
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
-        analyzer.reset_global_usage_definition_index_build_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
 
         let first_definitions = analyzer.global_usage_definition_index_shared();
         let first_facts = analyzer.usage_facts_index_shared();
@@ -11460,7 +12205,9 @@ mod tests {
         assert!(Arc::ptr_eq(&first_definitions, &cloned_definitions));
         assert!(Arc::ptr_eq(&first_facts, &cloned_facts));
         assert_eq!(
-            analyzer.global_usage_definition_index_build_count_for_test(),
+            analyzer
+                .test_hooks()
+                .global_usage_definition_index_build_count_for_test(),
             1
         );
         assert_eq!(first_definitions.fqn("demo.Service.before").len(), 1);
@@ -11475,7 +12222,9 @@ mod tests {
         assert!(!Arc::ptr_eq(&first_definitions, &updated_definitions));
         assert!(!Arc::ptr_eq(&first_facts, &updated_facts));
         assert_eq!(
-            updated.global_usage_definition_index_build_count_for_test(),
+            updated
+                .test_hooks()
+                .global_usage_definition_index_build_count_for_test(),
             1
         );
         assert_eq!(first_definitions.fqn("demo.Service.before").len(), 1);
@@ -11498,8 +12247,12 @@ mod tests {
 
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
         let analyzer = TreeSitterAnalyzer::new(project, JavaAdapter);
-        analyzer.reset_global_usage_definition_index_build_count_for_test();
-        analyzer.reset_full_declaration_scan_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_global_usage_definition_index_build_count_for_test();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
         let barrier = Arc::new(Barrier::new(32));
 
         let handles = std::thread::scope(|scope| {
@@ -11526,10 +12279,15 @@ mod tests {
             assert!(Arc::ptr_eq(&handles[0].1, facts));
         }
         assert_eq!(
-            analyzer.global_usage_definition_index_build_count_for_test(),
+            analyzer
+                .test_hooks()
+                .global_usage_definition_index_build_count_for_test(),
             1
         );
-        assert_eq!(analyzer.full_declaration_scan_count_for_test(), 1);
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            1
+        );
     }
 
     #[test]
@@ -11537,7 +12295,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         std::fs::create_dir_all(root.join("src")).expect("source directory");
-        let files: Vec<_> = (0..=TRANSIENT_FILE_STATE_CACHE_CAPACITY)
+        let files: Vec<_> = (0..=SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY)
             .map(|index| {
                 let file = temp_file(&root, &format!("src/Type{index}.java"));
                 file.write(format!("package demo; class Type{index} {{}}\n"))
@@ -11564,14 +12322,15 @@ mod tests {
 
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
-            TRANSIENT_FILE_STATE_CACHE_CAPACITY + 1
+            SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1
         );
 
         analyzer.end_query(&outer);
         assert!(analyzer.fetch_file_state(&files[0]).is_some());
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
-            TRANSIENT_FILE_STATE_CACHE_CAPACITY + 2
+            SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY + 1,
+            "the shared byte budget retains this small working set after the query ends"
         );
     }
 
@@ -11758,8 +12517,20 @@ mod tests {
         let snapshot = snapshot_guard
             .as_ref()
             .expect("bulk hydration should publish a file-state snapshot");
+        let query_budget = {
+            let cache = analyzer.query_read_cache_lock();
+            cache
+                .file_states
+                .read()
+                .expect("query file-state cache read lock poisoned")
+                .max_bytes
+        };
+        let snapshot_bytes = snapshot
+            .values()
+            .map(|state| state.estimated_retained_bytes())
+            .fold(0usize, usize::saturating_add);
         assert!(
-            snapshot.len() <= QUERY_FILE_STATE_CACHE_CAPACITY,
+            snapshot_bytes <= query_budget,
             "snapshot must stay within its request budget"
         );
         assert!(snapshot.contains_key(&key));
@@ -11779,8 +12550,7 @@ mod tests {
                 .transient_file_states
                 .lock()
                 .expect("transient file-state cache mutex poisoned");
-            transient.entries.clear();
-            transient.order.clear();
+            transient.clear();
         }
 
         let state = analyzer
@@ -12313,7 +13083,7 @@ mod tests {
         assert_eq!(prepared.source(), source);
         assert_eq!(prepared.origin(), PreparedSourceOrigin::Overlay);
         assert!(prepared.overlay_revision().is_some());
-        assert!(matches!(&prepared.source, PreparedSyntaxSource::Exact(_)));
+        assert!(matches!(prepared.backing(), PreparedSyntaxSource::Exact(_)));
         assert_eq!(
             analyzer.prepared_syntax_parse_count_for_test(&file),
             2,
@@ -12331,7 +13101,10 @@ mod tests {
         assert_eq!(indexed.source(), source);
         assert_eq!(indexed.origin(), prepared.origin());
         assert_eq!(indexed.overlay_revision(), prepared.overlay_revision());
-        assert!(matches!(&indexed.source, PreparedSyntaxSource::Indexed(_)));
+        assert!(matches!(
+            indexed.backing(),
+            PreparedSyntaxSource::Indexed(_)
+        ));
         assert_eq!(
             analyzer.full_hydration_count_for_test(),
             1,

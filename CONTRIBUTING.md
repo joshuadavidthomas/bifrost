@@ -23,8 +23,16 @@ Run the core Rust checks before submitting a change:
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo machete
 uv run --python 3.12 -- cargo test --features nlp,python
 ```
+
+`cargo machete` is the unused-dependency gate that CI's lint job runs; install
+it with `cargo install --locked cargo-machete --version 0.9.2`. If it flags a
+dependency that is genuinely used (macro-only, feature-gated, or build-script
+use it cannot see), add the dependency to that crate's
+`[package.metadata.cargo-machete] ignored` list with a comment explaining why
+it is real; otherwise remove the dependency.
 
 Bifrost's default feature set is empty. Include the `nlp` and `python` features
 when running the full test suite; a featureless `cargo test` skips the
@@ -220,7 +228,11 @@ contents are checked before trusted crates.io publication.
 
 The package-set check creates and unpacks every `.crate` archive, then
 builds a temporary consumer with local registry patches. Publication follows
-the dependency graph: `brokk-bifrost-core`, then `brokk-bifrost-analysis`, then
+the dependency graph: `brokk-bifrost-core`, then the language crates
+`brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
+`brokk-bifrost-js-ts`, `brokk-bifrost-jvm`, `brokk-bifrost-php`,
+`brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` (which may
+run in parallel), then `brokk-bifrost-analysis`, then
 its direct dependents `brokk-bifrost-policy`, `brokk-bifrost-nlp`, and
 `brokk-bifrost-semantic-packs` (which may run in parallel), then
 `brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
@@ -234,14 +246,23 @@ This table is the expected crates.io publication set for the workspace.
 | Package | Manifest | Publication order |
 | --- | --- | --- |
 | `brokk-bifrost-core` | `crates/bifrost-core/Cargo.toml` | 1 |
-| `brokk-bifrost-analysis` | `crates/bifrost-analysis/Cargo.toml` | 2 |
-| `brokk-bifrost-nlp` | `crates/bifrost-nlp/Cargo.toml` | 3 |
-| `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 3 |
-| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 3 |
-| `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 4 |
-| `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 5 |
-| `brokk-bifrost-lsp` | `crates/bifrost-lsp/Cargo.toml` | 5 |
-| `brokk-bifrost` | `Cargo.toml` | 6 |
+| `brokk-bifrost-cpp` | `crates/bifrost-cpp/Cargo.toml` | 2 |
+| `brokk-bifrost-csharp` | `crates/bifrost-csharp/Cargo.toml` | 2 |
+| `brokk-bifrost-go` | `crates/bifrost-go/Cargo.toml` | 2 |
+| `brokk-bifrost-js-ts` | `crates/bifrost-js-ts/Cargo.toml` | 2 |
+| `brokk-bifrost-jvm` | `crates/bifrost-jvm/Cargo.toml` | 2 |
+| `brokk-bifrost-php` | `crates/bifrost-php/Cargo.toml` | 2 |
+| `brokk-bifrost-python` | `crates/bifrost-python/Cargo.toml` | 2 |
+| `brokk-bifrost-ruby` | `crates/bifrost-ruby/Cargo.toml` | 2 |
+| `brokk-bifrost-rust` | `crates/bifrost-rust/Cargo.toml` | 2 |
+| `brokk-bifrost-analysis` | `crates/bifrost-analysis/Cargo.toml` | 3 |
+| `brokk-bifrost-nlp` | `crates/bifrost-nlp/Cargo.toml` | 4 |
+| `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 4 |
+| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 4 |
+| `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 5 |
+| `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 6 |
+| `brokk-bifrost-lsp` | `crates/bifrost-lsp/Cargo.toml` | 6 |
+| `brokk-bifrost` | `Cargo.toml` | 7 |
 
 Before each release, compare this table with the root workspace members and
 package names. Confirm these items for each package:
@@ -251,6 +272,8 @@ package names. Confirm these items for each package:
 - The publisher uses `release.yml` and the `release` environment.
 - `release.yml` includes the package in its publication graph.
 - Each internal dependency uses the release version.
+- The manifest declares `description` and `readme`, and inherits the
+  workspace `keywords`, `categories`, and `rust-version`.
 
 Do not add a crate only to move code into a new directory. A new crate must
 have a clear dependency, compilation, publication, or ownership boundary.
@@ -259,6 +282,15 @@ When a change adds a publishable crate, update this table and the release
 workflow in the same change. Publish the crate through a separate bootstrap
 change before the next version release. Configure its trusted publisher during
 that bootstrap.
+
+`brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
+`brokk-bifrost-js-ts`, `brokk-bifrost-jvm`, `brokk-bifrost-php`,
+`brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` are new
+packages that still await that bootstrap publication. Trusted publishing cannot create a new crate, so
+each one's first version must be uploaded with a scoped crates.io API token
+from a clean, reviewed commit. Then set the crate owners and configure the
+trusted publisher per the checklist above, and verify that configuration
+before you tag.
 
 Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual release. If a target fails,
 use GitHub Actions' **Re-run failed jobs** for that workflow run to reuse its
