@@ -62,3 +62,14 @@ These are candidates, not shipped content. Each entry will be:
 2. Cross-checked against CodeQL's sanitizer models where they overlap.
 
 You have no shipping authority. Your value is the context judgment and the rationale, which survive review; the envelope may be re-mapped into the final overlay schema by a downstream mechanical step. Write the reasoning as if the reviewer will read only your rationale and the fixture result, because they will.
+
+## Delivery (you run on a different machine)
+
+Deliver through the shared git remote, not the filesystem.
+
+1. Work inside a clone of `BrokkAi/bifrost`. Branch from the latest `origin/master`. You need the checkout only to know the target paths and to read the IR types under `crates/bifrost-semantic-packs/src/summary_foundry/` and `crates/bifrost-analysis/src/analyzer/semantic_model/model.rs`; you do not build anything.
+2. Write your JSON files at the exact repo-relative paths in the output contract: `.agents/foundry/candidates/sanitizers/<artifact-slug>.json`.
+3. Commit them on a branch named `foundry/k3-sanitizers`. Do not touch any code, do not run `cargo`, do not modify `master`.
+4. Push the branch to `origin`. Do not open a pull request and do not push to `master`. Report the pushed branch name back; the candidates are proof-gated and merged from the maintainer side.
+
+If the machine lacks push access to `origin`, fall back to producing the files as a single archive to hand off, but a pushed branch is strongly preferred because it carries provenance and diffs cleanly.

@@ -79,3 +79,14 @@ Overloads are distinct targets: `StringBuilder.append(String)` and `StringBuilde
 ## What happens to your output
 
 Candidates, not shipped content. Each entry will be proof-gated by a mechanically generated fixture pair: a positive fixture flows tainted data through the method and asserts each claimed transfer fires with the summary active and does not fire with it absent; a negative fixture (for `complete` entries) asserts an unlisted input-to-output pair does not carry taint. Entries that fail their fixtures are rejected. You have no shipping authority; your value is correct judgment with rationale a reviewer can check against the fixture result.
+
+## Delivery (you run on a different machine)
+
+Deliver through the shared git remote, not the filesystem.
+
+1. Work inside a clone of `BrokkAi/bifrost`. Branch from the latest `origin/master`. You need the checkout only to know the target paths and to read the IR types under `crates/bifrost-semantic-packs/src/summary_foundry/` and `crates/bifrost-analysis/src/analyzer/semantic_model/model.rs`; you do not build anything.
+2. Write your JSON files at the exact repo-relative paths in the output contract: `.agents/foundry/candidates/golden/<family>.json`.
+3. Commit them on a branch named `foundry/k3-golden`. Do not touch any code, do not run `cargo`, do not modify `master`.
+4. Push the branch to `origin`. Do not open a pull request and do not push to `master`. Report the pushed branch name back; the candidates are proof-gated and merged from the maintainer side.
+
+If the machine lacks push access to `origin`, fall back to producing the files as a single archive to hand off, but a pushed branch is strongly preferred because it carries provenance and diffs cleanly.
