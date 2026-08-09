@@ -13,12 +13,16 @@
 //! and joins the three slots into one deterministic report. Two runs over the
 //! same pins produce byte-identical output.
 
+pub mod adjudicate;
 pub mod codeql;
 pub mod derive;
+pub mod driver;
 pub mod fixture;
 pub mod ir;
 pub mod joern;
 pub mod join;
+pub mod sanitizer;
+pub mod store;
 
 use std::collections::BTreeMap;
 use std::fmt;
