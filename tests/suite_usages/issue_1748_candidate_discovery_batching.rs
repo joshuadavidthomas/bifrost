@@ -27,13 +27,16 @@
 use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::AnalyzerQueryScope;
 use brokk_bifrost::usages::{UsageFinder, UsageHitKind};
-use brokk_bifrost::{CancellationToken, IAnalyzer, Language, ProjectFile, RustAnalyzer};
+use brokk_bifrost::{
+    AnalyzerConfig, AnalyzerDelegate, CancellationToken, CodeUnit, IAnalyzer, Language,
+    MultiAnalyzer, ProjectFile, RustAnalyzer, WorkspaceAnalyzer,
+};
 
 const CALLER_COUNT: usize = 8;
 const BYSTANDER_COUNT: usize = 8;
 const IMPORTS_PER_FILE: usize = 4;
 
-fn import_heavy_project() -> (crate::common::BuiltInlineTestProject, RustAnalyzer) {
+fn import_heavy_files(builder: InlineTestProject) -> InlineTestProject {
     let mut lib = String::from("pub mod target;\npub mod support;\n");
     for index in 0..CALLER_COUNT {
         lib.push_str(&format!("pub mod caller_{index};\n"));
@@ -47,7 +50,7 @@ fn import_heavy_project() -> (crate::common::BuiltInlineTestProject, RustAnalyze
         support.push_str(&format!("pub struct Helper{index};\n"));
     }
 
-    let mut builder = InlineTestProject::with_language(Language::Rust)
+    let mut builder = builder
         .file(
             "Cargo.toml",
             "[package]\nname = \"importheavy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
@@ -87,12 +90,33 @@ fn import_heavy_project() -> (crate::common::BuiltInlineTestProject, RustAnalyze
         builder = builder.file(format!("src/bystander_{index}.rs"), bystander);
     }
 
-    let project = builder.build();
+    builder
+}
+
+fn import_heavy_project() -> (crate::common::BuiltInlineTestProject, RustAnalyzer) {
+    let project = import_heavy_files(InlineTestProject::with_language(Language::Rust)).build();
     let analyzer = RustAnalyzer::from_project(project.project().clone());
     (project, analyzer)
 }
 
-fn collect_it_target(analyzer: &RustAnalyzer, root: &std::path::Path) -> brokk_bifrost::CodeUnit {
+/// The same Rust fixture with a Python corner, so the workspace analyzer is a
+/// `MultiAnalyzer` over two delegates rather than a single-language one.
+///
+/// The Python half imports something of its own: the merge layer groups the
+/// candidate files by language and asks each delegate separately, so a second
+/// group that answers nothing is what keeps the Rust group from being the
+/// whole loop.
+fn mixed_language_import_heavy_project() -> crate::common::BuiltInlineTestProject {
+    import_heavy_files(InlineTestProject::new())
+        .file("tools/support.py", "def helper():\n    return 1\n")
+        .file(
+            "tools/report.py",
+            "from tools.support import helper\n\n\ndef report():\n    return helper()\n",
+        )
+        .build()
+}
+
+fn collect_it_target(analyzer: &dyn IAnalyzer, root: &std::path::Path) -> CodeUnit {
     let target_file = ProjectFile::new(root.to_path_buf(), "src/target.rs");
     analyzer
         .declarations(&target_file)
@@ -171,6 +195,153 @@ fn issue_1748_batched_discovery_finds_the_same_usages() {
              {unexpected} in {hit_files:?}"
         );
     }
+}
+
+fn rust_delegate(multi: &MultiAnalyzer) -> &RustAnalyzer {
+    match multi
+        .delegates()
+        .get(&Language::Rust)
+        .expect("the mixed fixture must build a Rust delegate")
+    {
+        AnalyzerDelegate::Rust(analyzer) => analyzer,
+        _ => panic!("the Rust language slot must hold a Rust analyzer"),
+    }
+}
+
+fn mixed_language_workspace(project: &crate::common::BuiltInlineTestProject) -> Box<MultiAnalyzer> {
+    assert_eq!(
+        std::collections::BTreeSet::from([Language::Python, Language::Rust]),
+        project.languages(),
+        "the fixture must be a two-language workspace for this pin to mean anything"
+    );
+    match project.workspace_analyzer(AnalyzerConfig::default()) {
+        WorkspaceAnalyzer::Multi(multi) => multi,
+        WorkspaceAnalyzer::Empty(_) => {
+            panic!("a two-language workspace must build a MultiAnalyzer")
+        }
+    }
+}
+
+/// #1748, second instance: the batch above never fired on a workspace with
+/// more than one language, which is the shape the issue was opened about.
+///
+/// `find_direct_importers_with_cancellation` resolves its provider through
+/// `analyzer.import_analysis_provider()`, which on a multi-language workspace
+/// is the `MultiAnalyzer` itself. `MultiAnalyzer` overrode
+/// `import_infos_for_files` but not `prefetch_import_targets`, so the trait's
+/// no-op default answered and `RustAnalyzer`'s batch was unreachable -- zero
+/// `prefetch_definitions` spans against 9,648 point `definition_candidates`
+/// reads in one rustc gate cell, measured at `0086f1e5`.
+///
+/// The counters come off the Rust delegate, not off the merged analyzer:
+/// `RustAnalyzer`'s `IAnalyzer` impl does not forward
+/// `definition_candidates_query_count_for_test`, so `MultiAnalyzer`'s sum of
+/// its delegates reports 0 for a Rust delegate no matter how many reads it
+/// took. Reading the merged counter here would have made this pin vacuous.
+///
+/// This query is the fixture's first, deliberately. The batch's saving is in
+/// the reads a cold request would otherwise take one at a time; a repeat query
+/// against the same names is served from cross-request caches and charges
+/// nothing on either side of the change, which measures neither.
+///
+/// Fail-before, with the `MultiAnalyzer::prefetch_import_targets` override
+/// removed: 0 batches and 71 point lookups, more than one per import
+/// statement in the fixture. After: 1 batch and 18.
+#[test]
+fn issue_1748_a_multi_language_workspace_gets_the_same_batched_read() {
+    let project = mixed_language_import_heavy_project();
+    let multi = mixed_language_workspace(&project);
+    let analyzer: &dyn IAnalyzer = multi.as_ref();
+    let target = collect_it_target(analyzer, project.root());
+
+    rust_delegate(&multi).reset_definition_candidates_query_count_for_test();
+    rust_delegate(&multi).reset_definition_prefetch_batch_count_for_test();
+    let query = UsageFinder::new().query(analyzer, std::slice::from_ref(&target), 1000, 1000);
+    let batches = rust_delegate(&multi).definition_prefetch_batch_count_for_test();
+    let point_lookups = rust_delegate(&multi).definition_candidates_query_count_for_test();
+
+    assert_eq!(
+        1, batches,
+        "candidate discovery must reach the language delegate's batch through the merge layer"
+    );
+
+    let import_statements = CALLER_COUNT * IMPORTS_PER_FILE + BYSTANDER_COUNT * IMPORTS_PER_FILE;
+    assert!(
+        point_lookups * 2 < import_statements,
+        "a multi-language query must not charge a point lookup per import statement: \
+         {point_lookups} lookups for {import_statements} imports"
+    );
+
+    // Parity with the single-language answer: routing through the merge layer
+    // must find every caller and admit no bystander.
+    let hit_files: std::collections::BTreeSet<String> = query
+        .result
+        .all_hits_including_imports()
+        .iter()
+        .map(|hit| hit.enclosing.source().to_string())
+        .collect();
+    for index in 0..CALLER_COUNT {
+        let expected = format!("src/caller_{index}.rs");
+        assert!(
+            hit_files.iter().any(|file| file.ends_with(&expected)),
+            "every caller must still be found: missing {expected} in {hit_files:?}"
+        );
+    }
+    for index in 0..BYSTANDER_COUNT {
+        let unexpected = format!("src/bystander_{index}.rs");
+        assert!(
+            !hit_files.iter().any(|file| file.ends_with(&unexpected)),
+            "a file that never names the target must not become a hit: \
+             {unexpected} in {hit_files:?}"
+        );
+    }
+}
+
+/// The prefix discipline `946710c4` established survives the delegation: a
+/// prefetch issued on behalf of a request whose deadline is already gone
+/// publishes nothing, so the name it did not read is not memoized as absent,
+/// and the merge layer's own stopping point -- between language groups -- is
+/// equally silent.
+///
+/// A property pin, not a fail-before one. Three layers refuse the batch on a
+/// spent deadline (this override between groups, the delegate before it
+/// resolves, `prefetch_definitions` before it reads) and any one of them is
+/// enough, so no single removal turns this red -- removing all three still
+/// leaves the resolver's per-file poll producing no names. What it does hold
+/// is the property itself, through the layer this change adds: the delegation
+/// must not become a way to issue that read, or to memoize its absence.
+#[test]
+fn issue_1748_a_stopped_multi_language_prefetch_memoizes_no_absence() {
+    let project = mixed_language_import_heavy_project();
+    let multi = mixed_language_workspace(&project);
+    let analyzer: &dyn IAnalyzer = multi.as_ref();
+    let target = collect_it_target(analyzer, project.root());
+    let fq_name = target.fq_name();
+    let files: Vec<ProjectFile> = analyzer.analyzed_files().into_iter().collect();
+    let provider = analyzer
+        .import_analysis_provider()
+        .expect("a multi-language workspace exposes an import provider");
+
+    let outer = AnalyzerQueryScope::new(analyzer);
+    {
+        let spent = CancellationToken::default();
+        spent.cancel();
+        let _inner = AnalyzerQueryScope::with_cancellation(analyzer, &spent);
+        rust_delegate(&multi).reset_definition_prefetch_batch_count_for_test();
+        provider.prefetch_import_targets(&files, None, &spent);
+        assert_eq!(
+            0,
+            rust_delegate(&multi).definition_prefetch_batch_count_for_test(),
+            "a prefetch past the request's deadline must not issue its batched read"
+        );
+    }
+
+    let answered: Vec<_> = analyzer.definitions(&fq_name).collect();
+    assert!(
+        !answered.is_empty(),
+        "the stopped prefetch must not have memoized proven absence for {fq_name}"
+    );
+    drop(outer);
 }
 
 /// #1809 (third instance): a read taken on behalf of a scan whose budget is

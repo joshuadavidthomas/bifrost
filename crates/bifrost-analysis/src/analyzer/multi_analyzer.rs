@@ -429,6 +429,58 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .unwrap_or(false)
     }
 
+    /// The batch that `could_import_file` above is meant to be answered from.
+    ///
+    /// Without this override the trait's no-op default answers, so a delegate's
+    /// own batch -- `RustAnalyzer::prefetch_import_targets`, and the single
+    /// chunked seek it stands for -- never runs on a workspace with more than
+    /// one language, which is every workspace #1748 was opened about. Measured
+    /// at `0086f1e5` on the rustc tree: zero `prefetch_definitions` spans in a
+    /// scan whose candidate discovery took 9,648 point `definition_candidates`
+    /// reads.
+    ///
+    /// Grouping is the same as `import_infos_for_files` above, for the same
+    /// reason: the question is per language and only that language's delegate
+    /// can answer it. `import_infos` goes through whole rather than split per
+    /// group -- a delegate reads it by the file keys it was handed, so a subset
+    /// would only cost a copy.
+    ///
+    /// Between groups is the one place this layer can stop. It polls there
+    /// because a group is one batched read and the deadline may have expired
+    /// during the previous one; it publishes nothing itself, so stopping leaves
+    /// each delegate's request memo exactly as that delegate left it -- the
+    /// prefix of a cut-short batch is never memoized as absence.
+    fn prefetch_import_targets(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: &crate::CancellationToken,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+        for file in files {
+            grouped
+                .entry(language_for_file(file))
+                .or_default()
+                .push(file.clone());
+        }
+        for (language, group) in grouped {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let Some(provider) = self
+                .delegates
+                .get(&language)
+                .and_then(AnalyzerDelegate::import_analysis_provider)
+            else {
+                continue;
+            };
+            provider.prefetch_import_targets(&group, import_infos, cancellation);
+        }
+    }
+
     /// Without this override, `MultiAnalyzer` falls back to the trait default (always `None`) instead
     /// of forwarding to the per-language delegate's implementation -- silently defeating a delegate's
     /// own `imported_code_units_from_infos` (e.g. Python's) for every workspace-level caller that goes
