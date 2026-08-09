@@ -52,6 +52,22 @@ Expected yield: the hash and comparison shares (~21-23%) compress toward the rel
 cost; membership tests drop ~15x in comparisons. Gate: re-profile the same cell; Stage 2
 proceeds only if path handling still holds a double-digit share.
 
+### Stage 1 as landed (2026-08-09, branch `bifrost-nlp-ft`)
+
+All four items plus the ride-along, one commit each; read the commit messages for the
+reasoning and the fail-before evidence.
+
+| Item | Commit | Notable deviation from the design above |
+| --- | --- | --- |
+| 1 precomputed hash | `30656b52` | none; hash VALUES change, which is safe because nothing persists or transmits them (checked) |
+| 2 comparison fast paths | `30656b52`, `de38e6bc` | the design's open question resolved AGAINST shared roots: each inner owned its own `PathBuf`, so a process-global root interner had to be added first. `eq` also gained a `path_hash` inequality reject |
+| 3 membership by hash | `0f746ce1` | no cheap seam exists for a comparison counter (it would need an atomic inside `Ord for ProjectFile`); the mechanism is pinned structurally instead |
+| 4 probe memo + components | `65ae9be4` | `ModuleKey::new` skipped: its `components` and `crate_root` are the key's own retained storage and cannot borrow |
+| ride-along canonicalize | `e7831df9` | root canonicalized once per root, per-file only on the below-root-symlink fallback; measured 24 files -> 1 canonicalization |
+
+Stage 2 remains gated on the re-profile of the same cell against
+`graph-churn-profile-2026-08.md`, same windows, same method.
+
 ## Stage 2 - interned file IDs (only if Stage 1's re-profile says so)
 
 Per-generation interner: the workspace listing is already a sorted `BTreeSet`; assign
