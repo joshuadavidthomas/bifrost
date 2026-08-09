@@ -2244,7 +2244,10 @@ mod tests {
             "recorded score {score} must clear the threshold"
         );
         assert_eq!(
-            pairing.fallback_paired.get(&pairing.pairs[0].1.key).copied(),
+            pairing
+                .fallback_paired
+                .get(&pairing.pairs[0].1.key)
+                .copied(),
             Some(score),
             "both endpoints map to the pair's score"
         );
