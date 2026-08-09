@@ -646,6 +646,53 @@ fn imported_owner_nested_annotation_chain_resolves_class_target() {
 }
 
 #[test]
+fn imported_outer_class_qualifier_in_nested_annotation_is_a_usage() {
+    let source = "from service import BaseFileComponent\nfrom decoy import Other\n\ndef process(files: list[BaseFileComponent.BaseFile]) -> list[BaseFileComponent.BaseFile]:\n    decoy: Other.BaseFile\n    return files\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "class BaseFileComponent:\n    class BaseFile:\n        pass\n",
+        )
+        .file(
+            "decoy.py",
+            "class Other:\n    class BaseFile:\n        pass\n",
+        )
+        .file("consumer.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.BaseFileComponent",
+        "consumer.py",
+        source,
+        &[("BaseFileComponent", 1), ("BaseFileComponent", 2)],
+    );
+}
+
+#[test]
+fn shadowed_outer_class_qualifier_does_not_match_imported_target() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "class BaseFileComponent:\n    class BaseFile:\n        pass\n",
+        )
+        .file(
+            "consumer.py",
+            "from service import BaseFileComponent\n\nclass BaseFileComponent:\n    class BaseFile:\n        pass\n\ndef process(value: BaseFileComponent.BaseFile):\n    return value\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.BaseFileComponent");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve a shadowed outer-class annotation");
+    assert!(hits.is_empty(), "{hits:#?}");
+}
+
+#[test]
 fn different_nested_annotation_owner_chain_does_not_match_target() {
     let project = InlineTestProject::with_language(Language::Python)
         .file(
