@@ -78,12 +78,23 @@ pub fn create_scoped_service(
 
 pub fn create_cli_tool_service(
     root: PathBuf,
+    tool_name: &str,
     sources: &[String],
     overlays: Vec<GitHistoryOverlay>,
 ) -> Result<SearchToolsService, String> {
     let root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
+    // A workspace-independent tool (`analyze_diff`) never reads the live
+    // workspace or semantic index; it builds its own ephemeral per-endpoint
+    // analyzers. Serve it from a lazy service so the one-shot CLI does not boot
+    // -- and then persist -- a whole-repo analyzer it will never touch, which
+    // otherwise dwarfs the analysis itself on a large repo. `--sources` and
+    // git-history overlays do not apply to such tools, so they are irrelevant
+    // here.
+    if SearchToolsService::tool_is_workspace_independent(tool_name) {
+        return SearchToolsService::new_workspace_independent(root);
+    }
     if overlays.is_empty() && sources.is_empty() {
         return SearchToolsService::new(root);
     }

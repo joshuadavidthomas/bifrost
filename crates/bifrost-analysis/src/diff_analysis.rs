@@ -458,7 +458,17 @@ pub fn analyze_diff_at_root(
     // unpaired symbol with no overlap is likewise dropped rather than reported.
     let endpoint_pairing = pair_endpoints(&before, &after, &file_changes);
     for (pre, post) in &endpoint_pairing.pairs {
-        if pre.symbol.path != post.symbol.path || pre.symbol.start_line != post.symbol.start_line {
+        // A paired symbol (same identity) is only *moved* when it genuinely
+        // relocated -- its file changed, or its position changed by more than
+        // the patch's own line offset accounts for. A symbol whose start line
+        // merely shifted because lines were inserted/deleted ELSEWHERE in the
+        // file has not moved; reporting it as such floods the result with one
+        // entry per symbol below any early edit (a single insert near the top
+        // of a large file otherwise yields hundreds of spurious "moved" rows).
+        let relocated = pre.symbol.path != post.symbol.path
+            || (pre.symbol.start_line != post.symbol.start_line
+                && !is_pure_line_shift(&pre.symbol, &post.symbol, &changed_lines));
+        if relocated {
             moved.push(MovedSymbol {
                 before: pre.symbol.clone(),
                 after: post.symbol.clone(),
@@ -1369,6 +1379,32 @@ fn pair_endpoints<'a>(
     }
 }
 
+/// Whether a paired symbol's line change is fully explained by edits ELSEWHERE
+/// in the same file (a pure shift), as opposed to a genuine relocation.
+///
+/// An unchanged symbol occupies the same position *among unchanged lines* on
+/// both endpoints. Subtracting the deletions before its old start and the
+/// insertions before its new start collapses both sides to that shared
+/// unchanged-line index; equal indices mean the symbol only slid, it did not
+/// move. Same-file only -- a path change is always a relocation.
+fn is_pure_line_shift(
+    pre: &CommitSymbol,
+    post: &CommitSymbol,
+    changed_lines: &BTreeMap<String, ChangedLines>,
+) -> bool {
+    if pre.path != post.path {
+        return false;
+    }
+    let deletions_before = changed_lines
+        .get(&pre.path)
+        .map_or(0, |cl| cl.old.range(..pre.start_line).count());
+    let insertions_before = changed_lines
+        .get(&post.path)
+        .map_or(0, |cl| cl.new.range(..post.start_line).count());
+    pre.start_line.saturating_sub(deletions_before)
+        == post.start_line.saturating_sub(insertions_before)
+}
+
 /// Deleted lines of the patch that fall inside a preimage symbol's range.
 ///
 /// `symbol.path` is the preimage path, which is also how `-` lines are keyed,
@@ -1765,9 +1801,57 @@ fn kind_name(kind: CodeUnitType) -> &'static str {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{RevisionTempDir, create_private_dirs, write_private_file};
+    use super::{
+        ChangedLines, CommitSymbol, RevisionTempDir, create_private_dirs, is_pure_line_shift,
+        write_private_file,
+    };
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    fn symbol_at(path: &str, start_line: usize) -> CommitSymbol {
+        CommitSymbol {
+            fqn: format!("{path}::sym"),
+            name: "sym".to_string(),
+            kind: "function".to_string(),
+            signature: "fn sym()".to_string(),
+            path: path.to_string(),
+            start_line,
+            end_line: start_line + 3,
+            language: "rust".to_string(),
+            is_test: false,
+        }
+    }
+
+    /// Guards the regression behind #1897: a symbol whose start line only slid
+    /// because lines were inserted/deleted *before* it must not be reported as
+    /// moved. A single early insert once produced hundreds of spurious "moved"
+    /// rows -- one per symbol below it -- because any `start_line` delta was
+    /// treated as a relocation.
+    #[test]
+    fn pure_line_shift_is_not_a_move() {
+        // Three lines inserted before the symbol: it slid 10 -> 13 with no
+        // deletions on the old side. Same position among unchanged lines.
+        let mut changed = BTreeMap::new();
+        changed.insert(
+            "src/a.rs".to_string(),
+            ChangedLines {
+                old: Default::default(),
+                new: [1usize, 2, 3].into_iter().collect(),
+            },
+        );
+        let pre = symbol_at("src/a.rs", 10);
+        let post = symbol_at("src/a.rs", 13);
+        assert!(is_pure_line_shift(&pre, &post, &changed));
+
+        // A larger jump than the 3 insertions explain is a genuine relocation.
+        let moved_post = symbol_at("src/a.rs", 20);
+        assert!(!is_pure_line_shift(&pre, &moved_post, &changed));
+
+        // A path change is always a relocation, regardless of line arithmetic.
+        let renamed_post = symbol_at("src/b.rs", 13);
+        assert!(!is_pure_line_shift(&pre, &renamed_post, &changed));
+    }
 
     #[test]
     fn snapshot_materialization_uses_private_permissions() {
