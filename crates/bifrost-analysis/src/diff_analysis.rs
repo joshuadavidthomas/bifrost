@@ -190,6 +190,14 @@ pub struct MovedSymbol {
     pub added_calls: Vec<CalleeChange>,
     /// See [`EditedSymbolPair::removed_calls`].
     pub removed_calls: Vec<CalleeChange>,
+    /// Present only when the pairing was *inferred* by body similarity (the
+    /// fuzzy third rule of [`pair_endpoints`]) rather than established by an
+    /// identity key or a Git-reported rename: the token-similarity score in
+    /// `[threshold, 1.0]`, rounded to two decimals. A consumer can use it to
+    /// weigh these lower-confidence relocations accordingly. Identity and
+    /// rename-bucket moves omit the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -475,12 +483,14 @@ pub fn analyze_diff_at_root(
             || pre.symbol.path != post.symbol.path
             || (pre.symbol.start_line != post.symbol.start_line
                 && !is_pure_line_shift(&pre.symbol, &post.symbol, &changed_lines));
+        let fallback_score = endpoint_pairing.fallback_paired.get(&pre.key).copied();
         if relocated {
             moved.push(MovedSymbol {
                 before: pre.symbol.clone(),
                 after: post.symbol.clone(),
                 added_calls: Vec::new(),
                 removed_calls: Vec::new(),
+                similarity: fallback_score.map(|score| (score * 100.0).round() / 100.0),
             });
         }
         // A pair matched by the body-similarity rule (rather than by identity or
@@ -490,7 +500,7 @@ pub fn analyze_diff_at_root(
         // after symbols, so also reporting it as an edit -- with every cut line
         // "deleted" and every pasted line "inserted" -- or as a signature change
         // would be double-counting noise. Suppress both for those pairs.
-        let relocated_by_body = endpoint_pairing.fallback_paired.contains(&pre.key);
+        let relocated_by_body = fallback_score.is_some();
         if !relocated_by_body && pre.symbol.signature != post.symbol.signature {
             signature_changes.push(SignatureChange {
                 before: pre.symbol.clone(),
@@ -1307,11 +1317,13 @@ struct EndpointPairing<'a> {
     pairs: Vec<(&'a SymbolSnapshot, &'a SymbolSnapshot)>,
     postimage_only: Vec<&'a SymbolSnapshot>,
     preimage_only: Vec<&'a SymbolSnapshot>,
-    /// Keys of the symbols paired by the body-similarity rule rather than by
-    /// identity or a Git rename. These relocated (and possibly were renamed or
-    /// lightly edited), but the hunks that deleted them from one place and
-    /// inserted them at another are not edits to report -- see the classifier.
-    fallback_paired: HashSet<&'a SymbolKey>,
+    /// Symbols paired by the body-similarity rule rather than by identity or a
+    /// Git rename, keyed on BOTH endpoints' keys, each mapped to the pair's
+    /// similarity score. These relocated (and possibly were renamed or lightly
+    /// edited), but the hunks that deleted them from one place and inserted
+    /// them at another are not edits to report -- see the classifier, which
+    /// also surfaces the score on the resulting [`MovedSymbol`].
+    fallback_paired: HashMap<&'a SymbolKey, f64>,
 }
 
 /// Match preimage symbols to postimage symbols.
@@ -1441,17 +1453,17 @@ fn pair_endpoints<'a>(
             .then_with(|| pa.symbol.fqn.cmp(&pb.symbol.fqn))
             .then_with(|| qa.symbol.fqn.cmp(&qb.symbol.fqn))
     });
-    let mut fallback_paired: HashSet<&SymbolKey> = HashSet::new();
-    for (_, pre, post) in scored {
-        if fallback_paired.contains(&pre.key) || fallback_paired.contains(&post.key) {
+    let mut fallback_paired: HashMap<&SymbolKey, f64> = HashMap::new();
+    for (score, pre, post) in scored {
+        if fallback_paired.contains_key(&pre.key) || fallback_paired.contains_key(&post.key) {
             continue;
         }
-        fallback_paired.insert(&pre.key);
-        fallback_paired.insert(&post.key);
+        fallback_paired.insert(&pre.key, score);
+        fallback_paired.insert(&post.key, score);
         pairs.push((pre, post));
     }
-    preimage_only.retain(|snapshot| !fallback_paired.contains(&snapshot.key));
-    postimage_only.retain(|snapshot| !fallback_paired.contains(&snapshot.key));
+    preimage_only.retain(|snapshot| !fallback_paired.contains_key(&snapshot.key));
+    postimage_only.retain(|snapshot| !fallback_paired.contains_key(&snapshot.key));
 
     EndpointPairing {
         pairs,
@@ -2222,7 +2234,20 @@ mod tests {
         assert_eq!(pairing.pairs.len(), 1, "the renamed move should pair");
         assert_eq!(pairing.pairs[0].0.symbol.fqn, "a::compute_total");
         assert_eq!(pairing.pairs[0].1.symbol.fqn, "b::sum_all");
-        assert!(pairing.fallback_paired.contains(&pairing.pairs[0].0.key));
+        let score = pairing
+            .fallback_paired
+            .get(&pairing.pairs[0].0.key)
+            .copied()
+            .expect("fuzzy pair records its similarity score");
+        assert!(
+            score >= BODY_MOVE_SIMILARITY_THRESHOLD,
+            "recorded score {score} must clear the threshold"
+        );
+        assert_eq!(
+            pairing.fallback_paired.get(&pairing.pairs[0].1.key).copied(),
+            Some(score),
+            "both endpoints map to the pair's score"
+        );
         // greet stayed unpaired -- not a false-positive move.
         assert_eq!(pairing.preimage_only.len(), 1);
         assert_eq!(pairing.preimage_only[0].symbol.fqn, "a::greet");
@@ -2366,6 +2391,111 @@ mod entry_point_tests {
                 .collect::<Vec<_>>(),
             vec!["Existing"],
             "the analyzer's project root is the repository that gets diffed"
+        );
+    }
+
+    /// End-to-end over a real repository: a fuzzy-paired move (relocated AND
+    /// renamed, so only body similarity lines it up) carries `similarity:
+    /// Some(score >= threshold)`, while a move paired by identity or a Git
+    /// rename reports `similarity: None`.
+    #[test]
+    fn analyze_diff_reports_similarity_only_for_fuzzy_moved_pairs() {
+        let temp = RevisionTempDir::new("fuzzy-move-entry").unwrap();
+        let root = temp.path();
+        let repo = Repository::init(root).unwrap();
+        let signature = git2::Signature::now("Tester", "tester@example.com").unwrap();
+        let accumulate = |name: &str, acc: &str| {
+            format!(
+                "func {name}(xs []int) int {{\n\t{acc} := 0\n\tfor _, x := range xs {{\n\t\t{acc} += x\n\t\tif x > 10 {{\n\t\t\t{acc} += 2\n\t\t}}\n\t}}\n\treturn {acc}\n}}\n"
+            )
+        };
+        let keep = "func Keep() int {\n\tv := 3\n\tv *= 7\n\treturn v\n}\n";
+        let commit = |parent: Option<Oid>, message: &str, files: &[&str]| {
+            let mut index = repo.index().unwrap();
+            index.clear().unwrap();
+            for file in files {
+                index.add_path(Path::new(file)).unwrap();
+            }
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents: Vec<git2::Commit> = parent
+                .into_iter()
+                .map(|oid| repo.find_commit(oid).unwrap())
+                .collect();
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents.iter().collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+
+        // Base: ComputeTotal lives in lib.go, Keep in keep.go.
+        fs::write(
+            root.join("lib.go"),
+            format!("package sample\n\n{}", accumulate("ComputeTotal", "sum")),
+        )
+        .unwrap();
+        fs::write(root.join("keep.go"), format!("package sample\n\n{keep}")).unwrap();
+        let base = commit(None, "base", &["lib.go", "keep.go"]);
+
+        // Target: ComputeTotal moves to other.go as SumAll with a renamed
+        // accumulator -- only the fuzzy third rule can pair it -- while keep.go
+        // is renamed wholesale with Keep untouched, which pairs by identity or
+        // the Git-rename bucket.
+        fs::write(root.join("lib.go"), "package sample\n").unwrap();
+        fs::write(
+            root.join("other.go"),
+            format!("package sample\n\n{}", accumulate("SumAll", "total")),
+        )
+        .unwrap();
+        fs::remove_file(root.join("keep.go")).unwrap();
+        fs::write(root.join("kept.go"), format!("package sample\n\n{keep}")).unwrap();
+        let head = commit(Some(base), "move", &["lib.go", "other.go", "kept.go"]);
+
+        let analyzer = build_analyzer(
+            root,
+            &[
+                PathBuf::from("lib.go"),
+                PathBuf::from("other.go"),
+                PathBuf::from("kept.go"),
+            ],
+        )
+        .unwrap();
+        let result = analyze_diff(
+            analyzer.analyzer(),
+            AnalyzeDiffParams {
+                base: Some(base.to_string()),
+                target: Some(head.to_string()),
+                include_tests: true,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .unwrap();
+
+        let moved = &result.patch_symbols.moved;
+        let fuzzy = moved
+            .iter()
+            .find(|entry| entry.after.name == "SumAll")
+            .expect("the renamed move should be reported as moved");
+        assert_eq!(fuzzy.before.name, "ComputeTotal");
+        let score = fuzzy
+            .similarity
+            .expect("a fuzzy-paired move carries its similarity score");
+        assert!(
+            score >= BODY_MOVE_SIMILARITY_THRESHOLD,
+            "reported similarity {score} must clear the threshold"
+        );
+        let exact = moved
+            .iter()
+            .find(|entry| entry.after.name == "Keep")
+            .expect("the renamed-file move should be reported as moved");
+        assert_eq!(
+            exact.similarity, None,
+            "a move paired by identity or Git rename must not report a score"
         );
     }
 
