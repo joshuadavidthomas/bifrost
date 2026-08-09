@@ -1,9 +1,10 @@
-//! The procedure-summary model foundry (#1871), milestone 1.
+//! The procedure-summary model foundry (#1871).
 //!
-//! This module owns the foundry's interchange form and the corpus translators
-//! that feed it. It is generation-time tooling: it lives behind the
-//! `release-tooling` feature, next to the pinned-pack release bundle, and no
-//! analyzer or runtime path depends on it.
+//! This module owns the foundry's interchange form, the corpus translators that
+//! feed it, and the derivation that produces Bifrost's own answers. It is
+//! generation-time tooling: it lives behind the `release-tooling` feature, next
+//! to the pinned-pack release bundle, and no analyzer or runtime path depends
+//! on it.
 //!
 //! One run reads the pinned external corpora, translates each into the
 //! authored procedure-summary IR, derives summaries from the pinned standard
