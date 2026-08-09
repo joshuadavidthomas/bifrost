@@ -17,7 +17,9 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::fq_name::{SegmentKind, segment_interner};
-use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
+use crate::analyzer::js_ts::weight_code_unit_vec_by_unit;
+use crate::analyzer::memo_cache::{FlightCache, WeightedCache as Cache};
+use crate::analyzer::memo_cache::{build_flight_cache, build_weighted_cache};
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
 use crate::analyzer::{
@@ -28,7 +30,6 @@ use crate::analyzer::{
     TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
-use moka::sync::Cache;
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
@@ -61,15 +62,15 @@ pub struct CppAnalyzer {
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
-    visible_type_units_by_file: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
+    direct_ancestors: FlightCache<CodeUnit, Arc<Vec<CodeUnit>>>,
+    visible_type_units_by_file: FlightCache<ProjectFile, Arc<Vec<CodeUnit>>>,
     /// #1134 resolution-time identity-reconciliation overlay. Maps the canonical
     /// `fq_name` a header declaration carries to the provisional out-of-line
     /// member definition `CodeUnit`s whose per-file identity extraction could not
     /// reconcile with it (the file-scope-under-using-directive shape and the
     /// template-specialization twin), keyed on the include-visible class table.
     /// Memoized per queried name; see `reconciled_definitions`.
-    reconciled_definitions_by_fq: Cache<String, Arc<ReconciledDefinitionIndex>>,
+    reconciled_definitions_by_fq: FlightCache<String, Arc<ReconciledDefinitionIndex>>,
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
@@ -86,6 +87,18 @@ pub struct CppAnalyzer {
     visible_type_units_build_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     cpp_class_strength_parse_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The reconciliation overlay's cache: entry-capped rather than byte-capped,
+/// because the value is an index whose size is a property of the class table
+/// and not of the queried name. It stays a single-flight cache because
+/// `reconciled_definition_index` is asked the same cold `fq_name` by every
+/// worker resolving that name at once.
+fn build_reconciled_definitions_cache() -> FlightCache<String, Arc<ReconciledDefinitionIndex>> {
+    build_flight_cache(
+        2048,
+        |_key: &String, _value: &Arc<ReconciledDefinitionIndex>| 1,
+    )
 }
 
 /// The #1134 resolution-time identity-reconciliation overlay (see the field
@@ -153,12 +166,12 @@ impl CppAnalyzer {
                 weight_code_unit_set_by_file,
             ),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            visible_type_units_by_file: build_weighted_cache(
+            direct_ancestors: build_flight_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
+            visible_type_units_by_file: build_flight_cache(
                 memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
-            reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
+            reconciled_definitions_by_fq: build_reconciled_definitions_cache(),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),
@@ -413,15 +426,15 @@ impl CppAnalyzer {
                 weight_code_unit_set_by_file,
             ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            direct_ancestors: build_weighted_cache(
+            direct_ancestors: build_flight_cache(
                 self.memo_budget / 8,
                 weight_code_unit_vec_by_unit,
             ),
-            visible_type_units_by_file: build_weighted_cache(
+            visible_type_units_by_file: build_flight_cache(
                 self.memo_budget / 8,
                 weight_code_unit_vec_by_file,
             ),
-            reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
+            reconciled_definitions_by_fq: build_reconciled_definitions_cache(),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(OnceLock::new()),

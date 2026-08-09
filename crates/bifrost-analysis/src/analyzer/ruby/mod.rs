@@ -17,7 +17,8 @@ mod tests;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::build_weighted_cache;
+use crate::analyzer::memo_cache::WeightedCache as Cache;
+use crate::analyzer::memo_cache::build_weighted_cache;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::{TypeRelation, TypeRelationKind};
 use crate::analyzer::{
@@ -28,7 +29,6 @@ use crate::analyzer::{
     TreeSitterAnalyzer, TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
-use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};

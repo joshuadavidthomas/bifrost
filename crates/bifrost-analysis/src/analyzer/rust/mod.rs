@@ -23,6 +23,7 @@ mod usage_walks;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::memo_cache::WeightedCache as Cache;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
@@ -33,13 +34,12 @@ use crate::analyzer::{
     TypeHierarchyProvider,
 };
 use crate::hash::{HashMap, HashSet};
-use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tree_sitter::Parser;
 
-use super::js_ts::build_weighted_cache;
+use super::memo_cache::build_weighted_cache;
 pub(crate) use adapter::RustAdapter;
 use cache::{
     weight_code_unit_set, weight_declaration_facts, weight_export_index, weight_project_file_set,

@@ -1,7 +1,7 @@
 use crate::analyzer::ImportInfo;
+use crate::analyzer::memo_cache::FlightCache;
 use crate::analyzer::usages::{ImportBinder, ImportBinding, ImportKind};
 use crate::hash::{HashMap, HashSet};
-use moka::sync::Cache;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
@@ -16,19 +16,22 @@ use super::imports::{
 /// Rust file of a large workspace (Bifrost's own `src/` is ~20 MiB) in one pass.
 const RUST_TREE_CACHE_SOURCE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 
-static RUST_TREES: OnceLock<Cache<Arc<str>, Option<Tree>>> = OnceLock::new();
+static RUST_TREES: OnceLock<FlightCache<Arc<str>, Option<Tree>>> = OnceLock::new();
 static RUST_TREE_PARSES: AtomicUsize = AtomicUsize::new(0);
 static RUST_TREE_PARSE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static RUST_TREE_PARSED_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-fn rust_tree_cache() -> &'static Cache<Arc<str>, Option<Tree>> {
+fn rust_tree_cache() -> &'static FlightCache<Arc<str>, Option<Tree>> {
+    // Stays a moka cache: the key is a whole file's source, the values are
+    // parse trees several times that size, and this one is process-global
+    // rather than generation-scoped, so eviction quality is worth paying for.
+    // The hasher is not: hashing a megabyte of source with SipHash on every
+    // probe is pure loss against Fx.
     RUST_TREES.get_or_init(|| {
-        Cache::builder()
-            .max_capacity(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES)
-            .weigher(|key: &Arc<str>, _value: &Option<Tree>| {
-                key.len().min(u32::MAX as usize) as u32
-            })
-            .build()
+        crate::analyzer::memo_cache::build_flight_cache(
+            RUST_TREE_CACHE_SOURCE_BUDGET_BYTES,
+            |key: &Arc<str>, _value: &Option<Tree>| key.len().min(u32::MAX as usize) as u32,
+        )
     })
 }
 

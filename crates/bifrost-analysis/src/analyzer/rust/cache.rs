@@ -1,4 +1,4 @@
-pub(super) use crate::analyzer::js_ts::build_weighted_cache;
+pub(super) use crate::analyzer::memo_cache::build_weighted_cache;
 use crate::analyzer::usages::{ExportEntry, ExportIndex};
 use crate::analyzer::{CodeUnit, ProjectFile};
 use crate::hash::{HashMap, HashSet};

@@ -12,7 +12,9 @@ use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::js_ts::{build_weighted_cache, weight_code_unit_vec_by_unit};
+use crate::analyzer::js_ts::weight_code_unit_vec_by_unit;
+use crate::analyzer::memo_cache::WeightedCache as Cache;
+use crate::analyzer::memo_cache::build_weighted_cache;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
@@ -22,7 +24,6 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
-use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser};

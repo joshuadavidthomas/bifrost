@@ -15,12 +15,12 @@ use super::materialization::MaterializationAxis;
 use super::occurrences::OccurrenceRole;
 use super::resolution::EnvironmentAxis;
 use super::routes::{IdentityAxis, RouteHopKind};
+use crate::analyzer::memo_cache::{FlightCache, build_flight_cache};
 use crate::analyzer::tree_sitter_analyzer::{
     LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, TreeSitterAnalyzer,
 };
 use crate::analyzer::{Language, ProjectFile};
 use crate::cancellation::CancellationToken;
-use moka::sync::Cache;
 use std::hash::Hasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -243,7 +243,7 @@ pub enum StructuralSourceLimitedOutcome {
 /// Follows the moka weigher idiom of the per-language memo caches
 /// (`src/analyzer/java/cache.rs`).
 pub struct StructuralFactsCache {
-    cache: Cache<ProjectFile, Arc<CachedFacts>>,
+    cache: FlightCache<ProjectFile, Arc<CachedFacts>>,
     extractions: AtomicU64,
     hydrations: AtomicU64,
 }
@@ -267,10 +267,7 @@ fn weigh_entry(key: &ProjectFile, value: &Arc<CachedFacts>) -> u32 {
 impl StructuralFactsCache {
     pub(crate) fn new(budget_bytes: u64) -> Self {
         Self {
-            cache: Cache::builder()
-                .max_capacity(budget_bytes.max(1))
-                .weigher(weigh_entry)
-                .build(),
+            cache: build_flight_cache(budget_bytes.max(1), weigh_entry),
             extractions: AtomicU64::new(0),
             hydrations: AtomicU64::new(0),
         }
