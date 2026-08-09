@@ -64,7 +64,7 @@ pub(crate) use brokk_bifrost_ruby::syntax::{
     is_runtime_node, ruby_call_arguments, ruby_semantic_identifier_range,
 };
 pub use dependency_discovery::resolve_ruby_semantic_pack_dependencies;
-pub use external::RubyDependencyPackAdapter;
+pub use external::{RubyDependencyPackAdapter, RubyGemArchivePackProducer};
 
 #[derive(Clone)]
 pub struct RubyAnalyzer {
