@@ -1074,6 +1074,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: source_locator(&self.artifact_path, name, node),
         });
         Some(id)
@@ -1125,6 +1126,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            guard: None,
             locator: source_locator(&self.artifact_path, &draft.name, node),
         });
     }

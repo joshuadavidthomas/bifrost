@@ -49,12 +49,34 @@ exists, `os.path.join` does not.
 Typeshed supports Python 3.10 through 3.14, so the pack's compatibility and
 activation name the `cpython` toolchain over that range. Typeshed guards
 version-specific and platform-specific declarations with `sys.version_info`
-and `sys.platform` blocks. The producer keeps a pack static and never
-evaluates a guard, so the published surface is the union of every branch: the
-pack lists `builtins.float.from_number` (Python 3.14 and later) and
-`os.startfile` (Windows only) for every activation in the range. Read a
-published name as "typeshed declares this name somewhere in the supported
-range", not as "this name exists on the interpreter that activated the pack".
+and `sys.platform` blocks.
+
+The producer keeps a pack static and still never evaluates a guard. It records
+the guard on the declaration instead: an inclusive minimum toolchain version,
+an exclusive maximum, and the activation targets the block requires or
+excludes. Activation pins one exact interpreter version and one target, and it
+drops a declaration only when a recorded constraint *provably* excludes that
+interpreter. Under a cpython 3.13.5 Linux activation the pack therefore stops
+resolving `builtins.float.from_number` (`sys.version_info >= (3, 14)`) and
+`os.startfile` (`sys.platform == "win32"`), while every unguarded name resolves
+as before.
+
+The honesty rule runs one way only. A guard this producer cannot express, and
+a coordinate the activation does not pin, both keep the declaration and mark it
+as read incompletely rather than dropping it. Two branches that declare one
+identity leave no branch's condition necessary, so that declaration stays
+active for every activation as well.
+
+Read a published name as "this interpreter declares this name, or its guard
+could not be read". A name this slice covers and this activation dropped is one
+the pinned interpreter provably does not declare. A name the slice never
+covered is still outside the pack's statements, as the module table above
+says.
+
+An activation supplies its target as the interpreter's own `sys.platform`
+value, which is the vocabulary typeshed's platform guards name. A target from
+another vocabulary would read as an ordinary mismatch and could drop a
+declaration the interpreter has.
 
 ## License
 

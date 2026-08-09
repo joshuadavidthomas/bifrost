@@ -1125,6 +1125,7 @@ impl CSharpAssemblyPackProducer {
                 hierarchy,
                 aliases: Vec::new(),
                 extension_surfaces: Vec::new(),
+                guard: None,
                 locator: Locator::Artifact {
                     path: locator_path.clone(),
                     symbol: metadata_location(ty.source()),
@@ -1231,6 +1232,7 @@ impl CSharpAssemblyPackProducer {
                     extension_receiver: None,
                     extension_receiver_constraints: Vec::new(),
                     aliases: Vec::new(),
+                    guard: None,
                     locator: Locator::Artifact {
                         path: locator_path.clone(),
                         symbol: metadata_location(member.source()),

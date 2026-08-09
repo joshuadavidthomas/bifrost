@@ -349,6 +349,7 @@ impl Validator {
                             surface,
                         );
                     }
+                    self.declaration_guard(&fact_path, fact.guard.as_ref());
                     self.locator(&format!("{fact_path}.locator"), &fact.locator);
                 }
                 for (index, fact) in members.iter().enumerate() {
@@ -371,6 +372,7 @@ impl Validator {
                     for (alias_index, alias) in fact.aliases.iter().enumerate() {
                         self.qualified_name(&format!("{fact_path}.aliases[{alias_index}]"), alias);
                     }
+                    self.declaration_guard(&fact_path, fact.guard.as_ref());
                 }
                 for (index, relation) in relations.iter().enumerate() {
                     self.stable_id(&format!("{path}.relations[{index}].id"), &relation.id);
@@ -1468,6 +1470,22 @@ impl Validator {
             } => {
                 self.locator_path(&format!("{path}.path"), value);
                 self.text(&format!("{path}.symbol"), symbol);
+            }
+        }
+    }
+
+    /// A guard names activation targets, so its target names obey the same
+    /// text rules as the activation selectors they are compared against.
+    fn declaration_guard(&mut self, path: &str, guard: Option<&DeclarationGuard>) {
+        let Some(guard) = guard else {
+            return;
+        };
+        for (field, targets) in [
+            ("required_targets", &guard.required_targets),
+            ("excluded_targets", &guard.excluded_targets),
+        ] {
+            for (index, target) in targets.iter().enumerate() {
+                self.text(&format!("{path}.guard.{field}[{index}]"), target);
             }
         }
     }

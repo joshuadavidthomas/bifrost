@@ -123,6 +123,14 @@ pub struct PythonAnalyzerConfig {
 pub struct PythonEnvironmentConfig {
     pub implementation: String,
     pub version: String,
+    /// The interpreter's own `sys.platform` value, for example `linux`,
+    /// `darwin`, or `win32`.
+    ///
+    /// This is the activation target for every pack the environment produces,
+    /// and a stub's `sys.platform` guard names targets in the same vocabulary.
+    /// A value from another vocabulary would compare against those guards as
+    /// an ordinary mismatch and could hide a declaration the interpreter has,
+    /// so hosts must report the interpreter's value and nothing else.
     pub platform: String,
     pub standard_library_root: PathBuf,
     pub bundled_stub_roots: Vec<PathBuf>,

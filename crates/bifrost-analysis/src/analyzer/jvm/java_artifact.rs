@@ -557,6 +557,7 @@ pub(super) fn java_api_facts(
             hierarchy: declaration.hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: declaration.locator,
         });
         for member in declaration.members {
@@ -611,6 +612,7 @@ pub(super) fn java_api_facts(
                 extension_receiver: None,
                 extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
+                guard: None,
                 locator: member.locator,
             });
         }

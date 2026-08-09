@@ -99,7 +99,7 @@ impl Environment {
                 environment: Some(PythonEnvironmentConfig {
                     implementation: "cpython".to_owned(),
                     version: "3.12.3".to_owned(),
-                    platform: "macos-arm64".to_owned(),
+                    platform: "darwin".to_owned(),
                     standard_library_root: self.standard_library.clone(),
                     bundled_stub_roots: vec![self.bundled_stubs.clone()],
                     distribution_roots: vec![self.distributions.clone()],
