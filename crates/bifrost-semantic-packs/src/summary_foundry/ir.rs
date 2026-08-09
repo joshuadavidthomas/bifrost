@@ -416,9 +416,12 @@ impl FoundryFineGrainedTransfer {
 }
 
 /// What one derivation run observed about one target.
+///
+/// The completeness *claim* the observation supports lives on the entry, not
+/// here: an entry can also reach a claim through adjudication or review, and a
+/// consumer must be able to read the claim without knowing where it came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FoundryDerivation {
-    pub completeness: FoundryCompleteness,
     /// Transfers the solver reported without proven, complete evidence. They
     /// still ship: a partial summary can add a flow but can never deny one.
     pub unproven_transfers: u32,
@@ -454,6 +457,12 @@ pub struct FoundryEntry {
     pub target: FoundryTarget,
     pub boundary: FoundryBoundary,
     pub claim: FoundryClaim,
+    /// How much of the target's behavior this entry accounts for.
+    ///
+    /// Only a `complete` claim can deny a flow, so only a `complete` entry can
+    /// carry a negative proof and only a `complete` entry can suppress. A
+    /// translated corpus row is never `complete`: translation is not traversal.
+    pub completeness: FoundryCompleteness,
     pub transfers: Vec<AuthoredSummaryTransfer>,
     pub artifact: FoundryArtifactBinding,
     pub evidence: Vec<FoundryEvidence>,
@@ -483,10 +492,10 @@ impl FoundryEntry {
                 has_receiver: self.boundary.has_receiver,
                 parameter_count: self.boundary.parameter_count,
             },
-            // The plan defaults every unreviewed entry to `partial`: a partial
-            // summary can add flows but can never prove absence, so a wrong
-            // one costs a visible false positive, never a silent miss.
-            completeness: Completeness::Partial,
+            completeness: match self.completeness {
+                FoundryCompleteness::Partial => Completeness::Partial,
+                FoundryCompleteness::Complete => Completeness::Complete,
+            },
             locations: Vec::new(),
             transfers: self.transfers.clone(),
             effects: Vec::new(),
@@ -725,6 +734,12 @@ impl FoundryEntryBuilder {
                 parameter_count,
             },
             claim,
+            // The plan defaults every unreviewed entry to `partial`: a partial
+            // summary can add flows but can never prove absence, so a wrong one
+            // costs a visible false positive, never a silent miss. A builder
+            // accumulates corpus rows, and translation is not traversal, so a
+            // built entry can never reach `complete`.
+            completeness: FoundryCompleteness::Partial,
             transfers: self.transfers.into_values().collect(),
             artifact: FoundryArtifactBinding::Unresolved,
             evidence: self.evidence,
