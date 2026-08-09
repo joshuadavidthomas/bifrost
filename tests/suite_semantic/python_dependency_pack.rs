@@ -356,6 +356,70 @@ class Reader(Protocol):
     );
 }
 
+/// Two overloads of one name that share an arity are one declaration unless
+/// the producer reads their annotations, and a stub tree deduplicates by
+/// declaration identity. Typeshed spells fifteen overloads of `builtins.pow`
+/// this way, so losing annotations publishes one of them and drops fourteen
+/// while still reporting the pack complete (#1869).
+#[test]
+fn stub_producer_reads_annotations_names_and_pep695_aliases() {
+    let environment = tempfile::tempdir().unwrap();
+    let artifact = environment.path().join("shapes.pyi");
+    std::fs::write(
+        &artifact,
+        r#"
+import os
+from typing import overload
+
+type Pair[T] = tuple[T, T]
+
+@overload
+def widen(value: int) -> float: ...
+@overload
+def widen(value: str) -> bytes: ...
+def locate(path: os.PathLike[str], *parts: str) -> list[str]: ...
+"#,
+    )
+    .unwrap();
+
+    let production = PythonArtifactPackProducer.produce_exact_artifact(
+        &artifact_request(artifact, ExternalArtifactKind::PythonStub),
+        &ArtifactProducerLimits::default(),
+    );
+
+    let pack = production.pack.unwrap();
+    let AuthoredPayload::DeclarationFacts { types, members, .. } = &pack.shards[0].payload else {
+        panic!("expected declaration facts");
+    };
+    let widen = members
+        .iter()
+        .filter(|fact| fact.name == "widen")
+        .collect::<Vec<_>>();
+    assert_eq!(widen.len(), 2, "{members:#?}");
+    assert_ne!(widen[0].id, widen[1].id, "{widen:#?}");
+    let locate = members
+        .iter()
+        .find(|fact| fact.name == "locate")
+        .and_then(|fact| fact.signature.as_ref())
+        .expect("locate publishes a signature");
+    assert_eq!(
+        locate
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("path"), Some("parts")],
+        "{locate:#?}"
+    );
+    assert!(locate.parameters[1].variadic, "{locate:#?}");
+    assert!(
+        types
+            .iter()
+            .any(|fact| fact.name == "shapes.Pair" && fact.type_parameters == vec!["T".to_owned()]),
+        "{types:#?}"
+    );
+}
+
 #[test]
 fn explicit_activation_publishes_python_facts_without_expanding_workspace_files() {
     let workspace = InlineTestProject::with_language(Language::Python)

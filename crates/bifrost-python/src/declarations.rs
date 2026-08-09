@@ -698,7 +698,14 @@ fn python_parameter_label_nodes(parameters_node: Node<'_>) -> Vec<Node<'_>> {
     labels
 }
 
-fn python_parameter_label_node(node: Node<'_>) -> Option<Node<'_>> {
+/// The identifier node that names one parameter's binding.
+///
+/// The grammar gives `default_parameter` and `typed_default_parameter` a
+/// `name` field but gives `typed_parameter` and the two splat patterns none,
+/// so a caller that reads only the field loses the binding name of every
+/// annotated parameter. Every Python surface that names parameters reads them
+/// through this function.
+pub fn python_parameter_label_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "identifier" => Some(node),
         "typed_parameter"
