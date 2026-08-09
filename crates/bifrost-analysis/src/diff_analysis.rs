@@ -1330,7 +1330,9 @@ struct EndpointPairing<'a> {
 /// Match preimage symbols to postimage symbols.
 ///
 /// Two symbols pair when their key -- fqn, kind and language -- is identical,
-/// which covers everything a patch leaves in place. The second rule exists
+/// which covers everything a patch leaves in place (an unqualified fqn -- a
+/// bare name, as flat-namespace languages produce -- must additionally keep
+/// its path; see the guard below). The second rule exists
 /// because a fully-qualified name derived from a path does not survive a file
 /// move: when Git reports a rename, a preimage symbol under the old path pairs
 /// with a postimage symbol under the new one, provided the name, kind and
@@ -1354,18 +1356,35 @@ fn pair_endpoints<'a>(
     after: &'a BTreeMap<SymbolKey, SymbolSnapshot>,
     file_changes: &[FileChange],
 ) -> EndpointPairing<'a> {
+    // First rule: identity of the key (fqn, kind, language) -- with one guard.
+    // In flat-namespace languages (JavaScript most prominently) a symbol's fqn
+    // can be its bare unqualified name, so two UNRELATED same-name functions in
+    // different files share an identity key: a deleted `updateConfig` in a.js
+    // would identity-pair with a brand-new `updateConfig` in b.js, fabricating
+    // a "moved" symbol and suppressing the real delete+introduce. When the fqn
+    // carries no qualifier (fqn == bare name), identity across DIFFERENT paths
+    // is no evidence at all, so such a pair must also agree on the path.
+    // Refused pairs fall through to the leftover sets, where the rename bucket
+    // (rule 2) or body similarity (rule 3, which also tags a similarity score)
+    // can legitimately claim a genuine cross-file move; this guard only
+    // refuses suspect identity pairs, it never creates new ones.
+    let flat_identity_conflict = |pre: &SymbolSnapshot, post: &SymbolSnapshot| {
+        (pre.symbol.fqn == pre.symbol.name || post.symbol.fqn == post.symbol.name)
+            && pre.symbol.path != post.symbol.path
+    };
     let mut pairs = Vec::new();
     let mut preimage_only = Vec::new();
     let mut postimage_only = Vec::new();
     for (key, post) in after {
         match before.get(key) {
-            Some(pre) => pairs.push((pre, post)),
-            None => postimage_only.push(post),
+            Some(pre) if !flat_identity_conflict(pre, post) => pairs.push((pre, post)),
+            _ => postimage_only.push(post),
         }
     }
     for (key, pre) in before {
-        if !after.contains_key(key) {
-            preimage_only.push(pre);
+        match after.get(key) {
+            Some(post) if !flat_identity_conflict(pre, post) => {}
+            _ => preimage_only.push(pre),
         }
     }
 
@@ -2393,6 +2412,81 @@ mod tests {
             got,
             vec![("a::compute_total", "b::sum_all"), ("a::render", "b::draw")],
             "each move claimed its own twin"
+        );
+    }
+
+    /// The flat-fqn identity guard: an unqualified fqn (fqn == bare name, as
+    /// flat-namespace languages produce) may identity-pair only within one
+    /// path. Unrelated same-name functions in different files must not pair;
+    /// a genuine cross-file move is recovered by the body-similarity rule.
+    #[test]
+    fn unqualified_identity_requires_a_matching_path() {
+        // Two unrelated same-name `updateConfig` functions, a.js deleted,
+        // b.js added, dissimilar bodies: refuse the identity pair AND the
+        // fuzzy pair -- report delete+introduce.
+        let before = BTreeMap::from([{
+            let src = "pub fn updateConfig(c: &mut Config) {\n    c.retries = 3;\n    c.verbose = true;\n    c.apply();\n}\n";
+            let s = snap_src("updateConfig", "updateConfig", "src/a.js", src);
+            (s.key.clone(), s)
+        }]);
+        let after = BTreeMap::from([{
+            let src = "pub fn updateConfig(db: &Db) -> Row {\n    let row = db.fetch(\"config\");\n    db.write(&row);\n    row\n}\n";
+            let s = snap_src("updateConfig", "updateConfig", "src/b.js", src);
+            (s.key.clone(), s)
+        }]);
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert!(
+            pairing.pairs.is_empty(),
+            "unrelated same-name flat symbols must not pair"
+        );
+        assert_eq!(pairing.preimage_only.len(), 1);
+        assert_eq!(pairing.postimage_only.len(), 1);
+        assert!(pairing.fallback_paired.is_empty());
+
+        // A true cross-file move of an unqualified symbol with an identical
+        // body: rule 1 refuses it, but body similarity pairs it and records
+        // the score a MovedSymbol will surface.
+        let src = "pub fn updateConfig(c: &mut Config) {\n    c.retries = 3;\n    c.verbose = true;\n    c.apply();\n}\n";
+        let before = BTreeMap::from([{
+            let s = snap_src("updateConfig", "updateConfig", "src/a.js", src);
+            (s.key.clone(), s)
+        }]);
+        let after = BTreeMap::from([{
+            let s = snap_src("updateConfig", "updateConfig", "src/b.js", src);
+            (s.key.clone(), s)
+        }]);
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert_eq!(
+            pairing.pairs.len(),
+            1,
+            "an identical body pairs the true move"
+        );
+        let score = pairing
+            .fallback_paired
+            .get(&pairing.pairs[0].0.key)
+            .copied()
+            .expect("the recovered move is a fuzzy pair and carries a score");
+        assert!(score >= BODY_MOVE_SIMILARITY_THRESHOLD);
+
+        // A qualified fqn (fqn != bare name) still identity-pairs across a
+        // path change exactly as before the guard.
+        let before = BTreeMap::from([{
+            let s = snap_src("a.Foo.bar", "bar", "src/Foo.java", src);
+            (s.key.clone(), s)
+        }]);
+        let after = BTreeMap::from([{
+            let s = snap_src("a.Foo.bar", "bar", "src/other/Foo.java", src);
+            (s.key.clone(), s)
+        }]);
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert_eq!(
+            pairing.pairs.len(),
+            1,
+            "qualified fqns keep identity pairing"
+        );
+        assert!(
+            pairing.fallback_paired.is_empty(),
+            "an identity pair is not a fuzzy pair"
         );
     }
 
