@@ -1219,6 +1219,28 @@ impl SearchToolsService {
         Self::new_transient_with_strategy(root, UpdateStrategy::Manual, false)
     }
 
+    /// Whether a tool is a pure function of its Git endpoints and never reads
+    /// the live workspace analyzer or semantic index.
+    ///
+    /// `analyze_diff` is such a tool: it builds its own ephemeral per-endpoint
+    /// analyzers (see `diff_analysis::build_analyzer`) and is dispatched before
+    /// `snapshot_for_query` is ever consulted. Booting a persisted whole-repo
+    /// workspace and background semantic indexer to serve it is pure waste --
+    /// on a large repository that whole-repo embed plus SQLite cache persist
+    /// dominates wall time for an analysis that only touches two git trees.
+    pub fn tool_is_workspace_independent(name: &str) -> bool {
+        name == "analyze_diff"
+    }
+
+    /// Lazy, watcher-less, non-semantic service whose workspace is never built
+    /// unless a query forces it. The one-shot CLI uses this for
+    /// [workspace-independent tools](Self::tool_is_workspace_independent): the
+    /// deferred `session` (`None`) is never materialized, so no whole-repo
+    /// analyzer is built and nothing is persisted to the cache database.
+    pub fn new_workspace_independent(root: PathBuf) -> Result<Self, String> {
+        Self::new_lazy_with_strategy(root, UpdateStrategy::Manual, false)
+    }
+
     /// Construct a manual, non-semantic service over an already-selected
     /// project. One-shot CLI subset workspaces use this to avoid whole-root
     /// watchers while still sharing the analyzer blob cache for git roots.
