@@ -1,0 +1,162 @@
+[
+  {
+    "target": {
+      "path": "java.base/java/util/Arrays.java",
+      "symbol": "java.util.Arrays.asList(java.lang.Object[])",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a fixed-size List backed by the argument array, so every element of the array is readable through the returned list and parameter 0 reaches normal_return. Taint is modeled at container granularity: the whole array taints the returned container, and element-level precision (which index is tainted) is lost. The array is the only input and there are no other outputs.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Arrays.asList; JDK java.util.Arrays source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Collections.java",
+      "symbol": "java.util.Collections.singletonList(java.lang.Object)",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is an immutable list holding exactly the argument as its single element, so parameter 0 reaches normal_return at container granularity. The argument is the only input and there are no other outputs. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Collections.singletonList; JDK java.util.Collections source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Iterator.java",
+      "symbol": "java.util.Iterator.next()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the next element of the underlying collection the iterator traverses, modeled at container granularity as receiver state, so the receiver reaches normal_return. This is an interface method and arbitrary implementations can behave differently, so completeness and confidence stay conservative; element-level precision (which element is tainted) is lost.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "medium",
+    "citations": "Javadoc of Iterator.next; JDK java.util.Iterator and ArrayList$Itr source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/List.java",
+      "symbol": "java.util.List.add(java.lang.Object)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      }
+    ],
+    "rationale": "At container granularity, an element added to the list taints the container, so parameter 0 reaches the receiver's post-state, and the list's prior elements remain, so the receiver reaches its own post-state. The boolean result reports success only and carries no element data, so no input reaches normal_return. This is an interface method and arbitrary implementations can differ, so completeness stays partial; element-level precision is lost.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "medium",
+    "citations": "Javadoc of List.add; JDK java.util.List and ArrayList.add source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/List.java",
+      "symbol": "java.util.List.get(int)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is an element stored in the list, so at container granularity the receiver reaches normal_return. The index (parameter 0) only selects which element to return; its value is not incorporated into the result, so it has no transfer. This is an interface method and arbitrary implementations can differ, so completeness stays partial; element-level precision (a tainted container makes every read tainted) is lost.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "medium",
+    "citations": "Javadoc of List.get; JDK java.util.List and ArrayList.get source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Map.java",
+      "symbol": "java.util.Map.get(java.lang.Object)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a value stored in the map (or null), so at container granularity the receiver reaches normal_return. The lookup key (parameter 0) is only hashed and compared; its value is not incorporated into the result, so it has no transfer. This is an interface method and arbitrary implementations can differ, so completeness stays partial; key-level precision (which mapping is tainted) is lost.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "medium",
+    "citations": "Javadoc of Map.get; JDK java.util.Map and HashMap.get source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Map.java",
+      "symbol": "java.util.Map.put(java.lang.Object,java.lang.Object)",
+      "has_receiver": true,
+      "parameter_count": 2
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 1 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "At container granularity, the key (parameter 0) and the value (parameter 1) are both stored in the map and taint the container, and the map's prior mappings remain (receiver to receiver). The result is the previous value associated with the key, which came out of the map, so the receiver also reaches normal_return. Neither parameter reaches normal_return because the result is never the key or value just put. This is an interface method and arbitrary implementations can differ, so completeness stays partial; key-level precision is lost.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "medium",
+    "citations": "Javadoc of Map.put; JDK java.util.Map and HashMap.put source. No CodeQL or Joern model consulted."
+  }
+]
