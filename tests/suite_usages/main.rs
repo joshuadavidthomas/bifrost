@@ -25,6 +25,7 @@ mod receiver_language_acceptance_matrix;
 mod receiver_language_scope;
 mod receiver_language_uncertainty;
 mod rust_top30_constructor_regression;
+mod rust_top30_macro_regression;
 mod scala_bounded_receiver_hardening;
 mod usage_graph_cpp_test;
 mod usage_graph_csharp_test;
