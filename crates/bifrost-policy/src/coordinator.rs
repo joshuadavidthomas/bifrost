@@ -1182,7 +1182,13 @@ fn evaluate_prepared_policy_inputs(
     // activation lifecycle (LSP, MCP), and re-activating here would race it.
     // The diff-base run activates against its exported base tree inside
     // `evaluate_policy_diff_baseline` for the same ownership reason.
-    let packs_review = match (&packs_config, owned_analyzer.as_ref()) {
+    // The document-driven activation transaction is retained, not just
+    // projected into the review: its already-resolved runtime carries the
+    // procedure summaries the taint evaluator reads, so the CLI/document route
+    // reuses this one activation rather than opening a second (#1915). The
+    // declaration-facts strand (#1893) reaches the resolver through the overlay
+    // this same transaction publishes onto the owned analyzer.
+    let document_activation = match (&packs_config, owned_analyzer.as_ref()) {
         (Some(config), Some(analyzer_workspace)) => {
             match activate_workspace_packs(
                 analyzer_workspace,
@@ -1191,7 +1197,7 @@ fn evaluate_prepared_policy_inputs(
                 config,
                 semantic_cancellation,
             ) {
-                Ok(activation) => Some(pack_activation_review(config, activation.as_ref())),
+                Ok(activation) => Some(activation),
                 Err(error) => {
                     secondary_diagnostics.push(report_diagnostic(
                         PolicyReportDiagnosticCode::PackActivationFailed,
@@ -1206,8 +1212,31 @@ fn evaluate_prepared_policy_inputs(
         }
         _ => None,
     };
+    let packs_review = match (&packs_config, document_activation.as_ref()) {
+        (Some(config), Some(activation)) => {
+            Some(pack_activation_review(config, activation.as_ref()))
+        }
+        _ => None,
+    };
+    // The summaries an activated pack publishes reach taint only through
+    // `PolicySemanticModelContext`. An API caller supplies that context; the
+    // CLI/document route supplies none, so without this strand an activated
+    // summary pack changed taint results for an API caller alone (#1915).
+    // Reuse the resolved runtime the document activation already built, exactly
+    // as an API caller would, and only when it is `Ready`: an incomplete
+    // activation must not silently model calls it never resolved.
+    let document_summary_models = document_activation
+        .as_ref()
+        .and_then(|activation| activation.as_ref())
+        .and_then(|activation| activation.outcome.runtime.as_ref())
+        .and_then(|runtime| match runtime {
+            SemanticModelRuntimeOutcome::Ready { active, .. } => Some(Arc::clone(active)),
+            SemanticModelRuntimeOutcome::Incomplete { .. }
+            | SemanticModelRuntimeOutcome::Cancelled(_)
+            | SemanticModelRuntimeOutcome::Unavailable(_) => None,
+        });
     let active_semantic_models = match semantic_models {
-        None => Ok(None),
+        None => Ok(document_summary_models),
         Some(context) => {
             let workspace = workspace.ok_or_else(|| {
                 PolicyCoordinatorError::new(

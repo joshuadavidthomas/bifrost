@@ -2964,3 +2964,268 @@ fn packs_document_lets_a_stdlib_member_assertion_conclude() {
          member assertion: {type_only_report}"
     );
 }
+
+/// The one packs document every taint-summary case below opts into.
+const PACKS_DOCUMENT_JVM: &str =
+    r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#;
+
+/// A JVM workspace whose only cross-procedure taint path runs through a
+/// bodiless method the workspace cannot analyze. `run` carries an
+/// attacker-controlled value into `external` and the result into a sensitive
+/// sink, so the flow reaches the sink only when a model transfers the argument
+/// to the return. This mirrors the `s1_d1_src1_sink1` shape the summary-taint
+/// lifecycle benchmark drives through the in-process API path.
+const SUMMARY_TAINT_SOURCE: &str = r#"class App {
+  static native String attacker();
+
+  static native void sensitive(String value);
+
+  native String external(String value);
+
+  void run() {
+    sensitive(this.external(attacker()));
+  }
+}
+"#;
+
+/// A `require-model` taint policy: the attacker return is untrusted, the sink
+/// rejects untrusted argument 0, and an unmodeled call is required to carry a
+/// model rather than be assumed transparent or inert. Without a model for
+/// `external` the run is honestly inconclusive; with one it concludes with the
+/// meeting.
+const SUMMARY_TAINT_POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "probe.summary.taint"
+  :name "Summary-carried taint reaches a sink"
+  :message "an attacker-controlled value reached a sensitive sink through an activated procedure summary"
+  :severity warning
+  :analysis (analysis
+    :type taint
+    :mode may
+    :call-modeling (call-modeling :unmodeled require-model)
+    :sources (endpoint-set :entries [
+      (source :id attacker :display-name "attacker" :categories [input.user]
+        :selector (rql :schema-version 1 (language java (call :callee (name "attacker"))))
+        :bind return-value :labels [untrusted])])
+    :sinks (endpoint-set :entries [
+      (sink :id sensitive :display-name "sensitive" :categories [data.sensitive]
+        :selector (rql :schema-version 1 (language java (call :callee (name "sensitive"))))
+        :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+  :classification (classification
+    :fallback (classification-id :taxonomy "Probe" :id "SUMMARY-TAINT")))
+"#;
+
+/// A procedure-summary pack that models `external` by transferring its argument
+/// to its normal return. It activates through the exact JDK 21.0.2 toolchain
+/// selector the declaration-facts stdlib packs use, so the document route's JVM
+/// discovery selects it from the fake JDK home with no jar on disk; the payload
+/// is the taint route's summary strand rather than declaration facts.
+const SUMMARY_TAINT_PACK: &str = r#"{
+  "schema_version": 1,
+  "pack_id": "fixture.jdk",
+  "version": "21.0.2",
+  "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "jdk", "requirement": "=21.0.2" }]
+  },
+  "provenance": { "source": "checked-in test source", "revision": "fixture-v1" },
+  "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "summaries.probe",
+    "activation": [{
+      "toolchain": { "name": "jdk", "version": "=21.0.2" },
+      "targets": ["jvm"]
+    }],
+    "payload": {
+      "kind": "procedure_summaries",
+      "summaries": [{
+        "id": "summary.external",
+        "target": {
+          "path": "src/App.java",
+          "symbol": "external(String)",
+          "has_receiver": true,
+          "parameter_count": 1
+        },
+        "completeness": "complete",
+        "transfers": [{
+          "input": { "kind": "parameter", "ordinal": 0 },
+          "exit_kind": "normal",
+          "output": { "kind": "normal_return" }
+        }],
+        "effects": []
+      }]
+    }
+  }]
+}"#;
+
+/// The same pack, selected identically, whose one summary targets a method the
+/// workspace never calls. `external` therefore stays unmodeled, so a selection
+/// alone must not manufacture a finding.
+const SUMMARY_TAINT_UNCOVERED_PACK: &str = r#"{
+  "schema_version": 1,
+  "pack_id": "fixture.jdk",
+  "version": "21.0.2",
+  "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "jdk", "requirement": "=21.0.2" }]
+  },
+  "provenance": { "source": "checked-in test source", "revision": "fixture-v1" },
+  "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "summaries.probe",
+    "activation": [{
+      "toolchain": { "name": "jdk", "version": "=21.0.2" },
+      "targets": ["jvm"]
+    }],
+    "payload": {
+      "kind": "procedure_summaries",
+      "summaries": [{
+        "id": "summary.uncovered",
+        "target": {
+          "path": "src/App.java",
+          "symbol": "uncovered(String)",
+          "has_receiver": true,
+          "parameter_count": 1
+        },
+        "completeness": "complete",
+        "transfers": [{
+          "input": { "kind": "parameter", "ordinal": 0 },
+          "exit_kind": "normal",
+          "output": { "kind": "normal_return" }
+        }],
+        "effects": []
+      }]
+    }
+  }]
+}"#;
+
+const SUMMARY_TAINT_ARGS: &[&str] = &[
+    "--policy-file",
+    "policies/summary-taint.rqlp",
+    "--evaluation-date",
+    "2026-07-28",
+    "--fail-on",
+    "warning",
+    "--format",
+    "json",
+];
+
+/// The epic #1877 taint acceptance, end to end through the shipped CLI: a
+/// workspace with an installed, selected procedure-summary pack yields the
+/// taint finding when the policy runs through the packs.json document route,
+/// and yields nothing with the pack absent (#1915).
+///
+/// Before #1915 an activated summary pack changed taint results only for an
+/// in-process API caller, because the CLI/document route passed no
+/// `PolicySemanticModelContext`. The whole chain now runs here: the packs
+/// document opts the workspace in, the catalog serves the installed summary
+/// pack, the fake JDK home satisfies the toolchain gate, and the resolved
+/// activation the document transaction already built now reaches the taint
+/// evaluator. No jar and no `src.zip` exists anywhere, so the summary pack is
+/// the only thing that can model `external` and carry the flow.
+#[test]
+fn packs_document_carries_procedure_summaries_into_the_cli_taint_route() {
+    let homes = tempfile::tempdir().expect("fake JDK home root");
+
+    // With the summary pack selected, `external` is modeled, so the flow
+    // attacker -> external -> sensitive reaches the sink and retains a finding.
+    let with_pack = InlineTestProject::new()
+        .file("src/App.java", SUMMARY_TAINT_SOURCE)
+        .file("policies/summary-taint.rqlp", SUMMARY_TAINT_POLICY)
+        .file(".bifrost/packs.json", PACKS_DOCUMENT_JVM)
+        .build();
+    install_fixture_pack(with_pack.root(), SUMMARY_TAINT_PACK);
+    let modeled = run_with_java_home(
+        with_pack.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        SUMMARY_TAINT_ARGS,
+    );
+    let report = json_stdout(&modeled);
+    let decisions = report["packs"]["decisions"].as_array().expect("decisions");
+    assert!(
+        decisions.iter().any(|decision| {
+            decision["pack"] == "fixture.jdk@21.0.2" && decision["status"] == "selected"
+        }),
+        "the summary pack must activate through the document route: {decisions:#?}"
+    );
+    let findings = report["runs"][0]["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("findings array: {report}"));
+    assert_eq!(
+        findings.len(),
+        1,
+        "the activated summary must carry the taint to the sink through the CLI \
+         route: {report}"
+    );
+
+    // Fail-before control: the same workspace and policy with no packs
+    // document. `external` is unmodeled, so `require-model` yields no finding
+    // and the run stays honestly inconclusive rather than vacuously clean. Only
+    // the pack can have carried the finding above.
+    let without_pack = InlineTestProject::new()
+        .file("src/App.java", SUMMARY_TAINT_SOURCE)
+        .file("policies/summary-taint.rqlp", SUMMARY_TAINT_POLICY)
+        .build();
+    let unmodeled = run(without_pack.root(), SUMMARY_TAINT_ARGS);
+    let unmodeled_report = json_stdout(&unmodeled);
+    assert!(
+        unmodeled_report.get("packs").is_none(),
+        "a run without a packs document activates nothing: {unmodeled_report}"
+    );
+    assert!(
+        unmodeled_report["runs"][0]["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("findings array: {unmodeled_report}"))
+            .is_empty(),
+        "without a model the flow must not reach the sink: {unmodeled_report}"
+    );
+    assert_eq!(
+        unmodeled_report["runs"][0]["completion"]["type"], "inconclusive",
+        "the unmodeled external call must surface as incompleteness, not a clean \
+         pass: {unmodeled_report}"
+    );
+
+    // Honesty near miss: a pack that is selected but whose summary does not
+    // cover `external` must not manufacture a finding. Activation carries the
+    // summaries into taint exactly as above, but the uncovered call stays
+    // unmodeled, so the run matches the fail-before control.
+    let uncovered = InlineTestProject::new()
+        .file("src/App.java", SUMMARY_TAINT_SOURCE)
+        .file("policies/summary-taint.rqlp", SUMMARY_TAINT_POLICY)
+        .file(".bifrost/packs.json", PACKS_DOCUMENT_JVM)
+        .build();
+    install_fixture_pack(uncovered.root(), SUMMARY_TAINT_UNCOVERED_PACK);
+    let selected_but_uncovered = run_with_java_home(
+        uncovered.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        SUMMARY_TAINT_ARGS,
+    );
+    let uncovered_report = json_stdout(&selected_but_uncovered);
+    let decisions = uncovered_report["packs"]["decisions"]
+        .as_array()
+        .expect("decisions");
+    assert!(
+        decisions.iter().any(|decision| {
+            decision["pack"] == "fixture.jdk@21.0.2" && decision["status"] == "selected"
+        }),
+        "the uncovered pack still activates through the document route: {decisions:#?}"
+    );
+    assert!(
+        uncovered_report["runs"][0]["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("findings array: {uncovered_report}"))
+            .is_empty(),
+        "a selected pack whose summary does not cover the call must not \
+         manufacture a finding: {uncovered_report}"
+    );
+}
