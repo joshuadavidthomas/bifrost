@@ -145,9 +145,6 @@ pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
             for import in &imports {
                 crate::lexical_scope::insert_rust_import_binding(&mut impl_import_binder, import);
             }
-            parsed
-                .import_statements
-                .extend(imports.iter().map(|import| import.raw_snippet.clone()));
             parsed.imports.extend(imports);
         }
     }
@@ -251,6 +248,12 @@ pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
             _ => {}
         }
     }
+
+    // The per-file usage facts persisted to the `rust_*` fact tables. Extracted
+    // here, from the tree this pass already holds, so nothing re-parses later
+    // to answer a usage query (ExecPlan `.agents/plans/rust-usage-index-v2.md`).
+    parsed.rust_usage_facts =
+        crate::facts::extract_rust_usage_facts(root, source, &item_macro_definitions);
 
     parsed
 }
@@ -760,9 +763,6 @@ fn visit_rust_macro_invocation_definitions(
             for import in &imports {
                 crate::lexical_scope::insert_rust_import_binding(&mut interior_binder, import);
             }
-            parsed
-                .import_statements
-                .extend(imports.iter().map(|import| import.raw_snippet.clone()));
             parsed.imports.extend(imports);
         }
     }
@@ -995,14 +995,9 @@ fn rust_is_identifier_like(node: Node<'_>) -> bool {
     )
 }
 
-#[derive(Debug, Clone)]
-pub struct RustRulesItemMacroDefinition {
-    pub name: String,
-    pub visible_after: usize,
-    pub scope_start: usize,
-    pub scope_end: usize,
-    pub passthrough: bool,
-}
+/// Re-exported from core, where the persisted Rust module-route facts that
+/// carry it live.
+pub use brokk_bifrost_core::analyzer::rust_facts::RustRulesItemMacroDefinition;
 
 pub fn rust_rules_item_macro_definitions(
     root: Node<'_>,

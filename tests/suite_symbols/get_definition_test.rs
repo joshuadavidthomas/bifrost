@@ -15915,6 +15915,7 @@ public class Consumer extends pkg.Base {
         return collision + inheritedCollision + importedOnly;
     }
 }
+
 "#;
     let project = InlineTestProject::with_language(Language::Java)
         .file(
@@ -15951,6 +15952,250 @@ public class ImportedFields {
         assert_eq!(result["definitions"][0]["fqn"], expected, "{name}: {value}");
         assert_eq!(result["definitions"][0]["kind"], "field", "{name}: {value}");
     }
+}
+
+#[test]
+fn java_nested_class_resolves_inherited_field() {
+    let source = r#"
+class Outer {
+    static class Base {
+        protected int data;
+    }
+
+    static class Child extends Base {
+        int read() {
+            return data;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source.rfind("data;").expect("inherited field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "Outer.Base.data",
+        "{value}"
+    );
+}
+
+#[test]
+fn java_nested_class_resolves_enclosing_type_method() {
+    let source = r#"
+class Outer {
+    static void helper() {}
+
+    static class Child {
+        void run() {
+            helper();
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source.rfind("helper();").expect("enclosing method call");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Outer.helper", "{value}");
+}
+
+#[test]
+fn java_non_static_inner_class_resolves_enclosing_instance_field() {
+    let source = r#"
+class Outer {
+    int value;
+
+    class Child {
+        int read() {
+            return value;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source
+        .rfind("value;")
+        .expect("enclosing instance field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "Outer.value", "{value}");
+}
+
+#[test]
+fn java_static_nested_class_does_not_resolve_enclosing_instance_field() {
+    let source = r#"
+class Outer {
+    int value;
+
+    static class Child {
+        int read() {
+            return value;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source
+        .rfind("value;")
+        .expect("illegal enclosing instance field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn java_static_inner_method_does_not_resolve_outer_instance_field() {
+    let source = r#"
+class Outer {
+    int value;
+
+    class Child {
+        static int read() {
+            return value;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source.rfind("value;").expect("illegal outer field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn java_static_initializer_does_not_resolve_outer_instance_field() {
+    let source = r#"
+class Outer {
+    int value;
+
+    class Child {
+        static {
+            int copy = value;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source.rfind("value;").expect("illegal outer field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+}
+
+#[test]
+fn java_interface_field_is_static_in_nested_static_context() {
+    let source = r#"
+interface Outer {
+    int VALUE = 1;
+
+    class Child {
+        static int read() {
+            return VALUE;
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source.rfind("VALUE;").expect("implicit static field read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(value["results"][0]["definitions"][0]["fqn"], "Outer.VALUE");
+}
+
+#[test]
+fn java_enum_constant_is_static_in_static_method() {
+    let source = r#"
+enum Choice {
+    YES;
+
+    static int read() {
+        return YES.ordinal();
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Choice.java", source)
+        .build();
+
+    let start = source.rfind("YES.ordinal").expect("enum constant read");
+    let value = lookup(
+        project.root(),
+        &location_reference("Choice.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "resolved", "{value}");
+    assert_eq!(value["results"][0]["definitions"][0]["fqn"], "Choice.YES");
+}
+
+#[test]
+fn java_inner_member_name_obscures_outer_method_when_arity_is_wrong() {
+    let source = r#"
+class Outer {
+    static void helper() {}
+
+    class Child {
+        void helper(int value) {}
+
+        void run() {
+            helper();
+        }
+    }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Outer.java", source)
+        .build();
+
+    let start = source
+        .rfind("helper();")
+        .expect("obscured outer method call");
+    let value = lookup(
+        project.root(),
+        &location_reference("Outer.java", source, start),
+    );
+    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
 }
 
 #[test]

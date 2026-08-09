@@ -273,6 +273,7 @@ pub fn visit_class_like(
         }
         let raw_supertypes = extract_raw_supertypes(node, source);
         let signature = class_signature(node, source);
+        let class_is_static = java_class_like_is_static(node, parent.as_ref());
 
         let top_level = top_level_owner.unwrap_or_else(|| code_unit.clone());
         parsed.add_code_unit(
@@ -291,10 +292,12 @@ pub fn visit_class_like(
         // class that names one in its `implements` clause implements it.
         parsed.add_signature_with_metadata(
             code_unit.clone(),
-            SignatureMetadata::new(signature, Vec::new()).with_class_like_interface(matches!(
-                node.kind(),
-                "interface_declaration" | "annotation_type_declaration"
-            )),
+            SignatureMetadata::new(signature, Vec::new())
+                .with_class_like_interface(matches!(
+                    node.kind(),
+                    "interface_declaration" | "annotation_type_declaration"
+                ))
+                .with_class_like_static(class_is_static),
         );
 
         if node.kind() == "record_declaration" {
@@ -591,24 +594,38 @@ fn visit_field_declaration(
 }
 
 fn java_field_modifiers(field: Node<'_>) -> (bool, bool) {
-    let Some(modifiers) = (0..field.named_child_count())
+    let modifiers = (0..field.named_child_count())
         .filter_map(|index| field.named_child(index))
-        .find(|child| child.kind() == "modifiers")
-    else {
-        return (false, false);
-    };
+        .find(|child| child.kind() == "modifiers");
     let mut is_static = false;
     let mut is_final = false;
-    for index in 0..modifiers.child_count() {
-        let Some(modifier) = modifiers.child(index) else {
-            continue;
-        };
-        match modifier.kind() {
-            "static" => is_static = true,
-            "final" => is_final = true,
-            _ => {}
+    if let Some(modifiers) = modifiers {
+        for index in 0..modifiers.child_count() {
+            let Some(modifier) = modifiers.child(index) else {
+                continue;
+            };
+            match modifier.kind() {
+                "static" => is_static = true,
+                "final" => is_final = true,
+                _ => {}
+            }
         }
     }
+
+    let mut ancestor = field.parent();
+    let mut implicit_static_final = false;
+    while let Some(current) = ancestor {
+        if is_class_like_declaration_kind(current.kind()) {
+            implicit_static_final = matches!(
+                current.kind(),
+                "interface_declaration" | "annotation_type_declaration"
+            );
+            break;
+        }
+        ancestor = current.parent();
+    }
+    is_static |= implicit_static_final;
+    is_final |= implicit_static_final;
     (is_static, is_final)
 }
 
@@ -698,7 +715,11 @@ fn visit_enum_constant(
         Some(parent.clone()),
         Some(top_level.clone()),
     );
-    parsed.add_signature(code_unit, enum_constant_signature(node, source));
+    parsed.add_signature_with_metadata(
+        code_unit,
+        SignatureMetadata::new(enum_constant_signature(node, source), Vec::new())
+            .with_field_modifiers(true, true),
+    );
 }
 
 fn collect_lambda_expressions(
@@ -1050,6 +1071,34 @@ fn class_signature(node: Node<'_>, source: &str) -> String {
     format!("{} {{", normalize_whitespace(header))
 }
 
+fn java_class_like_is_static(node: Node<'_>, parent: Option<&CodeUnit>) -> bool {
+    if parent.is_none() {
+        return false;
+    }
+    if matches!(
+        node.kind(),
+        "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+    ) || java_callable_modifiers(node).is_static
+    {
+        return true;
+    }
+
+    let mut ancestor = node.parent();
+    while let Some(current) = ancestor {
+        if is_class_like_declaration_kind(current.kind()) {
+            return matches!(
+                current.kind(),
+                "interface_declaration" | "annotation_type_declaration"
+            );
+        }
+        ancestor = current.parent();
+    }
+    false
+}
+
 fn callable_signature(node: Node<'_>, source: &str) -> String {
     let end = node
         .child_by_field_name("body")
@@ -1373,7 +1422,7 @@ pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
     let package_name = determine_package_name(root, source);
     let mut parsed = ParsedFile::new(package_name.clone());
     collect_type_identifiers(root, source, &mut parsed.type_identifiers);
-    let module_code_unit =
+    let package_module_code_unit =
         (!package_name.is_empty()).then(|| module_code_unit(file, &package_name));
 
     for index in 0..root.named_child_count() {
@@ -1383,14 +1432,13 @@ pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
 
         match child.kind() {
             "package_declaration" => {
-                if let Some(module) = &module_code_unit {
+                if let Some(module) = &package_module_code_unit {
                     parsed.add_code_unit(module.clone(), child, source, None, Some(module.clone()));
                     parsed.add_signature(module.clone(), format!("package {};", package_name));
                 }
             }
             "import_declaration" => {
                 let raw = node_text(child, source).trim().to_string();
-                parsed.import_statements.push(raw.clone());
                 parsed.imports.push(parse_import_info(child, source, raw));
             }
             "class_declaration"
@@ -1400,7 +1448,8 @@ pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
             | "annotation_type_declaration" => {
                 let class_code_unit =
                     visit_class_like(file, source, child, &package_name, None, None, &mut parsed);
-                if let (Some(module), Some(class_code_unit)) = (&module_code_unit, class_code_unit)
+                if let (Some(module), Some(class_code_unit)) =
+                    (&package_module_code_unit, class_code_unit)
                 {
                     parsed.add_child(module.clone(), class_code_unit);
                 }

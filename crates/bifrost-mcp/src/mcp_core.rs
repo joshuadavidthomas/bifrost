@@ -52,7 +52,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         "scan_usages_by_reference"
     };
     let search_symbols_description = format!(
-        "Find classes, functions, methods, fields, modules, and other indexed declarations by name. Use this first for broad or partial symbol discovery, then pass fully qualified results to get_symbol_sources or {scan_tool_name}."
+        "Find classes, functions, methods, fields, modules, and other indexed declarations by name. Use this first for broad or partial symbol discovery, then pass fully qualified results to get_symbol_sources or {scan_tool_name}. Patterns that match too many symbols to rank return a too_many_matches count instead of results; re-run with more specific patterns."
     );
 
     let mut descriptors = vec![
@@ -88,12 +88,12 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
         ),
         tool_descriptor(
             "get_symbol_sources",
-            "Read exact source blocks for known symbols after search_symbols. File paths/globs return flat top-level symbol outlines as a secondary file-backed view; use get_summaries for broader structure.",
+            "Read exact source blocks for known symbols after search_symbols. File paths/globs return flat top-level symbol outlines as a secondary file-backed view; use get_summaries for broader structure. A glob that matches more files than the per-target limit is skipped and reported under too_broad with a sample of the match; narrow it or list explicit files.",
             symbol_names_schema(),
         ),
         tool_descriptor(
             "get_summaries",
-            "Summarize code or navigate containers. Use a directory target like an `ls` to list its immediate child directories and git-visible files (tracked or unignored), including non-source files; gitignored files are excluded. Use an OO namespace or language package/import target like a semantic `ls` to list direct child packages and top-level types declared in that exact package. Real filesystem directories win name collisions, and mixed target kinds are accepted in one call. Literal files, globs, classes, and modules return ranged summaries. Oversized ordinary summaries degrade to compact_symbols; oversized listings retain a total count and set truncated. Examples: [\"src/auth\"], [\"com.example.auth\"], [\"github.com/cli/cli/v2/internal/skills/discovery\"], [\"src/auth/**/*.rs\", \"MyClass\"].",
+            "Summarize code or navigate containers. Use a narrow directory target like an `ls` to list its immediate child directories and git-visible files (tracked or unignored), including non-source files; gitignored files are excluded. Do not pass `/`, the repository root, or a broad source tree in a large repository; narrow the target to the package or source directory that matters. Use an OO namespace or language package/import target like a semantic `ls` to list direct child packages and top-level types declared in that exact package. Real filesystem directories win name collisions, and mixed target kinds are accepted in one call. Literal files, globs, classes, and modules return ranged summaries. Oversized ordinary summaries degrade to compact_symbols; oversized listings retain a total count and set truncated. A glob target that matches more files than the per-target limit is skipped and reported under too_broad with a sample of the match; narrow it or use list_symbols. Examples: [\"src/auth\"], [\"com.example.auth\"], [\"github.com/cli/cli/v2/internal/skills/discovery\"], [\"src/auth/**/*.rs\", \"MyClass\"].",
             summaries_schema(),
         ),
         scan_descriptor,
@@ -105,7 +105,7 @@ pub(crate) fn symbol_tool_descriptors(render_line_numbers: bool) -> Vec<Value> {
     descriptors.push(rename_symbol_descriptor());
     descriptors.push(tool_descriptor(
         "usage_graph",
-        "Return the whole-workspace caller->callee reference graph in one call: classes and functions as nodes, resolved references as weighted edges. Use to build a code map or rank symbols by importance instead of issuing one per-symbol scan-usage call. Each edge carries its reference locations as a `sites` array of {path, line} (1-based), so you can map call sites without re-scanning; the site count equals the edge weight. Edges reuse scan-usage resolution; symbols whose call sites exceed the enumeration guardrail are listed under truncated_symbols with their inbound edges omitted.",
+        "Build a whole-workspace caller->callee reference graph. This is an expensive batch analysis, not a normal file-localization lookup. Use it only when the task explicitly needs caller/callee relationships or a workspace-wide code map; prefer search_symbols, get_summaries, get_symbol_sources, or a scoped usage query for ordinary localization. Each edge carries its reference locations as a `sites` array of {path, line} (1-based), so you can map call sites without re-scanning; the site count equals the edge weight. Edges reuse scan-usage resolution; symbols whose call sites exceed the enumeration guardrail are listed under truncated_symbols with their inbound edges omitted.",
         json!({
             "type": "object",
             "properties": {
@@ -241,7 +241,7 @@ fn scan_usages_by_reference_descriptor() -> Value {
                     "type": "array",
                     "minItems": 1,
                     "items": { "type": "string", "pattern": "\\S" },
-                    "description": "Fully qualified symbols from search_symbols are preferred; short names may resolve fuzzily or become ambiguous."
+                    "description": "Fully qualified symbols from search_symbols are preferred; short names may resolve fuzzily or become ambiguous. A short name that hundreds of declarations answer is reported as ambiguous with `too_many_candidates` (the true count and the cap) and no candidate list -- qualify it and re-call."
                 },
                 "include_tests": {
                     "type": "boolean",
@@ -389,7 +389,7 @@ pub(crate) fn workspace_tool_descriptors() -> Vec<Value> {
         ),
         tool_descriptor(
             "get_active_workspace",
-            "Return the current active workspace root, including after any prior workspace switch; use this to confirm which repository later tools will inspect.",
+            "Return the current active workspace root, including after any prior workspace switch; use this to confirm which repository later tools will inspect. Also reports usage_index_ready: other tools block until any background usage-analysis catch-up finishes, so call this first if you would rather do something else than wait.",
             json_schema_object(&[]),
         ),
     ]

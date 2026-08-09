@@ -51,9 +51,7 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
         };
         match child.kind() {
             "import_statement" => {
-                let raw = node_text(child, source).trim().to_string();
                 module_has_imports = true;
-                parsed.import_statements.push(raw.clone());
                 parsed
                     .imports
                     .extend(parse_es_import_infos_from_node(child, source));
@@ -61,9 +59,7 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
             "expression_statement" => {
                 let imports = parse_commonjs_require_import_infos_from_node(child, source);
                 if !imports.is_empty() {
-                    let raw = node_text(child, source).trim().to_string();
                     module_has_imports = true;
-                    parsed.import_statements.push(raw);
                     parsed.imports.extend(imports);
                 }
             }
@@ -79,9 +75,7 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
             "lexical_declaration" | "variable_declaration" => {
                 let imports = parse_commonjs_require_import_infos_from_node(child, source);
                 if !imports.is_empty() {
-                    let raw = node_text(child, source).trim().to_string();
                     module_has_imports = true;
-                    parsed.import_statements.push(raw);
                     parsed.imports.extend(imports);
                 }
                 visit_js_variable_statement(

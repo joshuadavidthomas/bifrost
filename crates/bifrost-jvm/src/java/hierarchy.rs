@@ -9,10 +9,13 @@
 
 use brokk_bifrost_core::analyzer::CodeUnitIndex;
 use brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex;
-use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo, Range};
+use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
+use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo, Language, Range};
 use brokk_bifrost_core::hash::HashMap;
 
-use crate::java::graph_support::{JavaSource, resolve_java_forward_type_name};
+use crate::java::graph_support::{
+    JavaSource, resolve_java_forward_type_name, resolve_java_lexical_type_name,
+};
 use crate::java::imports::non_static_import_path;
 
 const HIERARCHY_FACT_BATCH_SIZE: usize = 4_096;
@@ -50,7 +53,10 @@ pub fn java_direct_ancestors(source: &dyn JavaSource, code_unit: &CodeUnit) -> V
     source
         .raw_supertypes_of(code_unit)
         .iter()
-        .filter_map(|raw_name| resolve_java_forward_type_name(source, code_unit.source(), raw_name))
+        .filter_map(|raw_name| {
+            resolve_java_lexical_type_name(source, code_unit, raw_name)
+                .or_else(|| resolve_java_forward_type_name(source, code_unit.source(), raw_name))
+        })
         .collect()
 }
 
@@ -119,12 +125,13 @@ where
             let descendant = u32::try_from(candidate_index)
                 .expect("Java hierarchy declarations must fit in a u32");
             for raw in facts.raw_supertypes().iter() {
-                let Some(resolved) = resolve_hierarchy_type_index(
+                let resolved = resolve_hierarchy_type_index(
                     raw,
-                    candidate.package_name(),
+                    candidate,
                     facts.imports(),
                     &types_by_fq_name,
-                ) else {
+                );
+                let Some(resolved) = resolved else {
                     continue;
                 };
                 let ancestor = same_source_hierarchy_identity(
@@ -163,7 +170,7 @@ fn java_definition_sort_key(
 
 fn resolve_hierarchy_type_index(
     raw_name: &str,
-    package_name: &str,
+    candidate: &CodeUnit,
     imports: &[ImportInfo],
     types_by_fq_name: &HashMap<String, JavaHierarchyTypeBucket>,
 ) -> Option<usize> {
@@ -177,6 +184,14 @@ fn resolve_hierarchy_type_index(
     {
         return Some(index);
     }
+
+    if let Some(index) =
+        resolve_lexical_hierarchy_type_index(normalized, candidate, types_by_fq_name)
+    {
+        return Some(index);
+    }
+
+    let package_name = candidate.package_name();
 
     for import in imports {
         let Some(import_path) = non_static_import_path(import) else {
@@ -225,6 +240,28 @@ fn resolve_hierarchy_type_index(
     };
     hierarchy_type_index(types_by_fq_name, &same_package_fqn)
         .or_else(|| hierarchy_type_index(types_by_fq_name, normalized))
+}
+
+fn resolve_lexical_hierarchy_type_index(
+    normalized: &str,
+    candidate: &CodeUnit,
+    types_by_fq_name: &HashMap<String, JavaHierarchyTypeBucket>,
+) -> Option<usize> {
+    if normalized.contains('.') {
+        return None;
+    }
+    let package_end = candidate.package_segment_count();
+    let type_end = candidate.fq().len().saturating_sub(1);
+    let interner = segment_interner();
+    for owner_end in (package_end.saturating_add(1)..=type_end).rev() {
+        let owner = candidate.fq().prefix(owner_end);
+        let target = owner.with_pushed(interner.intern(normalized, SegmentKind::Type));
+        let target_fqn = target.display_native(Language::Java, interner);
+        if let Some(index) = hierarchy_type_index(types_by_fq_name, &target_fqn) {
+            return Some(index);
+        }
+    }
+    None
 }
 
 fn hierarchy_type_index(

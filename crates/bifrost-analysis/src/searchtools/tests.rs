@@ -1,18 +1,22 @@
+use super::SearchSymbolsParams;
+use super::navigation::search_symbols_with_cap;
 use super::scan_usages::render_symbol_usages;
 use super::summaries::SummariesParams;
 use super::{
     ContainerListingEntry, DefinitionCandidateRenderCache, ScanUsageRequest,
     ScanUsagesAbsenceCaveat, ScanUsagesByLocationParams, ScanUsagesCandidateFilesSample,
     ScanUsagesExecutionContext, ScanUsagesIncompleteReason, ScanUsagesStatus, ScanUsagesSurface,
-    ScanUsagesTarget, ScanUsagesWorkEntry, SymbolLookupParams, SymbolUsageRenderState,
-    UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering, classify_scan_usages_entry,
-    definition_candidate_from_range, get_summaries, get_symbol_sources, list_symbols,
-    resolve_file_patterns, scan_usages_by_location_with_context, trim_summary_signature,
+    ScanUsagesTarget, ScanUsagesWorkEntry, SymbolLookupParams, SymbolSourcesResult,
+    SymbolUsageRenderState, UsageFailureInfo, UsageHitKind, UsageHitRow, UsageRendering,
+    classify_scan_usages_entry, definition_candidate_from_range, get_summaries, get_symbol_sources,
+    list_symbols, resolve_file_patterns, scan_usages_by_location_with_context,
+    symbol_source_candidate_files, trim_summary_signature,
 };
 use super::{function_like_macro_query, route_summary_targets, usage_failure_hint};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, DeclarationInfo, IAnalyzer, Language, Project, ProjectFile, Range,
 };
+use crate::searchtools_render::{RenderOptions, RenderText};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -58,6 +62,10 @@ struct CountingAnalyzer {
     project: CountingProject,
     analyzed_files_calls: AtomicUsize,
     search_definitions_calls: AtomicUsize,
+    /// Declarations `search_definitions` reports, which the default
+    /// `IAnalyzer::search_symbol_candidates` turns into search candidates.
+    /// Empty unless a test asks for them, so every other test is unaffected.
+    search_definition_results: BTreeSet<CodeUnit>,
 }
 
 impl CountingAnalyzer {
@@ -70,7 +78,13 @@ impl CountingAnalyzer {
             project: CountingProject::new(root, files),
             analyzed_files_calls: AtomicUsize::new(0),
             search_definitions_calls: AtomicUsize::new(0),
+            search_definition_results: BTreeSet::new(),
         }
+    }
+
+    fn with_search_definitions(mut self, code_units: impl IntoIterator<Item = CodeUnit>) -> Self {
+        self.search_definition_results = code_units.into_iter().collect();
+        self
     }
 
     fn analyzed_files_calls(&self) -> usize {
@@ -131,8 +145,18 @@ impl CodeUnitIndex for CountingAnalyzer {
         Vec::new()
     }
 
-    fn ranges_of(&self, _code_unit: &CodeUnit) -> Vec<Range> {
-        Vec::new()
+    // `ranges_of` defaults to this, so overriding `ranges` alone keeps the two
+    // consistent for every caller.
+    fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        if !self.search_definition_results.contains(code_unit) {
+            return Vec::new();
+        }
+        vec![Range {
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            end_line: 1,
+        }]
     }
 
     fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
@@ -154,7 +178,11 @@ impl CodeUnitIndex for CountingAnalyzer {
     fn search_definitions(&self, _pattern: &str, _auto_quote: bool) -> BTreeSet<CodeUnit> {
         self.search_definitions_calls
             .fetch_add(1, Ordering::Relaxed);
-        BTreeSet::new()
+        self.search_definition_results.clone()
+    }
+
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        true
     }
 }
 
@@ -164,6 +192,7 @@ impl IAnalyzer for CountingAnalyzer {
             project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
             analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
             search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
+            search_definition_results: self.search_definition_results.clone(),
         }
     }
 
@@ -172,6 +201,7 @@ impl IAnalyzer for CountingAnalyzer {
             project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
             analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
             search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
+            search_definition_results: self.search_definition_results.clone(),
         }
     }
 
@@ -242,6 +272,28 @@ fn broad_navigation_fallback_omits_unproven_columns() {
     let value = serde_json::to_value(candidate).unwrap();
     assert!(value.get("start_column").is_none(), "{value}");
     assert!(value.get("end_column").is_none(), "{value}");
+}
+
+#[test]
+fn complete_symbol_index_skips_enclosing_owner_regex_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let analyzer = CountingAnalyzer::new(root, &["Broken.java"]);
+    let result = SymbolSourcesResult {
+        sources: Vec::new(),
+        not_found: vec![super::NotFoundInput {
+            input: "missing.Owner.member".to_string(),
+            note: None,
+        }],
+        ambiguous: Vec::new(),
+        ambiguous_paths: Vec::new(),
+        too_broad: Vec::new(),
+    };
+
+    let files = symbol_source_candidate_files(&analyzer, &result);
+
+    assert!(files.is_empty());
+    assert_eq!(analyzer.search_definitions_calls(), 0);
 }
 
 #[test]
@@ -423,6 +475,52 @@ fn missing_explicit_source_paths_skip_fuzzy_symbol_resolution() {
         0,
         analyzer.analyzed_files_calls(),
         "explicit missing source paths must not enumerate files for nonexistent directories"
+    );
+}
+
+#[test]
+fn complete_symbol_index_miss_skips_broad_fuzzy_scan() {
+    let root = std::env::current_dir().unwrap();
+    let analyzer = CountingAnalyzer::new(root, &["src/Present.java"]);
+
+    let sources = get_symbol_sources(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec!["org.example.MissingType".to_string()],
+        },
+    );
+
+    assert_eq!(1, sources.not_found.len(), "{sources:#?}");
+    assert!(sources.sources.is_empty(), "{sources:#?}");
+    assert_eq!(
+        0,
+        analyzer.search_definitions_calls(),
+        "a complete index makes a qualified miss conclusive"
+    );
+}
+
+#[test]
+fn missing_extensionless_directory_paths_skip_package_and_fuzzy_resolution() {
+    let root = std::env::current_dir().unwrap();
+    let analyzer = CountingAnalyzer::new(root, &["src/Present.java"]);
+    let summaries = get_summaries(
+        &analyzer,
+        SummariesParams {
+            targets: vec!["pkg/admission/plugin/webhook".to_string()],
+        },
+    );
+
+    assert_eq!(1, summaries.not_found.len(), "{summaries:#?}");
+    assert!(summaries.summaries.is_empty(), "{summaries:#?}");
+    assert_eq!(
+        0,
+        analyzer.search_definitions_calls(),
+        "missing relative directory paths must not enter fuzzy symbol resolution"
+    );
+    assert_eq!(
+        0,
+        analyzer.analyzed_files_calls(),
+        "missing relative directory paths must not enumerate analyzed files"
     );
 }
 
@@ -966,14 +1064,14 @@ fn issue_1228_time_budget_is_explicit_and_never_reports_verified_absence() {
     assert_eq!(json["results"][0]["reason_kind"], "time_budget");
 }
 
-/// #1100: `excluded_test_files` decides membership from paths alone instead of
+/// #1100: `TestFileExclusion` decides membership from paths alone instead of
 /// hydrating every file's FileState. This pins the equivalence argument: the
 /// path-only predicate must produce exactly the set the full classification
 /// would exclude (Test and TestSupport are both excluded and both require
 /// `test_like`; Production/Ambiguous are never test_like), across fixtures
 /// covering all classification shapes.
 #[test]
-fn excluded_test_files_path_predicate_matches_full_classification() {
+fn test_file_exclusion_path_predicate_matches_full_classification() {
     let temp = tempfile::TempDir::new().unwrap();
     let root = temp.path();
     for (path, content) in [
@@ -999,7 +1097,13 @@ fn excluded_test_files_path_predicate_matches_full_classification() {
     let project = crate::analyzer::TestProject::new(root.to_path_buf(), Language::TypeScript);
     let analyzer = crate::analyzer::TypescriptAnalyzer::from_project(project);
 
-    let by_path = super::scan_usages::excluded_test_files(&analyzer, false).expect("excluded set");
+    let exclusion =
+        super::scan_usages::test_file_exclusion(&analyzer, false).expect("an exclusion");
+    let by_path: crate::hash::HashSet<ProjectFile> = analyzer
+        .analyzed_files()
+        .into_iter()
+        .filter(|file| exclusion.excludes(file))
+        .collect();
     let by_classification: crate::hash::HashSet<ProjectFile> = analyzer
         .analyzed_files()
         .into_iter()
@@ -1012,12 +1116,95 @@ fn excluded_test_files_path_predicate_matches_full_classification() {
         })
         .collect();
     assert_eq!(
-        *by_path, by_classification,
+        by_path, by_classification,
         "path-only exclusion must equal full-classification exclusion"
     );
     assert!(
         !by_path.is_empty(),
         "fixture must actually produce excluded files or the equivalence is vacuous"
+    );
+}
+
+/// The scan prologue must not pre-classify the workspace. `excluded_test_files`
+/// used to build its exclusion set by asking `is_test_like_file` about every
+/// analyzed file before any symbol work: 29,748 files and 2.30-2.78 s of a 3 s
+/// budget on the rustc tree, with `file_is_test_only` pulling the Rust
+/// cargo-route index in behind it
+/// (`.agents/docs/gate-cell-overhead-2026-08.md`). The classification is now
+/// driven by the candidate filter, so a scan whose target has a handful of
+/// candidate files classifies a handful of files.
+///
+/// The pin is the ratio, not a constant: the fixture's workspace is an order of
+/// magnitude larger than the candidate set, and the count has to track the
+/// candidates. Under the pre-classifying shape this assertion reads the
+/// workspace size and fails.
+#[test]
+fn a_scan_classifies_its_candidate_files_not_its_workspace() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let root = temp.path();
+    // One production file the scan resolves in, one caller that references it,
+    // and a large unrelated remainder — half of it under `tests/`, so the
+    // eager set-build had real work to do on every one of them.
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(
+        root.join("src/target.ts"),
+        "export function scanned_target() { return 1; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/caller.ts"),
+        "import { scanned_target } from './target';\nexport const used = scanned_target();\n",
+    )
+    .unwrap();
+    const UNRELATED: usize = 200;
+    for index in 0..UNRELATED {
+        std::fs::write(
+            root.join(format!("src/unrelated_{index}.ts")),
+            format!("export function unrelated_{index}() {{ return {index}; }}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(format!("tests/unrelated_{index}.test.ts")),
+            format!("test('u{index}', () => {{ expect({index}).toBe({index}); }});\n"),
+        )
+        .unwrap();
+    }
+    let project = crate::analyzer::TestProject::new(root.to_path_buf(), Language::TypeScript);
+    let analyzer = crate::analyzer::TypescriptAnalyzer::from_project(project);
+    let workspace_files = analyzer.analyzed_files().len();
+    assert!(
+        workspace_files >= 2 * UNRELATED,
+        "fixture must be workspace-scale: {workspace_files} files"
+    );
+
+    let exclusion =
+        super::scan_usages::test_file_exclusion(&analyzer, false).expect("an exclusion");
+    assert_eq!(
+        0,
+        exclusion.classified_count(),
+        "building the exclusion must classify nothing"
+    );
+
+    let overloads: Vec<CodeUnit> = analyzer.definitions("scanned_target").collect();
+    assert!(!overloads.is_empty(), "fixture target must resolve");
+    let query = super::scan_usages::scoped_usage_finder(Some(&exclusion), None).query(
+        &analyzer,
+        &overloads,
+        crate::analyzer::usages::DEFAULT_MAX_FILES,
+        crate::analyzer::usages::DEFAULT_MAX_USAGES,
+    );
+    assert!(
+        !query.candidate_files.is_empty(),
+        "the scan must have read candidate files: {:?}",
+        query.candidate_files
+    );
+    let classified = exclusion.classified_count();
+    assert!(
+        classified <= 4 * query.candidate_files.len(),
+        "classification must track the candidate set ({} files), not the workspace \
+         ({workspace_files} files): {classified} classified",
+        query.candidate_files.len()
     );
 }
 
@@ -1329,4 +1516,70 @@ pub fn helper() {}
         expectation_failures.join("\n")
     );
     assert!(!cancellation.is_cancelled());
+}
+
+/// `count` distinct class declarations in one file, all reported by
+/// `CountingAnalyzer::search_definitions` regardless of the pattern, so a test
+/// controls the candidate count exactly.
+fn widget_declarations(root: &Path, count: usize) -> Vec<CodeUnit> {
+    let file = ProjectFile::new(root.to_path_buf(), "src/Widget.java");
+    (0..count)
+        .map(|index| {
+            CodeUnit::new(
+                file.clone(),
+                CodeUnitType::Class,
+                "app",
+                format!("Widget{index}"),
+            )
+        })
+        .collect()
+}
+
+fn widget_search_params(limit: usize) -> SearchSymbolsParams {
+    SearchSymbolsParams {
+        patterns: vec!["Widget".to_string()],
+        include_tests: false,
+        limit,
+    }
+}
+
+#[test]
+fn search_symbols_over_candidate_cap_skips_ranking_and_reports_the_totals() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let analyzer = CountingAnalyzer::new(root.clone(), &["src/Widget.java"])
+        .with_search_definitions(widget_declarations(&root, 5));
+
+    let result = search_symbols_with_cap(&analyzer, widget_search_params(100), 3, None);
+
+    let too_many = result
+        .too_many_matches
+        .as_ref()
+        .expect("five candidates over a cap of three must report the overload");
+    assert_eq!(5, too_many.total_candidates);
+    assert_eq!(3, too_many.cap);
+    assert!(result.truncated);
+    assert!(result.files.is_empty(), "{:?}", result.files);
+    assert_eq!(0, result.total_files);
+
+    let rendered = result.render_text(RenderOptions::default());
+    assert!(rendered.contains('5'), "{rendered}");
+    assert!(rendered.contains('3'), "{rendered}");
+    assert!(rendered.contains("Widget"), "{rendered}");
+    assert!(rendered.contains("more specific"), "{rendered}");
+}
+
+#[test]
+fn search_symbols_under_candidate_cap_ranks_and_reports_files_as_before() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let analyzer = CountingAnalyzer::new(root.clone(), &["src/Widget.java"])
+        .with_search_definitions(widget_declarations(&root, 5));
+
+    let result = search_symbols_with_cap(&analyzer, widget_search_params(100), 10, None);
+
+    assert!(result.too_many_matches.is_none());
+    assert_eq!(1, result.total_files);
+    assert_eq!(1, result.files.len(), "{:?}", result.files);
+    assert_eq!(5, result.files[0].classes.len(), "{:?}", result.files[0]);
 }

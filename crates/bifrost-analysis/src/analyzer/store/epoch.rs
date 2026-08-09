@@ -28,9 +28,14 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
-// v7: `ImportInfo` gained `binder_span` (#1600), which changes the bincode
-// layout of every persisted import row.
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v7-import-binder-span";
+// v9: migration 0019 merged `import_details` into `import_statements`, so an
+// import is one row per binding instead of a raw statement plus a bincode
+// `ImportInfo`. What the writer records changed as well as where: Go segments
+// its import path, C# records a structured path and its `global using` flag,
+// and Scala and TypeScript now emit one row per binding rather than one per
+// declaration. `binder_span` (#1600) rides along as a column on that row
+// rather than as a bincode field, because the blob it used to live in is gone.
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v9-import-bindings-with-binder-span";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
@@ -206,11 +211,14 @@ macro_rules! lang_epoch {
 // the salted content now comes from a different crate's `include_str!`. The
 // bytes are unchanged, which is exactly why the salt has to carry the
 // relocation.
+// Salt bumped again (#1905): Java class-like signature metadata now records
+// explicit and implicit static nested declarations. Warm rows without this
+// fact would admit illegal outer-instance member resolution.
 lang_epoch!(
     Java,
     "java",
     "treesitter/java/",
-    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;native-callable-modifier-metadata-2026-08"
+    "synthetic-file-scope-code-units-2026-07;no-implicit-constructor-units-2026-07;source-backed-package-modules-2026-07;ast-test-detection-2026-07;callable-arity-metadata-2026-07;annotated-spread-parameter-metadata-2026-07;compact-record-constructors-2026-07;fq-interned-segments-2026-07;field-modifier-metadata-2026-08;static-import-path-kind-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;class-like-static-metadata-2026-08;native-callable-modifier-metadata-2026-08"
 );
 // Salt bumped: Go `package_name` is now the canonical import path, changing
 // every persisted Go `fq_name`. Forces stale rows to be re-analyzed.
@@ -444,11 +452,20 @@ lang_epoch!(
 // resolved as a bare module name carry the phantom owner package (`impls.m`)
 // for every member of such an impl, so a warm workspace would answer the alias
 // spelling and never the real owner (`model.Writer.act`).
+// Rust salt bumped again (Phase 2 of
+// `.agents/plans/port-optimization-arc-to-upstream.md`): the Rust walk now
+// records per-file usage facts (`rust_exports`, `rust_import_targets`,
+// `rust_modules`, `rust_identifier_occurrences`) and per-file Cargo module
+// routes (`rust_module_scopes`, `rust_module_routes`,
+// `rust_module_route_gates`, `rust_item_macros`) alongside its declarations.
+// A blob analyzed before this change carries none of those rows, and a reader
+// cannot tell that blob from one whose file genuinely declares nothing, so the
+// old rows must not be reused.
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08"
 );
 
 #[cfg(test)]

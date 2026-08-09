@@ -765,6 +765,7 @@ fn python_namespace_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo
                 format!("import {module}")
             },
             is_wildcard: false,
+            is_global: false,
             identifier,
             alias,
             path: Some(StructuredImportPath {
@@ -802,6 +803,7 @@ fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
         infos.push(ImportInfo {
             raw_snippet: format!("from {module} import *"),
             is_wildcard: true,
+            is_global: false,
             identifier: None,
             alias: None,
             path: Some(StructuredImportPath {
@@ -858,6 +860,7 @@ fn python_from_import_infos(node: Node<'_>, source: &str) -> Vec<ImportInfo> {
                 format!("from {module} import {imported_name}")
             },
             is_wildcard: false,
+            is_global: false,
             identifier: Some(alias.clone().unwrap_or_else(|| imported_name.clone())),
             alias,
             path: Some(StructuredImportPath {

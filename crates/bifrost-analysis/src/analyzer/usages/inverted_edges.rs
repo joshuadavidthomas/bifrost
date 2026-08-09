@@ -95,14 +95,37 @@ pub(crate) fn build_file_declarations<K: NodeKey>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
 ) -> FileDeclarations<K> {
+    build_file_declarations_with_file_scope(analyzer, file, false)
+}
+
+pub(crate) fn build_file_declarations_with_file_scope<K: NodeKey>(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    include_file_scope: bool,
+) -> FileDeclarations<K> {
     let mut enclosers = Vec::new();
     let mut definitions: HashMap<K, Vec<(usize, usize)>> = HashMap::default();
-    for unit in analyzer.declarations(file) {
+    for unit in analyzer
+        .declarations(file)
+        .into_iter()
+        .filter(|unit| include_file_scope || !unit.is_file_scope())
+    {
         let key = K::from_unit(&unit);
         for unit_range in analyzer.ranges(&unit) {
             let span = (unit_range.start_byte, unit_range.end_byte);
             enclosers.push((span.0, span.1, key.clone()));
             definitions.entry(key.clone()).or_default().push(span);
+        }
+    }
+    if include_file_scope {
+        let file_scope = CodeUnit::file_scope(file.clone());
+        for unit_range in analyzer.ranges(&file_scope) {
+            let span = (unit_range.start_byte, unit_range.end_byte);
+            enclosers.push((span.0, span.1, K::from_unit(&file_scope)));
+            definitions
+                .entry(K::from_unit(&file_scope))
+                .or_default()
+                .push(span);
         }
     }
     FileDeclarations {
@@ -114,7 +137,18 @@ pub(crate) fn build_file_declarations<K: NodeKey>(
 pub(crate) fn build_file_declarations_from_state<K: NodeKey>(
     state: &FileState,
 ) -> FileDeclarations<K> {
-    build_file_declarations_from_declaration_ranges(&state.declarations, &state.ranges)
+    build_file_declarations_from_state_with_file_scope(state, false)
+}
+
+pub(crate) fn build_file_declarations_from_state_with_file_scope<K: NodeKey>(
+    state: &FileState,
+    include_file_scope: bool,
+) -> FileDeclarations<K> {
+    build_file_declarations_from_declaration_ranges_with_file_scope(
+        &state.declarations,
+        &state.ranges,
+        include_file_scope,
+    )
 }
 
 /// [`build_file_declarations_from_state`] over the two maps it actually reads;
@@ -123,9 +157,20 @@ pub(crate) fn build_file_declarations_from_declaration_ranges<K: NodeKey>(
     declarations: &HashSet<CodeUnit>,
     ranges: &HashMap<CodeUnit, Vec<Range>>,
 ) -> FileDeclarations<K> {
+    build_file_declarations_from_declaration_ranges_with_file_scope(declarations, ranges, false)
+}
+
+pub(crate) fn build_file_declarations_from_declaration_ranges_with_file_scope<K: NodeKey>(
+    declarations: &HashSet<CodeUnit>,
+    ranges: &HashMap<CodeUnit, Vec<Range>>,
+    include_file_scope: bool,
+) -> FileDeclarations<K> {
     let mut enclosers = Vec::new();
     let mut definitions: HashMap<K, Vec<(usize, usize)>> = HashMap::default();
-    for unit in declarations.iter().filter(|unit| !unit.is_file_scope()) {
+    for unit in declarations
+        .iter()
+        .filter(|unit| include_file_scope || !unit.is_file_scope())
+    {
         let key = K::from_unit(unit);
         for unit_range in ranges.get(unit).into_iter().flatten() {
             let span = (unit_range.start_byte, unit_range.end_byte);

@@ -40,9 +40,10 @@ use tree_sitter::{Node, Parser, Tree};
 use crate::graph_support::{
     CSharpSource, first_logical_type_fqn, logical_type_count, visible_type_candidates,
 };
-use crate::imports::{csharp_using_alias_from_node, csharp_using_namespace};
+use crate::imports::csharp_using_alias_from_node;
 use crate::syntax::{
-    csharp_type_node_identity, csharp_using_directive_is_static, normalize_csharp_type_fragment,
+    csharp_type_node_identity, csharp_using_directive_is_static, csharp_using_directive_namespace,
+    normalize_csharp_type_fragment,
 };
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
@@ -305,8 +306,10 @@ impl CSharpDiagnosticCollector<'_> {
 
     fn check_using_directive(&mut self, node: Node<'_>) {
         let range = self.range_of(node);
-        let raw = node_text(node, self.source).to_string();
-        if let Some(namespace) = csharp_using_namespace(&raw) {
+        // The namespace form is read off the directive node, not off its text:
+        // the parser already tells a plain `using` apart from `using static`
+        // and `using A = X`.
+        if let Some(namespace) = csharp_using_directive_namespace(node, self.source) {
             self.check_using_namespace(range, &namespace);
             return;
         }

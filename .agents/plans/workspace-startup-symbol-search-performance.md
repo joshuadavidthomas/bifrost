@@ -27,6 +27,7 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - [x] (2026-08-05) Released the startup OID lock before language projection and parallelized the pure path-to-OID work.
 - [x] (2026-08-05) Reprofiled Apache Camel and ran the focused, workspace, and all-feature lint gates.
 - [x] (2026-08-05) Committed the parallelization and pushed the merged work to `origin/master`.
+- [x] (2026-08-05) Sorted semantic materialization lookups by their SQLite primary key and remeasured Kafka and Django prewarm.
 
 ## Surprises & Discoveries
 
@@ -69,6 +70,9 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
 - Observation: Parallel projection removes the long mutex hold and makes the shared Git identity map available to all language workers.
   Evidence: A release Apache Camel run resolved 37,451 clean tracked identities with zero file hashes. The shared Git scan and small-language projections completed in 673-702 milliseconds. The Java projection completed in 1.38 seconds while the other language workers used the same Rayon pool.
 
+- Observation: Semantic readiness still probes source identities in path order against a blob-first primary key.
+  Evidence: A 19,280-file Django prewarm spent minutes in SQLite B-tree lookup. CPU profiles showed `sqlite3BtreeIndexMoveto`, page-cache fetches, and SQLite VM work. `semantic_files` uses `(blob_oid, rel_path)` as its primary key.
+
 ## Decision Log
 
 - Decision: Correct the identity design instead of adding eager router startup.
@@ -95,6 +99,10 @@ After this work, Bifrost will use Git index object IDs for clean tracked files. 
   Rationale: The current mutex covers every path conversion and lookup. It serializes language threads and leaves the large Java projection on one core.
   Date/Author: 2026-08-05 / Codex
 
+- Decision: Sort and deduplicate semantic file identities before batched membership queries.
+  Rationale: This follows the persistent primary-key order and changes random B-tree probes into an ordered walk. The caller still receives missing identities in its original order.
+  Date/Author: 2026-08-05 / Codex
+
 ## Outcomes & Retrospective
 
 The implementation now resolves clean tracked paths from the Git index, shares one repository identity map across language analyzers, reuses one workspace listing, and limits symbol SQL to active blobs. The active set uses a connection-local `STRICT` temporary table. Literal queries filter names and qualified names in SQLite before Rust hydration.
@@ -108,6 +116,8 @@ The follow-up change now releases the startup mutex after the one-time Git scan.
 After the schema-15 merge, the shared CodeScale cache was moved from the version-14 name to the version-15 name. Migration 0015 was applied directly because Bifrost's normal migration validation scans the complete 28 GiB cache. The new table is empty and optional unless RQL materialization provenance is used.
 
 The shared cache had a cold operating-system page-cache effect during one earlier run. Its first Java symbol query took 9.63 seconds. The next Java query took 276.3 milliseconds. This is storage warmth, not repeated Bifrost indexing.
+
+The semantic follow-up sorts and deduplicates `(blob_oid, rel_path)` membership probes before SQLite execution. The same Django prewarm that exceeded five minutes completed in 10.8 seconds. Semantic membership took 3.2 milliseconds. Its remaining 5.08 seconds built the active in-memory index. A fresh Kafka run completed in 30.3 seconds. It used 15.92 seconds to build the active index and 9.87 seconds to fill 5,474 missing Java analyzer blobs.
 
 Formatting, all 12 focused liveness tests, and all-features clippy pass. The workspace suite reaches the same unrelated cross-language resolver failure described above after 397 other cross-language tests pass. The required policy tool is not installed.
 

@@ -64,6 +64,19 @@ pub enum SegmentKind {
 }
 
 impl SegmentKind {
+    /// Every variant, so a derivation over segment-kind pairs stays exhaustive
+    /// when a variant is added. `persist_tag`'s `match` is the compiler-checked
+    /// reminder to extend this list with it.
+    pub const ALL: [SegmentKind; 7] = [
+        SegmentKind::Path,
+        SegmentKind::Package,
+        SegmentKind::Type,
+        SegmentKind::Companion,
+        SegmentKind::Nested,
+        SegmentKind::Member,
+        SegmentKind::Unknown,
+    ];
+
     /// Stable on-disk tag for the cache's `code_units.fq_segments` blob. These
     /// numbers are a persistence contract: never renumber an existing variant
     /// (append new ones), or previously-cached rows would decode to the wrong
@@ -317,6 +330,68 @@ fn separator(prev: SegmentKind, cur: SegmentKind, native: Option<Language>) -> &
         }
     }
     "."
+}
+
+/// Every separator string [`separator`] can emit between two adjacent segments,
+/// across all languages. The universe the per-language derivations below
+/// partition.
+const ALL_SEGMENT_SEPARATORS: [&str; 4] = ["/", "$", "::", "."];
+
+/// Separators that [`separator`] can emit for *some* language but never for
+/// `lang`.
+///
+/// This is a storage contract, not a heuristic. A `CodeUnit`'s persisted
+/// `short_name` is `fq.suffix_from(package_segment_count)` rendered by
+/// [`FqName::display_native`], which joins segments with nothing but
+/// [`separator`]'s output. A separator this function returns therefore cannot
+/// appear between two segments of any `short_name` stored for `lang`, so a
+/// lookup spelling that carries one is a guaranteed miss against the
+/// `(lang, short_name)` index -- it can be dropped before it costs a pooled
+/// connection checkout, a generation check, a `prepare_cached` and an index
+/// probe (issue #1748; `.agents/docs/graph-read-cost-investigation-2026-08.md`
+/// measured 0 of 324,891 stored `short_name` values containing `::`).
+///
+/// Derived exhaustively over [`SegmentKind::ALL`] pairs rather than written out
+/// as a second list, so a new language-specific rule in [`separator`] changes
+/// this answer instead of silently disagreeing with it. C++ is the one language
+/// that renders `::`, and it is excluded from nothing here for exactly that
+/// reason.
+///
+/// The contract bounds what a *separator* can be, never what a segment's own
+/// text can be. Scala's cons class is literally named `::`, so `::` and
+/// `::.head` are ordinary scala short names whose `::` is a segment's text.
+/// This answer alone therefore does not license dropping a spelling: the
+/// caller must also know that the separator is one its own lookup vocabulary
+/// treats as a join. See `LanguageAdapter::lookup_candidate_separators`, which
+/// is where a language declares that -- and scala's declines `::` for exactly
+/// this reason.
+pub fn absent_segment_separators(lang: Language) -> &'static [&'static str] {
+    static TABLE: OnceLock<HashMap<Language, Vec<&'static str>>> = OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            let mut table = HashMap::default();
+            for language in std::iter::once(Language::None).chain(Language::ANALYZABLE) {
+                let emitted: Vec<&'static str> = SegmentKind::ALL
+                    .iter()
+                    .flat_map(|&prev| {
+                        SegmentKind::ALL
+                            .iter()
+                            .map(move |&cur| separator(prev, cur, Some(language)))
+                    })
+                    .collect();
+                table.insert(
+                    language,
+                    ALL_SEGMENT_SEPARATORS
+                        .into_iter()
+                        .filter(|candidate| !emitted.contains(candidate))
+                        .collect(),
+                );
+            }
+            table
+        })
+        .get(&lang)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
 }
 
 /// Number of interner shards. Extraction is file-parallel, so `intern` spreads
@@ -851,5 +926,45 @@ mod tests {
         let a = segment_interner().intern("pkg", SegmentKind::Path);
         let b = segment_interner().intern("pkg", SegmentKind::Path);
         assert_eq!(a, b);
+    }
+
+    /// The storage contract issue #1748's structural-miss filter rests on. `::`
+    /// is renderable only between two C++ `Package` segments, so every other
+    /// language's persisted `short_name` vocabulary excludes it -- and C++'s
+    /// does not, which is why the filter must be derived per language rather
+    /// than hardcoded.
+    #[test]
+    fn absent_separators_exclude_double_colon_everywhere_but_cpp() {
+        for language in Language::ANALYZABLE {
+            let absent = absent_segment_separators(language);
+            if language == Language::Cpp {
+                assert!(
+                    !absent.contains(&"::"),
+                    "cpp renders `::` between namespaces, so nothing may be dropped for it"
+                );
+            } else {
+                assert!(
+                    absent.contains(&"::"),
+                    "{language:?} has no `::` rendering rule, so a `::`-bearing spelling \
+                     cannot match one of its persisted short names"
+                );
+            }
+        }
+    }
+
+    /// The separators the renderer *does* emit are never reported absent: `.`
+    /// is the default join, `$` precedes every `Nested` segment, and `/` joins
+    /// two `Path` segments, in every language.
+    #[test]
+    fn absent_separators_never_claim_a_renderable_separator() {
+        for language in Language::ANALYZABLE {
+            let absent = absent_segment_separators(language);
+            for renderable in [".", "$", "/"] {
+                assert!(
+                    !absent.contains(&renderable),
+                    "{language:?} renders {renderable:?}, so it must not be reported absent"
+                );
+            }
+        }
     }
 }

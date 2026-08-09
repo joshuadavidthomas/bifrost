@@ -20,8 +20,9 @@
 
 use super::JavaGraphSource;
 use super::resolver::{
-    constructor_method_reference_receiver, is_ignored_type_context, node_text,
-    resolve_field_access_type, resolve_nested_type_for_owner, resolve_type_segments,
+    constructor_method_reference_receiver, is_ignored_type_context, is_module_type_reference,
+    is_non_type_module_reference, node_text, resolve_field_access_type,
+    resolve_nested_type_for_owner, resolve_type_segments,
 };
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
@@ -33,7 +34,7 @@ use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name_in};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node,
+    ClassRangeIndex, FileEdgeScanInput, PerFileEdges, UsageReferenceKind, classify_reference_node,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
@@ -149,13 +150,25 @@ impl JavaScan<'_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        self.edges.record_kind(
-            self.input,
-            callee,
-            classify_reference_node(node),
-            node.start_byte(),
-            node.end_byte(),
-        );
+        let kind = if is_module_type_reference(node) {
+            UsageReferenceKind::Type
+        } else {
+            classify_reference_node(node)
+        };
+        let start = node.start_byte();
+        let end = node.end_byte();
+        if self.input.enclosing(start, end).is_some() {
+            self.edges.record_kind(self.input, callee, kind, start, end);
+        } else if is_module_type_reference(node) {
+            self.edges.record_with_caller_kind(
+                self.input,
+                CodeUnit::file_scope(self.file.clone()).fq_name(),
+                callee,
+                kind,
+                start,
+                end,
+            );
+        }
     }
 
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
@@ -250,6 +263,9 @@ fn record_reference(
         // a scoped parent handles all of its semantic type segments (avoids
         // double counting while retaining outer-owner references).
         "type_identifier" | "scoped_identifier" | "scoped_type_identifier" => {
+            if is_non_type_module_reference(node) {
+                return;
+            }
             if node.parent().is_some_and(|parent| {
                 matches!(
                     parent.kind(),
@@ -259,6 +275,16 @@ fn record_reference(
             {
                 return;
             }
+            for (resolved, segment) in resolve_type_segments(
+                node,
+                ctx.source,
+                |candidate| ctx.resolve_type(candidate),
+                |owner, name| ctx.resolve_nested_type(owner, name),
+            ) {
+                ctx.record(resolved.fq_name(), segment);
+            }
+        }
+        "identifier" if is_module_type_reference(node) => {
             for (resolved, segment) in resolve_type_segments(
                 node,
                 ctx.source,

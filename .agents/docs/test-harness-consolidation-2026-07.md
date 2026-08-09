@@ -190,6 +190,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `issue_1218_boundary_candidate_honesty`
 - `issue_1225_python_annotation_inverse`
 - `issue_1325_csharp_census_complexity, issue_1332_search_notes_honesty`
+- `issue_1839_scan_usages_resolution_budget` - tool-surface pin for the scan_usages resolution fan-out guard (#1839). Reads no counters, so it is safe in the shared binary; the counter-pinned halves of that fix are crate-internal unit tests next to the resolver and next to the store read.
 - `issue_693_profile`
 - `issue_csharp_verbatim_identifiers`
 
@@ -343,6 +344,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 
 - `csharp_bounded_receiver_hardening`
 - `go_rust_bounded_receiver_acceptance`
+- `issue_1748_candidate_discovery_batching` - counter pins for the shared candidate-discovery batching fix (#1748, #1774). The counters it reads are per-analyzer fields, not process globals, so it is safe in the shared binary.
 - `receiver_language_acceptance_matrix`
 - `receiver_language_scope`
 - `receiver_language_uncertainty`

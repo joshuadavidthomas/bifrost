@@ -35,6 +35,8 @@ pub struct SummaryResult {
     pub ambiguous: Vec<AmbiguousSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub too_broad: Vec<TooBroadScope>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -174,6 +176,7 @@ pub(super) struct SummaryTargets {
     pub(super) listings: Vec<ContainerListing>,
     pub(super) symbol_targets: Vec<String>,
     pub(super) ambiguous_paths: Vec<AmbiguousPathInput>,
+    pub(super) too_broad: Vec<TooBroadScope>,
 }
 
 #[cfg(test)]
@@ -181,12 +184,22 @@ pub(super) fn route_summary_targets(
     analyzer: &dyn IAnalyzer,
     targets: &[String],
 ) -> SummaryTargets {
-    route_summary_targets_with_cancellation(analyzer, targets, None)
+    route_summary_targets_with_cancellation(
+        analyzer,
+        targets,
+        GET_SUMMARIES_MAX_FILES_PER_TARGET,
+        None,
+    )
 }
 
+/// `max_files_per_target` bounds how many files one glob target may expand to;
+/// a target over the bound is reported through `too_broad` and contributes no
+/// files at all, because a summary of an arbitrary subset of a huge match
+/// looks complete while meaning nothing.
 fn route_summary_targets_with_cancellation(
     analyzer: &dyn IAnalyzer,
     targets: &[String],
+    max_files_per_target: usize,
     cancellation: Option<&crate::CancellationToken>,
 ) -> SummaryTargets {
     let _scope = profiling::scope("searchtools::route_summary_targets");
@@ -199,12 +212,13 @@ fn route_summary_targets_with_cancellation(
     // 2,700-file C# tree, half the fuzzer census's tool time). The directory
     // question is now answered by a `stat` and the listing is built only when
     // that says yes.
-    let workspace_files: OnceCell<BTreeSet<ProjectFile>> = OnceCell::new();
+    let workspace_files: OnceCell<Arc<BTreeSet<ProjectFile>>> = OnceCell::new();
     let mut file_targets = BTreeSet::new();
     let mut listings = Vec::new();
     let mut listed_containers = HashSet::default();
     let mut symbol_targets = Vec::new();
     let mut ambiguous_paths = Vec::new();
+    let mut too_broad = Vec::new();
 
     for target in targets
         .iter()
@@ -236,7 +250,15 @@ fn route_summary_targets_with_cancellation(
         if let Some(directory) = directory_listing_root(target)
             && analyzer.project().has_directory(&directory)
             && let Some(listing) = directory_listing(
-                workspace_files.get_or_init(|| analyzer.project().all_files().unwrap_or_default()),
+                // `all_files_shared` hands back the project's own cached listing
+                // behind an `Arc`; `all_files` would deep-clone that whole
+                // `BTreeSet` on every call (#1738).
+                workspace_files.get_or_init(|| {
+                    analyzer
+                        .project()
+                        .all_files_shared()
+                        .unwrap_or_else(|_| Arc::new(BTreeSet::new()))
+                }),
                 target,
             )
         {
@@ -265,6 +287,14 @@ fn route_summary_targets_with_cancellation(
             continue;
         }
         if !matches.files.is_empty() {
+            if matches.files.len() > max_files_per_target {
+                too_broad.push(too_broad_scope(
+                    target,
+                    &matches.files,
+                    max_files_per_target,
+                ));
+                continue;
+            }
             file_targets.extend(matches.files);
             continue;
         }
@@ -293,6 +323,7 @@ fn route_summary_targets_with_cancellation(
         listings,
         symbol_targets,
         ambiguous_paths,
+        too_broad,
     }
 }
 
@@ -316,6 +347,11 @@ pub(super) fn directory_listing(
     files: &BTreeSet<ProjectFile>,
     target: &str,
 ) -> Option<ContainerListing> {
+    // Reconstructed per call: it scans every workspace file to keep the direct
+    // children of one directory. Spanned so #1738 can split this cost from the
+    // walk that produced `files` (`project::collect_workspace_files`) and from
+    // the git-status subprocess inside it (`gitblob::dirty_worktree_paths`).
+    let _scope = profiling::scope("searchtools::directory_listing");
     let directory = directory_listing_root(target)?;
 
     let mut entries_by_path = HashMap::default();
@@ -370,6 +406,17 @@ pub(super) fn stable_workspace_path(path: &Path) -> String {
 pub(super) fn package_listing(analyzer: &dyn IAnalyzer, target: &str) -> Option<ContainerListing> {
     let package = target.trim().trim_end_matches('/');
     if package.is_empty() {
+        return None;
+    }
+    // Relative paths that are not real directories are handled as misses.
+    // Import paths have a dotted first component (for example, github.com or
+    // k8s.io) and remain eligible for package resolution.
+    if package.contains('/')
+        && !package
+            .split('/')
+            .next()
+            .is_some_and(|component| component.contains('.'))
+    {
         return None;
     }
     let index = analyzer.global_usage_definition_index();
@@ -480,6 +527,31 @@ fn summarize_symbol_targets_with_cancellation(
             break;
         }
         let _target_scope = profiling::scope(format!("summarize_symbol_target[{target}]"));
+        // A slash-bearing target without a source extension is a missing
+        // relative directory or package path, not a useful fuzzy symbol. Do
+        // not build the workspace-wide definition index to prove that a path
+        // typo is not a symbol (#1608: a 399k-row Go index added 20 seconds
+        // to an ordinary directory listing request).
+        //
+        // A file-anchored selector (`src/a.js#Widget`) is also slash-bearing
+        // and is not itself an explicit source file target -- the anchor is,
+        // the whole selector is not -- so the anchor split has to decide the
+        // shape before this bailout sees it. The splitter is the same one
+        // `resolve_selectable_definitions` uses one call below, so the two
+        // cannot disagree about what is anchored. It reads no definitions: a
+        // slash-bearing anchor is accepted on its shape alone, and a target
+        // with no `#` never reaches the file check at all.
+        let file_anchored = matches!(
+            split_workspace_definition_selector(analyzer, &target),
+            DefinitionSelector::FileAnchored { .. }
+        );
+        if !file_anchored
+            && (target.contains('/') || target.contains('\\'))
+            && !looks_like_explicit_source_file_target(&target)
+        {
+            not_found.push(file_not_found_input(target));
+            continue;
+        }
         if looks_like_explicit_source_file_target(&target) {
             match resolve_selectable_definitions(analyzer, &target, exact_codeunit_resolution) {
                 SelectableDefinitionResolution::Resolved(code_units) => {
@@ -537,6 +609,7 @@ fn summarize_symbol_targets_with_cancellation(
         not_found,
         ambiguous,
         ambiguous_paths: Vec::new(),
+        too_broad: Vec::new(),
     }
 }
 
@@ -572,7 +645,12 @@ pub fn get_summaries_with_cancellation(
     // per target through `resolve_file_patterns`, so without a shared listing
     // an N-target request walked the workspace O(N) times (#1334).
     let _analyzer_query = AnalyzerQueryScope::new(analyzer);
-    let targets = route_summary_targets_with_cancellation(analyzer, &params.targets, cancellation);
+    let targets = route_summary_targets_with_cancellation(
+        analyzer,
+        &params.targets,
+        GET_SUMMARIES_MAX_FILES_PER_TARGET,
+        cancellation,
+    );
     summarize_routed_targets_with_cancellation(analyzer, &targets, cancellation)
 }
 
@@ -699,6 +777,7 @@ fn summarize_files_with_cancellation(
         not_found: Vec::new(),
         ambiguous: Vec::new(),
         ambiguous_paths: Vec::new(),
+        too_broad: Vec::new(),
     }
 }
 
@@ -849,6 +928,7 @@ fn summarize_routed_targets_with_cancellation(
 
     file_output.summaries.extend(symbol_output.summaries);
     file_output.listings = summary_targets.listings.clone();
+    file_output.too_broad = summary_targets.too_broad.clone();
     file_output.not_found.extend(symbol_output.not_found);
     file_output.ambiguous.extend(symbol_output.ambiguous);
     file_output
@@ -1011,6 +1091,97 @@ pub fn most_relevant_files_with_cancellation(
         duplicates,
         complete,
         ranking_mode_used,
+        incomplete_reason,
+    })
+}
+
+/// Rank files by recent Git co-change without expanding the import graph.
+///
+/// This is an internal retrieval primitive for semantic search. The public
+/// `most_relevant_files` tool keeps its history-plus-import behavior.
+pub fn most_relevant_files_history_only(
+    analyzer: &dyn IAnalyzer,
+    params: MostRelevantFilesParams,
+) -> Result<MostRelevantFilesResult, String> {
+    let _scope = profiling::scope("searchtools::most_relevant_files_history_only");
+    validate_most_relevant_files_params(&params)?;
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
+    let mut seeds = Vec::new();
+    let mut not_found = Vec::new();
+    let mut ambiguous_paths = Vec::new();
+    let mut duplicates = Vec::new();
+    let seed_weights = params
+        .seed_weights
+        .unwrap_or_else(|| vec![1.0; params.seed_file_paths.len()]);
+    let recency_half_life = params.recency_half_life;
+    let requested_limit = params.limit;
+    let mut resolved_by_file = HashMap::default();
+
+    for (input, weight) in params.seed_file_paths.into_iter().zip(seed_weights) {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match resolver.resolve_literal(trimmed) {
+            ResolvedFileInput::File(file) => {
+                let display_path = rel_path_string(&file);
+                if resolved_by_file.insert(file.clone(), ()).is_some() {
+                    duplicates.push(display_path);
+                    continue;
+                }
+                seeds.push((file, weight));
+            }
+            ResolvedFileInput::Ambiguous(item) => ambiguous_paths.push(item),
+            ResolvedFileInput::NotFound(item) => not_found.push(file_not_found_input(item)),
+        }
+    }
+
+    duplicates.sort();
+    duplicates.dedup();
+    if !duplicates.is_empty() {
+        return Ok(MostRelevantFilesResult {
+            files: Vec::new(),
+            not_found,
+            ambiguous_paths,
+            duplicates,
+            complete: true,
+            ranking_mode_used: MostRelevantFilesRankingMode::HistoryImports,
+            incomplete_reason: None,
+        });
+    }
+
+    let (ranked, history_status) = most_relevant_project_files_history_only(
+        analyzer,
+        &seeds,
+        requested_limit,
+        recency_half_life,
+        &crate::CancellationToken::default(),
+    );
+    let files = ranked
+        .into_iter()
+        .map(|file| MostRelevantFile {
+            test: super::scan_usages::classify_resolved_test_file(analyzer, &file).kind,
+            path: rel_path_string(&file),
+        })
+        .collect();
+    let (complete, incomplete_reason) = match history_status {
+        crate::relevance::HistoryRankingStatus::Complete => (true, None),
+        crate::relevance::HistoryRankingStatus::HistoryUnavailable => (
+            false,
+            Some(MostRelevantFilesIncompleteReason::HistoryUnavailable),
+        ),
+        crate::relevance::HistoryRankingStatus::Cancelled => {
+            (false, Some(MostRelevantFilesIncompleteReason::Cancelled))
+        }
+    };
+
+    Ok(MostRelevantFilesResult {
+        files,
+        not_found,
+        ambiguous_paths,
+        duplicates,
+        complete,
+        ranking_mode_used: MostRelevantFilesRankingMode::HistoryImports,
         incomplete_reason,
     })
 }

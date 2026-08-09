@@ -514,6 +514,58 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .unwrap_or(false)
     }
 
+    /// The batch that `could_import_file` above is meant to be answered from.
+    ///
+    /// Without this override the trait's no-op default answers, so a delegate's
+    /// own batch -- `RustAnalyzer::prefetch_import_targets`, and the single
+    /// chunked seek it stands for -- never runs on a workspace with more than
+    /// one language, which is every workspace #1748 was opened about. Measured
+    /// at `0086f1e5` on the rustc tree: zero `prefetch_definitions` spans in a
+    /// scan whose candidate discovery took 9,648 point `definition_candidates`
+    /// reads.
+    ///
+    /// Grouping is the same as `import_infos_for_files` above, for the same
+    /// reason: the question is per language and only that language's delegate
+    /// can answer it. `import_infos` goes through whole rather than split per
+    /// group -- a delegate reads it by the file keys it was handed, so a subset
+    /// would only cost a copy.
+    ///
+    /// Between groups is the one place this layer can stop. It polls there
+    /// because a group is one batched read and the deadline may have expired
+    /// during the previous one; it publishes nothing itself, so stopping leaves
+    /// each delegate's request memo exactly as that delegate left it -- the
+    /// prefix of a cut-short batch is never memoized as absence.
+    fn prefetch_import_targets(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: &crate::CancellationToken,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+        for file in files {
+            grouped
+                .entry(language_for_file(file))
+                .or_default()
+                .push(file.clone());
+        }
+        for (language, group) in grouped {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let Some(provider) = self
+                .delegates
+                .get(&language)
+                .and_then(AnalyzerDelegate::import_analysis_provider)
+            else {
+                continue;
+            };
+            provider.prefetch_import_targets(&group, import_infos, cancellation);
+        }
+    }
+
     /// A file whose language has no delegate is undecided, not unreachable:
     /// `unwrap_or` must not manufacture a proof the workspace never made.
     fn import_reachability(
@@ -875,10 +927,10 @@ impl CodeUnitIndex for MultiAnalyzer {
             })
     }
 
-    fn search_definitions_with_literal(
+    fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
-        required_literal: &str,
+        terminal_identifiers: &[String],
         language: Language,
     ) -> BTreeSet<CodeUnit> {
         // The pattern is language-specific, so only that language's delegate
@@ -887,9 +939,9 @@ impl CodeUnitIndex for MultiAnalyzer {
         self.delegates
             .get(&language)
             .map(|delegate| {
-                delegate.analyzer().search_definitions_with_literal(
+                delegate.analyzer().search_definitions_by_suffix_pattern(
                     pattern,
-                    required_literal,
+                    terminal_identifiers,
                     language,
                 )
             })
@@ -906,6 +958,16 @@ impl CodeUnitIndex for MultiAnalyzer {
                 acc.extend(candidates);
                 acc
             })
+    }
+
+    /// Every delegate must be able to answer from an index before a miss is
+    /// conclusive: one in-memory delegate's incomplete view would make a
+    /// qualified miss mean "not in the indexed languages", not "not in the
+    /// workspace".
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        self.delegates
+            .values()
+            .all(|delegate| delegate.analyzer().has_complete_symbol_lookup_index())
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {

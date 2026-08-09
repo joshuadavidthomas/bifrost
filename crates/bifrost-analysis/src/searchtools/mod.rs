@@ -7,7 +7,8 @@ use crate::analyzer::declaration_range::{
 };
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::symbol_lookup::{
-    CodeUnitResolution, is_bare_symbol_query, resolve_codeunit_exact, resolve_codeunit_fuzzy,
+    CodeUnitResolution, FuzzyResolveBudget, FuzzyResolveStop, is_bare_symbol_query,
+    resolve_codeunit_exact, resolve_codeunit_fuzzy, resolve_codeunit_fuzzy_bounded,
     resolve_codeunit_fuzzy_with, resolve_enclosing_codeunits, strip_trailing_call_suffix,
     symbol_selector_leaf,
 };
@@ -38,7 +39,8 @@ use crate::profiling;
 pub use crate::relevance::MostRelevantFilesRankingMode;
 use crate::relevance::{
     DEFAULT_RECENCY_HALF_LIFE, MostRelevantProjectFilesOutcome, most_important_project_files,
-    most_important_project_files_with_cancellation, most_relevant_project_files_with_half_life,
+    most_important_project_files_with_cancellation, most_relevant_project_files_history_only,
+    most_relevant_project_files_with_half_life,
     most_relevant_project_files_with_ranking_mode_and_cancellation,
 };
 use crate::text_utils::{
@@ -113,6 +115,7 @@ pub use navigation::SymbolAncestorsResult;
 pub use navigation::SymbolLocation;
 pub use navigation::SymbolLocationsResult;
 pub use navigation::SymbolLookupParams;
+pub use navigation::TooManySymbolMatches;
 pub use navigation::TypeLookupCandidate;
 pub use navigation::TypeLookupResult;
 pub use navigation::TypeReferenceQuery;
@@ -151,6 +154,7 @@ pub use scan_usages::SymbolUsages;
 pub use scan_usages::TestFileClassification;
 pub use scan_usages::TestFileKind;
 pub use scan_usages::TooManyCallsitesInfo;
+pub use scan_usages::TooManyResolutionCandidates;
 pub use scan_usages::UsageEnclosingCount;
 pub use scan_usages::UsageFailureInfo;
 pub use scan_usages::UsageFileGroup;
@@ -198,6 +202,7 @@ pub use summaries::get_summaries;
 pub use summaries::get_summaries_with_cancellation;
 pub use summaries::list_symbols;
 pub use summaries::most_relevant_files;
+pub use summaries::most_relevant_files_history_only;
 pub use summaries::most_relevant_files_with_cancellation;
 
 // Only the moved `#[cfg(test)]` test module reaches this name through the
@@ -243,11 +248,84 @@ const SCAN_USAGES_TOP_ENCLOSING_LIMIT: usize = 10;
 
 const SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT: usize = 3;
 
+/// Declarations one `scan_usages` selector may resolve to before the tool
+/// stops resolving and answers with the count.
+///
+/// Resolution costs one `definitions` store read per matched declaration, and
+/// the reply that work produces is a `candidate_targets` list. Both ends fail
+/// at scale: on the rustc tree the bare name `main` matched 20,935
+/// declarations, charged one store read each, and ran for 653-749 s against a
+/// 3 s budget (#1839), for a list far larger than the
+/// `SCAN_USAGES_RESPONSE_BUDGET_BYTES` reply can carry. Above this cap the
+/// candidate list is skipped, not truncated, and the true count is reported so
+/// the caller knows to qualify the selector.
+///
+/// The value is provisional and deliberately well above any ambiguity a caller
+/// can act on: an 8 KB reply holds on the order of a hundred selectors, so a
+/// list of two hundred is already past the point of usefulness while staying
+/// two orders of magnitude below the measured explosion.
+pub const SCAN_USAGES_MAX_RESOLUTION_CANDIDATES: usize = 200;
+
 const SCAN_USAGES_PATH_SELECTOR_MATCH_LIMIT: usize = 5;
 
 const SCAN_USAGES_SCOPE_PATH_LIMIT: usize = 5;
 
 const SCAN_USAGES_SCOPE_PATH_MAX_BYTES: usize = 256;
+
+/// How many matched paths a too-broad reply shows so the caller can narrow.
+pub const FILE_PATTERN_FANOUT_SAMPLE: usize = 10;
+
+/// Files a single `get_summaries` glob target may expand to before the tool
+/// skips it. Mirrors `FILE_SKIM_LIMIT`, the bound `list_symbols` already puts
+/// on the same expansion; a summary block is strictly larger than a skim
+/// listing, so a larger cap needs new evidence first.
+pub const GET_SUMMARIES_MAX_FILES_PER_TARGET: usize = 20;
+
+/// Files a single `get_symbol_sources` glob target may expand to before the
+/// tool skips it. Half the `get_summaries` cap because this tool answers with
+/// full source text, the heaviest payload per file the searchtools produce.
+pub const GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET: usize = 10;
+
+/// Deduplicated `search_symbols` candidates that may be ranked before the tool
+/// gives up and answers with counts instead. Broad multi-pattern search with
+/// ranking is this tool's normal, intended use, so the cap only has to catch
+/// pathological explosions.
+///
+/// The value is provisional. It comes from the Firefox measurement in
+/// `.agents/docs/codescale-grep-hard-checkpoint-2026-08-06.md` -- about 34 s of
+/// ranking for a broad six-pattern search -- without a candidate count for that
+/// workload. Record the measured count here and retune once one exists.
+pub const SEARCH_SYMBOLS_MAX_RANKED_CANDIDATES: usize = 10_000;
+
+/// A single request target that matched more of the workspace than the
+/// tool will process. The work was skipped, not truncated: `sample`
+/// holds the first `FILE_PATTERN_FANOUT_SAMPLE` matched paths so the
+/// caller can narrow, and `matched` is the true total.
+#[derive(Debug, Clone, Serialize)]
+pub struct TooBroadScope {
+    pub target: String,
+    pub matched: usize,
+    pub cap: usize,
+    pub sample: Vec<String>,
+}
+
+/// `matched` is already ordered (it comes out of a `BTreeSet<ProjectFile>`), so
+/// the sample is the first `FILE_PATTERN_FANOUT_SAMPLE` paths; sorting those
+/// few strings makes the rendered order path-lexicographic on every platform.
+fn too_broad_scope(target: &str, matched: &[ProjectFile], cap: usize) -> TooBroadScope {
+    let mut sample: Vec<_> = matched
+        .iter()
+        .take(FILE_PATTERN_FANOUT_SAMPLE)
+        .map(rel_path_string)
+        .collect();
+    sample.sort();
+    TooBroadScope {
+        target: target.to_string(),
+        matched: matched.len(),
+        cap,
+        sample,
+    }
+}
 
 pub const TYPE_LOOKUP_MAX_REFERENCES: usize = 100;
 
@@ -281,6 +359,14 @@ pub struct RefreshResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ActiveWorkspaceResult {
     pub workspace_path: String,
+    /// Whether a usage query would wait for background usage-analysis work.
+    /// Under the per-file fact design this is false only while an
+    /// above-threshold catch-up batch is being persisted; a tool that needs
+    /// those facts blocks until it drains, which is the right default, and a
+    /// caller that must not block asks this first (#1757). The field name is
+    /// the tool contract and did not change when the implementation moved off
+    /// the v1 usage index (ExecPlan Milestone 3).
+    pub usage_index_ready: bool,
 }
 
 pub fn refresh_result(analyzer: &dyn IAnalyzer) -> RefreshResult {

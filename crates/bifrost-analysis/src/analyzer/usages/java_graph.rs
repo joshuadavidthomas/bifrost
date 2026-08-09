@@ -29,6 +29,7 @@ use brokk_bifrost_jvm::java::graph::resolver::{TargetKind, TargetSpec};
 use brokk_bifrost_jvm::java::graph::return_type::{
     FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache,
 };
+use std::ffi::OsStr;
 use std::sync::Mutex;
 
 pub(in crate::analyzer::usages) use brokk_bifrost_jvm::java::graph::resolver::signature_arity as java_signature_arity;
@@ -289,8 +290,8 @@ where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     use crate::analyzer::usages::inverted_edges::{
-        ClassRangeIndex, build_edge_output, build_file_declarations,
-        build_file_declarations_from_state, class_range_index_from_state,
+        ClassRangeIndex, build_edge_output, build_file_declarations_from_state_with_file_scope,
+        build_file_declarations_with_file_scope, class_range_index_from_state,
         parse_and_collect_with_declarations,
     };
 
@@ -307,9 +308,26 @@ where
     with_java_graph_source(analyzer, |graph| {
         build_edge_output(files, keep_file, |file| {
             let state = file_states.get(file);
-            let declarations = state
-                .map(build_file_declarations_from_state)
-                .unwrap_or_else(|| build_file_declarations(analyzer, file));
+            let include_file_scope = is_java_module_descriptor(file);
+            let mut declarations = state
+                .map(|state| {
+                    build_file_declarations_from_state_with_file_scope(state, include_file_scope)
+                })
+                .unwrap_or_else(|| {
+                    build_file_declarations_with_file_scope(analyzer, file, include_file_scope)
+                });
+            if include_file_scope {
+                let file_scope = CodeUnit::file_scope(file.clone());
+                let file_scope_key = file_scope.fq_name();
+                if !declarations
+                    .enclosers
+                    .iter()
+                    .any(|(_, _, key)| key == &file_scope_key)
+                    && let Some(source) = analyzer.indexed_source(file)
+                {
+                    declarations.add_file_scope(file_scope_key, source.len());
+                }
+            }
             let class_ranges = state
                 .map(class_range_index_from_state)
                 .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
@@ -318,4 +336,8 @@ where
             })
         })
     })
+}
+
+fn is_java_module_descriptor(file: &ProjectFile) -> bool {
+    file.rel_path().file_name() == Some(OsStr::new("module-info.java"))
 }

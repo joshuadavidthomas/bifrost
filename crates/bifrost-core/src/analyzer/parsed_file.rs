@@ -12,6 +12,7 @@ use crate::analyzer::model::{
     CodeUnit, CppTemplateMetadata, ImportInfo, ProjectFile, Range, RubyMethodDispatchMode,
     ScalaExportInfo, SignatureMetadata,
 };
+use crate::analyzer::rust_facts::RustUsageFacts;
 use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::tree_walk::node_range;
 use crate::hash::{HashMap, HashSet};
@@ -25,7 +26,6 @@ pub struct ParsedFile {
     declarations: HashSet<CodeUnit>,
     declaration_identities: HashMap<DeclarationIdentity, usize>,
     pub definition_lookup_units: HashSet<CodeUnit>,
-    pub import_statements: Vec<String>,
     pub imports: Vec<ImportInfo>,
     pub scala_exports: HashMap<CodeUnit, Vec<ScalaExportInfo>>,
     pub raw_supertypes: HashMap<CodeUnit, Vec<String>>,
@@ -53,6 +53,11 @@ pub struct ParsedFile {
     /// that thread test-region taint through their traversal (currently Rust);
     /// other languages leave it empty, so their declarations default untainted.
     pub test_region_units: HashSet<CodeUnit>,
+    /// Per-file Rust usage facts (exports, import targets, modules, identifier
+    /// occurrences, module routes) on their way to the `rust_*` fact tables.
+    /// Default-empty for every other language. See
+    /// [`crate::analyzer::rust_facts`].
+    pub rust_usage_facts: RustUsageFacts,
     /// Declaration-materialization provenance recorded by the language walk
     /// that created the declarations it describes (issue #1476): generation
     /// sites and their generated units, dynamic generation sites, export
@@ -122,7 +127,6 @@ impl ParsedFile {
             declarations: HashSet::default(),
             declaration_identities: HashMap::default(),
             definition_lookup_units: HashSet::default(),
-            import_statements: Vec::new(),
             imports: Vec::new(),
             scala_exports: HashMap::default(),
             raw_supertypes: HashMap::default(),
@@ -139,6 +143,7 @@ impl ParsedFile {
             navigation_ranges_truncated: HashSet::default(),
             children: HashMap::default(),
             test_region_units: HashSet::default(),
+            rust_usage_facts: RustUsageFacts::default(),
             materialization_records: Vec::new(),
         }
     }

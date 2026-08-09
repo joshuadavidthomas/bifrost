@@ -578,18 +578,22 @@ impl CodeUnitIndex for KotlinAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_with_literal(
+    fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
-        required_literal: &str,
+        terminal_identifiers: &[String],
         language: Language,
     ) -> BTreeSet<CodeUnit> {
         self.inner
-            .search_definitions_with_literal(pattern, required_literal, language)
+            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_candidates_by_short_name(symbol)
+    }
+
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        self.inner.has_complete_symbol_lookup_index()
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {

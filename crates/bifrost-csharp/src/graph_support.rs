@@ -482,7 +482,7 @@ pub fn compute_using_namespaces_of(source: &dyn CSharpSource, file: &ProjectFile
     let mut namespaces: Vec<String> = source
         .import_info_of(file)
         .iter()
-        .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+        .filter_map(csharp_using_namespace)
         .collect();
     for namespace in source.global_using_namespaces() {
         if !namespaces.contains(namespace) {
@@ -507,7 +507,7 @@ pub fn compute_using_namespaces_of_limited(
     let mut namespaces: Vec<_> = imports
         .rows
         .into_iter()
-        .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+        .filter_map(|import| csharp_using_namespace(&import))
         .collect();
     if !imports.complete {
         return LimitedQueryRows::incomplete(namespaces, imports.inspected);
@@ -658,7 +658,7 @@ fn csharp_reaches_target(
     let source_imports = source.using_namespaces_of(source_file);
     imports
         .iter()
-        .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+        .filter_map(csharp_using_namespace)
         .chain(source_imports)
         .any(|namespace| target_namespaces.contains(&namespace))
         || source_aliases.values().any(|alias_target| {
@@ -783,7 +783,7 @@ fn csharp_visible_namespaces(
         .iter()
         .chain(source.import_info_of(source_file).iter())
     {
-        if let Some(namespace) = csharp_using_namespace(&import.raw_snippet) {
+        if let Some(namespace) = csharp_using_namespace(import) {
             insert_namespace_prefixes(&namespace, &mut visible);
         }
         if let Some(static_target) = csharp_static_using_from_import(import) {
@@ -869,7 +869,7 @@ pub fn compute_global_using_namespaces(source: &dyn CSharpSource) -> HashSet<Str
         .into_iter()
         .flat_map(|file| source.import_info_of(&file).into_iter())
         .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
-        .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+        .filter_map(|import| csharp_using_namespace(&import))
         .map(|namespace| {
             normalize_csharp_type_fragment(namespace.strip_prefix("global::").unwrap_or(&namespace))
         })
@@ -888,7 +888,7 @@ pub fn compute_global_using_namespaces_limited(
         .rows
         .into_iter()
         .filter(|import| import.raw_snippet.trim_start().starts_with("global using "))
-        .filter_map(|import| csharp_using_namespace(&import.raw_snippet))
+        .filter_map(|import| csharp_using_namespace(&import))
         .map(|namespace| {
             normalize_csharp_type_fragment(namespace.strip_prefix("global::").unwrap_or(&namespace))
         })

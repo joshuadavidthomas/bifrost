@@ -14,15 +14,10 @@ use crate::declarations::{rust_node_text, rust_package_name};
 use crate::graph_support::{RustSource, resolve_module_package};
 use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RustVisibility {
-    Private,
-    Public,
-    Crate,
-    SelfModule,
-    SuperModule,
-    InPath(Vec<String>),
-}
+/// Re-exported from core, where the persisted Rust usage facts that carry it
+/// live. It stays spelled `crate::imports::RustVisibility` for every Rust
+/// caller, because visibility arithmetic is this module's subject.
+pub use brokk_bifrost_core::analyzer::rust_facts::RustVisibility;
 
 #[derive(Debug, Clone)]
 pub struct RustImportInfo {
@@ -111,6 +106,7 @@ fn rust_external_crate_import(
         info: ImportInfo {
             raw_snippet: rust_node_text(node, source).to_string(),
             is_wildcard: false,
+            is_global: false,
             identifier: Some(name.to_string()),
             alias,
             path: Some(StructuredImportPath {
@@ -581,6 +577,7 @@ impl RustUseDeclaration {
             info: ImportInfo {
                 raw_snippet,
                 is_wildcard,
+                is_global: false,
                 identifier,
                 alias,
                 path: Some(StructuredImportPath {

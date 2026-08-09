@@ -53,8 +53,12 @@ impl LanguageAdapter for JavascriptAdapter {
         !code_unit.is_file_scope() && !code_unit.is_module()
     }
 
+    fn lookup_candidate_separators(&self) -> &'static [&'static str] {
+        &["."]
+    }
+
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
-        lookup_suffix_candidates(normalized_fq_name, &["."])
+        lookup_suffix_candidates(normalized_fq_name, self.lookup_candidate_separators())
     }
 
     fn storage_contains_tests(
@@ -483,14 +487,14 @@ impl CodeUnitIndex for JavascriptAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_with_literal(
+    fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
-        required_literal: &str,
+        terminal_identifiers: &[String],
         language: Language,
     ) -> BTreeSet<CodeUnit> {
         self.inner
-            .search_definitions_with_literal(pattern, required_literal, language)
+            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
@@ -505,6 +509,10 @@ impl CodeUnitIndex for JavascriptAnalyzer {
     // exact-match happened to find (dayjs's `formats`: a JS locale field's
     // bare identifier lookup returned empty, so the TypeScript `ILocale`
     // interface member won by default with no ambiguity ever reported).
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        self.inner.has_complete_symbol_lookup_index()
+    }
+
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_declarations_by_identifier(identifier)
     }

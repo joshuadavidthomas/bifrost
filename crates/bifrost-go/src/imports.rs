@@ -27,18 +27,16 @@ pub fn default_go_import_local_name(import_path_or_identifier: &str) -> String {
 }
 
 /// The quoted import path out of a raw `import ...` snippet.
-pub fn extract_go_import_path(raw_import: &str) -> Option<String> {
-    let trimmed = raw_import.trim();
-    trimmed
-        .split_whitespace()
-        .next_back()
-        .map(|path| {
-            path.trim_matches('"')
-                .trim_matches('`')
-                .trim_matches('\'')
-                .to_string()
-        })
-        .filter(|path| !path.is_empty())
+/// The import path a Go `import` binds, from its structured path.
+///
+/// `parse_go_import_spec` splits the path literal on Go's own '/' separator, so
+/// rejoining the segments reproduces the literal's value exactly. This replaced
+/// re-scanning `raw_snippet` for its last whitespace-delimited word and
+/// trimming quote characters off it.
+pub fn go_import_path(import: &ImportInfo) -> Option<String> {
+    let path = import.path.as_ref()?;
+    let rendered = path.render_segments("/");
+    (!rendered.is_empty()).then_some(rendered)
 }
 
 /// Legacy directory-suffix import match, used only as a fallback when no
@@ -225,7 +223,7 @@ pub fn go_imported_code_units_of(
         if import.alias.as_deref() == Some("_") {
             continue;
         }
-        let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+        let Some(path) = go_import_path(import) else {
             continue;
         };
         for target_file in go_matching_import_files(tables, file, &path) {
@@ -283,7 +281,7 @@ pub fn go_definition_import_namespaces(
         if alias == Some("_") {
             continue;
         }
-        let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+        let Some(path) = go_import_path(import) else {
             continue;
         };
         let vendor_suffix = format!("/vendor/{path}");

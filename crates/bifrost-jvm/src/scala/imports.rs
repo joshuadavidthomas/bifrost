@@ -133,6 +133,7 @@ pub fn scala_import_infos_from_node_with_prefixes(
     vec![ImportInfo {
         raw_snippet: render_scala_import(&base_path, false, None),
         is_wildcard: false,
+        is_global: false,
         identifier,
         alias: None,
         path: Some(StructuredImportPath {
@@ -242,6 +243,7 @@ fn scala_import_selector_info(
         return Some(ImportInfo {
             raw_snippet: render_scala_import(base_path, true, None),
             is_wildcard: true,
+            is_global: false,
             identifier: None,
             alias: None,
             path: Some(StructuredImportPath {
@@ -282,6 +284,7 @@ fn scala_import_selector_info(
     Some(ImportInfo {
         raw_snippet: render_scala_import(&path, false, alias.as_deref()),
         is_wildcard: false,
+        is_global: false,
         identifier: Some(alias.clone().unwrap_or(name)),
         alias,
         path: Some(StructuredImportPath {
