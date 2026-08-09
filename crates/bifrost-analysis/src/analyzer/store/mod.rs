@@ -11463,7 +11463,7 @@ mod tests {
     }
 
     /// A burst wider than the pool runs at full width, and the pool keeps only
-    /// `MAX_IDLE_READERS` of those connections afterwards. Both halves matter:
+    /// its configured idle capacity afterwards. Both halves matter:
     /// the first barrier would deadlock if checkout throttled a burst, and the
     /// idle count is what a live process pays for the rest of its lifetime.
     #[test]
@@ -11494,8 +11494,9 @@ mod tests {
 
         assert_eq!(
             store.readers.idle_len(),
-            MAX_IDLE_READERS,
-            "a {burst}-wide burst must leave only {MAX_IDLE_READERS} readers resident"
+            store.readers.capacity,
+            "a {burst}-wide burst must leave only {} readers resident",
+            store.readers.capacity,
         );
     }
 
