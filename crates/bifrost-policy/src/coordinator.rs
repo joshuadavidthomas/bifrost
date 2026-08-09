@@ -49,10 +49,11 @@ use super::loading::{PolicyDocumentLoadError, read_rqlp_document};
 use super::registry::{PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits};
 use super::report::{
     MAX_DIFF_FIXED_FINDINGS, PolicyDiffFixedFinding, PolicyDiffReview, PolicyExecutionMetadata,
-    PolicyExecutionStage, PolicyExecutionTermination, PolicyPackActivationReview,
-    PolicyPackDecision, PolicyPackDecisionStatus, PolicyReportBuilder, PolicyReportBuilderError,
-    PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
-    PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange, PolicyStageTiming,
+    PolicyExecutionStage, PolicyExecutionTermination, PolicyOptionalReviews,
+    PolicyPackActivationReview, PolicyPackDecision, PolicyPackDecisionStatus, PolicyReportBuilder,
+    PolicyReportBuilderError, PolicyReportDiagnostic, PolicyReportDiagnosticCode,
+    PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange,
+    PolicyStageTiming,
 };
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
@@ -604,9 +605,7 @@ fn deadline_before_evaluation_outcome(
         Vec::new(),
         Vec::new(),
         Vec::new(),
-        None,
-        None,
-        None,
+        PolicyOptionalReviews::default(),
         diagnostics,
         false,
         0,
