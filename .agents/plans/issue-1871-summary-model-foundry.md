@@ -62,11 +62,24 @@ Milestone 6, audits and scale. The pack-on/off fleet diff with suppression attri
 
 - [x] (2026-08-09) Design discussion with jbellis: constraints, trust model, routing, CodeQL-as-verifier calculus, and the human-review budget recorded in this plan.
 - [ ] Architecture note posted to #1871 for DavidBakerEffendi's review (license and attribution posture for corpus translation, dispute-resolution policy, Joern-experience critique).
-- [ ] Milestone 1 not started.
+- [x] (2026-08-09) Milestone 1 complete. The foundry IR seam, both corpus translators, the three-way join, and the round-trip check live in `crates/bifrost-semantic-packs/src/summary_foundry/` behind the existing `release-tooling` feature. `semantic-packs/summary-corpora/pins.json` pins both corpora; `scripts/fetch-pinned-summary-corpora.sh` fetches them and runs `bifrost-semantic-pack summary-corpus-join`. Measured on CodeQL `c9142680` and Joern `8a73ec09`:
+    - CodeQL: 404 files, 10953 rows, 3733 entries (2962 carrying flows, 771 no-flow claims), 3425 transfers, 6798 rows skipped by typed reason.
+    - Joern: 23 semantics, 17 entries, 23 transfers, 23 skipped mappings.
+    - Round trip: all 2962 + 17 entries with an authored spelling compile through `compile_source` with no diagnostic.
+    - Join: 0 agreements, 1 dispute, 3417 gaps. Two runs over the same pins are byte-identical.
+- [ ] Milestone 2 not started.
 
 ## Surprises & Discoveries
 
 - The 2026-08-09 epic acceptance probe (#1893, closed) proved the boundary-status machinery can type a derivation's own incompleteness, which is what makes no-LLM routing decidable per entry.
+- Joern ships no `.semantics` resource file at the pinned revision. The default corpus is Scala source, `dataflowengineoss/src/main/scala/io/joern/dataflowengineoss/DefaultSemantics.scala`, and `javaFlows` holds only 23 entries. The foundry therefore has two Joern front ends over one value: a parser for the documented `.semantics` DSL (grammar `Semantics.g4`) and a reader for the pinned Scala list literal. The Scala reader fails loudly on any shape it does not know, so an upstream refactor stops a foundry run instead of quietly translating less.
+- The authored IR carries less than the corpora state, in three ways that milestone 2 must weigh:
+    - It has no output port for a write into parameter N. 132 CodeQL rows and all 23 Joern mappings that were skipped want one (Joern's `getChars`-style buffer writes and every `(1,1)` self-taint mapping).
+    - It has no access paths. 3672 CodeQL rows qualify a port with `.Element`, `.MapValue`, `.MapKey`, `.ArrayElement`, `.SyntheticField[..]`, `.Field[..]`, or `.Parameter[..]`. `.SyntheticField[..]` and `.Field[..]` on an output look directly expressible as the existing named `heap` location; the container qualifiers do not, because an authored input can only be the receiver or a parameter.
+    - It cannot state "no flow at all". `validate.rs` rejects a summary with no transfer and no effect (`summary.empty`), so 771 CodeQL `neutralModel` summary rows and every Joern nil semantic translate into the foundry IR and stop there. These are exactly the claims with suppression power, so the shape they need is the same one the plan reserves for the human promotion queue.
+- CodeQL and Joern share almost nothing on the JVM. Of 3418 join keys, one is comparable and it is a dispute: CodeQL states `java.lang.String.compareTo(String)` is neutral, Joern states `receiver -> receiver` through `PASSTHROUGH`. Joern is not a cross-check of CodeQL's JVM content at this scale; it is a second opinion on about twenty targets. The plan's "lighter cross-check" framing holds, but the calibration weight it can carry for Java is near zero.
+- Three CodeQL rows reference an argument ordinal their own pinned signature does not have: `com.google.gson.Gson#toString()` with `Argument[0]`, `io.netty...ServerCookieEncoder#encode(String,String)` with `Argument[1..2]`, and `javax.naming.directory.BasicAttributes#put(Attribute)` with `Argument[0..1]`. Two more targets carry both summary rows and a `neutralModel` summary row. The translator records both as typed findings rather than guessing; they are candidate upstream bug reports.
+- Models-as-Data carries `barrierModel` and `barrierGuardModel` extensibles (31 rows in the Java corpus) that the plan did not name. They are counted as out of scope, like sources and sinks.
 
 ## Decision Log
 
@@ -77,7 +90,17 @@ Milestone 6, audits and scale. The pack-on/off fleet diff with suppression attri
 - PHP gets no summary content until demand appears; structural RQL support for PHP is unaffected (jbellis, 2026-08-09).
 - Depth-first per module with content-addressed stage artifacts, in demand order (jbellis, 2026-08-09).
 - The trust signal requires a dedicated blind grading pass over the underivable-but-CodeQL-covered stratum, with outputs discarded from shipping; production routing alone generates no calibration data. Spotted by jbellis after Milestone 1 dispatch (2026-08-09).
+- Milestone 1 wraps the authored IR instead of extending it (Fable, 2026-08-09). `AuthoredProcedureSummary` is the shipping contract that the compiler and the runtime binder consume; provenance, uncarried-claim notes, and the no-flow claim are foundry state, not shipping state. `FoundryEntry` holds both and projects the shipping contract back out. Extending the authored IR with a no-flow claim changes runtime semantics and belongs with the milestone where a proof gate can test it.
+- Translation skips faithfully instead of coarsening (Fable, 2026-08-09). Reading `Argument[0].Element -> ReturnValue` as `parameter[0] -> normal_return` would be a sound over-approximation for a partial summary, but it silently restates the corpus and would make the milestone-2 derivation agree with a claim CodeQL never made. Every unrepresentable row is counted under a typed reason instead.
+- The join key is (class-file path, member, pinned arity) (Fable, 2026-08-09). The corpora spell parameter types differently (`(String)` against `(java.lang.String)`), so arity is the only signature projection that compares. A row with no signature pins no overload, so it takes its own key with `arity: null` rather than acting as a wildcard that could manufacture agreement; gap records name the sibling arities so a reviewer sees the neighbourhood.
+- Constructors normalize to `<init>` and packages to class-file paths (Fable, 2026-08-09). Models-as-Data names a constructor after its type and Joern names it `<init>`; both reduce to the JVM binary spelling, which is also what an authored target's `path` and the eventual artifact resolution use.
+- `semantic-packs/summary-corpora/pins.json` is the single source of truth for both the acquisition script and the join tool (Fable, 2026-08-09), so a revision bump is one edit and a report can never claim a revision the download did not use. The corpora themselves are not vendored; only small verbatim slices under `crates/bifrost-semantic-packs/testdata/summary-corpora/` keep translator tests offline.
+- The artifact that holds a class is a typed `FoundryArtifactBinding::Unresolved` on every translated entry (Fable, 2026-08-09). Neither corpus names an artifact and the foundry has no artifact index yet, so the field records the gap where the answer belongs instead of guessing a jar.
 
 ## Outcomes & Retrospective
 
-Not started.
+Milestone 1 is done and its acceptance holds. Two observations shape what comes next.
+
+The first is that the authored IR, not the corpora, is now the binding constraint. Of 7128 CodeQL summary rows, 3425 transfers survive translation; the 3672 rows lost to access paths and the 132 lost to parameter-write outputs are not corpus noise, they are three specific missing shapes. Milestone 2 should decide which of them the derivation will need to emit anyway, because a derived summary of a real JDK body will want to say "the elements of the argument reach the return" just as often as CodeQL does.
+
+The second is that Joern cannot serve as the JVM cross-check the plan assumed. One comparable target out of 3418 is not calibration. The verification role the plan gives the external corpora has to rest on CodeQL alone for Java, with Joern retained for the languages where its corpus is comparatively deeper, and the milestone-3 proof gates carrying correspondingly more weight.
