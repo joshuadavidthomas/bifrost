@@ -21,8 +21,7 @@ use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
 };
 use crate::analyzer::common::language_for_file as file_language;
-use crate::analyzer::memo_cache::{FlightCache, WeightedCache as Cache};
-use crate::analyzer::memo_cache::{build_flight_cache, build_weighted_cache};
+use crate::analyzer::js_ts::build_weighted_cache;
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::{
@@ -37,6 +36,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
+use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
@@ -72,7 +72,7 @@ pub struct PythonAnalyzer {
     // import whose binding name collides with another's). `could_import_file` needs the undeduped
     // set to answer "does ANY import here resolve into `target`" without re-resolving every import
     // on every call (previously uncached, called once per (candidate file, target) pair).
-    imported_target_files: FlightCache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    imported_target_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     // `export_index_of` re-parses `file` from source on every call (it walks re-export chains, not
     // the store-backed `FileState`). `resolve_exported_name`'s re-export BFS calls it once per hop
@@ -80,13 +80,13 @@ pub struct PythonAnalyzer {
     // chain this was previously O(candidates * chain depth) redundant full-file parses -- invisible
     // while candidate discovery was single-threaded and dominated by slower costs, but the dominant
     // cost once that walk was fixed and parallelized (#1257).
-    export_index: FlightCache<ProjectFile, Arc<ExportIndex>>,
+    export_index: Cache<ProjectFile, Arc<ExportIndex>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     // Dead-code analysis scans the stable caller domain but resolves a bounded
     // callee target set. Cache that exact pair for warm requests so repeated
     // queries do not reparse the entire Python workspace.
     usage_edges:
-        FlightCache<PythonUsageEdgesKey, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
+        Cache<PythonUsageEdgesKey, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
     direct_descendant_index: Arc<OnceLock<DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     usage_index: Arc<OnceLock<PythonUsageIndex>>,
@@ -167,7 +167,7 @@ impl PythonAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
-        clone.usage_edges = build_flight_cache(self.memo_budget / 8, weight_python_usage_edges);
+        clone.usage_edges = build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges);
         clone
     }
 
@@ -203,11 +203,11 @@ impl PythonAnalyzer {
             inner,
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
-            imported_target_files: build_flight_cache(memo_budget / 8, weight_project_file_set),
+            imported_target_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            export_index: build_flight_cache(memo_budget / 8, weight_export_index),
+            export_index: build_weighted_cache(memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
-            usage_edges: build_flight_cache(memo_budget / 8, weight_python_usage_edges),
+            usage_edges: build_weighted_cache(memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
@@ -929,14 +929,14 @@ impl IAnalyzer for PythonAnalyzer {
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
-            imported_target_files: build_flight_cache(
+            imported_target_files: build_weighted_cache(
                 self.memo_budget / 8,
                 weight_project_file_set,
             ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            export_index: build_flight_cache(self.memo_budget / 8, weight_export_index),
+            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
-            usage_edges: build_flight_cache(self.memo_budget / 8, weight_python_usage_edges),
+            usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),
@@ -949,14 +949,14 @@ impl IAnalyzer for PythonAnalyzer {
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
-            imported_target_files: build_flight_cache(
+            imported_target_files: build_weighted_cache(
                 self.memo_budget / 8,
                 weight_project_file_set,
             ),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            export_index: build_flight_cache(self.memo_budget / 8, weight_export_index),
+            export_index: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
-            usage_edges: build_flight_cache(self.memo_budget / 8, weight_python_usage_edges),
+            usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
             direct_descendant_index: Arc::new(OnceLock::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(OnceLock::new()),

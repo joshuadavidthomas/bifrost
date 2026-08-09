@@ -17,7 +17,7 @@ use std::hash::Hash;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::analyzer::memo_cache::{FlightCache, build_flight_cache};
+use moka::sync::Cache;
 
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -67,7 +67,7 @@ pub(crate) struct CompleteValueCache<K, V>
 where
     K: Eq + Hash,
 {
-    entries: FlightCache<K, Arc<V>>,
+    entries: Cache<K, Arc<V>>,
     in_flight: Arc<Mutex<HashMap<K, Arc<InFlightMaterialization<V>>>>>,
 }
 
@@ -93,9 +93,10 @@ where
         weigher: impl Fn(&K, &Arc<V>) -> u32 + Send + Sync + 'static,
     ) -> Self {
         Self {
-            entries: build_flight_cache(max_retained_weight.max(1), move |key, value| {
-                weigher(key, value).max(1)
-            }),
+            entries: Cache::builder()
+                .max_capacity(max_retained_weight.max(1))
+                .weigher(move |key, value| weigher(key, value).max(1))
+                .build(),
             in_flight: Arc::new(Mutex::new(HashMap::default())),
         }
     }
@@ -279,7 +280,7 @@ where
 {
     key: K,
     flight: Arc<InFlightMaterialization<V>>,
-    entries: FlightCache<K, Arc<V>>,
+    entries: Cache<K, Arc<V>>,
     in_flight: Arc<Mutex<HashMap<K, Arc<InFlightMaterialization<V>>>>>,
 }
 

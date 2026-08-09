@@ -1,6 +1,6 @@
 use super::*;
-use crate::analyzer::memo_cache::{WeightedCache as Cache, build_weighted_cache};
 use crate::analyzer::{DirectDescendantIndex, PoolSafeMemo};
+use moka::sync::Cache;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
@@ -21,11 +21,11 @@ impl JavaMemoCaches {
     pub(super) fn new(budget_bytes: u64) -> Self {
         Self {
             budget_bytes,
-            resolved_imports: build_weighted_cache(budget_bytes / 4, weight_import_map),
-            package_names: build_weighted_cache(budget_bytes / 16, weight_package_name),
-            referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
-            relevant_imports: build_weighted_cache(budget_bytes / 8, weight_string_set),
-            direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec),
+            resolved_imports: Self::build_cache(budget_bytes / 4, weight_import_map),
+            package_names: Self::build_cache(budget_bytes / 16, weight_package_name),
+            referencing_files: Self::build_cache(budget_bytes / 8, weight_project_file_set),
+            relevant_imports: Self::build_cache(budget_bytes / 8, weight_string_set),
+            direct_ancestors: Self::build_cache(budget_bytes / 8, weight_code_unit_vec),
             direct_descendant_index: OnceLock::new(),
             reverse_import_index: PoolSafeMemo::new(),
             same_package_reference_index: PoolSafeMemo::new(),
@@ -34,6 +34,21 @@ impl JavaMemoCaches {
 
     pub(super) fn budget_bytes(&self) -> u64 {
         self.budget_bytes
+    }
+
+    fn build_cache<K, V>(
+        budget_bytes: u64,
+        weigher: impl Fn(&K, &V) -> u32 + Send + Sync + 'static,
+    ) -> Cache<K, V>
+    where
+        K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        let capacity = budget_bytes.max(1);
+        Cache::builder()
+            .max_capacity(capacity)
+            .weigher(weigher)
+            .build()
     }
 }
 

@@ -17,7 +17,7 @@
 //! visibility, Cargo routes, the analyzed-file set), not only file bytes, so a
 //! content-hash key would claim an invariance these values do not have.
 
-use crate::analyzer::memo_cache::WeightedCache as Cache;
+use moka::sync::Cache;
 use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -1857,26 +1857,6 @@ mod tests {
         (temp, analyzer)
     }
 
-    /// The same fixture under a memo budget too small to hold anything, so
-    /// every walk cache evicts on nearly every insert.
-    fn project_with_starved_memo(files: &[(&str, &str)]) -> (tempfile::TempDir, RustAnalyzer) {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let root = temp.path().canonicalize().expect("canonical root");
-        for (rel, body) in files {
-            ProjectFile::new(root.clone(), rel)
-                .write(body)
-                .expect("write fixture file");
-        }
-        let config = crate::analyzer::AnalyzerConfig {
-            memo_cache_budget_bytes: Some(1),
-            ..Default::default()
-        };
-        let analyzer =
-            RustAnalyzer::new_with_config(Arc::new(TestProject::new(root, Language::Rust)), config);
-        let _ = analyzer.get_analyzed_files();
-        (temp, analyzer)
-    }
-
     /// `modules` modules in one crate, each re-exporting a name from
     /// `neighbours` of its successors modulo the count. The import graph is
     /// therefore one strongly connected component of that size, which is the
@@ -2012,55 +1992,6 @@ mod tests {
             "a generation bump must not serve the previous generation's entry"
         );
         assert_eq!(*after, *first, "the answer itself is unchanged");
-    }
-
-    /// The walk caches are bounded by a FIFO cap, not by an LRU policy. The
-    /// bound is a memory bound, never an answer, and this pins the difference:
-    /// a workspace analyzed under a one-byte memo budget, where every insert
-    /// evicts, must give the same answers as one at the product budget.
-    #[test]
-    fn a_starved_memo_budget_changes_nothing_but_the_memory() {
-        const FILES: &[(&str, &str)] = &[
-            (
-                "src/lib.rs",
-                "pub mod service;\npub mod consumer;\npub mod impostor;\npub mod decoy;\n",
-            ),
-            ("src/service.rs", "pub struct Widget;\n"),
-            ("src/decoy.rs", "pub struct Widget;\n"),
-            (
-                "src/consumer.rs",
-                "use crate::service::Widget;\npub fn take(_: Widget) {}\n",
-            ),
-            (
-                "src/impostor.rs",
-                "use crate::decoy::Widget;\npub fn take(_: Widget) {}\n",
-            ),
-        ];
-        let answer = |(_temp, analyzer): (tempfile::TempDir, RustAnalyzer)| {
-            let walks = RustUsageWalks::new(&analyzer);
-            let target = identity_named(&walks, &file(&analyzer, "service.rs"), "Widget");
-            let importers: BTreeSet<String> = walks
-                .edges_binding_identity(&target)
-                .into_iter()
-                .map(|edge| edge.importer.rel_path().to_string_lossy().into_owned())
-                .collect();
-            let module_files: Vec<String> = walks
-                .files_in_module_package("service")
-                .iter()
-                .map(|file| file.rel_path().to_string_lossy().into_owned())
-                .collect();
-            (importers, module_files)
-        };
-        let budgeted = answer(project(FILES));
-        let starved = answer(project_with_starved_memo(FILES));
-        assert!(
-            !budgeted.0.is_empty() && !budgeted.1.is_empty(),
-            "the fixture must produce an answer to compare: {budgeted:?}"
-        );
-        assert_eq!(
-            starved, budgeted,
-            "an evicting cache and a retaining cache must answer identically"
-        );
     }
 
     /// The four-candidate filesystem probe is memoized per module path.

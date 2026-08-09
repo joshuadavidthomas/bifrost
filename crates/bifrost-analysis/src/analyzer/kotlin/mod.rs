@@ -67,11 +67,11 @@ pub(crate) mod types;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::{
-    weight_code_unit_set, weight_code_unit_vec_by_unit, weight_project_file_set,
+    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
+    weight_project_file_set,
 };
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
-use crate::analyzer::memo_cache::{WeightedCache as Cache, build_weighted_cache};
 use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
@@ -81,6 +81,7 @@ use crate::analyzer::{
     UsageFactsIndex,
 };
 use crate::hash::{HashMap, HashSet};
+use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 use tests::detect_kotlin_test_assertion_smells;

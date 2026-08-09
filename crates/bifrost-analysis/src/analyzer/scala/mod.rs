@@ -16,13 +16,11 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::js_ts::cache::{
-    weight_code_unit_set, weight_code_unit_vec_by_unit, weight_project_file_set,
+    build_weighted_cache, weight_code_unit_set, weight_code_unit_vec_by_unit,
+    weight_project_file_set,
 };
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
-use crate::analyzer::memo_cache::{
-    FlightCache, WeightedCache as Cache, build_flight_cache, build_weighted_cache,
-};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
 use crate::analyzer::{
@@ -34,6 +32,7 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
+use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -250,7 +249,7 @@ pub struct ScalaAnalyzer {
     /// analyzer generation and reset on `update`/`update_all`.
     project_types: Arc<OnceLock<Arc<crate::analyzer::usages::scala_graph::ScalaProjectTypes>>>,
     full_usage_edges:
-        FlightCache<Arc<[String]>, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
+        Cache<Arc<[String]>, Arc<crate::analyzer::usages::inverted_edges::UsageEdges>>,
     project_types_build_count: Arc<AtomicUsize>,
     scala_query_parse_count: Arc<AtomicUsize>,
     scala_query_walk_count: Arc<AtomicUsize>,
@@ -446,7 +445,8 @@ impl ScalaAnalyzer {
         clone.inner = clone.inner.clone_with_project(project);
         clone.external_index = Arc::new(OnceLock::new());
         clone.project_types = Arc::new(OnceLock::new());
-        clone.full_usage_edges = build_flight_cache(self.memo_budget / 8, weight_scala_usage_edges);
+        clone.full_usage_edges =
+            build_weighted_cache(self.memo_budget / 8, weight_scala_usage_edges);
         clone.project_types_build_count = Arc::new(AtomicUsize::new(0));
         clone.scala_query_parse_count = Arc::new(AtomicUsize::new(0));
         clone.scala_query_walk_count = Arc::new(AtomicUsize::new(0));
@@ -483,7 +483,7 @@ impl ScalaAnalyzer {
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             lazy_hierarchy_index: Arc::new(OnceLock::new()),
             project_types: Arc::new(OnceLock::new()),
-            full_usage_edges: build_flight_cache(memo_budget / 8, weight_scala_usage_edges),
+            full_usage_edges: build_weighted_cache(memo_budget / 8, weight_scala_usage_edges),
             project_types_build_count: Arc::new(AtomicUsize::new(0)),
             scala_query_parse_count: Arc::new(AtomicUsize::new(0)),
             scala_query_walk_count: Arc::new(AtomicUsize::new(0)),

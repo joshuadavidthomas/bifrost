@@ -1,9 +1,7 @@
-use crate::analyzer::memo_cache::{
-    FlightCache, WeightedCache as Cache, build_flight_cache, build_weighted_cache,
-};
 use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
 use crate::analyzer::{CodeUnit, DirectDescendantIndex, PoolSafeMemo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use moka::sync::Cache;
 use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 
@@ -22,7 +20,7 @@ pub(crate) struct JsTsMemoCaches {
     /// statement's path resolve to this file) used by `could_import_file`, not a symbol-level one --
     /// caching it separately avoids re-running `resolve_js_ts_import_paths` for every candidate/target
     /// pair the shared usages candidate walker checks.
-    pub(crate) imported_target_files: FlightCache<ProjectFile, Arc<HashSet<ProjectFile>>>,
+    pub(crate) imported_target_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     /// Files that import a given file, keyed by imported file.
     pub(crate) referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     /// Import snippets textually relevant to a code unit's source.
@@ -41,7 +39,7 @@ impl JsTsMemoCaches {
     pub(crate) fn new(budget_bytes: u64) -> Self {
         Self {
             imported_code_units: build_weighted_cache(budget_bytes / 3, weight_code_unit_set),
-            imported_target_files: build_flight_cache(budget_bytes / 6, weight_project_file_set),
+            imported_target_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             referencing_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(budget_bytes / 6, weight_string_set),
             direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec_by_unit),
@@ -50,6 +48,20 @@ impl JsTsMemoCaches {
             jsts_usage_index: PoolSafeMemo::new(),
         }
     }
+}
+
+pub(crate) fn build_weighted_cache<K, V>(
+    budget_bytes: u64,
+    weigher: impl Fn(&K, &V) -> u32 + Send + Sync + 'static,
+) -> Cache<K, V>
+where
+    K: Clone + Eq + std::hash::Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    Cache::builder()
+        .max_capacity(budget_bytes.max(1))
+        .weigher(weigher)
+        .build()
 }
 
 pub(crate) fn weight_string_set(_key: &CodeUnit, value: &Arc<HashSet<String>>) -> u32 {

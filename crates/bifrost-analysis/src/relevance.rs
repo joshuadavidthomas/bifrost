@@ -1,4 +1,3 @@
-use crate::analyzer::memo_cache::{FlightCache, build_flight_cache};
 use crate::analyzer::usages::inverted_edges::UsageReferenceCounts;
 use crate::analyzer::usages::workspace_graph::{
     UsageEcosystem, WorkspaceUsageCatalog, WorkspaceUsageGraphBuildOutcome,
@@ -14,6 +13,7 @@ use crate::compact_graph::CompactDirectedGraph;
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
 use git2::{Oid, Repository};
+use moka::sync::Cache;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, VecDeque};
 use std::io::Read;
@@ -1530,7 +1530,7 @@ struct GitProjectContext {
 }
 
 struct RepoCommitChangeCache {
-    commits: FlightCache<Oid, Arc<CommitChange>>,
+    commits: Cache<Oid, Arc<CommitChange>>,
     fill_lock: Mutex<()>,
     fill_commits_scanned: AtomicUsize,
     /// The ordered recent-commit OID list (topo-order, first-parent, as produced by
@@ -1562,10 +1562,7 @@ struct CachedRecentOids {
 impl RepoCommitChangeCache {
     fn new(max_entries: u64) -> Self {
         Self {
-            commits: build_flight_cache(
-                max_entries.max(1),
-                |_key: &Oid, _value: &Arc<CommitChange>| 1,
-            ),
+            commits: Cache::builder().max_capacity(max_entries.max(1)).build(),
             fill_lock: Mutex::new(()),
             fill_commits_scanned: AtomicUsize::new(0),
             recent_oids: Mutex::new(None),
@@ -2203,7 +2200,7 @@ impl GitProjectContext {
 
 fn missing_commit_ranges(
     ordered_oids: &[Oid],
-    cache: &FlightCache<Oid, Arc<CommitChange>>,
+    cache: &Cache<Oid, Arc<CommitChange>>,
 ) -> Vec<MissingCommitRange> {
     let mut ranges = Vec::new();
     let mut current_start = None;

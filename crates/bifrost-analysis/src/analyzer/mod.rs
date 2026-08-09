@@ -25,7 +25,6 @@ mod js_ts;
 pub(crate) mod jvm;
 mod kotlin;
 pub mod lexical_definitions;
-pub(crate) mod memo_cache;
 mod multi_analyzer;
 mod php;
 mod pool_memo;
