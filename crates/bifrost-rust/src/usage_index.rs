@@ -45,7 +45,10 @@ use crate::imports::{
     rust_crate_root_package, rust_import_projection, rust_module_extents,
     rust_target_kind_root_package,
 };
-use crate::lexical_scope::{RustCfgCondition, lexical_package_at, rust_cfg_condition};
+use crate::lexical_scope::{
+    RustCfgCondition, lexical_package_at, local_type_item_name_shadowed_in_tree,
+    rust_cfg_condition, visible_import_binders_with_scopes_in_tree,
+};
 
 /// How a local binding in an importer refers to its target: a named import
 /// (`use path::Item;`) or a namespace import (`use crate::module;`). A glob
@@ -2319,6 +2322,7 @@ fn rust_include_edges(file: &ProjectFile, root: Node<'_>, source: &str) -> Vec<R
     edges
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_include_routes(
     rust: &dyn RustSource,
     files: &[ProjectFile],
@@ -2660,6 +2664,212 @@ pub fn usage_exact_root_for_resolution(
         .exact_root_for_resolution(resolution, seeds)
 }
 
+/// Resolve a path prefix through the nearest visible namespace import.
+///
+/// The regular module-alias table only contains imports owned by a module. A
+/// `use` inside a function (or another local scope) is therefore absent from
+/// that table, even though Rust resolves the binding at the reference site.
+/// Keep this route query-local: the visible binder is authoritative, and an
+/// unresolved local namespace must not fall through to a relative module path.
+fn visible_namespace_module_routes(
+    rust: &dyn RustUsageSource,
+    index: &RustUsageIndex,
+    file: &ProjectFile,
+    module: &ModuleKey,
+    byte: usize,
+    path_prefix: &[&str],
+    leading_absolute: bool,
+) -> Option<Vec<RustResolvedModuleRoute>> {
+    let first = path_prefix.first()?;
+    let syntax = rust.prepared_syntax(file)?;
+    let leading_absolute_local = leading_absolute
+        && index
+            .module_files
+            .cargo_routes
+            .file_uses_rust_2015_edition(file);
+    for (scope_start, binder) in
+        visible_import_binders_with_scopes_in_tree(syntax.tree().root_node(), syntax.source(), byte)
+    {
+        let Some(binding) = binder.bindings.get(*first) else {
+            continue;
+        };
+        let base_segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
+        if base_segments.is_empty() {
+            return Some(Vec::new());
+        }
+        let lexical_package = lexical_package_at(&module.package(), syntax.source(), scope_start);
+        let mut base_routes =
+            index
+                .module_files
+                .resolve_segments(file, &lexical_package, &base_segments);
+        base_routes.retain(|route| {
+            !leading_absolute
+                || matches!(
+                    route.provenance,
+                    RustRouteProvenance::CurrentLibrary | RustRouteProvenance::Dependency
+                )
+                || (leading_absolute_local && route.provenance == RustRouteProvenance::Local)
+        });
+
+        let resolve_routes = |mut segments: Vec<String>| {
+            segments.extend(
+                path_prefix
+                    .iter()
+                    .skip(1)
+                    .map(|segment| (*segment).to_string()),
+            );
+            let mut routes = index
+                .module_files
+                .resolve_segments(file, &lexical_package, &segments);
+            routes.retain(|route| {
+                !leading_absolute
+                    || matches!(
+                        route.provenance,
+                        RustRouteProvenance::CurrentLibrary | RustRouteProvenance::Dependency
+                    )
+                    || (leading_absolute_local && route.provenance == RustRouteProvenance::Local)
+            });
+            routes
+        };
+
+        match binding.kind {
+            ImportKind::Namespace => return Some(resolve_routes(base_segments)),
+            ImportKind::Named => {
+                let Some(imported_name) = binding.imported_name.as_deref() else {
+                    return Some(Vec::new());
+                };
+
+                let mut module_item = false;
+                let mut type_item = false;
+                let mut value_or_macro_item = false;
+                for route in &base_routes {
+                    let mut candidate_identities = index
+                        .identities_by_name
+                        .get(imported_name)
+                        .into_iter()
+                        .flatten()
+                        .filter(|identity| {
+                            (identity.file == route.target_file
+                                || index
+                                    .physical_owners
+                                    .intersects(&identity.file, &route.target_file)
+                                || rust
+                                    .cargo_routes()
+                                    .files_share_target(&identity.file, &route.target_file)
+                                    == Some(true))
+                                && identity.module == route.target_module
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if candidate_identities.is_empty() {
+                        let export_targets = index.export_targets_from_files(
+                            rust.code_units(),
+                            std::slice::from_ref(&route.target_file),
+                            imported_name,
+                        );
+                        candidate_identities = export_targets
+                            .into_iter()
+                            .flat_map(|(target_file, target_name)| {
+                                index
+                                    .identities_by_name
+                                    .get(&target_name)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(move |identity| identity.file == target_file)
+                                    .cloned()
+                            })
+                            .collect();
+                    }
+                    for identity in candidate_identities {
+                        match identity.namespace {
+                            RustSymbolNamespace::Module => module_item = true,
+                            RustSymbolNamespace::Type => type_item = true,
+                            RustSymbolNamespace::Value | RustSymbolNamespace::Macro => {
+                                value_or_macro_item = true;
+                            }
+                        }
+                    }
+                }
+
+                if module_item && !type_item {
+                    let mut segments = base_segments.clone();
+                    segments.push(imported_name.to_string());
+                    return Some(resolve_routes(segments));
+                }
+                if value_or_macro_item && !module_item && !type_item {
+                    // Value- and macro-only imports do not occupy the
+                    // type/module namespace. Keep searching for an outer
+                    // binder with the same alias, such as a module import.
+                    continue;
+                }
+                // A named type, module, or unresolved item is authoritative at
+                // this scope. Do not use a relative path fallback that could
+                // resolve a different declaration.
+                return Some(Vec::new());
+            }
+            ImportKind::Default | ImportKind::CommonJsRequire | ImportKind::Glob => {
+                return Some(Vec::new());
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_identities_for_resolved_module_route(
+    rust: &dyn RustUsageSource,
+    index: &RustUsageIndex,
+    seeds: &RustBindingSeeds,
+    file: &ProjectFile,
+    module: &ModuleKey,
+    resolved: &RustResolvedModuleRoute,
+    terminal: &str,
+    namespace: RustReferenceNamespace,
+) -> HashSet<RustSymbolIdentity> {
+    let mut matches = index
+        .identities_by_name
+        .get(terminal)
+        .into_iter()
+        .flatten()
+        .filter(|identity| {
+            let domains = index
+                .declaration_domains
+                .get(*identity)
+                .expect("identities_by_name entries are declaration_domains keys");
+            let domains = seeds.identity_domains.get(*identity).unwrap_or(domains);
+            identity.file == resolved.target_file
+                && identity.module == resolved.target_module
+                && identity.namespace.accepts(namespace)
+                && domains.iter().any(|domain| domain.contains_module(module))
+                && index.resolved_declaration_visible_to(
+                    rust,
+                    identity,
+                    file,
+                    module,
+                    resolved.provenance,
+                )
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+    matches.extend(
+        index
+            .origin_routes_by_file
+            .get(&resolved.target_file)
+            .and_then(|routes| routes.get(terminal))
+            .into_iter()
+            .flatten()
+            .filter(|route| {
+                route.importer_module == resolved.target_module
+                    && route.path.len() == 1
+                    && route.path[0] == terminal
+                    && route.namespace.accepts(namespace)
+                    && route.domain.contains_module(module)
+            })
+            .map(|route| route.origin.clone()),
+    );
+    matches
+}
+
 pub fn usage_local_module_prefix_visible_at(
     rust: &dyn RustUsageSource,
     file: &ProjectFile,
@@ -2671,6 +2881,49 @@ pub fn usage_local_module_prefix_visible_at(
     let Some(module) = index.module_at_byte(file, byte) else {
         return false;
     };
+
+    if let Some(syntax) = rust.prepared_syntax(file) {
+        if local_type_item_name_shadowed_in_tree(
+            syntax.tree().root_node(),
+            syntax.source(),
+            name,
+            byte,
+        ) {
+            return false;
+        }
+
+        // Resolve a function-local namespace before checking the physical child
+        // module identity. A local `use crate::extjson;` is not a declaration in
+        // the current module, but it still owns this path at the reference site.
+        if let Some(routes) =
+            visible_namespace_module_routes(rust, &index, file, module, byte, &[name], false)
+        {
+            return routes.iter().any(|route| {
+                seeds.identities.iter().any(|identity| {
+                    let target_module = if identity.namespace == RustSymbolNamespace::Module {
+                        identity
+                            .module
+                            .with_suffix(std::slice::from_ref(&identity.name))
+                    } else {
+                        identity.module.clone()
+                    };
+                    (route.target_file == identity.file
+                        || index
+                            .physical_owners
+                            .intersects(&route.target_file, &identity.file)
+                        || rust
+                            .cargo_routes()
+                            .files_share_target(&route.target_file, &identity.file)
+                            == Some(true))
+                        && route.target_module.contains(&target_module)
+                        && seeds.identity_domains.get(identity).is_some_and(|domains| {
+                            domains.iter().any(|domain| domain.contains_module(module))
+                        })
+                })
+            });
+        }
+    }
+
     if index.matching_edges_for_importer(file, seeds).any(|edge| {
         edge.importer_module == *module
             && edge.extent.contains(byte)
@@ -2980,117 +3233,96 @@ pub fn usage_reference_at(
             .iter()
             .map(|segment| (*segment).to_string())
             .collect::<Vec<_>>();
-        for resolved in index.module_aliases.resolve_segments(
-            &index.module_files,
+        let local_namespace_routes = visible_namespace_module_routes(
+            rust,
+            &index,
             file,
-            &package,
-            &owned_prefix,
-        ) {
-            if !absolute_route_admitted(resolved.provenance) {
-                continue;
+            module,
+            byte,
+            prefix,
+            leading_absolute,
+        );
+        if let Some(routes) = local_namespace_routes {
+            for resolved in routes {
+                matches.extend(seed_identities_for_resolved_module_route(
+                    rust, &index, seeds, file, module, &resolved, terminal, namespace,
+                ));
             }
-            matches.extend(
-                index
-                    .identities_by_name
-                    .get(terminal)
-                    .into_iter()
-                    .flatten()
-                    .filter(|identity| {
-                        let domains = index
-                            .declaration_domains
-                            .get(*identity)
-                            .expect("identities_by_name entries are declaration_domains keys");
-                        identity.file == resolved.target_file
-                            && identity.module == resolved.target_module
-                            && identity.namespace.accepts(namespace)
-                            && domains.iter().any(|domain| domain.contains_module(module))
-                            && index.resolved_declaration_visible_to(
-                                rust,
-                                identity,
-                                file,
-                                module,
-                                resolved.provenance,
-                            )
-                    })
-                    .cloned(),
-            );
-            matches.extend(
-                index
-                    .origin_routes_by_file
-                    .get(&resolved.target_file)
-                    .and_then(|routes| routes.get(terminal))
-                    .into_iter()
-                    .flatten()
-                    .filter(|route| {
-                        route.importer_module == resolved.target_module
-                            && route.path.len() == 1
-                            && route.path[0] == terminal
-                            && route.namespace.accepts(namespace)
-                            && route.domain.contains_module(module)
-                    })
-                    .map(|route| route.origin.clone()),
-            );
-        }
-        let resolved_modules = if leading_absolute && !leading_absolute_local {
-            Vec::new()
-        } else if matches!(prefix.first(), Some(&"crate" | &"self" | &"super")) {
-            let mut crate_packages = index
-                .module_files
-                .cargo_routes
-                .target_roots_for_file(file)
-                .into_iter()
-                .map(|root| rust_package_name(&root))
-                .collect::<Vec<_>>();
-            if crate_packages.is_empty() {
-                crate_packages.push(module.crate_root.clone());
-            }
-            crate_packages.sort();
-            crate_packages.dedup();
-            crate_packages
-                .into_iter()
-                .filter_map(|crate_package| {
-                    resolve_rust_module_segments_with_crate(&package, &crate_package, prefix)
-                        .map(|package| ModuleKey::new(file, &package))
-                })
-                .collect()
         } else {
-            vec![ModuleKey {
-                crate_root: module.crate_root.clone(),
-                components: if leading_absolute {
-                    prefix
-                        .iter()
-                        .map(|segment| (*segment).to_string())
-                        .collect()
-                } else {
-                    module
-                        .components
-                        .iter()
-                        .cloned()
-                        .chain(prefix.iter().map(|segment| (*segment).to_string()))
-                        .collect()
-                },
-            }]
-        };
-        for resolved in resolved_modules {
-            matches.extend(
-                index
-                    .identities_by_name
-                    .get(terminal)
+            for resolved in index.module_aliases.resolve_segments(
+                &index.module_files,
+                file,
+                &package,
+                &owned_prefix,
+            ) {
+                if !absolute_route_admitted(resolved.provenance) {
+                    continue;
+                }
+                matches.extend(seed_identities_for_resolved_module_route(
+                    rust, &index, seeds, file, module, &resolved, terminal, namespace,
+                ));
+            }
+            let resolved_modules = if leading_absolute && !leading_absolute_local {
+                Vec::new()
+            } else if matches!(prefix.first(), Some(&"crate" | &"self" | &"super")) {
+                let mut crate_packages = index
+                    .module_files
+                    .cargo_routes
+                    .target_roots_for_file(file)
                     .into_iter()
-                    .flatten()
-                    .filter(|identity| {
-                        let domains = index
-                            .declaration_domains
-                            .get(*identity)
-                            .expect("identities_by_name entries are declaration_domains keys");
-                        let domains = seeds.identity_domains.get(*identity).unwrap_or(domains);
-                        identity.module == resolved
-                            && identity.namespace.accepts(namespace)
-                            && domains.iter().any(|domain| domain.contains_module(module))
-                            && index.declaration_owner_visible_to(rust, identity, file, module)
+                    .map(|root| rust_package_name(&root))
+                    .collect::<Vec<_>>();
+                if crate_packages.is_empty() {
+                    crate_packages.push(module.crate_root.clone());
+                }
+                crate_packages.sort();
+                crate_packages.dedup();
+                crate_packages
+                    .into_iter()
+                    .filter_map(|crate_package| {
+                        resolve_rust_module_segments_with_crate(&package, &crate_package, prefix)
+                            .map(|package| ModuleKey::new(file, &package))
                     })
-                    .cloned(),
-            );
+                    .collect()
+            } else {
+                vec![ModuleKey {
+                    crate_root: module.crate_root.clone(),
+                    components: if leading_absolute {
+                        prefix
+                            .iter()
+                            .map(|segment| (*segment).to_string())
+                            .collect()
+                    } else {
+                        module
+                            .components
+                            .iter()
+                            .cloned()
+                            .chain(prefix.iter().map(|segment| (*segment).to_string()))
+                            .collect()
+                    },
+                }]
+            };
+            for resolved in resolved_modules {
+                matches.extend(
+                    index
+                        .identities_by_name
+                        .get(terminal)
+                        .into_iter()
+                        .flatten()
+                        .filter(|identity| {
+                            let domains = index
+                                .declaration_domains
+                                .get(*identity)
+                                .expect("identities_by_name entries are declaration_domains keys");
+                            let domains = seeds.identity_domains.get(*identity).unwrap_or(domains);
+                            identity.module == resolved
+                                && identity.namespace.accepts(namespace)
+                                && domains.iter().any(|domain| domain.contains_module(module))
+                                && index.declaration_owner_visible_to(rust, identity, file, module)
+                        })
+                        .cloned(),
+                );
+            }
         }
     }
 

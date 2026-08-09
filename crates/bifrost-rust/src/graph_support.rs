@@ -1,4 +1,3 @@
-use brokk_bifrost_core::analyzer::CodeUnitIndex;
 use brokk_bifrost_core::analyzer::capabilities::{
     ImportAnalysisProvider, TypeAliasProvider, TypeHierarchyProvider,
 };
@@ -8,6 +7,7 @@ use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportKind, ReexportStar,
 };
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::analyzer::{CodeUnitIndex, default_parent_fq_name};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::profiling;
 use std::collections::BTreeSet;
@@ -421,7 +421,7 @@ pub fn export_index_of_declarations(
             continue;
         }
         if !is_module_export_candidate(
-            index_source,
+            rust,
             file,
             code_unit,
             &export_visible,
@@ -1387,8 +1387,15 @@ pub fn export_visible_declarations(
         .collect()
 }
 
+/// Check export visibility with a source-aware owner walk.
+///
+/// Rust permits separate Cargo targets to reuse the same module FQN. The
+/// generic CodeUnitIndex parent lookup returns the first matching definition,
+/// which can select a private module from a Python binding target instead of
+/// the public module that owns this declaration. Keep the owner walk on the
+/// declaration's Cargo target so export indexes do not lose valid symbols.
 pub fn is_module_export_candidate(
-    index: &dyn CodeUnitIndex,
+    rust: &dyn RustSource,
     file: &ProjectFile,
     code_unit: &CodeUnit,
     export_visible: &HashSet<CodeUnit>,
@@ -1398,21 +1405,19 @@ pub fn is_module_export_candidate(
         return false;
     }
 
-    // Candidacy is decided by the owner chain's kinds: a module export must
-    // be reachable through an unbroken run of export-visible modules. A
-    // method or associated function owned by a type fails right here, and a
-    // function nested in another function's body likewise, so no separate
-    // callable guard belongs after this loop. One that keyed on an owner
-    // merely existing rejected every free function declared in a named
-    // submodule -- the whole point of `pub mod x;` (#1341).
     let mut current = code_unit.clone();
-    while let Some(parent) = index.parent_of(&current) {
+    loop {
+        let parent = match rust_export_parent(rust, &current) {
+            RustExportParent::Parent(parent) => parent,
+            RustExportParent::Root => return true,
+            RustExportParent::Ambiguous => return false,
+        };
         let parent_is_export_visible = if parent.source() == file {
             export_visible.contains(&parent)
         } else if let Some(visible) = external_visibility.get(&parent) {
             *visible
         } else {
-            let visible = is_export_public_declaration(index, &parent);
+            let visible = is_export_public_declaration(rust.code_units(), &parent);
             external_visibility.insert(parent.clone(), visible);
             visible
         };
@@ -1421,8 +1426,41 @@ pub fn is_module_export_candidate(
         }
         current = parent;
     }
+}
 
-    true
+enum RustExportParent {
+    Parent(CodeUnit),
+    Root,
+    Ambiguous,
+}
+
+fn rust_export_parent(rust: &dyn RustSource, code_unit: &CodeUnit) -> RustExportParent {
+    if let Some(parent) = rust.structural_parent_of(code_unit) {
+        return RustExportParent::Parent(parent);
+    }
+    let Some(owner_fq_name) = default_parent_fq_name(code_unit) else {
+        return RustExportParent::Root;
+    };
+    let mut candidates = rust
+        .code_units()
+        .definitions(&owner_fq_name)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return RustExportParent::Root;
+    }
+    if let Some(local) = rust
+        .cargo_routes()
+        .candidates_in_same_target_root(code_unit.source(), candidates.clone())
+    {
+        candidates = local;
+    }
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [] => RustExportParent::Root,
+        [parent] => RustExportParent::Parent(parent.clone()),
+        _ => RustExportParent::Ambiguous,
+    }
 }
 
 pub fn is_visible_module_path(index: &dyn CodeUnitIndex, code_unit: &CodeUnit) -> bool {

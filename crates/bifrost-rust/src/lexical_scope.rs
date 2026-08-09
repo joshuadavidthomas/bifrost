@@ -821,6 +821,27 @@ pub fn local_item_name_shadowed_in_tree(
     items.contains(name)
 }
 
+/// Whether a visible local item occupies Rust's type or module namespace.
+///
+/// Value-only items such as functions, constants, and statics can share a
+/// name with a module path. Do not let those items shadow a type/module import.
+pub fn local_type_item_name_shadowed_in_tree(
+    root: Node<'_>,
+    source: &str,
+    name: &str,
+    reference_byte: usize,
+) -> bool {
+    let Some(scope) = enclosing_function_or_closure(root, reference_byte) else {
+        return false;
+    };
+    let Some(body) = scope.child_by_field_name("body") else {
+        return false;
+    };
+    let mut items = HashSet::default();
+    collect_visible_local_type_items(body, source, reference_byte, &mut items);
+    items.contains(name)
+}
+
 fn collect_visible_local_items(
     mut scope: Node<'_>,
     source: &str,
@@ -839,6 +860,35 @@ fn collect_visible_local_items(
                     | "function_item"
                     | "const_item"
                     | "static_item"
+            ) {
+                collect_local_item_name(node, source, out);
+            }
+        }
+        let Some(child_scope) = child_lexical_scope_containing_reference(scope, reference_byte)
+        else {
+            return;
+        };
+        scope = child_scope;
+    }
+}
+
+fn collect_visible_local_type_items(
+    mut scope: Node<'_>,
+    source: &str,
+    reference_byte: usize,
+    out: &mut HashSet<String>,
+) {
+    loop {
+        let mut cursor = scope.walk();
+        for node in scope.named_children(&mut cursor) {
+            if matches!(
+                node.kind(),
+                "struct_item"
+                    | "enum_item"
+                    | "union_item"
+                    | "trait_item"
+                    | "type_item"
+                    | "mod_item"
             ) {
                 collect_local_item_name(node, source, out);
             }
@@ -1172,5 +1222,50 @@ fn apply_from_stdin() -> u8 { 1 }
 
         assert_eq!(binding.kind, ImportKind::Named);
         assert_eq!(binding.imported_name.as_deref(), Some("linear_no_bias"));
+    }
+
+    #[test]
+    fn local_type_item_shadow_ignores_value_items() {
+        let source = r#"
+fn function_value() {
+    fn extjson() {}
+    let _: extjson::models::DateTimeBody = todo(); // FUNCTION_VALUE
+}
+
+fn const_value() {
+    const extjson: usize = 0;
+    let _: extjson::models::DateTimeBody = todo(); // CONST_VALUE
+}
+
+fn static_value() {
+    static extjson: usize = 0;
+    let _: extjson::models::DateTimeBody = todo(); // STATIC_VALUE
+}
+
+fn type_item() {
+    struct extjson;
+    let _: extjson::models::DateTimeBody = todo(); // TYPE_ITEM
+}
+"#;
+        let tree = parse_rust_tree_uncached(source).expect("parse Rust fixture");
+        for marker in ["FUNCTION_VALUE", "CONST_VALUE", "STATIC_VALUE"] {
+            let reference_byte = source.find(marker).expect("reference marker");
+            assert!(
+                !local_type_item_name_shadowed_in_tree(
+                    tree.root_node(),
+                    source,
+                    "extjson",
+                    reference_byte,
+                ),
+                "value item must not shadow a type/module path ({marker})"
+            );
+        }
+        let reference_byte = source.find("TYPE_ITEM").expect("reference marker");
+        assert!(local_type_item_name_shadowed_in_tree(
+            tree.root_node(),
+            source,
+            "extjson",
+            reference_byte,
+        ));
     }
 }

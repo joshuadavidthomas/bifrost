@@ -1510,6 +1510,9 @@ fn scan_member_node(root: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
                 {
                     record_bare_token_tree_variant_pattern_hit(node, ctx)
                 }
+                "identifier" if ctx.target_is_enum_variant => {
+                    record_bare_enum_variant_value_hit(node, ctx)
+                }
                 "struct_expression" | "struct_pattern" if ctx.target_is_field => {
                     record_struct_field_hits(node, ctx)
                 }
@@ -1613,6 +1616,51 @@ fn record_bare_token_tree_variant_pattern_hit(name: Node<'_>, ctx: &mut MemberSc
     }
 }
 
+fn record_bare_enum_variant_value_hit(name: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    let Some(written_name) = simple_node_text(name, ctx.source) else {
+        return;
+    };
+    let pattern_binding = lexical_scope::is_pattern_binding_identifier(name);
+    if token_tree_ancestor(name).is_some()
+        || node_in_use_declaration(name)
+        || identifier_is_scoped_path_part(name)
+        || ctx
+            .lexical_scope
+            .name_bound_at(&written_name, name.start_byte())
+        || ctx
+            .lexical_scope
+            .item_bound_at(&written_name, name.start_byte())
+    {
+        return;
+    }
+    if pattern_binding && !identifier_is_match_arm_pattern(name) {
+        return;
+    }
+    let matches_variant = unqualified_enum_variant_matches(name, ctx);
+    if pattern_binding && !matches_variant {
+        return;
+    }
+    if matches_variant {
+        record_static_member_name_hit(name, ctx);
+    }
+}
+
+fn identifier_is_match_arm_pattern(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "match_arm" {
+            return parent
+                .child_by_field_name("pattern")
+                .is_some_and(|pattern| {
+                    pattern.start_byte() <= node.start_byte()
+                        && node.end_byte() <= pattern.end_byte()
+                });
+        }
+        current = parent;
+    }
+    false
+}
+
 fn exact_forward_pattern_value_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
     let roots = BTreeSet::from([ctx.requested_target.clone()]);
     let seeds = usage_binding_seeds(ctx.rust, &roots);
@@ -1633,16 +1681,19 @@ fn exact_forward_pattern_value_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) 
 }
 
 fn unqualified_enum_variant_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> bool {
+    let Some(written_name) = simple_node_text(name, ctx.source) else {
+        return false;
+    };
     let binder =
         lexical_scope::visible_import_binder_in_tree(ctx.root, ctx.source, name.start_byte());
     let mut candidates = BTreeSet::new();
-    if let Some(binding) = binder.bindings.get(ctx.member_name) {
+    if let Some(binding) = binder.bindings.get(&written_name) {
         // An explicit binding is authoritative over all glob imports. Only a
         // named enum-variant import can prove this unqualified pattern.
         if binding.kind != ImportKind::Named {
             return false;
         }
-        let imported_name = binding.imported_name.as_deref().unwrap_or(ctx.member_name);
+        let imported_name = binding.imported_name.as_deref().unwrap_or(&written_name);
         collect_enum_variant_candidates(
             &binding.module_specifier,
             imported_name,
@@ -1650,15 +1701,17 @@ fn unqualified_enum_variant_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> 
             &mut candidates,
         );
     } else {
+        // Only a written target name can resolve through a glob. A different
+        // local name requires an explicit named import (possibly aliased).
+        if written_name != ctx.member_name {
+            return false;
+        }
         // Ordinary module globs and re-export globs are already represented by
         // the import graph. Enum globs (`use Enum::*`) name a type rather than a
         // module, so resolve that owner through the same Rust reference context.
-        for (target_file, target_name) in resolve_imported_export_from_binder_forward(
-            ctx.rust,
-            ctx.file,
-            &binder,
-            ctx.member_name,
-        ) {
+        for (target_file, target_name) in
+            resolve_imported_export_from_binder_forward(ctx.rust, ctx.file, &binder, &written_name)
+        {
             for candidate in ctx.support.file_identifier(&target_file, &target_name) {
                 insert_enum_variant_candidate(candidate, ctx, &mut candidates);
             }
@@ -1670,7 +1723,7 @@ fn unqualified_enum_variant_matches(name: Node<'_>, ctx: &MemberScanCtx<'_>) -> 
         {
             collect_enum_variant_candidates(
                 &binding.module_specifier,
-                ctx.member_name,
+                &written_name,
                 ctx,
                 &mut candidates,
             );
