@@ -25,6 +25,9 @@ use crate::imports::{
 };
 use crate::lexical_scope::{parse_rust_tree, visible_import_binder_at};
 use crate::usage_index::{RustUsageIndex, exported_targets_from_files};
+use crate::usage_queries::RustDeclarationFacts;
+use crate::usage_walks::RustWalkCaches;
+use brokk_bifrost_core::analyzer::rust_facts::RustUsageFacts;
 
 /// The memoized per-file products Rust's language logic resolves through, plus
 /// the core capability traits it reads declarations with. The analyzer owns the
@@ -101,6 +104,71 @@ pub trait RustUsageSource: RustSource {
         file: &ProjectFile,
         progress: &dyn Fn() -> bool,
     ) -> Option<Arc<RustReferenceContext>>;
+}
+
+/// The file-to-blob mapping in both directions, as an object-safe view.
+///
+/// A store-backed Rust answer starts from a blob oid an inverted lookup
+/// returned and has to reach the live `ProjectFile`s that currently hold those
+/// bytes, and the reverse. The mapping itself is `LiveSnapshot`, which lives in
+/// `brokk-bifrost-analysis` and cannot be named here, so the analyzer hands
+/// this view down instead.
+pub trait RustLiveBlobs: Send + Sync {
+    fn oid_for_path(&self, file: &ProjectFile) -> Option<git2::Oid>;
+    fn paths_for_oid(&self, oid: git2::Oid) -> Vec<ProjectFile>;
+}
+
+/// [`RustSource`] plus the persisted per-file Rust usage facts and the bounded
+/// caches the cross-file walks memoize into.
+///
+/// This is the v2 counterpart of [`RustUsageSource`]: where that one hands out
+/// a whole-workspace index built eagerly, this one hands out the rows analysis
+/// already wrote and the per-generation caches a walk composes them in. Every
+/// method here is something the analyzer alone can answer -- the store handle,
+/// the live blob mapping, the caches it owns, and the catch-up that guarantees
+/// the rows exist before they are read.
+///
+/// It extends [`RustUsageSource`] only while both designs are in the tree; step
+/// 4 of `.agents/plans/port-optimization-arc-to-upstream.md` deletes the index
+/// and narrows the bound to [`RustSource`].
+pub trait RustFactSource: RustUsageSource {
+    /// One blob's persisted facts, memoized per `(generation, blob)`.
+    ///
+    /// `None` when the blob has no rows, which a caller treats as "no facts"
+    /// rather than as an error; the catch-up is what makes that state narrow.
+    fn rust_usage_facts_of_blob(&self, oid: git2::Oid) -> Option<Arc<RustUsageFacts>>;
+
+    /// Blobs that import `module_path`, spelled exactly as written. Candidates,
+    /// never answers -- see `usage_queries.rs` for the contract.
+    fn rust_import_target_blobs(&self, module_path: &str) -> Vec<git2::Oid>;
+
+    /// Blobs that re-export `exported_name`.
+    fn rust_export_blobs(&self, exported_name: &str) -> Vec<git2::Oid>;
+
+    /// Blobs whose text mentions `identifier`, with the occurrence-context
+    /// bitmask each one carries.
+    fn rust_identifier_occurrence_blobs(&self, identifier: &str) -> Vec<(git2::Oid, u32)>;
+
+    /// Blobs with an `include!` whose literal's last path component is
+    /// `file_name`. The inverted direction of `rust_include_edges`, and the
+    /// seed of an include-route walk.
+    fn rust_include_blobs(&self, file_name: &str) -> Vec<git2::Oid>;
+
+    /// Every blob that writes at least one `include!`. Bounded by the number of
+    /// files that use the macro, not by the workspace.
+    fn rust_include_host_blobs(&self) -> Vec<git2::Oid>;
+
+    /// One file's declaration identities and their visibility domains, derived
+    /// once per file and then served from the analyzer's bounded cache.
+    fn rust_declaration_facts_of(&self, file: &ProjectFile) -> Arc<RustDeclarationFacts>;
+
+    fn live_blobs(&self) -> Arc<dyn RustLiveBlobs>;
+
+    fn walk_caches(&self) -> &Arc<RustWalkCaches>;
+
+    /// Ensure every live Rust file's blob carries fact rows before a walk reads
+    /// them. Runs at most once per analyzer generation.
+    fn ensure_rust_facts_caught_up(&self);
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -255,11 +323,11 @@ impl RustPackageFileIndex {
         }
     }
 
-    fn contains(&self, file: &ProjectFile) -> bool {
+    pub fn contains(&self, file: &ProjectFile) -> bool {
         self.files.binary_search(file).is_ok()
     }
 
-    fn files_in_package(&self, package: &str) -> impl Iterator<Item = &ProjectFile> {
+    pub fn files_in_package(&self, package: &str) -> impl Iterator<Item = &ProjectFile> {
         self.by_package
             .get(package)
             .into_iter()
@@ -1790,6 +1858,25 @@ fn rust_impl_member_node_matches(
             .is_some_and(|name| node_text(name, source) == member_name)
 }
 
+/// The files that can back the module at `relative_module`, relative to
+/// `file`'s own directory: `name.rs`, `name/mod.rs`, and the two `src/`-rooted
+/// forms a crate root uses.
+pub fn rust_module_files_at(file: &ProjectFile, relative_module: &Path) -> Vec<ProjectFile> {
+    let mut files = Vec::new();
+    for rel_path in [
+        relative_module.with_extension("rs"),
+        relative_module.join("mod.rs"),
+        Path::new("src").join(relative_module).with_extension("rs"),
+        Path::new("src").join(relative_module).join("mod.rs"),
+    ] {
+        let candidate = file.with_rel_path(rel_path);
+        if candidate.exists() {
+            files.push(candidate);
+        }
+    }
+    files
+}
+
 pub fn rust_module_files_from_path(file: &ProjectFile, module_specifier: &str) -> Vec<ProjectFile> {
     let Some(relative_module) = rust_relative_module_path(file, module_specifier) else {
         return Vec::new();
@@ -1835,7 +1922,7 @@ pub fn rust_module_files_from_segments(
     files
 }
 
-fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) -> Option<PathBuf> {
+pub fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) -> Option<PathBuf> {
     let (first, rest) = segments.split_first()?;
     let append = |base: &mut PathBuf, parts: &[String]| {
         for part in parts {
@@ -1882,7 +1969,7 @@ fn rust_relative_module_segments(file: &ProjectFile, segments: &[String]) -> Opt
     (!module.as_os_str().is_empty()).then_some(std::mem::take(&mut module))
 }
 
-fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Option<PathBuf> {
+pub fn rust_relative_module_path(file: &ProjectFile, module_specifier: &str) -> Option<PathBuf> {
     let module = module_specifier
         .strip_prefix("crate::")
         .or_else(|| module_specifier.strip_prefix("self::"))

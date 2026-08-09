@@ -42,6 +42,7 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind;
 use brokk_bifrost_rust::field_roles::rust_struct_field_references;
 use brokk_bifrost_rust::graph::ast::is_rust_type_node;
 pub(super) use brokk_bifrost_rust::graph::ast::{
@@ -52,7 +53,7 @@ use brokk_bifrost_rust::graph_support::{
 };
 use brokk_bifrost_rust::imports::rust_crate_root_package;
 use brokk_bifrost_rust::lexical_scope::{self, RustLexicalScopeIndex};
-use brokk_bifrost_rust::usage_index::RustUsageIndex;
+use brokk_bifrost_rust::usage_includes::RustIncludeRoutes;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -75,10 +76,9 @@ pub(super) fn effective_scan_files(
     let include_files: HashSet<_> = if scan_scope.is_authoritative() {
         HashSet::default()
     } else {
-        analyzer
-            .usage_index()
-            .include_routes
-            .keys()
+        RustIncludeRoutes::new(analyzer)
+            .all_included_files()
+            .iter()
             .filter(|file| analyzed.contains(*file))
             .filter(|file| {
                 file.read_to_string().ok().is_some_and(|source| {
@@ -146,7 +146,6 @@ pub(super) fn scan_files_for_target(
     let support = analyzer.global_usage_definition_index();
     let hits = Mutex::new(BTreeSet::new());
     let files_vec: Vec<_> = files.into_iter().collect();
-    let include_routes = rust.usage_index();
     // Shared across every file: the alias closure reachable from the target
     // roots. `effective_scan_files` already treats these names as the textual
     // universe a hit can be written under.
@@ -172,6 +171,12 @@ pub(super) fn scan_files_for_target(
         }
 
         let line_starts = prepared.line_starts();
+        // Per file, not once for the scan: the include-route walker carries the
+        // cycle bookkeeping its recursion needs, which is `RefCell` state and
+        // therefore not `Sync`. Constructing it is a handful of memo probes,
+        // and every route it composes is memoized on the analyzer, so the
+        // repeated construction costs no repeated work.
+        let include_routes = RustIncludeRoutes::new(rust);
         let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
@@ -264,7 +269,7 @@ pub(super) struct ScanCtx<'a> {
     name_gate: ScanNameGate<'a>,
     direct_names: &'a HashSet<String>,
     lexical_scope: &'a RustLexicalScopeIndex,
-    include_routes: &'a RustUsageIndex,
+    include_routes: &'a RustIncludeRoutes<'a>,
     token_tree_roles: RustTokenTreeRoleCache,
     pub(super) cancellation: Option<&'a CancellationToken>,
     cancellation_checks_remaining: usize,
@@ -272,13 +277,12 @@ pub(super) struct ScanCtx<'a> {
 }
 
 fn included_import_resolves_to_target(
-    rust: &RustAnalyzer,
     file: &ProjectFile,
     source: &str,
     byte: usize,
     local_name: &str,
     target: &CodeUnit,
-    include_routes: &RustUsageIndex,
+    include_routes: &RustIncludeRoutes<'_>,
 ) -> bool {
     let routes = include_routes.include_routes_for(file);
     if routes.is_empty() {
@@ -291,7 +295,6 @@ fn included_import_resolves_to_target(
                 .iter()
                 .flat_map(|route| {
                     include_routes.include_import_target_identities(
-                        rust,
                         route,
                         source,
                         scope_start,
@@ -312,7 +315,6 @@ fn included_import_resolves_to_target(
             .flat_map(|binding| {
                 routes.iter().filter_map(|route| {
                     let candidates = include_routes.include_import_target_identities(
-                        rust,
                         route,
                         source,
                         scope_start,
@@ -335,19 +337,20 @@ fn included_import_resolves_to_target(
         .iter()
         .flat_map(|route| {
             let has_named_binding = route.host_bindings.iter().any(|binding| {
-                binding.kind != ImportKind::Glob && binding.local_name == local_name
+                binding.kind != RustIncludeBindingKind::Glob && binding.local_name == local_name
             });
             route
                 .host_bindings
                 .iter()
                 .filter(move |binding| {
-                    (binding.kind != ImportKind::Glob && binding.local_name == local_name)
+                    (binding.kind != RustIncludeBindingKind::Glob
+                        && binding.local_name == local_name)
                         || (!has_named_binding
-                            && binding.kind == ImportKind::Glob
+                            && binding.kind == RustIncludeBindingKind::Glob
                             && binding.local_name == "*")
                 })
                 .flat_map(|binding| {
-                    let suffix = if binding.kind == ImportKind::Glob {
+                    let suffix = if binding.kind == RustIncludeBindingKind::Glob {
                         vec![target.identifier()]
                     } else {
                         Vec::new()
@@ -374,13 +377,12 @@ fn included_import_resolves_to_target(
 /// the complete import path before using the route so an unrelated path with
 /// the same terminal name cannot become a false positive.
 fn included_import_path_resolves_to_target(
-    rust: &RustAnalyzer,
     file: &ProjectFile,
     source: &str,
     byte: usize,
     segments: &[&str],
     target: &CodeUnit,
-    include_routes: &RustUsageIndex,
+    include_routes: &RustIncludeRoutes<'_>,
 ) -> bool {
     if segments.is_empty() {
         return false;
@@ -419,7 +421,6 @@ fn included_import_path_resolves_to_target(
             .iter()
             .flat_map(|route| {
                 include_routes.include_import_target_identities(
-                    rust,
                     route,
                     source,
                     scope_start,
@@ -442,7 +443,7 @@ fn included_host_path_resolves_to_target(
     byte: usize,
     segments: &[&str],
     target: &CodeUnit,
-    include_routes: &RustUsageIndex,
+    include_routes: &RustIncludeRoutes<'_>,
 ) -> bool {
     let Some(local_name) = segments.first() else {
         return false;
@@ -728,7 +729,6 @@ impl ScanCtx<'_> {
         if !shadowed
             && namespace == RustReferenceNamespace::Value
             && included_import_resolves_to_target(
-                self.rust,
                 self.file,
                 self.source,
                 byte,
@@ -807,7 +807,6 @@ impl ScanCtx<'_> {
         if namespace == RustReferenceNamespace::Value
             && !root_shadowed
             && included_import_path_resolves_to_target(
-                self.rust,
                 self.file,
                 self.source,
                 byte,

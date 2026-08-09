@@ -21,6 +21,7 @@
 //! the arguments.
 
 pub mod adapter;
+pub mod cache;
 pub mod cargo_routes;
 pub mod crate_naming;
 pub mod declarations;
@@ -36,4 +37,8 @@ pub mod proof;
 pub mod queries;
 pub mod structural;
 pub mod test_detection;
+pub mod usage;
+pub mod usage_includes;
 pub mod usage_index;
+pub mod usage_queries;
+pub mod usage_walks;

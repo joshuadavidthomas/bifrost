@@ -308,17 +308,12 @@ fn java_census_differential(
     .expect("run inline Java census differential")
 }
 
-/// The control for #1783: a Java bare call reaches an enclosing-class method
-/// through implicit `this`, so an OWNED same-file member is legitimate evidence
-/// there and must keep grading exactly as before -- the JS bindability answer
-/// must not become a blanket owner filter. The witness is a bare `helper()`
-/// inside a nested class, which the forward resolver misses while
-/// `Inner.helper` is indexed in the same file. It grades tier 2 rather than
-/// tier 1 because `census_site_role` reads a bare-call callee from a
-/// `function`/`callee` field, which Java's `method_invocation` spells as
-/// `name`; that is a separate grading gap and this test pins today's answer.
+/// A Java bare call reaches an enclosing-class method through implicit `this`.
+/// The forward resolver now follows this lexical owner chain. The inverse
+/// resolver retains the same exact site as unproven instead of reporting a
+/// false absence.
 #[test]
-fn census_java_bare_call_keeps_owned_member_evidence() {
+fn census_java_bare_call_resolves_enclosing_member() {
     let source = concat!(
         "class Inner {\n",
         "  void helper() {}\n",
@@ -336,19 +331,26 @@ fn census_java_bare_call_keeps_owned_member_evidence() {
         .find(|site| site.start_byte == call_start)
         .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
     assert_eq!(
-        site.forward_status, "no_definition",
-        "witness requires a forward-unresolvable bare call: {site:#?}"
+        site.forward_status, "resolved",
+        "the enclosing member must resolve: {site:#?}"
     );
+    assert_eq!(site.targets.len(), 1, "{site:#?}");
+    assert_eq!(site.targets[0].fq_name, "Inner.helper", "{site:#?}");
     assert_eq!(
-        site.tier,
-        Some(2),
-        "an owned same-class method stays same-file evidence in Java: {site:#?}"
+        site.tier, None,
+        "resolved sites do not receive census gap tiers: {site:#?}"
     );
     assert_eq!(
         site.classification,
-        ReferenceClassification::Missing,
-        "Java grading must not change: {site:#?}"
+        ReferenceClassification::Unproven,
+        "the exact inverse site must stay explicit and conservative: {site:#?}"
     );
+    let inverse = site
+        .inverse_hit
+        .as_ref()
+        .expect("the inverse resolver must retain the exact site");
+    assert_eq!(inverse.start_byte, call_start, "{site:#?}");
+    assert!(inverse.exact_range, "{site:#?}");
 }
 
 fn cpp_census_differential(

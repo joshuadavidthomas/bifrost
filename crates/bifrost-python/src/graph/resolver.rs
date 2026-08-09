@@ -200,7 +200,14 @@ fn resolve_bare_annotation_symbol(
             .index
             .top_level_declarations(file)
             .into_iter()
-            .filter(|code_unit| !code_unit.is_module() && code_unit.identifier() == raw_symbol),
+            .filter(|code_unit| {
+                !code_unit.is_module()
+                    && code_unit.identifier() == raw_symbol
+                    && graph
+                        .index
+                        .parent_of(code_unit)
+                        .is_some_and(|parent| parent.is_module())
+            }),
     );
 
     candidates.sort();

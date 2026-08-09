@@ -10,6 +10,12 @@ mod python_module;
 // which belong to this package.
 pub mod reference_differential;
 pub mod skill_install;
+// Stage 4 of the procedure-summary foundry (#1871). It runs generated fixtures
+// through the production policy evaluator, so it needs both the foundry IR from
+// brokk-bifrost-semantic-packs and the evaluator from brokk-bifrost-policy;
+// this package is the only one that depends on both.
+#[cfg(feature = "release-tooling")]
+pub mod summary_foundry_fixtures;
 
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CancellationToken, CapabilityProvider,

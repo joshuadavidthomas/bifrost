@@ -17,14 +17,18 @@ use tree_sitter::Node;
 
 use brokk_bifrost_core::analyzer::rust_facts::{
     RUST_OCCURRENCE_CODE, RUST_OCCURRENCE_COMMENT, RUST_OCCURRENCE_MACRO, RUST_OCCURRENCE_STRING,
-    RustExportFact, RustIdentifierOccurrence, RustImportTargetFact, RustModuleFact,
-    RustRulesItemMacroDefinition, RustUsageFacts, RustVisibility,
+    RustExportFact, RustIdentifierOccurrence, RustImportTargetFact, RustIncludeBindingKind,
+    RustIncludeEdgeFact, RustIncludeHostBindingFact, RustModuleFact, RustRulesItemMacroDefinition,
+    RustUsageFacts, RustVisibility,
 };
 use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use brokk_bifrost_core::hash::HashMap;
 
-use crate::cargo_routes::extract_rust_module_route_facts;
-use crate::declarations::{rust_identifier_like_node_kind, rust_node_text};
+use crate::cargo_routes::{extract_rust_module_route_facts, rust_static_string_literal};
+use crate::declarations::{
+    rust_identifier_like_node_kind, rust_macro_invocation_arguments, rust_node_text,
+    rust_unqualified_macro_invocation_name,
+};
 use crate::imports::{RustImportOwner, rust_import_projection, rust_module_extents};
 
 /// Extract every per-file usage fact from one already-parsed Rust file.
@@ -42,13 +46,150 @@ pub fn extract_rust_usage_facts(
     let exports = extract_exports(&import_targets);
     let identifier_occurrences = extract_identifier_occurrences(root, source);
     let module_routes = extract_rust_module_route_facts(root, source, item_macros);
+    let include_edges = extract_include_edges(root, source);
     RustUsageFacts {
         exports,
         import_targets,
         modules,
         identifier_occurrences,
         module_routes,
+        include_edges,
     }
+}
+
+/// Every `include!("...")` invocation in the file, with the host import
+/// bindings lexically in scope at each one.
+///
+/// Content-only, like everything else here: the literal is recorded as written
+/// and its last component indexed, because resolving it needs the host file's
+/// own directory and these rows are shared by every file with these bytes.
+///
+/// An absolute or empty literal is skipped, matching what the resolver would do
+/// with it: `include!` resolves relative to the including file, so an absolute
+/// path names nothing this workspace owns.
+///
+/// Explicit stack, never recursion: this runs over every analyzed Rust file.
+fn extract_include_edges(root: Node<'_>, source: &str) -> Vec<RustIncludeEdgeFact> {
+    let mut edges: Vec<RustIncludeEdgeFact> = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "macro_invocation"
+            && rust_unqualified_macro_invocation_name(node, source) == Some("include")
+            && let Some(arguments) = rust_macro_invocation_arguments(node)
+            && let Some(literal) = single_named_child(arguments)
+            && let Some(relative_path) = rust_static_string_literal(literal, source)
+            && !relative_path.is_empty()
+            && !std::path::Path::new(&relative_path).is_absolute()
+            && let Some(file_name) = std::path::Path::new(&relative_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+        {
+            edges.push(RustIncludeEdgeFact {
+                file_name: file_name.to_string(),
+                include_start: node.start_byte(),
+                host_bindings: include_host_bindings(root, source, node.start_byte()),
+                relative_path,
+            });
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    edges.sort_by(|left, right| {
+        left.relative_path
+            .cmp(&right.relative_path)
+            .then_with(|| left.include_start.cmp(&right.include_start))
+    });
+    edges.dedup_by(|left, right| {
+        left.relative_path == right.relative_path
+            && left.include_start == right.include_start
+            && left.host_bindings == right.host_bindings
+    });
+    edges
+}
+
+/// The file's import bindings whose lexical scope contains `include_start`.
+///
+/// The stored `module_specifier` is the written prefix; a glob binds no local
+/// name and records `*`, matching what the route composition shadows on.
+fn include_host_bindings(
+    root: Node<'_>,
+    source: &str,
+    include_start: usize,
+) -> Vec<RustIncludeHostBindingFact> {
+    let mut bindings = Vec::new();
+    // The base module is empty for the same reason every other fact here is
+    // relative: the host's package is path-derived and the reader composes it.
+    for projected in rust_import_projection(root, source, "") {
+        let (scope_start, scope_end) = match projected.owner {
+            RustImportOwner::Module { start, end, .. } => (start, end),
+            RustImportOwner::LocalOnly {
+                module_start,
+                module_end,
+                ..
+            } => (module_start, module_end),
+        };
+        if !(scope_start <= include_start && include_start < scope_end) {
+            continue;
+        }
+        let (local_name, module_specifier, imported_name, kind) =
+            if projected.import.info.is_wildcard {
+                (
+                    "*".to_string(),
+                    projected.import.path.join("::"),
+                    None,
+                    RustIncludeBindingKind::Glob,
+                )
+            } else if projected.import.is_extern_crate || projected.import.path.len() <= 1 {
+                let Some(local_name) = projected.import.info.local_name() else {
+                    continue;
+                };
+                (
+                    local_name.to_string(),
+                    projected.import.path.join("::"),
+                    None,
+                    RustIncludeBindingKind::Namespace,
+                )
+            } else {
+                let Some((imported_name, module_path)) = projected.import.path.split_last() else {
+                    continue;
+                };
+                let Some(local_name) = projected.import.info.local_name() else {
+                    continue;
+                };
+                (
+                    local_name.to_string(),
+                    module_path.join("::"),
+                    Some(imported_name.clone()),
+                    RustIncludeBindingKind::Named,
+                )
+            };
+        if module_specifier.is_empty() {
+            continue;
+        }
+        bindings.push(RustIncludeHostBindingFact {
+            local_name,
+            module_specifier,
+            imported_name,
+            scope_start,
+            kind,
+        });
+    }
+    bindings.sort_by(|left, right| {
+        left.scope_start
+            .cmp(&right.scope_start)
+            .then_with(|| left.local_name.cmp(&right.local_name))
+            .then_with(|| left.module_specifier.cmp(&right.module_specifier))
+    });
+    bindings.dedup();
+    bindings
+}
+
+/// The one named child of `node`, or `None` when it has none or several.
+fn single_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor);
+    let child = children.next()?;
+    children.next().is_none().then_some(child)
 }
 
 /// The file root plus every module the file declares.

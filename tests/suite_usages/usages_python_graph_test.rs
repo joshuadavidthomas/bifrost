@@ -1605,6 +1605,39 @@ def shadow(expression):
 }
 
 #[test]
+fn from_imported_module_target_reports_annotation_qualifier_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "")
+        .file("pkg/types.py", "Validator = object\n")
+        .file(
+            "pkg/consumer.py",
+            r#"from __future__ import annotations
+
+from pkg import types
+
+value: types.Validator
+
+def shadow(types):
+    local: types.Validator
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.types");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should retain the from-imported module qualifier");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one module qualifier hit");
+    assert_eq!(hit.file, project.file("pkg/consumer.py"));
+    assert!(hit.snippet.contains("types.Validator"), "{hit:#?}");
+}
+
+#[test]
 fn imported_package_submodule_qualifier_reports_module_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("pkg/image.py", "VALUE = 1\n")
@@ -3756,6 +3789,30 @@ fn module_qualified_annotation_resolves_module_function_target() {
         "user.py",
         source,
         &[("merge", 0)],
+    );
+}
+
+#[test]
+fn union_annotation_records_each_bare_class_reference() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "style.py",
+            "class Selected:\n    pass\n\nclass Ignored:\n    pass\n\nclass Decision:\n    Selected = 'selected'\n    Ignored = 'ignored'\n\nclass Engine:\n    def choose(self) -> Selected | Ignored:\n        return Selected()\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "style.Ignored");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve each member of a union annotation");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("Selected | Ignored")),
+        "{hits:#?}"
     );
 }
 

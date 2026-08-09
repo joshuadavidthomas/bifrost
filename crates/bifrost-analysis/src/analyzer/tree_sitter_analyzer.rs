@@ -5318,6 +5318,89 @@ where
         self.store_context.live_paths.snapshot()
     }
 
+    /// Re-parse `files` and persist their blobs into the store, without
+    /// producing a new analyzer generation.
+    ///
+    /// This is the catch-up half of ExecPlan Milestone 3
+    /// (`.agents/plans/rust-usage-index-v2.md`): a store-backed query answers
+    /// from a blob's rows, so a live file whose blob was never persisted -- a
+    /// write that failed and left a dirty in-memory state, say -- is invisible
+    /// to it. Running the whole reconcile to repair a handful of files would
+    /// build a new analyzer and drop every memo on it, which is precisely what
+    /// this plan exists to stop.
+    ///
+    /// A file whose current bytes no longer hash to its live oid is skipped:
+    /// persisting it would file the new content's rows under the old blob, and
+    /// blob rows are content-addressed and shared, so a row that lies is worse
+    /// than a row that is missing. The next `update` reconciles those files
+    /// with their real oid anyway.
+    pub(crate) fn persist_live_blobs(&self, files: &[ProjectFile]) {
+        let mut targets = Vec::with_capacity(files.len());
+        // One target per blob key, not per file: byte-identical files share a
+        // blob, and persisting the same key twice in one batch is a hard error
+        // in the persistence layer. Reconcile picks a representative for the
+        // same reason (`representative_by_blob_key`).
+        let mut claimed = HashSet::default();
+        for file in files {
+            let Some(oid) = self.live_snapshot().oid_for_path(file) else {
+                continue;
+            };
+            let Ok(source) = self.project.read_source(file) else {
+                continue;
+            };
+            if !CodeUnitIndex::indexed_source_matches(self, file, &source) {
+                continue;
+            }
+            let storage_key = self.adapter.storage_language_key_for_file(file);
+            let Some(generation) = self.store_context.generations.get(&storage_key).copied() else {
+                continue;
+            };
+            if !claimed.insert((oid, storage_key.clone())) {
+                continue;
+            }
+            targets.push((file.clone(), oid, storage_key, generation));
+        }
+        if targets.is_empty() {
+            return;
+        }
+        Self::analyze_prepare_and_persist_files(
+            self.adapter.as_ref(),
+            self.project.as_ref(),
+            &self.config,
+            targets,
+            None,
+            &self.store_context,
+            |_, _| {},
+        );
+    }
+
+    /// The analyzer store, for a language module that answers a question from
+    /// persisted rows rather than from a materialized in-heap index.
+    ///
+    /// The `IAnalyzer` surface deliberately does not carry it: only the store-
+    /// backed Rust fact paths need it, and they reach it through their own
+    /// analyzer shim.
+    pub(crate) fn analyzer_store(&self) -> &Arc<AnalyzerStore> {
+        &self.store_context.store
+    }
+
+    /// The analysis generation `lang`'s persisted rows belong to. Cache keys
+    /// that mention it are invalidated for free when the generation moves.
+    pub(crate) fn language_generation(&self, lang: &str) -> Option<GenerationId> {
+        self.store_context.generations.get(lang).copied()
+    }
+
+    /// The current file-to-blob mapping, in both directions.
+    ///
+    /// This is how a caller turns a blob oid an inverted store lookup returned
+    /// into the live `ProjectFile`s that currently have those bytes, and how it
+    /// turns a file back into the blob whose rows describe it. Populated with
+    /// or without a git-backed `Liveness` (see `resolve_live_oids`), so a
+    /// store-backed query works in a plain directory too.
+    pub(crate) fn live_path_snapshot(&self) -> Arc<LiveSnapshot> {
+        self.live_snapshot()
+    }
+
     /// Whether this adapter analyzes `file`.
     ///
     /// The extension registry is the rule. Include-driven inference (#1837)
