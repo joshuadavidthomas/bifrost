@@ -314,6 +314,11 @@ pub enum FoundryDerivationBoundary {
     SolverCancelled,
     /// The interprocedural closure reached the derivation's own bound.
     ClosureLimit { limit: u32 },
+    /// The value-flow machinery refused the target: the plan could not be built
+    /// or the solve failed. The entry states no flow at all and names the
+    /// refusal, because a target the engine cannot accept is a foundry finding,
+    /// not a target with no flows.
+    EngineRejected { detail: String },
 }
 
 impl FoundryDerivationBoundary {
@@ -329,6 +334,7 @@ impl FoundryDerivationBoundary {
             Self::BudgetExceeded { .. } => "budget_exceeded",
             Self::SolverCancelled => "solver_cancelled",
             Self::ClosureLimit { .. } => "closure_limit",
+            Self::EngineRejected { .. } => "engine_rejected",
         }
     }
 }

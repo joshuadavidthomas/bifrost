@@ -453,6 +453,9 @@ fn summary_corpus_join_command(
         for (boundary, count) in &derivation.boundaries_by_kind {
             println!("  boundary {boundary}: {count}");
         }
+        for unavailable in &derivation.unavailable_files {
+            println!("  unavailable {unavailable}");
+        }
     }
     for round_trip in &joined.round_trip {
         println!(

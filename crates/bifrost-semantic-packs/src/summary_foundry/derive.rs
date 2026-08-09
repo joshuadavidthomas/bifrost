@@ -3,17 +3,23 @@
 //!
 //! The engine is the analyzer's own value-flow machinery, not a second
 //! implementation of it. For one target procedure the derivation binds a
-//! [`ValueFlowSourceSpec`] to every input port at the entry point and a
-//! [`ValueFlowSinkSpec`] to every derivable output port at the exit points,
-//! discovers the interprocedural closure through the semantic oracle, and
-//! solves. Every meeting the solver reports is one authored transfer.
+//! [`ValueFlowSourceSpec`] to every input port at the entry point, binds a
+//! [`ValueFlowSinkSpec`] to every write into an output port at that write's own
+//! program point, discovers the interprocedural closure through the semantic
+//! oracle, and solves. Every meeting the solver reports is one derived flow.
+//!
+//! Sources and sinks bind access-path carriers, not only bare ports, so a
+//! field- or element-sensitive flow keeps its selectors. The authored IR has no
+//! access paths, so an entry ships the argument-level projection of its derived
+//! flows and keeps the full-granularity form beside it. The projection is
+//! irreversible, so it happens once, after the answer is known.
 //!
 //! The call behavior is [`UnmodeledCallBehavior::RequireModel`], so a call the
 //! closure cannot enter abstains instead of manufacturing a transfer. That is
 //! what makes the typed incompleteness meaningful: an entry never states a flow
 //! past a boundary it did not cross, and it records why it stopped.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,9 +29,9 @@ use brokk_bifrost_analysis::analyzer::dataflow::{
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallBindings, CancellationToken, DeclarationLocator, DeclarationSegmentKind,
     DispatchBoundaryKind, DispatchOracle, EvidenceCompleteness, OracleCallContext, ProcedureHandle,
-    ProcedureKind, ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle, ProgramPointId,
-    ProofStatus, SemanticBudget, SemanticLocator, SemanticRequest, SemanticValueKind,
-    ValueFlowOracle, ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot,
+    ProcedureKind, ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus,
+    SemanticBudget, SemanticLocator, SemanticRequest, SemanticValueKind, ValueFlowOracle,
+    ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot,
 };
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     AuthoredSummaryExitKind, AuthoredSummaryInput, AuthoredSummaryOutput, AuthoredSummaryTransfer,
@@ -85,6 +91,11 @@ pub struct DerivationRun {
     pub files_read: u32,
     pub procedures_read: u32,
     pub entries: Vec<FoundryEntry>,
+    /// Files the semantic provider could not materialize, with the reason it
+    /// gave. A corpus-scale run reports these and keeps going: one file the
+    /// analyzer rejects is a finding about the analyzer, not a reason to stop
+    /// deriving the rest of the standard library.
+    pub unavailable_files: Vec<String>,
 }
 
 /// Derive summaries for every Java procedure under `sources`.
@@ -126,18 +137,23 @@ pub fn derive_jvm_summaries(
     let declarations = DeclarationIndex::build(&analyzer, &files);
     let cancellation = CancellationToken::default();
     let mut entries = Vec::new();
+    let mut unavailable_files = Vec::new();
     let mut procedures_read = 0u32;
     for file in &files {
         let mut semantic_budget = SemanticBudget::default();
-        let outcome = analyzer
-            .materialize_program_semantics(
-                file,
-                &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
-            )
-            .map_err(|error| FoundryError::Derivation {
-                detail: format!("cannot materialize {}: {error}", file.rel_path().display()),
-            })?;
+        let path = file.rel_path().to_string_lossy().replace('\\', "/");
+        let outcome = match analyzer.materialize_program_semantics(
+            file,
+            &mut SemanticRequest::new(&mut semantic_budget, &cancellation),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                unavailable_files.push(format!("{path}: {error}"));
+                continue;
+            }
+        };
         let Some(artifact) = outcome.available_value().cloned() else {
+            unavailable_files.push(format!("{path}: no semantic artifact"));
             continue;
         };
         for procedure in artifact.procedures() {
@@ -157,10 +173,12 @@ pub fn derive_jvm_summaries(
         }
     }
     entries.sort_by(|left, right| left.id.cmp(&right.id));
+    unavailable_files.sort();
     Ok(DerivationRun {
         files_read: files.len() as u32,
         procedures_read,
         entries,
+        unavailable_files,
     })
 }
 
@@ -200,83 +218,106 @@ fn derive_procedure(
     // summary is argument-level. The authored IR projects the answer down to
     // whole ports, but the projection happens once, at the end, and the entry
     // keeps the full-granularity form beside it.
-    let mut sources = Vec::new();
-    let mut ordinal = 0u32;
-    for port in shape.input_ports(root) {
-        sources.push(port_source(
-            &entry_point,
-            ordinal,
-            ValueFlowCarrier::Port(port),
-        ));
-        ordinal += 1;
-    }
-    for carrier in qualified_carriers(closure.root_relations(), &input_ports_of(&shape, root)) {
-        sources.push(port_source(&entry_point, ordinal, carrier));
-        ordinal += 1;
-    }
+    let input_carriers = shape
+        .input_ports(root)
+        .into_iter()
+        .map(ValueFlowCarrier::Port)
+        .collect::<Vec<_>>();
+    let input_ports = input_carriers
+        .iter()
+        .map(|carrier| {
+            access_path(carrier)
+                .expect("a receiver or parameter port has a foundry spelling")
+                .port
+        })
+        .collect::<Vec<_>>();
+    let sources = input_carriers
+        .into_iter()
+        .chain(qualified_carriers(closure.root_relations(), &input_ports))
+        .enumerate()
+        .map(|(ordinal, carrier)| port_source(&entry_point, ordinal as u32, carrier))
+        .collect::<Vec<_>>();
 
     // An output port is observed where the body writes to it, not at the exit
     // point. The exit point is a sink of control, never the source of an edge
     // the solver evaluates, so a sink bound there never fires. The snapshot
     // states each write's exact point, which is also the point whose local rule
     // makes the port carrier live.
-    let output_ports = [
-        ProcedurePortKind::NormalReturn,
-        ProcedurePortKind::ExceptionalReturn,
-    ];
+    let output_ports = DERIVED_OUTPUT_PORTS.map(str::to_owned);
     let mut sinks = Vec::new();
     let mut ordinals: BTreeMap<ProgramPointId, u32> = BTreeMap::new();
-    for relation in closure.root_relations() {
-        let port = match relation.kind {
-            ValueFlowRelationKind::NormalReturn => ProcedurePortHandle::normal_return(root.clone()),
-            ValueFlowRelationKind::ExceptionalReturn => {
-                ProcedurePortHandle::exceptional_return(root.clone())
-            }
-            _ => continue,
-        };
-        let ordinal = ordinals.entry(relation.point().id()).or_default();
-        sinks.push(port_sink(
-            relation.point(),
-            *ordinal,
-            ValueFlowCarrier::Port(port),
-        ));
+    let mut bind_sink = |point: &ProgramPointHandle, carrier: ValueFlowCarrier| {
+        let ordinal = ordinals.entry(point.id()).or_default();
+        sinks.push(port_sink(point, *ordinal, carrier));
         *ordinal += 1;
-    }
+    };
     for relation in closure.root_relations() {
+        match relation.kind {
+            ValueFlowRelationKind::NormalReturn => bind_sink(
+                relation.point(),
+                ValueFlowCarrier::Port(ProcedurePortHandle::normal_return(root.clone())),
+            ),
+            ValueFlowRelationKind::ExceptionalReturn => bind_sink(
+                relation.point(),
+                ValueFlowCarrier::Port(ProcedurePortHandle::exceptional_return(root.clone())),
+            ),
+            _ => {}
+        }
         for endpoint in [&relation.source, &relation.target] {
             let carrier = ValueFlowCarrier::from(endpoint);
-            if !carrier_is_qualified_under(&carrier, &output_ports) {
-                continue;
+            if carrier_is_qualified_under(&carrier, &output_ports) {
+                bind_sink(relation.point(), carrier);
             }
-            let ordinal = ordinals.entry(relation.point().id()).or_default();
-            sinks.push(port_sink(relation.point(), *ordinal, carrier));
-            *ordinal += 1;
         }
     }
 
-    let plan = ValueFlowPlan::with_call_behavior(
+    // A target the engine refuses is one entry that states nothing and says
+    // why, not a run that stops. The refusal is a foundry finding: it names a
+    // shape the value-flow machinery cannot accept, and the report counts it.
+    let closure_procedures = closure.procedures;
+    let plan = match ValueFlowPlan::with_call_behavior(
         root.clone(),
         closure.snapshots,
         closure.bindings,
         sources,
         sinks,
         UnmodeledCallBehavior::RequireModel,
-    )
-    .map_err(|error| FoundryError::Derivation {
-        detail: format!("cannot plan value flow for {}: {error}", target.member),
-    })?;
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            boundaries.insert(FoundryDerivationBoundary::EngineRejected {
+                detail: format!("plan: {error}"),
+            });
+            return Ok(Some(rejected_entry(
+                target,
+                &shape,
+                closure_procedures,
+                boundaries,
+            )));
+        }
+    };
 
     let mut solver_budget = SolverBudget::default();
-    let result = solve_value_flow_with_summaries(
+    let result = match solve_value_flow_with_summaries(
         root,
         &analyzer.icfg_provider(),
         &plan,
         &mut semantic_budget,
         &mut DataflowRequest::new(&mut solver_budget, &cancellation),
-    )
-    .map_err(|error| FoundryError::Derivation {
-        detail: format!("cannot solve value flow for {}: {error}", target.member),
-    })?;
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            boundaries.insert(FoundryDerivationBoundary::EngineRejected {
+                detail: format!("solve: {error}"),
+            });
+            return Ok(Some(rejected_entry(
+                target,
+                &shape,
+                closure_procedures,
+                boundaries,
+            )));
+        }
+    };
 
     match result.result().termination() {
         SolverTermination::FixedPoint => {}
@@ -363,12 +404,40 @@ fn derive_procedure(
     }))
 }
 
+/// One entry for a target the value-flow machinery refused: no transfer, no
+/// completeness claim, and the typed refusal that explains both.
+fn rejected_entry(
+    target: FoundryTarget,
+    shape: &ProcedureShape,
+    closure_procedures: usize,
+    boundaries: BTreeSet<FoundryDerivationBoundary>,
+) -> FoundryEntry {
+    FoundryEntry {
+        id: summary_id(FoundryCorpus::Derived, &target),
+        corpus: FoundryCorpus::Derived,
+        target,
+        boundary: FoundryBoundary {
+            has_receiver: shape.has_receiver,
+            parameter_count: shape.parameter_count,
+        },
+        claim: FoundryClaim::Flows,
+        transfers: Vec::new(),
+        artifact: FoundryArtifactBinding::Unresolved,
+        evidence: Vec::new(),
+        notes: Vec::new(),
+        derivation: Some(FoundryDerivation {
+            completeness: FoundryCompleteness::Partial,
+            unproven_transfers: 0,
+            closure_procedures: closure_procedures as u32,
+            boundaries: boundaries.into_iter().collect(),
+            fine_grained: Vec::new(),
+        }),
+    }
+}
+
 /// Every access-path carrier the relations mention that is rooted at one of
 /// `ports` and says more than the bare port.
-fn qualified_carriers(
-    relations: &[ValueFlowRelation],
-    ports: &[ProcedurePortKind],
-) -> Vec<ValueFlowCarrier> {
+fn qualified_carriers(relations: &[ValueFlowRelation], ports: &[String]) -> Vec<ValueFlowCarrier> {
     let mut carriers: BTreeMap<String, ValueFlowCarrier> = BTreeMap::new();
     for relation in relations {
         for endpoint in [&relation.source, &relation.target] {
@@ -385,24 +454,10 @@ fn qualified_carriers(
     carriers.into_values().collect()
 }
 
-fn input_ports_of(shape: &ProcedureShape, procedure: &ProcedureHandle) -> Vec<ProcedurePortKind> {
-    shape
-        .input_ports(procedure)
-        .into_iter()
-        .map(|port| port.kind())
-        .collect()
-}
-
 /// Whether a carrier is an access path rooted at one of `ports` with at least
 /// one selector.
-fn carrier_is_qualified_under(carrier: &ValueFlowCarrier, ports: &[ProcedurePortKind]) -> bool {
-    let Some(path) = access_path(carrier) else {
-        return false;
-    };
-    path.is_qualified()
-        && ports
-            .iter()
-            .any(|port| port_label(*port) == Some(path.port.clone()))
+fn carrier_is_qualified_under(carrier: &ValueFlowCarrier, ports: &[String]) -> bool {
+    access_path(carrier).is_some_and(|path| path.is_qualified() && ports.contains(&path.port))
 }
 
 /// The foundry spelling of a carrier that is a procedure port, with any access
@@ -452,16 +507,6 @@ fn port_key_label(port: ValueFlowPortKey) -> Option<String> {
     }
 }
 
-fn port_label(port: ProcedurePortKind) -> Option<String> {
-    match port {
-        ProcedurePortKind::Receiver => Some("receiver".to_owned()),
-        ProcedurePortKind::Parameter { ordinal } => Some(format!("parameter[{ordinal}]")),
-        ProcedurePortKind::NormalReturn => Some("normal_return".to_owned()),
-        ProcedurePortKind::ExceptionalReturn => Some("exceptional_return".to_owned()),
-        ProcedurePortKind::Capture { .. } => None,
-    }
-}
-
 /// The receiver and parameter shape a live procedure declares.
 struct ProcedureShape {
     has_receiver: bool,
@@ -488,17 +533,23 @@ impl ProcedureShape {
         }
     }
 
+    /// The receiver and parameter ports, in port order.
+    ///
+    /// The port constructors validate against the same value table this shape
+    /// was read from, so a port this shape declares always exists.
     fn input_ports(&self, procedure: &ProcedureHandle) -> Vec<ProcedurePortHandle> {
         let mut ports = Vec::new();
-        if self.has_receiver
-            && let Ok(receiver) = ProcedurePortHandle::receiver(procedure.clone())
-        {
-            ports.push(receiver);
+        if self.has_receiver {
+            ports.push(
+                ProcedurePortHandle::receiver(procedure.clone())
+                    .expect("a procedure with a receiver value owns a receiver port"),
+            );
         }
         for ordinal in 0..self.parameter_count {
-            if let Ok(parameter) = ProcedurePortHandle::parameter(procedure.clone(), ordinal) {
-                ports.push(parameter);
-            }
+            ports.push(
+                ProcedurePortHandle::parameter(procedure.clone(), ordinal)
+                    .expect("a declared parameter ordinal owns a parameter port"),
+            );
         }
         ports
     }
@@ -581,14 +632,18 @@ struct ClosureInputs {
     snapshots: Vec<ValueFlowInput<ValueFlowSnapshot>>,
     bindings: Vec<ValueFlowInput<CallBindings>>,
     procedures: usize,
+    /// Where the root's own snapshot landed. `None` when the oracle returned no
+    /// snapshot for the root at all, which is a target with no observable body
+    /// rather than a target with no flow.
+    root_snapshot: Option<usize>,
 }
 
 impl ClosureInputs {
-    /// The target's own relations. The walk visits the root first, so its
-    /// snapshot is the first one collected.
+    /// The target's own relations, which are the only ones whose program points
+    /// may carry this target's sinks.
     fn root_relations(&self) -> &[ValueFlowRelation] {
-        self.snapshots
-            .first()
+        self.root_snapshot
+            .and_then(|index| self.snapshots.get(index))
             .map_or(&[][..], |input| input.value().relations())
     }
 }
@@ -601,7 +656,6 @@ impl ClosureInputs {
 /// not rest on a partial input; this one records the interruption as typed
 /// incompleteness on the entry and keeps going, because a partial derivation
 /// that names its boundary is exactly the artifact this stage ships.
-#[allow(clippy::too_many_arguments)]
 fn discover_closure(
     analyzer: &WorkspaceAnalyzer,
     root: &ProcedureHandle,
@@ -614,21 +668,21 @@ fn discover_closure(
     let oracle = analyzer.semantic_oracle_provider();
     let context = OracleCallContext::empty();
     let mut pending = vec![root.clone()];
-    let mut seen: Vec<ProcedureHandle> = Vec::new();
+    let mut seen: HashSet<ProcedureHandle> = HashSet::new();
     let mut seen_bindings = BTreeSet::new();
     let mut snapshots = Vec::new();
     let mut bindings = Vec::new();
+    let mut root_snapshot = None;
     while let Some(procedure) = pending.pop() {
-        if seen.contains(&procedure) {
+        if !seen.insert(procedure.clone()) {
             continue;
         }
-        if seen.len() >= limits.max_closure_procedures {
+        if seen.len() > limits.max_closure_procedures {
             boundaries.insert(FoundryDerivationBoundary::ClosureLimit {
                 limit: limits.max_closure_procedures as u32,
             });
             break;
         }
-        seen.push(procedure.clone());
 
         let outcome = oracle
             .procedure_relations(
@@ -644,6 +698,9 @@ fn discover_closure(
         let Some(snapshot) = outcome.available_value().cloned() else {
             continue;
         };
+        if &procedure == root {
+            root_snapshot = Some(snapshots.len());
+        }
         snapshots.push(ValueFlowInput::new(snapshot, status));
 
         for call_row in procedure.semantics().call_sites() {
@@ -695,6 +752,7 @@ fn discover_closure(
         snapshots,
         bindings,
         procedures: seen.len(),
+        root_snapshot,
     })
 }
 

@@ -289,6 +289,8 @@ pub struct FoundryDerivationReport {
     /// Output ports this stage observes. Any other output is silent, not
     /// denied.
     pub observed_output_ports: Vec<String>,
+    /// Files the semantic provider could not materialize, with its reason.
+    pub unavailable_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -451,6 +453,7 @@ fn derivation_report(run: &derive::DerivationRun) -> FoundryDerivationReport {
             .iter()
             .map(|port| (*port).to_owned())
             .collect(),
+        unavailable_files: run.unavailable_files.clone(),
     }
 }
 
