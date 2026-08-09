@@ -6,6 +6,7 @@ pub(crate) mod crate_identity;
 mod dependency_discovery;
 pub(crate) mod diagnostics;
 mod external;
+mod fact_catch_up;
 mod graph_support;
 mod hierarchy;
 mod imports;
@@ -13,6 +14,12 @@ mod rustdoc_artifact;
 mod semantic;
 mod structural;
 mod usage_index;
+#[cfg(test)]
+mod usage_queries_tests;
+#[cfg(test)]
+mod usage_tests;
+#[cfg(test)]
+mod usage_walks_tests;
 
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
@@ -49,7 +56,15 @@ use std::sync::{Arc, OnceLock};
 
 use super::weighted_cache::{build_weighted_cache, weight_code_unit_set, weight_project_file_set};
 pub(crate) use adapter::RustAdapter;
-use brokk_bifrost_core::analyzer::rust_facts::RustModuleRouteFacts;
+use brokk_bifrost_core::analyzer::rust_facts::{RustModuleRouteFacts, RustUsageFacts};
+use brokk_bifrost_rust::cache::{weight_declaration_facts, weight_rust_usage_facts};
+use brokk_bifrost_rust::graph_support::{RustFactSource, RustLiveBlobs};
+use brokk_bifrost_rust::usage_queries::RustDeclarationFacts;
+use brokk_bifrost_rust::usage_walks::RustWalkCaches;
+
+/// The key of the per-blob fact cache: the rows are content-addressed, and the
+/// generation component retires the whole cache when extraction semantics move.
+type RustFactCacheKey = (Option<crate::analyzer::store::GenerationId>, git2::Oid);
 use brokk_bifrost_rust::cargo_routes::{RustCargoRouteIndex, RustCargoTargetRelation};
 pub(crate) use brokk_bifrost_rust::declarations::{rust_package_name, rust_type_identifiers};
 pub use brokk_bifrost_rust::field_roles::rust_is_field_declaration_name;
@@ -112,6 +127,24 @@ pub struct RustAnalyzer {
     /// Files the Cargo-route build had to parse because their blob carried no
     /// persisted module-route rows (#1793).
     module_route_fact_fallback_count: Arc<AtomicUsize>,
+    /// One blob's persisted per-file Rust usage facts. Keyed by
+    /// `(generation, blob)` rather than by file, because the rows are
+    /// content-addressed and two byte-identical files share them; the
+    /// generation component retires the whole cache when extraction semantics
+    /// move. Bounded by a byte budget, never by workspace size.
+    rust_usage_facts: Cache<RustFactCacheKey, Arc<RustUsageFacts>>,
+    /// One file's declaration identities and their visibility domains. Keyed by
+    /// file rather than by blob because the derivation consults analyzer state
+    /// (structural parents, visibility) and not only the file's bytes; the
+    /// analyzer is replaced wholesale on `update`, so the cache retires with it.
+    declaration_facts: Cache<ProjectFile, Arc<RustDeclarationFacts>>,
+    /// The fact catch-up state for this generation: whether the live blobs
+    /// without persisted Rust facts have been found and repaired.
+    fact_catch_up: Arc<fact_catch_up::RustFactCatchUp>,
+    /// The cross-file usage walks' bounded memos. Behind one `Arc` so the
+    /// analyzer stays small: nine `Cache` handles inline would make this struct
+    /// the outsized variant of `AnalyzerDelegate`.
+    walk_caches: Arc<RustWalkCaches>,
     usage_index: Arc<PoolSafeMemo<RustUsageIndex>>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
     #[allow(dead_code)]
@@ -138,6 +171,42 @@ impl RustAnalyzer {
 
     pub(super) fn live_path_snapshot(&self) -> Arc<crate::analyzer::store::liveness::LiveSnapshot> {
         self.inner.live_path_snapshot()
+    }
+
+    /// One blob's persisted per-file usage facts, read once per
+    /// `(generation, blob)` and then served from the bounded cache.
+    fn rust_usage_facts_of_blob(&self, oid: git2::Oid) -> Option<Arc<RustUsageFacts>> {
+        let key: RustFactCacheKey = (self.inner.language_generation("rust"), oid);
+        if let Some(cached) = self.rust_usage_facts.get(&key) {
+            return Some(cached);
+        }
+        let facts = self.analyzer_store().rust_usage_facts(oid, "rust").ok()?;
+        if facts.modules.is_empty() {
+            return None;
+        }
+        let facts = Arc::new(facts);
+        self.rust_usage_facts.insert(key, Arc::clone(&facts));
+        Some(facts)
+    }
+
+    /// One file's declaration identities and their visibility domains, derived
+    /// once per file and then served from the bounded cache.
+    fn rust_declaration_facts_of(&self, file: &ProjectFile) -> Arc<RustDeclarationFacts> {
+        if let Some(cached) = self.declaration_facts.get(file) {
+            return cached;
+        }
+        let facts = Arc::new(
+            brokk_bifrost_rust::usage_queries::rust_declaration_facts(
+                self,
+                file,
+                &self.declarations(file),
+                &|| true,
+            )
+            .expect("uninterrupted Rust declaration-fact derivation"),
+        );
+        self.declaration_facts
+            .insert(file.clone(), Arc::clone(&facts));
+        facts
     }
 
     pub(crate) fn declaration_candidates_by_identifier_limited(
@@ -371,6 +440,11 @@ impl RustAnalyzer {
         self.cargo_routes.is_ready()
     }
 
+    #[cfg(test)]
+    pub(crate) fn hierarchy_index_built_for_test(&self) -> bool {
+        self.hierarchy_index.get().is_some()
+    }
+
     /// Files the Cargo-route build recovered by parsing. The structural claim of
     /// #1793 is that this reads zero on a warm workspace: the index composes
     /// from rows and never from a workspace parse.
@@ -464,6 +538,10 @@ impl RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
+            rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
+            declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
+            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
+            walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
             usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -500,6 +578,10 @@ impl RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
+            rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
+            declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
+            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
+            walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
             usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -629,6 +711,64 @@ impl brokk_bifrost_rust::graph_support::RustUsageSource for RustAnalyzer {
         progress: &dyn Fn() -> bool,
     ) -> Option<Arc<RustReferenceContext>> {
         self.forward_reference_context_of_with_progress(file, progress)
+    }
+}
+
+/// The live file-to-blob mapping, handed to `brokk-bifrost-rust` as an
+/// object-safe view because `LiveSnapshot` is an analysis-side type.
+struct LiveSnapshotBlobs(Arc<crate::analyzer::store::liveness::LiveSnapshot>);
+
+impl RustLiveBlobs for LiveSnapshotBlobs {
+    fn oid_for_path(&self, file: &ProjectFile) -> Option<git2::Oid> {
+        self.0.oid_for_path(file)
+    }
+
+    fn paths_for_oid(&self, oid: git2::Oid) -> Vec<ProjectFile> {
+        self.0.paths_for_oid(oid).to_vec()
+    }
+}
+
+/// The store-backed half of the Rust usage substrate. Everything here is
+/// something only the analyzer can answer: the store handle behind the four
+/// inverted lookups, the live blob mapping, the caches it owns, and the
+/// catch-up that guarantees the rows exist before a walk reads them.
+impl RustFactSource for RustAnalyzer {
+    fn rust_usage_facts_of_blob(&self, oid: git2::Oid) -> Option<Arc<RustUsageFacts>> {
+        self.rust_usage_facts_of_blob(oid)
+    }
+
+    fn rust_import_target_blobs(&self, module_path: &str) -> Vec<git2::Oid> {
+        self.analyzer_store()
+            .rust_import_target_blobs("rust", module_path)
+            .unwrap_or_default()
+    }
+
+    fn rust_export_blobs(&self, exported_name: &str) -> Vec<git2::Oid> {
+        self.analyzer_store()
+            .rust_export_blobs("rust", exported_name)
+            .unwrap_or_default()
+    }
+
+    fn rust_identifier_occurrence_blobs(&self, identifier: &str) -> Vec<(git2::Oid, u32)> {
+        self.analyzer_store()
+            .rust_identifier_occurrence_blobs("rust", identifier)
+            .unwrap_or_default()
+    }
+
+    fn rust_declaration_facts_of(&self, file: &ProjectFile) -> Arc<RustDeclarationFacts> {
+        self.rust_declaration_facts_of(file)
+    }
+
+    fn live_blobs(&self) -> Arc<dyn RustLiveBlobs> {
+        Arc::new(LiveSnapshotBlobs(self.live_path_snapshot()))
+    }
+
+    fn walk_caches(&self) -> &Arc<RustWalkCaches> {
+        &self.walk_caches
+    }
+
+    fn ensure_rust_facts_caught_up(&self) {
+        self.ensure_rust_facts_caught_up();
     }
 }
 
@@ -891,6 +1031,10 @@ impl IAnalyzer for RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
+            rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
+            declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
+            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
+            walk_caches: Arc::new(RustWalkCaches::new(self.memo_budget)),
             usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
@@ -917,6 +1061,10 @@ impl IAnalyzer for RustAnalyzer {
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
+            rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
+            declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
+            fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
+            walk_caches: Arc::new(RustWalkCaches::new(self.memo_budget)),
             usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),

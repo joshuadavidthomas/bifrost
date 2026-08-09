@@ -47,7 +47,7 @@ pub mod typestate;
 mod usage_facts;
 pub mod usages;
 pub mod value_flow;
-pub(crate) mod weighted_cache;
+pub(crate) use brokk_bifrost_core::analyzer::weighted_cache;
 mod work_budget;
 mod workspace;
 
@@ -175,7 +175,7 @@ pub use php::{
     PhpAnalyzer, PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
-pub(crate) use pool_memo::PoolSafeMemo;
+pub(crate) use pool_memo::{PoolSafeMemo, spawn_on_dedicated_build_pool};
 pub use project::{
     BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,
     MultiRootProject, OverlayProject, OverlayRevision, Project, ProjectSourceOrigin,

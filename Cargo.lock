@@ -297,6 +297,7 @@ dependencies = [
  "git2",
  "growable-bloom-filter",
  "ignore",
+ "moka",
  "once_cell",
  "rayon",
  "rusqlite",
@@ -508,6 +509,7 @@ version = "0.8.24"
 dependencies = [
  "brokk-bifrost-core",
  "filetime",
+ "git2",
  "glob",
  "moka",
  "rayon",

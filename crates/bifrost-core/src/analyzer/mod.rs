@@ -32,6 +32,7 @@ pub mod test_paths;
 pub mod tree_walk;
 pub mod type_relations;
 pub mod usages;
+pub mod weighted_cache;
 
 pub use code_unit_index::{CodeUnitIndex, default_parent_fq_name};
 pub use definition_lookup::{BoundedDefinitionLookup, DefinitionLookupAccess};

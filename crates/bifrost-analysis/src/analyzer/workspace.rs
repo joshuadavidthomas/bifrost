@@ -755,6 +755,46 @@ impl WorkspaceAnalyzer {
         }
     }
 
+    /// Bring the persisted per-file Rust usage facts up to date ahead of the
+    /// first query that reads them.
+    ///
+    /// This replaced a workspace-wide index build (issues #1416, #1757, #1758):
+    /// under usage v2 there is nothing to build, and the warm's only job is to
+    /// find the live blobs analysis did not persist rows for and repair them
+    /// off the request path. A no-op for workspaces without Rust.
+    pub fn warm_rust_usage_facts(&self) {
+        if let Some(rust) =
+            crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
+        {
+            // The catch-up issues per-file store queries that are only cheap
+            // under request-scoped memoization; without a scope each lookup
+            // re-hydrates (observed ~65s instead of ~3.5s on the Bifrost
+            // workspace).
+            let _scope = crate::analyzer::AnalyzerQueryScope::new(self.analyzer());
+            rust.warm_usage_facts();
+        }
+    }
+
+    /// Whether a Rust usage query would wait for a fact catch-up batch.
+    ///
+    /// Under usage v2 nothing is built, and the only wait a query can inherit
+    /// is an above-threshold batch of live blobs whose facts are being
+    /// persisted in the background. Answers without blocking behind that batch,
+    /// which is the point (#1757). Always true for a workspace with no Rust.
+    pub fn rust_usage_facts_ready(&self) -> bool {
+        crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
+            .is_none_or(|rust| rust.rust_usage_facts_ready())
+    }
+
+    /// Whether the Rust fact catch-up has run for this generation. The
+    /// warm-ness question, as distinct from the wait question
+    /// [`Self::rust_usage_facts_ready`] answers: a session that never warms and
+    /// never queries is ready but not warm.
+    pub fn rust_usage_facts_warm(&self) -> bool {
+        crate::analyzer::resolve_analyzer::<crate::analyzer::RustAnalyzer>(self.analyzer())
+            .is_none_or(|rust| rust.rust_usage_facts_warm())
+    }
+
     /// Select the execution-semantics provider for the requested file without
     /// widening the monolithic [`IAnalyzer`] surface.
     pub fn program_semantics_provider_for_file(
@@ -961,6 +1001,37 @@ mod tests {
         assert!(!multi.query_indexes_warm());
         multi.warm_query_indexes();
         assert!(multi.query_indexes_warm());
+    }
+
+    /// The two Rust usage predicates a caller can ask a workspace, and the
+    /// distinction ExecPlan Milestone 3 introduced between them: readiness is
+    /// "would a query wait", which a healthy workspace answers `true` even
+    /// before any warm because v2 has nothing to build, and warmth is "has the
+    /// catch-up run for this generation", which only the warm makes true.
+    /// Neither may be `false` for a workspace with no Rust.
+    #[test]
+    fn rust_usage_readiness_and_warmth_are_distinct_and_vacuous_without_rust() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        ProjectFile::new(root.clone(), "src/lib.rs")
+            .write("pub mod worker;\npub fn root() {}\n")
+            .unwrap();
+        ProjectFile::new(root.clone(), "src/worker.rs")
+            .write("use crate::root;\npub fn run() { root(); }\n")
+            .unwrap();
+
+        let rust: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
+        let rust = WorkspaceAnalyzer::build(rust, AnalyzerConfig::default());
+        assert!(rust.rust_usage_facts_ready());
+        assert!(!rust.rust_usage_facts_warm());
+        rust.warm_rust_usage_facts();
+        assert!(rust.rust_usage_facts_ready());
+        assert!(rust.rust_usage_facts_warm());
+
+        let java: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
+        let java = WorkspaceAnalyzer::build(java, AnalyzerConfig::default());
+        assert!(java.rust_usage_facts_ready());
+        assert!(java.rust_usage_facts_warm());
     }
 
     #[test]

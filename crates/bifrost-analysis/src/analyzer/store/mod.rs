@@ -3654,13 +3654,11 @@ impl AnalyzerStore {
             .map(|at| crate::cache_db::now_unix_seconds() - at))
     }
 
-    // Read access to the per-file Rust usage fact tables. Written by
-    // `insert_rust_fact_rows` above; the readers stay unused until the usage-v2
-    // read path lands (Phase 2 of
-    // `.agents/plans/port-optimization-arc-to-upstream.md`, "Restore the read
-    // path"). Keeping the reader beside the writer it inverts is what makes the
-    // round trip reviewable in one place, and the restored store tests below
-    // exercise both halves today.
+    // Read access to the per-file Rust usage fact tables, inverting
+    // `insert_rust_fact_rows` above. Keeping the reader beside the writer is
+    // what makes the round trip reviewable in one place. The Rust analyzer
+    // reaches these through `RustFactSource`, which is the only production
+    // caller; the store tests below exercise both halves directly.
 
     /// Every persisted per-file Rust usage fact for one blob.
     ///
@@ -3669,7 +3667,6 @@ impl AnalyzerStore {
     /// knows the file reads it directly; a caller searching by name reaches
     /// these rows through the inverted lookups below and then verifies each
     /// candidate against its facts.
-    #[allow(dead_code)]
     pub(crate) fn rust_usage_facts(&self, oid: Oid, lang: &str) -> Result<RustUsageFacts> {
         let conn = self.read_conn()?;
         read_rust_usage_facts(&conn, &oid.to_string(), lang)
@@ -3677,7 +3674,6 @@ impl AnalyzerStore {
 
     /// Blobs that import `module_path`, spelled exactly as the importing file
     /// writes it. The inverted direction of `rust_import_targets`.
-    #[allow(dead_code)]
     pub(crate) fn rust_import_target_blobs(
         &self,
         lang: &str,
@@ -3693,7 +3689,6 @@ impl AnalyzerStore {
 
     /// Blobs that re-export `exported_name`. The inverted direction of
     /// `rust_exports`, and the seed of an export-chain walk.
-    #[allow(dead_code)]
     pub(crate) fn rust_export_blobs(&self, lang: &str, exported_name: &str) -> Result<Vec<Oid>> {
         self.rust_fact_blobs(
             "SELECT DISTINCT blob_oid FROM rust_exports
@@ -3708,7 +3703,6 @@ impl AnalyzerStore {
     /// occurs, and the caller must still resolve it against the candidate's
     /// own facts. Comparison is case-sensitive, matching the spelling the
     /// declaration side stores.
-    #[allow(dead_code)]
     pub(crate) fn rust_identifier_occurrence_blobs(
         &self,
         lang: &str,
@@ -3779,7 +3773,6 @@ impl AnalyzerStore {
     /// `parsed_blob_keys_conn_with_condition`: each chunk is a batch of index
     /// seeks, so the cost tracks the live file set rather than the table's
     /// accumulated history.
-    #[allow(dead_code)]
     pub(crate) fn blobs_with_rust_facts(&self, lang: &str, oids: &[Oid]) -> Result<HashSet<Oid>> {
         const OIDS_PER_QUERY: usize = 400;
         let mut unique: Vec<String> = oids.iter().map(Oid::to_string).collect();
@@ -3816,7 +3809,6 @@ impl AnalyzerStore {
     ///
     /// A blob with no rows is absent from the result, which the caller
     /// distinguishes from "this file declares nothing".
-    #[allow(dead_code)]
     pub(crate) fn rust_module_route_facts(
         &self,
         lang: &str,
@@ -3928,7 +3920,6 @@ impl AnalyzerStore {
         Ok(by_oid)
     }
 
-    #[allow(dead_code)]
     fn rust_fact_blobs(&self, sql: &str, lang: &str, key: &str) -> Result<Vec<Oid>> {
         let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(sql)?;
@@ -4741,7 +4732,6 @@ fn insert_rust_fact_rows(
 /// column encodings are decoded. A visibility this build did not write means
 /// the row came from a schema this build does not own, which the schema-version
 /// file name already prevents -- so it is an assertion, not a recovery path.
-#[allow(dead_code)]
 fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<RustUsageFacts> {
     let mut exports = Vec::new();
     {
