@@ -3969,11 +3969,20 @@ fn run(_: Owner::Handle) {
 
     let assoc_type_hits = rust_graph_hits(&analyzer, "Trait.Handle");
     assert_eq!(
-        1,
+        2,
         assoc_type_hits.len(),
         "associated type hits: {assoc_type_hits:?}"
     );
-    assert!(assoc_type_hits[0].snippet.contains("Owner::Handle"));
+    assert!(
+        assoc_type_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("type Handle = usize"))
+    );
+    assert!(
+        assoc_type_hits
+            .iter()
+            .any(|hit| hit.snippet.contains("Owner::Handle"))
+    );
 
     let variant_hits = rust_graph_hits(&analyzer, "Status.Ready");
     assert_eq!(1, variant_hits.len(), "enum variant hits: {variant_hits:?}");
@@ -5540,7 +5549,19 @@ fn run(_: Foo::AssocType) {}
         )
         .into_either()
         .expect("associated type success");
-    assert_eq!(1, hits.len());
+    assert_eq!(
+        2,
+        hits.len(),
+        "associated type declaration and use: {hits:?}"
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("type AssocType = usize"))
+    );
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("Foo::AssocType"))
+    );
 }
 
 #[test]
@@ -8091,8 +8112,34 @@ fn consume_other(_: OtherOwner::Handle) {}
     )]);
 
     let hits = rust_graph_hits(&analyzer, "Trait.Handle");
-    assert_eq!(1, hits.len(), "trait associated type hits: {hits:?}");
-    assert!(hits[0].snippet.contains("Owner::Handle"));
+    assert_eq!(2, hits.len(), "trait associated type hits: {hits:?}");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.snippet.contains("type Handle = usize"))
+    );
+    assert!(hits.iter().any(|hit| hit.snippet.contains("Owner::Handle")));
+}
+
+#[test]
+fn rust_graph_strategy_resolves_trait_associated_type_impl_declarations() {
+    let (_project, analyzer) = rust_analyzer_with_files(&[(
+        "src/lib.rs",
+        r#"
+pub trait Input { type Item; }
+pub trait Other { type Item; }
+
+impl Input for &[u8] { type Item = u8; }
+impl Other for Vec<u8> { type Item = u8; }
+"#,
+    )]);
+
+    let hits = rust_graph_hits(&analyzer, "Input.Item");
+    assert_eq!(
+        1,
+        hits.len(),
+        "trait associated type declarations: {hits:?}"
+    );
+    assert!(hits[0].snippet.contains("type Item = u8"));
 }
 
 #[test]

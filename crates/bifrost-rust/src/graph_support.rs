@@ -3,10 +3,11 @@ use brokk_bifrost_core::analyzer::capabilities::{
 };
 use brokk_bifrost_core::analyzer::common::node_ident_text;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::model::{
     ExportEntry, ExportIndex, ImportBinder, ImportKind, ReexportStar,
 };
-use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::analyzer::{CodeUnit, Language, ProjectFile};
 use brokk_bifrost_core::analyzer::{CodeUnitIndex, default_parent_fq_name};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::profiling;
@@ -615,6 +616,11 @@ pub fn resolve_module_package(
         let Some(aliased) = rust_apply_import_alias(rust, importing_file, &current) else {
             break;
         };
+        if let Some(package) =
+            resolve_import_alias_exported_module_package(rust, importing_file, &aliased)
+        {
+            return Some(package);
+        }
         if is_rooted_rust_module_path(&aliased) {
             return resolve_rust_module_path_with_crate(&package, &crate_package, &aliased);
         }
@@ -627,6 +633,91 @@ pub fn resolve_module_package(
         current = aliased;
     }
     resolve_rust_module_path_with_crate(&package, &crate_package, &current)
+}
+
+fn resolve_import_alias_exported_module_package(
+    rust: &dyn RustSource,
+    importing_file: &ProjectFile,
+    aliased_specifier: &str,
+) -> Option<String> {
+    let segments = parse_symbol_path(Language::Rust, aliased_specifier);
+    let (root, suffix) = segments.split_first()?;
+    let suffix = (!suffix.is_empty()).then_some(suffix)?;
+    if rust_apply_import_alias(rust, importing_file, root).is_some() {
+        return None;
+    }
+    let mut files = resolve_module_files(rust, importing_file, root);
+    if files.is_empty() {
+        return None;
+    }
+    let mut package = None;
+    for segment in suffix {
+        let target = forward_exported_module_fqn(rust, &files, segment)?;
+        package = Some(target.clone());
+        files = resolve_module_files(rust, importing_file, &target);
+        if files.is_empty() {
+            return None;
+        }
+    }
+    package
+}
+
+fn forward_exported_module_fqn(
+    rust: &dyn RustSource,
+    module_files: &[ProjectFile],
+    name: &str,
+) -> Option<String> {
+    let mut pending = module_files
+        .iter()
+        .cloned()
+        .map(|file| (file, name.to_string(), false))
+        .collect::<Vec<_>>();
+    let mut visited = HashSet::default();
+    let mut targets = BTreeSet::new();
+    while let Some((file, name, reached_through_reexport)) = pending.pop() {
+        if !visited.insert((file.clone(), name.clone(), reached_through_reexport)) {
+            continue;
+        }
+        let export_index = rust.export_index_of(&file);
+        match export_index.exports_by_name.get(&name) {
+            Some(ExportEntry::Local { local_name }) => {
+                targets.extend(
+                    rust.definitions(&format!("{}.{}", rust_package_name(&file), local_name))
+                        .filter(|unit| unit.is_module())
+                        .map(|unit| unit.fq_name()),
+                );
+            }
+            Some(ExportEntry::ReexportedNamed {
+                module_specifier,
+                imported_name,
+            }) => {
+                pending.extend(
+                    resolve_module_files(rust, &file, module_specifier)
+                        .into_iter()
+                        .map(|target| (target, imported_name.clone(), true)),
+                );
+            }
+            Some(ExportEntry::Default { .. } | ExportEntry::ReexportedModule { .. }) => {}
+            None if reached_through_reexport => {
+                targets.extend(
+                    rust.definitions(&format!("{}.{}", rust_package_name(&file), name))
+                        .filter(|unit| unit.is_module())
+                        .map(|unit| unit.fq_name()),
+                );
+            }
+            None => {}
+        }
+        for ReexportStar { module_specifier } in &export_index.reexport_stars {
+            pending.extend(
+                resolve_module_files(rust, &file, module_specifier)
+                    .into_iter()
+                    .map(|target| (target, name.clone(), true)),
+            );
+        }
+    }
+    (targets.len() == 1)
+        .then(|| targets.into_iter().next())
+        .flatten()
 }
 
 pub fn build_reference_context_with_progress(

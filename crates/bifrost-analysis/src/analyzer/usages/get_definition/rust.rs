@@ -23,7 +23,9 @@ use brokk_bifrost_rust::field_roles::{
     RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
 };
 use brokk_bifrost_rust::graph_support::{
-    RustUsageSource, is_rust_trait_declaration, is_rust_trait_impl_member_declaration,
+    RustSource, RustUsageSource, is_rust_export_visible_declaration,
+    is_rust_macro_export_declaration, is_rust_trait_declaration,
+    is_rust_trait_impl_member_declaration,
 };
 use brokk_bifrost_rust::lexical_scope;
 use std::cell::RefCell;
@@ -1120,7 +1122,8 @@ fn resolve_rust_unscoped(
                                 CodeUnit::is_class,
                             )
                         })
-                        .flatten();
+                        .flatten()
+                        .filter(|unit| rust_declaration_is_trait(rust, unit));
                     // The import route is bound but unindexed, and the workspace
                     // nonetheless supplies the name: the route loses to a
                     // workspace declaration, which is a decision this arm makes
@@ -1147,7 +1150,12 @@ fn resolve_rust_unscoped(
                         site.focus_end_byte,
                         reference,
                         role,
-                    );
+                    )
+                    .into_iter()
+                    .filter(|unit| {
+                        role != RustBareReferenceRole::Type || rust_declaration_is_trait(rust, unit)
+                    })
+                    .collect::<Vec<_>>();
                     if !local.is_empty() {
                         trace_rejected_import_route(
                             file,
@@ -1162,7 +1170,10 @@ fn resolve_rust_unscoped(
                         file,
                         reference,
                         site.focus_start_byte,
-                    ) {
+                    )
+                    .filter(|unit| {
+                        role != RustBareReferenceRole::Type || rust_declaration_is_trait(rust, unit)
+                    }) {
                         return candidates_outcome(vec![unit]);
                     }
                     // gated upstream: the enclosing-scope member fallback and the
@@ -2487,7 +2498,7 @@ fn rust_value_namespace_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) -> 
 }
 
 fn rust_callable_namespace_candidate(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
-    candidate.is_class()
+    (candidate.is_class() && has_rust_value_constructor(rust, candidate))
         || (candidate.is_function() && rust_declaration_is_free_function(rust, candidate))
         || (candidate.is_field() && rust_declaration_is_enum_variant(rust, candidate))
 }
@@ -2548,6 +2559,10 @@ fn rust_declaration_is_module_type_alias(rust: &RustAnalyzer, candidate: &CodeUn
         }
         true
     })
+}
+
+fn rust_declaration_is_trait(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
+    rust_declaration_matches(rust, candidate, |node| node.kind() == "trait_item")
 }
 
 fn rust_declaration_is_value_item(rust: &RustAnalyzer, candidate: &CodeUnit) -> bool {
@@ -2778,14 +2793,28 @@ fn rust_self_scoped_associated_type_candidates(
     }
     let name = scoped.child_by_field_name("name")?;
     let name = rust_node_text(name, source).trim();
-    let associated_type = resolve_in_enclosing_scopes(
+    let candidate = resolve_in_enclosing_scopes(
         analyzer,
         file,
         name,
         site.focus_start_byte,
         CodeUnit::is_field,
-    )?;
-    Some(vec![associated_type])
+    );
+    let Some(impl_item) = rust_enclosing_ancestor(scoped, "impl_item") else {
+        return candidate.map(|candidate| vec![candidate]);
+    };
+    let candidate_is_in_impl = candidate.as_ref().is_some_and(|candidate| {
+        candidate.source() == file
+            && analyzer.ranges(candidate).iter().any(|range| {
+                impl_item.start_byte() <= range.start_byte && range.end_byte <= impl_item.end_byte()
+            })
+    });
+    Some(
+        candidate
+            .filter(|_| candidate_is_in_impl)
+            .into_iter()
+            .collect(),
+    )
 }
 
 fn rust_enum_variant_declaration_outcome(
@@ -3215,6 +3244,31 @@ fn rust_focused_use_path_outcome(
     } else {
         RustFocusedPathRole::Declaration
     };
+    if role == RustFocusedPathRole::Declaration && focused_path.full_path == focused_text {
+        let local = rust_current_module_candidates(
+            analyzer,
+            rust,
+            support,
+            file,
+            tree.root_node(),
+            site.focus_start_byte,
+            site.focus_end_byte,
+            focused_text,
+            RustBareReferenceRole::Owner,
+        )
+        .into_iter()
+        .filter(CodeUnit::is_module)
+        .collect::<Vec<_>>();
+        if !local.is_empty() {
+            return Some(candidates_outcome(local));
+        }
+    }
+    if role == RustFocusedPathRole::Declaration
+        && let Some(candidates) =
+            rust_focused_import_macro_candidates(rust, support, file, source, focused, site)
+    {
+        return Some(candidates_outcome(candidates));
+    }
     let refs = support.forward_reference_context(rust, file)?;
     let rooted_segments =
         crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, resolution_path);
@@ -3252,6 +3306,93 @@ fn rust_focused_use_path_outcome(
         resolved_fqn.as_deref(),
         false,
     ))
+}
+
+/// Select an exported macro for an unqualified `use` terminal when a private
+/// module has the same spelling. Rust keeps macro and module names in separate
+/// namespaces. A private module does not make the import ambiguous because it
+/// cannot cross the crate boundary (`spacetimedb_primitives::col_list`).
+///
+/// The generic path resolver intentionally accepts every declaration with the
+/// resolved FQN. This narrow import-terminal pass supplies the missing
+/// visibility fact before that fallback can select the private module.
+#[allow(clippy::too_many_arguments)]
+fn rust_focused_import_macro_candidates(
+    rust: &RustAnalyzer,
+    support: &dyn RustDefinitionProvider,
+    file: &ProjectFile,
+    source: &str,
+    focused: Node<'_>,
+    site: &ResolvedReferenceSite,
+) -> Option<Vec<CodeUnit>> {
+    let use_declaration = rust_enclosing_ancestor(focused, "use_declaration")?;
+    let focused_text = rust_node_text(focused, source).trim();
+    if focused_text.is_empty() {
+        return None;
+    }
+    let import = brokk_bifrost_rust::imports::rust_imports_with_visibility_from_use_declaration(
+        use_declaration,
+        source,
+    )
+    .into_iter()
+    .find(|import| {
+        import.info.alias.is_none()
+            && import.info.binder_span.is_some_and(|span| {
+                span.start_byte <= site.focus_start_byte && site.focus_end_byte <= span.end_byte
+            })
+            && import.path.last().is_some_and(|name| name == focused_text)
+    })?;
+    if import.path.len() < 2 {
+        return None;
+    }
+    let module_specifier = import.path[..import.path.len() - 1].join("::");
+    let binder = lexical_scope::visible_import_binder_at(source, site.focus_start_byte);
+    let mut candidates = resolve_visible_import_targets_forward(rust, file, &binder, focused_text)
+        .into_iter()
+        .flat_map(|(target_file, target_name)| support.file_identifier(&target_file, &target_name))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates = resolve_module_files(rust, file, &module_specifier)
+            .into_iter()
+            .flat_map(|target_file| support.file_identifier(&target_file, focused_text))
+            .collect();
+    }
+    if let Some(package) = resolve_module_package(rust, file, &module_specifier) {
+        candidates.extend(support.fqn(&format!("{package}.{focused_text}")));
+        let route_files = resolve_module_files(rust, file, &module_specifier);
+        candidates.extend(
+            rust.get_analyzed_files()
+                .into_iter()
+                .filter(|candidate_file| {
+                    rust_crate_root_package(candidate_file) == package
+                        && route_files.iter().any(|route_file| {
+                            rust.files_share_cargo_target(candidate_file, route_file) != Some(false)
+                        })
+                })
+                .flat_map(|candidate_file| rust.declarations(&candidate_file))
+                .filter(|candidate| candidate.identifier() == focused_text)
+                .filter(|candidate| {
+                    candidate.is_macro()
+                        && is_rust_macro_export_declaration(rust.code_units(), candidate)
+                }),
+        );
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    let macros = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.is_macro() && is_rust_macro_export_declaration(rust.code_units(), candidate)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if macros.is_empty() {
+        return None;
+    }
+    let has_exported_non_macro = candidates.iter().any(|candidate| {
+        !candidate.is_macro() && is_rust_export_visible_declaration(rust.code_units(), candidate)
+    });
+    (!has_exported_non_macro).then_some(macros)
 }
 
 #[allow(clippy::too_many_arguments)]

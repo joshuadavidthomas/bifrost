@@ -270,6 +270,55 @@ fn rust_enum_variant_prefers_imported_rust_type_over_python_module_class() {
 }
 
 #[test]
+fn rust_external_crate_alias_follows_root_reexport_for_nested_type() {
+    let trace = trace_for(
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"tokenizers\", \"bindings/python\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "tokenizers/Cargo.toml",
+                "[package]\nname = \"tokenizers\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            (
+                "tokenizers/src/lib.rs",
+                "pub mod tokenizer;\npub use tokenizer::*;\n",
+            ),
+            (
+                "tokenizers/src/tokenizer/mod.rs",
+                "pub mod normalizer;\npub use normalizer::*;\n",
+            ),
+            (
+                "tokenizers/src/tokenizer/normalizer.rs",
+                "pub enum SplitDelimiterBehavior { Removed, Isolated }\n",
+            ),
+            (
+                "bindings/python/Cargo.toml",
+                "[package]\nname = \"tokenizers-python\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\nname = \"tokenizers\"\npath = \"src/lib.rs\"\n[dependencies]\ntokenizers = { path = \"../../tokenizers\" }\n",
+            ),
+            ("bindings/python/src/lib.rs", "pub mod pre_tokenizers;\n"),
+            (
+                "bindings/python/src/pre_tokenizers.rs",
+                "use tokenizers as tk;\nuse tk::normalizer::SplitDelimiterBehavior;\npub fn parse() {\n    let _ = SplitDelimiterBehavior::Isolated;\n}\n",
+            ),
+            (
+                "tokenizers/__init__.py",
+                "class SplitDelimiterBehavior:\n    pass\n",
+            ),
+        ],
+        "bindings/python/src/pre_tokenizers.rs",
+        "SplitDelimiterBehavior::Isolated",
+        "Isolated",
+    );
+    assert_eq!(
+        selected_names(&trace),
+        ["tokenizers.tokenizer.normalizer.SplitDelimiterBehavior.Isolated"],
+        "an external crate alias must follow the root re-export to the nested Rust enum: {trace:#?}"
+    );
+}
+
+#[test]
 fn rust_tuple_enum_variant_prefers_local_reexport_over_python_module_class() {
     let trace = trace_for(
         &[
@@ -350,6 +399,101 @@ fn rust_crate_segment_outside_macro_keeps_existing_no_definition() {
         "crate outside a macro must keep its existing segment result: {outcome:#?}"
     );
     assert!(selected_names(&trace).is_empty(), "{trace:#?}");
+}
+
+#[test]
+fn rust_local_module_import_beats_same_named_dependency_module() {
+    let (outcome, trace) = outcome_for(
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "crates/sqlx-core/Cargo.toml",
+                "[package]\nname = \"sqlx-core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "crates/sqlx-core/src/lib.rs",
+                "pub mod arguments;\npub mod driver_prelude { pub use crate::io; }\npub mod io;\n",
+            ),
+            (
+                "crates/sqlx-core/src/arguments.rs",
+                "pub struct CoreArguments;\n",
+            ),
+            ("crates/sqlx-core/src/io.rs", "pub struct Io;\n"),
+            (
+                "crates/sqlx-sqlite/Cargo.toml",
+                "[package]\nname = \"sqlx-sqlite\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nsqlx-core = { path = \"../sqlx-core\" }\n",
+            ),
+            (
+                "crates/sqlx-sqlite/src/lib.rs",
+                "#[macro_use]\nextern crate sqlx_core;\n\nuse std::sync::atomic::AtomicBool;\npub use arguments::SqliteArguments;\npub(crate) use sqlx_core::driver_prelude::*;\nuse sqlx_core::io::Io;\nmod arguments;\n",
+            ),
+            (
+                "crates/sqlx-sqlite/src/arguments.rs",
+                "pub struct SqliteArguments;\n",
+            ),
+        ],
+        "crates/sqlx-sqlite/src/lib.rs",
+        "arguments::SqliteArguments",
+        "arguments",
+    );
+    assert_eq!(
+        outcome.status,
+        brokk_bifrost::usages::get_definition::DefinitionLookupStatus::Resolved,
+        "the local module import must resolve: {outcome:#?}"
+    );
+    assert_eq!(
+        selected_names(&trace),
+        ["sqlx_sqlite.arguments"],
+        "the local SQLx module must beat the same-named dependency module: {trace:#?}"
+    );
+}
+
+#[test]
+fn rust_macro_export_import_beats_private_same_named_module() {
+    let (outcome, trace) = outcome_for(
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "crates/primitives/Cargo.toml",
+                "[package]\nname = \"spacetimedb-primitives\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "crates/primitives/src/lib.rs",
+                "mod col_list;\npub use col_list::ColList;\n",
+            ),
+            (
+                "crates/primitives/src/col_list.rs",
+                "pub struct ColList;\n#[macro_export]\nmacro_rules! col_list { ($($x:expr),*) => { $crate::ColList }; }\n",
+            ),
+            (
+                "crates/bench/Cargo.toml",
+                "[package]\nname = \"bench\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nspacetimedb-primitives = { path = \"../primitives\" }\n",
+            ),
+            (
+                "crates/bench/src/lib.rs",
+                "use spacetimedb_primitives::{col_list, TableId};\nfn run() { col_list![1, 2]; let _: TableId; }\n",
+            ),
+        ],
+        "crates/bench/src/lib.rs",
+        "spacetimedb_primitives::{col_list, TableId}",
+        "col_list",
+    );
+    assert_eq!(
+        outcome.status,
+        brokk_bifrost::usages::get_definition::DefinitionLookupStatus::Resolved,
+        "the macro export import must resolve: {outcome:#?}"
+    );
+    assert_eq!(
+        selected_names(&trace),
+        ["spacetimedb_primitives.col_list.col_list"],
+        "the exported macro must beat the private module: {trace:#?}"
+    );
 }
 
 #[test]
@@ -733,5 +877,125 @@ fn rust_huggingface_tokenizers_type_alias_uses_python_binding_lexical_owner() {
         selected_names(&trace),
         ["tokenizers.tokenizer.TokenizerImpl.from_file"],
         "the Python binding alias must route to TokenizerImpl, not the wrapper: {trace:#?}"
+    );
+}
+
+#[test]
+fn rust_unindexed_external_type_import_does_not_claim_same_named_local_struct() {
+    let (outcome, trace) = outcome_for(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"ron\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nserde = \"1\"\n",
+            ),
+            ("src/lib.rs", "pub mod de;\n"),
+            (
+                "src/de/mod.rs",
+                "pub struct Deserializer<'de> { _marker: core::marker::PhantomData<&'de ()> }\npub mod value;\n",
+            ),
+            (
+                "src/de/value.rs",
+                "use serde::Deserializer;\npub fn decode<D: Deserializer<'static>>() {}\n",
+            ),
+        ],
+        "src/de/value.rs",
+        "D: Deserializer",
+        "Deserializer",
+    );
+    assert!(
+        matches!(
+            outcome.status,
+            brokk_bifrost::usages::get_definition::DefinitionLookupStatus::NoDefinition
+                | brokk_bifrost::usages::get_definition::DefinitionLookupStatus::UnresolvableImportBoundary
+        ),
+        "an unindexed serde trait must not resolve to ron::de::Deserializer: {outcome:#?}"
+    );
+    assert!(outcome.definitions.is_empty(), "{outcome:#?}");
+    assert!(selected_names(&trace).is_empty(), "{trace:#?}");
+}
+
+#[test]
+fn rust_nested_unindexed_self_associated_type_does_not_claim_outer_impl() {
+    let (outcome, trace) = outcome_for(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"bson\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nserde = \"1\"\n",
+            ),
+            ("src/lib.rs", "pub mod de;\n"),
+            ("src/de/mod.rs", "pub mod serde;\n"),
+            (
+                "src/de/serde.rs",
+                "use serde::de::Visitor;\npub struct BsonVisitor;\nimpl<'de> Visitor<'de> for BsonVisitor {\n    type Value = ();\n    fn visit_map(&self) {\n        struct BytesOrHexVisitor;\n        impl<'de> Visitor<'de> for BytesOrHexVisitor {\n            fn visit_borrowed_str<E>(self, _v: &'de str) -> std::result::Result<Self::Value, E>\n            where\n                E: serde::de::Error,\n            {\n                unimplemented!()\n            }\n        }\n    }\n}\n",
+            ),
+        ],
+        "src/de/serde.rs",
+        "Self::Value",
+        "Value",
+    );
+    assert!(
+        matches!(
+            outcome.status,
+            brokk_bifrost::usages::get_definition::DefinitionLookupStatus::NoDefinition
+                | brokk_bifrost::usages::get_definition::DefinitionLookupStatus::UnresolvableImportBoundary
+        ),
+        "an unindexed nested impl owner must not resolve Self::Value to BsonVisitor.Value: {outcome:#?}"
+    );
+    assert!(outcome.definitions.is_empty(), "{outcome:#?}");
+    assert!(selected_names(&trace).is_empty(), "{trace:#?}");
+}
+
+#[test]
+fn rust_imported_enum_type_is_not_selected_for_a_bare_value_call() {
+    let files = [
+        (
+            "Cargo.toml",
+            "[package]\nname = \"nom\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        ),
+        ("src/lib.rs", "pub mod internal;\npub use internal::Err;\n"),
+        ("src/internal.rs", "pub enum Err<E> { Error(E) }\n"),
+        (
+            "benchmarks/benches/json.rs",
+            "fn parse() { let _ = Err(()); }\nuse nom::Err;\n",
+        ),
+    ];
+    let (outcome, trace) = outcome_for(&files, "benchmarks/benches/json.rs", "Err(())", "Err");
+    assert!(outcome.definitions.is_empty(), "{outcome:#?}");
+    assert!(
+        !selected_names(&trace)
+            .iter()
+            .any(|name| name.ends_with(".Err")),
+        "{trace:#?}"
+    );
+    assert!(matches!(
+        outcome.status,
+        brokk_bifrost::usages::get_definition::DefinitionLookupStatus::NoDefinition
+            | brokk_bifrost::usages::get_definition::DefinitionLookupStatus::UnresolvableImportBoundary
+    ), "{outcome:#?}");
+}
+
+#[test]
+fn rust_imported_tuple_struct_remains_a_callable_value() {
+    let trace = trace_for(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+            ),
+            ("src/lib.rs", "pub mod types;\npub use types::Token;\n"),
+            ("src/types.rs", "pub struct Token(u8);\n"),
+            (
+                "src/consumer.rs",
+                "use crate::Token;\nfn parse() { let _ = Token(1); }\n",
+            ),
+        ],
+        "src/consumer.rs",
+        "Token(1)",
+        "Token",
+    );
+    assert_eq!(
+        selected_names(&trace),
+        ["demo.types.Token"],
+        "a tuple struct import remains callable in the value namespace: {trace:#?}"
     );
 }

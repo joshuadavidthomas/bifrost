@@ -12,7 +12,7 @@ use crate::analyzer::rust::{
 };
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::ImportKind;
-use crate::analyzer::usages::common::same_node;
+use crate::analyzer::usages::common::{reclassify_import_hit_at, same_node};
 // Relocated to `brokk_bifrost_rust::graph::ast` with the inverted pass (W7): the
 // five helpers it needed from this file and `hits.rs` are pure AST readers, and
 // this file is parked on the definition route's `RustTypeLookupCache`.
@@ -47,6 +47,10 @@ use brokk_bifrost_rust::graph::ast::is_rust_type_node;
 pub(super) use brokk_bifrost_rust::graph::ast::{
     first_generic_type_argument, rust_reference_namespace, type_node_last_segment,
 };
+use brokk_bifrost_rust::graph_support::{
+    RustSource, is_rust_macro_export_declaration, resolve_module_package,
+};
+use brokk_bifrost_rust::imports::rust_crate_root_package;
 use brokk_bifrost_rust::lexical_scope::{self, RustLexicalScopeIndex};
 use brokk_bifrost_rust::usage_index::RustUsageIndex;
 use rayon::prelude::*;
@@ -355,6 +359,77 @@ fn included_import_resolves_to_target(
     if !host_targets.is_empty() {
         return host_targets.len() == 1
             && host_targets.iter().any(|identity| {
+                identity.file == *target.source() && identity.name == target.identifier()
+            });
+    }
+    false
+}
+
+/// Resolve the path written by an import declaration in an included file.
+///
+/// The normal Rust reference graph sees the physical file as a separate module,
+/// while Rust evaluates the import at the `include!` host.  Calls to the
+/// imported name already use [`included_import_resolves_to_target`], but the
+/// path terminal in `use crate::...::name;` needs the same host route.  Match
+/// the complete import path before using the route so an unrelated path with
+/// the same terminal name cannot become a false positive.
+fn included_import_path_resolves_to_target(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    byte: usize,
+    segments: &[&str],
+    target: &CodeUnit,
+    include_routes: &RustUsageIndex,
+) -> bool {
+    if segments.is_empty() {
+        return false;
+    }
+    let path = segments
+        .iter()
+        .map(|segment| {
+            if *segment == "$crate" {
+                "crate"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("::");
+    let routes = include_routes.include_routes_for(file);
+    if routes.is_empty() {
+        return false;
+    }
+    for (scope_start, binder) in lexical_scope::visible_import_binders_with_scopes_at(source, byte)
+    {
+        let Some(binding) = binder.bindings.values().find(|binding| {
+            let imported_path = match binding.kind {
+                ImportKind::Named => binding
+                    .imported_name
+                    .as_deref()
+                    .map(|name| format!("{}::{name}", binding.module_specifier)),
+                ImportKind::Namespace => Some(binding.module_specifier.clone()),
+                _ => None,
+            };
+            imported_path.as_deref() == Some(path.as_str())
+        }) else {
+            continue;
+        };
+        let candidates = routes
+            .iter()
+            .flat_map(|route| {
+                include_routes.include_import_target_identities(
+                    rust,
+                    route,
+                    source,
+                    scope_start,
+                    binding,
+                    target.identifier(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        return candidates.len() == 1
+            && candidates.iter().any(|identity| {
                 identity.file == *target.source() && identity.name == target.identifier()
             });
     }
@@ -729,6 +804,20 @@ impl ScanCtx<'_> {
         root_shadowed: bool,
         leading_absolute: bool,
     ) -> bool {
+        if namespace == RustReferenceNamespace::Value
+            && !root_shadowed
+            && included_import_path_resolves_to_target(
+                self.rust,
+                self.file,
+                self.source,
+                byte,
+                segments,
+                self.target,
+                self.include_routes,
+            )
+        {
+            return true;
+        }
         if namespace == RustReferenceNamespace::Value
             && !root_shadowed
             && included_host_path_resolves_to_target(
@@ -1174,7 +1263,8 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
                             path.root,
                         ),
-                    ) {
+                    ) || rust_exported_macro_import_matches_target(node, current, ctx)
+                    {
                         record_import_hit(current, ctx);
                     }
                     return TreeWalkAction::Descend;
@@ -1208,6 +1298,7 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                         });
                 if ctx.matches_identifier(text, current.start_byte(), RustReferenceNamespace::Any)
                     || matches_target_namespace
+                    || rust_exported_macro_import_matches_target(node, current, ctx)
                 {
                     record_import_hit(current, ctx);
                 }
@@ -1216,6 +1307,43 @@ fn record_use_import_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         },
         |_| {},
     );
+}
+
+fn rust_exported_macro_import_matches_target(
+    use_declaration: Node<'_>,
+    binder: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    if !ctx.target_is_macro || !is_rust_macro_export_declaration(ctx.rust.code_units(), ctx.target)
+    {
+        return false;
+    }
+    let Some(import) =
+        brokk_bifrost_rust::imports::rust_imports_with_visibility_from_use_declaration(
+            use_declaration,
+            ctx.source,
+        )
+        .into_iter()
+        .find(|import| {
+            import.info.binder_span.is_some_and(|span| {
+                span.start_byte <= binder.start_byte() && binder.end_byte() <= span.end_byte
+            }) && import
+                .path
+                .last()
+                .is_some_and(|name| name == ctx.target.identifier())
+        })
+    else {
+        return false;
+    };
+    let Some((_, module_segments)) = import.path.split_last() else {
+        return false;
+    };
+    if module_segments.is_empty() {
+        return false;
+    }
+    let module_specifier = module_segments.join("::");
+    resolve_module_package(ctx.rust, ctx.file, &module_specifier)
+        .is_some_and(|package| package == rust_crate_root_package(ctx.target.source()))
 }
 
 fn is_local_use_binding_node(node: Node<'_>) -> bool {
@@ -1486,6 +1614,10 @@ fn scan_member_node(root: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
                 return TreeWalkAction::Stop;
             }
             match node.kind() {
+                "use_declaration" if ctx.target_is_field => {
+                    record_member_use_import_hits(node, ctx);
+                    return TreeWalkAction::Skip;
+                }
                 "field_expression" => record_instance_member_hit(node, ctx),
                 "token_tree" => {
                     record_token_tree_instance_member_hits(node, ctx);
@@ -1498,6 +1630,16 @@ fn scan_member_node(root: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
                     if ctx.target_is_field && ctx.target_owner_is_trait =>
                 {
                     record_associated_type_binding_hit(node, ctx)
+                }
+                "type_item"
+                    if ctx.target_is_field
+                        && ctx.target_owner_is_trait
+                        && !is_rust_trait_impl_member_declaration(
+                            ctx.rust,
+                            ctx.requested_target,
+                        ) =>
+                {
+                    record_associated_type_declaration_hit(node, ctx)
                 }
                 "tuple_struct_pattern" if ctx.target_is_enum_variant => {
                     record_tuple_variant_pattern_hit(node, ctx)
@@ -1524,6 +1666,49 @@ fn scan_member_node(root: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     );
 }
 
+fn record_member_use_import_hits(node: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    let imports = brokk_bifrost_rust::imports::rust_imports_with_visibility_from_use_declaration(
+        node, ctx.source,
+    );
+    for import in imports {
+        let Some(span) = import.info.binder_span else {
+            continue;
+        };
+        let Some(binder) = node_for_exact_range(ctx.root, span.start_byte, span.end_byte) else {
+            continue;
+        };
+        let path = import.path.join("::");
+        let Some(fqn) = resolve_rust_path_fqn(ctx.rust, ctx.refs, ctx.file, &path) else {
+            continue;
+        };
+        if !ctx
+            .support
+            .fqn(&fqn)
+            .into_iter()
+            .any(|candidate| same_rust_declaration_identity(&candidate, ctx.requested_target))
+        {
+            continue;
+        }
+        let start = binder.start_byte();
+        let end = binder.end_byte();
+        let Some(enclosing) =
+            member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
+        else {
+            continue;
+        };
+        push_member_hit(
+            ctx.file,
+            ctx.source,
+            ctx.line_starts,
+            start,
+            end,
+            enclosing,
+            ctx.hits,
+        );
+        reclassify_import_hit_at(ctx.hits, ctx.file, start, end);
+    }
+}
+
 fn record_associated_type_binding_hit(binding: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
     let Some(name) = binding.child_by_field_name("name") else {
         return;
@@ -1546,6 +1731,40 @@ fn record_associated_type_binding_hit(binding: Node<'_>, ctx: &mut MemberScanCtx
         ancestor = candidate.parent();
     };
     let Some(trait_type) = trait_type else {
+        return;
+    };
+    if !resolved_type_matches_owner(trait_type, ctx) {
+        return;
+    }
+
+    let start = name.start_byte();
+    let end = name.end_byte();
+    let Some(enclosing) = member_hit_enclosing(ctx.analyzer, ctx.file, ctx.line_starts, start, end)
+    else {
+        return;
+    };
+    push_member_hit(
+        ctx.file,
+        ctx.source,
+        ctx.line_starts,
+        start,
+        end,
+        enclosing,
+        ctx.hits,
+    );
+}
+
+fn record_associated_type_declaration_hit(type_item: Node<'_>, ctx: &mut MemberScanCtx<'_>) {
+    let Some(name) = type_item.child_by_field_name("name") else {
+        return;
+    };
+    if simple_node_text(name, ctx.source).as_deref() != Some(ctx.member_name) {
+        return;
+    }
+    let Some(impl_item) = enclosing_impl_item(type_item) else {
+        return;
+    };
+    let Some(trait_type) = impl_item.child_by_field_name("trait") else {
         return;
     };
     if !resolved_type_matches_owner(trait_type, ctx) {
