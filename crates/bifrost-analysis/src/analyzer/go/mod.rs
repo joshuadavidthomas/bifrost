@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 pub(crate) use adapter::GoAdapter;
-pub use artifact::GoDependencyPackAdapter;
+pub use artifact::{GoDependencyPackAdapter, GoModulePackProducer, GoPinnedPackage};
 // The Go declaration walk lives in the go crate; the rest of analysis (artifact,
 // semantic) still reaches its helpers through `super::declarations::`.
 pub(crate) use brokk_bifrost_go::declarations;
