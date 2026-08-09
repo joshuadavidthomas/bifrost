@@ -257,7 +257,8 @@ pub fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo
             None,
             module_specifier,
         )
-    } else if !raw.contains('{')
+    } else if import.alias.is_none()
+        && !raw.contains('{')
         && imported_name
             .chars()
             .all(|ch| ch.is_ascii_lowercase() || ch == '_')
@@ -1158,5 +1159,18 @@ fn apply_from_stdin() -> u8 { 1 }
             rust_cfg_condition(function, source),
             RustCfgCondition::NotAtom("feature = \"query_apply\"".to_string())
         );
+    }
+
+    #[test]
+    fn aliased_lowercase_import_preserves_the_named_target() {
+        let source = "use crate::models::with_tracing::{linear_no_bias as linear};\n";
+        let binder = visible_import_binder_at(source, source.len());
+        let binding = binder
+            .bindings
+            .get("linear")
+            .expect("the alias must be visible");
+
+        assert_eq!(binding.kind, ImportKind::Named);
+        assert_eq!(binding.imported_name.as_deref(), Some("linear_no_bias"));
     }
 }
