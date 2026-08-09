@@ -3048,6 +3048,27 @@ fn rust_rooted_use_prefix_outcome(
     (!candidates.is_empty()).then(|| candidates_outcome(candidates))
 }
 
+/// Return the structured target path for a focused renamed import binder.
+///
+/// The alias token itself is not part of the use path tree. Without this
+/// lookup, a site on `linear` in `use ...::linear_no_bias as linear` is
+/// resolved as a bare local path and can select an unrelated `linear` item.
+fn rust_focused_import_alias_path(focused: Node<'_>, source: &str) -> Option<String> {
+    let use_declaration = rust_enclosing_ancestor(focused, "use_declaration")?;
+    brokk_bifrost_rust::imports::rust_imports_from_use_declaration(use_declaration, source)
+        .into_iter()
+        .filter(|import| import.alias.is_some())
+        .find_map(|import| {
+            let span = import.binder_span?;
+            if span.start_byte <= focused.start_byte() && focused.end_byte() <= span.end_byte {
+                import.path.map(|path| path.segments.join("::"))
+            } else {
+                None
+            }
+        })
+        .filter(|path| !path.is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rust_focused_use_path_outcome(
     analyzer: &dyn IAnalyzer,
@@ -3062,6 +3083,8 @@ fn rust_focused_use_path_outcome(
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte)?;
     let focused_path = rust_focused_use_path(focused, source)?;
     let focused_text = rust_node_text(focused, source).trim();
+    let alias_path = rust_focused_import_alias_path(focused, source);
+    let resolution_path = alias_path.as_deref().unwrap_or(&focused_path.full_path);
     let role = if rust_focused_nonterminal_prefix(focused).is_some() {
         RustFocusedPathRole::Owner
     } else {
@@ -3069,7 +3092,7 @@ fn rust_focused_use_path_outcome(
     };
     let refs = support.forward_reference_context(rust, file)?;
     let rooted_segments =
-        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, &focused_path.full_path);
+        crate::analyzer::symbol_lookup::parse_symbol_path(Language::Rust, resolution_path);
     let resolved_fqn = if matches!(
         rooted_segments.first().map(String::as_str),
         Some("self" | "super")
@@ -3079,14 +3102,14 @@ fn rust_focused_use_path_outcome(
             file,
             source,
             focused.start_byte(),
-            &focused_path.full_path,
+            resolution_path,
         )
     } else {
         crate::analyzer::usages::rust_graph::resolve_rust_path_fqn(
             rust,
             &refs,
             file,
-            &focused_path.full_path,
+            resolution_path,
         )
     };
     Some(rust_focused_prefix_resolution_outcome(
@@ -3099,7 +3122,7 @@ fn rust_focused_use_path_outcome(
         &refs,
         focused_path.root,
         focused_text,
-        &focused_path.full_path,
+        resolution_path,
         role,
         resolved_fqn.as_deref(),
         false,
@@ -7133,6 +7156,169 @@ fn consume(_: assets::Table, _: accounts::Table) {}
                 .iter()
                 .all(|definition| definition.fq_name() != "schema.accounts"),
             "the sibling grouped import must stay unrelated: {value:#?}"
+        );
+    }
+
+    #[test]
+    fn full_definition_lookup_resolves_lowercase_alias_to_its_imported_function() {
+        let source = r#"
+use crate::with_tracing::linear_no_bias as linear;
+
+fn call() {
+    linear();
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod consumer;\npub mod with_tracing;\n"),
+                (
+                    "src/with_tracing.rs",
+                    "pub fn linear_no_bias() {}\npub fn linear() {}\n",
+                ),
+                ("src/consumer.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/consumer.rs");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_last(&source, &file, "linear");
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let mut cache = RustTypeLookupCache::default();
+        let value = resolve_rust(
+            fixture.analyzer.analyzer(),
+            &support,
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            &mut cache,
+            None,
+        );
+
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.fq_name() == "with_tracing.linear_no_bias"),
+            "the alias must resolve to the imported function: {value:#?}"
+        );
+        assert!(
+            value
+                .definitions
+                .iter()
+                .all(|definition| definition.fq_name() != "with_tracing.linear"),
+            "the same-named sibling must remain a near-miss: {value:#?}"
+        );
+    }
+
+    #[test]
+    fn full_definition_lookup_resolves_alias_binder_to_its_imported_function() {
+        let source = r#"
+use crate::with_tracing::linear_no_bias as linear;
+
+fn call() {
+    linear();
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod consumer;\npub mod with_tracing;\n"),
+                (
+                    "src/with_tracing.rs",
+                    "pub fn linear_no_bias() {}\npub fn linear() {}\n",
+                ),
+                ("src/consumer.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/consumer.rs");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_expression(
+            &source,
+            &file,
+            "use crate::with_tracing::linear_no_bias as linear",
+            "linear",
+        );
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let mut cache = RustTypeLookupCache::default();
+        let value = resolve_rust(
+            fixture.analyzer.analyzer(),
+            &support,
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            &mut cache,
+            None,
+        );
+
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.fq_name() == "with_tracing.linear_no_bias"),
+            "the alias binder must resolve to the imported function: {value:#?}"
+        );
+        assert!(
+            value
+                .definitions
+                .iter()
+                .all(|definition| definition.fq_name() != "with_tracing.linear"),
+            "the same-named sibling must remain a near-miss: {value:#?}"
+        );
+    }
+
+    #[test]
+    fn full_definition_lookup_keeps_multi_segment_module_aliases() {
+        let source = r#"
+use crate::options as package;
+
+fn call() {
+    let _ = package::Options;
+}
+"#
+        .to_string();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod consumer;\npub mod options;\n"),
+                ("src/options.rs", "pub struct Options;\n"),
+                ("src/consumer.rs", &source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "src/consumer.rs");
+        let tree = lexical_scope::parse_rust_tree(&source).expect("Rust tree");
+        let site = site_for_expression(&source, &file, "package::Options", "Options");
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let mut cache = RustTypeLookupCache::default();
+        let value = resolve_rust(
+            fixture.analyzer.analyzer(),
+            &support,
+            &file,
+            &source,
+            Some(&tree),
+            &site,
+            &mut cache,
+            None,
+        );
+
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value
+                .definitions
+                .iter()
+                .any(|definition| definition.fq_name() == "options.Options"),
+            "the module alias must still route to its nested type: {value:#?}"
         );
     }
 
