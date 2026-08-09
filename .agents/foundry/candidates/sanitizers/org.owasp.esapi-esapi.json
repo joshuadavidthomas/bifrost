@@ -1,0 +1,240 @@
+[
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForCSS",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css"],
+    "does_not_neutralize": ["html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "complete",
+    "rationale": "The reference implementation encodes every character outside a one-character immune set ('#') as a CSS hexadecimal escape, so the output cannot contain a raw quote, backslash, parenthesis, or control character and cannot terminate a CSS string, url(...) token, or declaration. The claim covers placement as a CSS value for all inputs; placement inside HTML still requires the surrounding HTML context to be encoded separately. The output uses backslash escapes that are meaningless in HTML, SQL, URL, and the other named grammars.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForCSS (esapi 2.7.0.0) referencing W3C CSS21 escaped-characters rules; DefaultEncoder.java: cssCodec.encode(IMMUNE_CSS) with IMMUNE_CSS = {'#'}."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForDN",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["ldap"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method encodes data for an LDAP distinguished name value, escaping the DN metacharacters (',', '+', '\"', '\\', '<', '>', ';', leading '#', and leading/trailing spaces) per RFC 4514. The claim covers only the DN grammar: the method does not apply the RFC 4515 filter encoding, so the output is not safe as a search-filter assertion value, and encodeForLDAP is the matching method for that context. Within the DN placement the claim holds for all inputs.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForDN (esapi 2.7.0.0): \"Encode data for use in LDAP Distinguished Names\"; RFC 4514 for the DN string representation."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForHTML",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The reference implementation entity-encodes every character outside the immune set {',', '.', '-', '_', ' '} as an HTML entity, so '<', '>', '&', and both quotes are always encoded and the value cannot break out of HTML content or a quoted HTML attribute; the entity output is also well-formed in XML content and quoted XML attributes. Because space is immune, the value is not safe in an unquoted HTML attribute. It encodes nothing for any other named context; in particular the entity spelling is an HTML grammar encoding and is not claimed as a neutralization for log or any non-markup context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForHTML (esapi 2.7.0.0); DefaultEncoder.java: htmlCodec.encode(IMMUNE_HTML) with IMMUNE_HTML = {',', '.', '-', '_', ' '}."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForHTMLAttribute",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "complete",
+    "rationale": "The reference implementation entity-encodes every character outside the immune set {',', '.', '-', '_'}, which excludes space, so every character that can terminate an unquoted or quoted HTML attribute value is encoded. The value is therefore safe in quoted and unquoted HTML attributes, in HTML content, and in XML for all inputs. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForHTMLAttribute (esapi 2.7.0.0); DefaultEncoder.java: htmlCodec.encode(IMMUNE_HTMLATTR) with IMMUNE_HTMLATTR = {',', '.', '-', '_'}."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForJSON",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["js"],
+    "does_not_neutralize": ["css", "html", "html_attr", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method performs JSON string escaping per RFC 8259 section 7 with an empty immune set in the reference implementation, so quotes, backslash, and control characters are always escaped. JSON is not in the context vocabulary; the js token is the nearest claim and holds only when the value is placed inside a double-quoted string literal, because the JSON grammar never escapes the single quote. The claim does not cover placement in single-quoted JavaScript strings or as raw script.",
+    "confidence": "medium",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForJSON (esapi 2.7.0.0) referencing RFC 8259 section 7; DefaultEncoder.java: IMMUNE_JSON = {}."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForJavaScript",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["js"],
+    "does_not_neutralize": ["css", "html", "html_attr", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "complete",
+    "rationale": "The reference implementation encodes every character outside the immune set {',', '.', '_'} as a JavaScript \\xHH or \\uHHHH escape, so the output cannot contain a raw quote, backslash, '/', or control character and cannot terminate a string literal, a script block, or an event-handler attribute. The javadoc warning that some sinks (for example setInterval with a string argument) can never safely receive encoded data is a property of those sinks, not of this encoding, so the claim holds for all inputs at ordinary data placements. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForJavaScript (esapi 2.7.0.0), including the setInterval caveat; DefaultEncoder.java: javaScriptCodec.encode(IMMUNE_JAVASCRIPT) with IMMUNE_JAVASCRIPT = {',', '.', '_'}."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForLDAP",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["ldap"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method hex-encodes the RFC 4515 section 3 filter metacharacters (NUL, '(', ')', '*', '\\') and additionally '/' for Microsoft Active Directory, with characters above 0x7F converted to UTF-8 and then hex-encoded since ESAPI 2.5.3. The claim covers search-filter assertion values for all inputs; it does not cover distinguished-name values, which follow RFC 4514 and are handled by encodeForDN. That DN gap is a placement constraint, hence partial.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForLDAP (esapi 2.7.0.0): \"This encoder operates according to RFC 4515, Section 3\", including the 2.5.3 strict-conformance note and the Active Directory '/' encoding; RFC 4515 section 3."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForLDAP",
+      "has_receiver": true,
+      "parameter_count": 2
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["ldap"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "This is the encodeForLDAP(String, boolean) overload; the second parameter selects whether wildcard '*' characters are encoded, and the sanitized data is the first parameter. With wildcard encoding enabled the claim matches the single-parameter overload: safe as an RFC 4515 search-filter assertion value, not safe as a distinguished-name value. When the caller disables wildcard encoding, '*' passes through raw by design, which a filter that treats '*' as a wildcard will interpret; the claim assumes the wildcard-encoded form.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForLDAP(String, boolean) (esapi 2.7.0.0): \"Wildcard (*) characters will be encoded\" when the flag is set; RFC 4515 section 3."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForOS",
+      "has_receiver": true,
+      "parameter_count": 2
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 1},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["shell"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "log", "path", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method encodes the second parameter with a caller-selected operating-system codec (WindowsCodec or UnixCodec), escaping characters outside a minimal immune set for the target shell. Shell grammars, and cmd.exe in particular, have expansion and parsing behaviors that no character encoder fully covers, and the javadoc itself recommends avoiding shell invocation and validating input in addition to encoding. The claim is therefore partial: it reduces shell metacharacter risk for the selected codec but must not be treated as a complete neutralization.",
+    "confidence": "low",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForOS (esapi 2.7.0.0): recommendations to avoid direct OS calls and to validate input in addition; DefaultEncoder.java: codec.encode(IMMUNE_OS) with IMMUNE_OS = {'-'}."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForSQL",
+      "has_receiver": true,
+      "parameter_count": 2
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 1},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["sql"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method encodes the second parameter with a caller-selected database codec (OracleCodec, MySQLCodec, and similar), primarily by doubling or backslash-escaping single quotes. ESAPI itself deprecates the method, states that it cannot guarantee prevention of all SQL injections, and gates it behind the ESAPI.dangerouslyAllowUnsafeMethods configuration so that the default build throws NotConfiguredByDefaultException; codec and database-mode mismatches (for example MySQL backslash modes, or LIKE wildcards, which are not escaped) leave real gaps. The sql claim is retained because the codecs do neutralize the quote character for their documented dialects, but it must be treated as a last-resort, dialect-pinned claim, exactly as ESAPI Security Bulletin #13 directs.",
+    "confidence": "low",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForSQL (esapi 2.7.0.0): deprecated, cites OWASP SQL Injection Prevention Cheat Sheet option 4 (\"we CANNOT guarantee that this option will prevent all SQL injections in all situations\") and requires ESAPI.dangerouslyAllowUnsafeMethods configuration; ESAPI Security Bulletin #13."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForURL",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": ["path", "shell"],
+    "completeness": "partial",
+    "rationale": "The reference implementation delegates to java.net.URLEncoder, so the output alphabet is the alphanumerics plus '.', '-', '*', '_' and '+', with every other byte rendered as %XX; no quote, angle bracket, ampersand, parenthesis, backslash, control character, or URL delimiter can appear in the output. It is unsafe for shell because '*' survives and expands as a glob in unquoted use, and unsafe for path because '..' sequences survive unchanged. The form-urlencoded space-as-'+' rule makes the output semantically wrong (though injection-safe) in URL path segments, and the method throws EncodingException when the configured encoding fails.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForURL (esapi 2.7.0.0): \"performs URL encoding on the entire string\"; DefaultEncoder delegates to java.net.URLEncoder, whose javadoc fixes the output alphabet. Output-alphabet reasoning against RFC 3986 section 2."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForXML",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The reference implementation entity-encodes every character outside the immune set {',', '.', '-', '_', ' '} per the W3C XML character-encoding rules, so '<', '>', '&', and both quotes are always encoded and the value is safe in XML content, quoted XML attributes, HTML content, and quoted HTML attributes. Because space is immune, the value is not safe in an unquoted HTML attribute. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForXML (esapi 2.7.0.0) referencing W3C REC-xml character encoding in entities; DefaultEncoder.java: IMMUNE_XML = {',', '.', '-', '_', ' '}."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForXMLAttribute",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "complete",
+    "rationale": "The reference implementation entity-encodes every character outside the immune set {',', '.', '-', '_'}, which excludes space, so every character that can terminate a quoted or unquoted attribute value is encoded. The value is safe in XML attributes and content, and in HTML attributes (quoted or unquoted) and content, for all inputs. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForXMLAttribute (esapi 2.7.0.0); DefaultEncoder.java: IMMUNE_XMLATTR = {',', '.', '-', '_'}."
+  },
+  {
+    "target": {
+      "path": "org/owasp/esapi/Encoder.java",
+      "symbol": "org.owasp.esapi.Encoder.encodeForXPath",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.esapi:esapi:2.7.0.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["xpath"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml"],
+    "completeness": "partial",
+    "rationale": "XPath has no escape mechanism for string literals, so the method encodes the dangerous characters (quotes and the operator set identified in the referenced injection literature) as entity references, which prevents the value from terminating a surrounding quoted literal because an XPath engine does not decode entities inside the expression text. The javadoc itself warns that the reference implementation encodes almost everything and may over-encode, and the encoded spelling will not match data that genuinely contains quotes, so the claim covers injection safety, not query correctness. The claim assumes the value is placed inside a quoted XPath literal.",
+    "confidence": "medium",
+    "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForXPath (esapi 2.7.0.0): \"The reference implementation encodes almost everything and may over-encode. The difficulty with XPath encoding is that XPath has no built-in mechanism for escaping characters\", citing the IBM XPath injection article; DefaultEncoder.java: IMMUNE_XPATH = {',', '.', '-', '_', ' '}."
+  }
+]

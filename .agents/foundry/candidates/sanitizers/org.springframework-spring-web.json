@@ -1,0 +1,155 @@
+[
+  {
+    "target": {
+      "path": "org/springframework/web/util/HtmlUtils.java",
+      "symbol": "org.springframework.web.util.HtmlUtils.htmlEscape",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.springframework:spring-web:7.0.8",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method replaces '&', '<', '>', '\"', and '\\'' with HTML entity references, so the value cannot open a tag or attribute boundary in HTML content or in a quoted HTML attribute, and the same references are well-formed in XML content and quoted XML attributes. Space and CR/LF pass through raw, so the attribute claim assumes a quoted attribute value and the value is not single-line for log. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.springframework.web.util.HtmlUtils.htmlEscape(String) (spring-web 7.0.8): \"Turns special characters into HTML character references\"; the implementation escapes & < > \" '."
+  },
+  {
+    "target": {
+      "path": "org/springframework/web/util/UriUtils.java",
+      "symbol": "org.springframework.web.util.UriUtils.encode",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "org.springframework:spring-web:7.0.8",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": ["path"],
+    "completeness": "complete",
+    "rationale": "This is the encode(String, String) overload with a charset name; the Charset overload behaves identically. The method percent-encodes every character that is illegal or has any reserved meaning anywhere in a URI per RFC 3986, so the output is the unreserved alphabet plus %XX sequences and can contain no URI delimiter, quote, angle bracket, ampersand, parenthesis, backslash, whitespace, or control character; the value cannot break out of any quoted or delimited context in the neutralized list. The only gap is path: '..' sequences are legal URI characters and survive unchanged, so the value can still express parent-directory traversal.",
+    "confidence": "high",
+    "citations": "Javadoc of org.springframework.web.util.UriUtils.encode (spring-web 7.0.8): \"Encode all characters that are either illegal, or have any reserved meaning, anywhere within a URI, as defined by RFC 3986.\""
+  },
+  {
+    "target": {
+      "path": "org/springframework/web/util/UriUtils.java",
+      "symbol": "org.springframework.web.util.UriUtils.encode",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "org.springframework:spring-web:7.0.8",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": ["path"],
+    "completeness": "complete",
+    "rationale": "This is the encode(String, Charset) overload, available since Spring 5.0; the String-charset overload delegates to it. The method percent-encodes every character that is illegal or has any reserved meaning anywhere in a URI per RFC 3986, so the output is the unreserved alphabet plus %XX sequences and can contain no URI delimiter, quote, angle bracket, ampersand, parenthesis, backslash, whitespace, or control character. The only gap is path: '..' sequences survive unchanged, so the value can still express parent-directory traversal.",
+    "confidence": "high",
+    "citations": "Javadoc of org.springframework.web.util.UriUtils.encode (spring-web 7.0.8): \"Encode all characters that are either illegal, or have any reserved meaning, anywhere within a URI, as defined by RFC 3986.\""
+  },
+  {
+    "target": {
+      "path": "org/springframework/web/util/UriUtils.java",
+      "symbol": "org.springframework.web.util.UriUtils.encodePath",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "org.springframework:spring-web:7.0.8",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["log", "url"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "path", "shell", "sql", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "This is the encodePath(String, String) overload; the Charset overload behaves identically. The method percent-encodes characters that are illegal within a URI path, including '?' and '#', so the value cannot escape the path portion of a URI into the query or fragment, and no raw control characters survive. The claim is only partial for url: '/' and the path sub-delimiters (including ';', '=', '&', and quotes) survive by design, so the value can add path segments and matrix parameters, and '..' sequences survive, so the value is not safe for path.",
+    "confidence": "high",
+    "citations": "Javadoc of org.springframework.web.util.UriUtils.encodePath (spring-web 7.0.8): encodes illegal characters for the URI path component per RFC 3986, which leaves the path delimiter '/' and the pchar sub-delimiters unencoded."
+  },
+  {
+    "target": {
+      "path": "org/springframework/web/util/UriUtils.java",
+      "symbol": "org.springframework.web.util.UriUtils.encodePath",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "org.springframework:spring-web:7.0.8",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["log", "url"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "path", "shell", "sql", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "This is the encodePath(String, Charset) overload, available since Spring 5.0. The method percent-encodes characters that are illegal within a URI path, including '?' and '#', so the value cannot escape the path portion of a URI into the query or fragment, and no raw control characters survive. The claim is only partial for url: '/' and the path sub-delimiters survive by design, so the value can add path segments and matrix parameters, and '..' sequences survive, so the value is not safe for path.",
+    "confidence": "high",
+    "citations": "Javadoc of org.springframework.web.util.UriUtils.encodePath (spring-web 7.0.8): encodes illegal characters for the URI path component per RFC 3986, which leaves the path delimiter '/' and the pchar sub-delimiters unencoded."
+  },
+  {
+    "target": {
+      "path": "org/springframework/web/util/UriUtils.java",
+      "symbol": "org.springframework.web.util.UriUtils.encodePathSegment",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "org.springframework:spring-web:7.0.8",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["log", "url"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "path", "shell", "sql", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "This is the encodePathSegment(String, String) overload; the Charset overload behaves identically. The method percent-encodes every character that is illegal in one URI path segment, including '/', '?', and '#', so the value cannot add path segments and cannot escape into the query or fragment, and no raw control characters survive. The claim is only partial for url: the RFC 3986 pchar sub-delimiters (including ';', '=', '&', and the single quote) survive by design, so matrix-parameter injection within the segment remains possible, and '..' sequences survive, so the value is not safe for path and not safe in any context whose metacharacters include the surviving sub-delimiters.",
+    "confidence": "high",
+    "citations": "Javadoc of org.springframework.web.util.UriUtils.encodePathSegment (spring-web 7.0.8): encodes illegal characters for one URI path segment per RFC 3986, which leaves the pchar sub-delimiters unencoded."
+  },
+  {
+    "target": {
+      "path": "org/springframework/web/util/UriUtils.java",
+      "symbol": "org.springframework.web.util.UriUtils.encodePathSegment",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "org.springframework:spring-web:7.0.8",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["log", "url"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "path", "shell", "sql", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "This is the encodePathSegment(String, Charset) overload, available since Spring 5.0. The method percent-encodes every character that is illegal in one URI path segment, including '/', '?', and '#', so the value cannot add path segments and cannot escape into the query or fragment, and no raw control characters survive. The claim is only partial for url: the RFC 3986 pchar sub-delimiters survive by design, so matrix-parameter injection within the segment remains possible, and '..' sequences survive, so the value is not safe for path and not safe in any context whose metacharacters include the surviving sub-delimiters.",
+    "confidence": "high",
+    "citations": "Javadoc of org.springframework.web.util.UriUtils.encodePathSegment (spring-web 7.0.8): encodes illegal characters for one URI path segment per RFC 3986, which leaves the pchar sub-delimiters unencoded."
+  },
+  {
+    "target": {
+      "path": "org/springframework/web/util/UriUtils.java",
+      "symbol": "org.springframework.web.util.UriUtils.encodeQueryParam",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "org.springframework:spring-web:7.0.8",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": ["path"],
+    "completeness": "complete",
+    "rationale": "This is the encodeQueryParam(String, String) overload; the Charset overload behaves identically. The method percent-encodes every character that is illegal in a URI query parameter, including '&' and '=', so the value cannot introduce new parameters or escape the parameter position, and the output alphabet (unreserved plus %XX) contains no quote, angle bracket, ampersand, parenthesis, backslash, whitespace, or control character. The only gap is path: '..' sequences survive unchanged, so the value can still express parent-directory traversal.",
+    "confidence": "high",
+    "citations": "Javadoc of org.springframework.web.util.UriUtils.encodeQueryParam (spring-web 7.0.8): encodes illegal characters for a URI query parameter per RFC 3986."
+  },
+  {
+    "target": {
+      "path": "org/springframework/web/util/UriUtils.java",
+      "symbol": "org.springframework.web.util.UriUtils.encodeQueryParam",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "org.springframework:spring-web:7.0.8",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": ["path"],
+    "completeness": "complete",
+    "rationale": "This is the encodeQueryParam(String, Charset) overload, available since Spring 5.0. The method percent-encodes every character that is illegal in a URI query parameter, including '&' and '=', so the value cannot introduce new parameters or escape the parameter position, and the output alphabet (unreserved plus %XX) contains no quote, angle bracket, ampersand, parenthesis, backslash, whitespace, or control character. The only gap is path: '..' sequences survive unchanged, so the value can still express parent-directory traversal.",
+    "confidence": "high",
+    "citations": "Javadoc of org.springframework.web.util.UriUtils.encodeQueryParam (spring-web 7.0.8): encodes illegal characters for a URI query parameter per RFC 3986."
+  }
+]

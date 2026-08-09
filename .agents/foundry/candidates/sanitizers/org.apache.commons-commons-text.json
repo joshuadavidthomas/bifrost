@@ -1,0 +1,121 @@
+[
+  {
+    "target": {
+      "path": "org/apache/commons/text/StringEscapeUtils.java",
+      "symbol": "org.apache.commons.text.StringEscapeUtils.escapeEcmaScript",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.apache.commons:commons-text:1.15.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["js"],
+    "does_not_neutralize": ["css", "html", "html_attr", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method backslash-escapes both quote characters, backslash, the forward slash, and control characters, so the value cannot terminate a single- or double-quoted JavaScript string literal and an escaped '/' prevents a \"</\" sequence from closing a script block. The claim is partial because the library's own security note states the method provides only backslash escaping: inside an HTML tag attribute the backslash does not protect the quote from the HTML parser, so the output is unsafe in event-handler attributes without a separate HTML attribute encoding. It encodes nothing for any other named context.",
+    "confidence": "medium",
+    "citations": "Javadoc of org.apache.commons.text.StringEscapeUtils.escapeEcmaScript (commons-text 1.15.0), including the Security Note: \"We only provide backslash escaping in this method ... could result in potential issues in the case where the string being escaped is being used in an HTML tag\", and the note that single quote and forward-slash are escaped."
+  },
+  {
+    "target": {
+      "path": "org/apache/commons/text/StringEscapeUtils.java",
+      "symbol": "org.apache.commons.text.StringEscapeUtils.escapeHtml3",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.apache.commons:commons-text:1.15.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method escapes the HTML 3.0 entity set, which covers '&', '<', '>', and '\"' but not the single quote. The value is safe in HTML content and in double-quoted HTML attributes, and the same references are well-formed in XML content and double-quoted XML attributes. The claim is partial because a raw single quote survives: the value is not safe in single-quoted attributes, and raw spaces make quoted placement a requirement in HTML.",
+    "confidence": "high",
+    "citations": "Javadoc of org.apache.commons.text.StringEscapeUtils.escapeHtml3 (commons-text 1.15.0): \"Supports only the HTML 3.0 entities\"; the HTML 3.2 entity set has no apostrophe entity."
+  },
+  {
+    "target": {
+      "path": "org/apache/commons/text/StringEscapeUtils.java",
+      "symbol": "org.apache.commons.text.StringEscapeUtils.escapeHtml4",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.apache.commons:commons-text:1.15.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method escapes the HTML 4.0 entity set, which covers '&', '<', '>', '\"', and '\\'', so the value cannot open a tag or attribute boundary in HTML content or in a quoted HTML attribute of either quote style, and the same references are well-formed in XML content and quoted XML attributes. The claim is partial because spaces and CR/LF pass through raw: the attribute claims assume a quoted attribute value, and the value is not single-line for log. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.apache.commons.text.StringEscapeUtils.escapeHtml4 (commons-text 1.15.0): \"Supports all known HTML 4.0 entities\", including the apostrophe."
+  },
+  {
+    "target": {
+      "path": "org/apache/commons/text/StringEscapeUtils.java",
+      "symbol": "org.apache.commons.text.StringEscapeUtils.escapeJson",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.apache.commons:commons-text:1.15.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["js"],
+    "does_not_neutralize": ["css", "html", "html_attr", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method escapes the double quote, backslash, forward slash, and control characters into JSON string form. JSON is not in the context vocabulary; the js token is the nearest claim and holds only inside a double-quoted string literal, because the single quote is not escaped. The escaped forward slash additionally prevents a \"</\" sequence from closing a script block when the JSON text is embedded in one. The claim does not cover single-quoted JavaScript strings or raw script placement.",
+    "confidence": "medium",
+    "citations": "Javadoc of org.apache.commons.text.StringEscapeUtils.escapeJson (commons-text 1.15.0): \"Escapes any values it finds into their Json String form ... in Json, forward-slash (/) is escaped\", referencing RFC 4627."
+  },
+  {
+    "target": {
+      "path": "org/apache/commons/text/StringEscapeUtils.java",
+      "symbol": "org.apache.commons.text.StringEscapeUtils.escapeXSI",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.apache.commons:commons-text:1.15.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["shell"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "log", "path", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method backslash-escapes the shell metacharacter set of the X/Open Shell Command Language (spaces, quotes, backslash, and the operator characters), so the value is preserved as a single word when it is used unquoted as one command argument. The claim is partial: the library's own javadoc warns that in most cases the right answer is the multi-argument ProcessBuilder or Runtime.exec(String[]) forms rather than escaping, and backslash escaping does not protect a value placed inside double quotes or re-parsed by a second shell. It encodes nothing for any other named context.",
+    "confidence": "medium",
+    "citations": "Javadoc of org.apache.commons.text.StringEscapeUtils.escapeXSI (commons-text 1.15.0), including the Beware note recommending ProcessBuilder or Runtime.exec(String[]), referencing the X/Open Shell Command Language specification."
+  },
+  {
+    "target": {
+      "path": "org/apache/commons/text/StringEscapeUtils.java",
+      "symbol": "org.apache.commons.text.StringEscapeUtils.escapeXml10",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.apache.commons:commons-text:1.15.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method escapes '&', '<', '>', '\"', and '\\'' and removes characters that are invalid in XML 1.0, so the value is safe in XML content and quoted XML attributes and, because the same five characters cover the HTML breakout set, in HTML content and quoted HTML attributes. The claim is partial because spaces and CR/LF pass through raw: the attribute claims assume a quoted attribute value, and the value is not single-line for log. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.apache.commons.text.StringEscapeUtils.escapeXml10 (commons-text 1.15.0): escapes the five XML predefined entities and removes characters invalid per the XML 1.0 specification."
+  },
+  {
+    "target": {
+      "path": "org/apache/commons/text/StringEscapeUtils.java",
+      "symbol": "org.apache.commons.text.StringEscapeUtils.escapeXml11",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.apache.commons:commons-text:1.15.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method escapes '&', '<', '>', '\"', and '\\'' and replaces characters that are invalid in XML 1.1 with numeric character references, so the value is safe in XML 1.1 content and quoted attributes and, because the same five characters cover the HTML breakout set, in HTML content and quoted HTML attributes. The claim is partial because spaces and CR/LF pass through raw: the attribute claims assume a quoted attribute value, and the value is not single-line for log. Note that XML 1.1 output may not be accepted by XML 1.0-only parsers.",
+    "confidence": "high",
+    "citations": "Javadoc of org.apache.commons.text.StringEscapeUtils.escapeXml11 (commons-text 1.15.0): escapes the five XML predefined entities and replaces characters invalid per the XML 1.1 specification."
+  }
+]

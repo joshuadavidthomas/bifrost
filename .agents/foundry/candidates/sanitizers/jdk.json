@@ -1,0 +1,240 @@
+[
+  {
+    "target": {
+      "path": "java.base/java/lang/Boolean.java",
+      "symbol": "java.lang.Boolean.parseBoolean",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": [],
+    "completeness": "complete",
+    "rationale": "The method returns a primitive boolean: the string \"true\" in any case yields true, every other input yields false. When the result is rendered back into a string it is literally \"true\" or \"false\", which contains no metacharacter of any named context. There is no input for which the returned value can carry attacker-controlled text.",
+    "confidence": "high",
+    "citations": "Javadoc of java.lang.Boolean.parseBoolean (Java 21): returns the boolean represented by the argument, true only when the argument equalsIgnoreCase \"true\"."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/Byte.java",
+      "symbol": "java.lang.Byte.parseByte",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": [],
+    "completeness": "complete",
+    "rationale": "The method returns a primitive byte. Malformed input raises NumberFormatException instead of returning attacker-controlled text. When the result is rendered back into a string it contains only an optional minus sign and decimal digits, which are metacharacters in no named context.",
+    "confidence": "high",
+    "citations": "Javadoc of java.lang.Byte.parseByte(String) (Java 21): parses the argument as a signed decimal byte and throws NumberFormatException on invalid input."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/Double.java",
+      "symbol": "java.lang.Double.parseDouble",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": [],
+    "completeness": "complete",
+    "rationale": "The method returns a primitive double. Malformed input raises NumberFormatException instead of returning attacker-controlled text. When the result is rendered back into a string it contains only digits, sign, decimal point, exponent marker, or the literals \"NaN\" and \"Infinity\", none of which is a metacharacter in any named context.",
+    "confidence": "high",
+    "citations": "Javadoc of java.lang.Double.parseDouble and Double.toString (Java 21): parse throws NumberFormatException on invalid input; toString renders a decimal or computerized scientific notation over [0-9.+-eE] plus NaN/Infinity."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/Float.java",
+      "symbol": "java.lang.Float.parseFloat",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": [],
+    "completeness": "complete",
+    "rationale": "The method returns a primitive float. Malformed input raises NumberFormatException instead of returning attacker-controlled text. When the result is rendered back into a string it contains only digits, sign, decimal point, exponent marker, or the literals \"NaN\" and \"Infinity\", none of which is a metacharacter in any named context.",
+    "confidence": "high",
+    "citations": "Javadoc of java.lang.Float.parseFloat and Float.toString (Java 21): same contract as Double.parseDouble / Double.toString over the float type."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/Integer.java",
+      "symbol": "java.lang.Integer.parseInt",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": [],
+    "completeness": "complete",
+    "rationale": "The method returns a primitive int. Malformed input raises NumberFormatException instead of returning attacker-controlled text. When the result is rendered back into a string it contains only an optional minus sign and decimal digits, which are metacharacters in no named context.",
+    "confidence": "high",
+    "citations": "Javadoc of java.lang.Integer.parseInt(String) (Java 21): parses the argument as a signed decimal integer and throws NumberFormatException on invalid input."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/Integer.java",
+      "symbol": "java.lang.Integer.parseInt",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": [],
+    "completeness": "complete",
+    "rationale": "This is the radix overload parseInt(String, int); the second parameter is the numeric base, not data. The method returns a primitive int and raises NumberFormatException on malformed input, so the returned value can never carry attacker-controlled text into any named context.",
+    "confidence": "high",
+    "citations": "Javadoc of java.lang.Integer.parseInt(String, int) (Java 21): parses the first argument in the radix given by the second argument and throws NumberFormatException on invalid input."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/Long.java",
+      "symbol": "java.lang.Long.parseLong",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": [],
+    "completeness": "complete",
+    "rationale": "The method returns a primitive long. Malformed input raises NumberFormatException instead of returning attacker-controlled text. When the result is rendered back into a string it contains only an optional minus sign and decimal digits, which are metacharacters in no named context.",
+    "confidence": "high",
+    "citations": "Javadoc of java.lang.Long.parseLong(String) (Java 21): parses the argument as a signed decimal long and throws NumberFormatException on invalid input."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/Long.java",
+      "symbol": "java.lang.Long.parseLong",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": [],
+    "completeness": "complete",
+    "rationale": "This is the radix overload parseLong(String, int); the second parameter is the numeric base, not data. The method returns a primitive long and raises NumberFormatException on malformed input, so the returned value can never carry attacker-controlled text into any named context.",
+    "confidence": "high",
+    "citations": "Javadoc of java.lang.Long.parseLong(String, int) (Java 21): parses the first argument in the radix given by the second argument and throws NumberFormatException on invalid input."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/Short.java",
+      "symbol": "java.lang.Short.parseShort",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": [],
+    "completeness": "complete",
+    "rationale": "The method returns a primitive short. Malformed input raises NumberFormatException instead of returning attacker-controlled text. When the result is rendered back into a string it contains only an optional minus sign and decimal digits, which are metacharacters in no named context.",
+    "confidence": "high",
+    "citations": "Javadoc of java.lang.Short.parseShort(String) (Java 21): parses the argument as a signed decimal short and throws NumberFormatException on invalid input."
+  },
+  {
+    "target": {
+      "path": "java.base/java/net/URLEncoder.java",
+      "symbol": "java.net.URLEncoder.encode",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": ["path", "shell"],
+    "completeness": "partial",
+    "rationale": "This is the encode(String, Charset) overload. The output alphabet is exactly the alphanumerics plus '.', '-', '*', '_' and '+', with every other byte rendered as %XX, so the output can contain no quote, angle bracket, ampersand, parenthesis, backslash, control character, or URL delimiter; the value cannot break out of any quoted or delimited context in the neutralized list. It is unsafe for shell because '*' survives and expands as a glob when the value is used unquoted, and unsafe for path because '..' sequences survive unchanged, which permits path traversal. The encoding is application/x-www-form-urlencoded, not strict RFC 3986: space becomes '+', which a strict component decoder will not turn back into a space, so the encoding is semantically wrong (though still injection-safe) for URL path segments.",
+    "confidence": "high",
+    "citations": "Javadoc of java.net.URLEncoder.encode(String, Charset) (Java 21): alphanumerics and \".-*_\" remain, space becomes '+', all other characters become %XX; HTML 4.01 section 17.13.4.1 for the form-urlencoded rules. Output-alphabet reasoning against RFC 3986 section 2 delimiter set."
+  },
+  {
+    "target": {
+      "path": "java.base/java/net/URLEncoder.java",
+      "symbol": "java.net.URLEncoder.encode",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": ["path", "shell"],
+    "completeness": "partial",
+    "rationale": "This is the encode(String, String) overload, which takes the charset name as the second parameter and is behaviorally identical to the Charset overload. The output alphabet is the alphanumerics plus '.', '-', '*', '_' and '+', with every other byte rendered as %XX, so no quote, angle bracket, ampersand, parenthesis, backslash, control character, or URL delimiter can appear in the output. It is unsafe for shell because '*' survives and expands as a glob in unquoted use, and unsafe for path because '..' sequences survive unchanged. The form-urlencoded space-as-'+' rule makes the output semantically wrong (though injection-safe) in URL path segments.",
+    "confidence": "high",
+    "citations": "Javadoc of java.net.URLEncoder.encode(String, String) (Java 21): same character rules as the Charset overload, with the charset named by a string. Output-alphabet reasoning against RFC 3986 section 2 delimiter set."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Base64.java",
+      "symbol": "java.util.Base64.Encoder.encode",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "sql", "xml", "xpath"],
+    "does_not_neutralize": ["log", "path", "shell", "url"],
+    "completeness": "partial",
+    "rationale": "The returned byte array holds Base64 output. The claim is the intersection over the three encoder variants that share this class: the basic alphabet [A-Za-z0-9+/=] makes the output unsafe for url ('+' and '/' are URL-significant) and path ('/' is a separator), and the MIME variant inserts CR-LF line wraps, which makes the output unsafe for log and for shell. The remaining contexts are safe for every variant because no variant can emit a quote, angle bracket, ampersand, parenthesis, or backslash. Base64 is a reversible encoding, not a semantic neutralization: if a downstream consumer decodes the value, the original tainted bytes return, so treat decode points as taint-restoring.",
+    "confidence": "medium",
+    "citations": "RFC 4648 section 4 (basic alphabet), section 5 (URL and filename safe alphabet), and section 3.3 / RFC 2045 (MIME 76-character line wrapping). Javadoc of java.util.Base64.Encoder.encode(byte[]) (Java 21)."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Base64.java",
+      "symbol": "java.util.Base64.Encoder.encodeToString",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "sql", "xml", "xpath"],
+    "does_not_neutralize": ["log", "path", "shell", "url"],
+    "completeness": "partial",
+    "rationale": "Same claim as Base64.Encoder.encode, with the result returned as a String. The safe set is the intersection over the basic, URL-safe, and MIME encoder variants that share this class: basic output contains '+' and '/' (unsafe for url) and '/' (unsafe for path), and MIME output contains CR-LF wraps (unsafe for log and shell). No variant can emit a quote, angle bracket, ampersand, parenthesis, or backslash, so the remaining contexts hold for every variant. Base64 is reversible; a downstream decode restores the original tainted bytes.",
+    "confidence": "medium",
+    "citations": "RFC 4648 section 4 (basic alphabet), section 5 (URL and filename safe alphabet), and section 3.3 / RFC 2045 (MIME line wrapping). Javadoc of java.util.Base64.Encoder.encodeToString(byte[]) (Java 21)."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/UUID.java",
+      "symbol": "java.util.UUID.fromString",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "jdk",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "does_not_neutralize": [],
+    "completeness": "complete",
+    "rationale": "The method returns a UUID object, and its canonical string rendering is fixed-format hexadecimal digits and hyphens only, which are metacharacters in no named context. The JDK parser is lenient about component widths, but leniency only affects which inputs are accepted, never the alphabet of the rendered output. The neutralization applies to the rendering of the returned UUID (for example via toString), not to the input string.",
+    "confidence": "high",
+    "citations": "Javadoc of java.util.UUID.fromString and UUID.toString (Java 21): toString renders the canonical 36-character form over [0-9a-f-]."
+  }
+]
