@@ -245,6 +245,11 @@ struct FileLineCounts {
 struct SymbolSnapshot {
     symbol: CommitSymbol,
     key: SymbolKey,
+    /// Normalized token sequence of the symbol's body, or `None` when the body
+    /// is too trivial to identify a move by content alone. Used only to pair
+    /// leftovers that shared no identity key, by token similarity -- see
+    /// [`pair_endpoints`] and [`body_similarity`].
+    token_sig: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -458,14 +463,16 @@ pub fn analyze_diff_at_root(
     // unpaired symbol with no overlap is likewise dropped rather than reported.
     let endpoint_pairing = pair_endpoints(&before, &after, &file_changes);
     for (pre, post) in &endpoint_pairing.pairs {
-        // A paired symbol (same identity) is only *moved* when it genuinely
-        // relocated -- its file changed, or its position changed by more than
-        // the patch's own line offset accounts for. A symbol whose start line
-        // merely shifted because lines were inserted/deleted ELSEWHERE in the
-        // file has not moved; reporting it as such floods the result with one
-        // entry per symbol below any early edit (a single insert near the top
-        // of a large file otherwise yields hundreds of spurious "moved" rows).
-        let relocated = pre.symbol.path != post.symbol.path
+        // A paired symbol is only *moved* when it genuinely relocated -- its
+        // name changed (body-identity pairing matched it under a new fqn), its
+        // file changed, or its position changed by more than the patch's own
+        // line offset accounts for. A symbol whose start line merely shifted
+        // because lines were inserted/deleted ELSEWHERE in the file has not
+        // moved; reporting it as such floods the result with one entry per
+        // symbol below any early edit (a single insert near the top of a large
+        // file otherwise yields hundreds of spurious "moved" rows).
+        let relocated = pre.symbol.fqn != post.symbol.fqn
+            || pre.symbol.path != post.symbol.path
             || (pre.symbol.start_line != post.symbol.start_line
                 && !is_pure_line_shift(&pre.symbol, &post.symbol, &changed_lines));
         if relocated {
@@ -476,7 +483,15 @@ pub fn analyze_diff_at_root(
                 removed_calls: Vec::new(),
             });
         }
-        if pre.symbol.signature != post.symbol.signature {
+        // A pair matched by the body-similarity rule (rather than by identity or
+        // a Git rename) relocated -- and may have been renamed or lightly
+        // edited -- but its touched lines are dominated by the relocation, not a
+        // real edit. The `moved` entry above already carries the full before and
+        // after symbols, so also reporting it as an edit -- with every cut line
+        // "deleted" and every pasted line "inserted" -- or as a signature change
+        // would be double-counting noise. Suppress both for those pairs.
+        let relocated_by_body = endpoint_pairing.fallback_paired.contains(&pre.key);
+        if !relocated_by_body && pre.symbol.signature != post.symbol.signature {
             signature_changes.push(SignatureChange {
                 before: pre.symbol.clone(),
                 after: post.symbol.clone(),
@@ -484,7 +499,7 @@ pub fn analyze_diff_at_root(
         }
         let touched_old_lines = old_overlap(&pre.symbol, &changed_lines);
         let touched_new_lines = new_overlap(&post.symbol, &changed_lines);
-        if touched_old_lines.is_empty() && touched_new_lines.is_empty() {
+        if relocated_by_body || (touched_old_lines.is_empty() && touched_new_lines.is_empty()) {
             continue;
         }
         edited.push(EditedSymbolPair {
@@ -1226,6 +1241,9 @@ fn symbol_snapshot_map(
     include_tests: bool,
 ) -> BTreeMap<SymbolKey, SymbolSnapshot> {
     let mut out = BTreeMap::new();
+    // Read each file at most once: many declarations share a source, and the
+    // body hash only needs the file's text sliced by line range.
+    let mut file_text: HashMap<PathBuf, Option<String>> = HashMap::new();
     for unit in analyzer.all_declarations() {
         if unit.is_synthetic() {
             continue;
@@ -1255,13 +1273,20 @@ fn symbol_snapshot_map(
             .map(|s| s.to_string())
             .or_else(|| unit.signature().map(str::to_string))
             .unwrap_or_default();
+        let name = unit.identifier().to_string();
+        let token_sig = file_text
+            .entry(unit.source().abs_path())
+            .or_insert_with(|| unit.source().read_to_string().ok())
+            .as_deref()
+            .and_then(|text| body_token_signature(text, &name, range.start_line, range.end_line));
         out.insert(
             key.clone(),
             SymbolSnapshot {
                 key,
+                token_sig,
                 symbol: CommitSymbol {
                     fqn: unit.fq_name(),
-                    name: unit.identifier().to_string(),
+                    name,
                     kind,
                     signature,
                     path,
@@ -1282,6 +1307,11 @@ struct EndpointPairing<'a> {
     pairs: Vec<(&'a SymbolSnapshot, &'a SymbolSnapshot)>,
     postimage_only: Vec<&'a SymbolSnapshot>,
     preimage_only: Vec<&'a SymbolSnapshot>,
+    /// Keys of the symbols paired by the body-similarity rule rather than by
+    /// identity or a Git rename. These relocated (and possibly were renamed or
+    /// lightly edited), but the hunks that deleted them from one place and
+    /// inserted them at another are not edits to report -- see the classifier.
+    fallback_paired: HashSet<&'a SymbolKey>,
 }
 
 /// Match preimage symbols to postimage symbols.
@@ -1299,6 +1329,13 @@ struct EndpointPairing<'a> {
 /// Overloads are exactly the case the uniqueness requirement rejects: two
 /// same-named declarations in a renamed file offer no evidence about which
 /// preimage one became which postimage one, so both stay unpaired.
+///
+/// The third rule catches what the first two miss: a symbol moved to a file Git
+/// did not report as a rename, or renamed in place -- possibly with light
+/// internal edits -- keeps neither its key nor a rename bucket. Leftovers are
+/// paired by token-similarity of their bodies, greedily and one-to-one above a
+/// threshold, so a relocated-and-renamed symbol still lines up. Trivial bodies
+/// never participate.
 fn pair_endpoints<'a>(
     before: &'a BTreeMap<SymbolKey, SymbolSnapshot>,
     after: &'a BTreeMap<SymbolKey, SymbolSnapshot>,
@@ -1372,11 +1409,192 @@ fn pair_endpoints<'a>(
     preimage_only.retain(|snapshot| !moved_keys.contains(&snapshot.key));
     postimage_only.retain(|snapshot| !moved_keys.contains(&snapshot.key));
 
+    // Third rule: pair the remaining leftovers by body SIMILARITY. A symbol cut
+    // from one place and pasted at another -- under a new name, in a file Git
+    // did not report as a rename, and perhaps with a few internal edits --
+    // shares no identity key and lands in no rename bucket, so it would
+    // otherwise surface as delete+introduce plus the very call-edge churn
+    // `fqn_renames` exists to cancel. Score every leftover preimage against
+    // every leftover postimage by token similarity and greedily accept the
+    // best mutual matches above the threshold, one-to-one. Greedy-by-descending
+    // score means the most confident relocation claims its counterpart first;
+    // ties break on fqn so the result is deterministic. Trivial bodies carry
+    // `token_sig == None` and never participate.
+    let mut scored: Vec<(f64, &'a SymbolSnapshot, &'a SymbolSnapshot)> = Vec::new();
+    for pre in preimage_only.iter().copied() {
+        let Some(pre_sig) = pre.token_sig.as_deref() else {
+            continue;
+        };
+        for post in postimage_only.iter().copied() {
+            let Some(post_sig) = post.token_sig.as_deref() else {
+                continue;
+            };
+            let score = body_similarity(pre_sig, post_sig);
+            if score >= BODY_MOVE_SIMILARITY_THRESHOLD {
+                scored.push((score, pre, post));
+            }
+        }
+    }
+    scored.sort_by(|(sa, pa, qa), (sb, pb, qb)| {
+        sb.partial_cmp(sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| pa.symbol.fqn.cmp(&pb.symbol.fqn))
+            .then_with(|| qa.symbol.fqn.cmp(&qb.symbol.fqn))
+    });
+    let mut fallback_paired: HashSet<&SymbolKey> = HashSet::new();
+    for (_, pre, post) in scored {
+        if fallback_paired.contains(&pre.key) || fallback_paired.contains(&post.key) {
+            continue;
+        }
+        fallback_paired.insert(&pre.key);
+        fallback_paired.insert(&post.key);
+        pairs.push((pre, post));
+    }
+    preimage_only.retain(|snapshot| !fallback_paired.contains(&snapshot.key));
+    postimage_only.retain(|snapshot| !fallback_paired.contains(&snapshot.key));
+
     EndpointPairing {
         pairs,
         postimage_only,
         preimage_only,
+        fallback_paired,
     }
+}
+
+/// Replace every whole-identifier occurrence of `name` in `line` with a fixed
+/// placeholder, leaving substrings (a `sum` inside `summary`) untouched.
+///
+/// This is what makes the body fingerprint name-independent: the symbol's own
+/// name appears in its declaration line and in any recursive call, so a rename
+/// would otherwise change the hash and defeat move detection. Neutralizing the
+/// name -- and only the name -- lets a renamed body still match its original.
+fn blank_identifier<'a>(line: &'a str, name: &str) -> Cow<'a, str> {
+    if name.is_empty() {
+        return Cow::Borrowed(line);
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out: Option<String> = None;
+    let mut last = 0;
+    for (idx, _) in line.match_indices(name) {
+        let boundary_before = line[..idx].chars().next_back().is_none_or(|c| !is_word(c));
+        let boundary_after = line[idx + name.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_word(c));
+        if boundary_before && boundary_after {
+            let buf = out.get_or_insert_with(|| String::with_capacity(line.len()));
+            buf.push_str(&line[last..idx]);
+            buf.push('\u{0}');
+            last = idx + name.len();
+        }
+    }
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&line[last..]);
+            Cow::Owned(buf)
+        }
+        None => Cow::Borrowed(line),
+    }
+}
+
+/// The minimum body token similarity for two leftover symbols to be paired as
+/// the same symbol relocated. Chosen to accept a renamed method whose body also
+/// saw a few internal renames or a small edit, while rejecting merely
+/// structurally-similar but unrelated code.
+const BODY_MOVE_SIMILARITY_THRESHOLD: f64 = 0.70;
+
+/// A normalized token sequence for a symbol's body, or `None` when the body is
+/// too trivial to identify a move by content alone.
+///
+/// The symbol's own `name` is blanked (see [`blank_identifier`]) so a rename
+/// does not change the signature, then the `[start_line, end_line]` span
+/// (1-based, inclusive) is tokenized into identifier/number runs and individual
+/// punctuation characters. Internal identifiers are deliberately KEPT: they let
+/// [`body_similarity`] tell genuinely different logic apart, and the threshold
+/// absorbs the few that a rename touches. A body of fewer than two non-blank
+/// lines is rejected (`None`): too weak a fingerprint to pair on without
+/// inventing moves.
+fn body_token_signature(
+    source: &str,
+    name: &str,
+    start_line: usize,
+    end_line: usize,
+) -> Option<Vec<String>> {
+    if start_line == 0 || end_line < start_line {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let mut non_blank_lines = 0;
+    for line in source
+        .lines()
+        .skip(start_line - 1)
+        .take(end_line - start_line + 1)
+    {
+        let blanked = blank_identifier(line, name);
+        let before = tokens.len();
+        tokenize_into(&blanked, &mut tokens);
+        if tokens.len() > before {
+            non_blank_lines += 1;
+        }
+    }
+    if non_blank_lines < 2 || tokens.is_empty() {
+        return None;
+    }
+    Some(tokens)
+}
+
+/// Append `line`'s tokens to `out`: maximal `[A-Za-z0-9_]`/NUL runs (words,
+/// numbers, and the blanked-name placeholder) and every other non-whitespace
+/// character as its own token. Whitespace is dropped, so indentation and
+/// spacing never affect the signature.
+fn tokenize_into(line: &str, out: &mut Vec<String>) {
+    let mut word = String::new();
+    for ch in line.chars() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '\u{0}' {
+            word.push(ch);
+        } else {
+            if !word.is_empty() {
+                out.push(std::mem::take(&mut word));
+            }
+            if !ch.is_whitespace() {
+                out.push(ch.to_string());
+            }
+        }
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+}
+
+/// Multiset (bag) Jaccard similarity of two token sequences, in `[0.0, 1.0]`.
+///
+/// Frequency-weighted: the shared size sums `min(count_a, count_b)` per token
+/// and the total sums `max`, so a token used three times on one side and once
+/// on the other counts as two mismatches, not one. Bag Jaccard tolerates the
+/// scattered token changes a rename introduces -- a variable renamed a handful
+/// of times barely moves the score -- which matters because a relocated symbol
+/// is usually renamed too. The deliberate cost is order-blindness: two bodies
+/// built from the same token bag in a different arrangement score alike. For a
+/// move-pairing heuristic guarded by a threshold and one-to-one assignment that
+/// is an acceptable trade; distinct real functions carry distinct token bags.
+fn body_similarity(a: &[String], b: &[String]) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut counts: HashMap<&str, i32> = HashMap::new();
+    for token in a {
+        *counts.entry(token).or_default() += 1;
+    }
+    for token in b {
+        *counts.entry(token).or_default() -= 1;
+    }
+    // Sum of |count| is the symmetric difference of the two bags; each bag has
+    // `a.len()`/`b.len()` elements, so intersection = (|a|+|b|-symdiff)/2.
+    let symmetric_difference: i32 = counts.values().map(|c| c.abs()).sum();
+    let total = a.len() + b.len();
+    let intersection = (total as i32 - symmetric_difference) as f64 / 2.0;
+    let union = total as f64 - intersection;
+    if union == 0.0 { 0.0 } else { intersection / union }
 }
 
 /// Whether a paired symbol's line change is fully explained by edits ELSEWHERE
@@ -1802,12 +2020,23 @@ fn kind_name(kind: CodeUnitType) -> &'static str {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        ChangedLines, CommitSymbol, RevisionTempDir, create_private_dirs, is_pure_line_shift,
-        write_private_file,
+        BODY_MOVE_SIMILARITY_THRESHOLD, ChangedLines, CommitSymbol, FileChange, RevisionTempDir,
+        SymbolKey, SymbolSnapshot, body_similarity, body_token_signature, create_private_dirs,
+        is_pure_line_shift, pair_endpoints, write_private_file,
     };
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Tokenize with the production normalizer, then score -- the path a real
+    /// symbol body takes.
+    fn similarity(a_name: &str, a_src: &str, b_name: &str, b_src: &str) -> f64 {
+        let lines_a = a_src.lines().count();
+        let lines_b = b_src.lines().count();
+        let a = body_token_signature(a_src, a_name, 1, lines_a).unwrap();
+        let b = body_token_signature(b_src, b_name, 1, lines_b).unwrap();
+        body_similarity(&a, &b)
+    }
 
     fn symbol_at(path: &str, start_line: usize) -> CommitSymbol {
         CommitSymbol {
@@ -1820,6 +2049,28 @@ mod tests {
             end_line: start_line + 3,
             language: "rust".to_string(),
             is_test: false,
+        }
+    }
+
+    fn snapshot(fqn: &str, name: &str, path: &str, token_sig: Option<Vec<String>>) -> SymbolSnapshot {
+        SymbolSnapshot {
+            key: SymbolKey {
+                fqn: fqn.to_string(),
+                kind: "function".to_string(),
+                language: "rust".to_string(),
+            },
+            token_sig,
+            symbol: CommitSymbol {
+                fqn: fqn.to_string(),
+                name: name.to_string(),
+                kind: "function".to_string(),
+                signature: format!("fn {name}()"),
+                path: path.to_string(),
+                start_line: 1,
+                end_line: 4,
+                language: "rust".to_string(),
+                is_test: false,
+            },
         }
     }
 
@@ -1851,6 +2102,141 @@ mod tests {
         // A path change is always a relocation, regardless of line arithmetic.
         let renamed_post = symbol_at("src/b.rs", 13);
         assert!(!is_pure_line_shift(&pre, &renamed_post, &changed));
+    }
+
+    // A realistic reduce-over-a-slice body, parameterized by function and
+    // accumulator name so tests can rename either.
+    fn accumulate_body(fn_name: &str, acc: &str) -> String {
+        format!(
+            "pub fn {fn_name}(items: &[i32]) -> i32 {{\n    \
+             let mut {acc} = 0;\n    \
+             for it in items {{\n        \
+             {acc} += *it;\n    \
+             }}\n    \
+             {acc}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn body_similarity_tolerates_rename_and_indentation_but_not_unrelated_code() {
+        let foo = accumulate_body("compute_total", "sum");
+
+        // Pure rename: only the function name changed. Blanking the symbol's own
+        // name must make the two bodies score identically.
+        let renamed = accumulate_body("sum_all", "sum");
+        assert_eq!(similarity("compute_total", &foo, "sum_all", &renamed), 1.0);
+
+        // Reindented into a deeper scope with a blank line: whitespace is
+        // dropped, so the score is unaffected.
+        let reindented = format!("\n        {}", accumulate_body("sum_all", "sum").replace('\n', "\n        "));
+        assert_eq!(similarity("compute_total", &foo, "sum_all", &reindented), 1.0);
+
+        // Move + rename + an internal variable rename (sum -> total): still well
+        // above the pairing threshold.
+        let edited = accumulate_body("sum_all", "total");
+        let score = similarity("compute_total", &foo, "sum_all", &edited);
+        assert!(
+            score >= BODY_MOVE_SIMILARITY_THRESHOLD,
+            "renamed move with an internal rename scored {score}, below threshold"
+        );
+
+        // Unrelated function: must fall well below the threshold.
+        let unrelated =
+            "pub fn greet(name: &str) -> String {\n    let mut out = String::new();\n    out.push_str(name);\n    out.push('!');\n    out\n}\n";
+        let score = similarity("compute_total", &foo, "greet", unrelated);
+        assert!(
+            score < BODY_MOVE_SIMILARITY_THRESHOLD,
+            "unrelated bodies scored {score}, at/above threshold"
+        );
+    }
+
+    #[test]
+    fn body_token_signature_rejects_trivial_and_degenerate_ranges() {
+        let src = accumulate_body("f", "sum");
+        let n = src.lines().count();
+        assert!(body_token_signature(&src, "f", 1, n).is_some());
+        // One non-blank line is too weak a fingerprint.
+        assert_eq!(body_token_signature("pub fn f() { done() }\n", "f", 1, 1), None);
+        // Degenerate ranges are rejected, not panicked on.
+        assert_eq!(body_token_signature(&src, "f", 0, n), None);
+        assert_eq!(body_token_signature(&src, "f", 5, 1), None);
+    }
+
+    fn snap_src(fqn: &str, name: &str, path: &str, src: &str) -> SymbolSnapshot {
+        let n = src.lines().count();
+        snapshot(fqn, name, path, body_token_signature(src, name, 1, n))
+    }
+
+    /// The third pairing rule (RM-style move detection): a symbol relocated to a
+    /// file Git did not flag as a rename -- renamed and lightly edited in the
+    /// process -- keeps no identity key and no rename bucket, yet body
+    /// similarity pairs it. An unrelated leftover must NOT be dragged in.
+    #[test]
+    fn fuzzy_pairing_matches_a_renamed_move_and_resists_false_positives() {
+        // compute_total moved a.rs -> b.rs, renamed sum_all, accumulator renamed.
+        let before = BTreeMap::from([
+            {
+                let s = snap_src("a::compute_total", "compute_total", "src/a.rs", &accumulate_body("compute_total", "sum"));
+                (s.key.clone(), s)
+            },
+            {
+                // An unrelated deleted function that must stay unpaired.
+                let src = "pub fn greet(name: &str) -> String {\n    let mut out = String::new();\n    out.push_str(name);\n    out\n}\n";
+                let s = snap_src("a::greet", "greet", "src/a.rs", src);
+                (s.key.clone(), s)
+            },
+        ]);
+        let after = BTreeMap::from([{
+            let s = snap_src("b::sum_all", "sum_all", "src/b.rs", &accumulate_body("sum_all", "total"));
+            (s.key.clone(), s)
+        }]);
+
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        assert_eq!(pairing.pairs.len(), 1, "the renamed move should pair");
+        assert_eq!(pairing.pairs[0].0.symbol.fqn, "a::compute_total");
+        assert_eq!(pairing.pairs[0].1.symbol.fqn, "b::sum_all");
+        assert!(pairing.fallback_paired.contains(&pairing.pairs[0].0.key));
+        // greet stayed unpaired -- not a false-positive move.
+        assert_eq!(pairing.preimage_only.len(), 1);
+        assert_eq!(pairing.preimage_only[0].symbol.fqn, "a::greet");
+        assert!(pairing.postimage_only.is_empty());
+
+        // Greedy one-to-one: two candidate moves, each must claim its true twin
+        // rather than cross-pair. Give b a clearly-better match than a.
+        let before = BTreeMap::from([
+            {
+                let s = snap_src("a::compute_total", "compute_total", "src/a.rs", &accumulate_body("compute_total", "sum"));
+                (s.key.clone(), s)
+            },
+            {
+                let src = "pub fn render(node: &Node) -> String {\n    let mut buf = String::new();\n    buf.push_str(node.label());\n    buf.push('\\n');\n    buf\n}\n";
+                let s = snap_src("a::render", "render", "src/a.rs", src);
+                (s.key.clone(), s)
+            },
+        ]);
+        let after = BTreeMap::from([
+            {
+                let s = snap_src("b::sum_all", "sum_all", "src/b.rs", &accumulate_body("sum_all", "total"));
+                (s.key.clone(), s)
+            },
+            {
+                let src = "pub fn draw(node: &Node) -> String {\n    let mut buf = String::new();\n    buf.push_str(node.label());\n    buf.push('\\n');\n    buf\n}\n";
+                let s = snap_src("b::draw", "draw", "src/b.rs", src);
+                (s.key.clone(), s)
+            },
+        ]);
+        let pairing = pair_endpoints(&before, &after, &[] as &[FileChange]);
+        let mut got: Vec<(&str, &str)> = pairing
+            .pairs
+            .iter()
+            .map(|(p, q)| (p.symbol.fqn.as_str(), q.symbol.fqn.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("a::compute_total", "b::sum_all"), ("a::render", "b::draw")],
+            "each move claimed its own twin"
+        );
     }
 
     #[test]
