@@ -37,9 +37,10 @@ use brokk_bifrost_core::hash::HashSet;
 use crate::declarations::rust_package_name;
 use crate::graph_support::rust_value_constructor_visibilities;
 use crate::imports::RustVisibility;
+use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
 use crate::usage::{
     Domain, ModuleKey, RustImportExtent, RustSymbolIdentity, RustSymbolNamespace,
-    direct_import_scope_for_module,
+    direct_import_scope_for_module, rust_file_is_actual_crate_root,
 };
 use brokk_bifrost_core::analyzer::rust_facts::{
     RustExportFact, RustImportTargetFact, RustUsageFacts,
@@ -64,7 +65,12 @@ pub struct RustImportBinding {
     /// `ImportInfo::local_name().unwrap_or_default()` yields today.
     pub local_name: String,
     pub is_glob: bool,
+    /// True for `extern crate name as alias;`: it binds a namespace and nothing
+    /// in the current module's own namespace.
+    pub is_extern_crate: bool,
     pub visibility: RustVisibility,
+    /// The `#[cfg(...)]` predicate the `use` was written under.
+    pub cfg_condition: RustCfgCondition,
     /// The enclosing module as a dotted package name, composed with the live
     /// file's package.
     pub owner_module: String,
@@ -97,6 +103,15 @@ pub struct RustDeclarationFacts {
     /// order. Two declarations can share one identity (a `#[cfg]`-duplicated
     /// item, say), so the value is a list rather than a single domain.
     pub domains: Vec<(RustSymbolIdentity, Vec<Domain>)>,
+    /// Identity -> the `#[cfg(...)]` predicate each declaration of it was
+    /// written under, grouped the same way. This is what lets a reference see
+    /// a `#[cfg(not(x))]` local declaration and a `#[cfg(x)]` import of the
+    /// same name as alternatives rather than as an ambiguity (#1377).
+    ///
+    /// Derived from the file's own tree, so it is a per-file product like the
+    /// rest of this struct and needs no stored row: the predicate sits on the
+    /// declaration's own item, in the file that declares it.
+    pub cfg_conditions: Vec<(RustSymbolIdentity, Vec<RustCfgCondition>)>,
 }
 
 /// Derive one file's declaration facts.
@@ -114,7 +129,9 @@ pub fn rust_declaration_facts(
 ) -> Option<RustDeclarationFacts> {
     let mut facts = RustDeclarationFacts::default();
     let mut ordered_domains: Vec<(RustSymbolIdentity, Domain)> = Vec::new();
+    let mut ordered_cfg_conditions: Vec<(RustSymbolIdentity, RustCfgCondition)> = Vec::new();
     let prepared = analyzer.prepared_syntax(file);
+    let is_actual_crate_root = rust_file_is_actual_crate_root(analyzer, file);
     for declaration in declarations {
         keep_going().then_some(())?;
         let (owner, declared_module) = if declaration.is_module() {
@@ -143,17 +160,34 @@ pub fn rust_declaration_facts(
         facts
             .identities
             .push((declaration.clone(), identity.clone()));
-        let constructor_domain = prepared.as_ref().and_then(|syntax| {
-            let node = crate::graph_support::rust_named_declaration_node(
+        let declaration_node = prepared.as_ref().and_then(|syntax| {
+            crate::graph_support::rust_named_declaration_node(
                 analyzer.code_units(),
                 declaration,
                 syntax.tree().root_node(),
                 syntax.source(),
-            )?;
+            )
+        });
+        // A declaration whose node this build cannot find proves nothing about
+        // its guard, so it is `Unknown` rather than `Always`.
+        ordered_cfg_conditions.push((
+            identity.clone(),
+            match (prepared.as_ref(), declaration_node) {
+                (Some(syntax), Some(node)) => rust_cfg_condition(node, syntax.source()),
+                _ => RustCfgCondition::Unknown,
+            },
+        ));
+        let constructor_domain = prepared.as_ref().and_then(|syntax| {
+            let node = declaration_node?;
             rust_value_constructor_visibilities(node, syntax.source())?
                 .into_iter()
                 .map(|visibility| {
-                    direct_import_scope_for_module(file, &owner.package(), visibility)
+                    direct_import_scope_for_module(
+                        file,
+                        &owner.package(),
+                        visibility,
+                        is_actual_crate_root,
+                    )
                 })
                 .try_fold(Domain::Public, |effective, domain| {
                     effective.intersect(&domain?)
@@ -170,6 +204,7 @@ pub fn rust_declaration_facts(
                 file,
                 &owner.package(),
                 crate::graph_support::rust_declaration_visibility(analyzer, declaration),
+                is_actual_crate_root,
             )
         };
         let Some(domain) = declaration_domain else {
@@ -201,6 +236,17 @@ pub fn rust_declaration_facts(
         {
             Some((_, domains)) => domains.push(domain),
             None => facts.domains.push((identity, vec![domain])),
+        }
+    }
+    for (identity, condition) in ordered_cfg_conditions {
+        keep_going().then_some(())?;
+        match facts
+            .cfg_conditions
+            .iter_mut()
+            .find(|(existing, _)| *existing == identity)
+        {
+            Some((_, conditions)) => conditions.push(condition),
+            None => facts.cfg_conditions.push((identity, vec![condition])),
         }
     }
     Some(facts)
@@ -435,7 +481,9 @@ fn binding_from_fact(
         path,
         local_name: target.bound_name.clone().unwrap_or_default(),
         is_glob: target.is_glob,
+        is_extern_crate: target.is_extern_crate,
         visibility: target.visibility.clone(),
+        cfg_condition: target.cfg_condition.clone(),
         importer_module: ModuleKey::new(file, &owner_module),
         owner_module,
         extent,

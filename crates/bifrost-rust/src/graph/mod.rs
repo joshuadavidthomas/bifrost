@@ -3,7 +3,7 @@
 //! [`resolver`] is the half both usage paths share: path and token-tree
 //! resolution, associated-item lookup, graph seeds, and the visibility
 //! predicates the scans filter targets with. It resolves through
-//! [`crate::graph_support::RustUsageSource`] and a
+//! [`crate::graph_support::RustFactSource`] and a
 //! [`resolver::RustDefinitionProvider`], never an analyzer handle.
 //!
 //! The two scan bodies -- the per-symbol forward scan (`rust_graph/extractor.rs`)

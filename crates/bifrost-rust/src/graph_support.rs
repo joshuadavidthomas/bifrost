@@ -24,7 +24,7 @@ use crate::imports::{
     rust_imports_with_visibility_from_use_declaration, rust_item_visibility,
 };
 use crate::lexical_scope::{parse_rust_tree, visible_import_binder_at};
-use crate::usage_index::{RustUsageIndex, exported_targets_from_files};
+use crate::usage::exported_targets_from_files;
 use crate::usage_queries::RustDeclarationFacts;
 use crate::usage_walks::RustWalkCaches;
 use brokk_bifrost_core::analyzer::rust_facts::RustUsageFacts;
@@ -35,9 +35,10 @@ use brokk_bifrost_core::analyzer::rust_facts::RustUsageFacts;
 /// function in this module and its siblings sees only this surface, so none of
 /// them can reach back into the analyzer type.
 ///
-/// The usage index is deliberately absent: [`RustUsageIndex::build`] and
-/// everything it calls take this trait, so the build cannot re-enter the cell it
-/// is filling. Code that runs once the index exists takes [`RustUsageSource`].
+/// The persisted usage facts are deliberately absent: the Cargo route
+/// composition and the declaration walk take this trait, so neither can reach
+/// the rows whose extraction they precede. Code that answers a usage question
+/// takes [`RustFactSource`].
 pub trait RustSource:
     CodeUnitIndex + ImportAnalysisProvider + TypeAliasProvider + TypeHierarchyProvider
 {
@@ -71,41 +72,6 @@ pub trait RustSource:
     fn note_module_file_resolution(&self);
 }
 
-/// [`RustSource`] plus the built usage index. Everything reached from
-/// the inverted export walk needs it; the index build itself must not.
-pub trait RustUsageSource: RustSource {
-    fn usage_index(&self) -> Arc<RustUsageIndex>;
-
-    /// [`Self::usage_index`], abandoning a cold build when `keep_going` stops
-    /// permitting it. A stopped build is not published, so the next
-    /// uninterrupted caller still builds a complete index.
-    fn usage_index_while(
-        &self,
-        keep_going: &(dyn Fn() -> bool + Sync),
-    ) -> Option<Arc<RustUsageIndex>>;
-
-    fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext>;
-
-    /// [`Self::reference_context_of`], abandoning the build when `progress`
-    /// reports the caller has stopped caring. The whole-workspace inverted pass
-    /// uses this to drop work for files a filter has already rejected.
-    fn reference_context_of_with_progress(
-        &self,
-        file: &ProjectFile,
-        progress: &dyn Fn() -> bool,
-    ) -> Option<Arc<RustReferenceContext>>;
-
-    /// The forward-scan counterpart of [`Self::reference_context_of`], built
-    /// from the same binder but resolving through the forward export index.
-    fn forward_reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext>;
-
-    fn forward_reference_context_of_with_progress(
-        &self,
-        file: &ProjectFile,
-        progress: &dyn Fn() -> bool,
-    ) -> Option<Arc<RustReferenceContext>>;
-}
-
 /// The file-to-blob mapping in both directions, as an object-safe view.
 ///
 /// A store-backed Rust answer starts from a blob oid an inverted lookup
@@ -118,20 +84,17 @@ pub trait RustLiveBlobs: Send + Sync {
     fn paths_for_oid(&self, oid: git2::Oid) -> Vec<ProjectFile>;
 }
 
-/// [`RustSource`] plus the persisted per-file Rust usage facts and the bounded
-/// caches the cross-file walks memoize into.
+/// [`RustSource`] plus the persisted per-file Rust usage facts, the bounded
+/// caches the cross-file walks memoize into, and the per-file reference
+/// contexts the resolvers read through.
 ///
-/// This is the v2 counterpart of [`RustUsageSource`]: where that one hands out
-/// a whole-workspace index built eagerly, this one hands out the rows analysis
-/// already wrote and the per-generation caches a walk composes them in. Every
-/// method here is something the analyzer alone can answer -- the store handle,
-/// the live blob mapping, the caches it owns, and the catch-up that guarantees
-/// the rows exist before they are read.
-///
-/// It extends [`RustUsageSource`] only while both designs are in the tree; step
-/// 4 of `.agents/plans/port-optimization-arc-to-upstream.md` deletes the index
-/// and narrows the bound to [`RustSource`].
-pub trait RustFactSource: RustUsageSource {
+/// Everything here is something only the analyzer can answer: the store handle
+/// behind the four inverted lookups, the live blob mapping, the caches it owns,
+/// the catch-up that guarantees the rows exist before a walk reads them, and
+/// the reference contexts it memoizes. Code that runs before any of that
+/// exists -- the Cargo route composition, the declaration walk -- takes
+/// [`RustSource`] instead, so it cannot re-enter what it is filling.
+pub trait RustFactSource: RustSource {
     /// One blob's persisted facts, memoized per `(generation, blob)`.
     ///
     /// `None` when the blob has no rows, which a caller treats as "no facts"
@@ -169,6 +132,27 @@ pub trait RustFactSource: RustUsageSource {
     /// Ensure every live Rust file's blob carries fact rows before a walk reads
     /// them. Runs at most once per analyzer generation.
     fn ensure_rust_facts_caught_up(&self);
+
+    fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext>;
+
+    /// [`Self::reference_context_of`], abandoning the build when `progress`
+    /// reports the caller has stopped caring. The whole-workspace inverted pass
+    /// uses this to drop work for files a filter has already rejected.
+    fn reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>>;
+
+    /// The forward-scan counterpart of [`Self::reference_context_of`], built
+    /// from the same binder but resolving through the forward export index.
+    fn forward_reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext>;
+
+    fn forward_reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -451,7 +435,7 @@ fn rust_declaration_targets_in_files_with_progress(
 }
 
 pub fn resolve_visible_import_targets_forward(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
@@ -557,7 +541,7 @@ pub fn export_index_of_declarations(
 /// rest of the traversal is identical, so the two entry points below wrap this
 /// rather than duplicating it.
 fn resolve_imported_export_from_binder_with_mode(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
@@ -625,7 +609,7 @@ fn resolve_imported_export_from_binder_with_mode(
 }
 
 pub fn resolve_imported_export_from_binder_forward(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
@@ -634,7 +618,7 @@ pub fn resolve_imported_export_from_binder_forward(
 }
 
 pub fn resolve_imported_export_from_binder(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     binder: &ImportBinder,
     reference: &str,
@@ -789,7 +773,7 @@ fn forward_exported_module_fqn(
 }
 
 pub fn build_reference_context_with_progress(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     forward: bool,
     progress: &dyn Fn() -> bool,
@@ -876,7 +860,7 @@ pub fn build_reference_context_with_progress(
 }
 
 fn canonical_export_fqn_with_progress(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     module_specifier: &str,
     name: &str,
@@ -893,7 +877,7 @@ fn canonical_export_fqn_with_progress(
 /// specifier route the invariant `resolve_module_files` once instead of once
 /// per name (#1230 item 4).
 fn canonical_export_fqn_from_files(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     module_files: &[ProjectFile],
     name: &str,
     forward: bool,
@@ -908,7 +892,7 @@ fn canonical_export_fqn_from_files(
 }
 
 pub fn forward_export_fqn_from_files(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     module_files: &[ProjectFile],
     name: &str,
 ) -> Option<String> {
@@ -941,7 +925,7 @@ pub fn forward_export_fqn_from_files(
 }
 
 fn insert_namespace_export_bindings(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     local: &str,
     module_specifier: &str,
@@ -971,7 +955,7 @@ fn insert_namespace_export_bindings(
 }
 
 fn collect_glob_reference_bindings(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     module_specifier: &str,
     forward: bool,
@@ -1000,7 +984,7 @@ fn collect_glob_reference_bindings(
 }
 
 fn insert_reexport_reference_bindings(
-    rust: &dyn RustUsageSource,
+    rust: &dyn RustFactSource,
     file: &ProjectFile,
     named: &mut HashMap<String, String>,
     forward: bool,

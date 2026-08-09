@@ -41,6 +41,63 @@ pub enum RustVisibility {
     InPath(Vec<String>),
 }
 
+/// The `#[cfg(...)]` predicate guarding one item, reduced to the shapes two
+/// items can be PROVEN to exclude each other by.
+///
+/// Anything richer than a bare atom or its negation is [`Self::Unknown`], which
+/// proves nothing: the reduction exists only so that `#[cfg(feature = "x")]`
+/// and `#[cfg(not(feature = "x"))]` can be recognized as alternatives of one
+/// declaration rather than as an ambiguity between two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustCfgCondition {
+    Always,
+    Atom(String),
+    NotAtom(String),
+    Unknown,
+}
+
+impl RustCfgCondition {
+    pub fn proven_mutually_exclusive(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Atom(left), Self::NotAtom(right)) | (Self::NotAtom(left), Self::Atom(right))
+                if left == right
+        )
+    }
+}
+
+/// The `cfg_condition` column of `rust_import_targets`.
+///
+/// Text for the same reason [`encode_rust_visibility`] is: the atom carries a
+/// predicate spelling, and a readable column keeps the row inspectable with
+/// plain SQL. `atom ` and `not ` are prefixes no bare keyword collides with, so
+/// the encoding round-trips exactly.
+pub fn encode_rust_cfg_condition(condition: &RustCfgCondition) -> String {
+    match condition {
+        RustCfgCondition::Always => "always".to_string(),
+        RustCfgCondition::Unknown => "unknown".to_string(),
+        RustCfgCondition::Atom(atom) => format!("atom {atom}"),
+        RustCfgCondition::NotAtom(atom) => format!("not {atom}"),
+    }
+}
+
+/// Inverse of [`encode_rust_cfg_condition`]. `None` only for text this build did
+/// not write.
+pub fn decode_rust_cfg_condition(encoded: &str) -> Option<RustCfgCondition> {
+    match encoded {
+        "always" => Some(RustCfgCondition::Always),
+        "unknown" => Some(RustCfgCondition::Unknown),
+        _ => encoded
+            .strip_prefix("atom ")
+            .map(|atom| RustCfgCondition::Atom(atom.to_string()))
+            .or_else(|| {
+                encoded
+                    .strip_prefix("not ")
+                    .map(|atom| RustCfgCondition::NotAtom(atom.to_string()))
+            }),
+    }
+}
+
 /// A `macro_rules!` definition written at an item position, with the byte range
 /// over which its name is in scope.
 ///
@@ -79,7 +136,15 @@ pub struct RustImportTargetFact {
     /// The final written segment. `None` for a glob.
     pub imported_name: Option<String>,
     pub is_glob: bool,
+    /// True for `extern crate name as alias;`, which binds only a namespace.
+    /// A plain `use name as alias;` is written identically in every other
+    /// stored column, so the distinction cannot be recovered by the reader.
+    pub is_extern_crate: bool,
     pub visibility: RustVisibility,
+    /// The `#[cfg(...)]` predicate on the `use` declaration that introduced this
+    /// binding. Two bindings of one name under proven-disjoint conditions are
+    /// alternatives, not an ambiguity.
+    pub cfg_condition: RustCfgCondition,
     /// Enclosing module relative to the file root; empty at the root.
     pub owner_module: String,
     pub owner_start: usize,
@@ -315,6 +380,23 @@ mod tests {
                 decode_rust_include_binding_kind(encoded),
                 Some(kind),
                 "{kind:?} encoded as {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_cfg_condition_encoding_round_trips() {
+        for condition in [
+            RustCfgCondition::Always,
+            RustCfgCondition::Unknown,
+            RustCfgCondition::Atom("feature = \"query_apply\"".to_string()),
+            RustCfgCondition::NotAtom("feature = \"query_apply\"".to_string()),
+        ] {
+            let encoded = encode_rust_cfg_condition(&condition);
+            assert_eq!(
+                decode_rust_cfg_condition(&encoded),
+                Some(condition.clone()),
+                "{condition:?} encoded as {encoded}"
             );
         }
     }

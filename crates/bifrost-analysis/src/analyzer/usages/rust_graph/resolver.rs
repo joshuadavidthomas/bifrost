@@ -1,7 +1,7 @@
 //! The analysis-side half of Rust's usage-graph resolver.
 //!
 //! The resolver itself is [`brokk_bifrost_rust::graph::resolver`]; it resolves
-//! through `RustUsageSource` and a `RustDefinitionProvider` and names no
+//! through `RustFactSource` and a `RustDefinitionProvider` and names no
 //! analyzer type. What stays here is the two `RustDefinitionProvider` impls
 //! for analysis-owned declaration indexes -- the whole-workspace
 //! [`GlobalUsageDefinitionIndex`] the graph builds against, and the bounded

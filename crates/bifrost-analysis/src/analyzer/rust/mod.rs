@@ -13,7 +13,6 @@ mod imports;
 mod rustdoc_artifact;
 mod semantic;
 mod structural;
-mod usage_index;
 #[cfg(test)]
 mod usage_queries_tests;
 #[cfg(test)]
@@ -96,8 +95,7 @@ pub use brokk_bifrost_rust::lexical_scope::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
-use brokk_bifrost_rust::usage_index::RustUsageIndex;
-pub(crate) use brokk_bifrost_rust::usage_index::{
+pub(crate) use brokk_bifrost_rust::usage::{
     RustBindingSeeds, RustReferenceNamespace, usage_binding_local_names, usage_binding_names,
     usage_binding_seeds, usage_candidate_files_while, usage_crate_export_targets,
     usage_declaration_visible_at, usage_exact_root_for_resolution, usage_has_exact_scoped_binding,
@@ -145,7 +143,6 @@ pub struct RustAnalyzer {
     /// analyzer stays small: nine `Cache` handles inline would make this struct
     /// the outsized variant of `AnalyzerDelegate`.
     walk_caches: Arc<RustWalkCaches>,
-    usage_index: Arc<PoolSafeMemo<RustUsageIndex>>,
     hierarchy_index: Arc<OnceLock<RustHierarchyIndex>>,
     #[allow(dead_code)]
     type_relations: Arc<OnceLock<Vec<TypeRelation>>>,
@@ -542,7 +539,6 @@ impl RustAnalyzer {
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
-            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -582,7 +578,6 @@ impl RustAnalyzer {
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(memo_budget)),
-            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         })
@@ -677,43 +672,6 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
     }
 }
 
-impl brokk_bifrost_rust::graph_support::RustUsageSource for RustAnalyzer {
-    fn usage_index(&self) -> Arc<RustUsageIndex> {
-        self.usage_index()
-    }
-
-    fn usage_index_while(
-        &self,
-        keep_going: &(dyn Fn() -> bool + Sync),
-    ) -> Option<Arc<RustUsageIndex>> {
-        self.usage_index_while(keep_going)
-    }
-
-    fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
-        self.reference_context_of(file)
-    }
-
-    fn reference_context_of_with_progress(
-        &self,
-        file: &ProjectFile,
-        progress: &dyn Fn() -> bool,
-    ) -> Option<Arc<RustReferenceContext>> {
-        self.reference_context_of_with_progress(file, progress)
-    }
-
-    fn forward_reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
-        self.forward_reference_context_of(file)
-    }
-
-    fn forward_reference_context_of_with_progress(
-        &self,
-        file: &ProjectFile,
-        progress: &dyn Fn() -> bool,
-    ) -> Option<Arc<RustReferenceContext>> {
-        self.forward_reference_context_of_with_progress(file, progress)
-    }
-}
-
 /// The live file-to-blob mapping, handed to `brokk-bifrost-rust` as an
 /// object-safe view because `LiveSnapshot` is an analysis-side type.
 struct LiveSnapshotBlobs(Arc<crate::analyzer::store::liveness::LiveSnapshot>);
@@ -781,6 +739,30 @@ impl RustFactSource for RustAnalyzer {
 
     fn ensure_rust_facts_caught_up(&self) {
         self.ensure_rust_facts_caught_up();
+    }
+
+    fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
+        self.reference_context_of(file)
+    }
+
+    fn reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>> {
+        self.reference_context_of_with_progress(file, progress)
+    }
+
+    fn forward_reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
+        self.forward_reference_context_of(file)
+    }
+
+    fn forward_reference_context_of_with_progress(
+        &self,
+        file: &ProjectFile,
+        progress: &dyn Fn() -> bool,
+    ) -> Option<Arc<RustReferenceContext>> {
+        self.forward_reference_context_of_with_progress(file, progress)
     }
 }
 
@@ -1003,20 +985,22 @@ impl IAnalyzer for RustAnalyzer {
         self.inner.compute_cognitive_complexities(file)
     }
 
-    /// The type-hierarchy and usage indexes each take double-digit seconds to
-    /// build on large workspaces; every other lazy cache on this analyzer
-    /// fills incrementally at acceptable cost. Warm them sequentially from
-    /// the calling thread rather than under `rayon::join`: each build
-    /// parallelizes internally, and running the accessors on pool workers
-    /// would both demote the usage build to its serial pool-safe path and
-    /// block a worker inside the hierarchy `OnceLock` init.
+    /// The hierarchy index still takes double-digit seconds to build on a large
+    /// workspace; the Rust usage side no longer builds anything, so its warm is
+    /// the fact catch-up, which finds nothing to do on a workspace analysis
+    /// already persisted. The two run on separate threads because neither may
+    /// wait on the other: on a 401k-file workspace the hierarchy build had not
+    /// returned sixteen minutes in (#1757), and a usage query must not inherit
+    /// that wait.
     fn warm_query_indexes(&self) {
-        self.hierarchy_index();
-        self.usage_index();
+        std::thread::scope(|scope| {
+            scope.spawn(|| self.warm_usage_facts());
+            self.hierarchy_index();
+        });
     }
 
     fn query_indexes_warm(&self) -> bool {
-        self.hierarchy_index.get().is_some() && self.usage_index.is_ready()
+        self.hierarchy_index.get().is_some() && self.rust_usage_facts_warm()
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
@@ -1047,7 +1031,6 @@ impl IAnalyzer for RustAnalyzer {
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(self.memo_budget)),
-            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -1077,7 +1060,6 @@ impl IAnalyzer for RustAnalyzer {
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
             fact_catch_up: Arc::new(fact_catch_up::RustFactCatchUp::new()),
             walk_caches: Arc::new(RustWalkCaches::new(self.memo_budget)),
-            usage_index: Arc::new(PoolSafeMemo::new()),
             hierarchy_index: Arc::new(OnceLock::new()),
             type_relations: Arc::new(OnceLock::new()),
         }
@@ -1384,7 +1366,7 @@ impl LanguageSupport for RustSupport {
         // request-scoped memoization; without a scope each lookup re-hydrates
         // (observed ~65s instead of ~3.5s on the Bifrost workspace).
         let _scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
-        rust.warm_usage_analysis();
+        rust.warm_usage_facts();
     }
 
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {

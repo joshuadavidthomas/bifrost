@@ -11,23 +11,10 @@ use crate::imports::{
     rust_import_body, rust_imports_from_use_declaration, split_rust_import_module_and_name,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RustCfgCondition {
-    Always,
-    Atom(String),
-    NotAtom(String),
-    Unknown,
-}
-
-impl RustCfgCondition {
-    pub fn proven_mutually_exclusive(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (Self::Atom(left), Self::NotAtom(right)) | (Self::NotAtom(left), Self::Atom(right))
-                if left == right
-        )
-    }
-}
+/// Re-exported from core, where the persisted `rust_import_targets` row shape
+/// that carries it lives. Kept spelled here because every reader of a cfg
+/// predicate reaches it through the lexical-scope surface that computes one.
+pub use brokk_bifrost_core::analyzer::rust_facts::RustCfgCondition;
 
 pub fn rust_cfg_condition(node: Node<'_>, source: &str) -> RustCfgCondition {
     let mut condition = RustCfgCondition::Always;

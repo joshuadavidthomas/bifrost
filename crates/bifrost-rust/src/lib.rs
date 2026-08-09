@@ -12,7 +12,7 @@
 //! `TreeSitterAnalyzer`, or `RustAnalyzer`.
 //!
 //! Where analysis code would reach for an analyzer handle, the functions here
-//! take `graph_support::RustSource` (or `RustUsageSource` once the usage
+//! take `graph_support::RustSource` (or `RustFactSource` once the usage
 //! index exists) -- a core [`brokk_bifrost_core::analyzer::CodeUnitIndex`] plus
 //! the memoized per-file products Rust resolves through. `analyzer/rust/` in
 //! `brokk-bifrost-analysis` keeps the shim: the `RustAnalyzer` newtype and its
@@ -39,6 +39,5 @@ pub mod structural;
 pub mod test_detection;
 pub mod usage;
 pub mod usage_includes;
-pub mod usage_index;
 pub mod usage_queries;
 pub mod usage_walks;

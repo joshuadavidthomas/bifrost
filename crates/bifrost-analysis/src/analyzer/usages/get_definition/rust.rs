@@ -23,7 +23,7 @@ use brokk_bifrost_rust::field_roles::{
     RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
 };
 use brokk_bifrost_rust::graph_support::{
-    RustSource, RustUsageSource, is_rust_export_visible_declaration,
+    RustFactSource, RustSource, is_rust_export_visible_declaration,
     is_rust_macro_export_declaration, is_rust_trait_declaration,
     is_rust_trait_impl_member_declaration,
 };
@@ -96,7 +96,7 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
 
     fn forward_reference_context(
         &self,
-        rust: &dyn RustUsageSource,
+        rust: &dyn RustFactSource,
         file: &ProjectFile,
     ) -> Option<std::sync::Arc<RustReferenceContext>> {
         match self.session {

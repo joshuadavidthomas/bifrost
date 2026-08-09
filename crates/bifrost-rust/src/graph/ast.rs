@@ -8,7 +8,7 @@
 //! callers.
 
 use crate::declarations::RUST_IDENTIFIER_SIGIL;
-use crate::usage_index::RustReferenceNamespace;
+use crate::usage::RustReferenceNamespace;
 use brokk_bifrost_core::analyzer::common::node_ident_text;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use tree_sitter::Node;

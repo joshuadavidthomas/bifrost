@@ -8,7 +8,7 @@
 //! accessors, so the functions below reach back for the memoized products they
 //! need without naming the analyzer type.
 //!
-//! One tier is enough here, unlike Rust's `RustSource`/`RustUsageSource`
+//! One tier is enough here, unlike Rust's `RustSource`/`RustFactSource`
 //! split: no `OnceLock` in the C# memo web re-enters the cell it is filling.
 //! The deepest recursion, `visible_type_candidates_with_lookups`, was already
 //! written as a function of its injected lookups and stays that way -- it needs
