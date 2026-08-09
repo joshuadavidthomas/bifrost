@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use crate::analyzer::java::imports::JavaTypeResolution;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
-use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
+use crate::analyzer::jvm::external::{JvmExternalDeclarationIndex, JvmExternalDeclarations};
 use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier};
 pub(crate) use adapter::JavaAdapter;
@@ -216,8 +216,16 @@ impl JavaAnalyzer {
         resolve_java_forward_type_name_candidates(self, file, raw_name)
     }
 
-    pub fn is_known_type_name_in_file(&self, file: &ProjectFile, raw_name: &str) -> bool {
-        self.resolve_type_name_with_external(file, raw_name)
+    /// Whether `raw_name` names a type this file can see, in the workspace or
+    /// past it. `packs` is the dispatching analyzer's activated overlay; see
+    /// [`JavaAnalyzer::resolve_type_name_with_external`].
+    pub fn is_known_type_name_in_file(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> bool {
+        self.resolve_type_name_with_external(packs, file, raw_name)
             .is_some()
     }
 
@@ -228,27 +236,32 @@ impl JavaAnalyzer {
     /// How far a lookup for `name` from `file` could see past the workspace,
     /// and the external type it landed on when it landed on one.
     ///
-    /// This reads the external declaration index that the resolver itself
-    /// consults; it performs no new resolution and cannot change one. The three
+    /// This reads the external declaration surface that the resolver itself
+    /// consults -- the jar index and the activated packs' declaration facts --
+    /// and performs no new resolution, so it cannot change one. The three
     /// answers it distinguishes are the ones a single "unresolvable import"
     /// bucket cannot: the name is externally indexed, the build declared
     /// artifacts the index could not finish reading (so the name may be there),
     /// or nothing is known.
     pub(crate) fn external_boundary_evidence(
         &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
-        let external = self.external_declaration_index();
         if let Some(JavaTypeResolution::External(external_type)) =
-            self.resolve_type_name_with_external(file, name)
+            self.resolve_type_name_with_external(packs, file, name)
         {
             return (
                 BoundaryStatus::ExternalIndexed,
                 Some(external_type.fqn().to_owned()),
             );
         }
-        if external.production_diagnostic_count() > 0 {
+        if self
+            .external_declaration_index()
+            .production_diagnostic_count()
+            > 0
+        {
             return (BoundaryStatus::ExternalDeclaredUnindexed, None);
         }
         (BoundaryStatus::ExternalUnknown, None)
@@ -258,6 +271,16 @@ impl JavaAnalyzer {
         self.external_index.get_or_init(|| {
             JvmExternalDeclarationIndex::build_for_project(&self.java_config, self.inner.project())
         })
+    }
+
+    /// The external declaration surface Java resolution reads: this analyzer's
+    /// jar-backed index plus the declaration facts the activated semantic packs
+    /// publish (#1893).
+    pub(crate) fn external_declarations(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> JvmExternalDeclarations<'_> {
+        JvmExternalDeclarations::new(self.external_declaration_index(), packs)
     }
 
     pub(crate) fn bulk_file_states(
@@ -336,14 +359,6 @@ impl JavaSource for JavaAnalyzer {
 
     fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>> {
         self.inner.prepared_syntax(file)
-    }
-
-    fn external_boundary_evidence(
-        &self,
-        file: &ProjectFile,
-        name: &str,
-    ) -> (BoundaryStatus, Option<String>) {
-        JavaAnalyzer::external_boundary_evidence(self, file, name)
     }
 
     fn retained_external_index(&self) -> JvmRetainedExternalIndex {

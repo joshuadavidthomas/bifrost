@@ -70,7 +70,7 @@ use brokk_bifrost_jvm::kotlin::syntax;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
-use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
+use crate::analyzer::jvm::external::{JvmExternalDeclarationIndex, JvmExternalDeclarations};
 use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
@@ -260,19 +260,34 @@ impl KotlinAnalyzer {
         })
     }
 
+    /// The external declaration surface Kotlin resolution reads: the shared
+    /// jar-backed index plus the declaration facts the activated semantic packs
+    /// publish (#1893).
+    ///
+    /// `packs` is the *dispatching* analyzer's overlay; see
+    /// [`crate::analyzer::JavaAnalyzer::resolve_type_name_with_external`] on
+    /// why activation state arrives as a parameter.
+    pub(crate) fn external_declarations(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> JvmExternalDeclarations<'_> {
+        JvmExternalDeclarations::new(self.external_declaration_index(), packs)
+    }
+
     /// How far a lookup for `name` from `file` could see past the workspace,
     /// and the external type it landed on when it landed on one.
     ///
     /// The JVM half of boundary refinement, mirroring
     /// `JavaAnalyzer::external_boundary_evidence`: the name is resolved through
-    /// Kotlin's own import ladder against the shared jar-backed external
-    /// declaration index, so the trace classifies a spelling exactly as the
+    /// Kotlin's own import ladder against the shared external declaration
+    /// surface, so the trace classifies a spelling exactly as the
     /// resolver would see it. A hit is [`BoundaryStatus::ExternalIndexed`] with
     /// the resolved external type; a miss against an index whose producers
     /// reported truncation is [`BoundaryStatus::ExternalDeclaredUnindexed`],
     /// because the build declared artifacts the index never finished reading.
     pub(crate) fn external_boundary_evidence(
         &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
@@ -280,7 +295,7 @@ impl KotlinAnalyzer {
             KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name,
         };
 
-        let external = self.external_declaration_index();
+        let external = self.external_declarations(packs);
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
         let imports = self.inner.import_info_of(file);
         let scope = KotlinNameScope {
@@ -304,7 +319,11 @@ impl KotlinAnalyzer {
             KotlinTypeName::Ambiguous => return (BoundaryStatus::ExternalIndexed, None),
             KotlinTypeName::Unresolved => {}
         }
-        if external.production_diagnostic_count() > 0 {
+        if self
+            .external_declaration_index()
+            .production_diagnostic_count()
+            > 0
+        {
             return (BoundaryStatus::ExternalDeclaredUnindexed, None);
         }
         (BoundaryStatus::ExternalUnknown, None)
