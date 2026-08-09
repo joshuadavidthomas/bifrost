@@ -104,6 +104,16 @@ moka's caller tree is not attributable from this profile (30.1% of window A is a
 all-moka truncated stack), so no intervention is sized here; a frame-pointer build
 must come first.
 
+**Disposition of the moka question (2026-08-09, m15): CLOSED, the share is not the
+cost.** Migrating all 49 generation-lifetime memo caches off moka onto a sharded
+`RwLock<HashMap>` collapsed moka+crossbeam from 38.05% of window A to **0.03%** and made
+the same answering cell **41-66% slower** (wall 781 -> 1,102-1,299 s, sys +82%, voluntary
+context switches +100%, `locking` 2.58% -> 8.56%); it was reverted at `1ecef87b`. moka's
+per-hit machinery is largely the price of a lock-free read path plus an eviction order
+that matters at these budgets (16-32 MiB over 35,370 files), and the profile could not
+have shown that because `exclude_kernel: 1` hides the blocking a locked map substitutes.
+Full audit, both A/B rounds and the two untested candidates: `moka-migration-v1.md`.
+
 ## Stage 2 - interned file IDs (NOT WARRANTED; the gate above closed it)
 
 Per-generation interner: the workspace listing is already a sorted `BTreeSet`; assign
