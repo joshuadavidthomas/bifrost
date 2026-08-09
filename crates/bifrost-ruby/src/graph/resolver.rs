@@ -256,6 +256,32 @@ impl<'a> RubySemanticIndex<'a> {
         )
     }
 
+    /// Whether the workspace declares the constant path `node` spells anywhere
+    /// at all, ignoring which files the referencing file can reach.
+    ///
+    /// [`Self::resolve_constant`] answers the navigation question -- can this
+    /// file reach the declaration -- and a cross-workspace boundary claim must
+    /// not be built on it. A project file that declares the constant without
+    /// being required is still a workspace declaration, and reporting the
+    /// reference as leaving the workspace would be false. This is the weaker,
+    /// visibility-blind question such a claim has to ask first.
+    pub fn declares_constant_anywhere(
+        &self,
+        lexical_stack: &[String],
+        node: Node<'_>,
+        source: &str,
+    ) -> bool {
+        let path = extract_name_path(node, source);
+        let Some(candidates) =
+            constant_lookup_candidates(lexical_stack, &path.segments, path.absolute)
+        else {
+            return false;
+        };
+        candidates
+            .iter()
+            .any(|candidate| self.graph.index.definitions(candidate).next().is_some())
+    }
+
     pub fn resolve_constant_name(
         &self,
         file: &ProjectFile,

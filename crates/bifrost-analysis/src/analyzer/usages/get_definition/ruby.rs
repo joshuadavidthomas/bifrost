@@ -1143,15 +1143,46 @@ fn ruby_constant_outcome(
     source: &str,
 ) -> DefinitionLookupOutcome {
     let raw = ruby_node_text(node, source);
-    let Some(unit) =
+    if let Some(unit) =
         semantic.resolve_constant(file, visible_files, &context.lexical_stack, node, source)
-    else {
-        return no_definition(
-            "no_indexed_definition",
-            format!("`{raw}` did not resolve to an indexed Ruby definition"),
-        );
+    {
+        return candidates_outcome(vec![unit]);
+    }
+    // `ruby_constant_path_leaves_the_workspace` fuses the qualified-path shape
+    // with the workspace-declaration check, so its negation is the
+    // workspace-internal gate.
+    gated_boundary(
+        || !ruby_constant_path_leaves_the_workspace(semantic, context, node, source),
+        format!("`{raw}` appears to cross a Ruby gem boundary not indexed in this workspace"),
+        "no_indexed_definition",
+        format!("`{raw}` did not resolve to an indexed Ruby definition"),
+    )
+}
+
+/// Whether an unresolved constant reference routes out of the workspace.
+///
+/// Only an explicitly qualified path (`Widget::Config`) can say so, which is
+/// the same candidate shape Ruby's proof-gated diagnostics judge. Ruby's
+/// top-level constant surface includes the core library, everything `Object`
+/// inherits, and whatever every loaded gem defined as a side effect, none of
+/// which Bifrost publishes, so a bare constant that misses proves nothing about
+/// where the name lives (#1624).
+///
+/// The owner is then checked against the workspace's own declarations
+/// regardless of which files this one can reach. That is the #1089
+/// workspace-namespace gate: a project file may declare `Widget` without this
+/// file requiring it, and an unreached workspace declaration is a plain miss,
+/// never a route out of the workspace.
+fn ruby_constant_path_leaves_the_workspace(
+    semantic: &RubySemanticIndex<'_>,
+    context: &RubyLookupContext<'_>,
+    node: Node<'_>,
+    source: &str,
+) -> bool {
+    let Some(owner) = node.child_by_field_name("scope") else {
+        return false;
     };
-    candidates_outcome(vec![unit])
+    !semantic.declares_constant_anywhere(&context.lexical_stack, owner, source)
 }
 
 fn ruby_autoload_symbol_outcome(

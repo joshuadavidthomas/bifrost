@@ -1036,14 +1036,13 @@ mod tests {
 /// `external_declared_unindexed` for a declared-but-unindexed dependency,
 /// instead of the unconditional `external_unknown` the wildcard used to give.
 ///
-/// Scala, C#, and PHP are driven end-to-end through
+/// Every arm here is driven end-to-end through
 /// [`resolve_definition_batch_with_trace`], the same entry the occurrence-rows
-/// acceptance tests for Python and TypeScript use underneath: the real
-/// resolver draws the boundary and `finish_boundary` refines it. Kotlin and
-/// Ruby exercise [`boundary_evidence`] directly, because their resolvers do
-/// not yet emit `UnresolvableImportBoundary` outcomes (they answer
-/// `no_definition` at the same seam), so no trace can carry their boundary
-/// rows end-to-end until they do.
+/// acceptance tests for Python and TypeScript use underneath: the real resolver
+/// draws the boundary and `finish_boundary` refines it. Each language that
+/// draws one is also tested for the case it must *not* draw: a name whose
+/// failing segment stays inside the workspace answers `no_definition` with no
+/// route row at all (#1889).
 #[cfg(test)]
 mod boundary_evidence_tests {
     use super::*;
@@ -1118,28 +1117,45 @@ mod boundary_evidence_tests {
             .pop()
             .expect("one traced outcome per request")
         }
-
-        fn evidence(&self, name: &str) -> (BoundaryStatus, Option<String>) {
-            boundary_evidence(self.workspace.analyzer(), &self.file, name)
-        }
     }
 
     /// The external-route rows of one trace: `(boundary, external_target)`.
     /// Empty means the resolver never drew a boundary, which fails the test
     /// asking about one.
     fn external_routes(trace: &ResolutionTraceResult) -> Vec<(BoundaryStatus, Option<String>)> {
-        let routes: Vec<_> = trace
-            .candidates
-            .iter()
-            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
-            .map(|row| (row.boundary, row.external_target.clone()))
-            .collect();
+        let routes: Vec<_> = route_rows(trace);
         assert!(
             !routes.is_empty(),
             "a boundary outcome always reports the route it took: {:?}",
             trace.candidates
         );
         routes
+    }
+
+    fn route_rows(trace: &ResolutionTraceResult) -> Vec<(BoundaryStatus, Option<String>)> {
+        trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .map(|row| (row.boundary, row.external_target.clone()))
+            .collect()
+    }
+
+    /// A reference whose failing segment stays inside the workspace: the status
+    /// is a plain miss and the trace carries no route out of the workspace.
+    fn assert_no_boundary_was_drawn(needle: &str, fixture: &BoundaryFixture) {
+        let (outcome, trace) = fixture.trace(needle);
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::NoDefinition,
+            "an in-workspace miss stays a plain no-definition: {:?}",
+            outcome.diagnostics
+        );
+        assert!(
+            route_rows(&trace).is_empty(),
+            "an in-workspace miss reports no route out of the workspace: {:?}",
+            trace.candidates
+        );
     }
 
     /// A discovery outcome declaring exactly `modules` for `language`, in the
@@ -1556,9 +1572,7 @@ mod boundary_evidence_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Kotlin: the classifier directly. `resolve_kotlin` answers
-    // `no_definition` where other resolvers draw a boundary, so no trace can
-    // reach the Kotlin arm end-to-end yet.
+    // Kotlin: end-to-end through the resolver's own boundary outcome (#1889).
     // -----------------------------------------------------------------------
 
     const KOTLIN_BOUNDARY_SOURCE: &str = concat!(
@@ -1570,7 +1584,7 @@ mod boundary_evidence_tests {
     );
 
     #[test]
-    fn kotlin_boundary_evidence_resolves_an_indexed_import_through_the_jvm_index() {
+    fn a_kotlin_import_of_an_indexed_external_type_reports_external_indexed() {
         let fixture = BoundaryFixture::with_config(
             Language::Kotlin,
             "app/Caller.kt",
@@ -1585,44 +1599,86 @@ mod boundary_evidence_tests {
                 jvm_config_with_source_jar(Some(jar))
             },
         );
-        assert_eq!(
-            fixture.evidence("Gadget"),
-            (
-                BoundaryStatus::ExternalIndexed,
-                Some("com.acme.Gadget".to_owned())
-            )
+        let (_, trace) = fixture.trace("Gadget? = null");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("com.acme.Gadget")
+            }),
+            "the jar index resolves `Gadget` through the explicit import: {routes:?}"
         );
     }
 
     #[test]
-    fn kotlin_boundary_evidence_reports_a_declared_unread_dependency() {
+    fn a_kotlin_import_of_a_declared_unread_dependency_reports_declared_unindexed() {
         let fixture = BoundaryFixture::with_config(
             Language::Kotlin,
             "app/Caller.kt",
             KOTLIN_BOUNDARY_SOURCE,
             |_| jvm_config_with_source_jar(None),
         );
-        assert_eq!(
-            fixture.evidence("Gadget"),
-            (BoundaryStatus::ExternalUnknown, None),
-            "with no index and no retained discovery, nothing is known"
+        let (_, trace) = fixture.trace("Gadget? = null");
+        assert!(
+            external_routes(&trace)
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "with no index and no retained discovery, nothing is known: {:?}",
+            trace.candidates
         );
         fixture.workspace.retain_dependency_discovery_evidence(
             &[Language::Kotlin],
             &discovery_declaring("kotlin", &["com.acme"], false),
         );
-        assert_eq!(
-            fixture.evidence("Gadget"),
-            (BoundaryStatus::ExternalDeclaredUnindexed, None)
+        let (_, trace) = fixture.trace("Gadget? = null");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
+            "a truncated JVM discovery keeps the name accountable: {routes:?}"
         );
     }
 
+    #[test]
+    fn a_kotlin_import_of_a_workspace_package_stays_a_plain_miss() {
+        // The import target is the workspace's own package, so the failing
+        // segment never leaves it and the honest answer is `no_definition`.
+        let fixture = BoundaryFixture::new(
+            Language::Kotlin,
+            "app/Caller.kt",
+            concat!(
+                "package app\n",
+                "import app.Helper\n",
+                "class Caller {\n",
+                "  fun build(): Helper? = null\n",
+                "}\n",
+            ),
+        );
+        assert_no_boundary_was_drawn("Helper? = null", &fixture);
+    }
+
+    #[test]
+    fn a_kotlin_reference_with_no_import_at_all_stays_a_plain_miss() {
+        let fixture = BoundaryFixture::new(
+            Language::Kotlin,
+            "app/Caller.kt",
+            concat!(
+                "package app\n",
+                "class Caller {\n",
+                "  fun build(): Helper? = null\n",
+                "}\n",
+            ),
+        );
+        assert_no_boundary_was_drawn("Helper? = null", &fixture);
+    }
+
     // -----------------------------------------------------------------------
-    // Ruby: the classifier directly, for the same reason as Kotlin.
+    // Ruby: end-to-end through the resolver's own boundary outcome (#1889).
     // -----------------------------------------------------------------------
 
     #[test]
-    fn ruby_boundary_evidence_resolves_an_activated_gem_constant() {
+    fn a_ruby_reference_to_an_indexed_gem_constant_reports_external_indexed() {
         use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
 
         let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Widget::Config\n");
@@ -1643,27 +1699,60 @@ mod boundary_evidence_tests {
             ),
             activation_evidence("ruby", "rubygems", "widget"),
         );
-        assert_eq!(
-            fixture.evidence("Widget::Config"),
-            (BoundaryStatus::ExternalIndexed, Some(type_id))
+        let (_, trace) = fixture.trace("Config");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some(type_id.as_str())
+            }),
+            "the activated pack publishes `Widget::Config`: {routes:?}"
         );
     }
 
     #[test]
-    fn ruby_boundary_evidence_reports_a_declared_unread_gem() {
+    fn a_ruby_reference_into_a_declared_unread_gem_reports_declared_unindexed() {
         let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Widget::Config\n");
-        assert_eq!(
-            fixture.evidence("Widget::Config"),
-            (BoundaryStatus::ExternalUnknown, None),
-            "with no overlay and no retained discovery, nothing is known"
+        let (_, trace) = fixture.trace("Config");
+        assert!(
+            external_routes(&trace)
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "with no overlay and no retained discovery, nothing is known: {:?}",
+            trace.candidates
         );
         fixture.workspace.retain_dependency_discovery_evidence(
             &[Language::Ruby],
             &discovery_declaring("ruby", &["widget"], false),
         );
-        assert_eq!(
-            fixture.evidence("Widget::Config"),
-            (BoundaryStatus::ExternalDeclaredUnindexed, None)
+        let (_, trace) = fixture.trace("Config");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalDeclaredUnindexed),
+            "a truncated gem discovery keeps the name accountable: {routes:?}"
         );
+    }
+
+    #[test]
+    fn a_ruby_path_under_a_workspace_namespace_stays_a_plain_miss() {
+        // `Widget` is a workspace module, so the miss is inside the workspace
+        // however the path continues.
+        let fixture = BoundaryFixture::new(
+            Language::Ruby,
+            "app.rb",
+            concat!("module Widget\n", "end\n", "\n", "Widget::Missing\n"),
+        );
+        assert_no_boundary_was_drawn("Missing", &fixture);
+    }
+
+    #[test]
+    fn a_bare_ruby_constant_never_draws_a_boundary() {
+        // Ruby's top-level surface includes the core library and everything a
+        // loaded gem defines as a side effect, none of which Bifrost publishes,
+        // so a bare miss says nothing about where the name lives (#1624).
+        let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Missing\n");
+        assert_no_boundary_was_drawn("Missing", &fixture);
     }
 }
