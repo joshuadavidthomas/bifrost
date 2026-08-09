@@ -236,9 +236,7 @@ fn issue_1748_a_scan_reports_time_budget_when_the_hierarchy_build_runs_out() {
         .map(|entry| entry.incomplete_reason)
         .collect();
     assert!(
-        reasons
-            .iter()
-            .any(|reason| *reason == Some(ScanUsagesIncompleteReason::TimeBudget)),
+        reasons.contains(&Some(ScanUsagesIncompleteReason::TimeBudget)),
         "an out-of-budget scan must report time_budget: {reasons:?}"
     );
 }

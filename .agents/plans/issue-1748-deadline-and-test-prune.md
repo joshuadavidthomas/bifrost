@@ -90,9 +90,12 @@ only from test-gated code.
 - [x] (2026-08-09) Milestone 4: `candidates.rs` / `finder.rs` / `scan_usages.rs` carry the
       scope, so the request's deadline and its `include_tests` answer both reach the build.
 - [x] (2026-08-09) Milestone 5: tests, with fail-before evidence recorded below.
-- [x] (2026-08-09) Milestone 6: gate (fmt, nextest workspace, doctests, all-features clippy).
-- [x] (2026-08-09) Milestone 7: reproducer measurement, or the recorded reason it could not
-      be run on this host.
+- [x] (2026-08-09) Milestone 6: gate. `cargo nextest run --workspace --all-targets
+      --no-fail-fast` is 9936 run / 9936 passed / 0 failed, 42 skipped, in 282 s; doctests
+      18 targets, 0 failures; `cargo fmt` clean; all-features clippy clean after one fix
+      (a redundant closure the first run caught).
+- [x] (2026-08-09) Milestone 7: reproducer measurement on the llvm-project clone; see
+      `Artifacts and Notes`.
 
 ## Surprises & Discoveries
 
@@ -212,7 +215,38 @@ only from test-gated code.
 
 ## Outcomes & Retrospective
 
-See the entry at the end of this document, written at completion.
+Written 2026-08-09, at completion of both fixes.
+
+What was achieved. A `scan_usages_by_reference` request that runs out of its
+`max_duration_secs` now ends with a structured `time_budget` verdict and whatever sites it
+proved, instead of running until something else kills the call. Measured on the
+llvm-project clone that produced the incident: the request the issue records as a 1,200 s
+transport error now returns in 44.6 s of process wall -- of which roughly 22 s is workspace
+binding outside the scan's budget entirely -- carrying `incomplete_reason: time_budget`.
+Every whole-workspace descendant-index build in the tree except Rust's and Go's now polls a
+deadline, and every one of them publishes nothing when it stops. An `include_tests: false`
+request no longer inverts the ancestor relation over classes it has already excluded: on the
+test fixture that is exactly the 20 test headers, and on the incident workspace it is 52.3%
+of the include-closure builds.
+
+What was not achieved, and should not be read into this change. The llvm query is still too
+expensive to *finish* inside 30 s -- the honest reading of a `time_budget` verdict is that
+the answer is partial. This change converts an unbounded failure into a bounded partial
+answer; it does not make the query fast. The build-count and cache-pressure cut from Fix B
+is measured; the *time* cut is not claimed, because the excluded closures are mostly trivial
+(the trace's test files walk one file each in 0.1-0.3 ms) and the expensive closures are
+production headers.
+
+Lessons. First, the deadline was never missing -- it was present, correct, and composed all
+the way to one trait call that had no parameter for it. The whole fix is a parameter, and the
+reason it took a design was deciding what a stopped build publishes, not how to pass a token.
+Second, the additive-trait-method shape was worth the slight redundancy: a required-parameter
+change would have edited roughly 150 test call sites that ask a purely structural question,
+and reviewers would have had to find the four real poll points inside that diff. Third, the
+one genuinely subtle decision was refusing to reuse the finder's `file_filter` as the
+exclusion channel; it is the conjunction of a pure predicate and an arbitrary per-request
+path scope, and a shared index keyed on "was anything excluded" would have been silently
+wrong for the second one.
 
 ## Context and Orientation
 
@@ -623,3 +657,39 @@ Fix B fail-before. `DescendantIndexScope::admits` was replaced by an uncondition
 
 65 is exactly one build per production class header: 60 subclass headers, `base.h`, and the
 four chain headers. 85 adds the 20 excluded test headers, one each.
+
+### The llvm-project reproducer
+
+The clone the campaign used is still on this host at
+`/mnt/T9/repo-clones/llvm-project--a8f3c97d` (2.7 GB, `4152de643`). Its per-repo cache is
+not: `/mnt/T9/repo-clones/.codescale-cache-perrepo-r26` holds ten other repositories and no
+llvm entry, so the workspace was indexed fresh into a throwaway cache root
+(`BIFROST_CACHE_DIR=/mnt/T9/repo-clones/.codescale-cache-issue1748`, 2.2 GB, 3 m 22 s wall /
+303 s user for the cold index). Every figure below is from the same warm cache, with
+`BIFROST_SEMANTIC_INDEX=off BIFROST_CACHE_GC=off`, one process per row, under
+`/usr/bin/time -v`:
+
+    ./target/release/bifrost --root /mnt/T9/repo-clones/llvm-project--a8f3c97d \
+      --tool scan_usages_by_reference \
+      --args '{"symbols":["llvm.EVT.isSimple"],"include_tests":false,"max_duration_secs":30}'
+
+    max_duration_secs   wall      user CPU   verdict
+    5                   27.5 s    19.6 s     failure / time_budget
+    30                  44.6 s    34.0 s     failure / time_budget
+    30 (first run)      47.3 s    37.2 s     failure / time_budget
+
+The number that matters is that the call *ends*. It ends with the structured verdict the
+machinery always had and could never reach -- `incomplete_reason: time_budget`, with the
+message telling the caller to narrow `paths` -- instead of running past twenty minutes and
+dying on the MCP host's own request budget with a transport error and no data.
+
+Read the wall clock honestly. It is process wall, not scan wall: roughly 22 s of it is
+outside the scan's budget entirely (process start, workspace binding over a 100k-file tree,
+cache open, semantic-pack activation, rendering). The budget governs the difference: raising
+it from 5 s to 30 s, a 25 s increase, moved the wall from 27.5 s to 44.6 s. The scan phase
+tracks its budget; the constant is everything around it, which is a different issue.
+
+The `time_budget` verdict also says plainly what this change does *not* do: the query is
+still too expensive to finish inside 30 s on llvm-project. Enforcing the deadline turns a
+1,200 s failure into a 30 s partial answer. Making the answer complete is the deferred work
+below.

@@ -546,7 +546,7 @@ pub fn descendants_from_variant_index(
             .cell(&scope.variant())
             // The builders are serial, so the same closure serves both memo
             // arms; the memo's value here is the non-blocking claim protocol.
-            .get_or_build_while(&scope.keep_going(), || build(), || build())?
+            .get_or_build_while(&scope.keep_going(), &build, &build)?
             .descendants(code_unit),
     )
 }
