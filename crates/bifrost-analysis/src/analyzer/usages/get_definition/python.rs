@@ -1422,12 +1422,7 @@ pub(super) fn resolve_python(
             if object_text.is_empty() || attribute_text.is_empty() {
                 return no_definition("no_reference_text", "Python attribute reference is blank");
             }
-            let object_shadowed = python_name_shadowed_at(
-                object_text,
-                tree.root_node(),
-                site.range.start_byte,
-                source,
-            );
+            let object_shadowed = python_name_shadowed_at(object_text, object, source);
             if !object_shadowed && let Some(module) = ctx.namespace_module_for_node(object, source)
             {
                 return python_fqn_outcome(
@@ -1506,7 +1501,7 @@ pub(super) fn resolve_python(
             if text.is_empty() {
                 return no_definition("no_reference_text", "Python identifier is blank");
             }
-            if python_name_shadowed_at(text, tree.root_node(), site.range.start_byte, source) {
+            if python_name_shadowed_at(text, identifier, source) {
                 return no_definition(
                     "local_variable_reference",
                     format!("`{text}` is a local Python value"),
@@ -2722,88 +2717,24 @@ fn python_import_binding_is_workspace_internal(
     python_workspace_module_exists(support, module)
 }
 
-fn python_name_shadowed_at(name: &str, root: Node<'_>, byte: usize, source: &str) -> bool {
-    let Some(scope) = python_enclosing_function(root, byte) else {
-        return false;
-    };
-    let mut locals = HashSet::default();
-    if let Some(parameters) = scope.child_by_field_name("parameters") {
-        python_collect_parameter_names(parameters, source, &mut locals);
-    }
-    if let Some(body) = scope.child_by_field_name("body") {
-        python_collect_bound_targets(body, source, &mut locals);
-    }
-    locals.contains(name)
-}
-
-fn python_enclosing_function<'tree>(root: Node<'tree>, byte: usize) -> Option<Node<'tree>> {
-    let mut best = None;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.start_byte() <= byte && byte < node.end_byte() {
-            if matches!(node.kind(), "function_definition" | "lambda") {
-                best = Some(node);
-            }
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                stack.push(child);
-            }
+fn python_name_shadowed_at(name: &str, reference: Node<'_>, source: &str) -> bool {
+    let mut current = reference;
+    while let Some(parent) = current.parent() {
+        current = parent;
+        if !matches!(current.kind(), "function_definition" | "lambda") {
+            continue;
         }
-    }
-    best
-}
-
-fn python_collect_parameter_names(params: Node<'_>, source: &str, out: &mut HashSet<String>) {
-    let mut cursor = params.walk();
-    for child in params.named_children(&mut cursor) {
-        let name = match child.kind() {
-            "identifier" => Some(child),
-            _ => child.child_by_field_name("name").or_else(|| {
-                child
-                    .named_child(0)
-                    .filter(|node| node.kind() == "identifier")
-            }),
+        let Some(inventory) = python_lexical_scope_inventory_bounded(current, source, || true)
+        else {
+            return true;
         };
-        if let Some(name) = name {
-            let text = python_slice(name, source).trim();
-            if !text.is_empty() {
-                out.insert(text.to_string());
-            }
+        match inventory.name_resolution_at(name, reference) {
+            PythonLexicalNameResolution::Local => return true,
+            PythonLexicalNameResolution::Global => return false,
+            PythonLexicalNameResolution::Nonlocal | PythonLexicalNameResolution::Unbound => {}
         }
     }
-}
-
-fn python_collect_bound_targets(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        match node.kind() {
-            "function_definition" | "class_definition" => {
-                if let Some(name) = node.child_by_field_name("name") {
-                    let text = python_slice(name, source).trim();
-                    if !text.is_empty() {
-                        out.insert(text.to_string());
-                    }
-                }
-                continue;
-            }
-            "lambda" => continue,
-            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
-                if let Some(left) = node.child_by_field_name("left") {
-                    collect_assigned_identifiers(left, source, out);
-                }
-            }
-            "named_expression" => {
-                if let Some(name) = node.child_by_field_name("name") {
-                    collect_assigned_identifiers(name, source, out);
-                }
-            }
-            _ => {}
-        }
-        let mut cursor = node.walk();
-        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
-        children.reverse();
-        stack.extend(children);
-    }
+    false
 }
 
 fn python_is_non_reference_context(node: Node<'_>) -> bool {

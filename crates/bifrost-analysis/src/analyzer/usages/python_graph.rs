@@ -31,9 +31,8 @@ use brokk_bifrost_python::usage_index::usage_importer_files;
 use std::sync::Arc;
 
 pub(in crate::analyzer::usages) use brokk_bifrost_python::graph::extractor::{
-    collect_assigned_identifiers, collect_module_binding_timeline,
-    collect_scope_facts_from_parsed_source, enclosing_scope_facts, is_declaration_identifier,
-    slice as python_slice,
+    collect_module_binding_timeline, collect_scope_facts_from_parsed_source, enclosing_scope_facts,
+    is_declaration_identifier, slice as python_slice,
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_python::graph::resolver::resolve_receiver_type;
 

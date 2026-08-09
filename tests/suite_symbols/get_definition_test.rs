@@ -18507,6 +18507,87 @@ fn python_direct_call_excludes_same_named_file_module() {
 }
 
 #[test]
+fn python_nested_function_honors_outer_parameter_shadow() {
+    let source = concat!(
+        "import service as mo\n",
+        "\n",
+        "def shadow(mo):\n",
+        "    def nested():\n",
+        "        return mo.target()  # shadowed\n",
+        "    return nested\n",
+        "\n",
+        "def visible():\n",
+        "    def nested():\n",
+        "        return mo.target()  # visible\n",
+        "    return nested\n",
+        "\n",
+        "def global_visible(mo):\n",
+        "    def nested():\n",
+        "        global mo\n",
+        "        return mo.target()  # global\n",
+        "    return nested\n",
+        "\n",
+        "def nonlocal_shadow(mo):\n",
+        "    def nested():\n",
+        "        nonlocal mo\n",
+        "        return mo.target()  # nonlocal\n",
+        "    return nested\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("service.py", "def target():\n    return 1\n")
+        .file("consumer.py", source)
+        .build();
+
+    let shadowed = source
+        .find("target()  # shadowed")
+        .expect("shadowed target");
+    let shadowed_value = lookup(
+        project.root(),
+        &location_reference("consumer.py", source, shadowed),
+    );
+    assert_eq!(
+        shadowed_value["results"][0]["status"], "no_definition",
+        "{shadowed_value}"
+    );
+
+    let visible = source.find("target()  # visible").expect("visible target");
+    let visible_value = lookup(
+        project.root(),
+        &location_reference("consumer.py", source, visible),
+    );
+    assert_eq!(
+        visible_value["results"][0]["status"], "resolved",
+        "{visible_value}"
+    );
+    assert_eq!(
+        visible_value["results"][0]["definitions"][0]["fqn"], "service.target",
+        "{visible_value}"
+    );
+
+    let global = source.find("target()  # global").expect("global target");
+    let global_value = lookup(
+        project.root(),
+        &location_reference("consumer.py", source, global),
+    );
+    assert_eq!(
+        global_value["results"][0]["status"], "resolved",
+        "{global_value}"
+    );
+
+    let nonlocal = source
+        .find("target()  # nonlocal")
+        .expect("nonlocal target");
+    let nonlocal_value = lookup(
+        project.root(),
+        &location_reference("consumer.py", source, nonlocal),
+    );
+    assert_eq!(
+        nonlocal_value["results"][0]["status"], "no_definition",
+        "{nonlocal_value}"
+    );
+}
+
+#[test]
 fn python_class_body_bare_member_resolves_to_sibling_method() {
     let source = concat!(
         "class Operations:\n",
