@@ -522,7 +522,9 @@ Each row: the fix, where it lived on the arc, where it lives after the merge, th
 
 ## Parked v2 sources and tests
 
-The owner asked for arc tests that cannot pass under Phase 1 to be `#[ignore]`d rather than deleted, with a tracking table. `#[ignore]` was not available for these: an ignored test still has to *compile*, and every one of them names a type or method (`RustUsageFacts`, `AnalyzerStore::rust_usage_facts`, `WorkspaceAnalyzer::rust_usage_facts_warm`) that Phase 1 does not define. They are therefore preserved verbatim, outside the Cargo build, under `.agents/phase2/rust-usage-v2/`. Nothing is deleted, every file names the plan that parked it, and each row below names the Phase 2 step that restores it.
+**All rows below are restored and live in the tree; `.agents/phase2/` is removed.** Phase 2 step 4 was the last step that needed it. The tables are kept as the record of what was parked and where each item landed.
+
+The owner asked for arc tests that cannot pass under Phase 1 to be `#[ignore]`d rather than deleted, with a tracking table. `#[ignore]` was not available for these: an ignored test still has to *compile*, and every one of them names a type or method (`RustUsageFacts`, `AnalyzerStore::rust_usage_facts`, `WorkspaceAnalyzer::rust_usage_facts_warm`) that Phase 1 does not define. They were therefore preserved verbatim, outside the Cargo build, under `.agents/phase2/rust-usage-v2/`. Nothing was deleted, every file named the plan that parked it, and each row below names the Phase 2 step that restored it.
 
 Three MCP tests were an exception: their claims survive the change of mechanism, so they were rewritten in place rather than parked, and they run today.
 
