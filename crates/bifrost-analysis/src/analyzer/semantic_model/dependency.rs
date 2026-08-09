@@ -633,12 +633,33 @@ pub fn prepare_dependency_semantic_packs(
                     installed_packs.push(installed);
                     profile.installed_packs += 1;
                 }
-                Ok(None) => diagnostics.error(
-                    "dependency.pack_unavailable",
-                    Some(&dependency.id),
-                    None,
-                    "resolved dependency has no exact locally producible artifact or compatible installed semantic pack",
-                ),
+                // No usable pack. Distinguish "a pack exists for another
+                // version of this exact coordinate" from "no pack at all":
+                // the near miss names the installed and required versions so
+                // a version mismatch is attributable, never silent (#1884).
+                Ok(None) => match installed_pack_query(dependency)
+                    .map(|query| catalog.version_near_misses(&query))
+                {
+                    Some(Ok(near_misses)) if !near_misses.is_empty() => {
+                        for near_miss in near_misses {
+                            diagnostics.error(
+                                "dependency.pack_version_mismatch",
+                                Some(&dependency.id),
+                                None,
+                                near_miss.describe(),
+                            );
+                        }
+                    }
+                    Some(Err(error)) => {
+                        diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error)
+                    }
+                    Some(Ok(_)) | None => diagnostics.error(
+                        "dependency.pack_unavailable",
+                        Some(&dependency.id),
+                        None,
+                        "resolved dependency has no exact locally producible artifact or compatible installed semantic pack",
+                    ),
+                },
                 Err(error) => {
                     diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error)
                 }
@@ -963,10 +984,11 @@ pub fn prepare_dependency_semantic_packs(
     }
 }
 
-fn compatible_installed_pack(
-    catalog: &SemanticPackCatalog,
-    dependency: &ResolvedDependency,
-) -> Result<Option<PreparedInstalledDependencyPack>, CatalogError> {
+/// The evidence-only catalog query for one dependency, or `None` when the
+/// dependency carries no exact package or toolchain version. Version-exact
+/// selection (#1884) starts here: a versionless dependency never consults
+/// installed packs, and the same query later names version near misses.
+fn installed_pack_query(dependency: &ResolvedDependency) -> Option<SemanticPackSelectorQuery> {
     let has_exact_coordinate = dependency
         .evidence
         .package
@@ -980,9 +1002,9 @@ fn compatible_installed_pack(
             .and_then(|coordinate| coordinate.version.as_ref())
             .is_some();
     if !has_exact_coordinate {
-        return Ok(None);
+        return None;
     }
-    let query = SemanticPackSelectorQuery {
+    Some(SemanticPackSelectorQuery {
         language: dependency.evidence.language.clone(),
         ecosystem: dependency.evidence.ecosystem.clone(),
         package: dependency.evidence.package.clone(),
@@ -993,6 +1015,15 @@ fn compatible_installed_pack(
         artifact_sha256: None,
         bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("Bifrost package version must be semantic"),
+    })
+}
+
+fn compatible_installed_pack(
+    catalog: &SemanticPackCatalog,
+    dependency: &ResolvedDependency,
+) -> Result<Option<PreparedInstalledDependencyPack>, CatalogError> {
+    let Some(query) = installed_pack_query(dependency) else {
+        return Ok(None);
     };
     let mut manifest_digests = Vec::new();
     let mut has_complete_pack = false;

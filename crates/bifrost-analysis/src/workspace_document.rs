@@ -402,7 +402,7 @@ fn read_opened_workspace_document(
     })
 }
 
-fn validate_workspace_relative_path(
+pub(crate) fn validate_workspace_relative_path(
     relative_path: &Path,
 ) -> Result<PathBuf, WorkspaceDocumentError> {
     if relative_path.as_os_str().is_empty() {

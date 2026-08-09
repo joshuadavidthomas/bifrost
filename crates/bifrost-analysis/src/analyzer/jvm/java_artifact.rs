@@ -103,7 +103,7 @@ impl JavaJarPackProducer {
         self.produce_loaded_artifact(request, limits, cancellation, &artifact)
     }
 
-    pub(crate) fn produce_loaded_artifact(
+    pub fn produce_loaded_artifact(
         &self,
         request: &ArtifactProductionRequest,
         limits: &ArtifactProducerLimits,

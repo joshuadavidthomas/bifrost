@@ -3217,6 +3217,10 @@ where
         TypeLookupStatus::UnsupportedLanguage => ReceiverAnalysisOutcome::Unsupported {
             reason: "receiver_analysis_language_unsupported",
         },
+        // The bounded resolvers report exhaustion as `BoundedResolution::Exceeded`,
+        // which the ledger handles before an outcome reaches here; the status form
+        // exists for the interactive type lookup, whose outcome is the whole answer.
+        TypeLookupStatus::ExceededBudget(limit) => limit.exceeded(),
     }
 }
 

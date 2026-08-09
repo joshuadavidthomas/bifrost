@@ -3,8 +3,10 @@ use super::{
     candidates_outcome_with_target_kind, no_type, type_reference_outcome,
 };
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
+use crate::analyzer::usages::get_definition::{BoundedResolution, ResolutionSession};
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::model::ImportKind;
+use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::{
     ResolvedReferenceSite, smallest_named_node_covering,
 };
@@ -12,6 +14,7 @@ use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{
     AliasResolver, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile,
 };
+use crate::cancellation::CancellationToken;
 use brokk_bifrost_js_ts::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
@@ -24,7 +27,124 @@ use brokk_bifrost_js_ts::ts_owners::{
 use brokk_bifrost_js_ts::type_text::{jsts_type_space_candidates, ts_type_annotation_text};
 use tree_sitter::{Node, Tree};
 
-pub(crate) fn resolve_js_ts_type(
+/// Bounded JS/TS type resolution: the same resolver, with every definition-index
+/// lookup charged to the session through [`SessionChargedLookup`]. The tree
+/// walks between lookups stay uncharged -- they are bounded by the file the
+/// caller already read -- so the budget meters exactly the work that can fan
+/// out across the workspace.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_js_ts_type_bounded(
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    file: &ProjectFile,
+    language: Language,
+    source: &str,
+    tree: Option<&Tree>,
+    site: &ResolvedReferenceSite,
+    budget: ReceiverAnalysisBudget,
+    cancellation: Option<&CancellationToken>,
+) -> BoundedResolution<TypeLookupOutcome> {
+    let session = ResolutionSession::bounded(budget, cancellation);
+    let charged = SessionChargedLookup {
+        support,
+        session: &session,
+    };
+    let outcome = resolve_js_ts_type(analyzer, &charged, file, language, source, tree, site);
+    session.finish(outcome)
+}
+
+/// Charges every [`BoundedDefinitionLookup`] question to a resolution session.
+/// Once the session stops, every answer is empty; `finish` then reports the
+/// terminal condition instead of the partial value, so exhaustion cannot be
+/// mistaken for "no type".
+struct SessionChargedLookup<'a> {
+    support: &'a dyn BoundedDefinitionLookup,
+    session: &'a ResolutionSession,
+}
+
+impl BoundedDefinitionLookup for SessionChargedLookup<'_> {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.session.query_rows(|| self.support.fqn(fqn))
+    }
+
+    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        self.session
+            .query_rows(|| self.support.fqn_in_language(fqn, language))
+    }
+
+    fn fqn_in_any_language(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.session
+            .query_rows(|| self.support.fqn_in_any_language(fqn))
+    }
+
+    fn package_exists_in_any_language(&self, package: &str) -> bool {
+        self.session
+            .query(|| self.support.package_exists_in_any_language(package))
+            .unwrap_or(false)
+    }
+
+    fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+        self.session
+            .query_rows(|| self.support.types_in_package(package, simple))
+    }
+
+    fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
+        self.session
+            .query_rows(|| self.support.by_normalized_fqn(normalized))
+    }
+
+    fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
+        self.session.query_rows(|| self.support.identifier(ident))
+    }
+
+    fn members_for_owner_name(
+        &self,
+        owner_fqn: &str,
+        normalized_owner_fqn: &str,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        self.session.query_rows(|| {
+            self.support
+                .members_for_owner_name(owner_fqn, normalized_owner_fqn, name)
+        })
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        self.session
+            .query_rows(|| self.support.file_identifier(file, ident))
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        self.session
+            .query_rows(|| self.support.fqn_direct_children(fqn))
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        self.session
+            .query(|| self.support.fqn_exists(fqn))
+            .unwrap_or(false)
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        self.session
+            .query(|| self.support.package_exists(package))
+            .unwrap_or(false)
+    }
+
+    fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        self.session
+            .query(|| self.support.package_exists_in_language(package, language))
+            .unwrap_or(false)
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.session
+            .query(|| self.support.fqn_prefix_exists(prefix))
+            .unwrap_or(false)
+    }
+}
+
+fn resolve_js_ts_type(
     analyzer: &dyn IAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,

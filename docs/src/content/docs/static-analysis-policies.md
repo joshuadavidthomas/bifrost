@@ -871,6 +871,117 @@ findings. Use `--scope-file PATH` on the CLI or `scope_file` on the MCP
 `run_policy` tool for one workspace-relative override; both default to
 `.bifrost/policy-scope.json`.
 
+## Gate Only On What The Change Introduced
+
+A full policy run fails a repository for every finding, including debt that
+predates the change under review. `--diff-base REV` turns the same run into a
+changed-code gate: the identical policies also evaluate the committed content
+of `REV`, findings are joined across the two revisions by `(policy_id,
+finding_id)`, and the failure threshold counts only the findings whose
+identity is absent from the base.
+
+```bash
+bifrost --root . \
+  --policy-pack bifrost.code-smells \
+  --format sarif --output out.sarif \
+  --diff-base origin/main
+```
+
+The join works because a strong finding identity hashes only content-derived
+facts: the workspace-relative path, the semantic owner key, a digest of the
+matched source bytes, and a small ordinal for identical slices under one
+owner. It contains no absolute path, revision, timestamp, or run-local
+handle, so the same finding in unchanged content produces the same identity
+at both revisions. The base revision is exported into a private temporary
+directory and analyzed there; the checkout is never touched.
+
+Each retained finding gains a `diff` decision (`new` or `persisting`, plus a
+`weak_identity` marker), and the report gains one top-level `diff` review
+with the requested revision, the resolved commit, the three counts, and the
+fixed identities the head no longer produces. Weak identities are
+snapshot-local by construction, so a weak finding never joins and always
+classifies as new. Suppressions and scope still apply first: a suppressed or
+scoped new finding does not gate, exactly as in a full run. SARIF results
+carry the standard `baselineState` field (`new` or `unchanged`; fixed base
+findings are not emitted as results), and concise human output hides
+persisting findings while the summary reports all three counts.
+
+The reliability contract is asymmetric on purpose. An unresolvable base -- a
+workspace outside a git repository, or a revision `git rev-parse` cannot
+resolve -- fails the run with status 2: an unresolvable base is an unreliable
+diff request, never a silent full run. A base that resolves but whose
+evaluation cannot prove its own completeness instead degrades to full gating:
+every head finding gates as if `--diff-base` had not been given, the review
+records `degraded: true`, and a `diff-base-unreliable` report diagnostic
+states why, so a broken base can never hide new findings and can never be
+mistaken for a clean diff run.
+
+Two identity limitations are accepted rather than solved. A pure file rename
+re-keys every finding in the file (the path is part of the identity), so a
+rename reports one `fixed` plus one `new` pair. Identical source slices under
+one owner are distinguished by an ordinal, so inserting an exact duplicate
+above an existing one can shift the ordinals and misclassify one pair.
+
+The base evaluation is a full second in-memory analysis of the base tree; it
+shares no analyzer cache in this version. For the GitHub Actions recipe that
+passes the pull request's base SHA, see
+[CI Gating with GitHub Actions](/ci-github-actions/).
+
+## Accept Today's Findings, Gate Tomorrow's
+
+A repository adopting Bifrost can carry hundreds to thousands of pre-existing
+findings. The suppression store is deliberately the wrong tool for that scale:
+it caps at 512 identity-exact records and demands a reviewed reason for each,
+which is right for governed waivers and wrong for onboarding. `--diff-base`
+removes the pressure from pull-request gates, but scheduled full runs and
+release gates still need "accept everything that exists today, gate everything
+new." That is the baseline document:
+
+```bash
+bifrost --root . --policy-pack bifrost.code-smells --accept-current
+```
+
+`--accept-current` runs the selected policies and writes
+`.bifrost/baseline.json` (override with `--baseline-file`) from the completed
+run: per policy, the sorted strong finding-id hashes plus the policy's
+semantic hash at acceptance, under one batch-level reason and acceptance date.
+Entries are identity-only — no per-record prose — so the document holds up to
+100,000 entries in at most 16 MiB, two decimal orders beyond the suppression
+cap. Acceptance is written only by a clean run: an unreliable run refuses to
+define a baseline and exits 2 without writing, because an identity the run
+could not prove cannot be accepted. Weak-identity findings are never written
+(their identities are snapshot-local), and their excluded count is reported.
+Regeneration is always an explicit re-run; the baseline never refreshes
+itself.
+
+On every later run the document joins by `(policy_id, finding_id)` after
+suppressions and directory scope claim their findings; a finding already
+suppressed or scoped is not claimed by the baseline, and its entry is audited
+as `finding_claimed`. Claimed findings stay in the report with a `baseline`
+decision and stop counting toward `--fail-on`, in full and in `--diff-base`
+runs alike: gating counts findings that are new and unclaimed by suppression,
+scope, and baseline. The report gains one top-level `baseline` review with the
+document path, the batch metadata, exact per-state counts, and a bounded
+needs-attention entry list (anything other than applied-with-matching-hash;
+the counts stay exact when the list truncates). SARIF renders each baselined
+finding as an external accepted suppression entry whose property bag carries
+`bifrost.decision: "baseline"`, and concise human output hides baselined
+findings while the summary reports the counts.
+
+The audit rules mirror suppressions. A malformed or oversized document is a
+diagnostic and exit 2; a baseline never turns an unreliable run clean. Editing
+a policy marks its entries drifted without reactivating them — a drifted entry
+still applies, and the drift count in the review is the signal to re-review.
+An entry is stale only when an exhaustive completed run proves the finding
+absent; an incomplete run reports `policy_incomplete` instead of guessing. The
+`--diff-base` identity limitations apply unchanged: a rename or an edited
+source slice re-keys the finding, so the old entry goes stale and the re-keyed
+finding gates until it is re-accepted or fixed.
+
+For the onboarding recipe that commits the baseline once and keeps
+pull-request gates on `--diff-base`, see
+[CI Gating with GitHub Actions](/ci-github-actions/).
+
 ## Classification And CVSS v4.0
 
 A policy can declare one broad fallback taxonomy classification plus typed

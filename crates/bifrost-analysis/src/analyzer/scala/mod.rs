@@ -27,8 +27,7 @@ use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver, analyzable_file_count,
-    fqn_bulk_nodes, overloaded_function_fqns,
+    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
@@ -36,9 +35,7 @@ use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_scala_bounded,
 };
-use crate::analyzer::usages::get_type::{
-    TypeLookupOutcome, resolve_scala_type, resolve_scala_type_bounded,
-};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_scala_type_bounded};
 use crate::analyzer::usages::scala_graph::{
     ScalaDeadCodeBulkContext, ScalaDeadCodeBulkEligibility, ScalaUsageGraphStrategy,
     build_full_scala_usage_edges, build_scala_usage_edge_weights, build_scala_usage_edges,
@@ -464,6 +461,60 @@ impl ScalaAnalyzer {
         self.external_index.get_or_init(|| {
             JvmExternalDeclarationIndex::build_for_project(&self.java_config, self.inner.project())
         })
+    }
+
+    /// How far a lookup for `name` from `file` could see past the workspace,
+    /// and the external type it landed on when it landed on one.
+    ///
+    /// The JVM half of boundary refinement, mirroring
+    /// `JavaAnalyzer::external_boundary_evidence`. The tiers are the external
+    /// tiers of [`ScalaSource::simple_type_proof`] -- a written qualified name,
+    /// `java.lang`, the file's explicit and wildcard imports, the file's own
+    /// package -- read against the built index rather than a peek, because the
+    /// trace runs on the resolver path where building is permitted. A hit is
+    /// [`BoundaryStatus::ExternalIndexed`] with the resolved external type; a
+    /// miss against an index whose producers reported truncation is
+    /// [`BoundaryStatus::ExternalDeclaredUnindexed`], because the build
+    /// declared artifacts the index never finished reading.
+    pub(crate) fn external_boundary_evidence(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> (BoundaryStatus, Option<String>) {
+        let external = self.external_declaration_index();
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        let indexed = |ty: &crate::analyzer::jvm::external::JvmExternalType| {
+            (BoundaryStatus::ExternalIndexed, Some(ty.fqn().to_owned()))
+        };
+        if name.contains('.')
+            && let Some(ty) = external.resolve_qualified_name(name, &package_name)
+        {
+            return indexed(ty);
+        }
+        if let Some(ty) = external.resolve_java_lang(name) {
+            return indexed(ty);
+        }
+        for import in self.inner.import_info_of(file) {
+            let Some(path) = scala_import_path(&import) else {
+                continue;
+            };
+            if import.is_wildcard {
+                if let Some(ty) = external.resolve_wildcard_import(&path, name, &package_name) {
+                    return indexed(ty);
+                }
+            } else if import.local_name() == Some(name)
+                && let Some(ty) = external.resolve_explicit_import(&path, &package_name)
+            {
+                return indexed(ty);
+            }
+        }
+        if let Some(ty) = external.resolve_same_package(&package_name, name) {
+            return indexed(ty);
+        }
+        if external.production_diagnostic_count() > 0 {
+            return (BoundaryStatus::ExternalDeclaredUnindexed, None);
+        }
+        (BoundaryStatus::ExternalUnknown, None)
     }
 
     /// Whether a bare Scala type name is declared in `file` itself or anywhere
@@ -1463,10 +1514,6 @@ impl LanguageSupport for ScalaSupport {
         Some(&ScalaSupport)
     }
 
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
-        Some(&ScalaSupport)
-    }
-
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
         language::LANGUAGE.into()
     }
@@ -1528,20 +1575,6 @@ impl StructuralReceiverResolver for ScalaSupport {
             query.site,
             query.budget,
             query.cancellation,
-        )
-    }
-}
-
-impl TypeLookupResolver for ScalaSupport {
-    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
-        query.support.set_language(query.language);
-        resolve_scala_type(
-            query.analyzer,
-            query.support,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
         )
     }
 }

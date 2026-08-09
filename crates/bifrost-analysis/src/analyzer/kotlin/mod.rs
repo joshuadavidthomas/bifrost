@@ -62,6 +62,7 @@ pub(crate) mod types;
 
 use crate::analyzer::Range;
 use crate::analyzer::store::LimitedQueryRows;
+use crate::analyzer::structural::BoundaryStatus;
 use brokk_bifrost_jvm::kotlin::graph_support::KotlinSource;
 use brokk_bifrost_jvm::kotlin::imports::build_kotlin_top_level_declarations_by_package;
 use brokk_bifrost_jvm::kotlin::syntax;
@@ -74,16 +75,14 @@ use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver,
+    StructuralReceiverResolver,
 };
 use crate::analyzer::pool_memo::PoolSafeMemo;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_kotlin_bounded,
 };
-use crate::analyzer::usages::get_type::{
-    TypeLookupOutcome, resolve_kotlin_type, resolve_kotlin_type_bounded,
-};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_kotlin_type_bounded};
 use crate::analyzer::usages::kotlin_graph::{
     KotlinUsageGraphStrategy, build_kotlin_usage_edge_weights, build_kotlin_usage_edges,
 };
@@ -259,6 +258,56 @@ impl KotlinAnalyzer {
         self.external_index.get_or_init(|| {
             JvmExternalDeclarationIndex::build_for_project(&self.jvm_config, self.inner.project())
         })
+    }
+
+    /// How far a lookup for `name` from `file` could see past the workspace,
+    /// and the external type it landed on when it landed on one.
+    ///
+    /// The JVM half of boundary refinement, mirroring
+    /// `JavaAnalyzer::external_boundary_evidence`: the name is resolved through
+    /// Kotlin's own import ladder against the shared jar-backed external
+    /// declaration index, so the trace classifies a spelling exactly as the
+    /// resolver would see it. A hit is [`BoundaryStatus::ExternalIndexed`] with
+    /// the resolved external type; a miss against an index whose producers
+    /// reported truncation is [`BoundaryStatus::ExternalDeclaredUnindexed`],
+    /// because the build declared artifacts the index never finished reading.
+    pub(crate) fn external_boundary_evidence(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+    ) -> (BoundaryStatus, Option<String>) {
+        use brokk_bifrost_jvm::kotlin::types::{
+            KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name,
+        };
+
+        let external = self.external_declaration_index();
+        let package_name = self.inner.package_name_of(file).unwrap_or_default();
+        let imports = self.inner.import_info_of(file);
+        let scope = KotlinNameScope {
+            package_name: &package_name,
+            imports: &imports,
+            // The trace hands over a reference spelling without its enclosing
+            // declaration; a file-level scope is the resolution every import
+            // tier still sees.
+            scope_owners: Vec::new(),
+        };
+        match resolve_kotlin_type_name(name, &scope, |candidate| {
+            external
+                .resolve_qualified_name(candidate, &package_name)
+                .is_some()
+        }) {
+            KotlinTypeName::Resolved(fqn) => {
+                return (BoundaryStatus::ExternalIndexed, Some(fqn));
+            }
+            // Two star imports both name an indexed external type: the name is
+            // certainly indexed, but no single target can be reported.
+            KotlinTypeName::Ambiguous => return (BoundaryStatus::ExternalIndexed, None),
+            KotlinTypeName::Unresolved => {}
+        }
+        if external.production_diagnostic_count() > 0 {
+            return (BoundaryStatus::ExternalDeclaredUnindexed, None);
+        }
+        (BoundaryStatus::ExternalUnknown, None)
     }
 
     /// Row-capped projections for bounded receiver queries (issue #1242).
@@ -851,10 +900,6 @@ impl LanguageSupport for KotlinSupport {
         Some(&KotlinSupport)
     }
 
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
-        Some(&KotlinSupport)
-    }
-
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
         language::LANGUAGE.into()
     }
@@ -916,20 +961,6 @@ impl StructuralReceiverResolver for KotlinSupport {
             query.site,
             query.budget,
             query.cancellation,
-        )
-    }
-}
-
-impl TypeLookupResolver for KotlinSupport {
-    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
-        query.support.set_language(query.language);
-        resolve_kotlin_type(
-            query.analyzer,
-            query.support,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
         )
     }
 }

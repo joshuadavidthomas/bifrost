@@ -359,18 +359,6 @@ enum JavaMemberLookupKind {
     Type,
 }
 
-pub(crate) fn java_type_lookup_resolution(
-    analyzer: &dyn IAnalyzer,
-    support: &dyn BoundedDefinitionLookup,
-    file: &ProjectFile,
-    source: &str,
-    root: Node<'_>,
-    site: &ResolvedReferenceSite,
-) -> Option<JavaTypeLookupResolution> {
-    let session = JavaResolutionSession::unbounded(support);
-    java_type_lookup_resolution_in_session(analyzer, &session, file, source, root, site)
-}
-
 pub(crate) fn java_type_lookup_resolution_in_session(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,

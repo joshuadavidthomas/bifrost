@@ -1421,8 +1421,6 @@ mod tests {
                     warm_nanos: 59,
                     records: 1,
                 }],
-                diagnostics: Vec::new(),
-                suppressed_diagnostics: 0,
             }],
         }
     }

@@ -24,6 +24,7 @@ pub const EXTENDED_TOOL_NAMES: &[&str] = &[
 
 pub(crate) const MAX_RUN_POLICY_PATH_BYTES: usize = 1_024;
 pub(crate) const MAX_RUN_POLICY_SELECTOR_BYTES: usize = 256;
+pub(crate) const MAX_RUN_POLICY_DIFF_BASE_BYTES: usize = 256;
 
 pub fn run_extended_stdio_server(
     root: PathBuf,
@@ -915,6 +916,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "maxLength": crate::policy::MAX_POLICY_SCOPE_PATH_BYTES,
                         "description": "Optional workspace-relative directory-scope JSON path. Defaults to .bifrost/policy-scope.json."
                     },
+                    "baseline_file": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": crate::policy::MAX_POLICY_BASELINE_PATH_BYTES,
+                        "description": "Optional workspace-relative bulk-acceptance baseline JSON path. Defaults to .bifrost/baseline.json."
+                    },
                     "evaluation_date": {
                         "type": "string",
                         "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
@@ -925,6 +932,12 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
                         "enum": ["never", "finding", "note", "warning", "error"],
                         "default": "warning",
                         "description": "Finding threshold used to compute the returned policy status."
+                    },
+                    "diff_base": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_RUN_POLICY_DIFF_BASE_BYTES,
+                        "description": "Optional git revision to diff against: the same policies also evaluate that commit's content, each finding is classified new or persisting, and only new findings gate. Any revision git rev-parse accepts."
                     }
                 },
                 "required": ["evaluation_date"],
@@ -1341,10 +1354,22 @@ mod tests {
             schema["properties"]["scope_file"]["maxLength"],
             crate::policy::MAX_POLICY_SCOPE_PATH_BYTES
         );
+        assert_eq!(schema["properties"]["baseline_file"]["type"], "string");
+        assert_eq!(schema["properties"]["baseline_file"]["minLength"], 1);
+        assert_eq!(
+            schema["properties"]["baseline_file"]["maxLength"],
+            crate::policy::MAX_POLICY_BASELINE_PATH_BYTES
+        );
         assert_eq!(
             schema["properties"]["fail_on"]["enum"],
             json!(["never", "finding", "note", "warning", "error"])
         );
         assert_eq!(schema["properties"]["fail_on"]["default"], "warning");
+        assert_eq!(schema["properties"]["diff_base"]["type"], "string");
+        assert_eq!(schema["properties"]["diff_base"]["minLength"], 1);
+        assert_eq!(
+            schema["properties"]["diff_base"]["maxLength"],
+            MAX_RUN_POLICY_DIFF_BASE_BYTES
+        );
     }
 }

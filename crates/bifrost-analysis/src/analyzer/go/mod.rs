@@ -15,17 +15,14 @@ use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, TypeLookupQuery, TypeLookupResolver, analyzable_file_count,
-    fqn_bulk_nodes,
+    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_go_bounded,
 };
-use crate::analyzer::usages::get_type::{
-    TypeLookupOutcome, resolve_go_type, resolve_go_type_bounded,
-};
+use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_go_type_bounded};
 use crate::analyzer::usages::go_graph::{
     GoUsageGraphStrategy, build_go_usage_edge_weights, build_go_usage_edges,
     go_implicit_entry_point,
@@ -816,10 +813,6 @@ impl LanguageSupport for GoSupport {
         Some(&GoSupport)
     }
 
-    fn type_lookup(&self) -> Option<&'static dyn TypeLookupResolver> {
-        Some(&GoSupport)
-    }
-
     fn parser_language(&self, _flavor: crate::analyzer::ParserFlavor) -> tree_sitter::Language {
         tree_sitter_go::LANGUAGE.into()
     }
@@ -878,18 +871,6 @@ impl StructuralReceiverResolver for GoSupport {
             query.site,
             query.budget,
             query.cancellation,
-        )
-    }
-}
-
-impl TypeLookupResolver for GoSupport {
-    fn resolve_type(&self, query: TypeLookupQuery<'_>) -> TypeLookupOutcome {
-        resolve_go_type(
-            query.analyzer,
-            query.file,
-            query.source,
-            query.tree,
-            query.site,
         )
     }
 }

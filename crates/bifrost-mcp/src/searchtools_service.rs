@@ -10,6 +10,7 @@ use crate::searchtools::get_symbol_sources;
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
+    analyzer::packs_document::{activate_workspace_packs, load_workspace_packs_config_at},
     analyzer::semantic::WorkspaceRelativePath,
     analyzer::semantic_model::{
         CatalogCoordinate, CatalogOpenMode, CatalogOptions, CompilerOptions,
@@ -32,10 +33,10 @@ use crate::{
     path_normalization::NormalizePath,
     policy::{
         BuiltInPolicySelection, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING, POLICY_EXIT_UNRELIABLE,
-        PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyFailOn,
-        PolicyId, PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource,
-        PolicySuppressionOptions, PolicySuppressionSource, built_in_policy_catalog,
-        workspace_snapshot_deadline_outcome,
+        PolicyBaselineOptions, PolicyBaselineSource, PolicyEvaluationDate, PolicyEvaluationInput,
+        PolicyEvaluationOptions, PolicyFailOn, PolicyId, PolicyReportDocument, PolicyScopeOptions,
+        PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource,
+        built_in_policy_catalog, workspace_snapshot_deadline_outcome,
     },
     profiling,
     searchtools::{
@@ -209,12 +210,64 @@ fn parse_workspace_semantic_models_setting(
     }
 }
 
+/// Document-driven dependency-pack activation (#1868).
+///
+/// A bound MCP session activates the same packs the LSP and the CLI policy
+/// runner would from the same `.bifrost/packs.json`. A malformed document is
+/// loud but does not fail the workspace bind: search tools stay usable while
+/// the misconfiguration is reported on stderr, and a policy run against this
+/// workspace reports the same failure as a `packs-load-failed` diagnostic.
+fn activate_workspace_pack_document(workspace_root: &Path, workspace: &WorkspaceAnalyzer) {
+    let _scope = profiling::scope("semantic_pack.workspace_document");
+    let config = match load_workspace_packs_config_at(workspace_root) {
+        Ok(Some(config)) => config,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!(
+                "bifrost: workspace packs document is invalid, no packs were activated: {error}"
+            );
+            return;
+        }
+    };
+    match activate_workspace_packs(
+        workspace,
+        &AnalyzerConfig::default(),
+        workspace_root,
+        &config,
+        &CancellationToken::default(),
+    ) {
+        Ok(Some(activation)) => {
+            eprintln!(
+                "bifrost: workspace pack activation ecosystems={:?} complete={}",
+                activation
+                    .ecosystems
+                    .iter()
+                    .map(|ecosystem| ecosystem.label())
+                    .collect::<Vec<_>>(),
+                activation.outcome.complete()
+            );
+            if !activation.outcome.complete() {
+                eprintln!(
+                    "bifrost: workspace pack activation was incomplete: {:#?}",
+                    activation.outcome
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => eprintln!("bifrost: workspace pack activation failed: {error}"),
+    }
+}
+
 fn activate_configured_semantic_models(
     workspace_root: &Path,
     workspace: &WorkspaceAnalyzer,
     configured: Option<ConfiguredSemanticModels>,
 ) -> Result<(), String> {
     let _scope = profiling::scope("semantic_pack.activate_configured");
+    // Every workspace build funnels through this activation step, so the
+    // shared packs document runs here first: MCP parity with the LSP and the
+    // CLI comes from one document, not per-host configuration (#1868).
+    activate_workspace_pack_document(workspace_root, workspace);
     let bootstrap = SEMANTIC_MODEL_CATALOG_BOOTSTRAP.get().copied();
     if configured.is_none() && bootstrap.is_none() {
         return Ok(());
@@ -515,6 +568,35 @@ mod workspace_semantic_model_configuration_tests {
     }
 
     #[test]
+    fn packs_document_activates_for_a_bound_workspace_without_environment_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub struct Local;\n").unwrap();
+        std::fs::create_dir_all(temp.path().join(".bifrost")).unwrap();
+        std::fs::write(
+            temp.path().join(".bifrost/packs.json"),
+            r#"{ "schema_version": 1, "ecosystems": ["cargo"] }"#,
+        )
+        .unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root.clone()).unwrap());
+        let analyzer = WorkspaceAnalyzer::build_for_service(project, AnalyzerConfig::default());
+
+        // No environment variables, no host options: the document alone is
+        // the opt-in, so a bound MCP session activates the same packs the LSP
+        // and the CLI would (#1868).
+        activate_configured_semantic_models(&root, &analyzer, None).unwrap();
+
+        assert!(
+            analyzer
+                .analyzer()
+                .dependency_discovery_evidence(Language::Rust)
+                .is_some(),
+            "the packs document must drive dependency activation on workspace bind"
+        );
+    }
+
+    #[test]
     fn workspace_setting_requires_an_explicit_supported_value() {
         assert!(!parse_workspace_semantic_models_setting(None).unwrap());
         assert!(parse_workspace_semantic_models_setting(Some(std::ffi::OsStr::new("on"))).unwrap());
@@ -657,9 +739,11 @@ struct RunPolicyParams {
     policy_ids: Vec<String>,
     suppression_file: Option<String>,
     scope_file: Option<String>,
+    baseline_file: Option<String>,
     evaluation_date: PolicyEvaluationDate,
     #[serde(default)]
     fail_on: RunPolicyFailOn,
+    diff_base: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -895,7 +979,9 @@ pub(crate) struct PreparedRunPolicy {
 
 pub(crate) enum RunPolicyPreparation {
     Ready(PreparedRunPolicy),
-    Deadline(RunPolicyToolResult),
+    // Boxed: the ready payload is a slim handle while the deadline payload
+    // carries a whole report document.
+    Deadline(Box<RunPolicyToolResult>),
 }
 
 impl WorkspaceQueryScope {
@@ -3644,11 +3730,33 @@ impl SearchToolsService {
                 ))
             })?
             .map_or_else(PolicyScopeOptions::default, PolicyScopeOptions::new);
+        let baseline = params
+            .baseline_file
+            .map(PolicyBaselineSource::explicit_portable)
+            .transpose()
+            .map_err(|error| {
+                SearchToolsServiceError::invalid_params(format!(
+                    "invalid run_policy baseline_file: {error}"
+                ))
+            })?
+            .map_or_else(PolicyBaselineOptions::default, PolicyBaselineOptions::new);
         let fail_on = PolicyFailOn::from(params.fail_on);
-        let options =
+        let mut options =
             PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
                 .with_scope(scope)
+                .with_baseline(baseline)
                 .with_fail_on(fail_on);
+        if let Some(revision) = params.diff_base {
+            if revision.is_empty()
+                || revision.len() > crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
+            {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "run_policy diff_base must contain between 1 and {} bytes",
+                    crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
+                )));
+            }
+            options = options.with_diff_base(revision);
+        }
         let selection_elapsed = preparation_started.elapsed();
         let snapshot_started = Instant::now();
 
@@ -3680,7 +3788,7 @@ impl SearchToolsService {
                         exit_status: outcome.exit_status(),
                         report: outcome.into_report(),
                     };
-                    return Ok(RunPolicyPreparation::Deadline(result));
+                    return Ok(RunPolicyPreparation::Deadline(Box::new(result)));
                 }
                 Err(error) => return Err(error),
             };

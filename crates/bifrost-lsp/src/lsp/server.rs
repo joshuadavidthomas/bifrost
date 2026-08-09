@@ -53,6 +53,7 @@ use crate::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, BIFROST_IGNORE_FILE_NAME, BuildProgressEvent,
     BuildProgressPhase, FilesystemProject, IndexWarmer, MultiRootProject, OverlayProject, Project,
     ProjectFile, PythonAnalyzerConfig, PythonEnvironmentConfig, WorkspaceAnalyzer,
+    packs_document::{WorkspacePacksConfig, load_workspace_packs_config_at},
     semantic_model::{
         CatalogOpenMode, CatalogOptions, DependencyPackLimits, SemanticModelActivationRequest,
         SemanticModelRuntimeLimits, SemanticPackCatalog,
@@ -2168,6 +2169,12 @@ pub(crate) struct ServerState {
     /// The latest activation scheduled through `dependency_packs`. A
     /// completion carrying an older generation has been superseded.
     dependency_pack_generation: u64,
+    /// The primary root's `.bifrost/packs.json` (#1868), paired with that
+    /// root so the configured catalog resolves against the root that declared
+    /// it. Presence of the document is itself an activation opt-in; it also
+    /// narrows activation to its named ecosystems and names the shared
+    /// catalog every entry point uses.
+    packs_config: Option<(PathBuf, WorkspacePacksConfig)>,
     /// The `OverlayProject` is shared with the analyzer (via `Arc<dyn Project>`
     /// inside `WorkspaceAnalyzer`) and with request-time read paths in
     /// `handlers::util::read_document_for_uri`. did{Open,Change,Close}
@@ -2943,6 +2950,7 @@ impl ServerState {
             progress.set_expected_language_count(project.analyzer_languages().len());
         }
         let workspace = build_workspace_for_lsp(project, progress, python_pack.as_ref())?;
+        let packs_config = load_lsp_packs_config(&active_roots);
         Ok(Self {
             active_roots,
             editor_roots,
@@ -2954,6 +2962,7 @@ impl ServerState {
             index_warmer: IndexWarmer::new(),
             dependency_packs: DependencyPackActivator::new(),
             dependency_pack_generation: 0,
+            packs_config,
             overlay,
             completion_cache: completion::CompletionCache::new(),
             rejected_didchange_log: ThrottledLog::new(
@@ -2981,20 +2990,29 @@ impl ServerState {
     }
 
     /// Queue a background dependency-pack activation for the current snapshot
-    /// (#1628). A no-op while the client has not opted into unrecognized-symbol
-    /// diagnostics: without that opt-in no published proof can reach a client,
-    /// so discovering it would be pure cost.
+    /// (#1628, #1868). Two opt-ins reach this path: the workspace packs
+    /// document, which also narrows the ecosystems and names the shared
+    /// catalog, and the legacy `unrecognized_symbol_diagnostics` client
+    /// setting, which activates every present-language ecosystem into an
+    /// ephemeral catalog. Without either, activation would be pure cost.
     ///
     /// Never called from a request handler. A diagnostic that arrives before
     /// the activation lands reports the collectors' typed suppressions, which
     /// is the correct answer for a session that cannot yet see its
     /// dependencies.
     fn schedule_dependency_pack_activation(&mut self) {
-        if !self.runtime_configuration.unrecognized_symbol_diagnostics {
+        if self.packs_config.is_none()
+            && !self.runtime_configuration.unrecognized_symbol_diagnostics
+        {
             return;
         }
         let languages = self.workspace.analyzer().languages();
-        let ecosystems = dependency_packs::ecosystems_for_languages(&languages);
+        let mut ecosystems = dependency_packs::ecosystems_for_languages(&languages);
+        let mut catalog_root = None;
+        if let Some((root, config)) = self.packs_config.as_ref() {
+            ecosystems.retain(|ecosystem| config.ecosystems().contains(ecosystem));
+            catalog_root = config.catalog().map(|relative| root.join(relative));
+        }
         if ecosystems.is_empty() {
             return;
         }
@@ -3002,6 +3020,7 @@ impl ServerState {
             Arc::new(self.workspace.clone()),
             lsp_analyzer_config(self.python_pack.as_ref()),
             ecosystems,
+            catalog_root,
         );
     }
 
@@ -3185,6 +3204,7 @@ impl ServerState {
             }
         }
         self.active_roots = prepared.active_roots;
+        self.packs_config = load_lsp_packs_config(&self.active_roots);
         let old_workspace = std::mem::replace(&mut self.workspace, prepared.workspace);
         let old_overlay = std::mem::replace(&mut self.overlay, prepared.overlay);
         self.completion_cache.clear();
@@ -3471,6 +3491,28 @@ impl Project for ScopedProject {
 
     fn has_overlay(&self, file: &ProjectFile) -> bool {
         self.inner.has_overlay(file)
+    }
+}
+
+/// Load the primary root's pack-activation document (#1868).
+///
+/// A malformed document is loud and activates nothing: an explicit
+/// configuration must never decay into silent partial activation. A
+/// multi-root session reads the first active root, the same root that anchors
+/// its other workspace conventions.
+fn load_lsp_packs_config(
+    active_roots: &[WorkspaceRoot],
+) -> Option<(PathBuf, WorkspacePacksConfig)> {
+    let root = &active_roots.first()?.analyzer_path;
+    match load_workspace_packs_config_at(root) {
+        Ok(Some(config)) => Some((root.clone(), config)),
+        Ok(None) => None,
+        Err(error) => {
+            eprintln!(
+                "[bifrost-lsp] workspace packs document is invalid, no packs were activated: {error}"
+            );
+            None
+        }
     }
 }
 

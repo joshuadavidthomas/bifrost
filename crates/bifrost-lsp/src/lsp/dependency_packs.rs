@@ -17,6 +17,7 @@
 //! main loop, which owns every state mutation and every publication.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
@@ -25,7 +26,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use semver::Version;
 
 use crate::analyzer::semantic_model::{
-    CatalogOptions, DependencyPackLimits, SemanticModelActivationRequest,
+    CatalogOpenMode, CatalogOptions, DependencyPackLimits, SemanticModelActivationRequest,
     SemanticModelRuntimeLimits, SemanticPackCatalog,
 };
 use crate::analyzer::{
@@ -86,6 +87,10 @@ struct ActivationJob {
     snapshot: Arc<WorkspaceAnalyzer>,
     config: AnalyzerConfig,
     ecosystems: Vec<DependencyPackEcosystem>,
+    /// Absolute root of the workspace-configured semantic-pack catalog from
+    /// `.bifrost/packs.json` (#1868). `None` keeps the session-scoped
+    /// ephemeral catalog.
+    catalog_root: Option<PathBuf>,
     cancellation: CancellationToken,
 }
 
@@ -136,6 +141,7 @@ impl DependencyPackActivator {
         snapshot: Arc<WorkspaceAnalyzer>,
         config: AnalyzerConfig,
         ecosystems: Vec<DependencyPackEcosystem>,
+        catalog_root: Option<PathBuf>,
     ) -> u64 {
         assert!(
             !ecosystems.is_empty(),
@@ -157,6 +163,7 @@ impl DependencyPackActivator {
             snapshot,
             config,
             ecosystems,
+            catalog_root,
             cancellation: CancellationToken::new(),
         });
         if state.worker.is_none() {
@@ -221,8 +228,10 @@ impl DependencyPackActivator {
 
 fn run_worker(activator: &Arc<DependencyPackActivator>) {
     // The catalog holds SQLite state, so it stays on this thread for the
-    // session's lifetime and is opened only once a job actually needs it.
-    let mut catalog: Option<SemanticPackCatalog> = None;
+    // session's lifetime and is opened only once a job actually needs it. The
+    // cache is keyed by the configured root so a packs-document change to
+    // another catalog reopens it instead of publishing from the old one.
+    let mut catalog: Option<(Option<PathBuf>, SemanticPackCatalog)> = None;
     loop {
         let job = {
             let mut state = activator.lock();
@@ -266,16 +275,30 @@ fn run_worker(activator: &Arc<DependencyPackActivator>) {
 /// could publish, so the main loop is not asked to refresh for a job that
 /// deliberately changed nothing.
 fn run_job(
-    catalog: &mut Option<SemanticPackCatalog>,
+    catalog: &mut Option<(Option<PathBuf>, SemanticPackCatalog)>,
     job: &ActivationJob,
 ) -> Option<DependencyPackActivation> {
     if job.cancellation.is_cancelled() {
         return None;
     }
-    if catalog.is_none() {
-        match SemanticPackCatalog::open_ephemeral(CatalogOptions::default()) {
-            Ok(opened) => *catalog = Some(opened),
+    if catalog
+        .as_ref()
+        .is_none_or(|(root, _)| *root != job.catalog_root)
+    {
+        let opened = match &job.catalog_root {
+            // Read-write so packs generated from local artifacts persist
+            // across sessions at the workspace-configured location (#1868).
+            Some(root) => SemanticPackCatalog::open(
+                root,
+                CatalogOpenMode::ReadWrite,
+                CatalogOptions::default(),
+            ),
+            None => SemanticPackCatalog::open_ephemeral(CatalogOptions::default()),
+        };
+        match opened {
+            Ok(opened) => *catalog = Some((job.catalog_root.clone(), opened)),
             Err(error) => {
+                *catalog = None;
                 eprintln!(
                     "[bifrost-lsp] dependency-pack catalog is unavailable, unrecognized-symbol \
                      diagnostics stay suppressed: {error}"
@@ -284,7 +307,7 @@ fn run_job(
             }
         }
     }
-    let catalog = catalog.as_ref().expect("catalog opened above");
+    let (_, catalog) = catalog.as_ref().expect("catalog opened above");
     let activation = SemanticModelActivationRequest {
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("package version must be semver"),

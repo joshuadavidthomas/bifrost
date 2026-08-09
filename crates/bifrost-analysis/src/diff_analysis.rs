@@ -4,7 +4,10 @@ use crate::searchtools::{
     UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
 };
 use crate::{FileSetProject, WorkspaceAnalyzer};
-use git2::{Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository};
+use git2::{
+    Delta, DiffFormat, DiffOptions, FileMode, ObjectType, Oid, Repository, TreeWalkMode,
+    TreeWalkResult,
+};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -868,6 +871,127 @@ impl RevisionImage {
             Self::Snapshot { files, .. } | Self::Worktree { files, .. } => files,
         }
     }
+}
+
+/// A complete private on-disk export of one committed revision's workspace
+/// subtree, plus the resolved commit id.
+///
+/// Diff-aware policy gating evaluates policies against this image instead of
+/// the checkout. The export directory lives under the process temp directory
+/// with owner-only permissions and is deleted when this value drops.
+pub struct RevisionExport {
+    image: RevisionImage,
+    commit_id: String,
+}
+
+impl RevisionExport {
+    /// Root directory containing the exported files.
+    pub fn root(&self) -> &Path {
+        self.image.root()
+    }
+
+    /// Workspace-relative paths of every exported regular file.
+    pub fn files(&self) -> &[PathBuf] {
+        self.image.files()
+    }
+
+    /// Full hex id of the commit the requested revision resolved to.
+    pub fn commit_id(&self) -> &str {
+        &self.commit_id
+    }
+}
+
+/// Resolve `revision` in the repository that contains `workspace_root`, peel it
+/// to a commit, and export that commit's workspace subtree into a private
+/// temporary directory.
+///
+/// `workspace_root` may be the repository work-tree root or a subdirectory of
+/// it. The export always contains paths relative to `workspace_root`, so a
+/// finding identity computed over the export joins with one computed over the
+/// live workspace.
+pub fn export_revision(workspace_root: &Path, revision: &str) -> Result<RevisionExport, String> {
+    let repo = Repository::discover(workspace_root).map_err(|err| {
+        format!(
+            "workspace root {} is not inside a git repository: {err}",
+            workspace_root.display()
+        )
+    })?;
+    let commit_id = match resolve_snapshot(&repo, revision)? {
+        Snapshot::Commit(oid) => oid,
+        Snapshot::Tree(_) => {
+            return Err(format!("revision `{revision}` is a tree, not a commit"));
+        }
+        Snapshot::Worktree => unreachable!("explicit revisions never resolve to worktree"),
+    };
+    let workdir = repo.workdir().ok_or_else(|| {
+        format!(
+            "repository for {} has no working tree",
+            workspace_root.display()
+        )
+    })?;
+    let workdir = workdir.canonicalize().map_err(|err| {
+        format!(
+            "unable to resolve repository work tree {}: {err}",
+            workdir.display()
+        )
+    })?;
+    let workspace_root = workspace_root.canonicalize().map_err(|err| {
+        format!(
+            "unable to resolve workspace root {}: {err}",
+            workspace_root.display()
+        )
+    })?;
+    let prefix = workspace_root.strip_prefix(&workdir).map_err(|_| {
+        format!(
+            "workspace root {} is outside the repository work tree {}",
+            workspace_root.display(),
+            workdir.display()
+        )
+    })?;
+    let commit_tree = repo
+        .find_commit(commit_id)
+        .and_then(|commit| commit.tree())
+        .map_err(|err| format!("unable to read tree for commit {commit_id}: {err}"))?;
+    let tree = if prefix.as_os_str().is_empty() {
+        commit_tree
+    } else {
+        commit_tree
+            .get_path(prefix)
+            .map_err(|err| {
+                format!(
+                    "revision `{revision}` has no entry for workspace directory `{}`: {err}",
+                    prefix.display()
+                )
+            })?
+            .to_object(&repo)
+            .and_then(|object| object.peel_to_tree())
+            .map_err(|err| {
+                format!(
+                    "workspace directory `{}` at revision `{revision}` is not a directory: {err}",
+                    prefix.display()
+                )
+            })?
+    };
+    let subtree = Snapshot::Tree(tree.id());
+    let mut paths = Vec::new();
+    tree.walk(TreeWalkMode::PreOrder, |parent, entry| {
+        // Entries with non-UTF-8 names are skipped: every workspace-relative
+        // path in the analyzer and the policy report is a UTF-8 string, so
+        // such a file can never join a head finding anyway.
+        if entry.kind() == Some(ObjectType::Blob)
+            && is_regular_file_mode(entry.filemode())
+            && let Some(name) = entry.name()
+        {
+            paths.push(format!("{parent}{name}"));
+        }
+        TreeWalkResult::Ok
+    })
+    .map_err(|err| format!("unable to enumerate tree for revision `{revision}`: {err}"))?;
+    let image = RevisionImage::materialize(&repo, subtree, &paths)?;
+    Ok(RevisionExport {
+        image,
+        commit_id: commit_id.to_string(),
+    })
 }
 
 /// Collect the changed paths that actually exist as regular files on disk.

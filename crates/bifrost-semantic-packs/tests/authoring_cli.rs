@@ -3,8 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    CatalogOpenMode, CatalogOptions, CompilerOptions, DurablePackSource, DurablePackSourceKind,
-    SemanticPackCatalog, SourceFormat, compile_source,
+    ActivationSelector, ArtifactProducerLimits, CatalogOpenMode, CatalogOptions, Compatibility,
+    CompilerOptions, DurablePackSource, DurablePackSourceKind, NameSelector, Provenance, Safety,
+    SemanticPackCatalog, SourceFormat, VersionConstraint, compile_source, read_exact_source_set,
+};
+use brokk_bifrost_semantic_packs::release_bundle::{
+    PACK_SPEC_SCHEMA_VERSION, PinnedArtifact, PinnedLookupQuery, PinnedPackKind, PinnedPackSpec,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -109,6 +113,118 @@ fn invalid_source_and_arguments_return_versioned_nonzero_results() {
     assert_eq!(
         json_output(&arguments)["format"],
         "bifrost_semantic_model_cli_error/v1"
+    );
+}
+
+#[test]
+fn generate_and_verify_python_stub_bundle_and_list_extraction_rejects() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("stubs");
+    fs::create_dir_all(root.join("pkg")).unwrap();
+    fs::write(
+        root.join("pkg/__init__.pyi"),
+        "class Widget: ...\ndef make_widget() -> Widget: ...\n",
+    )
+    .unwrap();
+    // One deliberately rejected stub: not UTF-8, so extraction must record a
+    // structured reject instead of silently dropping the entry.
+    fs::write(root.join("pkg/bad.pyi"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    fs::write(temporary.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+    let stubs = vec!["pkg/__init__.pyi".to_owned(), "pkg/bad.pyi".to_owned()];
+    let artifact_sha256 = read_exact_source_set(
+        &root,
+        &stubs.iter().map(PathBuf::from).collect::<Vec<_>>(),
+        16,
+        8,
+        &ArtifactProducerLimits::default(),
+    )
+    .unwrap()
+    .sha256()
+    .to_owned();
+    let selector = ActivationSelector {
+        package: Some(NameSelector {
+            name: "widget-stubs".to_owned(),
+            version: Some("=1.0.0".to_owned()),
+        }),
+        module: None,
+        toolchain: Some(NameSelector {
+            name: "python".to_owned(),
+            version: Some("=1.0.0".to_owned()),
+        }),
+        targets: Vec::new(),
+        configurations: Vec::new(),
+        artifact_sha256: None,
+    };
+    let spec = PinnedPackSpec {
+        schema_version: PACK_SPEC_SCHEMA_VERSION,
+        pack_id: "python-stubs-cli".to_owned(),
+        pack_version: "1.0.0".to_owned(),
+        ecosystem: "pypi".to_owned(),
+        kind: PinnedPackKind::PythonStub { stubs },
+        artifact: PinnedArtifact {
+            file_name: "stubs".to_owned(),
+            sha256: artifact_sha256,
+            url: Some("https://example.invalid/widget-stubs".to_owned()),
+            container: None,
+        },
+        compatibility: Compatibility {
+            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            toolchains: vec![VersionConstraint {
+                name: "python".to_owned(),
+                requirement: "=1.0.0".to_owned(),
+            }],
+        },
+        activation: vec![selector.clone()],
+        provenance: Provenance {
+            source: "fixture".to_owned(),
+            revision: Some("fixture-v1".to_owned()),
+        },
+        license: "Apache-2.0".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: false,
+        },
+        notices: vec!["NOTICE.txt".to_owned()],
+        measurement_activation: selector,
+        measurement_queries: vec![PinnedLookupQuery::Type {
+            name: "pkg.Widget".to_owned(),
+        }],
+    };
+    let spec_path = temporary.path().join("python-stubs.json");
+    fs::write(&spec_path, serde_json::to_vec_pretty(&spec).unwrap()).unwrap();
+    let output_root = temporary.path().join("bundle");
+
+    let generate = run(&[
+        "generate",
+        output_root.to_str().unwrap(),
+        spec_path.to_str().unwrap(),
+        root.to_str().unwrap(),
+    ]);
+    assert!(generate.status.success(), "{generate:#?}");
+    let stdout = String::from_utf8(generate.stdout).unwrap();
+    assert!(
+        stdout.contains("generated 1 pinned semantic packs"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("rejects python-stubs-cli@1.0.0: 1 rejected entries, 0 suppressed"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("warning python.source.encoding pkg/bad.pyi:"),
+        "{stdout}"
+    );
+
+    let verify = run(&["verify", output_root.to_str().unwrap()]);
+    assert!(verify.status.success(), "{verify:#?}");
+    let stdout = String::from_utf8(verify.stdout).unwrap();
+    assert!(
+        stdout.contains("verified 1 pinned semantic packs"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("warning python.source.encoding pkg/bad.pyi:"),
+        "{stdout}"
     );
 }
 

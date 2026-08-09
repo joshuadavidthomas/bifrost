@@ -8102,6 +8102,60 @@ fn bifrost_lsp_server_opt_in_activates_dependency_packs_off_the_request_path() {
 }
 
 #[test]
+fn bifrost_lsp_server_packs_document_opts_the_session_into_its_named_ecosystems() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n").expect("write app.py");
+    fs::write(temp_root.join("go.mod"), "module example.com/app\n").expect("write go.mod");
+    fs::write(
+        temp_root.join("main.go"),
+        "package main\n\nfunc main() {}\n",
+    )
+    .expect("write main.go");
+    fs::create_dir_all(temp_root.join(".bifrost")).expect("create .bifrost");
+    // The document is the opt-in (#1868): no client diagnostic setting is
+    // required, and activation covers only the document's ecosystems even
+    // though Python source is present too.
+    fs::write(
+        temp_root.join(".bifrost/packs.json"),
+        r#"{ "schema_version": 1, "ecosystems": ["go"] }"#,
+    )
+    .expect("write packs document");
+
+    let mut server = LspServer::start(&temp_root);
+    let go_uri = uri_for(&temp_root.join("main.go"));
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didSave",
+        "params": {"textDocument": {"uri": go_uri}}
+    }));
+    let published = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(published["params"]["uri"], go_uri);
+    // The activation the save superseded-or-scheduled refreshes the published
+    // document once it lands, which makes worker completion observable before
+    // shutdown can race it.
+    let activation_refresh = server.read_notification("textDocument/publishDiagnostics");
+    assert_eq!(
+        activation_refresh["params"]["uri"], go_uri,
+        "a completed activation must refresh the published document: {activation_refresh}"
+    );
+
+    let stderr = server.shutdown_with_stderr();
+    assert!(
+        activation_count(&stderr) >= 1,
+        "the packs document must activate without any client diagnostic opt-in: {stderr}"
+    );
+    assert!(
+        stderr.contains("ecosystems=[Go]"),
+        "activation must cover exactly the document's ecosystems: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ecosystems=[Go, Python]") && !stderr.contains("Python"),
+        "the document must narrow activation to its named ecosystems: {stderr}"
+    );
+}
+
+#[test]
 fn bifrost_lsp_server_opted_out_session_never_activates_dependency_packs() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
