@@ -1559,7 +1559,10 @@ pub fn rust_value_constructor_visibilities(
             let mut cursor = body.walk();
             for child in body.named_children(&mut cursor) {
                 match child.kind() {
-                    "attribute_item" => {}
+                    "attribute_item"
+                    | "inner_attribute_item"
+                    | "line_comment"
+                    | "block_comment" => {}
                     "visibility_modifier" => {
                         pending_visibility = Some(rust_visibility_modifier(child, source));
                     }
