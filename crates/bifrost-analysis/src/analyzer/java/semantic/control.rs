@@ -818,16 +818,54 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let alternative = required_field(node, "alternative")?;
                 let consequence_entry = self.point(builder, consequence, Vec::new())?;
                 let alternative_entry = self.point(builder, alternative, Vec::new())?;
+                // The chosen branch's value is the conditional's value. Each
+                // branch therefore leaves through its own merge point, which
+                // carries that one flow. The merge point exists because the
+                // flow has to be ordered after the branch produced its value,
+                // and the branch's own effects land on the points between its
+                // entry and this one.
+                let consequence_merge = self.point(builder, consequence, Vec::new())?;
+                let alternative_merge = self.point(builder, alternative, Vec::new())?;
+                let consequence_value = self.expression_value(
+                    builder,
+                    consequence,
+                    expression_value_kind(consequence),
+                )?;
+                let alternative_value = self.expression_value(
+                    builder,
+                    alternative,
+                    expression_value_kind(alternative),
+                )?;
+                self.append_effect(
+                    builder,
+                    consequence_merge,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: consequence_value,
+                        target: result,
+                    },
+                )?;
+                self.append_effect(
+                    builder,
+                    alternative_merge,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source: alternative_value,
+                        target: result,
+                    },
+                )?;
+                self.edge(builder, consequence_merge, next)?;
+                self.edge(builder, alternative_merge, next)?;
                 stack.push(Work::Expression {
                     node: alternative,
                     entry: alternative_entry,
-                    next,
+                    next: EdgeTarget::normal(alternative_merge),
                     scope,
                 });
                 stack.push(Work::Expression {
                     node: consequence,
                     entry: consequence_entry,
-                    next,
+                    next: EdgeTarget::normal(consequence_merge),
                     scope,
                 });
                 stack.push(Work::Condition {

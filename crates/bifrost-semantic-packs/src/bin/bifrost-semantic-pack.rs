@@ -374,18 +374,29 @@ fn summary_corpus_join_command(
     format: OutputFormat,
 ) -> Result<u8, CommandFailure> {
     require_human_release_output(format)?;
-    let [pins, codeql_models, joern_source, report] = arguments.as_slice() else {
-        return Err(failure(2, usage(), format));
+    let (pins, codeql_models, joern_source, report, jvm_sources) = match arguments.as_slice() {
+        [pins, codeql_models, joern_source, report] => {
+            (pins, codeql_models, joern_source, report, None)
+        }
+        [pins, codeql_models, joern_source, report, jvm_sources] => (
+            pins,
+            codeql_models,
+            joern_source,
+            report,
+            Some(PathBuf::from(jvm_sources)),
+        ),
+        _ => return Err(failure(2, usage(), format)),
     };
     let report_path = PathBuf::from(report);
     let pins = FoundryPins::read(Path::new(pins))
         .map_err(|error_value| failure(2, error_value.to_string(), format))?;
-    let inputs = FoundryRunInputs::from_pins(
+    let mut inputs = FoundryRunInputs::from_pins(
         &pins,
         PathBuf::from(codeql_models),
         PathBuf::from(joern_source),
     )
     .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+    inputs.jvm_sources = jvm_sources;
     let joined = run_foundry_join(&inputs)
         .map_err(|error_value| failure(2, error_value.to_string(), format))?;
     if let Some(parent) = report_path.parent()
@@ -424,6 +435,25 @@ fn summary_corpus_join_command(
             println!("  note {note}: {count}");
         }
     }
+    if let Some(derivation) = &joined.derivation {
+        println!(
+            "derived entries={} ({} flow, {} no-flow, {} complete) transfers={} files={} procedures={}",
+            derivation.entries,
+            derivation.flow_entries,
+            derivation.no_flow_entries,
+            derivation.complete_entries,
+            derivation.transfers,
+            derivation.files_read,
+            derivation.procedures_read
+        );
+        println!(
+            "  flows finer than the shipped projection: {}",
+            derivation.qualified_flows
+        );
+        for (boundary, count) in &derivation.boundaries_by_kind {
+            println!("  boundary {boundary}: {count}");
+        }
+    }
     for round_trip in &joined.round_trip {
         println!(
             "{} round-trip entries={} shards={} manifest={}",
@@ -440,8 +470,11 @@ fn summary_corpus_join_command(
         }
     }
     println!(
-        "join agreements={} disputes={} gaps={}",
-        joined.join.agreement_count, joined.join.dispute_count, joined.join.gap_count
+        "join agreements={} ({} at the argument-level projection only) disputes={} gaps={}",
+        joined.join.agreement_count,
+        joined.join.agreements_at_projection_only,
+        joined.join.dispute_count,
+        joined.join.gap_count
     );
     for (corpus, count) in &joined.join.gaps_by_missing_slot {
         println!("  gaps missing from {corpus}: {count}");
@@ -713,5 +746,5 @@ impl ActivationControlInput {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json"
+    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]"
 }

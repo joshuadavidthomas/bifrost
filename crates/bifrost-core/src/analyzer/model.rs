@@ -508,6 +508,17 @@ pub struct SignatureMetadata {
     /// bounded candidate set, never as an identity.
     #[serde(default)]
     callable_parameter_types: Option<Vec<String>>,
+    /// Whether the declaration carries a `native`-style modifier: the callable
+    /// is declared here and implemented outside every source this workspace
+    /// can read.
+    ///
+    /// A body-less declaration alone does not answer this. An abstract method,
+    /// an interface method, and a native method all produce no body, and a
+    /// consumer that must not guess past the boundary needs to tell them
+    /// apart. Only meaningful when [`Self::callable_modifiers_recorded`] is
+    /// true.
+    #[serde(default)]
+    callable_is_native: bool,
     /// Whether this class-like declaration is an interface.
     #[serde(default)]
     class_like_is_interface: bool,
@@ -1691,6 +1702,7 @@ impl SignatureMetadata {
             callable_declared_visibility: None,
             callable_modifiers_recorded: false,
             callable_parameter_types: None,
+            callable_is_native: false,
             class_like_is_interface: false,
         }
     }
@@ -1749,6 +1761,15 @@ impl SignatureMetadata {
         self
     }
 
+    /// Record whether the declaration carries a `native`-style modifier.
+    ///
+    /// Pair this with [`Self::with_callable_modifiers`], which is what states
+    /// that the adapter read the modifier nodes at all.
+    pub fn with_callable_native(mut self, is_native: bool) -> Self {
+        self.callable_is_native = is_native;
+        self
+    }
+
     pub fn with_class_like_interface(mut self, is_interface: bool) -> Self {
         self.class_like_is_interface = is_interface;
         self
@@ -1772,6 +1793,10 @@ impl SignatureMetadata {
 
     pub fn callable_parameter_types(&self) -> Option<&[String]> {
         self.callable_parameter_types.as_deref()
+    }
+
+    pub fn callable_is_native(&self) -> bool {
+        self.callable_is_native
     }
 
     pub fn class_like_is_interface(&self) -> bool {

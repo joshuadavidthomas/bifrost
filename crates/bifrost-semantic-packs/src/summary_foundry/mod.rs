@@ -6,11 +6,14 @@
 //! analyzer or runtime path depends on it.
 //!
 //! One run reads the pinned external corpora, translates each into the
-//! authored procedure-summary IR, compiles the translated entries back through
-//! the production pack compiler, and joins the slots into one deterministic
-//! report. Two runs over the same pins produce byte-identical output.
+//! authored procedure-summary IR, derives summaries from the pinned standard
+//! library sources with the analyzer's own value-flow machinery, compiles the
+//! translated and derived entries back through the production pack compiler,
+//! and joins the three slots into one deterministic report. Two runs over the
+//! same pins produce byte-identical output.
 
 pub mod codeql;
+pub mod derive;
 pub mod ir;
 pub mod joern;
 pub mod join;
@@ -28,6 +31,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
 use serde::{Deserialize, Serialize};
 
 use codeql::{CodeqlParseError, corpus_digest, skip_counts, translate_codeql_models};
+use derive::{DERIVED_OUTPUT_PORTS, DerivationLimits, derive_jvm_summaries};
 use ir::{FoundryClaim, FoundryCorpus, FoundryEntry, FoundrySkip};
 use joern::{
     JoernParseError, parse_default_semantics_scala, parse_semantics_dsl, translate_joern_semantics,
@@ -43,6 +47,16 @@ const JOERN_JAVA_DEFINITION: &str = "javaFlows";
 
 /// The suffix every Models-as-Data file carries.
 const MODEL_FILE_SUFFIX: &str = ".model.yml";
+
+/// The provenance of the derived slot. Its content comes from this tool over
+/// the pinned sources, not from an upstream corpus, so it names itself.
+fn derived_pin() -> FoundryPin {
+    FoundryPin {
+        upstream: "https://github.com/BrokkAi/bifrost".to_owned(),
+        revision: env!("CARGO_PKG_VERSION").to_owned(),
+        license: "LGPL-3.0-or-later".to_owned(),
+    }
+}
 
 /// Where one corpus came from, recorded in every report it produces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +134,10 @@ pub struct FoundryRunInputs {
     /// `DefaultSemantics.scala`, or a `.semantics` file in Joern's DSL.
     pub joern_source: PathBuf,
     pub joern_pin: FoundryPin,
+    /// The package root of the extracted pinned standard-library sources. A run
+    /// without it leaves the derived slot empty and says so in the report.
+    pub jvm_sources: Option<PathBuf>,
+    pub derivation_limits: DerivationLimits,
 }
 
 impl FoundryRunInputs {
@@ -146,6 +164,8 @@ impl FoundryRunInputs {
             codeql_pin,
             joern_source,
             joern_pin,
+            jvm_sources: None,
+            derivation_limits: DerivationLimits::default(),
         })
     }
 }
@@ -174,6 +194,9 @@ pub enum FoundryError {
         path: PathBuf,
         error: JoernParseError,
     },
+    Derivation {
+        detail: String,
+    },
 }
 
 impl fmt::Display for FoundryError {
@@ -200,6 +223,7 @@ impl fmt::Display for FoundryError {
             Self::Joern { path, error } => {
                 write!(formatter, "cannot read {}: {error}", path.display())
             }
+            Self::Derivation { detail } => write!(formatter, "cannot derive summaries: {detail}"),
         }
     }
 }
@@ -247,11 +271,34 @@ pub struct FoundryRoundTripReport {
     pub diagnostics: Vec<String>,
 }
 
+/// What the derivation over the pinned sources produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FoundryDerivationReport {
+    pub files_read: u32,
+    pub procedures_read: u32,
+    pub entries: u32,
+    pub flow_entries: u32,
+    pub no_flow_entries: u32,
+    pub complete_entries: u32,
+    pub transfers: u32,
+    /// Derived flows whose granularity the authored IR cannot carry. The
+    /// entries ship the argument-level projection; this counts what the
+    /// projection dropped.
+    pub qualified_flows: u32,
+    pub boundaries_by_kind: BTreeMap<String, u32>,
+    /// Output ports this stage observes. Any other output is silent, not
+    /// denied.
+    pub observed_output_ports: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FoundryReport {
     pub format: String,
     pub corpora: Vec<FoundryCorpusRecord>,
     pub translation: Vec<FoundryTranslationReport>,
+    /// Absent when the run had no pinned sources to derive from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<FoundryDerivationReport>,
     pub round_trip: Vec<FoundryRoundTripReport>,
     pub join: FoundryJoin,
 }
@@ -273,7 +320,8 @@ impl FoundryReport {
     }
 }
 
-/// Translate both pinned corpora, round-trip them, and join them.
+/// Translate both pinned corpora, derive from the pinned sources, round-trip
+/// every entry, and join the three slots.
 pub fn run_foundry_join(inputs: &FoundryRunInputs) -> Result<FoundryReport, FoundryError> {
     let codeql_files = read_codeql_models(&inputs.codeql_models)?;
     let codeql = translate_codeql_models(&codeql_files).map_err(FoundryError::Codeql)?;
@@ -298,10 +346,18 @@ pub fn run_foundry_join(inputs: &FoundryRunInputs) -> Result<FoundryReport, Foun
     })?;
     let joern = translate_joern_semantics(&joern_name, &joern_semantics);
 
+    let derived = match &inputs.jvm_sources {
+        Some(sources) => Some(derive_jvm_summaries(sources, inputs.derivation_limits)?),
+        None => None,
+    };
+    let derived_entries = derived
+        .as_ref()
+        .map_or(&[][..], |run| run.entries.as_slice());
+
     let join = join_corpora(&[
         (FoundryCorpus::Codeql, &codeql.entries),
         (FoundryCorpus::Joern, &joern.entries),
-        (FoundryCorpus::Derived, &[]),
+        (FoundryCorpus::Derived, derived_entries),
     ]);
 
     Ok(FoundryReport {
@@ -341,12 +397,61 @@ pub fn run_foundry_join(inputs: &FoundryRunInputs) -> Result<FoundryReport, Foun
                 joern.skips,
             ),
         ],
+        derivation: derived.as_ref().map(derivation_report),
         round_trip: vec![
             round_trip(FoundryCorpus::Codeql, &codeql.entries, &inputs.codeql_pin),
             round_trip(FoundryCorpus::Joern, &joern.entries, &inputs.joern_pin),
+            round_trip(FoundryCorpus::Derived, derived_entries, &derived_pin()),
         ],
         join,
     })
+}
+
+fn derivation_report(run: &derive::DerivationRun) -> FoundryDerivationReport {
+    let mut boundaries_by_kind: BTreeMap<String, u32> = BTreeMap::new();
+    let mut complete_entries = 0u32;
+    let mut qualified_flows = 0u32;
+    for entry in &run.entries {
+        let Some(derivation) = &entry.derivation else {
+            continue;
+        };
+        if derivation.completeness == ir::FoundryCompleteness::Complete {
+            complete_entries += 1;
+        }
+        qualified_flows += derivation.qualified_flows().len() as u32;
+        for boundary in &derivation.boundaries {
+            *boundaries_by_kind
+                .entry(boundary.kind().to_owned())
+                .or_default() += 1;
+        }
+    }
+    FoundryDerivationReport {
+        files_read: run.files_read,
+        procedures_read: run.procedures_read,
+        entries: run.entries.len() as u32,
+        flow_entries: run
+            .entries
+            .iter()
+            .filter(|entry| entry.claim == FoundryClaim::Flows)
+            .count() as u32,
+        no_flow_entries: run
+            .entries
+            .iter()
+            .filter(|entry| entry.claim == FoundryClaim::NoFlow)
+            .count() as u32,
+        complete_entries,
+        transfers: run
+            .entries
+            .iter()
+            .map(|entry| entry.transfers.len() as u32)
+            .sum(),
+        qualified_flows,
+        boundaries_by_kind,
+        observed_output_ports: DERIVED_OUTPUT_PORTS
+            .iter()
+            .map(|port| (*port).to_owned())
+            .collect(),
+    }
 }
 
 fn translation_report(
@@ -544,6 +649,19 @@ mod tests {
                 revision: "8a73ec09be8fa59dba3cfed5959690c003d7ca52".to_owned(),
                 license: "Apache-2.0".to_owned(),
             },
+            jvm_sources: None,
+            derivation_limits: DerivationLimits::default(),
+        }
+    }
+
+    /// The same run with the pinned JDK slices, so the derived slot is live.
+    fn fixture_inputs_with_derivation() -> FoundryRunInputs {
+        FoundryRunInputs {
+            jvm_sources: Some(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("testdata/summary-sources/temurin-jdk-21.0.8+9"),
+            ),
+            ..fixture_inputs()
         }
     }
 
@@ -557,10 +675,97 @@ mod tests {
             report.round_trip
         );
         for round_trip in &report.round_trip {
+            if round_trip.corpus == FoundryCorpus::Derived {
+                // The derived slot is empty in this run.
+                assert_eq!(round_trip.entries, 0, "{round_trip:?}");
+                continue;
+            }
             assert!(round_trip.entries > 0, "{round_trip:?}");
             assert_eq!(round_trip.shards, 1, "{round_trip:?}");
             assert!(round_trip.manifest_content_sha256.is_some());
         }
+    }
+
+    #[test]
+    fn every_derived_entry_round_trips_through_the_pack_compiler() {
+        let report = run_foundry_join(&fixture_inputs_with_derivation())
+            .expect("the fixture corpora and pinned slices run");
+
+        assert!(
+            report.round_trip_is_clean(),
+            "round trip diagnostics: {:#?}",
+            report.round_trip
+        );
+        let derived = report
+            .round_trip
+            .iter()
+            .find(|round_trip| round_trip.corpus == FoundryCorpus::Derived)
+            .expect("the derived slot is reported");
+        assert!(derived.entries > 0, "{derived:?}");
+        assert_eq!(derived.shards, 1, "{derived:?}");
+    }
+
+    #[test]
+    fn the_derived_slot_classifies_against_codeql_at_the_argument_level_projection() {
+        let report = run_foundry_join(&fixture_inputs_with_derivation())
+            .expect("the fixture corpora and pinned slices run");
+
+        let derivation = report.derivation.expect("the run derived");
+        assert_eq!(derivation.files_read, 2);
+        assert!(derivation.entries > 0);
+        assert_eq!(
+            derivation.observed_output_ports,
+            vec!["normal_return".to_owned(), "exceptional_return".to_owned()]
+        );
+        assert_eq!(
+            derivation.boundaries_by_kind.get("native_callee"),
+            Some(&1),
+            "boundaries: {:?}",
+            derivation.boundaries_by_kind
+        );
+
+        assert!(
+            report
+                .join
+                .slots
+                .iter()
+                .any(|slot| slot.corpus == FoundryCorpus::Derived && slot.populated)
+        );
+        // CodeQL states `Objects.requireNonNullElse` without a signature, so its
+        // key pins no overload. The derived entry pins arity 2. Both keys are
+        // gaps against each other, and the gap names the sibling so a reviewer
+        // sees the neighbourhood.
+        let derived_gap = report
+            .join
+            .gaps
+            .iter()
+            .find(|gap| {
+                gap.key.artifact_path == "java/util/Objects.class"
+                    && gap.key.member == "requireNonNullElse"
+                    && gap.key.arity == Some(2)
+            })
+            .expect("the derived entry is a gap against the unsigned CodeQL row");
+        assert_eq!(
+            derived_gap.views["derived"].transfers,
+            vec![
+                "parameter[0]->normal_return@normal".to_owned(),
+                "parameter[1]->normal_return@normal".to_owned(),
+            ]
+        );
+        let codeql_row = report
+            .join
+            .gaps
+            .iter()
+            .find(|gap| {
+                gap.key.artifact_path == "java/util/Objects.class"
+                    && gap.key.member == "requireNonNullElse"
+                    && gap.key.arity.is_none()
+            })
+            .expect("the unsigned CodeQL row keeps its own key");
+        assert_eq!(
+            codeql_row.views["codeql"].transfers, derived_gap.views["derived"].transfers,
+            "the derived transfers match the CodeQL translation exactly"
+        );
     }
 
     #[test]
@@ -569,8 +774,8 @@ mod tests {
 
         let codeql = &report.translation[0];
         assert_eq!(codeql.corpus, FoundryCorpus::Codeql);
-        assert_eq!(codeql.files_read, 2);
-        assert_eq!(codeql.rows_by_kind.get("summaryModel"), Some(&9));
+        assert_eq!(codeql.files_read, 3);
+        assert_eq!(codeql.rows_by_kind.get("summaryModel"), Some(&14));
         assert!(codeql.entries > 0);
         assert_eq!(codeql.no_flow_entries, 1);
         assert!(codeql.skipped_rows > 0);

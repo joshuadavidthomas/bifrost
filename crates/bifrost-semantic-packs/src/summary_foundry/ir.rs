@@ -37,7 +37,7 @@ pub enum FoundryCorpus {
     Codeql,
     /// Joern flow semantics (joernio/joern, Apache-2.0).
     Joern,
-    /// Bifrost's own generation-time derivation. Empty until milestone 2.
+    /// Bifrost's own generation-time derivation over the pinned sources.
     Derived,
 }
 
@@ -267,6 +267,179 @@ pub struct FoundrySkip {
     pub detail: String,
 }
 
+/// How much of a target's behavior an entry accounts for.
+///
+/// Only a body the derivation traversed with no unresolved boundary may claim
+/// `complete`. A corpus row never claims it: translation is not traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FoundryCompleteness {
+    Partial,
+    Complete,
+}
+
+/// Why a derivation stopped short of the whole body.
+///
+/// Each variant is a fact the derivation observed, never an inference about
+/// what lies past it. An entry that carries any of these states less than the
+/// target does; it never states a transfer it did not derive.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(tag = "boundary", rename_all = "snake_case")]
+pub enum FoundryDerivationBoundary {
+    /// The callee is declared `native`: its behavior is not in any source the
+    /// pins carry, so no transfer through it can be derived.
+    NativeCallee { callee: String },
+    /// The callee is declared without a body and is not `native` (abstract, or
+    /// an interface method with no default).
+    CalleeWithoutBody { callee: String },
+    /// The callee's body is outside the pinned sources this run indexed.
+    ExternalCallee { callee: Option<String> },
+    /// The call resumes later (async, generator), so its transfer is not one
+    /// call edge.
+    DeferredCallee { callee: String, kind: String },
+    /// Dispatch produced no target at all.
+    UnresolvedCall,
+    /// The dispatch candidate set hit a bound and omitted candidates.
+    TruncatedDispatch,
+    /// A semantic oracle answered with something other than a complete outcome.
+    /// `capability` names the unsupported capability when the oracle said which
+    /// one it is, which is what routes the entry to the right repair.
+    SemanticGap {
+        status: String,
+        capability: Option<String>,
+    },
+    /// A semantic or solver budget stopped the run.
+    BudgetExceeded { detail: String },
+    /// The solver was cancelled.
+    SolverCancelled,
+    /// The interprocedural closure reached the derivation's own bound.
+    ClosureLimit { limit: u32 },
+}
+
+impl FoundryDerivationBoundary {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::NativeCallee { .. } => "native_callee",
+            Self::CalleeWithoutBody { .. } => "callee_without_body",
+            Self::ExternalCallee { .. } => "external_callee",
+            Self::DeferredCallee { .. } => "deferred_callee",
+            Self::UnresolvedCall => "unresolved_call",
+            Self::TruncatedDispatch => "truncated_dispatch",
+            Self::SemanticGap { .. } => "semantic_gap",
+            Self::BudgetExceeded { .. } => "budget_exceeded",
+            Self::SolverCancelled => "solver_cancelled",
+            Self::ClosureLimit { .. } => "closure_limit",
+        }
+    }
+}
+
+/// One step of an access path, as the value-flow machinery reports it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(tag = "selector", rename_all = "snake_case")]
+pub enum FoundrySelector {
+    Field { name: String },
+    ExactIndex,
+    AnyIndex,
+}
+
+impl FoundrySelector {
+    fn render(&self) -> String {
+        match self {
+            Self::Field { name } => format!(".Field[{name}]"),
+            Self::ExactIndex => ".ExactIndex".to_owned(),
+            Self::AnyIndex => ".Element".to_owned(),
+        }
+    }
+}
+
+/// One port with the access path the derivation observed beneath it.
+///
+/// The authored IR has no access paths, so a shipping transfer keeps only
+/// `port`. This form keeps the whole answer, because the granularity cannot be
+/// recovered once it is dropped: 3672 CodeQL rows in the milestone-1 run were
+/// skipped for exactly this reason, and heap- and object-sensitive summaries
+/// are the direction the IR is headed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct FoundryAccessPath {
+    /// The port spelling, as [`render_transfer`] spells it.
+    pub port: String,
+    pub selectors: Vec<FoundrySelector>,
+}
+
+impl FoundryAccessPath {
+    pub fn render(&self) -> String {
+        let mut rendered = self.port.clone();
+        for selector in &self.selectors {
+            rendered.push_str(&selector.render());
+        }
+        rendered
+    }
+
+    /// Whether this path says more than its port alone.
+    pub fn is_qualified(&self) -> bool {
+        !self.selectors.is_empty()
+    }
+}
+
+/// One derived flow at the granularity the value-flow machinery reported it.
+///
+/// The shipping transfer is this record projected onto its two ports. A join
+/// against an argument-level corpus compares the projection; this record is
+/// what makes the projection visible as a projection.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct FoundryFineGrainedTransfer {
+    pub input: FoundryAccessPath,
+    pub output: FoundryAccessPath,
+    pub exit_kind: String,
+}
+
+impl FoundryFineGrainedTransfer {
+    pub fn render(&self) -> String {
+        format!(
+            "{}->{}@{}",
+            self.input.render(),
+            self.output.render(),
+            self.exit_kind
+        )
+    }
+
+    /// Whether either end says more than the shipping transfer can.
+    pub fn is_qualified(&self) -> bool {
+        self.input.is_qualified() || self.output.is_qualified()
+    }
+}
+
+/// What one derivation run observed about one target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FoundryDerivation {
+    pub completeness: FoundryCompleteness,
+    /// Transfers the solver reported without proven, complete evidence. They
+    /// still ship: a partial summary can add a flow but can never deny one.
+    pub unproven_transfers: u32,
+    /// Procedures the interprocedural closure entered, including the target.
+    pub closure_procedures: u32,
+    pub boundaries: Vec<FoundryDerivationBoundary>,
+    /// Every derived flow at full granularity. The entry's `transfers` are the
+    /// argument-level projection of these.
+    pub fine_grained: Vec<FoundryFineGrainedTransfer>,
+}
+
+impl FoundryDerivation {
+    /// The rendered flows whose granularity the shipping transfers cannot
+    /// carry, sorted.
+    pub fn qualified_flows(&self) -> Vec<String> {
+        let mut rendered = self
+            .fine_grained
+            .iter()
+            .filter(|transfer| transfer.is_qualified())
+            .map(FoundryFineGrainedTransfer::render)
+            .collect::<Vec<_>>();
+        rendered.sort();
+        rendered.dedup();
+        rendered
+    }
+}
+
 /// One target's claim from one corpus, in the authored IR plus its envelope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FoundryEntry {
@@ -279,6 +452,10 @@ pub struct FoundryEntry {
     pub artifact: FoundryArtifactBinding,
     pub evidence: Vec<FoundryEvidence>,
     pub notes: Vec<FoundryNote>,
+    /// Present only on a derived entry. A corpus row is a translated claim, not
+    /// a traversal, so it has nothing to say here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<FoundryDerivation>,
 }
 
 impl FoundryEntry {
@@ -546,6 +723,7 @@ impl FoundryEntryBuilder {
             artifact: FoundryArtifactBinding::Unresolved,
             evidence: self.evidence,
             notes: self.notes,
+            derivation: None,
         }
     }
 }

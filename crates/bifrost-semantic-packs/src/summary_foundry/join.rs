@@ -7,9 +7,15 @@
 //! * dispute: every populated slot has a claim and at least one field differs;
 //! * gap: at least one populated slot has no claim at all.
 //!
-//! The derived slot holds Bifrost's own generation-time derivation. Milestone 1
-//! does not populate it, and the report states that once in `slots` rather than
-//! reporting every target as missing from it.
+//! The derived slot holds Bifrost's own generation-time derivation. A run
+//! without pinned sources leaves it empty, and the report states that once in
+//! `slots` rather than reporting every target as missing from it.
+//!
+//! Slots are compared at the argument-level projection, because that is the
+//! only granularity every slot can state: Models-as-Data rows and the authored
+//! IR are both argument-level. A derived entry may know more, so an agreement
+//! records whether it holds only at the projection, and every view carries the
+//! finer-grained flows and the typed boundaries beside the compared form.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,10 +39,17 @@ pub struct FoundrySlotState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FoundryClaimView {
     pub claim: FoundryClaim,
+    /// The argument-level projection: the form every slot can be compared in.
     pub transfers: Vec<String>,
     pub has_receiver: bool,
     pub parameter_count: u32,
     pub entry_ids: Vec<String>,
+    /// Flows this slot derived at a granularity the projection cannot carry.
+    /// Empty for a translated corpus, which states argument-level rows.
+    pub qualified_flows: Vec<String>,
+    /// Typed reasons a derivation stopped short. Empty for a corpus: a
+    /// translated row is a claim, not a traversal.
+    pub boundaries: Vec<String>,
 }
 
 /// One field on which the populated slots disagree.
@@ -52,6 +65,10 @@ pub struct FoundryAgreement {
     pub key: FoundryJoinKey,
     pub claim: FoundryClaim,
     pub transfers: Vec<String>,
+    /// The slots match on the argument-level projection while at least one of
+    /// them states more than the projection carries. The agreement is real at
+    /// the compared granularity and silent about the rest.
+    pub at_projection_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -77,6 +94,9 @@ pub struct FoundryGap {
 pub struct FoundryJoin {
     pub slots: Vec<FoundrySlotState>,
     pub agreement_count: u32,
+    /// Agreements that hold only after projecting a finer-grained slot onto
+    /// argument level.
+    pub agreements_at_projection_only: u32,
     pub dispute_count: u32,
     pub gap_count: u32,
     pub gaps_by_missing_slot: BTreeMap<String, u32>,
@@ -149,6 +169,7 @@ pub fn join_corpora(slots: &[(FoundryCorpus, &[FoundryEntry])]) -> FoundryJoin {
                     key: key.clone(),
                     claim: view.claim,
                     transfers: view.transfers.clone(),
+                    at_projection_only: views.values().any(|view| !view.qualified_flows.is_empty()),
                 });
             } else {
                 disputes.push(FoundryDispute {
@@ -188,6 +209,10 @@ pub fn join_corpora(slots: &[(FoundryCorpus, &[FoundryEntry])]) -> FoundryJoin {
     FoundryJoin {
         slots: slot_states,
         agreement_count: agreements.len() as u32,
+        agreements_at_projection_only: agreements
+            .iter()
+            .filter(|agreement| agreement.at_projection_only)
+            .count() as u32,
         dispute_count: disputes.len() as u32,
         gap_count: gaps.len() as u32,
         gaps_by_missing_slot,
@@ -209,6 +234,8 @@ fn named_views(
 fn merge_view(entries: &[&FoundryEntry]) -> FoundryClaimView {
     let mut transfers = BTreeSet::new();
     let mut entry_ids = BTreeSet::new();
+    let mut qualified_flows = BTreeSet::new();
+    let mut boundaries = BTreeSet::new();
     let mut has_receiver = false;
     let mut parameter_count = 0u32;
     let mut every_entry_states_no_flow = true;
@@ -218,6 +245,15 @@ fn merge_view(entries: &[&FoundryEntry]) -> FoundryClaimView {
         has_receiver |= entry.boundary.has_receiver;
         parameter_count = parameter_count.max(entry.boundary.parameter_count);
         every_entry_states_no_flow &= entry.claim == FoundryClaim::NoFlow;
+        if let Some(derivation) = &entry.derivation {
+            qualified_flows.extend(derivation.qualified_flows());
+            boundaries.extend(
+                derivation
+                    .boundaries
+                    .iter()
+                    .map(|boundary| boundary.kind().to_owned()),
+            );
+        }
     }
     FoundryClaimView {
         claim: if every_entry_states_no_flow {
@@ -229,6 +265,8 @@ fn merge_view(entries: &[&FoundryEntry]) -> FoundryClaimView {
         has_receiver,
         parameter_count,
         entry_ids: entry_ids.into_iter().collect(),
+        qualified_flows: qualified_flows.into_iter().collect(),
+        boundaries: boundaries.into_iter().collect(),
     }
 }
 
