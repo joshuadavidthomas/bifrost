@@ -752,7 +752,7 @@ impl RustUsageWalks<'_> {
         })
     }
 
-    fn export_targets_from_files(
+    pub fn export_targets_from_files(
         &self,
         analyzer: &dyn RustFactSource,
         module_files: &[ProjectFile],

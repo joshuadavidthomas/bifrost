@@ -194,6 +194,64 @@ impl RustModuleRouteFacts {
     }
 }
 
+/// One `include!("...")` invocation in this file, as written.
+///
+/// Persisted as `rust_include_edges`. `relative_path` is the literal after
+/// escape decoding and `file_name` its last component; neither the resolved
+/// target nor the host's package is stored, because both need the live file's
+/// own location and these rows are content-keyed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustIncludeEdgeFact {
+    pub relative_path: String,
+    pub file_name: String,
+    /// The invocation's start byte, which is where the reader takes the host's
+    /// lexical package and picks the bindings in scope.
+    pub include_start: usize,
+    /// The host import bindings whose scope contains `include_start`, in the
+    /// order route composition applies them.
+    pub host_bindings: Vec<RustIncludeHostBindingFact>,
+}
+
+/// One host import binding visible at an include splice.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RustIncludeHostBindingFact {
+    pub local_name: String,
+    pub module_specifier: String,
+    pub imported_name: Option<String>,
+    pub scope_start: usize,
+    pub kind: RustIncludeBindingKind,
+}
+
+/// The three import shapes an include route threads. A narrow enum rather than
+/// core's `ImportKind` because only these three can reach a route, and the
+/// stored `kind` column round-trips exactly through
+/// [`encode_rust_include_binding_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RustIncludeBindingKind {
+    Named,
+    Namespace,
+    Glob,
+}
+
+pub fn encode_rust_include_binding_kind(kind: RustIncludeBindingKind) -> &'static str {
+    match kind {
+        RustIncludeBindingKind::Named => "named",
+        RustIncludeBindingKind::Namespace => "namespace",
+        RustIncludeBindingKind::Glob => "glob",
+    }
+}
+
+/// Inverse of [`encode_rust_include_binding_kind`]. `None` only for text this
+/// build did not write.
+pub fn decode_rust_include_binding_kind(encoded: &str) -> Option<RustIncludeBindingKind> {
+    match encoded {
+        "named" => Some(RustIncludeBindingKind::Named),
+        "namespace" => Some(RustIncludeBindingKind::Namespace),
+        "glob" => Some(RustIncludeBindingKind::Glob),
+        _ => None,
+    }
+}
+
 /// Everything the Rust walk records about one file for usage analysis.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RustUsageFacts {
@@ -205,6 +263,8 @@ pub struct RustUsageFacts {
     pub identifier_occurrences: Vec<RustIdentifierOccurrence>,
     /// What the Cargo route index needs from this file (issue #1793).
     pub module_routes: RustModuleRouteFacts,
+    /// The file's `include!` invocations, in source order.
+    pub include_edges: Vec<RustIncludeEdgeFact>,
 }
 
 /// The `visibility` column of `rust_import_targets`.
@@ -242,6 +302,22 @@ pub fn decode_rust_visibility(encoded: &str) -> Option<RustVisibility> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_include_binding_kind_encoding_round_trips() {
+        for kind in [
+            RustIncludeBindingKind::Named,
+            RustIncludeBindingKind::Namespace,
+            RustIncludeBindingKind::Glob,
+        ] {
+            let encoded = encode_rust_include_binding_kind(kind);
+            assert_eq!(
+                decode_rust_include_binding_kind(encoded),
+                Some(kind),
+                "{kind:?} encoded as {encoded}"
+            );
+        }
+    }
 
     #[test]
     fn rust_visibility_encoding_round_trips() {

@@ -755,6 +755,18 @@ impl RustFactSource for RustAnalyzer {
             .unwrap_or_default()
     }
 
+    fn rust_include_blobs(&self, file_name: &str) -> Vec<git2::Oid> {
+        self.analyzer_store()
+            .rust_include_blobs("rust", file_name)
+            .unwrap_or_default()
+    }
+
+    fn rust_include_host_blobs(&self) -> Vec<git2::Oid> {
+        self.analyzer_store()
+            .rust_include_host_blobs("rust")
+            .unwrap_or_default()
+    }
+
     fn rust_declaration_facts_of(&self, file: &ProjectFile) -> Arc<RustDeclarationFacts> {
         self.rust_declaration_facts_of(file)
     }

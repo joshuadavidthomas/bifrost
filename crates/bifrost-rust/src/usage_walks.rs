@@ -30,7 +30,7 @@ use crate::graph_support::RustFactSource;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::cache::{
-    build_weighted_cache, weight_alias_routes, weight_forward_import_edges,
+    build_weighted_cache, weight_alias_routes, weight_forward_import_edges, weight_include_routes,
     weight_macro_scope_edges, weight_macro_visible_ranges, weight_module_bindings,
     weight_module_domains, weight_module_probe, weight_origin_routes, weight_project_file_list,
 };
@@ -90,6 +90,10 @@ pub struct RustWalkCaches {
     origin_routes: Cache<ProjectFile, Arc<HashMap<String, Vec<RustOriginRoute>>>>,
     macro_scope_edges: Cache<ProjectFile, Arc<Vec<RustMacroScopeEdge>>>,
     macro_visible_ranges: Cache<CodeUnit, Arc<RustMacroScopeRanges>>,
+    /// Composed include-expansion routes, per included file. The backward walk
+    /// that fills it is in `usage_includes.rs`; the cache lives here with every
+    /// other cross-file walk's, so it retires with the analyzer generation.
+    pub include_routes: Cache<ProjectFile, Arc<Vec<crate::usage_includes::RustIncludeRoute>>>,
 }
 
 impl RustWalkCaches {
@@ -106,6 +110,7 @@ impl RustWalkCaches {
             macro_scope_edges: build_weighted_cache(share, weight_macro_scope_edges),
             macro_visible_ranges: build_weighted_cache(share, weight_macro_visible_ranges),
             module_probes: build_weighted_cache(share, weight_module_probe),
+            include_routes: build_weighted_cache(share, weight_include_routes),
             module_probe_computations: AtomicU64::new(0),
         }
     }
@@ -364,7 +369,7 @@ impl<'a> RustUsageWalks<'a> {
     /// and every cache write is gated on it. A truncated answer is a correct
     /// thing to return to a caller that is about to report `Cancelled`, and a
     /// catastrophic thing to memoize for the rest of the generation.
-    fn cancelled(&self) -> bool {
+    pub fn cancelled(&self) -> bool {
         self.keep_going.is_some_and(|keep_going| !keep_going())
     }
 

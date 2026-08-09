@@ -264,3 +264,34 @@ pub fn weight_macro_visible_ranges(
         .sum::<usize>();
     (key.fq_name().len() + size).min(u32::MAX as usize) as u32
 }
+
+/// Byte weight of one file's composed include-expansion routes. The host
+/// bindings dominate: a deeply nested include accumulates one per binding
+/// visible at each splice it passed through.
+pub fn weight_include_routes(
+    _key: &ProjectFile,
+    value: &Arc<Vec<crate::usage_includes::RustIncludeRoute>>,
+) -> u32 {
+    let size = value
+        .iter()
+        .map(|route| {
+            route.root_file.rel_path().to_string_lossy().len()
+                + route.crate_package.len()
+                + route.module_package.len()
+                + route
+                    .host_bindings
+                    .iter()
+                    .map(|binding| {
+                        binding.local_name.len()
+                            + binding.module_specifier.len()
+                            + binding.imported_name.as_ref().map_or(0, String::len)
+                            + binding.module_package.len()
+                            + size_of::<crate::usage_includes::RustIncludeHostBinding>()
+                    })
+                    .sum::<usize>()
+                + size_of::<crate::usage_includes::RustIncludeRoute>()
+        })
+        .sum::<usize>()
+        + size_of::<Vec<crate::usage_includes::RustIncludeRoute>>();
+    size.min(u32::MAX as usize) as u32
+}

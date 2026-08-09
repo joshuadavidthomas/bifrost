@@ -370,6 +370,17 @@ impl<'a> RustUsageQueries<'a> {
         dedup_files(files)
     }
 
+    /// Live files with an `include!` whose literal ends in `file_name`.
+    ///
+    /// One indexed lookup on `rust_include_edges.file_name`. The result is a
+    /// candidate set under the same contract as the other inverted lookups
+    /// here: two directories can both hold a `table.rs`, and only resolving
+    /// each candidate's own literal against its own directory decides which
+    /// one it names.
+    pub fn files_with_include_named(&self, file_name: &str) -> Vec<ProjectFile> {
+        self.live_files(self.analyzer.rust_include_blobs(file_name))
+    }
+
     fn live_files(&self, oids: Vec<Oid>) -> Vec<ProjectFile> {
         let snapshot = self.analyzer.live_blobs();
         dedup_files(

@@ -56,7 +56,7 @@ A **pin** is a test that fails before a fix and passes after it. When this plan 
 - [x] (2026-08-09) Phase 2 Step 1 -- restore the write path. Fact value types in `crates/bifrost-core/src/analyzer/rust_facts.rs`; extraction in `crates/bifrost-rust/src/facts.rs`; `extract_rust_module_route_facts` back in `crates/bifrost-rust/src/cargo_routes.rs`; `ParsedFile`/`FileState` carry `rust_usage_facts`; the store writes and reads the eight `rust_*` tables; the two detector salt tokens added. Eight parked store tests restored and green.
 - [x] (2026-08-09) Phase 2 Step 2a -- Cargo routes composed from per-blob module-route rows. `RustCargoRouteIndex::build_while` takes plain fact data instead of a `prepared_syntax` closure and a `parallel` flag; `RustAnalyzer::rust_module_route_facts` is the one batched store read that feeds it.
 - [x] (2026-08-09) Phase 2 Step 2b -- the read path. `usage.rs`, `usage_walks.rs`, `usage_queries.rs` and a new `cache.rs` in `crates/bifrost-rust/src/`, over the new `RustFactSource` trait; `fact_catch_up.rs` in `crates/bifrost-analysis/src/analyzer/rust/`. The ninth parked test is restored in `workspace.rs`.
-- [ ] Phase 2 Step 3: rebuild upstream's include-expansion routes on the v2 substrate.
+- [x] (2026-08-09) Phase 2 Step 3 -- include-expansion routes on the v2 substrate. Migration 0020 adds `rust_include_edges` and `rust_include_host_bindings`; `crates/bifrost-rust/src/usage_includes.rs` composes routes backwards from those rows. Dave's four regression suites pass against the rebuilt routes.
 - [ ] Phase 2 Step 4: delete `RustUsageIndex`.
 
 ## Surprises & Discoveries

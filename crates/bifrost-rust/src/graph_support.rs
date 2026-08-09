@@ -149,6 +149,15 @@ pub trait RustFactSource: RustUsageSource {
     /// bitmask each one carries.
     fn rust_identifier_occurrence_blobs(&self, identifier: &str) -> Vec<(git2::Oid, u32)>;
 
+    /// Blobs with an `include!` whose literal's last path component is
+    /// `file_name`. The inverted direction of `rust_include_edges`, and the
+    /// seed of an include-route walk.
+    fn rust_include_blobs(&self, file_name: &str) -> Vec<git2::Oid>;
+
+    /// Every blob that writes at least one `include!`. Bounded by the number of
+    /// files that use the macro, not by the workspace.
+    fn rust_include_host_blobs(&self) -> Vec<git2::Oid>;
+
     /// One file's declaration identities and their visibility domains, derived
     /// once per file and then served from the analyzer's bounded cache.
     fn rust_declaration_facts_of(&self, file: &ProjectFile) -> Arc<RustDeclarationFacts>;

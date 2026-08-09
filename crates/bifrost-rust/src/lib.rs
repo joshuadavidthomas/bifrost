@@ -38,6 +38,7 @@ pub mod queries;
 pub mod structural;
 pub mod test_detection;
 pub mod usage;
+pub mod usage_includes;
 pub mod usage_index;
 pub mod usage_queries;
 pub mod usage_walks;

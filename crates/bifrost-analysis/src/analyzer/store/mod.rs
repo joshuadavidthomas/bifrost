@@ -29,10 +29,11 @@ use brokk_bifrost_core::cache_db::{
 };
 
 use brokk_bifrost_core::analyzer::rust_facts::{
-    RustExportFact, RustIdentifierOccurrence, RustImportTargetFact, RustMacroGateFact,
-    RustModuleFact, RustModuleRouteFact, RustModuleRouteFacts, RustModuleScopeFact,
-    RustRulesItemMacroDefinition, RustUsageFacts, RustVisibility, decode_rust_visibility,
-    encode_rust_visibility,
+    RustExportFact, RustIdentifierOccurrence, RustImportTargetFact, RustIncludeEdgeFact,
+    RustIncludeHostBindingFact, RustMacroGateFact, RustModuleFact, RustModuleRouteFact,
+    RustModuleRouteFacts, RustModuleScopeFact, RustRulesItemMacroDefinition, RustUsageFacts,
+    RustVisibility, decode_rust_include_binding_kind, decode_rust_visibility,
+    encode_rust_include_binding_kind, encode_rust_visibility,
 };
 
 use crate::CancellationToken;
@@ -3698,6 +3699,44 @@ impl AnalyzerStore {
         )
     }
 
+    /// Every blob that writes at least one `include!`.
+    ///
+    /// Bounded by the number of Rust files that use `include!`, which is a
+    /// handful in even a very large workspace -- this is a scan of one narrow
+    /// table, not of the workspace. The one caller is the inverse-scan file
+    /// selection, which has to know which files are spliced into another
+    /// before it can decide whether to read them.
+    pub(crate) fn rust_include_host_blobs(&self, lang: &str) -> Result<Vec<Oid>> {
+        let conn = self.read_conn()?;
+        let mut stmt = conn
+            .prepare_cached("SELECT DISTINCT blob_oid FROM rust_include_edges WHERE lang = ?1")?;
+        let rows = stmt.query_map(params![lang], |row| row.get::<_, String>(0))?;
+        let mut blobs = Vec::new();
+        for row in rows {
+            let text = row?;
+            blobs.push(
+                Oid::from_str(&text)
+                    .map_err(|err| StoreError::new(format!("invalid blob oid {text}: {err}")))?,
+            );
+        }
+        Ok(blobs)
+    }
+
+    /// Blobs with an `include!` whose literal's last path component is
+    /// `file_name`. The inverted direction of `rust_include_edges`.
+    ///
+    /// A candidate set: two directories can both hold a `table.rs`, so the
+    /// caller confirms each candidate by resolving that candidate's own stored
+    /// `relative_path` against its own directory.
+    pub(crate) fn rust_include_blobs(&self, lang: &str, file_name: &str) -> Result<Vec<Oid>> {
+        self.rust_fact_blobs(
+            "SELECT DISTINCT blob_oid FROM rust_include_edges
+             WHERE lang = ?1 AND file_name = ?2",
+            lang,
+            file_name,
+        )
+    }
+
     /// Blobs whose text mentions `identifier`, with the OR of the contexts it
     /// was seen in. These are CANDIDATES, never usages: a hit means the name
     /// occurs, and the caller must still resolve it against the candidate's
@@ -4267,6 +4306,30 @@ struct RustFactRows {
     /// The `rust_module_scopes` / `rust_module_routes` /
     /// `rust_module_route_gates` / `rust_item_macros` rows (issue #1793).
     module_routes: RustModuleRouteRows,
+    /// The `rust_include_edges` rows, each carrying its
+    /// `rust_include_host_bindings` rows.
+    include_edges: Vec<RustIncludeEdgeRow>,
+}
+
+/// One `rust_include_edges` row and the host bindings that hang off it.
+#[derive(Debug)]
+struct RustIncludeEdgeRow {
+    ordinal: i64,
+    relative_path: String,
+    file_name: String,
+    include_start: i64,
+    host_bindings: Vec<RustIncludeHostBindingRow>,
+}
+
+/// One `rust_include_host_bindings` row.
+#[derive(Debug)]
+struct RustIncludeHostBindingRow {
+    ordinal: i64,
+    local_name: String,
+    module_specifier: String,
+    imported_name: Option<String>,
+    scope_start: i64,
+    kind: String,
 }
 
 /// The four module-route tables' rows for one blob.
@@ -4418,12 +4481,41 @@ impl RustFactRows {
             })
             .collect();
         let module_routes = RustModuleRouteRows::from_facts(&facts.module_routes)?;
+        let include_edges = facts
+            .include_edges
+            .iter()
+            .enumerate()
+            .map(|(ordinal, edge)| {
+                Ok(RustIncludeEdgeRow {
+                    ordinal: usize_to_i64(ordinal)?,
+                    relative_path: edge.relative_path.clone(),
+                    file_name: edge.file_name.clone(),
+                    include_start: usize_to_i64(edge.include_start)?,
+                    host_bindings: edge
+                        .host_bindings
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, binding)| {
+                            Ok(RustIncludeHostBindingRow {
+                                ordinal: usize_to_i64(ordinal)?,
+                                local_name: binding.local_name.clone(),
+                                module_specifier: binding.module_specifier.clone(),
+                                imported_name: binding.imported_name.clone(),
+                                scope_start: usize_to_i64(binding.scope_start)?,
+                                kind: encode_rust_include_binding_kind(binding.kind).to_string(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             exports,
             import_targets,
             modules,
             identifier_occurrences,
             module_routes,
+            include_edges,
         })
     }
 
@@ -4434,6 +4526,11 @@ impl RustFactRows {
             self.modules.len(),
             self.identifier_occurrences.len(),
             self.module_routes.logical_rows(),
+            saturating_sum(
+                self.include_edges
+                    .iter()
+                    .map(|edge| edge.host_bindings.len().saturating_add(1)),
+            ),
         ])
     }
 
@@ -4462,6 +4559,20 @@ impl RustFactRows {
                     .map(|(identifier, _)| identifier.len()),
             ),
             self.module_routes.string_bytes(),
+            saturating_sum(self.include_edges.iter().map(|edge| {
+                saturating_sum([
+                    edge.relative_path.len(),
+                    edge.file_name.len(),
+                    saturating_sum(edge.host_bindings.iter().map(|binding| {
+                        saturating_sum([
+                            binding.local_name.len(),
+                            binding.module_specifier.len(),
+                            binding.imported_name.as_ref().map_or(0, String::len),
+                            binding.kind.len(),
+                        ])
+                    })),
+                ])
+            })),
         ])
     }
 }
@@ -4722,6 +4833,42 @@ fn insert_rust_fact_rows(
             ])?;
         }
     }
+    if !rows.include_edges.is_empty() {
+        let mut edge_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO rust_include_edges(
+               blob_oid, lang, ordinal, relative_path, file_name, include_start
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        let mut binding_stmt = tx.prepare(
+            "INSERT OR IGNORE INTO rust_include_host_bindings(
+               blob_oid, lang, edge_ordinal, ordinal, local_name, module_specifier,
+               imported_name, scope_start, kind
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for edge in &rows.include_edges {
+            edge_stmt.execute(params![
+                oid,
+                lang,
+                edge.ordinal,
+                edge.relative_path,
+                edge.file_name,
+                edge.include_start,
+            ])?;
+            for binding in &edge.host_bindings {
+                binding_stmt.execute(params![
+                    oid,
+                    lang,
+                    edge.ordinal,
+                    binding.ordinal,
+                    binding.local_name,
+                    binding.module_specifier,
+                    binding.imported_name,
+                    binding.scope_start,
+                    binding.kind,
+                ])?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4839,13 +4986,84 @@ fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<Rus
         }
     }
     let module_routes = read_rust_module_route_facts(conn, oid, lang)?;
+    let include_edges = read_rust_include_edges(conn, oid, lang)?;
     Ok(RustUsageFacts {
         exports,
         import_targets,
         modules,
         identifier_occurrences,
         module_routes,
+        include_edges,
     })
+}
+
+/// Read back one blob's `include!` edges and their host bindings.
+///
+/// Two ordered reads rather than a join: the bindings are grouped by
+/// `edge_ordinal`, both statements are index-ordered by the tables' primary
+/// keys, and a merge over two sorted streams costs one pass without the
+/// duplicated edge columns a join would carry.
+fn read_rust_include_edges(
+    conn: &Connection,
+    oid: &str,
+    lang: &str,
+) -> Result<Vec<RustIncludeEdgeFact>> {
+    let mut edges: Vec<RustIncludeEdgeFact> = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT relative_path, file_name, include_start FROM rust_include_edges
+             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+        )?;
+        let rows = stmt.query_map(params![oid, lang], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (relative_path, file_name, include_start) = row?;
+            edges.push(RustIncludeEdgeFact {
+                relative_path,
+                file_name,
+                include_start: i64_to_usize(include_start)?,
+                host_bindings: Vec::new(),
+            });
+        }
+    }
+    if edges.is_empty() {
+        return Ok(edges);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT edge_ordinal, local_name, module_specifier, imported_name, scope_start, kind
+         FROM rust_include_host_bindings
+         WHERE blob_oid = ?1 AND lang = ?2 ORDER BY edge_ordinal, ordinal",
+    )?;
+    let rows = stmt.query_map(params![oid, lang], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    for row in rows {
+        let (edge_ordinal, local_name, module_specifier, imported_name, scope_start, kind) = row?;
+        let Some(edge) = edges.get_mut(i64_to_usize(edge_ordinal)?) else {
+            continue;
+        };
+        edge.host_bindings.push(RustIncludeHostBindingFact {
+            local_name,
+            module_specifier,
+            imported_name,
+            scope_start: i64_to_usize(scope_start)?,
+            kind: decode_rust_include_binding_kind(&kind)
+                .unwrap_or_else(|| panic!("unknown persisted include binding kind: {kind}")),
+        });
+    }
+    Ok(edges)
 }
 
 /// Read back one blob's module-route facts.
@@ -15964,6 +16182,59 @@ mod tests {
             mask("in_a_string"),
             Some(brokk_bifrost_core::analyzer::rust_facts::RUST_OCCURRENCE_STRING)
         );
+
+        // The include edge records the literal as written and its last
+        // component, never the resolved target: two byte-identical files at
+        // different paths share this row set, so resolution is the reader's.
+        let edges: Vec<_> = facts
+            .include_edges
+            .iter()
+            .map(|edge| (edge.relative_path.as_str(), edge.file_name.as_str()))
+            .collect();
+        assert_eq!(edges, vec![("generated/table.rs", "table.rs")]);
+        let bindings: Vec<_> = facts.include_edges[0]
+            .host_bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.local_name.as_str(),
+                    binding.module_specifier.as_str(),
+                    binding.imported_name.as_deref(),
+                    binding.kind,
+                )
+            })
+            .collect();
+        assert_eq!(
+            bindings,
+            vec![
+                (
+                    "*",
+                    "gamma",
+                    None,
+                    brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Glob
+                ),
+                (
+                    "Alias",
+                    "beta",
+                    Some("Renamed"),
+                    brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Named
+                ),
+                (
+                    "Exported",
+                    "alpha",
+                    Some("Exported"),
+                    brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Named
+                ),
+                (
+                    "Private",
+                    "delta",
+                    Some("Private"),
+                    brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind::Named
+                ),
+            ],
+            "only the root-scope bindings reach a root-scope include: {:?}",
+            facts.include_edges[0].host_bindings
+        );
     }
 
     #[test]
@@ -16023,6 +16294,8 @@ mod tests {
                 "rust_module_routes",
                 "rust_module_route_gates",
                 "rust_item_macros",
+                "rust_include_edges",
+                "rust_include_host_bindings",
             ]
             .into_iter()
             .map(|table| {
@@ -16291,6 +16564,7 @@ mod inline {
         let _ = \"in_a_string\";
     }
 }
+include!(\"generated/table.rs\");
 // in_a_comment
 ";
 
