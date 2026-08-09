@@ -1926,6 +1926,47 @@ mod boundary_evidence_tests {
     }
 
     #[test]
+    fn a_pack_for_another_language_never_answers_a_jvm_name() {
+        // Near miss: an activated pack that publishes the very same qualified
+        // name for a different ecosystem's language. The JVM realm is Java,
+        // Kotlin and Scala, so this one is not on the classpath and must not
+        // upgrade the reference.
+        use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
+
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        let type_id = type_declaration_id(TypeIdentity {
+            ecosystem: "composer",
+            name: "java.util.Collections",
+        });
+        activate_fixture_pack(
+            &fixture,
+            "fixture.php.impostor",
+            &single_type_pack(
+                "fixture.php.impostor",
+                "php",
+                "composer",
+                "vendor/impostor",
+                &type_id,
+                "java.util.Collections",
+            ),
+            activation_evidence("php", "composer", "vendor/impostor"),
+        );
+        let (_, trace) = fixture.trace("Collections helper");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "a pack for another language declares nothing on the classpath: {routes:?}"
+        );
+    }
+
+    #[test]
     fn an_indexed_external_route_is_the_selection_and_an_unknown_one_is_not() {
         // The trace's outcome column, not just its boundary column: a route
         // that named an exact external declaration is what the reference
