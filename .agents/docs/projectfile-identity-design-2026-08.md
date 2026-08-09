@@ -64,6 +64,13 @@ it is deliberately gated because Stage 1 may capture most of the win at a tenth 
 radius - `ProjectFile` is the codebase's central identity type and Stage 2 touches its
 representation.
 
+OWNER REVIEW NOTE (2026-08-09): the sorted-order ID assignment ("ID order equals path order
+within a generation") is judged FRAGILE by the owner and must not be implemented as written.
+If Stage 2 is ever warranted by the re-profile, use the boring-safe shape instead: IDs are
+opaque and serve equality/hash/membership/arena indexing ONLY; every structure whose iteration
+or output order is contractual stays keyed/sorted by path. Ordering never rides on ID
+assignment.
+
 ## Rides along with Stage 1 (measured, designless)
 
 **The canonicalize storm**: `liveness.rs:273` `rel_path_from_workdir` calls
