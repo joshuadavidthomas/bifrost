@@ -16,10 +16,14 @@
 //!   must yield none. Only a `complete` claim can deny a flow, so only a
 //!   `complete` entry gets one.
 //!
-//! What the fixture proves is executability, not truth. The target's real body
-//! is never in the fixture -- it cannot be, because a procedure summary binds
-//! only where the workspace has a *declaration without a body* -- so the
-//! fixture states: this entry's transfer set, applied to a target of the shape
+//! What the fixture proves is executability, not truth. The target is always a
+//! synthetic declaration the generator writes into the fixture's own workspace,
+//! for two reasons that both hold today: every entry carries
+//! [`FoundryArtifactBinding::Unresolved`](super::ir::FoundryArtifactBinding), so
+//! there is no artifact to point at; and a procedure summary binds only where
+//! the workspace has a *declaration without a body*, so the target's real body
+//! could not be in the fixture even if the artifact were known. The fixture
+//! therefore states: this entry's transfer set, applied to a target of the shape
 //! the entry itself declares, survives the production pack compiler, binds
 //! through the production binder, and carries taint exactly where it claims and
 //! nowhere else. Whether the claim matches the real standard-library body is
@@ -95,13 +99,6 @@ impl FixtureInputPort {
         match input {
             AuthoredSummaryInput::Receiver {} => Self::Receiver,
             AuthoredSummaryInput::Parameter { ordinal } => Self::Parameter { ordinal: *ordinal },
-        }
-    }
-
-    pub fn render(self) -> String {
-        match self {
-            Self::Receiver => "receiver".to_owned(),
-            Self::Parameter { ordinal } => format!("parameter[{ordinal}]"),
         }
     }
 }
@@ -504,7 +501,7 @@ fn render_policy(language: &str, probes: &[FixtureProbe]) -> String {
 }
 
 /// The entry compiled into an authored pack, as canonical JSON.
-pub fn pack_source(
+fn pack_source(
     entry: &FoundryEntry,
     shape: &FixtureTargetShape,
     completeness: Completeness,
