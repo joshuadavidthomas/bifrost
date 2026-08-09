@@ -2363,6 +2363,13 @@ fn write_run_completion<W: Write>(
             }
             write!(output, ")").map_err(map_io_error)?;
         }
+        PolicyRunCompletion::ProvenBySummary => {
+            write!(
+                output,
+                "proven by summary (precise via authored models, not exhaustive from analyzed code)"
+            )
+            .map_err(map_io_error)?;
+        }
         PolicyRunCompletion::Inconclusive { reasons } => {
             write!(output, "inconclusive (").map_err(map_io_error)?;
             for (index, reason) in reasons.iter().enumerate() {
@@ -2490,6 +2497,7 @@ fn write_summary<W: Write>(
         .count();
     let mut complete = 0_usize;
     let mut proven_subset = 0_usize;
+    let mut proven_by_summary = 0_usize;
     let mut inconclusive = 0_usize;
     let mut unsupported = 0_usize;
     let mut failed = 0_usize;
@@ -2498,6 +2506,9 @@ fn write_summary<W: Write>(
             PolicyRunCompletion::Complete => complete = complete.saturating_add(1),
             PolicyRunCompletion::ProvenSubset { .. } => {
                 proven_subset = proven_subset.saturating_add(1);
+            }
+            PolicyRunCompletion::ProvenBySummary => {
+                proven_by_summary = proven_by_summary.saturating_add(1);
             }
             PolicyRunCompletion::Inconclusive { .. } => {
                 inconclusive = inconclusive.saturating_add(1);
@@ -2588,6 +2599,11 @@ fn write_summary<W: Write>(
     } else {
         write_run_count(output, complete, "complete")?;
         write_run_count(output, proven_subset, "proven-subset (not exhaustive)")?;
+        write_run_count(
+            output,
+            proven_by_summary,
+            "proven-by-summary (authored models)",
+        )?;
         write_run_count(output, inconclusive, "inconclusive")?;
         write_run_count(output, unsupported, "unsupported")?;
         write_run_count(output, failed, "failed")?;

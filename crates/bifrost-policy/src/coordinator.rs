@@ -2595,7 +2595,7 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
             && report
                 .runs()
                 .iter()
-                .any(|run| !run.completion().is_exhaustive()));
+                .any(|run| !run.completion().permits_clean_negative()));
     if unreliable {
         return POLICY_EXIT_UNRELIABLE;
     }
@@ -3019,6 +3019,57 @@ mod tests {
 
         assert_eq!(
             report_exit_status(outcome.report(), false),
+            POLICY_EXIT_UNRELIABLE
+        );
+    }
+
+    fn single_run_report(completion: PolicyRunCompletion) -> PolicyReportDocument {
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry =
+            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+        registry
+            .register_policy_bytes(
+                PolicySourceIdentity::new("test:exit-gate"),
+                match_policy("test.exit-gate", "Exit gate").as_bytes(),
+            )
+            .expect("valid policy");
+        let policy = registry.policies().next().expect("one policy");
+        let descriptor = PolicyRuleDescriptor::from_loaded(policy);
+        let run = PolicyRun::try_new(
+            policy.definition().metadata.id.clone(),
+            policy.semantic_hash(),
+            policy.definition().analysis.analysis_type(),
+            completion,
+            Vec::new(),
+            Vec::new(),
+            false,
+            PolicyWorkReport::default(),
+            &PolicyBudget::default(),
+        )
+        .expect("synthetic run");
+        PolicyReportDocument::try_new(vec![descriptor], vec![run], Vec::new(), false, 0, None)
+            .expect("canonical report")
+    }
+
+    #[test]
+    fn issue_1916_proven_by_summary_passes_the_exit_gate_but_inconclusive_does_not() {
+        // A summary-backed run with no findings is trustworthy under the
+        // require-model contract, so it exits clean rather than unreliable.
+        let proven_by_summary = single_run_report(PolicyRunCompletion::ProvenBySummary);
+        assert_eq!(
+            report_exit_status(&proven_by_summary, false),
+            POLICY_EXIT_CLEAN
+        );
+
+        // A genuinely inconclusive run with no findings still exits unreliable.
+        let inconclusive = single_run_report(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
+                .unwrap(),
+        );
+        assert_eq!(
+            report_exit_status(&inconclusive, false),
             POLICY_EXIT_UNRELIABLE
         );
     }

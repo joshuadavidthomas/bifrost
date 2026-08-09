@@ -278,6 +278,23 @@ fn summary_evidence_is_proven_complete(evidence: &SummaryEvidence) -> bool {
         .any(|alternative| alternative.quality().is_proven() && alternative.quality().is_complete())
 }
 
+/// How strong a dispatch boundary's proof must be for it to count as fully
+/// modeled.
+///
+/// `execution_result_complete` asks with `Derived`: a boundary is modeled only
+/// when the solver derived a proof for it. The `ProvenBySummary` completion
+/// tier (#1916) asks the weaker question with `AcceptAuthoredComplete` -- would
+/// the run be complete if an authored-complete external procedure summary were
+/// accepted as closing its boundary, even though `bind_compiled_procedure_summaries`
+/// deliberately stamps that boundary's proof authored rather than derived. The
+/// relaxation touches only the external-summary branch; a curated model, a
+/// limit, a continuation, or a partial summary is unaffected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SummaryProofRequirement {
+    Derived,
+    AcceptAuthoredComplete,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CallFlowRule {
     pub call: CallSiteHandle,
@@ -1230,9 +1247,10 @@ impl ValueFlowPlan {
         &self.owner
     }
 
-    pub(crate) fn execution_discovery_complete<Fact>(
+    fn execution_discovery_modeled<Fact>(
         &self,
         result: &SummaryDataflowResult<Fact>,
+        requirement: SummaryProofRequirement,
     ) -> bool {
         self.structural_discovery_complete
             && result.reached().iter().all(|reached| {
@@ -1246,7 +1264,11 @@ impl ValueFlowPlan {
                                 SemanticEffect::Invoke { call_site } => {
                                     procedure.call_site_handle(call_site).is_some_and(|call| {
                                         self.has_binding_for_call(&call)
-                                            || self.call_boundaries_are_fully_modeled(result, &call)
+                                            || self.call_boundaries_are_fully_modeled(
+                                                result,
+                                                &call,
+                                                requirement,
+                                            )
                                     })
                                 }
                                 _ => true,
@@ -1259,7 +1281,29 @@ impl ValueFlowPlan {
         &self,
         result: &SummaryDataflowResult<Fact>,
     ) -> bool {
-        if !result.termination().is_fixed_point() || !self.execution_discovery_complete(result) {
+        self.execution_result_modeled(result, SummaryProofRequirement::Derived)
+    }
+
+    /// Whether the run is complete once authored-complete external procedure
+    /// summaries are accepted as closing their boundaries. A run that is already
+    /// complete on derived proof also satisfies this, so callers that want the
+    /// distinct `ProvenBySummary` case must additionally require
+    /// `!execution_result_complete`.
+    pub(crate) fn execution_result_complete_accepting_authored_summaries<Fact>(
+        &self,
+        result: &SummaryDataflowResult<Fact>,
+    ) -> bool {
+        self.execution_result_modeled(result, SummaryProofRequirement::AcceptAuthoredComplete)
+    }
+
+    fn execution_result_modeled<Fact>(
+        &self,
+        result: &SummaryDataflowResult<Fact>,
+        requirement: SummaryProofRequirement,
+    ) -> bool {
+        if !result.termination().is_fixed_point()
+            || !self.execution_discovery_modeled(result, requirement)
+        {
             return false;
         }
         let fully_modeled_calls = result
@@ -1267,7 +1311,7 @@ impl ValueFlowPlan {
             .boundaries()
             .iter()
             .filter_map(SummaryBoundary::origin)
-            .filter(|call| self.call_boundaries_are_fully_modeled(result, call))
+            .filter(|call| self.call_boundaries_are_fully_modeled(result, call, requirement))
             .collect::<Vec<_>>();
         let edge_is_discharged = |edge: &crate::analyzer::dataflow::SummaryEdge| {
             matches!(
@@ -1292,13 +1336,14 @@ impl ValueFlowPlan {
                 .coverage()
                 .boundaries()
                 .iter()
-                .all(|boundary| self.boundary_is_fully_modeled(result, boundary))
+                .all(|boundary| self.boundary_is_fully_modeled(result, boundary, requirement))
     }
 
     fn call_boundaries_are_fully_modeled<Fact>(
         &self,
         result: &SummaryDataflowResult<Fact>,
         call: &CallSiteHandle,
+        requirement: SummaryProofRequirement,
     ) -> bool {
         let mut saw_dispatch = false;
         for boundary in result
@@ -1310,7 +1355,7 @@ impl ValueFlowPlan {
             match boundary.kind() {
                 SummaryBoundaryKind::Dispatch(_) => {
                     saw_dispatch = true;
-                    if !self.dispatch_boundary_is_fully_modeled(boundary) {
+                    if !self.dispatch_boundary_is_fully_modeled(boundary, requirement) {
                         return false;
                     }
                 }
@@ -1327,16 +1372,21 @@ impl ValueFlowPlan {
         &self,
         result: &SummaryDataflowResult<Fact>,
         boundary: &SummaryBoundary,
+        requirement: SummaryProofRequirement,
     ) -> bool {
         if matches!(boundary.kind(), SummaryBoundaryKind::Semantic(_)) {
-            return boundary
-                .origin()
-                .is_some_and(|call| self.call_boundaries_are_fully_modeled(result, call));
+            return boundary.origin().is_some_and(|call| {
+                self.call_boundaries_are_fully_modeled(result, call, requirement)
+            });
         }
-        self.dispatch_boundary_is_fully_modeled(boundary)
+        self.dispatch_boundary_is_fully_modeled(boundary, requirement)
     }
 
-    fn dispatch_boundary_is_fully_modeled(&self, boundary: &SummaryBoundary) -> bool {
+    fn dispatch_boundary_is_fully_modeled(
+        &self,
+        boundary: &SummaryBoundary,
+        requirement: SummaryProofRequirement,
+    ) -> bool {
         let Some(call) = boundary.origin() else {
             return false;
         };
@@ -1344,21 +1394,40 @@ impl ValueFlowPlan {
             return false;
         };
         if let Some(summary) = self.external_summary_for_boundary(kind) {
-            return matches!(boundary.proof(), Some(ProofStatus::Proven))
-                && summary.completeness().is_complete()
-                && self.model_is_fully_bindable(call, summary.transfers());
+            let authored_complete = summary.completeness().is_complete()
+                && self.model_is_fully_bindable(call, summary.transfers(), requirement);
+            return match requirement {
+                SummaryProofRequirement::Derived => {
+                    matches!(boundary.proof(), Some(ProofStatus::Proven)) && authored_complete
+                }
+                SummaryProofRequirement::AcceptAuthoredComplete => authored_complete,
+            };
         }
-        self.curated_model_for_call(call)
-            .is_some_and(|model| self.model_is_fully_bindable(call, model.transfers()))
+        // A curated model is a Bifrost-authored fallback, not an external pack
+        // summary, so it always answers to the derived requirement.
+        self.curated_model_for_call(call).is_some_and(|model| {
+            self.model_is_fully_bindable(call, model.transfers(), SummaryProofRequirement::Derived)
+        })
     }
 
     fn model_is_fully_bindable(
         &self,
         call: &CallSiteHandle,
         transfers: &[SummaryTransfer],
+        requirement: SummaryProofRequirement,
     ) -> bool {
         transfers.iter().all(|transfer| {
-            summary_evidence_is_proven_complete(transfer.evidence())
+            let evidence = transfer.evidence();
+            let evidence_ok = match requirement {
+                SummaryProofRequirement::Derived => summary_evidence_is_proven_complete(evidence),
+                // `bind_compiled_procedure_summaries` stamps an external transfer
+                // unproven, because a summary is an authored assertion about a
+                // body Bifrost never analyzed (#1916). An authored-complete
+                // summary still carries complete evidence, so accept completeness
+                // alone when the summary-backed tier is the question.
+                SummaryProofRequirement::AcceptAuthoredComplete => evidence.is_complete(),
+            };
+            evidence_ok
                 && self.summary_port_carrier(call, transfer.input()).is_some()
                 && self
                     .summary_port_carrier(call, transfer.exit().port())

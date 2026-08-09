@@ -82,6 +82,7 @@ pub struct ValueFlowSummaryResult {
     result: SummaryDataflowResult<ValueFlowFact>,
     meetings: Box<[ValueFlowMeeting]>,
     discovery_complete: bool,
+    proven_by_authored_summaries: bool,
     owner: Arc<()>,
 }
 
@@ -122,10 +123,15 @@ impl ValueFlowSummaryResult {
             });
         }
         let discovery_complete = plan.execution_result_complete(&result);
+        // Mirrors the taint layer (#1916): the run is not derived-complete, yet
+        // accepting authored-complete external summaries closes it.
+        let proven_by_authored_summaries = !discovery_complete
+            && plan.execution_result_complete_accepting_authored_summaries(&result);
         Ok(Self {
             result,
             meetings: meetings.into_boxed_slice(),
             discovery_complete,
+            proven_by_authored_summaries,
             owner: Arc::clone(plan.owner()),
         })
     }
@@ -140,6 +146,13 @@ impl ValueFlowSummaryResult {
 
     pub fn is_complete(&self) -> bool {
         self.discovery_complete
+    }
+
+    /// Whether the run is not derived-complete, but every open boundary is
+    /// closed by an authored-complete external procedure summary (#1916).
+    /// Mutually exclusive with `is_complete`.
+    pub fn is_proven_by_authored_summaries(&self) -> bool {
+        self.proven_by_authored_summaries
     }
 
     pub fn sink_outcome(&self, sink: ValueFlowSinkId) -> ValueFlowSinkOutcome<'_> {
