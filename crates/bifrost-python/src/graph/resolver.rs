@@ -190,9 +190,12 @@ fn resolve_bare_annotation_symbol(
         && let Some(imported) = binding.imported_name.as_ref()
     {
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        candidates.extend(resolve_fqn_candidates(python, &fqn, |name| {
-            graph.index.definitions(name).collect()
-        }));
+        let mut imported_candidates =
+            resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect());
+        imported_candidates.retain(|candidate| {
+            !candidate.is_module() || candidate.fq_name() != binding.module_specifier
+        });
+        candidates.extend(imported_candidates);
     }
 
     candidates.extend(

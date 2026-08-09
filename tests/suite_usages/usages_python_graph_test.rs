@@ -574,6 +574,45 @@ fn imported_alias_annotations_resolve_module_field_target() {
 }
 
 #[test]
+fn imported_class_annotation_survives_same_fqn_module_collision() {
+    let source = "from lfx.schema.dotdict import dotdict\n\n\nclass Tool:\n    def update(self, value: dotdict) -> dotdict:\n        return value\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("src/lfx/__init__.py", "")
+        .file("src/lfx/schema/__init__.py", "")
+        .file(
+            "src/lfx/schema/dotdict.py",
+            "class dotdict(dict):\n    pass\n",
+        )
+        .file("src/lfx/tool.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = analyzer
+        .declarations(&project.file("src/lfx/schema/dotdict.py"))
+        .into_iter()
+        .find(|unit| unit.is_class() && unit.identifier() == "dotdict")
+        .expect("dotdict class declaration");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve the imported class annotations");
+    let mut actual: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit.file == project.file("src/lfx/tool.py"))
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(
+        actual,
+        vec![
+            nth_occurrence_range(source, "dotdict", 2),
+            nth_occurrence_range(source, "dotdict", 3),
+        ],
+        "{hits:#?}"
+    );
+}
+
+#[test]
 fn paramspec_annotations_resolve_module_field_target() {
     let source = "from typing import Callable\nfrom service import P\n\ndef wrap(func: Callable[P, int]) -> Callable[P, int]:\n    return func\n";
     let project = InlineTestProject::with_language(Language::Python)
