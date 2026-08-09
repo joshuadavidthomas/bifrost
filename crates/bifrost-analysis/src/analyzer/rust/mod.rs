@@ -386,6 +386,17 @@ impl RustAnalyzer {
     }
 
     #[doc(hidden)]
+    pub fn reset_definition_candidate_row_read_count_for_test(&self) {
+        self.inner
+            .reset_definition_candidate_row_read_count_for_test();
+    }
+
+    #[doc(hidden)]
+    pub fn definition_candidate_row_read_count_for_test(&self) -> usize {
+        self.inner.definition_candidate_row_read_count_for_test()
+    }
+
+    #[doc(hidden)]
     pub fn reset_definition_prefetch_batch_count_for_test(&self) {
         self.inner.reset_definition_prefetch_batch_count_for_test();
     }

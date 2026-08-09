@@ -127,6 +127,25 @@ measurement is a separate task run after review; it is not part of this plan's a
       the structured `too_many_candidates[4186/200]` verdict -- the first non-`time_budget`
       gate-cell answer in ten runs. See `Outcomes & Retrospective`.
 
+- [x] (2026-08-08) **The last measured D4 gate defect is fixed, and the run-10 report's account of
+      it is corrected.** Run 10 recorded cell (a)'s budget window at **3.67 s against a 3.00 s
+      budget** and attributed the overshoot to `usages::candidate_discovery` "not polling the
+      deadline". Measured at `0086f1e5` on the same rustc tree, **that attribution is wrong**:
+      discovery's loops all poll -- the importer walk once per candidate file, the finder once per
+      overload, the Rust binding-seed walks through `keep_going` since `575c2ffb`. What does not
+      poll is the *single read* each polled step issues. The timed window ends on one
+      `sql_definition_candidates.rows[main]` of **1,141.9 ms**, the last span before
+      `END usages::candidate_discovery (3574.4 ms)`; the walk stopped on time and the read it had
+      already asked for did not. A deadline is only honoured at the granularity of the longest
+      thing that ignores it. Fixed by carrying the request's cancellation on the boundary the scan
+      already opens (`AnalyzerQueryScope::with_cancellation` -> `AnalyzerQueryContext`), so
+      `definition_candidate_rows` refuses to start past the deadline, its single-flight wait is
+      bounded, its seek polls every 512 rows, and no truncated row set is memoized. Measured on
+      the gate cell, 3 reps a side, interleaved, loadavg 3.4-4.4: budget window **3.59-3.74 s ->
+      3.28-3.34 s**, wall median **4.98 -> 4.80 s**, user CPU median **4.45 -> 3.79 s (-15%)**.
+      Gate 1(a) is under its 5 s bar in 3 of 3 reps where it was in 1 of 3. **A ~0.30 s residual
+      overshoot remains and is not attributed** -- see `Surprises & Discoveries`.
+
 ## Surprises & Discoveries
 
 - Observation: the forward reference context is built *during a scan*, not only by
@@ -185,6 +204,46 @@ measurement is a separate task run after review; it is not part of this plan's a
   the downstream re-read-from-disk that had been masking it. The failure being language-agnostic
   (the Java `get_summaries` sibling shares it) is the tell that it never belonged to the Rust usage
   work at all.
+
+- Observation: **"the phase does not poll its deadline" was the wrong diagnosis three times
+  running, and the third time it was wrong about the phase, not about the class.** `575c2ffb`
+  fixed the Rust walk layer, `d97a6ef9` fixed the bare-name loops, and both were loops that
+  genuinely did not poll. Run 10's report predicted a third such loop inside
+  `usages::candidate_discovery`. There isn't one. Every loop between the discovery span's open and
+  close polls: the finder's per-overload loop, the source-file/sibling walk, the importer
+  `par_iter`'s three per-candidate checks, the PHP and JVM cross-language walks, and the Rust
+  binding-seed path through `keep_going`. What ignores the deadline is the *leaf*: one
+  `definitions(fq_name)` store read, issued once per distinct import target by the polled walk,
+  which for a hot short name is the longest single thing the request does.
+  Evidence, `0086f1e5`, rustc tree, `BIFROST_TIMING=1`: inside one discovery window there are
+  **9,648 `sql_definition_candidates.rows` spans** (p50 0.1 ms, p90 15.3 ms, p99 355 ms, max
+  1,263 ms), and the final three lines before `END usages::candidate_discovery (3574.4 ms)` are
+  `rows[main] (1141.9 ms)`, `resolve_rows[cargo_miri_test.main] (68.1 ms)`, then the window
+  closing. The overshoot was 574 ms and that one read had started ~568 ms before the deadline, so
+  no poll placed *around* it could have helped. The generalisable rule: a cooperative deadline is
+  honoured at the granularity of the longest uninterruptible step, and in a read-bound phase that
+  step is a store read, not a loop iteration.
+
+- Observation: **#1748's batch never fires on a multi-language workspace, so the gate cell still
+  pays the per-import point lookup the batch exists to remove.** `MultiAnalyzer` implements
+  `ImportAnalysisProvider` and overrides `import_infos_for_files` (grouping by delegate) but not
+  `prefetch_import_targets`, so the default no-op is used and `RustAnalyzer`'s override is never
+  reached. Evidence: `TreeSitterAnalyzer::prefetch_definitions` emits **zero** spans in a rustc
+  gate cell, while 9,648 point `sql_definition_candidates.rows` reads happen inside the same
+  window. The single-name reads are cheap at p50 and brutal in the tail, which is exactly the
+  distribution a batch would flatten. This is a cost defect, not a deadline defect; it is not
+  fixed here and is recorded on #1748.
+
+- Observation: **the deadline fix closes about half the overshoot, and the residual is not
+  attributed.** After the change the window is 3.28-3.34 s against 3.00 s, so ~0.30 s of overshoot
+  survives. The 512-row poll interval does not explain it: at the measured 0.052 ms/row for a hot
+  name, 512 rows is 26 ms. The reads at the tail of an "after" window (`rows[tests] 530.8 ms`,
+  `rows[A] 445.9 ms`) are consistent with a seek whose cost is in *scanning*, not in *yielding* --
+  a statement that examines many rows and returns few polls rarely, because the poll counts
+  returned rows. `sqlite3_progress_handler` (exposed by rusqlite as
+  `Connection::progress_handler`) counts VM steps instead and is the named next step; it is a
+  per-connection setting on a pooled connection, so it is a separate change. Reader-pool
+  contention is ruled out: `read_conn_from_pool` opens a new connection rather than blocking.
 
 ## Decision Log
 

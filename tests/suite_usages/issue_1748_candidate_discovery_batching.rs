@@ -25,8 +25,9 @@
 //! these counters measure.
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::analyzer::AnalyzerQueryScope;
 use brokk_bifrost::usages::{UsageFinder, UsageHitKind};
-use brokk_bifrost::{IAnalyzer, Language, ProjectFile, RustAnalyzer};
+use brokk_bifrost::{CancellationToken, IAnalyzer, Language, ProjectFile, RustAnalyzer};
 
 const CALLER_COUNT: usize = 8;
 const BYSTANDER_COUNT: usize = 8;
@@ -170,4 +171,178 @@ fn issue_1748_batched_discovery_finds_the_same_usages() {
              {unexpected} in {hit_files:?}"
         );
     }
+}
+
+/// #1809 (third instance): a read taken on behalf of a scan whose budget is
+/// already gone is the scan's deadline overshoot.
+///
+/// Candidate discovery polls its own loops -- once per candidate file in the
+/// importer walk, once per overload in the finder -- and that was not enough.
+/// The walk's per-candidate question is answered by `definitions(import
+/// target)`, and on the rustc tree one of those reads is the longest single
+/// thing the request does: `main` is 22k rows and 1.14 s. Run 10 measured the
+/// consequence exactly. The scan budget window was 3.67 s against a 3.00 s
+/// budget, `usages::candidate_discovery` owned 97.8 % of it, and the last span
+/// before the window closed was one `sql_definition_candidates.rows[main]` of
+/// 1,141.9 ms. The loops stopped on time; the read they had already asked for
+/// did not.
+///
+/// So the request's deadline now reaches the reads, through the query scope
+/// the scan already opens. Two halves, both pinned here: a read is not started
+/// once the deadline has passed, and the nothing it returns is not memoized as
+/// this name's answer for the rest of the request.
+///
+/// Before the fix the inner read runs (`row_reads` is 1), returns the real
+/// declarations, and memoizes them -- so the first two assertions fail.
+#[test]
+fn issue_1809_a_read_past_the_deadline_is_neither_taken_nor_memoized() {
+    let (project, analyzer) = import_heavy_project();
+    let target = collect_it_target(&analyzer, project.root());
+    let fq_name = target.fq_name();
+
+    // The outer scope is the request; the inner one is the same request under
+    // a spent budget. Nesting is what makes "not memoized" observable: the
+    // request memos survive the inner scope and are read again after it.
+    let outer = AnalyzerQueryScope::new(&analyzer);
+    {
+        let spent = CancellationToken::default();
+        spent.cancel();
+        let _inner = AnalyzerQueryScope::with_cancellation(&analyzer, &spent);
+        analyzer.reset_definition_candidate_row_read_count_for_test();
+        let stopped: Vec<_> = analyzer.definitions(&fq_name).collect();
+        assert_eq!(
+            0,
+            analyzer.definition_candidate_row_read_count_for_test(),
+            "a candidate-row read must not start once the request's deadline has passed"
+        );
+        assert!(
+            stopped.is_empty(),
+            "a stopped read has no answer to give: {stopped:#?}"
+        );
+    }
+
+    let answered: Vec<_> = analyzer.definitions(&fq_name).collect();
+    assert!(
+        !answered.is_empty(),
+        "the stopped read must not have memoized proven absence for {fq_name}"
+    );
+    drop(outer);
+}
+
+/// The completing path is unchanged: a deadline that never expires produces
+/// the same query result, candidate set and hits as no deadline at all.
+///
+/// This is the parity half of the change. Every scan now runs its reads under
+/// a token, so the polling code path is the *only* path a real query takes;
+/// this pins that taking it changes nothing about the answer.
+#[test]
+fn issue_1809_a_deadline_that_never_expires_does_not_change_the_answer() {
+    let (project, analyzer) = import_heavy_project();
+    let target = collect_it_target(&analyzer, project.root());
+
+    let plain = UsageFinder::new().query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+    let deadlined = UsageFinder::new()
+        .with_cancellation(
+            CancellationToken::default().with_timeout(std::time::Duration::from_secs(600)),
+        )
+        .query(&analyzer, std::slice::from_ref(&target), 1000, 1000);
+
+    assert_eq!(plain.completion, deadlined.completion);
+    assert_eq!(
+        sorted_paths(&plain.candidate_files),
+        sorted_paths(&deadlined.candidate_files),
+        "a deadline the query never reaches must not change candidate discovery"
+    );
+    assert_eq!(
+        hit_summary(&plain),
+        hit_summary(&deadlined),
+        "a deadline the query never reaches must not change the usages found"
+    );
+    assert!(
+        !hit_summary(&plain).is_empty(),
+        "the fixture must produce hits for this comparison to mean anything"
+    );
+}
+
+/// The wiring, pinned separately from the mechanism: the scan's own token has
+/// to reach the request boundary, or nothing below it can see the deadline.
+///
+/// The provider spends the budget and then issues exactly the read candidate
+/// discovery issues at that point -- `definitions` for a name it has not read
+/// yet. With `UsageFinder` opening its query scope without the token (the
+/// shape before this change) that read is taken and the counter is 1.
+#[test]
+fn issue_1809_a_scan_passes_its_own_deadline_to_the_reads_below_it() {
+    struct CancelThenRead {
+        cancellation: CancellationToken,
+        read_name: String,
+    }
+
+    impl brokk_bifrost::usages::CandidateFileProvider for CancelThenRead {
+        fn find_candidates(
+            &self,
+            _target: &brokk_bifrost::CodeUnit,
+            analyzer: &dyn IAnalyzer,
+        ) -> brokk_bifrost::hash::HashSet<ProjectFile> {
+            self.cancellation.cancel();
+            let _ = analyzer.definitions(&self.read_name).count();
+            brokk_bifrost::hash::HashSet::default()
+        }
+    }
+
+    let (project, analyzer) = import_heavy_project();
+    let target = collect_it_target(&analyzer, project.root());
+    let cancellation = CancellationToken::default();
+    let provider = CancelThenRead {
+        cancellation: cancellation.clone(),
+        read_name: target.fq_name(),
+    };
+
+    analyzer.reset_definition_candidate_row_read_count_for_test();
+    let query = UsageFinder::new()
+        .with_cancellation(cancellation)
+        .query_with_provider(
+            &analyzer,
+            std::slice::from_ref(&target),
+            Some(&provider),
+            1000,
+            1000,
+        );
+
+    assert_eq!(
+        0,
+        analyzer.definition_candidate_row_read_count_for_test(),
+        "a read issued after the scan's budget expired must not reach the store"
+    );
+    assert_eq!(
+        brokk_bifrost::usages::UsageQueryCompletion::Cancelled,
+        query.completion,
+        "and the scan must still report the budget, not an empty success"
+    );
+}
+
+fn sorted_paths(
+    files: &std::collections::HashSet<ProjectFile, impl std::hash::BuildHasher>,
+) -> Vec<String> {
+    let mut paths: Vec<String> = files.iter().map(|file| file.to_string()).collect();
+    paths.sort();
+    paths
+}
+
+fn hit_summary(query: &brokk_bifrost::usages::QueryResult) -> Vec<String> {
+    let mut hits: Vec<String> = query
+        .result
+        .all_hits_including_imports()
+        .iter()
+        .map(|hit| {
+            format!(
+                "{}:{:?}:{}",
+                hit.enclosing.source(),
+                hit.kind,
+                hit.enclosing.fq_name()
+            )
+        })
+        .collect();
+    hits.sort();
+    hits
 }

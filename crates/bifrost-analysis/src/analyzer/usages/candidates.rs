@@ -205,6 +205,14 @@ fn find_direct_importers_with_cancellation(
     cancellation: &CancellationToken,
 ) -> HashSet<ProjectFile> {
     let mut files: Vec<_> = files.into_iter().collect();
+    // Everything from here to the per-candidate loop is workspace-scale and
+    // uninterruptible once entered: sorting every analyzed file, and the
+    // provider's bulk import-fact read over all of them. Poll before paying
+    // for either, so a scan whose budget is already gone stops here rather
+    // than at the first candidate.
+    if cancellation.is_cancelled() {
+        return HashSet::default();
+    }
     files.sort();
     let import_infos = import_provider.import_infos_for_files(&files);
     // The walk below is about to ask the provider the same shape of question

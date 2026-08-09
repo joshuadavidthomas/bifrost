@@ -156,7 +156,12 @@ impl<'a> UsageFinder<'a> {
         max_usages: usize,
         max_source_bytes: Option<usize>,
     ) -> QueryResult {
-        let _query_scope = AnalyzerQueryScope::new(analyzer);
+        // The scan's deadline, not just its loops: candidate discovery spends
+        // most of its time inside single analyzer reads that take no token
+        // (`definitions` for one import target is 1.14 s for a hot short name
+        // on the rustc tree). Opening the request boundary with the token is
+        // what lets those reads stop when this scan's budget does.
+        let _query_scope = AnalyzerQueryScope::with_cancellation(analyzer, &self.cancellation);
         if overloads.is_empty() {
             return QueryResult {
                 completion: UsageQueryCompletion::Complete,

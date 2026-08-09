@@ -1352,6 +1352,18 @@ impl QueryReadCache {
         !self.contexts.is_empty()
     }
 
+    /// The deadline governing the innermost active request boundary.
+    ///
+    /// Scopes nest (a scan opens one, a nested resolver may open another), and
+    /// an inner scope can only narrow a deadline, never widen one, so the
+    /// innermost token that carries one governs.
+    fn active_cancellation(&self) -> Option<CancellationToken> {
+        self.contexts
+            .iter()
+            .rev()
+            .find_map(|context| context.cancellation().cloned())
+    }
+
     #[cfg(test)]
     fn analyzed_live_files(&self) -> Option<Vec<ProjectFile>> {
         if !self.is_active() {
@@ -6360,7 +6372,16 @@ where
         let definitions = self.sql_definition_candidates_vec(fq_name, false)?;
         // A failed read is never memoized: the `?` above leaves the entry
         // missing so the next caller retries instead of inheriting an empty
-        // answer that reads as proven absence.
+        // answer that reads as proven absence. A read that stopped at the
+        // request's deadline is the same case: `definition_candidate_rows`
+        // hands back nothing, and memoizing that would serve proven absence to
+        // every later caller of this name in the request.
+        if self
+            .active_query_cancellation()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+        {
+            return Ok(definitions);
+        }
         if let Some(memo) = memo.as_ref() {
             memo.write()
                 .expect("query definition-unit cache write lock poisoned")
@@ -6384,6 +6405,17 @@ where
     /// query scope open there is no memo and this is exactly the unmemoized
     /// read; a failed read is never published, so the next caller retries
     /// instead of inheriting an empty answer that would read as proven absence.
+    ///
+    /// This read is the longest single thing a `scan_usages` request does. It
+    /// is issued once per distinct import target by the import-graph candidate
+    /// walk, and for a hot short name on a large workspace it is not small:
+    /// `main` on the rustc tree is 22k rows and 1.14 s. The walk around it
+    /// polls its deadline per candidate file, so before this it was the only
+    /// step that could not stop -- one such read in flight when the budget
+    /// expired *was* the measured 0.57 s overshoot of the 3 s budget. It
+    /// therefore runs under the request's deadline: it is not started once that
+    /// deadline has passed, its wait for another thread's read is bounded, and
+    /// a read cut short answers nothing and memoizes nothing.
     fn definition_candidate_rows(
         &self,
         langs: &[String],
@@ -6396,6 +6428,11 @@ where
             short_name,
             include_definition_lookup_units,
         };
+        // No separate "already expired" gate here: with a token there is always
+        // a request memo, and `get_or_try_build_pool_independent_while` checks
+        // the deadline before it claims the build. Without one there is no
+        // token either, because the token arrives on the request boundary.
+        let cancellation = self.active_query_cancellation();
         let read = || {
             self.definition_candidate_row_read_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -6406,6 +6443,7 @@ where
                         langs,
                         self.store_context.generations.as_ref(),
                         &key.short_name,
+                        cancellation.as_ref(),
                     )
             } else {
                 self.store_context
@@ -6414,14 +6452,35 @@ where
                         langs,
                         self.store_context.generations.as_ref(),
                         &key.short_name,
+                        cancellation.as_ref(),
                     )
             }
         };
         let Some(memo) = self.active_query_cache_handle(|cache| &cache.definition_candidate_rows)
         else {
-            return Ok(Arc::new(read()?));
+            return Ok(Arc::new(read()?.rows));
         };
-        memo.cell(&key).get_or_try_build_pool_independent(read)
+        if cancellation.is_none() {
+            return memo
+                .cell(&key)
+                .get_or_try_build_pool_independent(|| read().map(|batch| batch.rows));
+        }
+        let keep_going = || {
+            !cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        };
+        // A stopped read yields nothing rather than its prefix. Neither shape
+        // is an answer, and the caller is a scan that is already reporting
+        // `time_budget`; an empty vec keeps the "not memoized, not presented"
+        // rule in one place instead of carrying a prefix through the assembly
+        // that a later reader could mistake for the candidate set.
+        let built = memo
+            .cell(&key)
+            .get_or_try_build_pool_independent_while(&keep_going, || {
+                read().map(|batch| batch.complete.then_some(batch.rows))
+            })?;
+        Ok(built.unwrap_or_default())
     }
 
     fn sql_definition_candidates_vec(
@@ -6431,6 +6490,16 @@ where
     ) -> std::result::Result<Vec<CodeUnit>, StoreError> {
         self.definition_candidates_query_count
             .fetch_add(1, Ordering::Relaxed);
+        // Two store reads and an assembly, all on behalf of a caller whose
+        // budget is gone. `definition_candidate_rows` refuses the big one on
+        // its own, and refusing the whole lookup here also spares the
+        // path-symbol read (68 ms on the name that ended the run-10 window).
+        if self
+            .active_query_cancellation()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+        {
+            return Ok(Vec::new());
+        }
         let normalized = self.adapter.normalize_full_name(fq_name);
         let langs = self.storage_language_keys_for_queries();
         let candidate_names = self.definition_candidate_short_names(fq_name);
@@ -6559,11 +6628,20 @@ where
     /// A no-op without an open query scope: with no memo to fill there is
     /// nothing to prefetch into, and every caller falls back to the point
     /// lookup with unchanged results. Prefetch failures are equally
-    /// non-binding -- the name is simply left unmemoized.
+    /// non-binding -- the name is simply left unmemoized. A request whose
+    /// deadline has already expired is the same case: this is a whole-workspace
+    /// read taken on behalf of work that will not happen.
     pub(crate) fn prefetch_definitions(&self, fq_names: &[String]) {
         let Some(memo) = self.active_query_cache_handle(|cache| &cache.definition_units) else {
             return;
         };
+        let cancellation = self.active_query_cancellation();
+        if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return;
+        }
         let _scope = crate::profiling::scope("TreeSitterAnalyzer::prefetch_definitions");
         let missing: Vec<String> = {
             let seen = memo
@@ -6603,6 +6681,7 @@ where
                 &self.storage_language_keys_for_queries(),
                 self.store_context.generations.as_ref(),
                 &unique_short_names,
+                cancellation.as_ref(),
             ) {
             Ok(rows) => rows,
             Err(error) => {
@@ -6612,9 +6691,16 @@ where
                 return;
             }
         };
+        // A batch cut short covers only a prefix of the names, and the loop
+        // below cannot tell a name with no rows from a name whose rows were
+        // never reached. Memoizing that is proven absence for the rest of the
+        // request, so a stopped prefetch publishes nothing at all.
+        if !rows.complete {
+            return;
+        }
         let mut rows_by_short_name: HashMap<String, Vec<DefinitionOrderCandidateRow>> =
             HashMap::default();
-        for row in rows {
+        for row in rows.rows {
             rows_by_short_name
                 .entry(row.candidate.short_name.clone())
                 .or_default()
@@ -8026,6 +8112,13 @@ where
     ) -> Option<Arc<T>> {
         let cache = self.query_read_cache_lock();
         cache.is_active().then(|| Arc::clone(select(&cache)))
+    }
+
+    /// The deadline of the request this read is running under, if its opener
+    /// set one. Cloned once per read rather than consulted per row, so the
+    /// coarse cache lock stays off the row loop.
+    pub(crate) fn active_query_cancellation(&self) -> Option<CancellationToken> {
+        self.query_read_cache_lock().active_cancellation()
     }
 
     fn query_read_cache_write(&self) -> std::sync::RwLockWriteGuard<'_, QueryReadCache> {

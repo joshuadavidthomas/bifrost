@@ -2477,12 +2477,16 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    /// `complete` is false when the caller's deadline expired mid-seek. The
+    /// rows returned with it are a prefix, not an answer: a caller must not
+    /// present them as this name's candidate set, and must not memoize them.
     pub(crate) fn declaration_order_candidate_rows_by_short_name_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         short_name: &str,
-    ) -> Result<Vec<DefinitionOrderCandidateRow>> {
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -2495,6 +2499,7 @@ impl AnalyzerStore {
             langs.iter().map(String::as_str),
             &sql,
             &[&short_name],
+            cancellation,
         )?;
         tx.commit()?;
         Ok(rows)
@@ -2519,15 +2524,17 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         short_names: &[String],
-    ) -> Result<Vec<DefinitionOrderCandidateRow>> {
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
         const SHORT_NAMES_PER_QUERY: usize = 400;
         if short_names.is_empty() {
-            return Ok(Vec::new());
+            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
         }
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let mut rows = Vec::new();
+        let mut complete = true;
         for chunk in short_names.chunks(SHORT_NAMES_PER_QUERY) {
             // `?1` is the language, so the names start at `?2`.
             let placeholders = (0..chunk.len())
@@ -2539,25 +2546,39 @@ impl AnalyzerStore {
                 "units.in_declarations = 1",
             );
             let values: Vec<&dyn ToSql> = chunk.iter().map(|name| name as &dyn ToSql).collect();
-            rows.extend(definition_order_candidate_rows_for_languages(
+            let chunk_rows = definition_order_candidate_rows_for_languages(
                 &tx,
                 langs.iter().map(String::as_str),
                 &sql,
                 &values,
-            )?);
+                cancellation,
+            )?;
+            complete &= chunk_rows.complete;
+            rows.extend(chunk_rows.rows);
+            if !complete {
+                break;
+            }
         }
         tx.commit()?;
-        Ok(rows)
+        let inspected = rows.len();
+        Ok(if complete {
+            LimitedQueryRows::complete(rows, inspected)
+        } else {
+            LimitedQueryRows::incomplete(rows, inspected)
+        })
     }
 
     /// Returns name-bounded declaration-lookup candidates together with the
-    /// persisted range fact needed for definition ordering.
+    /// persisted range fact needed for definition ordering. `complete` carries
+    /// the same meaning as in
+    /// [`Self::declaration_order_candidate_rows_by_short_name_for_langs`].
     pub(crate) fn definition_lookup_order_candidate_rows_by_short_name_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         short_name: &str,
-    ) -> Result<Vec<DefinitionOrderCandidateRow>> {
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -2570,6 +2591,7 @@ impl AnalyzerStore {
             langs.iter().map(String::as_str),
             &sql,
             &[&short_name],
+            cancellation,
         )?;
         tx.commit()?;
         Ok(rows)
@@ -3725,24 +3747,51 @@ fn candidate_rows_for_languages_limited<'a>(
     Ok(LimitedQueryRows::complete(rows, inspected))
 }
 
+/// Rows walked between two deadline checks inside one candidate-row seek.
+///
+/// The seek for one short name is a single statement, and on a large workspace
+/// a hot name makes it a long one: `main` on the rustc tree reads 22k rows in
+/// 1.14 s. That read is issued from inside the import-graph candidate walk,
+/// which polls its deadline once per candidate file -- so the walk stopped on
+/// time and the read it had already started did not, and the whole of
+/// `scan_usages`' 0.57 s budget overshoot was that one read finishing. A
+/// deadline is only honoured at the granularity of the longest thing that
+/// ignores it, so the seek polls too. 512 rows is well under a millisecond of
+/// row decoding and costs one `Instant::now` per 512 rows on the completing
+/// path.
+const CANDIDATE_ROWS_PER_CANCELLATION_POLL: usize = 512;
+
 fn definition_order_candidate_rows_for_languages<'a>(
     conn: &Connection,
     langs: impl IntoIterator<Item = &'a str>,
     sql: &str,
     values: &[&dyn ToSql],
-) -> Result<Vec<DefinitionOrderCandidateRow>> {
+    cancellation: Option<&CancellationToken>,
+) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
     let mut statement = conn.prepare_cached(sql)?;
     let mut rows = Vec::new();
     for lang in langs {
         let params = std::iter::once(&lang as &dyn ToSql).chain(values.iter().copied());
-        rows.extend(collect_definition_order_candidate_rows(
-            statement.query_map(
-                params_from_iter(params),
-                definition_order_candidate_row_from_row,
-            )?,
-        )?);
+        let mapped = statement.query_map(
+            params_from_iter(params),
+            definition_order_candidate_row_from_row,
+        )?;
+        for row in mapped {
+            rows.push(row?);
+            if rows.len() % CANDIDATE_ROWS_PER_CANCELLATION_POLL == 0
+                && cancellation.is_some_and(CancellationToken::is_cancelled)
+            {
+                let inspected = rows.len();
+                return Ok(LimitedQueryRows::incomplete(rows, inspected));
+            }
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            let inspected = rows.len();
+            return Ok(LimitedQueryRows::incomplete(rows, inspected));
+        }
     }
-    Ok(rows)
+    let inspected = rows.len();
+    Ok(LimitedQueryRows::complete(rows, inspected))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7270,19 +7319,6 @@ fn collect_candidate_primary_range_rows<F>(
 ) -> Result<Vec<CandidatePrimaryRangeRow>>
 where
     F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<CandidatePrimaryRangeRow>,
-{
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-fn collect_definition_order_candidate_rows<F>(
-    rows: rusqlite::MappedRows<'_, F>,
-) -> Result<Vec<DefinitionOrderCandidateRow>>
-where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<DefinitionOrderCandidateRow>,
 {
     let mut out = Vec::new();
     for row in rows {
@@ -11272,10 +11308,12 @@ mod tests {
                 &["java".to_string()],
                 &generations,
                 "Sample",
+                None,
             )
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].first_start_byte, Some(5));
+        assert!(rows.complete);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].first_start_byte, Some(5));
 
         {
             let conn = store.conn.lock().unwrap();
@@ -11301,10 +11339,120 @@ mod tests {
                 &["java".to_string()],
                 &generations,
                 "Sample",
+                None,
             )
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].first_start_byte, None);
+        assert!(rows.complete);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].first_start_byte, None);
+    }
+
+    /// One short name, more rows than a poll interval, written across many
+    /// blobs -- the shape a hot name has on a large workspace (`main` is 22k
+    /// rows on the rustc tree).
+    fn store_with_repeated_short_name(blobs: usize) -> (tempfile::TempDir, AnalyzerStore) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "src/demo/Sample.java",
+            "package demo; class Sample {}\n",
+        );
+        let adapter = JavaAdapter;
+        let state = parse_state(&adapter, &file);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        for index in 0..blobs {
+            let oid = oid_for(format!("sample blob {index}").as_bytes());
+            store
+                .write_parsed_blob(oid, "java", &adapter, &state)
+                .unwrap();
+        }
+        (temp, store)
+    }
+
+    /// A candidate-row seek must observe its caller's deadline *inside* the
+    /// statement, not only around it.
+    ///
+    /// The seek for one short name is a single read, and for a hot name it is
+    /// the longest single thing a `scan_usages` request does -- 1.14 s for
+    /// `main` on the rustc tree, issued from inside a candidate walk that polls
+    /// its own deadline once per file. The walk stopped on time; the read it had
+    /// already started did not, and that one read was the whole of the measured
+    /// 0.57 s overshoot of a 3 s budget.
+    ///
+    /// Without the in-statement poll this returns all 1,200 rows and reports
+    /// `complete`.
+    #[test]
+    fn a_cancelled_candidate_row_seek_stops_inside_the_statement() {
+        const BLOBS: usize = 1_200;
+        let (_temp, store) = store_with_repeated_short_name(BLOBS);
+        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+        let langs = ["java".to_string()];
+
+        let complete = store
+            .declaration_order_candidate_rows_by_short_name_for_langs(
+                &langs,
+                &generations,
+                "Sample",
+                None,
+            )
+            .unwrap();
+        assert!(complete.complete);
+        assert_eq!(
+            BLOBS,
+            complete.rows.len(),
+            "the fixture must hold more rows than one poll interval"
+        );
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let stopped = store
+            .declaration_order_candidate_rows_by_short_name_for_langs(
+                &langs,
+                &generations,
+                "Sample",
+                Some(&cancellation),
+            )
+            .unwrap();
+        assert!(
+            !stopped.complete,
+            "a seek that stopped at its deadline must not report a complete row set"
+        );
+        assert_eq!(
+            CANDIDATE_ROWS_PER_CANCELLATION_POLL,
+            stopped.rows.len(),
+            "the seek must stop at its first poll, not run the statement out"
+        );
+    }
+
+    /// The poll is per row block, not per row: a completing seek of 1,200 rows
+    /// must cost a handful of deadline checks, so the deadline costs nothing
+    /// measurable on the path that answers.
+    ///
+    /// The token trips on its eighth check, which is generous against the three
+    /// this seek needs (`1200 / 512` blocks plus the end-of-language check) and
+    /// far under the 1,200 a per-row poll would spend.
+    #[test]
+    fn a_completing_candidate_row_seek_polls_once_per_row_block() {
+        const BLOBS: usize = 1_200;
+        const GENEROUS_CHECK_BUDGET: usize = 8;
+        let (_temp, store) = store_with_repeated_short_name(BLOBS);
+        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(GENEROUS_CHECK_BUDGET);
+
+        let rows = store
+            .declaration_order_candidate_rows_by_short_name_for_langs(
+                &["java".to_string()],
+                &generations,
+                "Sample",
+                Some(&cancellation),
+            )
+            .unwrap();
+
+        assert!(
+            rows.complete,
+            "a seek that polls per row would spend its whole check budget and report incomplete"
+        );
+        assert_eq!(BLOBS, rows.rows.len());
     }
 
     #[test]

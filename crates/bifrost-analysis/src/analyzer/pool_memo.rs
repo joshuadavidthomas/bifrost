@@ -183,7 +183,11 @@ impl<T> PoolSafeMemo<T> {
     /// its cancellation token trips. The timed wait keeps normal builders on
     /// the condition-variable path and gives cancellation a bounded polling
     /// interval. Rayon workers retain the duplicate serial-build rule.
-    fn wait_or_claim_build_while(&self, keep_going: &impl Fn() -> bool) -> Option<Option<Arc<T>>> {
+    fn wait_or_claim_build_while(
+        &self,
+        claim: BuildClaim,
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<Option<Arc<T>>> {
         let mut state = self.state.lock().expect("pool memo poisoned");
         loop {
             if let Some(value) = state.value.as_ref() {
@@ -200,6 +204,9 @@ impl<T> PoolSafeMemo<T> {
                 continue;
             }
             state.builders += 1;
+            if claim == BuildClaim::PoolIndependent {
+                state.pool_independent_builders += 1;
+            }
             return Some(None);
         }
     }
@@ -354,6 +361,49 @@ impl<T> PoolSafeMemo<T> {
         Ok(built)
     }
 
+    /// [`Self::get_or_try_build_pool_independent`] under a caller's deadline.
+    ///
+    /// Two things change and both are needed for a store read that a request's
+    /// budget can outlive. The wait is bounded, so a follower does not stay
+    /// parked behind a leader whose read is longer than the whole budget; and a
+    /// build that stops short (`Ok(None)`) publishes nothing, because a
+    /// truncated row set memoized here is served to every later caller of this
+    /// key as the complete answer -- the failure mode 575c2ffb closed for the
+    /// Rust walk caches.
+    ///
+    /// `Ok(None)` means "stopped", from either end: the wait gave up, or the
+    /// build declined to produce a value. The caller distinguishes it from an
+    /// answer and decides what a stopped read means for it.
+    pub(crate) fn get_or_try_build_pool_independent_while<E>(
+        &self,
+        keep_going: &impl Fn() -> bool,
+        build: impl FnOnce() -> Result<Option<T>, E>,
+    ) -> Result<Option<Arc<T>>, E> {
+        let Some(claimed) = self.wait_or_claim_build_while(BuildClaim::PoolIndependent, keep_going)
+        else {
+            return Ok(None);
+        };
+        if let Some(value) = claimed {
+            return Ok(Some(value));
+        }
+        let _guard = BuildingGuard {
+            memo: self,
+            pool_independent: true,
+        };
+
+        let Some(built) = build()? else {
+            return Ok(None);
+        };
+        let built = Arc::new(built);
+
+        let mut state = self.state.lock().expect("pool memo poisoned");
+        if let Some(existing) = state.value.as_ref() {
+            return Ok(Some(Arc::clone(existing)));
+        }
+        state.value = Some(Arc::clone(&built));
+        Ok(Some(built))
+    }
+
     /// Infallible [`Self::get_or_try_build_pool_independent`], for a build that
     /// reaches its value without any rayon worker and cannot fail.
     pub(crate) fn get_or_build_pool_independent(&self, build: impl FnOnce() -> T) -> Arc<T> {
@@ -374,7 +424,7 @@ impl<T> PoolSafeMemo<T> {
         build_parallel: impl FnOnce() -> Option<T>,
         build_serial: impl FnOnce() -> Option<T>,
     ) -> Option<Arc<T>> {
-        if let Some(value) = self.wait_or_claim_build_while(keep_going)? {
+        if let Some(value) = self.wait_or_claim_build_while(BuildClaim::Shared, keep_going)? {
             return Some(value);
         }
         let _guard = BuildingGuard {
