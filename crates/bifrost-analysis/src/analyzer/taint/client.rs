@@ -1183,18 +1183,29 @@ pub struct TaintSummaryResult {
     result: RawTaintSummaryResult,
     owner: Arc<()>,
     discovery_complete: bool,
+    proven_by_authored_summaries: bool,
 }
 
 impl TaintSummaryResult {
     fn from_result(plan: &TaintAnalysisPlan, result: RawTaintSummaryResult) -> Self {
-        let discovery_complete = plan
-            .value_flow()
-            .execution_result_complete(result.fact_result())
-            && plan.discovery_complete();
+        let value_flow = plan.value_flow();
+        let facts = result.fact_result();
+        let plan_complete = plan.discovery_complete();
+        let derived_complete = value_flow.execution_result_complete(facts);
+        let discovery_complete = derived_complete && plan_complete;
+        // The run is proven only by authored models when every open boundary is
+        // closed by an authored-complete external summary (#1916): the plan is
+        // structurally complete, derived proof alone does not close the run, and
+        // accepting authored-complete summaries does. Deriving the run in full
+        // stays the strictly stronger `Complete`, never this tier.
+        let proven_by_authored_summaries = plan_complete
+            && !derived_complete
+            && value_flow.execution_result_complete_accepting_authored_summaries(facts);
         Self {
             result,
             owner: Arc::clone(plan.owner()),
             discovery_complete,
+            proven_by_authored_summaries,
         }
     }
 
@@ -1226,6 +1237,13 @@ impl TaintSummaryResult {
 
     pub fn is_complete(&self) -> bool {
         self.discovery_complete
+    }
+
+    /// Whether the run terminates precisely, but its precision rests on
+    /// authored-complete external procedure summaries rather than on derived
+    /// proof (#1916). Mutually exclusive with `is_complete`.
+    pub fn is_proven_by_authored_summaries(&self) -> bool {
+        self.proven_by_authored_summaries
     }
 
     pub(crate) fn owner(&self) -> &Arc<()> {

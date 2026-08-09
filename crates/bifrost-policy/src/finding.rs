@@ -50,6 +50,13 @@ pub enum PolicyRunCompletion {
     ProvenSubset {
         codes: Vec<CodeQueryDiagnosticCode>,
     },
+    /// The run is precise and terminating, but its precision rests on
+    /// authored-complete external procedure summaries rather than on code
+    /// Bifrost analyzed (#1916). It ranks below `Complete`, which stays reserved
+    /// for a result proven exhaustively from analyzed code, and above
+    /// `Inconclusive`. A summary-backed conclusion never launders authored trust
+    /// into `Complete`.
+    ProvenBySummary,
     Inconclusive {
         reasons: Vec<PolicyIncompleteReason>,
     },
@@ -87,17 +94,32 @@ impl PolicyRunCompletion {
 
     /// Whether this run is reliable enough for the policy batch exit status.
     pub const fn is_reliable(&self) -> bool {
-        matches!(self, Self::Complete | Self::ProvenSubset { .. })
+        matches!(
+            self,
+            Self::Complete | Self::ProvenSubset { .. } | Self::ProvenBySummary
+        )
     }
 
-    /// Whether a negative result proves that all applicable matches were found.
+    /// Whether a negative result proves that all applicable matches were found
+    /// from analyzed code. Only `Complete` qualifies: a summary-backed run
+    /// proves absence only under authored trust, which this predicate never
+    /// grants.
     pub const fn is_exhaustive(&self) -> bool {
         matches!(self, Self::Complete)
     }
 
+    /// Whether a run with no findings may still exit clean rather than
+    /// unreliable. Exhaustive analysis qualifies; so does a run closed entirely
+    /// by authored-complete external summaries, because the `require-model`
+    /// contract trusts those models. A proven subset does not: it never searched
+    /// the whole program.
+    pub const fn permits_clean_negative(&self) -> bool {
+        matches!(self, Self::Complete | Self::ProvenBySummary)
+    }
+
     fn validate(&self) -> Result<(), CompletionReasonError> {
         match self {
-            Self::Complete => Ok(()),
+            Self::Complete | Self::ProvenBySummary => Ok(()),
             Self::ProvenSubset { codes } => {
                 let mut normalized = codes.clone();
                 normalize_nonempty(&mut normalized)?;
@@ -2704,7 +2726,9 @@ impl PolicyRun {
         reason: PolicyIncompleteReason,
     ) -> Result<(), CompletionReasonError> {
         match &mut self.completion {
-            PolicyRunCompletion::Complete | PolicyRunCompletion::ProvenSubset { .. } => {
+            PolicyRunCompletion::Complete
+            | PolicyRunCompletion::ProvenSubset { .. }
+            | PolicyRunCompletion::ProvenBySummary => {
                 self.completion = PolicyRunCompletion::inconclusive(vec![reason])?;
             }
             PolicyRunCompletion::Inconclusive { reasons } => {
@@ -3322,7 +3346,7 @@ pub(crate) fn tighten_string(value: &mut String) {
 impl RetainedSize for PolicyRunCompletion {
     fn retained_size(&self) -> usize {
         size_of::<Self>().saturating_add(match self {
-            Self::Complete => 0,
+            Self::Complete | Self::ProvenBySummary => 0,
             Self::ProvenSubset { codes } => codes
                 .capacity()
                 .saturating_mul(size_of::<CodeQueryDiagnosticCode>()),
@@ -3482,6 +3506,35 @@ mod tests {
     };
     use crate::source::{PolicySourceIdentity, parse_rqlp_source};
     use serde_json::json;
+
+    #[test]
+    fn issue_1916_proven_by_summary_ranks_between_complete_and_inconclusive() {
+        let tier = PolicyRunCompletion::ProvenBySummary;
+        // Reliable enough for the batch exit status, like Complete and ProvenSubset.
+        assert!(tier.is_reliable(), "the tier passes the reliability gate");
+        // But never exhaustive: absence is proven only under authored trust, not
+        // from analyzed code.
+        assert!(!tier.is_exhaustive());
+        assert!(!tier.is_complete(), "the tier never claims Complete");
+        // A clean, no-finding summary-backed run may still exit clean...
+        assert!(
+            tier.permits_clean_negative(),
+            "a clean summary-backed run may still exit clean"
+        );
+        // ...whereas a proven subset, though reliable, may not: it never searched
+        // the whole program.
+        let subset =
+            PolicyRunCompletion::proven_subset(vec![CodeQueryDiagnosticCode::ResultLimitReached])
+                .unwrap();
+        assert!(subset.is_reliable());
+        assert!(
+            !subset.permits_clean_negative(),
+            "a proven subset never searched the whole program"
+        );
+        // The tier is a valid, canonical completion carrying no reason payload.
+        assert!(tier.validate().is_ok());
+        assert_eq!(tier.retained_size(), size_of::<PolicyRunCompletion>());
+    }
 
     fn path() -> WorkspaceRelativePath {
         WorkspaceRelativePath::new("src/app.rs").unwrap()

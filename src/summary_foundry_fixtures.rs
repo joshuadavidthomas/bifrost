@@ -281,6 +281,19 @@ fn run_case(
 /// because a clean negative without the model would mean the finding never
 /// depended on the entry. A negative case must produce none, which is a claim
 /// only a `complete` entry is allowed to make.
+///
+/// One completion invariant holds for every case with the pack active (#1916): a
+/// summary-backed run must never report `Complete`, because a summary is an
+/// authored assertion about a body Bifrost never analyzed. `Complete` stays
+/// reserved for proof from analyzed code; the summary-backed clean conclusion is
+/// the distinct `ProvenBySummary` tier. The fail-before control, whose pack is
+/// absent, must degrade all the way to `Inconclusive`. The tier itself is proven
+/// end to end -- earned by an authored-complete summary, withheld from a partial
+/// one -- by `value_flow_client::authored_complete_external_summary_is_proven_by_summary_not_complete`
+/// and its partial sibling; these foundry fixtures do not reach it because their
+/// native source, sink, and dispatch call sites are open boundaries a target
+/// summary does not close, which is orthogonal engine work (#1917 and dispatch
+/// resolution), not a completion-semantics question.
 fn verdict(
     case: &FixtureCase,
     completion: &PolicyRunCompletion,
@@ -293,14 +306,20 @@ fn verdict(
             case.expected_findings
         ));
     }
-    if case.polarity == FixturePolarity::FailBefore
-        && matches!(completion, PolicyRunCompletion::Complete)
-    {
+    if matches!(completion, PolicyRunCompletion::Complete) {
         return Some(
-            "the fail-before control concluded cleanly without the entry, so the finding it \
-             controls never depended on the entry"
+            "a summary-backed run reported Complete, which launders authored trust into the word \
+             reserved for proof from analyzed code (#1916)"
                 .to_owned(),
         );
+    }
+    if case.polarity == FixturePolarity::FailBefore
+        && !matches!(completion, PolicyRunCompletion::Inconclusive { .. })
+    {
+        return Some(format!(
+            "the fail-before control did not surface the entry's absence as incompleteness; it \
+             reported {completion:?} instead of Inconclusive"
+        ));
     }
     if matches!(completion, PolicyRunCompletion::Failed { .. }) {
         return Some(format!(
