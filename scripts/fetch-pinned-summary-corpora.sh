@@ -48,16 +48,24 @@ fetch_corpus() {
   member=$(read_pin "${corpus}" "record.archive.member")
   archive="${download_dir}/${corpus}.tar.gz"
 
-  curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-    --retry-delay 5 --connect-timeout 30 --output "${archive}" "${url}"
+  # No --retry-all-errors here, unlike build-pinned-jvm-semantic-packs.sh: that
+  # option needs curl 7.71 and this script is meant to run on any maintainer
+  # machine. --retry still covers transient 5xx responses and timeouts.
+  curl --fail --location --silent --show-error --retry 5 \
+    --retry-delay 5 --connect-timeout 30 --output "${archive}" "${url}" \
+    || { echo "error: cannot download the ${corpus} archive from ${url}" >&2; exit 1; }
   echo "${sha256}  ${archive}" | shasum -a 256 --check --status \
     || { echo "error: ${corpus} archive does not match its pinned sha256" >&2; exit 1; }
-  tar -C "${extract_dir}" -xzf "${archive}" "${member}"
+  tar -C "${extract_dir}" -xzf "${archive}" "${member}" \
+    || { echo "error: ${corpus} archive has no member ${member}" >&2; exit 1; }
   echo "${extract_dir}/${member}"
 }
 
-codeql_models=$(fetch_corpus codeql)
-joern_source=$(fetch_corpus joern)
+# A command substitution runs in a subshell, so `exit 1` inside fetch_corpus
+# ends only that subshell. Check each result here so a failed fetch stops the
+# run instead of feeding an empty path to the join.
+codeql_models=$(fetch_corpus codeql) || exit 1
+joern_source=$(fetch_corpus joern) || exit 1
 
 cargo run --locked --release --features release-tooling \
   -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- summary-corpus-join \
