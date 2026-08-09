@@ -4793,6 +4793,90 @@ def render(value: Widget):
     );
 }
 
+/// A caret on the member of `car.engine` asks for the member's type, not the
+/// receiver's: the bounded core types the receiver, resolves the member the
+/// receiver's class owns, and answers with what that member declares (#1887).
+#[test]
+fn python_type_lookup_resolves_member_expression_through_receiver_type() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "app.py",
+            r#"class Engine:
+    def start(self):
+        pass
+
+
+class Car:
+    def __init__(self, engine: Engine):
+        self.engine = engine
+
+
+def drive(car: Car):
+    car.engine.start()
+"#,
+        )
+        .build();
+
+    let line = "    car.engine.start()";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":12,"column":{}}}]}}"#,
+            column_of(line, "engine")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "app.Engine", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "app.py",
+        "{value}"
+    );
+}
+
+/// The annotation names a class this file imports from another workspace file,
+/// so the bounded core reads the import binder and asks the index for the
+/// module-qualified declaration rather than giving up at the file edge (#1887).
+#[test]
+fn python_type_lookup_resolves_imported_annotation_from_another_file() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "widget.py",
+            r#"class Widget:
+    def paint(self):
+        pass
+"#,
+        )
+        .file(
+            "app.py",
+            r#"from widget import Widget
+
+
+def render(value: Widget):
+    return value
+"#,
+        )
+        .build();
+
+    let line = "    return value";
+    let value = lookup_type(
+        project.root(),
+        &format!(
+            r#"{{"references":[{{"path":"app.py","line":5,"column":{}}}]}}"#,
+            column_of(line, "value")
+        ),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["types"][0]["fqn"], "widget.Widget", "{value}");
+    assert_eq!(
+        result["types"][0]["definitions"][0]["path"], "widget.py",
+        "{value}"
+    );
+}
+
 #[test]
 fn php_type_lookup_resolves_typed_parameter_type() {
     let project = InlineTestProject::with_language(Language::Php)

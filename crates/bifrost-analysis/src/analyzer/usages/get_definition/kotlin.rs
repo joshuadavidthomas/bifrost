@@ -1362,7 +1362,8 @@ fn kotlin_import_reference_outcome(
 /// Resolve a focus on a `type_identifier`: a type annotation, a supertype, an
 /// annotation name, a receiver type, or a type argument.
 fn kotlin_type_reference_outcome(ctx: &KotlinCtx<'_>, node: Node<'_>) -> DefinitionLookupOutcome {
-    let spelled = kotlin_type_spelling_through(ctx, node);
+    let segments = kotlin_type_spelling_segments(ctx, node);
+    let spelled = segments.join(".");
     if spelled.is_empty() {
         return no_definition("no_reference_text", "Kotlin type reference is blank");
     }
@@ -1386,7 +1387,14 @@ fn kotlin_type_reference_outcome(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Definit
                     format!("`{spelled}` names a package, which has no declaration to navigate to"),
                 );
             }
-            no_definition(
+            // `kotlin_type_leaves_the_workspace` fuses the external-route signal
+            // with the workspace-package check, so its negation is the
+            // workspace-internal gate.
+            gated_boundary(
+                || !kotlin_type_leaves_the_workspace(ctx, &scope, &segments),
+                format!(
+                    "`{spelled}` appears to cross a Kotlin import boundary not indexed in this workspace"
+                ),
                 "no_indexed_definition",
                 format!("`{spelled}` is not indexed as a Kotlin type"),
             )
@@ -1394,16 +1402,18 @@ fn kotlin_type_reference_outcome(ctx: &KotlinCtx<'_>, node: Node<'_>) -> Definit
     }
 }
 
-/// The dotted name a focused `type_identifier` spells, up to and including
+/// The dotted segments a focused `type_identifier` spells, up to and including
 /// itself.
 ///
 /// A dotted type is one `user_type` node with one `type_identifier` child per
 /// segment, so focusing `Outer` in `Outer.Inner` asks about `Outer` while
-/// focusing `Inner` asks about `Outer.Inner`. Joining the children's own text
-/// is a structural read of the tree, not a re-parse of the source.
-fn kotlin_type_spelling_through(ctx: &KotlinCtx<'_>, node: Node<'_>) -> String {
+/// focusing `Inner` asks about `Outer.Inner`. Reading the children's own text
+/// is a structural read of the tree, not a re-parse of the source, and keeping
+/// the segments apart is what lets a boundary check address the head and the
+/// qualifier without splitting the joined spelling again.
+fn kotlin_type_spelling_segments<'a>(ctx: &KotlinCtx<'a>, node: Node<'_>) -> Vec<&'a str> {
     let Some(parent) = node.parent().filter(|parent| parent.kind() == "user_type") else {
-        return ctx.text(node).to_string();
+        return vec![ctx.text(node)];
     };
     let segments = named_children(parent)
         .into_iter()
@@ -1416,8 +1426,82 @@ fn kotlin_type_spelling_through(ctx: &KotlinCtx<'_>, node: Node<'_>) -> String {
     segments[..=last]
         .iter()
         .map(|segment| ctx.text(*segment))
-        .collect::<Vec<_>>()
-        .join(".")
+        .collect()
+}
+
+/// Whether a type spelling that nothing in scope resolves leaves the indexed
+/// workspace.
+///
+/// Two shapes say so, and each fuses the workspace check `gated_boundary`
+/// demands, so the negation of this predicate is the workspace-internal gate:
+///
+/// - the leading segment is bound by an explicit import whose owning package
+///   the workspace does not declare, or a star import names such a package.
+///   This is the Kotlin form of Java's `java_import_boundary_for_type`, read
+///   through `local_name` because Kotlin's ladder binds an aliased import under
+///   its alias, and with the explicit tier consulted first because that tier is
+///   terminal in the ladder.
+/// - the spelling is written qualified and its qualifier is neither a workspace
+///   package nor a name this scope resolves (the #1089 workspace-namespace
+///   shape). Kotlin never searches enclosing packages, so a qualifier the
+///   workspace does not declare is a route out of it.
+fn kotlin_type_leaves_the_workspace(
+    ctx: &KotlinCtx<'_>,
+    scope: &KotlinScope,
+    segments: &[&str],
+) -> bool {
+    let Some((_, qualifier_segments)) = segments.split_last() else {
+        return false;
+    };
+    let head = segments[0];
+
+    for import in &scope.facts.imports {
+        if import.is_wildcard || import.local_name() != Some(head) {
+            continue;
+        }
+        let Some(path) = import
+            .path
+            .as_ref()
+            .filter(|path| !path.segments.is_empty())
+        else {
+            continue;
+        };
+        let owner = path.segments[..path.segments.len() - 1].join(".");
+        return !kotlin_workspace_package_exists(ctx.support, &owner);
+    }
+    for import in &scope.facts.imports {
+        if !import.is_wildcard {
+            continue;
+        }
+        let Some(path) = import
+            .path
+            .as_ref()
+            .filter(|path| !path.segments.is_empty())
+        else {
+            continue;
+        };
+        if !kotlin_workspace_package_exists(ctx.support, &path.render_segments(".")) {
+            return true;
+        }
+    }
+
+    if qualifier_segments.is_empty() {
+        return false;
+    }
+    let qualifier = qualifier_segments.join(".");
+    !kotlin_workspace_package_exists(ctx.support, &qualifier)
+        && ctx.resolve_name(&qualifier, scope) == KotlinTypeName::Unresolved
+}
+
+/// Whether the workspace declares `package` -- as a package of its own, or as
+/// the prefix of some declaration's fully-qualified name -- in any language.
+///
+/// A Kotlin file names Java and Scala packages in the same JVM realm, so a
+/// language-scoped answer would let a confident boundary claim fire for a
+/// package the workspace does index (#1174).
+fn kotlin_workspace_package_exists(support: &dyn BoundedDefinitionLookup, package: &str) -> bool {
+    !package.is_empty()
+        && (support.package_exists_in_any_language(package) || support.fqn_prefix_exists(package))
 }
 
 // ---------------------------------------------------------------------------
@@ -2613,7 +2697,7 @@ pub(crate) fn kotlin_type_lookup_resolution_in_session(
         if kotlin_enclosing_import_header(node).is_some() {
             return None;
         }
-        let spelled = kotlin_type_spelling_through(&ctx, node);
+        let spelled = kotlin_type_spelling_segments(&ctx, node).join(".");
         let scope = ctx.scope_at(node.start_byte());
         let fqn = ctx.resolve_name(&spelled, &scope).resolved()?;
         return Some(KotlinTypeLookupResolution::Type {
