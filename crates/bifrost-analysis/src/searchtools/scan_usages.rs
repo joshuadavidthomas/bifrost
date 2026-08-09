@@ -197,6 +197,9 @@ pub enum ScanUsagesIncompleteReason {
     SourceBytes,
     Callsites,
     ResponseBudget,
+    /// The selector matched more declarations than the tool will resolve, so
+    /// no candidate list was produced. See [`TooManyResolutionCandidates`].
+    ResolutionCandidates,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -256,6 +259,8 @@ pub struct ScanUsagesEntry {
     pub candidate_details_truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub candidates: Vec<AmbiguousUsageCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub too_many_candidates: Option<TooManyResolutionCandidates>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fq_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,7 +370,20 @@ pub struct AmbiguousUsageSymbol {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition_sites_excluded: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub too_many_candidates: Option<TooManyResolutionCandidates>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// The selector matched more declarations than `scan_usages` will resolve.
+/// The candidate list was skipped, not truncated, so `candidate_targets` is
+/// empty and `total_candidates` is the true count of matched declarations --
+/// taken from the deduplicated match set before any per-declaration store
+/// read. Mirrors `search_symbols`' `too_many_matches` block (#1839).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TooManyResolutionCandidates {
+    pub total_candidates: usize,
+    pub cap: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -434,46 +452,100 @@ pub struct TooManyCallsitesInfo {
     pub note: Option<String>,
 }
 
-/// Pre-compute the set of detected test files to exclude, or `None` when test
-/// files should be kept. Both `scan_usages` and `usage_graph` filter at the
-/// source (before the regex scan and the call-site cap) rather than dropping
-/// test hits after the fact: filtering post-hoc would let test hits eat into
-/// the cap and turn production-only queries into `TooManyCallsites` errors.
-pub(super) fn excluded_test_files(
+/// The detected-test-file exclusion for one request, or `None` when test files
+/// should be kept. Both `scan_usages` and `usage_graph` filter at the source
+/// (before the regex scan and the call-site cap) rather than dropping test hits
+/// after the fact: filtering post-hoc would let test hits eat into the cap and
+/// turn production-only queries into `TooManyCallsites` errors.
+pub(super) fn test_file_exclusion(
     analyzer: &dyn IAnalyzer,
     include_tests: bool,
-) -> Option<Arc<HashSet<ProjectFile>>> {
-    if include_tests {
-        return None;
+) -> Option<Arc<TestFileExclusion<'_>>> {
+    (!include_tests).then(|| Arc::new(TestFileExclusion::new(analyzer)))
+}
+
+/// Answers "is this file excluded from a non-test scan?" one file at a time,
+/// memoized for the life of the request.
+///
+/// A file is excluded exactly when its classification is `Test` or
+/// `TestSupport`. Both kinds require — and are fully determined by — the
+/// `test_like` predicate in `classify_resolved_test_file`: a `Test` file is
+/// `test_like && contains_test_code`, a `TestSupport` file is
+/// `test_like && !contains_test_code`, and every non-`test_like` file lands in
+/// `Production`/`Ambiguous`. So membership is decided by [`is_test_like_file`]
+/// alone; the `contains_test_code` signal only splits `Test` from
+/// `TestSupport`, and both are excluded. That avoids hydrating a file's
+/// `FileState` (a full store read + decode of all declarations) solely to read
+/// a boolean that cannot change the verdict.
+///
+/// The per-file verdict is exactly what it was when this was a pre-built set
+/// over `analyzer.analyzed_files()`. What changed is *who* gets classified.
+/// Pre-classifying the workspace cost 2.30-2.78 s on the rustc tree — 66-87 %
+/// of a 3 s scan budget, 29,748 files classified before any symbol work, with
+/// `file_is_test_only` dragging `RustAnalyzer::build_cargo_routes` (0.83-1.03 s)
+/// into the budget with it (`.agents/docs/gate-cell-overhead-2026-08.md`). The
+/// consumers only ever ask about files they are about to read: the scan's
+/// candidate files, hundreds at most, and the usage-graph walk's caller files.
+/// Every one of those comes from analyzer-indexed declarations, which is the
+/// same population the pre-built set was drawn from.
+pub(super) struct TestFileExclusion<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    /// `file -> is_test_like`. A scan asks about the same candidate file once
+    /// per overload and once per requested symbol, so the memo is what keeps
+    /// the classification O(distinct candidates) rather than O(asks).
+    verdicts: std::sync::Mutex<HashMap<ProjectFile, bool>>,
+    classified: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> TestFileExclusion<'a> {
+    fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self {
+            analyzer,
+            verdicts: std::sync::Mutex::new(HashMap::default()),
+            classified: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
-    // A file is excluded from a non-test scan exactly when its classification is
-    // `Test` or `TestSupport`. Both kinds require — and are fully determined by —
-    // the `test_like` predicate in `classify_resolved_test_file`: a `Test` file
-    // is `test_like && contains_test_code`, a `TestSupport` file is
-    // `test_like && !contains_test_code`, and every non-`test_like` file lands in
-    // `Production`/`Ambiguous`. So membership here is decided by `test_like`
-    // alone; the `contains_test_code` signal only splits `Test` from
-    // `TestSupport`, and both are excluded. That still avoids hydrating every
-    // workspace file's `FileState` (a full store read + decode of all
-    // declarations) solely to read a boolean that cannot change the set — the
-    // dominant per-call cost of a scan on a large workspace.
-    let set: HashSet<ProjectFile> = analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| {
-            is_test_like_file(
-                analyzer,
-                file,
-                &rel_path_string(file),
-                language_for_file(file),
-            )
-        })
-        .collect();
-    Some(Arc::new(set))
+
+    /// Whether `file` is dropped from a non-test scan.
+    pub(super) fn excludes(&self, file: &ProjectFile) -> bool {
+        if let Some(verdict) = self
+            .verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(file)
+        {
+            return *verdict;
+        }
+        // Classify with the lock released: `file_is_test_only` can build a
+        // language's route index, and holding the memo lock across it would
+        // serialize the whole-workspace usage-graph walk behind one file.
+        // A racing duplicate classification is harmless — the predicate is
+        // pure — and is counted, so `classified_count` stays an upper bound.
+        self.classified
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let verdict = is_test_like_file(
+            self.analyzer,
+            file,
+            &rel_path_string(file),
+            language_for_file(file),
+        );
+        self.verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(file.clone(), verdict);
+        verdict
+    }
+
+    /// How many files this request has classified. The observable complexity
+    /// signal: a scan must classify its candidates, not its workspace.
+    #[cfg(test)]
+    pub(super) fn classified_count(&self) -> usize {
+        self.classified.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// The `test_like` predicate shared by [`classify_resolved_test_file`] and
-/// [`excluded_test_files`]: a file rooted under a test directory, carrying a
+/// [`TestFileExclusion`]: a file rooted under a test directory, carrying a
 /// test filename convention, or reachable only from test-gated code.
 ///
 /// The third disjunct is the structural one (#1546): Rust's sibling test module
@@ -494,16 +566,19 @@ fn is_test_like_file(
 /// Build a [`UsageFinder`] whose file filter drops the excluded test files and
 /// applies the optional path filter — the workspace scoping that both
 /// `scan_usages` and `usage_graph` run before querying call sites.
-pub(super) fn scoped_usage_finder(
-    test_files: Option<&Arc<HashSet<ProjectFile>>>,
+pub(super) fn scoped_usage_finder<'a>(
+    test_files: Option<&Arc<TestFileExclusion<'a>>>,
     path_filter: Option<&Arc<ScanUsagesPathFilter>>,
-) -> UsageFinder {
+) -> UsageFinder<'a> {
     let mut finder = UsageFinder::new();
     if let Some(test_files) = test_files {
         let test_files = Arc::clone(test_files);
         let path_filter = path_filter.map(Arc::clone);
+        // The candidate files reaching this filter are the only files the scan
+        // will read, so this is where the test classification is paid for --
+        // per candidate, not per workspace file.
         finder = finder.with_file_filter(move |file| {
-            !test_files.contains(file)
+            !test_files.excludes(file)
                 && path_filter
                     .as_ref()
                     .map(|filter| filter.matches(file))
@@ -574,6 +649,7 @@ pub(super) fn ambiguous_usage_symbol_from_groups(
         candidates: Vec::new(),
         candidate_files_truncated: false,
         definition_sites_excluded: None,
+        too_many_candidates: None,
         note: Some(
             if surface == ScanUsagesSurface::Location && total > SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT
             {
@@ -586,6 +662,40 @@ pub(super) fn ambiguous_usage_symbol_from_groups(
             },
         ),
     }
+}
+
+/// The reply for a selector that matched more declarations than the tool will
+/// resolve. `candidate_targets` is empty on purpose: producing it is the work
+/// that was skipped, and an arbitrary subset of twenty thousand namesakes
+/// would read as the answer while being meaningless. The count and the cap
+/// carry the honest part (#1839).
+fn too_many_resolution_candidates_symbol(
+    symbol: String,
+    total_candidates: usize,
+    cap: usize,
+) -> AmbiguousUsageSymbol {
+    AmbiguousUsageSymbol {
+        short_name: symbol.clone(),
+        symbol,
+        candidate_targets: Vec::new(),
+        candidate_details: Vec::new(),
+        candidate_details_total: None,
+        candidate_details_truncated: false,
+        candidates: Vec::new(),
+        candidate_files_truncated: false,
+        definition_sites_excluded: None,
+        too_many_candidates: Some(TooManyResolutionCandidates {
+            total_candidates,
+            cap,
+        }),
+        note: Some(too_many_resolution_candidates_note(total_candidates, cap)),
+    }
+}
+
+pub(super) fn too_many_resolution_candidates_note(total_candidates: usize, cap: usize) -> String {
+    format!(
+        "The symbol matched {total_candidates} declarations, over the {cap}-declaration resolution limit for one selector, so no candidate list was produced. Qualify the symbol (add its owner or module), or pick one declaration with `path#symbol`, and re-call."
+    )
 }
 
 pub(super) fn scan_usages_ambiguity_note(surface: ScanUsagesSurface) -> &'static str {
@@ -948,6 +1058,10 @@ fn incomplete_recovery_message(
         ),
         ScanUsagesIncompleteReason::ResponseBudget => format!(
             "usage results were summarized to fit the response budget; re-call {} with one target to maximize retained detail, but exhaustive modeled relation retrieval is unavailable",
+            surface.tool_name()
+        ),
+        ScanUsagesIncompleteReason::ResolutionCandidates => format!(
+            "the selector matched more declarations than usage analysis will resolve; qualify it (or use `path#symbol` from a previous ambiguous reply), then re-call {}",
             surface.tool_name()
         ),
     }
@@ -1344,6 +1458,7 @@ pub(super) fn resolve_scan_usages_target(
                 candidates: Vec::new(),
                 candidate_files_truncated: false,
                 definition_sites_excluded: None,
+                too_many_candidates: None,
                 note: Some(
                     "Ambiguous modeled location; provide an exact model declaration selector."
                         .to_owned(),
@@ -1726,12 +1841,15 @@ pub(super) fn present_reference_only_sibling_extensions_by_language(
     analyzer: &dyn IAnalyzer,
 ) -> BTreeMap<Language, Vec<&'static str>> {
     let mut present = BTreeMap::new();
-    let Ok(files) = analyzer.project().all_files() else {
+    // `all_files_shared`, not `all_files`: this reads each path's extension and
+    // keeps nothing, so deep-cloning the project's whole listing to do it is
+    // pure waste (the same swap as `route_summary_targets_with_cancellation`).
+    let Ok(files) = analyzer.project().all_files_shared() else {
         return present;
     };
 
     let mut workspace_extensions = HashSet::default();
-    for file in files {
+    for file in files.iter() {
         if let Some(extension) = file
             .rel_path()
             .extension()
@@ -1962,7 +2080,7 @@ fn scan_usages_backend_on_pool(
         return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
     }
 
-    let test_files = excluded_test_files(analyzer, include_tests);
+    let test_files = test_file_exclusion(analyzer, include_tests);
     if context.cancellation.is_cancelled() {
         let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
@@ -2079,9 +2197,41 @@ fn scan_usages_backend_on_pool(
             DefinitionSelector::Name(name) => (None, name),
             DefinitionSelector::FileAnchored { anchor, lookup } => (Some(anchor), lookup),
         };
+        // Resolution is inside the scan's budget, not beside it. It is the
+        // phase that reads the identifier index and then one `definitions`
+        // page per matched declaration, so on a large workspace a common name
+        // spends the whole budget several hundred times over here, before the
+        // scan proper starts (#1839).
+        let keep_scanning = || !context.cancellation.is_cancelled();
         let resolution = {
             let _scope = profiling::scope("searchtools::scan_usages_symbol_resolution");
-            resolve_codeunit_fuzzy(analyzer, lookup)
+            resolve_codeunit_fuzzy_bounded(
+                analyzer,
+                lookup,
+                FuzzyResolveBudget::new(&keep_scanning, SCAN_USAGES_MAX_RESOLUTION_CANDIDATES),
+            )
+        };
+        let resolution = match resolution {
+            Ok(resolution) => resolution,
+            // The budget expired mid-resolution. Reported through the same
+            // incomplete entry a budget expiry anywhere else in the scan uses.
+            Err(FuzzyResolveStop::Cancelled) => {
+                work_entries.push(incomplete_work_entry(
+                    request,
+                    Some(symbol),
+                    context.interruption_reason(),
+                ));
+                continue;
+            }
+            Err(FuzzyResolveStop::TooManyCandidates { total, limit }) => {
+                let item = too_many_resolution_candidates_symbol(symbol, total, limit);
+                work_entries.push(ScanUsagesWorkEntry::Ambiguous {
+                    request,
+                    item,
+                    incomplete_reason: Some(ScanUsagesIncompleteReason::ResolutionCandidates),
+                });
+                continue;
+            }
         };
         if context.cancellation.is_cancelled() {
             work_entries.push(incomplete_work_entry(
@@ -2389,6 +2539,7 @@ fn scan_usages_backend_on_pool(
                     candidates,
                     candidate_files_truncated: truncated,
                     definition_sites_excluded: some_if_nonzero(definition_sites_excluded),
+                    too_many_candidates: None,
                     note: detail_source.note,
                 };
                 work_entries.push(ScanUsagesWorkEntry::Ambiguous {
@@ -2571,7 +2722,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     let _scope = profiling::scope("searchtools::usage_graph");
 
     let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref()).filter;
-    let test_files = excluded_test_files(analyzer, params.include_tests);
+    let test_files = test_file_exclusion(analyzer, params.include_tests);
 
     // Build node identity once and share it with the internal relevance graph.
     // The catalog collapses overloads, keeps JS/TS declarations file-scoped, and
@@ -2612,7 +2763,7 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
     let keep_file = |file: &ProjectFile| {
         test_files
             .as_ref()
-            .map(|excluded| !excluded.contains(file))
+            .map(|exclusion| !exclusion.excludes(file))
             .unwrap_or(true)
             && path_filter
                 .as_ref()
@@ -3197,6 +3348,7 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
             result.candidate_details_total = item.candidate_details_total;
             result.candidate_details_truncated = item.candidate_details_truncated;
             result.candidates = item.candidates.clone();
+            result.too_many_candidates = item.too_many_candidates;
             result.definition_sites_excluded = item.definition_sites_excluded;
             result.complete = incomplete_reason.is_none() && !item.candidate_files_truncated;
             result.incomplete_reason = incomplete_reason.or_else(|| {
@@ -3253,6 +3405,9 @@ pub(super) fn classify_scan_usages_entry(entry: &ScanUsagesWorkEntry) -> ScanUsa
                     ScanUsagesIncompleteReason::SourceBytes => "source_bytes_budget",
                     ScanUsagesIncompleteReason::Callsites => "callsites_budget",
                     ScanUsagesIncompleteReason::ResponseBudget => "response_budget",
+                    ScanUsagesIncompleteReason::ResolutionCandidates => {
+                        "resolution_candidates_budget"
+                    }
                 }
                 .to_string(),
             );
@@ -3497,6 +3652,7 @@ pub(super) fn scan_usages_entry_base(
         candidate_details_total: None,
         candidate_details_truncated: false,
         candidates: Vec::new(),
+        too_many_candidates: None,
         fq_name: None,
         definition_path: None,
         definition_line: None,

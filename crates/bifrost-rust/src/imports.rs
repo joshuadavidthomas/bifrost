@@ -111,6 +111,7 @@ fn rust_external_crate_import(
         info: ImportInfo {
             raw_snippet: rust_node_text(node, source).to_string(),
             is_wildcard: false,
+            is_global: false,
             identifier: Some(name.to_string()),
             alias,
             path: Some(StructuredImportPath {
@@ -581,6 +582,7 @@ impl RustUseDeclaration {
             info: ImportInfo {
                 raw_snippet,
                 is_wildcard,
+                is_global: false,
                 identifier,
                 alias,
                 path: Some(StructuredImportPath {

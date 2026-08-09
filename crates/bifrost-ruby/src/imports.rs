@@ -32,6 +32,7 @@ pub fn parse_ruby_require_call(node: Node<'_>, source: &str) -> Option<ImportInf
     Some(ImportInfo {
         raw_snippet,
         is_wildcard: false,
+        is_global: false,
         identifier: Some(path),
         alias: None,
         path: None,
@@ -181,6 +182,7 @@ pub fn collect_ruby_autoload_edges(
             let import = ImportInfo {
                 raw_snippet: node_text(node, source).trim().to_string(),
                 is_wildcard: false,
+                is_global: false,
                 identifier: Some(path),
                 alias: None,
                 path: None,

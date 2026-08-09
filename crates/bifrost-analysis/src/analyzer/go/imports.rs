@@ -11,9 +11,8 @@ use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, ProjectFile}
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_go::imports::{
     GoImportTables, build_go_dir_parent_files, build_go_dir_parent_suffix_files,
-    build_go_package_files, dir_suffix_matches, extract_go_import_path,
-    go_directory_sibling_import_files, go_imported_code_units_of, go_matching_import_files,
-    go_package_of, go_relevant_imports_for,
+    build_go_package_files, dir_suffix_matches, go_directory_sibling_import_files, go_import_path,
+    go_imported_code_units_of, go_matching_import_files, go_package_of, go_relevant_imports_for,
 };
 use std::sync::Arc;
 
@@ -71,7 +70,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
         Some(
             imports
                 .iter()
-                .filter_map(|import| extract_go_import_path(&import.raw_snippet))
+                .filter_map(go_import_path)
                 .flat_map(|path| {
                     let resolved = go_matching_import_files(&tables, file, &path);
                     if !resolved.is_empty() {
@@ -102,7 +101,7 @@ impl ImportAnalysisProvider for GoAnalyzer {
     ) -> bool {
         let target_pkg = self.go_package_of(target);
         imports.iter().any(|import| {
-            let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+            let Some(path) = go_import_path(import) else {
                 return false;
             };
             target_pkg.as_deref() == Some(path.as_str()) || dir_suffix_matches(target, &path)

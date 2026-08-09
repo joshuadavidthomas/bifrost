@@ -9,6 +9,7 @@ use crate::analyzer::{
     TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
     UsageFactsIndex, metrics_from_declarations,
 };
+use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::code_unit_index::CodeUnitIndex;
 pub(crate) use brokk_bifrost_core::analyzer::code_unit_index::default_parent_fq_name;
 pub use brokk_bifrost_core::analyzer::query_batch::QueryBatch;
@@ -167,15 +168,27 @@ fn escape_sigil_anchors(pattern: &str) -> String {
     escaped
 }
 
-/// Failure state for one top-level analyzer request.
+/// Failure state and deadline for one top-level analyzer request.
 ///
 /// The analyzer trait intentionally retains best-effort collection-returning APIs, so persisted
 /// implementations record storage failures here before returning their compatibility fallback.
 /// Service boundaries inspect the context before presenting a successful response.
+///
+/// The context also carries the request's cancellation token, because a
+/// request's deadline has to be visible at the depth where the request spends
+/// its time. `IAnalyzer`'s read APIs take no token -- `definitions(fq_name)` is
+/// a plain lookup -- yet one of those reads can be the single longest thing a
+/// scan does: on the rustc tree `definitions` for a hot short name such as
+/// `main` is a 1.14 s store read, issued from inside the polled import-graph
+/// walk, and it was the whole of the `scan_usages` deadline overshoot. Passing
+/// the token through every read signature would mean a cancellation parameter
+/// on most of `IAnalyzer`; carrying it on the request boundary that already
+/// exists gives the same reach without one.
 #[doc(hidden)]
 #[derive(Debug, Default)]
 pub struct AnalyzerQueryContext {
     first_store_error: Mutex<Option<StoreError>>,
+    cancellation: Option<CancellationToken>,
 }
 
 /// Analyzer-snapshot-owned query caches. The container is public only because
@@ -319,6 +332,18 @@ impl WorkspaceFileIndex {
 }
 
 impl AnalyzerQueryContext {
+    pub fn with_cancellation(cancellation: CancellationToken) -> Self {
+        Self {
+            first_store_error: Mutex::new(None),
+            cancellation: Some(cancellation),
+        }
+    }
+
+    /// The deadline this request is running under, if its opener set one.
+    pub fn cancellation(&self) -> Option<&CancellationToken> {
+        self.cancellation.as_ref()
+    }
+
     pub fn record_store_error(&self, error: StoreError) {
         let mut slot = self
             .first_store_error
@@ -914,6 +939,28 @@ pub trait AnalyzerTestHooks {
         0
     }
 
+    /// Batched import-target prefetches issued by candidate discovery (#1748):
+    /// one per language group per request, against the per-candidate
+    /// `definition_candidates` reads the batch replaces.
+    #[doc(hidden)]
+    fn reset_definition_prefetch_batch_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        0
+    }
+
+    /// Store round trips the definition-candidate row read actually issued,
+    /// as distinct from the calls that were served by the request's
+    /// single-flight memo.
+    #[doc(hidden)]
+    fn reset_definition_candidate_row_read_count_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn definition_candidate_row_read_count_for_test(&self) -> usize {
+        0
+    }
+
     #[doc(hidden)]
     fn reset_full_declaration_scan_count_for_test(&self) {}
 
@@ -1004,6 +1051,19 @@ pub struct AnalyzerQueryScope<'a> {
 impl<'a> AnalyzerQueryScope<'a> {
     pub fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         let context = Arc::new(AnalyzerQueryContext::default());
+        analyzer.begin_query(&context);
+        Self { analyzer, context }
+    }
+
+    /// Open a request boundary that carries the caller's deadline, so reads
+    /// issued anywhere below it can stop when that deadline expires.
+    pub fn with_cancellation(
+        analyzer: &'a dyn IAnalyzer,
+        cancellation: &CancellationToken,
+    ) -> Self {
+        let context = Arc::new(AnalyzerQueryContext::with_cancellation(
+            cancellation.clone(),
+        ));
         analyzer.begin_query(&context);
         Self { analyzer, context }
     }

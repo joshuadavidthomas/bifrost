@@ -3107,19 +3107,29 @@ import (
             brokk_bifrost_go::declarations::collect_go_import_infos(tree.root_node(), source);
 
         assert_eq!(imports.len(), 2);
+        // A Go import path is stored one '/'-separated component per segment,
+        // so consumers rejoin it with `render_segments("/")` instead of taking
+        // segment zero as the whole path.
         assert_eq!(
             imports[0]
                 .path
                 .as_ref()
                 .map(|path| path.segments.as_slice()),
-            Some(["example.com/app/service".to_string()].as_slice())
+            Some(
+                [
+                    "example.com".to_string(),
+                    "app".to_string(),
+                    "service".to_string()
+                ]
+                .as_slice()
+            )
         );
         assert_eq!(
             imports[1]
                 .path
                 .as_ref()
-                .map(|path| path.segments.as_slice()),
-            Some(["example.com/app/model".to_string()].as_slice())
+                .map(|path| path.render_segments("/")),
+            Some("example.com/app/model".to_string())
         );
     }
 

@@ -26,12 +26,18 @@ use arc_swap::ArcSwapOption;
 use brokk_bifrost_core::analyzer::code_unit_index::file_namespace_from_top_level_declarations;
 
 use crate::analyzer::cognitive_complexity;
+use crate::analyzer::common::{
+    IdentifierSeek, decorated_identifier_seeks, identifier_addresses_target,
+};
+use crate::analyzer::fq_name::absent_segment_separators;
+use crate::analyzer::pool_memo::KeyedPoolSafeMemo;
 use crate::analyzer::project::{OverlayRevision, ProjectSourceOrigin, ProjectSourceSnapshot};
 use crate::analyzer::store::liveness::{LivePathEntry, LivePathMap, LiveSnapshot, Liveness};
 use crate::analyzer::store::query::QueryResolver;
 use crate::analyzer::store::{
-    AnalyzerStore, GenerationId, HierarchyStorageKey, LimitedQueryRows, PathSymbolRow,
-    PersistBatchLimits, PersistBatchStats, PreparedParsedBlob, StoreError,
+    AnalyzerStore, DefinitionOrderCandidateRow, GenerationId, HierarchyStorageKey,
+    LimitedQueryRows, PathSymbolRow, PersistBatchLimits, PersistBatchStats, PreparedParsedBlob,
+    StoreError,
 };
 use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::{
@@ -165,6 +171,50 @@ const SUMMARY_FILE_PROJECTION_CACHE_CAPACITY: usize = 128;
 const STORE_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STORE_WRITE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const STORE_WRITE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+// OpenJDK and LLVM contain generated-style fixtures that can keep one tree-sitter
+// worker busy for tens of minutes after all ordinary files finish (issue #1690).
+// Bound each complete-file parse so one blob cannot hold the workspace build open.
+const COMPLETE_FILE_PARSE_BUDGET: Duration = Duration::from_secs(10);
+
+enum BoundedParse {
+    Complete(Tree),
+    Cancelled,
+    TimedOut,
+    Rejected,
+}
+
+fn parse_complete_file_bounded(
+    parser: &mut Parser,
+    source: &str,
+    cancellation: Option<&CancellationToken>,
+    budget: Duration,
+) -> BoundedParse {
+    let deadline = Instant::now() + budget;
+    let mut timed_out = false;
+    let mut read = |offset: usize, _| &source.as_bytes()[offset..];
+    let mut progress = |_: &tree_sitter::ParseState| {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return true;
+        }
+        timed_out = Instant::now() >= deadline;
+        timed_out
+    };
+    let tree = parser.parse_with_options(
+        &mut read,
+        None,
+        Some(ParseOptions::new().progress_callback(&mut progress)),
+    );
+    if let Some(tree) = tree {
+        return BoundedParse::Complete(tree);
+    }
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        BoundedParse::Cancelled
+    } else if timed_out {
+        BoundedParse::TimedOut
+    } else {
+        BoundedParse::Rejected
+    }
+}
 
 fn limited_projection_rows<T: Clone>(rows: Option<&[T]>, limit: usize) -> LimitedQueryRows<T> {
     if limit == 0 {
@@ -390,8 +440,21 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn preferred_type_candidate<'a>(&self, candidates: &'a [CodeUnit]) -> Option<&'a CodeUnit> {
         candidates.first()
     }
+    /// The separators this adapter's lookup spellings are peeled on -- and, by
+    /// the same declaration, the separators it treats as a *join* wherever one
+    /// appears in a spelling.
+    ///
+    /// That second reading is what lets `definition_candidate_short_names` drop
+    /// a spelling as a structurally guaranteed miss. A language whose
+    /// identifiers can themselves contain a separator must not list it: scala's
+    /// cons class is named `::`, so scala peels on `.` alone and `::` in a
+    /// scala spelling is a declaration's name rather than a join. The one
+    /// declaration answers both questions, so the two cannot drift apart.
+    fn lookup_candidate_separators(&self) -> &'static [&'static str] {
+        &[".", "::"]
+    }
     fn lookup_candidate_short_names(&self, normalized_fq_name: &str) -> Vec<String> {
-        lookup_suffix_candidates(normalized_fq_name, &[".", "::"])
+        lookup_suffix_candidates(normalized_fq_name, self.lookup_candidate_separators())
     }
     fn is_anonymous_structure(&self, _fq_name: &str) -> bool {
         false
@@ -558,7 +621,6 @@ pub struct FileState {
     pub(crate) top_level_declarations: Vec<CodeUnit>,
     pub(crate) declarations: HashSet<CodeUnit>,
     pub(crate) definition_lookup_units: HashSet<CodeUnit>,
-    pub(crate) import_statements: Vec<String>,
     pub(crate) imports: Vec<ImportInfo>,
     pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::ScalaExportInfo>>,
     pub(crate) raw_supertypes: HashMap<CodeUnit, Vec<String>>,
@@ -602,9 +664,9 @@ impl FileState {
         const ALLOCATION_ALLOWANCE_DENOMINATOR: usize = 2;
 
         let strings = self
-            .import_statements
+            .imports
             .iter()
-            .map(|value| value.capacity())
+            .map(|import| import.raw_snippet.capacity())
             .chain(self.type_identifiers.iter().map(|value| value.capacity()))
             .chain(self.raw_supertypes.iter().flat_map(|(unit, values)| {
                 std::iter::once(unit.fq_name().capacity())
@@ -634,11 +696,6 @@ impl FileState {
                 self.definition_lookup_units
                     .capacity()
                     .saturating_mul(std::mem::size_of::<CodeUnit>()),
-            )
-            .saturating_add(
-                self.import_statements
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<String>()),
             )
             .saturating_add(
                 self.imports
@@ -1691,6 +1748,81 @@ struct QueryReadCache {
     /// hydration, so a racing duplicate query is cheap and single-flighting per
     /// key would cost more than it saves.
     parent_units: Arc<RwLock<HashMap<String, Option<CodeUnit>>>>,
+    /// Definition candidates keyed by fq name, resolved at most once per name
+    /// per request.
+    ///
+    /// `definitions` is the single hottest store read in candidate discovery:
+    /// the shared import-graph walk asks it once per import statement in the
+    /// workspace, and a workspace's import statements name far fewer distinct
+    /// targets than there are import statements (#1748). Same plain-`HashMap`
+    /// shape and reasoning as `parent_units`: each entry is one bounded
+    /// lookup, so a racing duplicate is cheaper than per-key single flight.
+    /// The expensive half of a duplicate -- the persisted row read -- is
+    /// single-flighted one level down by `definition_candidate_rows`, so what
+    /// a racing duplicate here repeats is the per-name assembly, not a store
+    /// round trip.
+    definition_units: Arc<RwLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
+    /// The persisted candidate rows for one short name, read at most once per
+    /// (short name, lookup kind) per request.
+    ///
+    /// `definition_units` above memoizes by *fq name*, but the store read it
+    /// wraps is keyed by the candidate *short name*: `Foo::main`,
+    /// `Bar::main` and twenty thousand other fq names all reduce to the one
+    /// short name `main` and each re-reads the same page. That is not a repeat
+    /// the fq memo can ever see -- every key is distinct and new -- and it is
+    /// what charged 20,935 identical `main` reads inside a single
+    /// `scan_usages` request on the rustc tree (#1839). Memoizing at the key
+    /// the store read actually uses collapses them to one.
+    ///
+    /// The rows, not the assembled answer: assembly still merges each fq
+    /// name's own dirty units and path-symbol units, and narrows to that name.
+    ///
+    /// [`KeyedPoolSafeMemo`], not the plain `HashMap` the memos above use: this
+    /// is the one request memo whose key is *hot*, and a plain map only
+    /// deduplicates sequential repeats. The scan's parallel candidate fan-out
+    /// asks for the same short name from many rayon workers at once; they all
+    /// miss the check and they all run the read. The D4 measurement on the
+    /// rustc tree found 8 and more concurrent reads of one short name each
+    /// taking 9-11 seconds, with the slowest 1% of 146,678 lookups carrying
+    /// 87.8% of the time (#1748). A per-key single-flight cell collapses a
+    /// same-key burst to one read; see `KeyedPoolSafeMemo` for why parking a
+    /// rayon worker on this particular build is safe under #549.
+    definition_candidate_rows:
+        Arc<KeyedPoolSafeMemo<DefinitionCandidateRowsKey, Vec<DefinitionOrderCandidateRow>>>,
+    /// The workspace's path-synthetic module units, walked at most once per
+    /// request (#1774). See [`TreeSitterAnalyzer::workspace_module_walk`].
+    workspace_module_walk: Arc<RwLock<Option<Arc<WorkspaceModuleWalk>>>>,
+}
+
+/// What one persisted candidate-row read is keyed by: the short name the store
+/// seeks, and which of the two candidate orderings the caller asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DefinitionCandidateRowsKey {
+    short_name: String,
+    include_definition_lookup_units: bool,
+}
+
+/// One request's materialization of the workspace's path-synthetic module
+/// units, plus the live snapshot it was read from. See
+/// [`TreeSitterAnalyzer::workspace_module_walk`].
+struct WorkspaceModuleWalk {
+    snapshot: Arc<LiveSnapshot>,
+    entries: Vec<(ProjectFile, Oid, CodeUnit)>,
+    /// Live paths visited by the walk, so a memo hit reports the same
+    /// `inspected` budget figure the walk itself would have reported.
+    inspected: usize,
+}
+
+// `LiveSnapshot` is not `Debug`, and the entry list is workspace-sized, so
+// report the shape rather than the contents.
+impl std::fmt::Debug for WorkspaceModuleWalk {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkspaceModuleWalk")
+            .field("entries", &self.entries.len())
+            .field("inspected", &self.inspected)
+            .finish()
+    }
 }
 
 impl Default for QueryReadCache {
@@ -1726,6 +1858,9 @@ impl QueryReadCache {
             top_level_class_units_by_package: Arc::new(OnceLock::new()),
             workspace_file_index: Arc::new(OnceLock::new()),
             parent_units: Arc::new(RwLock::new(HashMap::default())),
+            definition_units: Arc::new(RwLock::new(HashMap::default())),
+            definition_candidate_rows: Arc::new(KeyedPoolSafeMemo::new()),
+            workspace_module_walk: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1770,10 +1905,25 @@ impl QueryReadCache {
         self.file_states = Arc::new(RwLock::new(QueryFileStateCache::new(max_bytes)));
         self.prepared_syntax = Arc::new(RwLock::new(HashMap::default()));
         self.parent_units = Arc::new(RwLock::new(HashMap::default()));
+        self.definition_units = Arc::new(RwLock::new(HashMap::default()));
+        self.definition_candidate_rows = Arc::new(KeyedPoolSafeMemo::new());
+        self.workspace_module_walk = Arc::new(RwLock::new(None));
     }
 
     fn is_active(&self) -> bool {
         !self.contexts.is_empty()
+    }
+
+    /// The deadline governing the innermost active request boundary.
+    ///
+    /// Scopes nest (a scan opens one, a nested resolver may open another), and
+    /// an inner scope can only narrow a deadline, never widen one, so the
+    /// innermost token that carries one governs.
+    fn active_cancellation(&self) -> Option<CancellationToken> {
+        self.contexts
+            .iter()
+            .rev()
+            .find_map(|context| context.cancellation().cloned())
     }
 
     #[cfg(test)]
@@ -1994,6 +2144,13 @@ pub struct TreeSitterAnalyzer<A> {
     bulk_hydration_count: Arc<AtomicUsize>,
     sql_definitions_query_count: Arc<AtomicUsize>,
     definition_candidates_query_count: Arc<AtomicUsize>,
+    definition_prefetch_batch_count: Arc<AtomicUsize>,
+    definition_candidate_row_read_count: Arc<AtomicUsize>,
+    /// Candidate spellings dropped by `definition_candidate_short_names`
+    /// because the persisted `short_name` vocabulary for this adapter's
+    /// language cannot contain a separator they carry. Each one is a store seek
+    /// that did not happen (issue #1748).
+    structural_miss_spelling_count: Arc<AtomicUsize>,
     enclosing_code_unit_query_count: Arc<AtomicUsize>,
     full_declaration_scan_count: Arc<AtomicUsize>,
     /// Persisted declarations that a `search_symbols` request hydrated into
@@ -2053,6 +2210,11 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             bulk_hydration_count: Arc::clone(&self.bulk_hydration_count),
             sql_definitions_query_count: Arc::clone(&self.sql_definitions_query_count),
             definition_candidates_query_count: Arc::clone(&self.definition_candidates_query_count),
+            definition_prefetch_batch_count: Arc::clone(&self.definition_prefetch_batch_count),
+            definition_candidate_row_read_count: Arc::clone(
+                &self.definition_candidate_row_read_count,
+            ),
+            structural_miss_spelling_count: Arc::clone(&self.structural_miss_spelling_count),
             enclosing_code_unit_query_count: Arc::clone(&self.enclosing_code_unit_query_count),
             full_declaration_scan_count: Arc::clone(&self.full_declaration_scan_count),
             search_candidate_hydration_count: Arc::clone(&self.search_candidate_hydration_count),
@@ -2261,6 +2423,9 @@ where
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
+            definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
+            definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
+            structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
@@ -2472,6 +2637,9 @@ where
             bulk_hydration_count: Arc::new(AtomicUsize::new(0)),
             sql_definitions_query_count: Arc::new(AtomicUsize::new(0)),
             definition_candidates_query_count: Arc::new(AtomicUsize::new(0)),
+            definition_prefetch_batch_count: Arc::new(AtomicUsize::new(0)),
+            definition_candidate_row_read_count: Arc::new(AtomicUsize::new(0)),
+            structural_miss_spelling_count: Arc::new(AtomicUsize::new(0)),
             enclosing_code_unit_query_count: Arc::new(AtomicUsize::new(0)),
             full_declaration_scan_count: Arc::new(AtomicUsize::new(0)),
             search_candidate_hydration_count: Arc::new(AtomicUsize::new(0)),
@@ -2507,29 +2675,71 @@ where
         file: &ProjectFile,
         source: String,
     ) -> Option<FileState> {
+        Self::analyze_source_with_budget(parser, adapter, file, source, COMPLETE_FILE_PARSE_BUDGET)
+    }
+
+    fn analyze_source_with_budget(
+        parser: &mut Parser,
+        adapter: &A,
+        file: &ProjectFile,
+        source: String,
+        budget: Duration,
+    ) -> Option<FileState> {
         if crate::analyzer::common::is_unparseable_source(source.as_str()) {
             return None;
         }
         parser
             .set_language(&adapter.parser_language_for_file(file))
             .ok()?;
-        let tree = parser.parse(source.as_str(), None)?;
+        let tree = match parse_complete_file_bounded(parser, &source, None, budget) {
+            BoundedParse::Complete(tree) => tree,
+            BoundedParse::TimedOut => {
+                let mut parsed = ParsedFile::new(String::new());
+                parsed.add_file_scope(file, &source);
+                return Some(Self::file_state_from_parsed(
+                    source,
+                    parsed,
+                    false,
+                    Some(Vec::new()),
+                ));
+            }
+            BoundedParse::Cancelled => unreachable!("no cancellation token supplied"),
+            BoundedParse::Rejected => return None,
+        };
         let mut parsed = adapter.parse_file(file, &source, &tree);
         parsed.add_file_scope(file, &source);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
         let mut parse_errors = Vec::new();
         collect_parse_errors(tree.root_node(), &mut parse_errors);
 
+        Some(Self::file_state_from_parsed(
+            source,
+            parsed,
+            contains_tests,
+            Some(parse_errors),
+        ))
+    }
+
+    /// Assemble a `FileState` from a completed parse.
+    ///
+    /// Shared with the bounded-parse timeout path above, which produces a
+    /// file-scope-only `ParsedFile` rather than reaching the walk at all, and
+    /// must still hand back a `FileState` of exactly the same shape.
+    fn file_state_from_parsed(
+        source: String,
+        mut parsed: ParsedFile,
+        contains_tests: bool,
+        parse_errors: Option<Vec<crate::analyzer::ParseError>>,
+    ) -> FileState {
         let declarations = parsed.take_declarations();
 
-        Some(FileState {
+        FileState {
             source,
             content_qualifier: parsed.content_qualifier,
             package_name: parsed.package_name,
             top_level_declarations: parsed.top_level_declarations,
             declarations,
             definition_lookup_units: parsed.definition_lookup_units,
-            import_statements: parsed.import_statements,
             imports: parsed.imports,
             scala_exports: parsed.scala_exports,
             raw_supertypes: parsed.raw_supertypes,
@@ -2546,8 +2756,8 @@ where
             contains_tests,
             test_region_units: parsed.test_region_units,
             materialization_records: parsed.materialization_records,
-            parse_errors: Some(parse_errors),
-        })
+            parse_errors,
+        }
     }
 
     pub fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
@@ -4604,23 +4814,17 @@ where
             .entry(file.clone())
             .or_default() += 1;
         let exact_source = source.source();
-        let tree = if let Some(cancellation) = cancellation {
-            let mut read = |offset: usize, _| &exact_source.as_bytes()[offset..];
-            let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
-            parser.parse_with_options(
-                &mut read,
-                None,
-                Some(ParseOptions::new().progress_callback(&mut progress)),
-            )
-        } else {
-            parser.parse(exact_source, None)
-        };
-        let Some(tree) = tree else {
-            return if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                PreparedSyntaxPreparation::Cancelled
-            } else {
-                PreparedSyntaxPreparation::Complete(None)
-            };
+        let tree = match parse_complete_file_bounded(
+            &mut parser,
+            exact_source,
+            cancellation,
+            COMPLETE_FILE_PARSE_BUDGET,
+        ) {
+            BoundedParse::Complete(tree) => tree,
+            BoundedParse::Cancelled => return PreparedSyntaxPreparation::Cancelled,
+            BoundedParse::TimedOut | BoundedParse::Rejected => {
+                return PreparedSyntaxPreparation::Complete(None);
+            }
         };
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return PreparedSyntaxPreparation::Cancelled;
@@ -5364,7 +5568,7 @@ where
 
     fn resolve_definition_order_candidate_rows(
         &self,
-        rows: Vec<crate::analyzer::store::DefinitionOrderCandidateRow>,
+        rows: Vec<DefinitionOrderCandidateRow>,
     ) -> Vec<DefinitionSortCandidate> {
         QueryResolver::from_snapshot(
             self.adapter.as_ref(),
@@ -5553,23 +5757,47 @@ where
             .rows)
     }
 
-    fn try_sql_nonpersisted_workspace_declarations_vec_matching_limited(
+    /// The live-path prefix shared by every non-persisted workspace
+    /// declaration scan: one pass over the snapshot's paths that keeps the
+    /// entries carrying a path-synthetic module unit for this analyzer's
+    /// language, together with the snapshot it was taken from.
+    ///
+    /// Materialized at most once per request (#1774). Every caller of
+    /// `sql_nonpersisted_workspace_declarations_vec_matching` used to pay this
+    /// whole-workspace walk again, and the callers are per-name (short-name
+    /// lookup, package-scoped class listings, identifier lookup), so a single
+    /// query re-walked the workspace once per name it resolved. The narrowing
+    /// `keep` predicate is deliberately *not* part of the memo: it runs after
+    /// the walk, so the expensive tail (stat validation, the structured-import
+    /// blob query, declaration hydration) stays scoped to the matching subset
+    /// exactly as before.
+    ///
+    /// The snapshot travels with the walk so a memo hit and its tail read the
+    /// same live-path state. `Err(inspected)` reports a cancelled walk and
+    /// publishes nothing: a partial walk must never be served to a later
+    /// caller as the workspace.
+    fn workspace_module_walk(
         &self,
-        mut keep: impl FnMut(&CodeUnit) -> bool,
-        mut continue_query: impl FnMut() -> bool,
-    ) -> std::result::Result<LimitedQueryRows<CodeUnit>, StoreError> {
-        if !self.adapter.has_path_synthetic_module_units() {
-            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
+        continue_query: &mut impl FnMut() -> bool,
+    ) -> std::result::Result<Arc<WorkspaceModuleWalk>, usize> {
+        let memo = self.active_query_cache_handle(|cache| &cache.workspace_module_walk);
+        let cached = memo.as_ref().and_then(|memo| {
+            memo.read()
+                .expect("query workspace-module walk cache read lock poisoned")
+                .clone()
+        });
+        if let Some(walk) = cached {
+            return Ok(walk);
         }
+
         self.workspace_path_scan_count
             .fetch_add(1, Ordering::Relaxed);
         let snapshot = self.live_snapshot();
-        let mut candidates = Vec::new();
-        let mut candidate_files = Vec::new();
+        let mut entries = Vec::new();
         let mut inspected = 0usize;
         for file in snapshot.all_paths() {
             if !continue_query() {
-                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+                return Err(inspected);
             }
             inspected = inspected.saturating_add(1);
             let Some(project_file) = self.rebase_live_file_to_project_root(file) else {
@@ -5581,14 +5809,51 @@ where
             let Some(module) = self.adapter.path_synthetic_module_unit(&project_file) else {
                 continue;
             };
-            if !keep(&module) {
-                continue;
-            }
             let Some(oid) = snapshot.oid_for_path(file) else {
                 continue;
             };
+            entries.push((file.clone(), oid, module));
+        }
+
+        let walk = Arc::new(WorkspaceModuleWalk {
+            snapshot,
+            entries,
+            inspected,
+        });
+        if let Some(memo) = memo.as_ref() {
+            *memo
+                .write()
+                .expect("query workspace-module walk cache write lock poisoned") =
+                Some(Arc::clone(&walk));
+        }
+        Ok(walk)
+    }
+
+    fn try_sql_nonpersisted_workspace_declarations_vec_matching_limited(
+        &self,
+        mut keep: impl FnMut(&CodeUnit) -> bool,
+        mut continue_query: impl FnMut() -> bool,
+    ) -> std::result::Result<LimitedQueryRows<CodeUnit>, StoreError> {
+        if !self.adapter.has_path_synthetic_module_units() {
+            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
+        }
+        let walk = match self.workspace_module_walk(&mut continue_query) {
+            Ok(walk) => walk,
+            Err(inspected) => return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected)),
+        };
+        let snapshot = Arc::clone(&walk.snapshot);
+        let mut candidates = Vec::new();
+        let mut candidate_files = Vec::new();
+        let mut inspected = walk.inspected;
+        for (file, oid, module) in &walk.entries {
+            if !continue_query() {
+                return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+            }
+            if !keep(module) {
+                continue;
+            }
             candidate_files.push(file.clone());
-            candidates.push((file.clone(), oid, module));
+            candidates.push((file.clone(), *oid, module.clone()));
         }
 
         if !continue_query() {
@@ -5943,6 +6208,52 @@ where
     pub fn definition_candidates_query_count_for_test(&self) -> usize {
         self.definition_candidates_query_count
             .load(Ordering::Relaxed)
+    }
+
+    /// Batched definition-candidate store reads performed by
+    /// [`Self::prefetch_definitions`]. Paired with
+    /// `definition_candidates_query_count_for_test` it separates "one batch
+    /// for the whole request" from "one point lookup per name".
+    #[doc(hidden)]
+    pub fn reset_definition_prefetch_batch_count_for_test(&self) {
+        self.definition_prefetch_batch_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.definition_prefetch_batch_count.load(Ordering::Relaxed)
+    }
+
+    /// Persisted candidate-row reads that actually reached the store, one per
+    /// (short name, ordering) the request has not already read. Paired with
+    /// `definition_candidates_query_count_for_test` it separates "one read for
+    /// every fq name that shares a short name" from "one read per fq name"
+    /// (#1839).
+    #[doc(hidden)]
+    pub fn reset_definition_candidate_row_read_count_for_test(&self) {
+        self.definition_candidate_row_read_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn definition_candidate_row_read_count_for_test(&self) -> usize {
+        self.definition_candidate_row_read_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// Candidate spellings the structural-miss filter dropped, paired with the
+    /// row-read count so a test can show that N dropped spellings cost N fewer
+    /// seeks rather than merely being counted (#1748).
+    #[doc(hidden)]
+    pub fn reset_structural_miss_spelling_count_for_test(&self) {
+        self.structural_miss_spelling_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn structural_miss_spelling_count_for_test(&self) -> usize {
+        self.structural_miss_spelling_count.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]
@@ -6392,11 +6703,43 @@ where
         Some(())
     }
 
+    /// The spellings one fq name is looked up under in the `(lang, short_name)`
+    /// index.
+    ///
+    /// This is where the suffix expansion is minted -- 4.41 spellings per fq
+    /// name on the rustc tree, each one a memo op and, on a miss, a pooled
+    /// connection checkout plus an index probe. A spelling that carries a
+    /// separator join [`absent_segment_separators`] reports for this adapter's
+    /// language cannot match any stored `short_name` for it, so it is dropped
+    /// here rather than seeking for a row the storage contract says is not
+    /// there (issue #1748;
+    /// `.agents/docs/graph-read-cost-investigation-2026-08.md`).
+    ///
+    /// Dropping is sound in exactly one direction: it removes probes that
+    /// return no rows. It cannot remove a candidate, because a candidate is a
+    /// row and there are none to return. The normalized spellings are minted
+    /// first and filtered with the rest, so an adapter whose
+    /// `normalize_full_name` rewrites `::` into its own vocabulary keeps every
+    /// spelling that can match.
     fn definition_candidate_short_names(&self, fq_name: &str) -> Vec<String> {
         let mut names = self.adapter.lookup_candidate_short_names(fq_name);
         let normalized = self.adapter.normalize_full_name(fq_name);
         if normalized != fq_name {
             names.extend(self.adapter.lookup_candidate_short_names(&normalized));
+        }
+        // A separator is droppable only when both declarations agree: the
+        // renderer never emits it for this language, and the adapter's own
+        // lookup vocabulary treats it as a join rather than as name text.
+        let joins = self.adapter.lookup_candidate_separators();
+        let droppable = absent_segment_separators(self.adapter.language())
+            .iter()
+            .filter(|separator| joins.contains(*separator))
+            .collect::<Vec<_>>();
+        if !droppable.is_empty() {
+            let before = names.len();
+            names.retain(|name| !droppable.iter().any(|separator| name.contains(**separator)));
+            self.structural_miss_spelling_count
+                .fetch_add(before - names.len(), Ordering::Relaxed);
         }
         names.sort();
         names.dedup();
@@ -6443,10 +6786,40 @@ where
         )
     }
 
+    /// Request-scoped memo behind [`IAnalyzer::definitions`]. With no query
+    /// scope open there is no memo and the behaviour is exactly the unmemoized
+    /// lookup, matching `definition_parent_unit` (#1230 item 6).
     fn sql_definitions_vec(&self, fq_name: &str) -> std::result::Result<Vec<CodeUnit>, StoreError> {
         self.sql_definitions_query_count
             .fetch_add(1, Ordering::Relaxed);
-        self.sql_definition_candidates_vec(fq_name, false)
+        let memo = self.active_query_cache_handle(|cache| &cache.definition_units);
+        if let Some(cached) = memo.as_ref().and_then(|memo| {
+            memo.read()
+                .expect("query definition-unit cache read lock poisoned")
+                .get(fq_name)
+                .cloned()
+        }) {
+            return Ok((*cached).clone());
+        }
+        let definitions = self.sql_definition_candidates_vec(fq_name, false)?;
+        // A failed read is never memoized: the `?` above leaves the entry
+        // missing so the next caller retries instead of inheriting an empty
+        // answer that reads as proven absence. A read that stopped at the
+        // request's deadline is the same case: `definition_candidate_rows`
+        // hands back nothing, and memoizing that would serve proven absence to
+        // every later caller of this name in the request.
+        if self
+            .active_query_cancellation()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+        {
+            return Ok(definitions);
+        }
+        if let Some(memo) = memo.as_ref() {
+            memo.write()
+                .expect("query definition-unit cache write lock poisoned")
+                .insert(fq_name.to_string(), Arc::new(definitions.clone()));
+        }
+        Ok(definitions)
     }
 
     fn sql_bounded_definitions_vec(
@@ -6456,6 +6829,92 @@ where
         self.sql_definition_candidates_vec(fq_name, true)
     }
 
+    /// The persisted candidate rows for one short name, read once per request
+    /// *and* once per concurrent same-name burst.
+    ///
+    /// See `QueryReadCache::definition_candidate_rows` for why the memo is
+    /// keyed here and not one level up, and why it single-flights. With no
+    /// query scope open there is no memo and this is exactly the unmemoized
+    /// read; a failed read is never published, so the next caller retries
+    /// instead of inheriting an empty answer that would read as proven absence.
+    ///
+    /// This read is the longest single thing a `scan_usages` request does. It
+    /// is issued once per distinct import target by the import-graph candidate
+    /// walk, and for a hot short name on a large workspace it is not small:
+    /// `main` on the rustc tree is 22k rows and 1.14 s. The walk around it
+    /// polls its deadline per candidate file, so before this it was the only
+    /// step that could not stop -- one such read in flight when the budget
+    /// expired *was* the measured 0.57 s overshoot of the 3 s budget. It
+    /// therefore runs under the request's deadline: it is not started once that
+    /// deadline has passed, its wait for another thread's read is bounded, and
+    /// a read cut short answers nothing and memoizes nothing.
+    fn definition_candidate_rows(
+        &self,
+        langs: &[String],
+        short_name: String,
+        include_definition_lookup_units: bool,
+    ) -> std::result::Result<Arc<Vec<DefinitionOrderCandidateRow>>, StoreError> {
+        let _rows_scope =
+            crate::profiling::scope(format!("sql_definition_candidates.rows[{short_name}]"));
+        let key = DefinitionCandidateRowsKey {
+            short_name,
+            include_definition_lookup_units,
+        };
+        // No separate "already expired" gate here: with a token there is always
+        // a request memo, and `get_or_try_build_pool_independent_while` checks
+        // the deadline before it claims the build. Without one there is no
+        // token either, because the token arrives on the request boundary.
+        let cancellation = self.active_query_cancellation();
+        let read = || {
+            self.definition_candidate_row_read_count
+                .fetch_add(1, Ordering::Relaxed);
+            if include_definition_lookup_units {
+                self.store_context
+                    .store
+                    .definition_lookup_order_candidate_rows_by_short_name_for_langs(
+                        langs,
+                        self.store_context.generations.as_ref(),
+                        &key.short_name,
+                        cancellation.as_ref(),
+                    )
+            } else {
+                self.store_context
+                    .store
+                    .declaration_order_candidate_rows_by_short_name_for_langs(
+                        langs,
+                        self.store_context.generations.as_ref(),
+                        &key.short_name,
+                        cancellation.as_ref(),
+                    )
+            }
+        };
+        let Some(memo) = self.active_query_cache_handle(|cache| &cache.definition_candidate_rows)
+        else {
+            return Ok(Arc::new(read()?.rows));
+        };
+        if cancellation.is_none() {
+            return memo
+                .cell(&key)
+                .get_or_try_build_pool_independent(|| read().map(|batch| batch.rows));
+        }
+        let keep_going = || {
+            !cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        };
+        // A stopped read yields nothing rather than its prefix. Neither shape
+        // is an answer, and the caller is a scan that is already reporting
+        // `time_budget`; an empty vec keeps the "not memoized, not presented"
+        // rule in one place instead of carrying a prefix through the assembly
+        // that a later reader could mistake for the candidate set.
+        let built = memo
+            .cell(&key)
+            .get_or_try_build_pool_independent_while(&keep_going, || {
+                read().map(|batch| batch.complete.then_some(batch.rows))
+            })?;
+        Ok(built.unwrap_or_default())
+    }
+
     fn sql_definition_candidates_vec(
         &self,
         fq_name: &str,
@@ -6463,6 +6922,16 @@ where
     ) -> std::result::Result<Vec<CodeUnit>, StoreError> {
         self.definition_candidates_query_count
             .fetch_add(1, Ordering::Relaxed);
+        // Two store reads and an assembly, all on behalf of a caller whose
+        // budget is gone. `definition_candidate_rows` refuses the big one on
+        // its own, and refusing the whole lookup here also spares the
+        // path-symbol read (68 ms on the name that ended the run-10 window).
+        if self
+            .active_query_cancellation()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+        {
+            return Ok(Vec::new());
+        }
         let normalized = self.adapter.normalize_full_name(fq_name);
         let langs = self.storage_language_keys_for_queries();
         let candidate_names = self.definition_candidate_short_names(fq_name);
@@ -6477,49 +6946,77 @@ where
         } else {
             let mut rows = Vec::new();
             for short_name in candidate_names {
-                let candidates = if include_definition_lookup_units {
-                    self.store_context
-                        .store
-                        .definition_lookup_order_candidate_rows_by_short_name_for_langs(
-                            &langs,
-                            self.store_context.generations.as_ref(),
-                            &short_name,
-                        )
-                } else {
-                    self.store_context
-                        .store
-                        .declaration_order_candidate_rows_by_short_name_for_langs(
-                            &langs,
-                            self.store_context.generations.as_ref(),
-                            &short_name,
-                        )
-                };
-                rows.extend(candidates.map_err(|error| {
-                    error.context(format!("querying definition candidates for `{fq_name}`"))
-                })?);
+                rows.extend(
+                    self.definition_candidate_rows(
+                        &langs,
+                        short_name,
+                        include_definition_lookup_units,
+                    )
+                    .map_err(|error| {
+                        error.context(format!("querying definition candidates for `{fq_name}`"))
+                    })?
+                    .iter()
+                    .cloned(),
+                );
             }
             rows
         };
-        let mut candidates = self.resolve_definition_order_candidate_rows(rows);
-        candidates.extend(
-            self.dirty_units_matching(include_definition_lookup_units, |unit| {
-                unit.fq_name() == fq_name
-                    || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
-            })
-            .into_iter()
-            .map(|unit| DefinitionSortCandidate {
-                unit,
-                range_start: DefinitionRangeStart::FileState,
-            }),
-        );
-        candidates.extend(
+        let path_units = {
+            let _path_scope = crate::profiling::scope(format!(
+                "sql_definition_candidates.path_symbol[{fq_name}]"
+            ));
             self.sql_path_symbol_units(fq_name, &normalized)?
+        };
+        Ok(self.assemble_definition_candidates(
+            fq_name,
+            &normalized,
+            rows,
+            path_units,
+            include_definition_lookup_units,
+        ))
+    }
+
+    /// The store-independent half of [`Self::sql_definition_candidates_vec`]:
+    /// merge persisted candidate rows, dirty units and path-symbol units for
+    /// one fq name, then apply the exact/normalized precedence, definition
+    /// ordering and single-module rule.
+    ///
+    /// Split out so the batched prefetch can assemble many names from one
+    /// chunked row read without duplicating (or drifting from) this ordering.
+    fn assemble_definition_candidates(
+        &self,
+        fq_name: &str,
+        normalized: &str,
+        rows: Vec<DefinitionOrderCandidateRow>,
+        path_units: Vec<CodeUnit>,
+        include_definition_lookup_units: bool,
+    ) -> Vec<CodeUnit> {
+        let mut candidates = {
+            let _resolve_scope = crate::profiling::scope(format!(
+                "sql_definition_candidates.resolve_rows[{fq_name}]"
+            ));
+            self.resolve_definition_order_candidate_rows(rows)
+        };
+        {
+            let _dirty_scope = crate::profiling::scope(format!(
+                "sql_definition_candidates.dirty_units[{fq_name}]"
+            ));
+            candidates.extend(
+                self.dirty_units_matching(include_definition_lookup_units, |unit| {
+                    unit.fq_name() == fq_name
+                        || self.adapter.normalize_full_name(&unit.fq_name()) == normalized
+                })
                 .into_iter()
                 .map(|unit| DefinitionSortCandidate {
                     unit,
                     range_start: DefinitionRangeStart::FileState,
                 }),
-        );
+            );
+        }
+        candidates.extend(path_units.into_iter().map(|unit| DefinitionSortCandidate {
+            unit,
+            range_start: DefinitionRangeStart::FileState,
+        }));
         let has_exact = candidates
             .iter()
             .any(|candidate| candidate.unit.fq_name() == fq_name);
@@ -6548,10 +7045,144 @@ where
                 true
             }
         });
-        Ok(matches
+        matches
             .into_iter()
             .map(|candidate| candidate.unit)
-            .collect())
+            .collect()
+    }
+
+    /// Resolve many fq names into the request-scoped `definitions` memo using
+    /// chunked `IN`-list seeks instead of one point lookup per name (#1748).
+    ///
+    /// The shared import-graph candidate walk enumerates every import target
+    /// in the workspace before it inspects any file, so the keys are known up
+    /// front. Asking per name cost one pooled reader checkout, one
+    /// transaction and one generation check each -- on a 35k-file Rust
+    /// workspace that was 397k-662k round trips inside a single
+    /// `scan_usages` query. Here it is two batched reads: one chunked
+    /// short-name seek for the persisted rows and one shared-transaction pass
+    /// for the path-symbol rows.
+    ///
+    /// A no-op without an open query scope: with no memo to fill there is
+    /// nothing to prefetch into, and every caller falls back to the point
+    /// lookup with unchanged results. Prefetch failures are equally
+    /// non-binding -- the name is simply left unmemoized. A request whose
+    /// deadline has already expired is the same case: this is a whole-workspace
+    /// read taken on behalf of work that will not happen.
+    pub(crate) fn prefetch_definitions(&self, fq_names: &[String]) {
+        let Some(memo) = self.active_query_cache_handle(|cache| &cache.definition_units) else {
+            return;
+        };
+        let cancellation = self.active_query_cancellation();
+        if cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return;
+        }
+        let _scope = crate::profiling::scope("TreeSitterAnalyzer::prefetch_definitions");
+        let missing: Vec<String> = {
+            let seen = memo
+                .read()
+                .expect("query definition-unit cache read lock poisoned");
+            let mut unique: BTreeSet<&str> = BTreeSet::new();
+            fq_names
+                .iter()
+                .filter(|fq_name| !seen.contains_key(fq_name.as_str()))
+                .filter(|fq_name| unique.insert(fq_name.as_str()))
+                .cloned()
+                .collect()
+        };
+        if missing.is_empty() {
+            return;
+        }
+
+        let short_names_by_name: Vec<Vec<String>> = missing
+            .iter()
+            .map(|fq_name| self.definition_candidate_short_names(fq_name))
+            .collect();
+        let mut unique_short_names: Vec<String> = short_names_by_name
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        unique_short_names.sort();
+
+        self.definition_prefetch_batch_count
+            .fetch_add(1, Ordering::Relaxed);
+        let rows = match self
+            .store_context
+            .store
+            .declaration_order_candidate_rows_by_short_names_for_langs(
+                &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
+                &unique_short_names,
+                cancellation.as_ref(),
+            ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.record_store_error(
+                    error.context("prefetching definition candidates by short name"),
+                );
+                return;
+            }
+        };
+        // A batch cut short covers only a prefix of the names, and the loop
+        // below cannot tell a name with no rows from a name whose rows were
+        // never reached. Memoizing that is proven absence for the rest of the
+        // request, so a stopped prefetch publishes nothing at all.
+        if !rows.complete {
+            return;
+        }
+        let mut rows_by_short_name: HashMap<String, Vec<DefinitionOrderCandidateRow>> =
+            HashMap::default();
+        for row in rows.rows {
+            rows_by_short_name
+                .entry(row.candidate.short_name.clone())
+                .or_default()
+                .push(row);
+        }
+
+        let path_units_by_name = self.forward_path_module_fqns_batch(&missing);
+        let mut resolved = Vec::with_capacity(missing.len());
+        for ((fq_name, short_names), path_units) in missing
+            .iter()
+            .zip(short_names_by_name)
+            .zip(path_units_by_name)
+        {
+            // `None` means this name's path-symbol read failed on its own.
+            // Leaving it unmemoized sends the next caller down the point
+            // lookup, which is the honest answer rather than a short one.
+            let Some(path_units) = path_units else {
+                continue;
+            };
+            let mut name_rows = Vec::new();
+            for short_name in &short_names {
+                if let Some(matching) = rows_by_short_name.get(short_name) {
+                    name_rows.extend(matching.iter().cloned());
+                }
+            }
+            let normalized = self.adapter.normalize_full_name(fq_name);
+            resolved.push((
+                fq_name.clone(),
+                Arc::new(self.assemble_definition_candidates(
+                    fq_name,
+                    &normalized,
+                    name_rows,
+                    path_units,
+                    false,
+                )),
+            ));
+        }
+
+        let mut sink = memo
+            .write()
+            .expect("query definition-unit cache write lock poisoned");
+        for (fq_name, units) in resolved {
+            sink.entry(fq_name).or_insert(units);
+        }
     }
 
     fn sql_lookup_candidates_by_short_name(&self, symbol: &str) -> Option<BTreeSet<CodeUnit>> {
@@ -6594,9 +7225,19 @@ where
         Some(matches)
     }
 
+    /// Declarations this analyzer indexes under `identifier`, where
+    /// "indexes under" means the spelling a caller can address the declaration
+    /// by -- `source_identifier_for_target`, not the raw persisted
+    /// `identifier`. The two differ for C# generic arity and TypeScript
+    /// `$static`, and the callers in `symbol_lookup` compare against lookup
+    /// aliases built from the source spelling, so a raw-only lookup would miss
+    /// exactly those declarations (#1063). `decorated_identifier_seeks`
+    /// supplies the extra index keys; the row filter below stays authoritative
+    /// because a prefix range also admits spellings that are not decorations.
     pub(crate) fn lookup_declarations_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         let langs = self.storage_language_keys_for_queries();
-        let rows = self
+        let names = |unit: &CodeUnit| identifier_addresses_target(unit, identifier);
+        let mut rows = self
             .store_query_or_record(
                 self.store_context
                     .store
@@ -6608,21 +7249,44 @@ where
                 format!("querying declarations by identifier `{identifier}`"),
             )
             .unwrap_or_default();
+        for seek in decorated_identifier_seeks(self.adapter.language(), identifier) {
+            let decorated = match &seek {
+                IdentifierSeek::Exact(spelling) => self.store_query_or_record(
+                    self.store_context
+                        .store
+                        .declaration_candidate_rows_by_identifier_for_langs(
+                            &langs,
+                            self.store_context.generations.as_ref(),
+                            spelling,
+                        ),
+                    format!("querying declarations by decorated identifier `{spelling}`"),
+                ),
+                IdentifierSeek::Prefix(prefix) => self.store_query_or_record(
+                    self.store_context
+                        .store
+                        .declaration_candidate_rows_by_identifier_prefix_for_langs(
+                            &langs,
+                            self.store_context.generations.as_ref(),
+                            prefix,
+                        ),
+                    format!("querying declarations by decorated identifier prefix `{prefix}`"),
+                ),
+            };
+            rows.extend(decorated.unwrap_or_default());
+        }
         let mut matches: BTreeSet<_> = self
             .resolve_candidate_rows(rows)
             .into_iter()
-            .filter(|unit| unit.identifier() == identifier)
+            .filter(&names)
             .collect();
         // `true`: dirty (edited-but-not-yet-persisted) file state must offer
         // the same membership as the widened SQL query above, or unsaved
         // edits to a definition-lookup-only unit would regress to invisible
         // while its persisted counterpart resolves.
-        matches.extend(self.dirty_units_matching(true, |unit| unit.identifier() == identifier));
+        matches.extend(self.dirty_units_matching(true, &names));
         matches.extend(
-            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
-                unit.identifier() == identifier
-            })
-            .unwrap_or_default(),
+            self.sql_nonpersisted_workspace_declarations_vec_matching(&names)
+                .unwrap_or_default(),
         );
         matches
     }
@@ -6959,19 +7623,79 @@ where
             .any(|unit| unit.package_name() == package)
     }
 
+    /// The persisted path of `search_definitions_by_suffix_pattern`. Its
+    /// contract (see `IAnalyzer`) is that every fully-qualified name `pattern`
+    /// can match ends at the query path's tail, and that
+    /// `terminal_identifiers` holds every way one persisted `identifier` can
+    /// spell that tail. `idx_code_units_lang_identifier_lookup` indexes
+    /// `(lang, identifier)`, so the candidate set is one seek per spelling
+    /// rather than the whole-table walk
+    /// `declaration_candidate_rows_by_pattern_for_langs` performs (#1688). On
+    /// the CodeScale shared cache that walk reads 8.3 M `cpp` rows, each with a
+    /// `WITHOUT ROWID` primary-key probe and a correlated active-blob EXISTS,
+    /// once per workspace language, to return a handful of units: 194 s for one
+    /// Go selector on Kubernetes, over 600 s on Firefox. The seeks answer the
+    /// same selectors in 12.9 s and 0.55 s.
+    ///
+    /// The compiled regex stays authoritative over what is returned. Two
+    /// candidate-set differences from the walk are deliberate:
+    ///
+    /// * `identifier IN (...)` is case sensitive while the regex is not, so the
+    ///   tail must be spelled in its indexed case. Every other indexed lookup
+    ///   `symbol_lookup` performs (`lookup_candidates_by_identifier`) already
+    ///   requires that, and the stage that runs before this one is one of them.
+    /// * The identifier index covers definition-lookup-only units as well as
+    ///   declarations (#1088), so this stage now sees the same membership as
+    ///   the short-name stage before it. `dirty_units_matching` widens to match,
+    ///   for the reason `lookup_declarations_by_identifier` widens: an unsaved
+    ///   edit must not make a unit less visible than its persisted counterpart.
+    fn sql_search_definitions_by_suffix_pattern(
+        &self,
+        pattern: &str,
+        terminal_identifiers: &[String],
+    ) -> Option<BTreeSet<CodeUnit>> {
+        assert!(
+            !pattern.is_empty() && !terminal_identifiers.is_empty(),
+            "suffix search needs a pattern and its terminal identifiers, got {pattern:?} and {terminal_identifiers:?}"
+        );
+        let _scope = crate::profiling::scope(format!(
+            "sql_search_definitions_by_suffix_pattern{terminal_identifiers:?}"
+        ));
+        let compiled = RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .ok()?;
+        let spellings: Vec<&str> = terminal_identifiers.iter().map(String::as_str).collect();
+        let rows = self.store_query_or_record(
+            self.store_context
+                .store
+                .declaration_candidate_rows_by_identifiers_for_langs(
+                    &self.storage_language_keys_for_queries(),
+                    self.store_context.generations.as_ref(),
+                    &spellings,
+                ),
+            format!("searching definitions with terminal identifiers {terminal_identifiers:?}"),
+        )?;
+        let mut out: BTreeSet<_> = self
+            .resolve_candidate_rows(rows)
+            .into_iter()
+            .filter(|unit| self.fq_pattern_matches(unit, &compiled))
+            .collect();
+        out.extend(
+            self.dirty_units_matching(true, |unit| self.fq_pattern_matches(unit, &compiled)),
+        );
+        out.extend(
+            self.sql_nonpersisted_workspace_declarations_vec_matching(|unit| {
+                self.fq_pattern_matches(unit, &compiled)
+            })?,
+        );
+        Some(out)
+    }
+
     fn sql_search_definitions(
         &self,
         pattern: &str,
         auto_quote: bool,
-    ) -> Option<BTreeSet<CodeUnit>> {
-        self.sql_search_definitions_with_literal(pattern, auto_quote, None)
-    }
-
-    fn sql_search_definitions_with_literal(
-        &self,
-        pattern: &str,
-        auto_quote: bool,
-        required_literal: Option<&str>,
     ) -> Option<BTreeSet<CodeUnit>> {
         if pattern.is_empty() {
             return Some(BTreeSet::new());
@@ -6991,12 +7715,9 @@ where
             .build()
             .ok()?;
         let storage_languages = self.storage_language_keys_for_queries();
-        // A bare-literal pattern is its own substring prefilter; otherwise a
-        // caller-supplied required literal serves the same role for patterns
-        // the caller proves always contain it (regex filtering below stays
-        // authoritative either way).
-        let substring_prefilter = literal_ascii_search_substring(&pattern)
-            .or_else(|| required_literal.and_then(literal_ascii_search_substring));
+        // A bare-literal pattern is its own substring prefilter (regex
+        // filtering below stays authoritative either way).
+        let substring_prefilter = literal_ascii_search_substring(&pattern);
         let _scope = crate::profiling::scope(format!(
             "sql_search_definitions[{pattern}][substring_prefilter={}]",
             substring_prefilter.is_some()
@@ -7020,6 +7741,13 @@ where
                 format!("searching definitions for `{pattern}`"),
             )?
         } else {
+            // Nothing in the pattern narrows the store, so it can only answer
+            // by reading every declaration of every language in play. Charge
+            // that as the full scan it is: symbol lookup must never land here
+            // (its suffix patterns carry their terminal identifiers and take
+            // the indexed path above), so a test can pin that with the counter.
+            self.full_declaration_scan_count
+                .fetch_add(1, Ordering::Relaxed);
             self.store_query_or_record(
                 self.store_context
                     .store
@@ -7710,6 +8438,42 @@ where
         self.analyzed_live_files()
     }
 
+    /// Every workspace file of this analyzer's language, taken from the
+    /// project's shared file listing.
+    ///
+    /// This is deliberately not `all_files`/`analyzed_live_files`. That path
+    /// validates every candidate blob key against the store -- on the #1758
+    /// workspace, ~97 serial batched SQL round trips over ~38.6k C++ keys,
+    /// 56.6s intrinsic and up to 227s under contention -- which only a caller
+    /// that needs parse products can justify. A caller that needs file
+    /// *identity* (a path -> `ProjectFile` map) reads the listing instead, and
+    /// `all_files_shared` hands back the project's own cached `Arc` rather
+    /// than deep-cloning the set.
+    ///
+    /// The result is a superset of the analyzed set: a file that exists in the
+    /// workspace but has not been parsed yet is still a real workspace file.
+    /// Every workspace file this adapter could own, from the workspace listing
+    /// rather than from the analyzed set.
+    ///
+    /// The extension registry is the rule. A caller that also needs the files
+    /// this adapter has *adopted* -- include-driven inference (#1837) gives an
+    /// unclaimed-extension file to the adapter that includes it -- must union
+    /// this with the analyzed set; adoption is not an extension property.
+    pub(crate) fn workspace_language_files(&self) -> Vec<ProjectFile> {
+        self.project
+            .all_files_shared()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|file| {
+                        crate::analyzer::common::language_for_file(file) == self.adapter.language()
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn class_declarations_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
         let mut matches = self.persisted_top_level_classes_in_package(package_name);
         matches.extend(self.dirty_units_matching(false, |unit| {
@@ -7801,12 +8565,23 @@ where
             .expect("query read cache read lock poisoned")
     }
 
-    fn active_query_cache_handle<T>(
+    /// Clone one request memo's handle out from under the coarse cache lock, or
+    /// `None` with no request open. Generic over the handle's own type: most
+    /// memos are `Arc<RwLock<Map>>`, the definition-candidate rows are an
+    /// `Arc<KeyedPoolSafeMemo<..>>` that synchronizes itself.
+    fn active_query_cache_handle<T: ?Sized>(
         &self,
-        select: impl for<'a> FnOnce(&'a QueryReadCache) -> &'a Arc<RwLock<T>>,
-    ) -> Option<Arc<RwLock<T>>> {
+        select: impl for<'a> FnOnce(&'a QueryReadCache) -> &'a Arc<T>,
+    ) -> Option<Arc<T>> {
         let cache = self.query_read_cache_lock();
         cache.is_active().then(|| Arc::clone(select(&cache)))
+    }
+
+    /// The deadline of the request this read is running under, if its opener
+    /// set one. Cloned once per read rather than consulted per row, so the
+    /// coarse cache lock stays off the row loop.
+    pub(crate) fn active_query_cancellation(&self) -> Option<CancellationToken> {
+        self.query_read_cache_lock().active_cancellation()
     }
 
     fn query_read_cache_write(&self) -> std::sync::RwLockWriteGuard<'_, QueryReadCache> {
@@ -8733,13 +9508,13 @@ where
             .unwrap_or_default()
     }
 
-    fn search_definitions_with_literal(
+    fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
-        required_literal: &str,
+        terminal_identifiers: &[String],
         _language: Language,
     ) -> BTreeSet<CodeUnit> {
-        self.sql_search_definitions_with_literal(pattern, false, Some(required_literal))
+        self.sql_search_definitions_by_suffix_pattern(pattern, terminal_identifiers)
             .unwrap_or_default()
     }
 
@@ -8750,6 +9525,10 @@ where
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
         self.lookup_declarations_by_identifier(identifier)
+    }
+
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        true
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
@@ -8974,10 +9753,29 @@ where
         self.adapter.extract_call_receiver(reference)
     }
 
+    /// The file's import statements in source order, one entry per statement.
+    ///
+    /// Since migration 0019 the store holds one row per import BINDING, and a
+    /// declaration that binds several names (`import { A, B } from 'm'`) gives
+    /// each binding the same snippet. Collapsing runs of equal adjacent
+    /// snippets restores "one entry per statement" without keeping a second
+    /// stored list: bindings of one declaration are always contiguous because
+    /// every adapter emits them together while walking that declaration.
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
-        self.fetch_file_state(file)
-            .map(|state| state.import_statements.clone())
-            .unwrap_or_default()
+        let Some(state) = self.fetch_file_state(file) else {
+            return Vec::new();
+        };
+        let mut statements: Vec<String> = Vec::with_capacity(state.imports.len());
+        for import in &state.imports {
+            if statements
+                .last()
+                .is_some_and(|last| last == &import.raw_snippet)
+            {
+                continue;
+            }
+            statements.push(import.raw_snippet.clone());
+        }
+        statements
     }
 
     fn structural_search_providers(
@@ -9117,6 +9915,22 @@ where
         TreeSitterAnalyzer::reset_definition_candidates_query_count_for_test(self);
     }
 
+    fn reset_definition_prefetch_batch_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_definition_prefetch_batch_count_for_test(self);
+    }
+
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::definition_prefetch_batch_count_for_test(self)
+    }
+
+    fn reset_definition_candidate_row_read_count_for_test(&self) {
+        TreeSitterAnalyzer::reset_definition_candidate_row_read_count_for_test(self);
+    }
+
+    fn definition_candidate_row_read_count_for_test(&self) -> usize {
+        TreeSitterAnalyzer::definition_candidate_row_read_count_for_test(self)
+    }
+
     fn reset_search_candidate_hydration_count_for_test(&self) {
         TreeSitterAnalyzer::reset_search_candidate_hydration_count_for_test(self);
     }
@@ -9225,6 +10039,7 @@ mod tests {
     use crate::analyzer::javascript::JavascriptAdapter;
     use crate::analyzer::python::PythonAdapter;
     use crate::analyzer::rust::RustAdapter;
+    use crate::analyzer::scala::ScalaAdapter;
     use crate::analyzer::store::AnalyzerStore;
     use crate::analyzer::typescript::TypescriptAdapter;
     use crate::analyzer::{
@@ -9260,6 +10075,18 @@ mod tests {
         assert_eq!(
             expanded_comment_start(source, declaration),
             source.find("// nearby").unwrap()
+        );
+    }
+
+    #[test]
+    fn expanded_comment_start_ignores_non_boundary_offsets() {
+        let source = "// docs\nfn café() {}";
+        let non_boundary = source.find('é').unwrap() + 1;
+
+        assert_eq!(expanded_comment_start(source, non_boundary), non_boundary);
+        assert_eq!(
+            expanded_comment_start(source, source.len() + 1),
+            source.len()
         );
     }
 
@@ -9993,7 +10820,6 @@ mod tests {
             top_level_declarations: Vec::new(),
             declarations: HashSet::default(),
             definition_lookup_units: HashSet::default(),
-            import_statements: Vec::new(),
             imports: Vec::new(),
             scala_exports: HashMap::default(),
             raw_supertypes: HashMap::default(),
@@ -10059,6 +10885,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parse_timeout_persists_a_file_scope_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(root, "Generated.java");
+        let source = format!(
+            "class Generated {{\n{}\n}}\n",
+            "int generatedField;\n".repeat(10_000)
+        );
+        let mut parser = TreeSitterAnalyzer::<JavaAdapter>::build_parser(
+            JavaAdapter.parser_language_for_file(&file),
+        );
+
+        let state = TreeSitterAnalyzer::<JavaAdapter>::analyze_source_with_budget(
+            &mut parser,
+            &JavaAdapter,
+            &file,
+            source.clone(),
+            Duration::ZERO,
+        )
+        .expect("a timed-out source keeps a persistent file marker");
+
+        assert_eq!(state.declarations.len(), 1);
+        assert!(state.declarations.iter().all(CodeUnit::is_file_scope));
+        let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes()).unwrap();
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        store
+            .write_parsed_blob(oid, "java", &JavaAdapter, &state)
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "java").unwrap());
     }
 
     #[test]
@@ -10163,6 +11021,448 @@ mod tests {
                 .iter()
                 .any(|unit| unit.fq_name() == "pkg.dirty.Dirty"),
             "a sufficient bounded lookup must retain dirty declarations"
+        );
+    }
+
+    /// A Python workspace whose files each declare one distinctly named class,
+    /// so every lookup below names a different identifier and cannot be
+    /// answered from a name-keyed memo.
+    fn workspace_scan_probe_project(file_count: usize) -> (tempfile::TempDir, Arc<dyn Project>) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("pkg")).expect("create pkg");
+        std::fs::write(root.join("pkg/__init__.py"), "").expect("write package marker");
+        for index in 0..file_count {
+            std::fs::write(
+                root.join(format!("pkg/mod_{index}.py")),
+                format!("class Widget{index}:\n    pass\n"),
+            )
+            .expect("write module");
+        }
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        (temp, project)
+    }
+
+    /// One rust crate whose declarations live behind a module, so a scoped
+    /// lookup expands into `::`-bearing spellings.
+    fn rust_scoped_lookup_project() -> (tempfile::TempDir, Arc<dyn Project>) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub mod inner;\npub struct Outer;\n",
+        )
+        .expect("write lib");
+        std::fs::write(
+            root.join("src/inner.rs"),
+            "pub struct Widget;\n\nimpl Widget {\n    pub fn make() -> Self {\n        Widget\n    }\n}\n",
+        )
+        .expect("write module");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        (temp, project)
+    }
+
+    /// #1748: `lookup_suffix_candidates` peels a rust lookup path on both `.`
+    /// and `::`, so a `::`-spelled input mints spellings that carry `::` --
+    /// and no rust `short_name` can contain one, because the FqName renderer
+    /// emits `::` only between two C++ namespace segments. Every such spelling
+    /// was still paying a pooled connection checkout, a generation check, a
+    /// `prepare_cached` and an index probe to be told what the storage
+    /// contract already says.
+    ///
+    /// Fails before the filter: all three spellings seek, so `row_reads` is 3
+    /// and `dropped` is 0. After it, the two `::`-bearing spellings are
+    /// dropped and only the one that can match seeks.
+    #[test]
+    fn issue_1748_double_colon_spellings_do_not_seek_for_rust() {
+        let (_temp, project) = rust_scoped_lookup_project();
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+
+        analyzer.reset_definition_candidate_row_read_count_for_test();
+        analyzer.reset_structural_miss_spelling_count_for_test();
+        // Spellings: `probe::inner::Widget`, `inner::Widget`, `Widget`. Only
+        // the last can match a stored rust short name.
+        let scoped: Vec<CodeUnit> =
+            CodeUnitIndex::definitions(&analyzer, "probe::inner::Widget").collect();
+        let row_reads = analyzer.definition_candidate_row_read_count_for_test();
+        let dropped = analyzer.structural_miss_spelling_count_for_test();
+
+        assert_eq!(
+            2, dropped,
+            "both `::`-bearing spellings are structurally guaranteed misses"
+        );
+        assert_eq!(
+            1, row_reads,
+            "only the spelling the persisted vocabulary can hold may seek"
+        );
+        // The drop removes probes, never answers. Measured before the filter,
+        // this lookup resolved to nothing too, and structurally it cannot
+        // resolve to anything: `assemble_definition_candidates` keeps a row
+        // only on an exact or normalized fq match against the *input*
+        // spelling, rust's `normalize_full_name` is the identity, and no
+        // stored rust fq name carries `::`. The three spellings were three
+        // seeks for an answer the storage contract had already refused.
+        assert!(
+            scoped.is_empty(),
+            "a `::`-spelled rust fq name resolved to {scoped:?} before the filter too"
+        );
+        // The declaration itself is reachable, by the dotted name it is
+        // actually stored under -- see the sibling test. This is the
+        // difference the filter must not blur.
+    }
+
+    /// #1748: the filter drops a spelling only when *both* declarations agree
+    /// -- the renderer never emits the separator for this language, and the
+    /// adapter's own lookup vocabulary treats it as a join. Scala satisfies the
+    /// first and not the second: its cons class is named `::`, so `::` and
+    /// `Foo.::` are ordinary scala short names and `List.:::` is an ordinary
+    /// scala method.
+    ///
+    /// Caught by the parity run rather than by review:
+    /// `scala_colon_infix_dispatch_uses_the_right_receiver` and
+    /// `scala_infix_right_associative_and_postfix_calls_have_icfg_and_source_order`
+    /// both broke on an earlier substring-only filter that used
+    /// `absent_segment_separators` alone. Scala's declining to peel on `::` is
+    /// the same fact stated once, which is why the two can no longer drift.
+    #[test]
+    fn issue_1748_scala_colon_named_declarations_are_never_dropped() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(
+            root.join("src/Cons.scala"),
+            "package coll\n\
+             class ::[A](head: A, tail: List[A]) {\n\
+             \x20 def :::(other: List[A]): List[A] = other\n\
+             }\n",
+        )
+        .expect("write scala source");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Scala));
+        let analyzer = TreeSitterAnalyzer::new(project, ScalaAdapter);
+
+        analyzer.reset_structural_miss_spelling_count_for_test();
+        for name in ["coll.::", "::", "coll.::.:::", "::.head"] {
+            let _ = CodeUnitIndex::definitions(&analyzer, name).count();
+        }
+
+        assert_eq!(
+            0,
+            analyzer.structural_miss_spelling_count_for_test(),
+            "scala declares `::` as name text, not as a join, so nothing may be dropped"
+        );
+    }
+
+    /// The other side of the filter: a dotted rust lookup carries no excluded
+    /// separator, so nothing is dropped and every spelling still seeks. This is
+    /// what keeps the cut from being a blanket reduction in probes.
+    #[test]
+    fn issue_1748_dotted_rust_spellings_are_all_still_sought() {
+        let (_temp, project) = rust_scoped_lookup_project();
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+
+        analyzer.reset_definition_candidate_row_read_count_for_test();
+        analyzer.reset_structural_miss_spelling_count_for_test();
+        let dotted: Vec<CodeUnit> =
+            CodeUnitIndex::definitions(&analyzer, "probe.inner.Widget").collect();
+
+        assert_eq!(0, analyzer.structural_miss_spelling_count_for_test());
+        assert_eq!(
+            3,
+            analyzer.definition_candidate_row_read_count_for_test(),
+            "`probe.inner.Widget`, `inner.Widget` and `Widget` all remain seekable spellings"
+        );
+        assert_eq!(
+            vec!["probe.inner.Widget"],
+            dotted
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<Vec<String>>()
+        );
+    }
+
+    /// #1774: every caller of the non-persisted workspace declaration scan used
+    /// to re-walk the whole live-path set, and the callers are per-name. One
+    /// request that resolves several names therefore walked the workspace once
+    /// per name. Fails at 3 (one per lookup) before the walk is memoized.
+    #[test]
+    fn issue_1774_one_request_walks_the_live_path_set_once_for_many_lookups() {
+        let (_temp, project) = workspace_scan_probe_project(3);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_workspace_path_scan_count_for_test();
+        for index in 0..3 {
+            let _ = CodeUnitIndex::lookup_candidates_by_identifier(
+                &analyzer,
+                &format!("Widget{index}"),
+            );
+        }
+        let scans_in_one_request = analyzer.workspace_path_scan_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert_eq!(
+            1, scans_in_one_request,
+            "a request must materialize the workspace live-path set at most once"
+        );
+    }
+
+    /// The memo is request scoped, not analyzer scoped: a second request must
+    /// see the workspace again rather than inherit the first request's walk.
+    #[test]
+    fn issue_1774_a_later_request_walks_the_live_path_set_again() {
+        let (_temp, project) = workspace_scan_probe_project(2);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+
+        analyzer.reset_workspace_path_scan_count_for_test();
+        for _ in 0..2 {
+            let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+            analyzer.begin_query(&scope);
+            let _ = CodeUnitIndex::lookup_candidates_by_identifier(&analyzer, "Widget0");
+            analyzer.end_query(&scope);
+        }
+
+        assert_eq!(
+            2,
+            analyzer.workspace_path_scan_count_for_test(),
+            "each request must re-read the workspace it was opened against"
+        );
+    }
+
+    /// The `keep` predicate stays outside the memo, so the narrowed answer is
+    /// the same whether the walk was just taken or served from the memo.
+    #[test]
+    fn issue_1774_memoized_walk_answers_each_name_with_its_own_narrowed_result() {
+        let (_temp, project) = workspace_scan_probe_project(3);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+
+        let unscoped: Vec<BTreeSet<CodeUnit>> = (0..3)
+            .map(|index| {
+                CodeUnitIndex::lookup_candidates_by_identifier(&analyzer, &format!("Widget{index}"))
+            })
+            .collect();
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        let scoped: Vec<BTreeSet<CodeUnit>> = (0..3)
+            .map(|index| {
+                CodeUnitIndex::lookup_candidates_by_identifier(&analyzer, &format!("Widget{index}"))
+            })
+            .collect();
+        analyzer.end_query(&scope);
+
+        assert_eq!(unscoped, scoped);
+        for (index, matches) in scoped.iter().enumerate() {
+            assert!(
+                matches
+                    .iter()
+                    .any(|unit| unit.identifier() == format!("Widget{index}")),
+                "lookup {index} must still find its own declaration: {matches:?}"
+            );
+        }
+    }
+
+    /// #1748: `definitions` is asked the same name many times inside one
+    /// candidate-discovery pass. Fails at 2 before the request-scoped memo.
+    #[test]
+    fn issue_1748_repeated_definition_lookups_in_one_request_charge_one_store_read() {
+        let (_temp, project) = workspace_scan_probe_project(1);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_definition_candidates_query_count_for_test();
+        let first: Vec<CodeUnit> =
+            CodeUnitIndex::definitions(&analyzer, "pkg.mod_0.Widget0").collect();
+        let second: Vec<CodeUnit> =
+            CodeUnitIndex::definitions(&analyzer, "pkg.mod_0.Widget0").collect();
+        let queries = analyzer.definition_candidates_query_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert_eq!(first, second, "the memo must not change what is resolved");
+        assert_eq!(
+            1, queries,
+            "a request must resolve one definition name with one store read"
+        );
+    }
+
+    /// With no request open there is no memo, so the behaviour is exactly the
+    /// unmemoized lookup. This is what keeps direct-analyzer callers honest.
+    #[test]
+    fn issue_1748_definition_lookups_outside_a_request_are_not_memoized() {
+        let (_temp, project) = workspace_scan_probe_project(1);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+
+        analyzer.reset_definition_candidates_query_count_for_test();
+        let _ = CodeUnitIndex::definitions(&analyzer, "pkg.mod_0.Widget0").count();
+        let _ = CodeUnitIndex::definitions(&analyzer, "pkg.mod_0.Widget0").count();
+
+        assert_eq!(2, analyzer.definition_candidates_query_count_for_test());
+    }
+
+    /// A workspace where one short name is shared by `count` distinct fq
+    /// names -- the shape that defeated #1748's fq-keyed memo (#1839).
+    fn shared_short_name_project(count: usize) -> (tempfile::TempDir, Arc<dyn Project>) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        std::fs::create_dir_all(root.join("pkg")).expect("create pkg");
+        std::fs::write(root.join("pkg/__init__.py"), "").expect("write package marker");
+        for index in 0..count {
+            std::fs::write(
+                root.join(format!("pkg/mod_{index}.py")),
+                "class Shared:\n    pass\n",
+            )
+            .expect("write module");
+        }
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Python));
+        (temp, project)
+    }
+
+    /// #1839: the #1748 memo is keyed by fq name, but the store read it wraps
+    /// is keyed by the candidate short name. Distinct fq names that share one
+    /// short name are all memo misses, and each re-read the same page: on the
+    /// rustc tree that was 20,935 identical `main` reads in one request. Fails
+    /// at one read per name before the row memo.
+    #[test]
+    fn issue_1839_distinct_fq_names_sharing_a_short_name_read_the_rows_once() {
+        let (_temp, project) = shared_short_name_project(6);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let names: Vec<String> = (0..6)
+            .map(|index| format!("pkg.mod_{index}.Shared"))
+            .collect();
+
+        let point: Vec<Vec<CodeUnit>> = names
+            .iter()
+            .map(|name| CodeUnitIndex::definitions(&analyzer, name).collect())
+            .collect();
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_definition_candidates_query_count_for_test();
+        analyzer.reset_definition_candidate_row_read_count_for_test();
+        let memoized: Vec<Vec<CodeUnit>> = names
+            .iter()
+            .map(|name| CodeUnitIndex::definitions(&analyzer, name).collect())
+            .collect();
+        let row_reads = analyzer.definition_candidate_row_read_count_for_test();
+        let point_lookups = analyzer.definition_candidates_query_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert_eq!(point, memoized, "the memo must not change any answer");
+        assert_eq!(
+            6, point_lookups,
+            "each distinct fq name is still its own question"
+        );
+        // Each `pkg.mod_i.Shared` seeks three spellings -- itself,
+        // `mod_i.Shared`, and the bare `Shared` -- so six names name thirteen
+        // distinct keys: two of their own each, plus the one they all share.
+        // Every key is read once. Before the memo this was eighteen reads,
+        // six of them the identical `Shared` page, which is the shape that
+        // charged 20,935 identical `main` reads on the rustc tree.
+        assert_eq!(
+            2 * 6 + 1,
+            row_reads,
+            "each distinct short name is read once, and the shared one is not read per fq name"
+        );
+    }
+
+    /// #1748 D4: the row memo above deduplicates *sequential* repeats only. A
+    /// scan's parallel candidate fan-out asks for the same hot short name from
+    /// many rayon workers at once; every one of them misses the
+    /// check-then-read-then-insert map and every one of them runs the read.
+    /// On the rustc tree that was eight and more concurrent reads of a single
+    /// short name, each taking 9-11 seconds: the slowest 1% of 146,678 lookups
+    /// carried 87.8% of one request's candidate time. The per-key
+    /// single-flight cell must collapse the burst to one read.
+    ///
+    /// Fails before the cell: ten runs against the duplicating memo charged
+    /// 19-24 reads for the seventeen distinct keys, ten times out of ten.
+    #[test]
+    fn issue_1748_concurrent_lookups_of_one_short_name_read_the_rows_once() {
+        const WORKERS: usize = 8;
+
+        let (_temp, project) = shared_short_name_project(WORKERS);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let names: Vec<String> = (0..WORKERS)
+            .map(|index| format!("pkg.mod_{index}.Shared"))
+            .collect();
+
+        let sequential: Vec<Vec<CodeUnit>> = names
+            .iter()
+            .map(|name| CodeUnitIndex::definitions(&analyzer, name).collect())
+            .collect();
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_definition_candidate_row_read_count_for_test();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(WORKERS)
+            .build()
+            .expect("rayon pool");
+        // Every worker starts its lookup at the same instant, so all eight
+        // reach the shared `Shared` key while the first read is still in
+        // flight -- the fan-out shape the measurement caught.
+        let start = std::sync::Barrier::new(WORKERS);
+        let concurrent = pool.broadcast(|context| {
+            start.wait();
+            CodeUnitIndex::definitions(&analyzer, &names[context.index()])
+                .collect::<Vec<CodeUnit>>()
+        });
+        let row_reads = analyzer.definition_candidate_row_read_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert_eq!(
+            sequential, concurrent,
+            "single flight must not change any answer"
+        );
+        // The same thirteen keys as the sequential case: two of each worker's
+        // own spellings, plus the one `Shared` they all share.
+        assert_eq!(
+            2 * WORKERS + 1,
+            row_reads,
+            "concurrent callers of one short name must run one row read"
+        );
+    }
+
+    /// The batched prefetch must fill the memo with the same answers the point
+    /// lookups produce, in one store read for the whole key set.
+    #[test]
+    fn issue_1748_prefetched_definitions_match_the_point_lookups_they_replace() {
+        let (_temp, project) = workspace_scan_probe_project(4);
+        let analyzer = TreeSitterAnalyzer::new(project, PythonAdapter);
+        let names: Vec<String> = (0..4)
+            .map(|index| format!("pkg.mod_{index}.Widget{index}"))
+            .collect();
+
+        let point: Vec<Vec<CodeUnit>> = names
+            .iter()
+            .map(|name| CodeUnitIndex::definitions(&analyzer, name).collect())
+            .collect();
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.reset_definition_candidates_query_count_for_test();
+        analyzer.reset_definition_prefetch_batch_count_for_test();
+        analyzer.prefetch_definitions(&names);
+        let batches = analyzer.definition_prefetch_batch_count_for_test();
+        let prefetched: Vec<Vec<CodeUnit>> = names
+            .iter()
+            .map(|name| CodeUnitIndex::definitions(&analyzer, name).collect())
+            .collect();
+        let point_lookups = analyzer.definition_candidates_query_count_for_test();
+        analyzer.end_query(&scope);
+
+        assert_eq!(point, prefetched, "batched rows must resolve identically");
+        assert_eq!(1, batches, "one batched read serves the whole key set");
+        assert_eq!(
+            0, point_lookups,
+            "a prefetched name must not fall back to a point lookup"
         );
     }
 
@@ -10515,6 +11815,7 @@ mod tests {
         state.imports.push(ImportInfo {
             raw_snippet: "import { value } from './value';".to_string(),
             is_wildcard: false,
+            is_global: false,
             identifier: Some("value".to_string()),
             alias: None,
             path: None,
@@ -11497,6 +12798,7 @@ mod tests {
             .map(|snippet| ImportInfo {
                 raw_snippet: (*snippet).to_string(),
                 is_wildcard: false,
+                is_global: false,
                 identifier: None,
                 alias: None,
                 path: None,

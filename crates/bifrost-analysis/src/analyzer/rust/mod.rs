@@ -683,18 +683,22 @@ impl CodeUnitIndex for RustAnalyzer {
         self.inner.search_definitions(pattern, auto_quote)
     }
 
-    fn search_definitions_with_literal(
+    fn search_definitions_by_suffix_pattern(
         &self,
         pattern: &str,
-        required_literal: &str,
+        terminal_identifiers: &[String],
         language: Language,
     ) -> BTreeSet<CodeUnit> {
         self.inner
-            .search_definitions_with_literal(pattern, required_literal, language)
+            .search_definitions_by_suffix_pattern(pattern, terminal_identifiers, language)
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
         self.inner.lookup_candidates_by_short_name(symbol)
+    }
+
+    fn has_complete_symbol_lookup_index(&self) -> bool {
+        self.inner.has_complete_symbol_lookup_index()
     }
 
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
@@ -937,6 +941,42 @@ impl IAnalyzer for RustAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for RustAnalyzer {
+    fn reset_definition_prefetch_batch_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_prefetch_batch_count_for_test();
+    }
+
+    fn definition_prefetch_batch_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_prefetch_batch_count_for_test()
+    }
+
+    fn reset_definition_candidate_row_read_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_candidate_row_read_count_for_test();
+    }
+
+    fn definition_candidate_row_read_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_candidate_row_read_count_for_test()
+    }
+
+    fn reset_definition_candidates_query_count_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+    }
+
+    fn definition_candidates_query_count_for_test(&self) -> usize {
+        self.inner
+            .test_hooks()
+            .definition_candidates_query_count_for_test()
+    }
+
     fn reset_global_usage_definition_index_build_count_for_test(&self) {
         self.inner
             .test_hooks()

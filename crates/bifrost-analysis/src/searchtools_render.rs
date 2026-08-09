@@ -6,7 +6,8 @@ use crate::searchtools::{
     ScanUsagesInput, ScanUsagesResult, ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile,
     SearchSymbolsResult, SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement,
     SummaryResult, SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
-    SymbolSourcesResult, UsageFileGroup, UsageGraphResult, UsageLocation, scan_usages_target_label,
+    SymbolSourcesResult, TooBroadScope, TooManySymbolMatches, UsageFileGroup, UsageGraphResult,
+    UsageLocation, scan_usages_target_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +33,11 @@ pub trait RenderText {
 
 impl RenderText for SearchSymbolsResult {
     fn render_text(&self, options: RenderOptions) -> String {
+        // The cap is enforced before ranking, so a tripped request has no files
+        // and no model declarations to show; the counts are the whole answer.
+        if let Some(too_many) = &self.too_many_matches {
+            return render_too_many_symbol_matches(too_many, self);
+        }
         let mut blocks: Vec<String> = self
             .files
             .iter()
@@ -89,6 +95,32 @@ impl RenderText for SearchSymbolsResult {
         lines.push(blocks.join("\n\n"));
         lines.join("\n")
     }
+}
+
+fn render_too_many_symbol_matches(
+    too_many: &TooManySymbolMatches,
+    result: &SearchSymbolsResult,
+) -> String {
+    assert!(
+        result.files.is_empty(),
+        "ranking was skipped, so no files can be ranked: {result:?}"
+    );
+    let mut lines = vec![
+        "# Symbol search results".to_string(),
+        String::new(),
+        format!(
+            "- Patterns: {}",
+            render_inline_list(result.patterns.iter().map(String::as_str))
+        ),
+        format!(
+            "- Too many matches: {} symbols matched, over the {} this search will rank, so ranking was skipped and no files are listed.",
+            too_many.total_candidates, too_many.cap
+        ),
+    ];
+    if let Some(note) = result.note.as_deref() {
+        lines.push(format!("- Note: {note}"));
+    }
+    lines.join("\n")
 }
 
 impl RenderText for SymbolLocationsResult {
@@ -182,6 +214,7 @@ impl RenderText for SummaryResult {
         if !self.ambiguous_paths.is_empty() {
             blocks.push(render_ambiguous_paths(&self.ambiguous_paths));
         }
+        blocks.extend(self.too_broad.iter().map(render_too_broad_scope));
         if blocks.is_empty() {
             "No matching summaries found.".to_string()
         } else {
@@ -273,6 +306,7 @@ impl RenderText for SymbolSourcesResult {
         if !self.ambiguous_paths.is_empty() {
             blocks.push(render_ambiguous_paths(&self.ambiguous_paths));
         }
+        blocks.extend(self.too_broad.iter().map(render_too_broad_scope));
         blocks.extend(
             self.sources
                 .iter()
@@ -516,6 +550,12 @@ fn render_scan_usages_entry_text(entry: &ScanUsagesEntry) -> String {
         lines.push(format!(
             "  candidate target(s): {}",
             entry.candidate_targets.join(", ")
+        ));
+    }
+    if let Some(too_many) = &entry.too_many_candidates {
+        lines.push(format!(
+            "  resolution cap: {} declaration(s) matched, over the limit {}; no candidate list was produced",
+            too_many.total_candidates, too_many.cap
         ));
     }
     if let Some(total_callsites) = entry.total_callsites {
@@ -847,6 +887,24 @@ fn render_ambiguous_paths(paths: &[AmbiguousPathInput]) -> String {
     lines.join("\n")
 }
 
+fn render_too_broad_scope(scope: &TooBroadScope) -> String {
+    // A scope is only reported once it matched more files than the cap, so it
+    // always carries at least one sample path.
+    assert!(
+        !scope.sample.is_empty(),
+        "too-broad scope without a sample: {scope:?}"
+    );
+    [
+        format!(
+            "Too broad: target {} matched {} files, over the {} file limit for one target, so it was skipped.",
+            scope.target, scope.matched, scope.cap
+        ),
+        format!("Sample of the match: {}", scope.sample.join(", ")),
+        "Narrow the target to a subdirectory, list the specific files you want, or call list_symbols for an outline of the whole match.".to_string(),
+    ]
+    .join("\n")
+}
+
 fn render_skim_file(file: &SkimFile) -> String {
     let mut lines = vec![format!("{} ({} lines)", file.path, file.loc)];
     lines.extend(file.lines.iter().cloned());
@@ -1103,6 +1161,7 @@ mod tests {
                 "Showing 1 of 3 matching files. Raise `limit` or use a more specific identifier, qualified, or regex-like pattern to see the rest."
                     .to_string(),
             ),
+            too_many_matches: None,
         };
 
         let text = result.render_text(RenderOptions::default());
@@ -1165,6 +1224,7 @@ mod tests {
                 input: "Foo.java".to_string(),
                 matches: vec!["app/Foo.java".to_string(), "lib/Foo.java".to_string()],
             }],
+            too_broad: Vec::new(),
         };
 
         let text = result.render_text(RenderOptions::default());

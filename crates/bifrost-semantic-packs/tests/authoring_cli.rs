@@ -19,6 +19,44 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+#[test]
+fn summary_corpus_join_writes_a_deterministic_report_over_the_in_tree_slices() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let testdata = manifest_dir.join("testdata/summary-corpora");
+    let pins = manifest_dir.join("../../semantic-packs/summary-corpora/pins.json");
+    let temporary = TempDir::new().unwrap();
+    let report_path = temporary.path().join("reports/summary-corpus-join.json");
+    let codeql_models = testdata.join("codeql");
+    let joern_source = testdata.join("joern/DefaultSemantics.scala");
+
+    let arguments = [
+        "summary-corpus-join",
+        pins.to_str().unwrap(),
+        codeql_models.to_str().unwrap(),
+        joern_source.to_str().unwrap(),
+        report_path.to_str().unwrap(),
+    ];
+    let first = run(&arguments);
+    assert!(first.status.success(), "{first:#?}");
+    let first_report = fs::read_to_string(&report_path).unwrap();
+    let second = run(&arguments);
+    assert!(second.status.success(), "{second:#?}");
+    let second_report = fs::read_to_string(&report_path).unwrap();
+
+    assert_eq!(first_report, second_report);
+    assert_eq!(first.stdout, second.stdout);
+    let report: Value = serde_json::from_str(&first_report).unwrap();
+    assert_eq!(report["format"], "bifrost_summary_foundry_join/v1");
+    assert_eq!(
+        report["corpora"][0]["revision"],
+        "c9142680f5b6409dbe0944350321c54e8c801e61"
+    );
+    for round_trip in report["round_trip"].as_array().unwrap() {
+        assert_eq!(round_trip["diagnostics"].as_array().unwrap().len(), 0);
+        assert!(round_trip["entries"].as_u64().unwrap() > 0);
+    }
+}
+
 fn run(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_bifrost-semantic-pack"))
         .args(arguments)

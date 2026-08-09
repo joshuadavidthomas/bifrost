@@ -25,7 +25,7 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 
 const BASELINE_MIGRATION_VERSION: i64 = 1;
-const CURRENT_MIGRATION_VERSION: i64 = 16;
+const CURRENT_MIGRATION_VERSION: i64 = 19;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -59,6 +59,14 @@ const MATERIALIZATION_RECORDS_SQL: &str =
     include_str!("../migrations/cache/0015-materialization-records.sql");
 const OPTIONAL_FACT_MANIFEST_SQL: &str =
     include_str!("../migrations/cache/0016-optional-fact-manifest.sql");
+// Migrations 0017 and 0018 create the per-file Rust usage-fact tables the
+// usage-v2 arc writes. Phase 1 of `.agents/plans/port-optimization-arc-to-upstream.md`
+// creates them empty: the Rust reader is upstream's whole-workspace index for
+// now, and Phase 2 adds the writer without needing another schema version.
+const RUST_USAGE_FACTS_SQL: &str = include_str!("../migrations/cache/0017-rust-usage-facts.sql");
+const RUST_MODULE_ROUTES_SQL: &str =
+    include_str!("../migrations/cache/0018-rust-module-routes.sql");
+const IMPORT_BINDINGS_SQL: &str = include_str!("../migrations/cache/0019-import-bindings.sql");
 const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     CURRENT_BASELINE_SQL,
     PATH_SYMBOL_UNITS_SQL,
@@ -76,6 +84,9 @@ const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
     SEMANTIC_FILE_DOCUMENTS_SQL,
     MATERIALIZATION_RECORDS_SQL,
     OPTIONAL_FACT_MANIFEST_SQL,
+    RUST_USAGE_FACTS_SQL,
+    RUST_MODULE_ROUTES_SQL,
+    IMPORT_BINDINGS_SQL,
 ];
 // The store file is named for the schema version that wrote it, and that
 // version is the migration count. Tie the two at compile time so a migration
@@ -128,6 +139,12 @@ static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|
         .expect("apply materialization records migration");
     conn.execute_batch(OPTIONAL_FACT_MANIFEST_SQL)
         .expect("apply optional fact manifest migration");
+    conn.execute_batch(RUST_USAGE_FACTS_SQL)
+        .expect("apply Rust usage facts migration");
+    conn.execute_batch(RUST_MODULE_ROUTES_SQL)
+        .expect("apply Rust module routes migration");
+    conn.execute_batch(IMPORT_BINDINGS_SQL)
+        .expect("apply import bindings migration");
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -525,12 +542,48 @@ fn configure_readonly_connection(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Page cache for one interactive reader connection, in KiB (negative = KiB,
+/// SQLite's convention). Every pooled reader pays this, so the resident cost is
+/// this value times the number of retained connections, not once per process.
+///
+/// 8 MiB is four times SQLite's ~2 MB default and holds the b-tree interior
+/// pages and index roots that the post-campaign read mix (indexed point seeks
+/// into `code_units` and the parsed-blob tables) touches repeatedly. The
+/// previous value, 64 MiB, was chosen as if there were one reader; measured on
+/// 2026-08-08 against 120 pooled readers it contributed 1.32-2.82 GB with a
+/// 7.68 GB ceiling.
+///
+/// Both directions are measured on the same cell (2026-08-08). Holding the
+/// other two knobs fixed, 64 MiB against 8 MiB is 225.3 against 218.4
+/// CPU-seconds (`sys` 85.4 against 86.1) -- i.e. free -- and 8 MiB carries
+/// 131 MB less private memory. Going further, to the streaming path's 2 MiB,
+/// cost 20-30% more CPU on the larger tree the earlier ladder used (248.9
+/// against 187.1 CPU-seconds), nearly all `sys`, from re-reading evicted pages.
+const READER_PAGE_CACHE_KIB: i64 = -8192;
+
 fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
-    conn.pragma_update(None, "cache_size", -65536)
+    conn.pragma_update(None, "cache_size", READER_PAGE_CACHE_KIB)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
-    conn.pragma_update(None, "mmap_size", 268435456i64)
+    // No memory-mapped I/O. `mmap_size` is per connection, so a pool of readers
+    // maps the same file once each, and the mapped bytes scale with the host's
+    // core count as well as the DB: measured 2026-08-08, 115-125 mappings of one
+    // 176 MB cache DB held 20.0 GB of mapped address space for a whole query.
+    // mmap's only unique benefit is avoiding a copy out of the OS page cache,
+    // which matters when the DB does not fit the connection's own cache --
+    // exactly the case where the mapping cost is largest.
+    //
+    // This is a priced trade, not a free win. Isolated on the same cell,
+    // removing the mapping costs about 7% CPU, all of it `sys` (212.2 against
+    // 197.6 CPU-seconds; `sys` 79.6 against 70.1) from read syscalls replacing
+    // mapped loads, and wall clock does not move. It buys 20.0 GB of address
+    // space and 2.3 GB of RSS back, and it removes a ceiling that grows with
+    // both the DB size and the core count (5.55-12.3 GB on the 848 MB rustc
+    // cache, ~30 GB worst case on a 120-CPU host).
+    // `open_streaming_readonly_connection` already reached this conclusion for
+    // scans; it holds for interactive readers too.
+    conn.pragma_update(None, "mmap_size", 0)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     Ok(())
@@ -2555,11 +2608,15 @@ mod tests {
         );
         assert_eq!(
             conn.query_row(
+                // `import_count` goes with them, dropped by migration 0019:
+                // there is one import table now, so counting it twice would
+                // check one fact twice.
                 "SELECT COUNT(*) FROM pragma_table_info('blob_meta')
                  WHERE name IN (
                    'cpp_template_metadata_count',
                    'ruby_dispatch_count',
-                   'scala_trait_count'
+                   'scala_trait_count',
+                   'import_count'
                  )",
                 [],
                 |row| row.get::<_, i64>(0),
@@ -2588,7 +2645,7 @@ mod tests {
             conn.query_row(
                 "SELECT stored_unit_count, range_count, signature_count,
                         signature_metadata_count, supertype_count, child_count,
-                        import_statement_count, import_count, type_identifier_count
+                        import_statement_count, type_identifier_count
                  FROM blob_meta
                  WHERE blob_oid = '1111111111111111111111111111111111111111'
                    AND lang = 'cpp'",
@@ -2603,12 +2660,11 @@ mod tests {
                         row.get::<_, i64>(5)?,
                         row.get::<_, i64>(6)?,
                         row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
                     ))
                 },
             )
             .unwrap(),
-            (2, 11, 12, 13, 14, 15, 16, 17, 18)
+            (2, 11, 12, 13, 14, 15, 16, 18)
         );
         assert_eq!(
             conn.query_row("SELECT payload_bytes FROM blob_payload_costs", [], |row| {

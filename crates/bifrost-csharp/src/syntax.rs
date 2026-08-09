@@ -124,8 +124,17 @@ pub fn csharp_using_directive_target_node(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 pub fn csharp_using_directive_namespace(node: Node<'_>, source: &str) -> Option<String> {
+    csharp_using_directive_namespace_node(node)
+        .map(|target| csharp_type_node_identity(target, source))
+        .filter(|target| !target.is_empty())
+}
+
+/// The target node of a plain `using Some.Namespace;`, or `None` for the
+/// `using static` and `using Alias = ...` forms, which name a type rather than
+/// a namespace.
+pub fn csharp_using_directive_namespace_node(node: Node<'_>) -> Option<Node<'_>> {
     (!csharp_using_directive_is_static(node) && node.child_by_field_name("name").is_none())
-        .then(|| csharp_using_directive_target(node, source))
+        .then(|| csharp_using_directive_target_node(node))
         .flatten()
 }
 
@@ -247,6 +256,31 @@ fn csharp_type_node_identity_with_terminal_suffix(
     terminal_suffix: &str,
     strip_terminal_verbatim_prefix: bool,
 ) -> String {
+    csharp_type_node_segments_with_terminal_suffix(
+        node,
+        source,
+        terminal_suffix,
+        strip_terminal_verbatim_prefix,
+    )
+    .join(".")
+}
+
+/// The dotted parts of a C# type or namespace name, in order.
+///
+/// The joined spelling is [`csharp_type_node_identity`]; a caller that has to
+/// record the name structurally (a `StructuredImportPath`, for instance) needs
+/// the parts themselves and must not recover them by splitting the join, which
+/// an extern-alias qualifier or a generic arity marker would defeat.
+pub fn csharp_type_node_segments(node: Node<'_>, source: &str) -> Vec<String> {
+    csharp_type_node_segments_with_terminal_suffix(node, source, "", false)
+}
+
+fn csharp_type_node_segments_with_terminal_suffix(
+    node: Node<'_>,
+    source: &str,
+    terminal_suffix: &str,
+    strip_terminal_verbatim_prefix: bool,
+) -> Vec<String> {
     let mut segments = Vec::new();
     let mut stack = vec![node];
     let mut alias_qualified = false;
@@ -338,11 +372,14 @@ fn csharp_type_node_identity_with_terminal_suffix(
         }
         terminal.push_str(terminal_suffix);
     }
+    // An extern-alias qualifier binds tighter than the dots that follow it, so
+    // `A::B.C` is three names but only two dot-joined parts. Fold the qualifier
+    // into the first segment and every caller can join with '.' unconditionally.
     if alias_qualified && segments.len() > 1 {
-        format!("{}::{}", segments[0], segments[1..].join("."))
-    } else {
-        segments.join(".")
+        let qualified = format!("{}::{}", segments[0], segments[1]);
+        segments.splice(0..2, std::iter::once(qualified));
     }
+    segments
 }
 
 pub fn csharp_type_reference_root(mut node: Node<'_>) -> Option<Node<'_>> {

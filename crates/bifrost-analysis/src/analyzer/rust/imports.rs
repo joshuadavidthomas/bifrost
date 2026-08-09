@@ -7,7 +7,10 @@
 
 use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, ProjectFile};
 use crate::hash::HashSet;
-use brokk_bifrost_rust::imports::{rust_could_import_file, rust_imported_code_units};
+use brokk_bifrost_rust::declarations::rust_package_name;
+use brokk_bifrost_rust::imports::{
+    resolve_rust_import_fq_name, rust_could_import_file, rust_imported_code_units,
+};
 use std::sync::Arc;
 
 use super::RustAnalyzer;
@@ -79,5 +82,46 @@ impl ImportAnalysisProvider for RustAnalyzer {
         target: &ProjectFile,
     ) -> bool {
         rust_could_import_file(self, source_file, imports, target)
+    }
+
+    /// Rust answers "could this file import the target" by resolving each
+    /// `use` path to an fq name and asking the store which files define it,
+    /// so the shared candidate walk charged one `definition_candidates` query
+    /// per `use` statement in the workspace (#1748). Every path the walk will
+    /// ask about is derivable from the import facts it already has, so resolve
+    /// them all here and hand the whole set to one batched store read.
+    fn prefetch_import_targets(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&crate::hash::HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) {
+        use rayon::prelude::*;
+
+        let mut fq_names: Vec<String> = files
+            .par_iter()
+            .flat_map_iter(|file| {
+                if cancellation.is_cancelled() {
+                    return Vec::new().into_iter();
+                }
+                let package = rust_package_name(file);
+                let imports = import_infos
+                    .and_then(|infos| infos.get(file).cloned())
+                    .unwrap_or_else(|| self.inner.import_info_of(file));
+                imports
+                    .iter()
+                    .filter_map(|import| {
+                        resolve_rust_import_fq_name(file, &package, &import.raw_snippet)
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
+            .collect();
+        if cancellation.is_cancelled() {
+            return;
+        }
+        fq_names.sort_unstable();
+        fq_names.dedup();
+        self.inner.prefetch_definitions(&fq_names);
     }
 }

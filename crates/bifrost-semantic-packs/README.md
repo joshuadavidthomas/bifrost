@@ -66,3 +66,22 @@ incomplete bounded operations return status 2.
 Workspace rules are opt-in direct files under `.bifrost/semantic-models/`.
 Discovery rejects links and path escape. It reports an exact content hash for
 review. It does not load code or activate a rule by itself.
+
+## Procedure-summary corpus translation
+
+The `release-tooling` feature also carries the procedure-summary model foundry
+(#1871). It translates external procedure-model corpora into the authored
+procedure-summary IR, compiles every translated entry back through the
+production pack compiler, and joins the corpora into one deterministic report:
+
+```text
+scripts/fetch-pinned-summary-corpora.sh /path/to/work-dir
+bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE report.json
+```
+
+`semantic-packs/summary-corpora/pins.json` is the single source of truth for
+the upstream, revision, archive checksum, and license of each corpus. The
+corpora are third-party content and are not vendored here. The report records
+each corpus's revision and a digest of the exact bytes read, every row the
+translator could not carry and why, and each target the corpora agree on,
+dispute, or cover alone. Two runs over the same pins produce the same bytes.

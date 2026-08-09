@@ -145,9 +145,6 @@ pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
             for import in &imports {
                 crate::lexical_scope::insert_rust_import_binding(&mut impl_import_binder, import);
             }
-            parsed
-                .import_statements
-                .extend(imports.iter().map(|import| import.raw_snippet.clone()));
             parsed.imports.extend(imports);
         }
     }
@@ -760,9 +757,6 @@ fn visit_rust_macro_invocation_definitions(
             for import in &imports {
                 crate::lexical_scope::insert_rust_import_binding(&mut interior_binder, import);
             }
-            parsed
-                .import_statements
-                .extend(imports.iter().map(|import| import.raw_snippet.clone()));
             parsed.imports.extend(imports);
         }
     }

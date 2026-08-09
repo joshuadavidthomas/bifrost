@@ -171,7 +171,13 @@ pub fn walk_named_tree_preorder_bounded<'tree>(
 /// `text` start at the file header while `start_line`/`end_line` still pointed
 /// at the declaration body.
 pub fn expanded_comment_start(source: &str, start_byte: usize) -> usize {
-    assert!(start_byte <= source.len() && source.is_char_boundary(start_byte));
+    // Tree-sitter can report a byte offset inside a UTF-8 code point for a
+    // malformed or generated source file. The caller's later `str::get` already
+    // rejects that range, so do not panic while trying to add comments. This
+    // occurred while prewarming Envoy's generated C++ sources.
+    if start_byte > source.len() || !source.is_char_boundary(start_byte) {
+        return start_byte.min(source.len());
+    }
 
     // Walk backward from the declaration instead of building a line index for
     // the whole file. Semantic indexing asks for every function body in a

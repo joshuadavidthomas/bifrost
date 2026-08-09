@@ -1,5 +1,6 @@
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::collections::hash_map::DefaultHasher;
@@ -9,7 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use crate::analyzer::structural::resolution::{BoundaryStatus, DeclaredVisibility};
@@ -1985,10 +1986,97 @@ fn matching_close_paren(label: &str, open_paren: usize) -> Option<usize> {
     None
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+/// The process-global set of interned workspace roots.
+///
+/// Every file in a workspace carries the identical root, so half of every
+/// `ProjectFile` comparison is known-equal by construction. Interning the root
+/// turns that half into a pointer comparison: two `ProjectFile`s built from the
+/// same normalized root share one `Arc<Path>`, so `Arc::ptr_eq` answers "same
+/// root" without walking the path. The full path comparison stays as the
+/// fallback, because a process can hold files from more than one workspace and
+/// those must still order and compare by path.
+///
+/// The set never evicts. A root is one small `Arc<Path>`, and the number of
+/// distinct workspace roots a process sees is bounded by the workspaces it
+/// opens; a test process that opens a temporary root per test retains a few
+/// dozen bytes each, which is not worth a reclamation scheme.
+static PROJECT_ROOT_INTERNER: LazyLock<RwLock<HashSet<Arc<Path>>>> =
+    LazyLock::new(|| RwLock::new(HashSet::default()));
+
+thread_local! {
+    /// The last root this thread interned, keyed by the *un-normalized* input.
+    ///
+    /// Construction is overwhelmingly repetitive -- the same root, over and
+    /// over, from one walk -- so a one-entry thread-local cache answers almost
+    /// every call without touching the global lock and without paying
+    /// `normalize`'s allocation.
+    static LAST_INTERNED_ROOT: RefCell<Option<(PathBuf, Arc<Path>)>> =
+        const { RefCell::new(None) };
+}
+
+fn intern_project_root(root: PathBuf) -> Arc<Path> {
+    if let Some(cached) = LAST_INTERNED_ROOT.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .filter(|(input, _)| *input == root)
+            .map(|(_, interned)| Arc::clone(interned))
+    }) {
+        return cached;
+    }
+
+    let normalized = root.clone().normalize();
+    let existing = PROJECT_ROOT_INTERNER
+        .read()
+        .expect("project root interner poisoned")
+        .get(normalized.as_path())
+        .map(Arc::clone);
+    let interned = match existing {
+        Some(interned) => interned,
+        None => {
+            let mut guard = PROJECT_ROOT_INTERNER
+                .write()
+                .expect("project root interner poisoned");
+            match guard.get(normalized.as_path()) {
+                Some(interned) => Arc::clone(interned),
+                None => {
+                    let interned: Arc<Path> = Arc::from(normalized.as_path());
+                    guard.insert(Arc::clone(&interned));
+                    interned
+                }
+            }
+        }
+    };
+
+    LAST_INTERNED_ROOT.with(|cell| {
+        *cell.borrow_mut() = Some((root, Arc::clone(&interned)));
+    });
+    interned
+}
+
+/// The hash `Hash for ProjectFile` used to recompute on every touch: the root
+/// path followed by the relative path, fed to one hasher.
+///
+/// Fixed-seed `FxHasher` rather than the caller's hasher, because the point is
+/// to compute this once at construction rather than once per touch. The value
+/// is stable within a build and nothing persists or transmits it -- `Hash for
+/// ProjectFile` only ever feeds in-memory `HashMap` / `HashSet` / `moka` keys
+/// -- so stability within a build is all it has to be.
+fn project_file_path_hash(root: &Path, rel_path: &Path) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    root.hash(&mut hasher);
+    rel_path.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[derive(Debug)]
 struct ProjectFileInner {
-    root: PathBuf,
+    /// Interned, so files sharing a workspace share one allocation and
+    /// `Arc::ptr_eq` decides the root half of a comparison.
+    root: Arc<Path>,
     rel_path: PathBuf,
+    /// Computed once, at construction. `Hash` writes it rather than re-walking
+    /// both paths on every `HashMap` / `moka` touch.
+    path_hash: u64,
 }
 
 #[derive(Clone)]
@@ -2005,14 +2093,42 @@ impl ProjectFile {
             "project file path must be relative"
         );
 
+        Self::from_interned_root(intern_project_root(root), rel_path.normalize())
+    }
+
+    /// Another file under the same workspace root.
+    ///
+    /// The root is already interned here, so this skips the interner entirely.
+    /// Prefer it over `ProjectFile::new(file.root().to_path_buf(), rel)` at the
+    /// probe sites that build candidate siblings by the thousand.
+    pub fn with_rel_path(&self, rel_path: impl Into<PathBuf>) -> Self {
+        let rel_path = rel_path.into();
+        assert!(
+            !rel_path.is_absolute(),
+            "project file path must be relative"
+        );
+        Self::from_interned_root(Arc::clone(&self.0.root), rel_path.normalize())
+    }
+
+    fn from_interned_root(root: Arc<Path>, rel_path: PathBuf) -> Self {
+        let path_hash = project_file_path_hash(&root, &rel_path);
         Self(Arc::new(ProjectFileInner {
-            root: root.normalize(),
-            rel_path: rel_path.normalize(),
+            root,
+            rel_path,
+            path_hash,
         }))
     }
 
     pub fn root(&self) -> &Path {
         &self.0.root
+    }
+
+    /// Whether two files sit under the same workspace root. Interning makes the
+    /// pointer test decide it; the path comparison covers roots that reached
+    /// this process by different paths, which is what keeps files from
+    /// different workspaces comparing correctly.
+    fn roots_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0.root, &other.0.root) || self.0.root == other.0.root
     }
 
     pub fn rel_path(&self) -> &Path {
@@ -2069,8 +2185,21 @@ impl fmt::Debug for ProjectFile {
 }
 
 impl PartialEq for ProjectFile {
+    /// Path equality, reached by the cheapest sufficient test.
+    ///
+    /// `ProjectFile` is cloned everywhere, so two handles to one allocation are
+    /// the common case; interned roots make "same workspace" a pointer test;
+    /// and `path_hash` is a pure function of the two paths, so unequal hashes
+    /// prove inequality without touching either path. Only a same-root,
+    /// same-hash pair reaches the path comparison.
     fn eq(&self, other: &Self) -> bool {
-        self.0.root == other.0.root && self.0.rel_path == other.0.rel_path
+        if Arc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        if self.0.path_hash != other.0.path_hash {
+            return false;
+        }
+        self.roots_eq(other) && self.0.rel_path == other.0.rel_path
     }
 }
 
@@ -2078,13 +2207,20 @@ impl Eq for ProjectFile {}
 
 impl Hash for ProjectFile {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.root.hash(state);
-        self.0.rel_path.hash(state);
+        state.write_u64(self.0.path_hash);
     }
 }
 
 impl Ord for ProjectFile {
+    /// Path order: root, then relative path. Unchanged; the pointer tests only
+    /// decide the root comparison earlier when they can.
     fn cmp(&self, other: &Self) -> Ordering {
+        if Arc::ptr_eq(&self.0, &other.0) {
+            return Ordering::Equal;
+        }
+        if Arc::ptr_eq(&self.0.root, &other.0.root) {
+            return self.0.rel_path.cmp(&other.0.rel_path);
+        }
         match self.0.root.cmp(&other.0.root) {
             Ordering::Equal => self.0.rel_path.cmp(&other.0.rel_path),
             ordering => ordering,
@@ -2887,6 +3023,29 @@ pub enum StructuredImportPathKind {
     StaticMember,
 }
 
+impl StructuredImportPathKind {
+    /// The spelling this variant is stored under in
+    /// `import_statements.path_kind`. That column's `CHECK` lists exactly these
+    /// three strings, so the enum and the schema's closed vocabulary stay one
+    /// declaration apart instead of drifting.
+    pub const fn persist_tag(self) -> &'static str {
+        match self {
+            Self::Namespace => "namespace",
+            Self::ImportFrom => "import_from",
+            Self::StaticMember => "static_member",
+        }
+    }
+
+    pub fn from_persist_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "namespace" => Some(Self::Namespace),
+            "import_from" => Some(Self::ImportFrom),
+            "static_member" => Some(Self::StaticMember),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuredImportScope {
     pub start_byte: usize,
@@ -2897,6 +3056,12 @@ pub struct StructuredImportScope {
 pub struct ImportInfo {
     pub raw_snippet: String,
     pub is_wildcard: bool,
+    /// The import binds beyond its own file. C#'s `global using` is the only
+    /// language form that sets this; every other adapter leaves it false.
+    /// It is recorded by the parser because consumers otherwise detect the
+    /// form by matching the prefix `global using ` against `raw_snippet`.
+    #[serde(default)]
+    pub is_global: bool,
     pub identifier: Option<String>,
     pub alias: Option<String>,
     /// Parser-derived path components. Language adapters should populate this
@@ -3737,5 +3902,220 @@ mod path_tests {
             PathBuf::from("A.java"),
         );
         assert_eq!(ordinary, verbatim);
+    }
+}
+
+/// Equivalence and mechanism pins for `ProjectFile`'s identity fast paths.
+///
+/// `ProjectFile` is the codebase's central identity type: every ordered
+/// container, every analyzer map and every moka key rides on its `Ord`, `Eq`
+/// and `Hash`. The fast paths added for the identity-cost work must not be
+/// visible through those three traits, so the equivalence pins compare them
+/// against the pre-change definitions, frozen here as `reference_*`.
+///
+/// The mechanism pins are separate on purpose: an equivalence pin passes with
+/// or without the fast path, so each mechanism also gets a pin that fails when
+/// the mechanism is reverted.
+#[cfg(test)]
+mod project_file_identity_tests {
+    use super::*;
+
+    /// `Ord for ProjectFile` as it read before the fast paths.
+    fn reference_cmp(left: &ProjectFile, right: &ProjectFile) -> Ordering {
+        match left.root().cmp(right.root()) {
+            Ordering::Equal => left.rel_path().cmp(right.rel_path()),
+            ordering => ordering,
+        }
+    }
+
+    /// `PartialEq for ProjectFile` as it read before the fast paths.
+    fn reference_eq(left: &ProjectFile, right: &ProjectFile) -> bool {
+        left.root() == right.root() && left.rel_path() == right.rel_path()
+    }
+
+    fn absolute_root(name: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{name}"))
+        } else {
+            PathBuf::from(format!("/{name}"))
+        }
+    }
+
+    /// Paths chosen to exercise the orderings that a naive fast path breaks:
+    /// prefixes of one another, differing only in depth, differing only in
+    /// case, and sorting differently as strings than as component sequences.
+    const REL_PATHS: [&str; 12] = [
+        "a.rs",
+        "a/b.rs",
+        "a/b/c.rs",
+        "a-b.rs",
+        "a.b.rs",
+        "b.rs",
+        "A.rs",
+        "src/lib.rs",
+        "src/a/mod.rs",
+        "src/a.rs",
+        "z/y/x.rs",
+        "./a.rs",
+    ];
+
+    fn corpus() -> Vec<ProjectFile> {
+        let mut files = Vec::new();
+        for root in [
+            absolute_root("identity-corpus-one"),
+            absolute_root("identity-corpus-two"),
+            absolute_root("identity-corpus-one-longer"),
+        ] {
+            for rel in REL_PATHS {
+                files.push(ProjectFile::new(root.clone(), rel));
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn ord_matches_the_pre_change_definition_over_every_pair() {
+        let files = corpus();
+        for left in &files {
+            for right in &files {
+                assert_eq!(
+                    left.cmp(right),
+                    reference_cmp(left, right),
+                    "order drifted for {left:?} vs {right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eq_matches_the_pre_change_definition_over_every_pair() {
+        let files = corpus();
+        for left in &files {
+            for right in &files {
+                assert_eq!(
+                    left == right,
+                    reference_eq(left, right),
+                    "equality drifted for {left:?} vs {right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sorting_the_corpus_agrees_with_the_pre_change_total_order() {
+        let mut sorted = corpus();
+        sorted.sort();
+        let mut reference = corpus();
+        reference.sort_by(reference_cmp);
+        assert_eq!(sorted, reference);
+        // `sort` is stable, so agreeing element-wise is only half the claim;
+        // the rendered order is what ordered containers hand to callers.
+        let rendered: Vec<String> = sorted.iter().map(|file| format!("{file:?}")).collect();
+        let reference_rendered: Vec<String> =
+            reference.iter().map(|file| format!("{file:?}")).collect();
+        assert_eq!(rendered, reference_rendered);
+    }
+
+    #[test]
+    fn equal_files_hash_equally_and_distinct_files_do_not_collide() {
+        let files = corpus();
+        for file in &files {
+            let clone = ProjectFile::new(file.root().to_path_buf(), file.rel_path());
+            assert_eq!(hash_of(file), hash_of(&clone));
+        }
+        // Same-process consistency plus a collision check over the corpus: the
+        // precomputed hash is a pure function of the two paths, so two files
+        // that differ must not be forced to share a bucket by construction.
+        let mut seen: HashMap<u64, ProjectFile> = HashMap::default();
+        for file in files {
+            if let Some(previous) = seen.insert(hash_of(&file), file.clone()) {
+                assert_eq!(previous, file, "distinct files collided in the corpus");
+            }
+        }
+    }
+
+    fn hash_of(file: &ProjectFile) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        file.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Mechanism pin for the precomputed hash: hashing writes one `u64` and
+    /// touches neither path. Reverting `Hash` to `root.hash(); rel_path.hash()`
+    /// makes this record the path bytes instead.
+    #[test]
+    fn hashing_writes_the_precomputed_value_and_never_walks_the_paths() {
+        #[derive(Default)]
+        struct RecordingHasher {
+            writes: Vec<&'static str>,
+            bytes: usize,
+        }
+
+        impl Hasher for RecordingHasher {
+            fn finish(&self) -> u64 {
+                0
+            }
+
+            fn write(&mut self, bytes: &[u8]) {
+                self.writes.push("write");
+                self.bytes += bytes.len();
+            }
+
+            fn write_u64(&mut self, _: u64) {
+                self.writes.push("write_u64");
+                self.bytes += 8;
+            }
+        }
+
+        let file = ProjectFile::new(
+            absolute_root("identity-hash-pin"),
+            "a/deeply/nested/module/path/that/would/be/walked.rs",
+        );
+        let mut hasher = RecordingHasher::default();
+        file.hash(&mut hasher);
+        assert_eq!(hasher.writes, vec!["write_u64"]);
+        assert_eq!(hasher.bytes, 8);
+    }
+
+    /// Mechanism pin for root interning: files built independently under one
+    /// workspace share a single root allocation, which is what lets `eq` and
+    /// `cmp` settle the root half with a pointer test. Reverting to a per-inner
+    /// `PathBuf` root makes the addresses differ.
+    #[test]
+    fn roots_are_interned_so_one_workspace_has_one_root_allocation() {
+        let root = absolute_root("identity-intern-pin");
+        let first = ProjectFile::new(root.clone(), "a.rs");
+        let second = ProjectFile::new(root.clone(), "b/c.rs");
+        // Reached by a different spelling that normalizes to the same root.
+        let third = ProjectFile::new(root.join("nested").join(".."), "d.rs");
+        assert!(std::ptr::eq(first.root(), second.root()));
+        assert!(std::ptr::eq(first.root(), third.root()));
+
+        let other = ProjectFile::new(absolute_root("identity-intern-pin-other"), "a.rs");
+        assert!(!std::ptr::eq(first.root(), other.root()));
+        assert_ne!(first, other);
+        assert_eq!(first.cmp(&other), reference_cmp(&first, &other));
+    }
+
+    #[test]
+    fn with_rel_path_reuses_the_root_and_agrees_with_new() {
+        let root = absolute_root("identity-sibling-pin");
+        let file = ProjectFile::new(root.clone(), "src/lib.rs");
+        let sibling = file.with_rel_path("src/a/mod.rs");
+        assert!(std::ptr::eq(file.root(), sibling.root()));
+        assert_eq!(sibling, ProjectFile::new(root, "src/a/mod.rs"));
+        assert_eq!(sibling.rel_path(), Path::new("src/a/mod.rs"));
+    }
+
+    /// Files from two workspaces meet in one process -- a multi-root MCP
+    /// session, a cross-workspace comparison -- and must still order by path.
+    #[test]
+    fn cross_workspace_pairs_order_and_compare_by_path() {
+        let left = ProjectFile::new(absolute_root("workspace-a"), "same/rel.rs");
+        let right = ProjectFile::new(absolute_root("workspace-b"), "same/rel.rs");
+        assert_ne!(left, right);
+        assert_eq!(left.cmp(&right), reference_cmp(&left, &right));
+        assert_eq!(right.cmp(&left), reference_cmp(&right, &left));
+        assert_ne!(hash_of(&left), hash_of(&right));
     }
 }

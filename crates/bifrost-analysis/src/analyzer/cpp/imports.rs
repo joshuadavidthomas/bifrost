@@ -129,9 +129,37 @@ impl ImportAnalysisProvider for CppAnalyzer {
 }
 
 impl CppAnalyzer {
+    /// The path -> file map every include resolution reads.
+    ///
+    /// Two sources, and each is there for a reason the other does not cover.
+    ///
+    /// The workspace listing, filtered to C++'s own extensions, is the bulk of
+    /// it: the index only ever answers `by_rel_path`/`by_file_name` lookups, so
+    /// it needs file identity and never a parse product, and an include target
+    /// with a C++ extension exists the moment the file exists (#1758). Reading
+    /// the analyzed set alone made a header resolvable only after something had
+    /// parsed it.
+    ///
+    /// The analyzed set supplies the rest: include-driven inference (#1837)
+    /// adopts a file whose extension no language claims -- a `.inc` fragment,
+    /// say -- into this analyzer, and adoption is recorded in the live path map
+    /// rather than being derivable from the name. Widening the listing filter
+    /// to every unclaimed extension instead would be wrong, not merely broad:
+    /// an unadopted extensionless `vendor/vector` would then satisfy
+    /// `#include <vector>` on basename alone, which
+    /// `cpp_extensionless_angle_include_with_unrelated_basename_reports_boundary`
+    /// pins as a boundary.
     pub(crate) fn include_target_index(&self) -> &IncludeTargetIndex {
         self.include_target_index.get_or_init(|| {
-            let files = self.inner.all_files();
+            let _scope = crate::profiling::scope("cpp.include_target_index.build");
+            let mut files = self.inner.workspace_language_files();
+            let listed: HashSet<ProjectFile> = files.iter().cloned().collect();
+            files.extend(
+                self.inner
+                    .all_files()
+                    .into_iter()
+                    .filter(|file| !listed.contains(file)),
+            );
             IncludeTargetIndex::build(files.iter())
         })
     }

@@ -37,7 +37,8 @@ use crate::analyzer::structural::materialization::{
 use crate::analyzer::tree_sitter_analyzer::{FileState, LanguageAdapter};
 use crate::analyzer::{
     CodeUnit, CodeUnitType, CppTemplateMetadata, ImportInfo, Language, PackageAnchor, ProjectFile,
-    Range, RubyMethodDispatchMode, SignatureMetadata, SummaryFileProjection,
+    Range, RubyMethodDispatchMode, SignatureMetadata, StructuredImportPath,
+    StructuredImportPathKind, StructuredImportScope, SummaryFileProjection,
 };
 use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
@@ -266,10 +267,6 @@ AND meta.import_statement_count = (
   SELECT COUNT(*) FROM import_statements AS statements
   WHERE statements.blob_oid = meta.blob_oid AND statements.lang = meta.lang
 )
-AND meta.import_count = (
-  SELECT COUNT(*) FROM import_details AS details
-  WHERE details.blob_oid = meta.blob_oid AND details.lang = meta.lang
-)
 AND meta.type_identifier_count = (
   SELECT COUNT(*) FROM type_identifiers AS identifiers
   WHERE identifiers.blob_oid = meta.blob_oid AND identifiers.lang = meta.lang
@@ -335,6 +332,9 @@ pub struct AnalyzerStore {
 /// `capacity` idle connections and drops the rest (transient burst readers), so
 /// the steady-state resident pool is bounded by `capacity`.
 ///
+/// `capacity` is therefore an *idle-retention* bound, not a concurrency limit,
+/// and `MAX_IDLE_READERS` explains why it is a small constant.
+///
 /// When `source` is `None` the store has no separate readable file (the
 /// in-memory single-connection fallback); reads then route back through the
 /// writer connection so correctness is preserved at the cost of read
@@ -350,12 +350,34 @@ thread_local! {
         RefCell::new(HashMap::default());
 }
 
+/// Upper bound on the idle readers one pool retains between checkouts.
+///
+/// A retained reader is not free: each one holds its own SQLite page cache (see
+/// `READER_PAGE_CACHE_KIB`) and its own prepared-statement cache for the
+/// process's lifetime. Sizing retention at `available_parallelism()` conflated
+/// "cores this host has" with "readers worth keeping warm", and it was measured
+/// on 2026-08-08. A single `scan_usages` on a 120-CPU host reached 115 live
+/// cache-DB connections within 10 s and then held that number flat for the
+/// remaining 166 s of the query. The same cell with retention capped at 16 shows
+/// what was actually concurrent: one transient 0.5 s sample at 41 connections
+/// during discovery, then 352 consecutive samples at 20. So the ~120 was
+/// retention accumulating every burst connection and never releasing it, not
+/// 120 readers doing work.
+///
+/// A burst wider than this still runs at full width -- checkout never blocks --
+/// it just does not leave its connections resident afterwards. Re-opening the
+/// above-cap readers is not free (about 3% CPU on that cell, in `sys`), which is
+/// why the cap is 16 rather than the ladder's 8: 16 covers the concurrent tool
+/// calls an MCP or LSP host realistically keeps in flight with margin, and,
+/// unlike `available_parallelism()`, it does not grow with the core count.
+const MAX_IDLE_READERS: usize = 16;
+
 impl ReaderPool {
     fn new(source: Option<PathBuf>) -> Self {
         let capacity = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .max(4);
+            .clamp(4, MAX_IDLE_READERS);
         Self {
             source,
             capacity,
@@ -380,6 +402,14 @@ impl ReaderPool {
             .lock()
             .expect("analyzer store reader pool poisoned")
             .clear();
+    }
+
+    #[cfg(test)]
+    fn idle_len(&self) -> usize {
+        self.idle
+            .lock()
+            .expect("analyzer store reader pool poisoned")
+            .len()
     }
 }
 
@@ -680,7 +710,7 @@ fn path_symbol_rows_by_fqn_in_tx(
            AND (
              lang NOT IN ('javascript', 'typescript:ts', 'typescript:tsx')
              OR EXISTS(
-               SELECT 1 FROM import_details AS imports
+               SELECT 1 FROM import_statements AS imports
                JOIN blob_meta AS meta
                  ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
                WHERE imports.blob_oid = units.blob_oid AND imports.lang = units.lang
@@ -2486,7 +2516,7 @@ impl AnalyzerStore {
         require_current_generation(&tx, lang, generation)?;
         let oid = oid.to_string();
         let meta_sql = format!(
-            "SELECT meta.import_count
+            "SELECT meta.import_statement_count
              FROM blob_meta AS meta
              WHERE meta.blob_oid = ?1 AND meta.lang = ?2
                AND {PARSED_BLOB_COMPLETE_CONDITION}"
@@ -2500,13 +2530,17 @@ impl AnalyzerStore {
         };
         let import_count = i64_to_usize(import_count)?;
         let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        // The byte budget prices the row's own text. The child tables hold
+        // pieces of the same declaration, so budgeting `statement` bounds them
+        // within a small constant factor, and their integer columns are fixed
+        // width. Only `statement` can be arbitrarily large, and only because
+        // the source declaration can be.
         let sql = format!(
-            "SELECT length(info),
-                    CASE
-                        WHEN length(info) <= {MAX_LIMITED_QUERY_ROW_BYTES} THEN info
-                        ELSE NULL
-                    END
-             FROM import_details
+            "SELECT length(CAST(statement AS BLOB))
+                      + COALESCE(length(CAST(identifier AS BLOB)), 0)
+                      + COALESCE(length(CAST(alias AS BLOB)), 0),
+                    {IMPORT_STATEMENT_COLUMNS}
+             FROM import_statements
              WHERE blob_oid = ?1 AND lang = ?2
              ORDER BY ordinal
              LIMIT ?3"
@@ -2524,14 +2558,16 @@ impl AnalyzerStore {
                 byte_complete = false;
                 break;
             }
-            let Some(info) = row.get::<_, Option<Vec<u8>>>(1)? else {
-                byte_complete = false;
-                break;
-            };
-            rows.push(deserialize_limited_blob(&info)?);
+            rows.push(import_info_from_statement_row(row, 1)?);
         }
         drop(query);
         drop(statement);
+        // The admitted prefix is dense from ordinal zero, so the shared child
+        // reader indexes it the same way the unbounded paths do.
+        let mut by_oid = HashMap::default();
+        by_oid.insert(oid.clone(), std::mem::take(&mut rows));
+        attach_import_path_children(&tx, lang, std::slice::from_ref(&oid), &mut by_oid)?;
+        let rows = by_oid.remove(&oid).unwrap_or_default();
         tx.commit()?;
         if !byte_complete || inspected == limit || import_count != inspected {
             Ok(LimitedQueryRows::incomplete(rows, inspected))
@@ -2570,12 +2606,16 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    /// `complete` is false when the caller's deadline expired mid-seek. The
+    /// rows returned with it are a prefix, not an answer: a caller must not
+    /// present them as this name's candidate set, and must not memoize them.
     pub(crate) fn declaration_order_candidate_rows_by_short_name_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         short_name: &str,
-    ) -> Result<Vec<DefinitionOrderCandidateRow>> {
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -2588,19 +2628,86 @@ impl AnalyzerStore {
             langs.iter().map(String::as_str),
             &sql,
             &[&short_name],
+            cancellation,
         )?;
         tx.commit()?;
         Ok(rows)
     }
 
+    /// The many-name form of
+    /// [`Self::declaration_order_candidate_rows_by_short_name_for_langs`], for
+    /// callers that can enumerate every name they will ask about before they
+    /// ask about any of them (#1748).
+    ///
+    /// One chunked `IN` seek per `SHORT_NAMES_PER_QUERY` names against the
+    /// same `(lang, short_name)` index, inside one transaction and one
+    /// generation check, instead of a pooled reader checkout plus transaction
+    /// plus generation check per name. Rows carry their `short_name`, so the
+    /// caller regroups them without a second read.
+    ///
+    /// The `IN` list is the same idiom as
+    /// `declaration_candidate_rows_by_identifiers_for_langs` (#1688); the
+    /// chunk bound matches the 400-key bulk readers in this file.
+    pub(crate) fn declaration_order_candidate_rows_by_short_names_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        short_names: &[String],
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
+        const SHORT_NAMES_PER_QUERY: usize = 400;
+        if short_names.is_empty() {
+            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
+        }
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let mut rows = Vec::new();
+        let mut complete = true;
+        for chunk in short_names.chunks(SHORT_NAMES_PER_QUERY) {
+            // `?1` is the language, so the names start at `?2`.
+            let placeholders = (0..chunk.len())
+                .map(|index| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = definition_order_candidate_sql(
+                &format!("units.lang = ?1 AND units.short_name IN ({placeholders})"),
+                "units.in_declarations = 1",
+            );
+            let values: Vec<&dyn ToSql> = chunk.iter().map(|name| name as &dyn ToSql).collect();
+            let chunk_rows = definition_order_candidate_rows_for_languages(
+                &tx,
+                langs.iter().map(String::as_str),
+                &sql,
+                &values,
+                cancellation,
+            )?;
+            complete &= chunk_rows.complete;
+            rows.extend(chunk_rows.rows);
+            if !complete {
+                break;
+            }
+        }
+        tx.commit()?;
+        let inspected = rows.len();
+        Ok(if complete {
+            LimitedQueryRows::complete(rows, inspected)
+        } else {
+            LimitedQueryRows::incomplete(rows, inspected)
+        })
+    }
+
     /// Returns name-bounded declaration-lookup candidates together with the
-    /// persisted range fact needed for definition ordering.
+    /// persisted range fact needed for definition ordering. `complete` carries
+    /// the same meaning as in
+    /// [`Self::declaration_order_candidate_rows_by_short_name_for_langs`].
     pub(crate) fn definition_lookup_order_candidate_rows_by_short_name_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         short_name: &str,
-    ) -> Result<Vec<DefinitionOrderCandidateRow>> {
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -2613,6 +2720,7 @@ impl AnalyzerStore {
             langs.iter().map(String::as_str),
             &sql,
             &[&short_name],
+            cancellation,
         )?;
         tx.commit()?;
         Ok(rows)
@@ -2636,23 +2744,83 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         identifier: &str,
     ) -> Result<Vec<CandidateRow>> {
+        self.declaration_candidate_rows_by_identifiers_for_langs(langs, generations, &[identifier])
+    }
+
+    /// The several-spelling form of the above, for the suffix-pattern stage of
+    /// symbol lookup: one query path can be spelled by more than one persisted
+    /// `identifier` (`Foo.Bar` also matches the declaration indexed as
+    /// `Foo$Bar`), and an `IN` list seeks the same `(lang, identifier)` index
+    /// once per spelling instead of reading the whole declaration table once
+    /// per language (#1688).
+    pub(crate) fn declaration_candidate_rows_by_identifiers_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        identifiers: &[&str],
+    ) -> Result<Vec<CandidateRow>> {
+        assert!(
+            !identifiers.is_empty(),
+            "a suffix query path always spells at least its terminal segment"
+        );
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        // `?1` is the language, so the spellings start at `?2`.
+        let placeholders = (0..identifiers.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = candidate_rows_sql_with_membership(
             "units",
             "FROM code_units AS units
              JOIN blob_meta AS meta
                ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
-            "units.lang = ?1 AND units.identifier = ?2",
+            &format!("units.lang = ?1 AND units.identifier IN ({placeholders})"),
             "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
             "units.blob_oid, units.unit_key",
         );
+        let values: Vec<&dyn ToSql> = identifiers
+            .iter()
+            .map(|identifier| identifier as &dyn ToSql)
+            .collect();
+        let rows =
+            candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &values)?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    /// Candidate rows whose `identifier` starts with `prefix`.
+    ///
+    /// A half-open range over the same `(lang, identifier)` index the exact
+    /// forms above seek, so this is a bounded range scan and not a table walk:
+    /// `identifier` has the default BINARY collation, and `upper` is `prefix`
+    /// with its last byte incremented. Symbol lookup needs it because C#
+    /// indexes a generic type under a CLR arity of no fixed width
+    /// (``Widget`1``, ``Widget``2``) while the lookup alias is the arity-free
+    /// source spelling, so the decorated spellings cannot be enumerated into
+    /// an `IN` list. See `decorated_identifier_seeks`; the caller verifies
+    /// each row, because the range also admits non-arity spellings.
+    ///
+    /// `prefix` must be non-empty and must not end in `0xFF`, which has no
+    /// byte successor. Every caller derives it by appending an ASCII
+    /// decoration character to an identifier.
+    pub(crate) fn declaration_candidate_rows_by_identifier_prefix_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        prefix: &str,
+    ) -> Result<Vec<CandidateRow>> {
+        let upper = byte_successor(prefix)
+            .expect("an identifier prefix is a non-empty string with a byte successor");
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let rows = candidate_rows_for_languages(
             &tx,
             langs.iter().map(String::as_str),
-            &sql,
-            &[&identifier],
+            &identifier_prefix_candidate_sql(),
+            &[&prefix, &upper.as_str()],
         )?;
         tx.commit()?;
         Ok(rows)
@@ -2986,9 +3154,14 @@ impl AnalyzerStore {
         cancellation: Option<&CancellationToken>,
     ) -> Result<LimitedQueryRows<SearchCandidateNameRow>> {
         // Pattern matching is performed after language-specific FQN hydration.
-        // Keep all storage languages in one statement. Repeating the active
-        // blob join once per language makes a broad regex request scale with
-        // both workspace size and the number of language indexes.
+        // One request may carry several patterns, so the storage projection
+        // intentionally supplies one complete declaration candidate set for
+        // the batch while avoiding per-candidate file-state hydration. Keep
+        // all languages in one SQL statement: the active-blob join is the
+        // dominant cost on large workspaces, and repeating it once per
+        // language turned a broad Firefox search into a serial multi-minute
+        // scan, and it makes a broad regex request scale with the number of
+        // language indexes as well as with workspace size.
         let mut conn = {
             let _scope = crate::profiling::scope("store.symbol_names.open_reader");
             self.active_read_conn()?
@@ -3385,7 +3558,9 @@ impl AnalyzerStore {
             "unit_supertypes",
             "unit_children",
             "import_statements",
-            "import_details",
+            "import_path_segments",
+            "import_lexical_scopes",
+            "import_lexical_prefixes",
             "blob_meta",
             "type_identifiers",
             "ruby_method_dispatch_modes",
@@ -3475,6 +3650,37 @@ impl AnalyzerStore {
 
 fn declaration_candidate_sql(predicate: &str) -> String {
     declaration_candidate_sql_with_order(predicate, "units.blob_oid, units.unit_key")
+}
+
+/// `declaration_candidate_rows_by_identifier_prefix_for_langs`'s query. Named
+/// so `identifier_prefix_lookup_seeks_the_identifier_index` can plan it.
+fn identifier_prefix_candidate_sql() -> String {
+    candidate_rows_sql_with_membership(
+        "units",
+        "FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+        "units.lang = ?1 AND units.identifier >= ?2 AND units.identifier < ?3",
+        "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+        "units.blob_oid, units.unit_key",
+    )
+}
+
+/// The least string greater than every string starting with `prefix`, under
+/// SQLite's BINARY collation, so that `col >= prefix AND col < successor` is
+/// an index range over exactly the prefix matches.
+///
+/// `None` when `prefix` is empty or ends in a byte with no successor that
+/// keeps the result valid UTF-8 (`0x7f`, or any continuation byte of a
+/// multi-byte character).
+fn byte_successor(prefix: &str) -> Option<String> {
+    let last = *prefix.as_bytes().last()?;
+    if !last.is_ascii() || last == 0x7f {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    *bytes.last_mut().expect("prefix is non-empty") = last + 1;
+    String::from_utf8(bytes).ok()
 }
 
 fn limited_declaration_candidate_sql(predicate: &str) -> String {
@@ -3671,24 +3877,51 @@ fn candidate_rows_for_languages_limited<'a>(
     Ok(LimitedQueryRows::complete(rows, inspected))
 }
 
+/// Rows walked between two deadline checks inside one candidate-row seek.
+///
+/// The seek for one short name is a single statement, and on a large workspace
+/// a hot name makes it a long one: `main` on the rustc tree reads 22k rows in
+/// 1.14 s. That read is issued from inside the import-graph candidate walk,
+/// which polls its deadline once per candidate file -- so the walk stopped on
+/// time and the read it had already started did not, and the whole of
+/// `scan_usages`' 0.57 s budget overshoot was that one read finishing. A
+/// deadline is only honoured at the granularity of the longest thing that
+/// ignores it, so the seek polls too. 512 rows is well under a millisecond of
+/// row decoding and costs one `Instant::now` per 512 rows on the completing
+/// path.
+const CANDIDATE_ROWS_PER_CANCELLATION_POLL: usize = 512;
+
 fn definition_order_candidate_rows_for_languages<'a>(
     conn: &Connection,
     langs: impl IntoIterator<Item = &'a str>,
     sql: &str,
     values: &[&dyn ToSql],
-) -> Result<Vec<DefinitionOrderCandidateRow>> {
+    cancellation: Option<&CancellationToken>,
+) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
     let mut statement = conn.prepare_cached(sql)?;
     let mut rows = Vec::new();
     for lang in langs {
         let params = std::iter::once(&lang as &dyn ToSql).chain(values.iter().copied());
-        rows.extend(collect_definition_order_candidate_rows(
-            statement.query_map(
-                params_from_iter(params),
-                definition_order_candidate_row_from_row,
-            )?,
-        )?);
+        let mapped = statement.query_map(
+            params_from_iter(params),
+            definition_order_candidate_row_from_row,
+        )?;
+        for row in mapped {
+            rows.push(row?);
+            if rows.len() % CANDIDATE_ROWS_PER_CANCELLATION_POLL == 0
+                && cancellation.is_some_and(CancellationToken::is_cancelled)
+            {
+                let inspected = rows.len();
+                return Ok(LimitedQueryRows::incomplete(rows, inspected));
+            }
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            let inspected = rows.len();
+            return Ok(LimitedQueryRows::incomplete(rows, inspected));
+        }
     }
-    Ok(rows)
+    let inspected = rows.len();
+    Ok(LimitedQueryRows::complete(rows, inspected))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3745,8 +3978,7 @@ pub(crate) struct PreparedParsedBlob {
     cpp_template_metadata: Vec<(i64, Vec<u8>)>,
     supertypes: Vec<(i64, i64, String, String)>,
     children: Vec<(i64, i64, i64)>,
-    import_statements: Vec<(i64, String)>,
-    imports: Vec<(i64, Vec<u8>)>,
+    imports: ImportRows,
     scala_exports: Vec<(i64, i64, Vec<u8>)>,
     type_identifiers: Vec<String>,
     ruby_dispatch_modes: Vec<(i64, i64)>,
@@ -3884,7 +4116,6 @@ struct PersistedSideTableCounts {
     supertype_count: usize,
     child_count: usize,
     import_statement_count: usize,
-    import_count: usize,
     type_identifier_count: usize,
     optional: OptionalFactCounts,
 }
@@ -4003,6 +4234,196 @@ fn insert_optional_fact_manifest(
         if count > 0 {
             stmt.execute(params![oid, lang, kind as i64, usize_to_i64(count)?])?;
         }
+    }
+    Ok(())
+}
+
+/// One `import_statements` row: an `ImportInfo`'s scalars, ordinal-keyed.
+///
+/// `declaration_start_byte` is `Some` exactly when the import has a structured
+/// path, which is also exactly when `ImportRows` holds child rows at this
+/// ordinal. Migration 0018 states that contract in the DDL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportStatementRow {
+    ordinal: i64,
+    statement: String,
+    is_wildcard: i64,
+    is_global: i64,
+    identifier: Option<String>,
+    alias: Option<String>,
+    path_kind: Option<&'static str>,
+    declaration_start_byte: Option<i64>,
+    binder_start: Option<i64>,
+    binder_end: Option<i64>,
+}
+
+/// A blob's import bindings as the four tables store them. Both write paths
+/// build this from `FileState::imports` and hand it to `insert_import_rows`,
+/// so the prepared batch and the direct transaction cannot drift apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ImportRows {
+    statements: Vec<ImportStatementRow>,
+    /// `(ordinal, seg_ordinal, segment)`
+    segments: Vec<(i64, i64, String)>,
+    /// `(ordinal, scope_ordinal, start_byte, end_byte)`
+    scopes: Vec<(i64, i64, i64, i64)>,
+    /// `(ordinal, prefix_ordinal, prefix)`
+    prefixes: Vec<(i64, i64, String)>,
+}
+
+impl ImportRows {
+    fn from_imports(imports: &[ImportInfo]) -> Result<Self> {
+        let mut rows = Self {
+            statements: Vec::with_capacity(imports.len()),
+            ..Self::default()
+        };
+        for (ordinal, import) in imports.iter().enumerate() {
+            let ordinal = usize_to_i64(ordinal)?;
+            let (path_kind, declaration_start_byte) = match &import.path {
+                Some(path) => {
+                    for (seg_ordinal, segment) in path.segments.iter().enumerate() {
+                        rows.segments
+                            .push((ordinal, usize_to_i64(seg_ordinal)?, segment.clone()));
+                    }
+                    for (scope_ordinal, scope) in path.lexical_scopes.iter().enumerate() {
+                        rows.scopes.push((
+                            ordinal,
+                            usize_to_i64(scope_ordinal)?,
+                            usize_to_i64(scope.start_byte)?,
+                            usize_to_i64(scope.end_byte)?,
+                        ));
+                    }
+                    for (prefix_ordinal, prefix) in path.lexical_prefixes.iter().enumerate() {
+                        rows.prefixes.push((
+                            ordinal,
+                            usize_to_i64(prefix_ordinal)?,
+                            prefix.clone(),
+                        ));
+                    }
+                    (
+                        path.kind.map(StructuredImportPathKind::persist_tag),
+                        Some(usize_to_i64(path.declaration_start_byte)?),
+                    )
+                }
+                None => (None, None),
+            };
+            let (binder_start, binder_end) = match import.binder_span {
+                Some(span) => (
+                    Some(usize_to_i64(span.start_byte)?),
+                    Some(usize_to_i64(span.end_byte)?),
+                ),
+                None => (None, None),
+            };
+            rows.statements.push(ImportStatementRow {
+                ordinal,
+                statement: import.raw_snippet.clone(),
+                is_wildcard: bool_to_i64(import.is_wildcard),
+                is_global: bool_to_i64(import.is_global),
+                identifier: import.identifier.clone(),
+                alias: import.alias.clone(),
+                path_kind,
+                declaration_start_byte,
+                binder_start,
+                binder_end,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Every row this blob's imports write, across all four tables. The batch
+    /// cost model prices a blob by row count, so the child tables have to be in
+    /// it or a segment-heavy language looks free to the garbage collector.
+    fn logical_rows(&self) -> usize {
+        saturating_sum([
+            self.statements.len(),
+            self.segments.len(),
+            self.scopes.len(),
+            self.prefixes.len(),
+        ])
+    }
+
+    /// Text bytes these rows store. Integer columns are fixed width and priced
+    /// by the row count above, so only the strings are counted here.
+    fn string_bytes(&self) -> usize {
+        saturating_sum([
+            saturating_sum(self.statements.iter().map(|row| {
+                saturating_sum([
+                    row.statement.len(),
+                    row.identifier.as_ref().map_or(0, String::len),
+                    row.alias.as_ref().map_or(0, String::len),
+                ])
+            })),
+            saturating_sum(self.segments.iter().map(|(_, _, segment)| segment.len())),
+            saturating_sum(self.prefixes.iter().map(|(_, _, prefix)| prefix.len())),
+        ])
+    }
+}
+
+fn insert_import_rows(
+    tx: &Transaction<'_>,
+    oid: &str,
+    lang: &str,
+    rows: &ImportRows,
+) -> Result<()> {
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO import_statements(
+               blob_oid, lang, ordinal, statement, is_wildcard, is_global,
+               identifier, alias, path_kind, declaration_start_byte,
+               binder_start, binder_end
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        )?;
+        for row in &rows.statements {
+            stmt.execute(params![
+                oid,
+                lang,
+                row.ordinal,
+                row.statement,
+                row.is_wildcard,
+                row.is_global,
+                row.identifier,
+                row.alias,
+                row.path_kind,
+                row.declaration_start_byte,
+                row.binder_start,
+                row.binder_end,
+            ])?;
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO import_path_segments(
+               blob_oid, lang, ordinal, seg_ordinal, segment
+             ) VALUES(?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for (ordinal, seg_ordinal, segment) in &rows.segments {
+            stmt.execute(params![oid, lang, ordinal, seg_ordinal, segment])?;
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO import_lexical_scopes(
+               blob_oid, lang, ordinal, scope_ordinal, start_byte, end_byte
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for (ordinal, scope_ordinal, start_byte, end_byte) in &rows.scopes {
+            stmt.execute(params![
+                oid,
+                lang,
+                ordinal,
+                scope_ordinal,
+                start_byte,
+                end_byte
+            ])?;
+        }
+    }
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO import_lexical_prefixes(
+           blob_oid, lang, ordinal, prefix_ordinal, prefix
+         ) VALUES(?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for (ordinal, prefix_ordinal, prefix) in &rows.prefixes {
+        stmt.execute(params![oid, lang, ordinal, prefix_ordinal, prefix])?;
     }
     Ok(())
 }
@@ -4153,18 +4574,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         };
         materialization_records.push((usize_to_i64(ordinal)?, unit_key, serialize_blob(&payload)?));
     }
-    let import_statements = state
-        .import_statements
-        .iter()
-        .enumerate()
-        .map(|(ordinal, statement)| Ok((usize_to_i64(ordinal)?, statement.clone())))
-        .collect::<Result<Vec<_>>>()?;
-    let imports = state
-        .imports
-        .iter()
-        .enumerate()
-        .map(|(ordinal, import)| Ok((usize_to_i64(ordinal)?, serialize_blob(import)?)))
-        .collect::<Result<Vec<_>>>()?;
+    let imports = ImportRows::from_imports(&state.imports)?;
     let mut scala_exports = Vec::new();
     for (owner, entries) in &state.scala_exports {
         let Some(&owner_key) = unit_keys.get(owner) else {
@@ -4194,8 +4604,7 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         cpp_template_metadata.len(),
         supertypes.len(),
         children.len(),
-        import_statements.len(),
-        imports.len(),
+        imports.logical_rows(),
         scala_exports.len(),
         type_identifiers.len(),
         ruby_dispatch_modes.len(),
@@ -4221,17 +4630,12 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
                 .iter()
                 .map(|(_, _, raw, path)| raw.len().saturating_add(path.len())),
         ),
-        saturating_sum(
-            import_statements
-                .iter()
-                .map(|(_, statement)| statement.len()),
-        ),
+        imports.string_bytes(),
         saturating_sum(type_identifiers.iter().map(String::len)),
     ]);
     let binary_bytes = saturating_sum([
         saturating_sum(signature_metadata.iter().map(|(_, _, bytes)| bytes.len())),
         saturating_sum(cpp_template_metadata.iter().map(|(_, bytes)| bytes.len())),
-        saturating_sum(imports.iter().map(|(_, bytes)| bytes.len())),
         saturating_sum(scala_exports.iter().map(|(_, _, bytes)| bytes.len())),
         saturating_sum(
             materialization_records
@@ -4261,7 +4665,6 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         cpp_template_metadata,
         supertypes,
         children,
-        import_statements,
         imports,
         scala_exports,
         type_identifiers,
@@ -4371,20 +4774,7 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
             stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
         }
     );
-    insert_rows!(
-        "INSERT OR IGNORE INTO import_statements(blob_oid, lang, ordinal, statement) VALUES(?1, ?2, ?3, ?4)",
-        &blob.import_statements,
-        |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1])?;
-        }
-    );
-    insert_rows!(
-        "INSERT OR IGNORE INTO import_details(blob_oid, lang, ordinal, info) VALUES(?1, ?2, ?3, ?4)",
-        &blob.imports,
-        |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1])?;
-        }
-    );
+    insert_import_rows(tx, oid, lang, &blob.imports)?;
     insert_rows!(
         "INSERT OR IGNORE INTO scala_exports(blob_oid, lang, owner_key, ordinal, info) VALUES(?1, ?2, ?3, ?4, ?5)",
         &blob.scala_exports,
@@ -4424,8 +4814,8 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
         "INSERT OR IGNORE INTO blob_meta(
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
-           child_count, import_statement_count, import_count, type_identifier_count, is_complete
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1)",
+           child_count, import_statement_count, type_identifier_count, is_complete
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)",
         params![
             oid,
             lang,
@@ -4437,8 +4827,7 @@ fn write_prepared_blob_unchecked_tx(tx: &Transaction<'_>, blob: &PreparedParsedB
             usize_to_i64(blob.signature_metadata.len())?,
             usize_to_i64(blob.supertypes.len())?,
             usize_to_i64(blob.children.len())?,
-            usize_to_i64(blob.import_statements.len())?,
-            usize_to_i64(blob.imports.len())?,
+            usize_to_i64(blob.imports.statements.len())?,
             usize_to_i64(blob.type_identifiers.len())?,
         ],
     )?;
@@ -4563,7 +4952,8 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
         &state.ruby_method_dispatch_modes,
     )?;
     let scala_trait_count = insert_scala_traits(tx, &oid, lang, &unit_keys, &state.scala_traits)?;
-    let (import_statement_count, import_count) = insert_imports(tx, &oid, lang, state)?;
+    let import_rows = ImportRows::from_imports(&state.imports)?;
+    insert_import_rows(tx, &oid, lang, &import_rows)?;
     let scala_export_count =
         insert_scala_exports(tx, &oid, lang, &unit_keys, &state.scala_exports)?;
     let materialization_record_count =
@@ -4574,8 +4964,7 @@ fn write_parsed_blob_tx<A: LanguageAdapter>(
         signature_metadata_count,
         supertype_count,
         child_count,
-        import_statement_count,
-        import_count,
+        import_statement_count: import_rows.statements.len(),
         type_identifier_count: state.type_identifiers.len(),
         optional: optional_fact_counts(
             cpp_template_metadata_count,
@@ -4903,41 +5292,6 @@ fn insert_scala_traits(
     Ok(count)
 }
 
-fn insert_imports(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    state: &FileState,
-) -> Result<(usize, usize)> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO import_statements(
-           blob_oid, lang, ordinal, statement
-         ) VALUES(?1, ?2, ?3, ?4)",
-    )?;
-    let mut statement_count = 0;
-    for (ordinal, statement) in state.import_statements.iter().enumerate() {
-        stmt.execute(params![oid, lang, usize_to_i64(ordinal)?, statement])?;
-        statement_count += 1;
-    }
-    drop(stmt);
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO import_details(
-           blob_oid, lang, ordinal, info
-         ) VALUES(?1, ?2, ?3, ?4)",
-    )?;
-    let mut import_count = 0;
-    for (ordinal, import) in state.imports.iter().enumerate() {
-        stmt.execute(params![
-            oid,
-            lang,
-            usize_to_i64(ordinal)?,
-            serialize_blob(import)?,
-        ])?;
-        import_count += 1;
-    }
-    Ok((statement_count, import_count))
-}
-
 fn insert_scala_exports(
     tx: &Transaction<'_>,
     oid: &str,
@@ -4982,8 +5336,8 @@ fn insert_blob_meta<A: LanguageAdapter>(
         "INSERT OR IGNORE INTO blob_meta(
            blob_oid, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
-           child_count, import_statement_count, import_count, type_identifier_count, is_complete
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+           child_count, import_statement_count, type_identifier_count, is_complete
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             oid,
             lang,
@@ -4996,7 +5350,6 @@ fn insert_blob_meta<A: LanguageAdapter>(
             usize_to_i64(side_counts.supertype_count)?,
             usize_to_i64(side_counts.child_count)?,
             usize_to_i64(side_counts.import_statement_count)?,
-            usize_to_i64(side_counts.import_count)?,
             usize_to_i64(side_counts.type_identifier_count)?,
             1,
         ],
@@ -5069,7 +5422,6 @@ struct RawSideTableCounts {
     supertype_count: i64,
     child_count: i64,
     import_statement_count: i64,
-    import_count: i64,
     type_identifier_count: i64,
     optional: [i64; OPTIONAL_FACT_DESCRIPTORS.len()],
     unknown_optional_count: i64,
@@ -5143,7 +5495,6 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         read_unit_string_vec(conn, &oid, lang, "unit_supertypes", "lookup_path", &by_key)?;
     let ruby_method_dispatch_modes = read_ruby_method_dispatch_modes(conn, &oid, lang, &by_key)?;
     let scala_traits = read_scala_traits(conn, &oid, lang, &by_key)?;
-    let import_statements = read_import_statements(conn, &oid, lang)?;
     let imports = read_import_infos(conn, &oid, lang)?;
     let scala_exports = read_scala_exports(conn, &oid, lang, &by_key)?;
     let materialization_records = read_materialization_records(conn, &oid, lang, &by_key)?;
@@ -5159,8 +5510,7 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         cpp_template_metadata: &cpp_template_metadata,
         raw_supertypes: &raw_supertypes,
         children: &children,
-        import_statement_count: import_statements.len(),
-        import_count: imports.len(),
+        import_statement_count: imports.len(),
         type_identifier_count: meta.type_identifiers.len(),
         ruby_dispatch_count: ruby_method_dispatch_modes.len(),
         scala_trait_count: scala_traits.len(),
@@ -5178,9 +5528,10 @@ fn hydrate_file_state_conn<A: LanguageAdapter>(
         top_level_declarations: top_level.into_iter().map(|(_, unit)| unit).collect(),
         declarations,
         definition_lookup_units,
-        import_statements,
         imports,
         scala_exports,
+        // Not hydrated: the Rust fact tables are read by blob oid straight from
+        // SQL, never through a materialized `FileState`. See the field's doc.
         raw_supertypes,
         supertype_lookup_paths,
         type_identifiers: meta.type_identifiers,
@@ -5390,7 +5741,6 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
     let ranges_by_oid = read_ranges_bulk(conn, lang, &oids)?;
     let ruby_dispatch_by_oid = read_ruby_method_dispatch_modes_bulk(conn, lang, &oids)?;
     let scala_traits_by_oid = read_scala_traits_bulk(conn, lang, &oids)?;
-    let import_statements_by_oid = read_import_statements_bulk(conn, lang, &oids)?;
     let import_infos_by_oid = read_import_infos_bulk(conn, lang, &oids)?;
     let scala_exports_by_oid = read_scala_exports_bulk(conn, lang, &oids)?;
     let materialization_records_by_oid = read_materialization_records_bulk(conn, lang, &oids)?;
@@ -5468,10 +5818,6 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
         let ruby_method_dispatch_modes =
             ruby_dispatch_map_for_file(ruby_dispatch_by_oid.get(&oid_text), &by_key)?;
         let scala_traits = scala_traits_for_file(scala_traits_by_oid.get(&oid_text), &by_key);
-        let import_statements = import_statements_by_oid
-            .get(&oid_text)
-            .cloned()
-            .unwrap_or_default();
         let imports = import_infos_by_oid
             .get(&oid_text)
             .cloned()
@@ -5502,8 +5848,7 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             cpp_template_metadata: &cpp_template_metadata,
             raw_supertypes: &raw_supertypes,
             children: &children,
-            import_statement_count: import_statements.len(),
-            import_count: imports.len(),
+            import_statement_count: imports.len(),
             type_identifier_count: meta.type_identifiers.len(),
             ruby_dispatch_count: ruby_method_dispatch_modes.len(),
             scala_trait_count: scala_traits.len(),
@@ -5521,7 +5866,6 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
             top_level_declarations: top_level.into_iter().map(|(_, unit)| unit).collect(),
             declarations,
             definition_lookup_units,
-            import_statements,
             imports,
             scala_exports,
             raw_supertypes,
@@ -5565,7 +5909,7 @@ fn read_blob_meta<A: LanguageAdapter>(
             &format!(
                 "SELECT contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
-                    child_count, import_statement_count, import_count, type_identifier_count,
+                    child_count, import_statement_count, type_identifier_count,
                     {optional_fact_projection}
              FROM blob_meta AS meta
              LEFT JOIN blob_optional_fact_manifest AS manifest
@@ -5653,16 +5997,15 @@ fn raw_side_table_counts_from_row(
         supertype_count: row.get(offset + 3)?,
         child_count: row.get(offset + 4)?,
         import_statement_count: row.get(offset + 5)?,
-        import_count: row.get(offset + 6)?,
-        type_identifier_count: row.get(offset + 7)?,
+        type_identifier_count: row.get(offset + 6)?,
         optional: [
+            row.get(offset + 7)?,
             row.get(offset + 8)?,
             row.get(offset + 9)?,
             row.get(offset + 10)?,
             row.get(offset + 11)?,
-            row.get(offset + 12)?,
         ],
-        unknown_optional_count: row.get(offset + 13)?,
+        unknown_optional_count: row.get(offset + 12)?,
     })
 }
 
@@ -5684,7 +6027,6 @@ fn side_table_counts_from_raw(raw: RawSideTableCounts) -> Result<PersistedSideTa
         supertype_count: i64_to_usize(raw.supertype_count)?,
         child_count: i64_to_usize(raw.child_count)?,
         import_statement_count: i64_to_usize(raw.import_statement_count)?,
-        import_count: i64_to_usize(raw.import_count)?,
         type_identifier_count: i64_to_usize(raw.type_identifier_count)?,
         optional,
     })
@@ -5747,7 +6089,7 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
         let sql = format!(
             "SELECT meta.blob_oid, contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
-                    child_count, import_statement_count, import_count, type_identifier_count,
+                    child_count, import_statement_count, type_identifier_count,
                     {optional_fact_projection}
              FROM blob_meta AS meta
              LEFT JOIN blob_optional_fact_manifest AS manifest
@@ -5898,33 +6240,129 @@ fn read_unit_rows_bulk(
     Ok(out)
 }
 
-fn read_import_statements_bulk(
+/// The `import_statements` columns every hydration path selects, in the order
+/// `import_info_from_statement_row` reads them.
+const IMPORT_STATEMENT_COLUMNS: &str = "statement, is_wildcard, is_global, identifier, alias, \
+     path_kind, declaration_start_byte, binder_start, binder_end";
+
+/// Rebuild the scalar half of an `ImportInfo` from one `import_statements` row.
+///
+/// A non-NULL `declaration_start_byte` is the structured path's presence
+/// marker (migration 0018), so the path is created empty here and
+/// `attach_import_path_children` fills its three lists.
+fn import_info_from_statement_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<ImportInfo> {
+    let path_kind = row.get::<_, Option<String>>(offset + 5)?;
+    let declaration_start_byte = row.get::<_, Option<i64>>(offset + 6)?;
+    let binder_start = row.get::<_, Option<i64>>(offset + 7)?;
+    let binder_end = row.get::<_, Option<i64>>(offset + 8)?;
+    let to_usize = |column: usize, value: i64| {
+        i64_to_usize(value).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Integer,
+                Box::new(err),
+            )
+        })
+    };
+    let path = declaration_start_byte
+        .map(|start| {
+            let kind = match path_kind.as_deref() {
+                Some(tag) => Some(StructuredImportPathKind::from_persist_tag(tag).ok_or_else(
+                    || {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            offset + 5,
+                            rusqlite::types::Type::Text,
+                            Box::new(StoreError::new(format!("unknown import path kind `{tag}`"))),
+                        )
+                    },
+                )?),
+                None => None,
+            };
+            Ok::<_, rusqlite::Error>(StructuredImportPath {
+                segments: Vec::new(),
+                kind,
+                lexical_prefixes: Vec::new(),
+                lexical_scopes: Vec::new(),
+                declaration_start_byte: to_usize(offset + 6, start)?,
+            })
+        })
+        .transpose()?;
+    let binder_span = match (binder_start, binder_end) {
+        (Some(start), Some(end)) => Some(crate::analyzer::structural::facts::Span {
+            start_byte: to_usize(offset + 7, start)?,
+            end_byte: to_usize(offset + 8, end)?,
+        }),
+        _ => None,
+    };
+    Ok(ImportInfo {
+        raw_snippet: row.get(offset)?,
+        is_wildcard: row.get::<_, i64>(offset + 1)? != 0,
+        is_global: row.get::<_, i64>(offset + 2)? != 0,
+        identifier: row.get(offset + 3)?,
+        alias: row.get(offset + 4)?,
+        path,
+        binder_span,
+    })
+}
+
+/// Fill the three child lists of every already-hydrated import in `by_oid`.
+///
+/// `ordinal` is dense from zero within a blob because the writer enumerates
+/// `FileState::imports`, so it indexes the per-blob vector directly. A child
+/// row whose blob is absent belongs to a blob the caller's parent query
+/// excluded, and one whose ordinal is out of range cannot exist while the
+/// foreign key to `import_statements` holds; both are skipped rather than
+/// guessed at.
+fn attach_import_path_children(
     conn: &Connection,
     lang: &str,
     oids: &[String],
-) -> Result<HashMap<String, Vec<String>>> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::default();
+    by_oid: &mut HashMap<String, Vec<ImportInfo>>,
+) -> Result<()> {
     for chunk in oids.chunks(900) {
         if chunk.is_empty() {
             continue;
         }
         let placeholders = chunk_placeholders(chunk);
-        let sql = format!(
-            "SELECT blob_oid, statement FROM import_statements
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, ordinal"
-        );
         let params = chunk_params(lang, chunk);
-        let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (oid, statement) = row?;
-            out.entry(oid).or_default().push(statement);
+        for (table, value_columns) in [
+            ("import_path_segments", "segment"),
+            ("import_lexical_prefixes", "prefix"),
+            ("import_lexical_scopes", "start_byte, end_byte"),
+        ] {
+            let sql = format!(
+                "SELECT blob_oid, ordinal, {value_columns}
+                 FROM {table}
+                 WHERE lang = ? AND blob_oid IN ({placeholders})
+                 ORDER BY blob_oid, ordinal"
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let mut query = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+            while let Some(row) = query.next()? {
+                let oid = row.get::<_, String>(0)?;
+                let ordinal = i64_to_usize(row.get::<_, i64>(1)?)?;
+                let Some(path) = by_oid
+                    .get_mut(&oid)
+                    .and_then(|imports| imports.get_mut(ordinal))
+                    .and_then(|import| import.path.as_mut())
+                else {
+                    continue;
+                };
+                match table {
+                    "import_path_segments" => path.segments.push(row.get(2)?),
+                    "import_lexical_prefixes" => path.lexical_prefixes.push(row.get(2)?),
+                    _ => path.lexical_scopes.push(StructuredImportScope {
+                        start_byte: i64_to_usize(row.get::<_, i64>(2)?)?,
+                        end_byte: i64_to_usize(row.get::<_, i64>(3)?)?,
+                    }),
+                }
+            }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn read_import_infos_bulk(
@@ -5939,8 +6377,11 @@ fn read_import_infos_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT imports.blob_oid, imports.info
-             FROM import_details AS imports
+            "SELECT imports.blob_oid, imports.statement, imports.is_wildcard,
+                    imports.is_global, imports.identifier, imports.alias,
+                    imports.path_kind, imports.declaration_start_byte,
+                    imports.binder_start, imports.binder_end
+             FROM import_statements AS imports
              JOIN blob_meta AS meta
                ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
              WHERE imports.lang = ? AND imports.blob_oid IN ({placeholders})
@@ -5950,13 +6391,17 @@ fn read_import_infos_bulk(
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                import_info_from_statement_row(row, 1)?,
+            ))
         })?;
         for row in rows {
-            let (oid, bytes) = row?;
-            out.entry(oid).or_default().push(deserialize_blob(&bytes)?);
+            let (oid, import) = row?;
+            out.entry(oid).or_default().push(import);
         }
     }
+    attach_import_path_children(conn, lang, oids, &mut out)?;
     Ok(out)
 }
 
@@ -6409,7 +6854,6 @@ struct HydratedSideTableParts<'a> {
     raw_supertypes: &'a HashMap<CodeUnit, Vec<String>>,
     children: &'a HashMap<CodeUnit, Vec<CodeUnit>>,
     import_statement_count: usize,
-    import_count: usize,
     type_identifier_count: usize,
     ruby_dispatch_count: usize,
     scala_trait_count: usize,
@@ -6427,7 +6871,6 @@ fn side_table_counts_from_hydrated_parts(
         supertype_count: count_vec_entries(parts.raw_supertypes),
         child_count: count_vec_entries(parts.children),
         import_statement_count: parts.import_statement_count,
-        import_count: parts.import_count,
         type_identifier_count: parts.type_identifier_count,
         optional: optional_fact_counts(
             parts.cpp_template_metadata.len(),
@@ -6517,19 +6960,6 @@ fn collect_candidate_primary_range_rows<F>(
 ) -> Result<Vec<CandidatePrimaryRangeRow>>
 where
     F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<CandidatePrimaryRangeRow>,
-{
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-fn collect_definition_order_candidate_rows<F>(
-    rows: rusqlite::MappedRows<'_, F>,
-) -> Result<Vec<DefinitionOrderCandidateRow>>
-where
-    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<DefinitionOrderCandidateRow>,
 {
     let mut out = Vec::new();
     for row in rows {
@@ -6900,7 +7330,7 @@ fn blobs_with_structured_imports_conn(
             .join(",");
         let sql = format!(
             "SELECT DISTINCT imports.blob_oid
-             FROM import_details AS imports
+             FROM import_statements AS imports
              JOIN blob_meta AS meta
                ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
              WHERE imports.lang = ? AND imports.blob_oid IN ({placeholders})
@@ -7010,27 +7440,24 @@ fn read_unit_rows<A: LanguageAdapter>(
     Ok(out)
 }
 
-fn read_import_statements(conn: &Connection, oid: &str, lang: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT statement FROM import_statements
-         WHERE blob_oid = ?1 AND lang = ?2
-         ORDER BY ordinal",
-    )?;
-    collect_string_rows(stmt.query_map(params![oid, lang], |row| row.get(0))?)
-}
-
 fn read_import_infos(conn: &Connection, oid: &str, lang: &str) -> Result<Vec<ImportInfo>> {
-    let mut stmt = conn.prepare(
-        "SELECT info FROM import_details
+    let sql = format!(
+        "SELECT {IMPORT_STATEMENT_COLUMNS} FROM import_statements
          WHERE blob_oid = ?1 AND lang = ?2
-         ORDER BY ordinal",
-    )?;
-    let rows = stmt.query_map(params![oid, lang], |row| row.get::<_, Vec<u8>>(0))?;
-    let mut out = Vec::new();
+         ORDER BY ordinal"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![oid, lang], |row| {
+        import_info_from_statement_row(row, 0)
+    })?;
+    let mut imports = Vec::new();
     for row in rows {
-        out.push(deserialize_blob(&row?)?);
+        imports.push(row?);
     }
-    Ok(out)
+    let mut by_oid = HashMap::default();
+    by_oid.insert(oid.to_string(), imports);
+    attach_import_path_children(conn, lang, &[oid.to_string()], &mut by_oid)?;
+    Ok(by_oid.remove(oid).unwrap_or_default())
 }
 
 fn insert_materialization_records(
@@ -7792,16 +8219,6 @@ fn synthesize_file_scope(file: &ProjectFile, source: &str, state: &mut FileState
     });
 }
 
-fn collect_string_rows(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<String>>,
-) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
 fn ensure_language_epochs_tx(
     conn: &mut Connection,
     entries: &[(String, String)],
@@ -8019,7 +8436,13 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
              ELSE 2 + meta.stored_unit_count + meta.range_count + meta.signature_count
                + meta.signature_metadata_count
                + meta.supertype_count + meta.child_count
-               + meta.import_statement_count + meta.import_count + meta.type_identifier_count
+               + meta.import_statement_count + meta.type_identifier_count
+               + (SELECT COUNT(*) FROM import_path_segments AS segments
+                  WHERE segments.blob_oid = meta.blob_oid AND segments.lang = meta.lang)
+               + (SELECT COUNT(*) FROM import_lexical_scopes AS scopes
+                  WHERE scopes.blob_oid = meta.blob_oid AND scopes.lang = meta.lang)
+               + (SELECT COUNT(*) FROM import_lexical_prefixes AS prefixes
+                  WHERE prefixes.blob_oid = meta.blob_oid AND prefixes.lang = meta.lang)
                + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
                   FROM blob_optional_fact_manifest AS manifest
                   WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang)
@@ -8058,7 +8481,13 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
          1 + meta.stored_unit_count + meta.range_count + meta.signature_count
            + meta.signature_metadata_count
            + meta.supertype_count + meta.child_count
-           + meta.import_statement_count + meta.import_count + meta.type_identifier_count
+           + meta.import_statement_count + meta.type_identifier_count
+           + (SELECT COUNT(*) FROM import_path_segments AS segments
+              WHERE segments.blob_oid = meta.blob_oid AND segments.lang = meta.lang)
+           + (SELECT COUNT(*) FROM import_lexical_scopes AS scopes
+              WHERE scopes.blob_oid = meta.blob_oid AND scopes.lang = meta.lang)
+           + (SELECT COUNT(*) FROM import_lexical_prefixes AS prefixes
+              WHERE prefixes.blob_oid = meta.blob_oid AND prefixes.lang = meta.lang)
            + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
               FROM blob_optional_fact_manifest AS manifest
               WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang)
@@ -8083,9 +8512,13 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + COALESCE((SELECT SUM(length(CAST(raw AS BLOB))
                + length(CAST(lookup_path AS BLOB))) FROM unit_supertypes
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
-           + COALESCE((SELECT SUM(length(CAST(statement AS BLOB))) FROM import_statements
+           + COALESCE((SELECT SUM(length(CAST(statement AS BLOB))
+               + COALESCE(length(CAST(identifier AS BLOB)), 0)
+               + COALESCE(length(CAST(alias AS BLOB)), 0)) FROM import_statements
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
-           + COALESCE((SELECT SUM(length(info)) FROM import_details
+           + COALESCE((SELECT SUM(length(CAST(segment AS BLOB))) FROM import_path_segments
+               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+           + COALESCE((SELECT SUM(length(CAST(prefix AS BLOB))) FROM import_lexical_prefixes
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(info)) FROM scala_exports
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
@@ -8280,7 +8713,7 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
                       1 + meta.stored_unit_count + meta.range_count + meta.signature_count
                         + meta.signature_metadata_count
                         + meta.supertype_count + meta.child_count
-                        + meta.import_statement_count + meta.import_count
+                        + meta.import_statement_count
                         + meta.type_identifier_count
                         + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
                            FROM blob_optional_fact_manifest AS manifest
@@ -8561,17 +8994,6 @@ fn deserialize_signature_metadata_blob(bytes: &[u8]) -> Result<SignatureMetadata
     }
     let byte_limit = u64::try_from(bytes.len())
         .map_err(|_| StoreError::new("signature metadata blob length does not fit in u64"))?;
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .allow_trailing_bytes()
-        .with_limit(byte_limit)
-        .deserialize(bytes)
-        .map_err(|err| StoreError::new(format!("analyzer store deserialization error: {err}")))
-}
-
-fn deserialize_limited_blob<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    let byte_limit = u64::try_from(bytes.len())
-        .map_err(|_| StoreError::new("limited-query blob length does not fit in u64"))?;
     bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .allow_trailing_bytes()
@@ -9152,13 +9574,15 @@ mod tests {
             let conn = store.conn.lock().unwrap();
             assert_eq!(
                 conn.execute(
-                    "UPDATE import_details
-                     SET info = zeroblob(?3)
+                    // `hex` doubles its argument's length, so this writes a
+                    // statement two bytes past the per-row cap.
+                    "UPDATE import_statements
+                     SET statement = hex(zeroblob(?3))
                      WHERE blob_oid = ?1 AND lang = ?2",
                     params![
                         oid.to_string(),
                         "go",
-                        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES + 1).unwrap(),
+                        usize_to_i64(MAX_LIMITED_QUERY_ROW_BYTES / 2 + 1).unwrap(),
                     ],
                 )
                 .unwrap(),
@@ -9198,7 +9622,7 @@ mod tests {
             assert_eq!(
                 conn.execute(
                     "UPDATE blob_meta
-                     SET import_count = 1
+                     SET import_statement_count = 1
                      WHERE blob_oid = ?1 AND lang = ?2",
                     params![oid.to_string(), "go"],
                 )
@@ -9952,6 +10376,43 @@ mod tests {
         });
     }
 
+    /// A burst wider than the pool runs at full width, and the pool keeps only
+    /// `MAX_IDLE_READERS` of those connections afterwards. Both halves matter:
+    /// the first barrier would deadlock if checkout throttled a burst, and the
+    /// idle count is what a live process pays for the rest of its lifetime.
+    #[test]
+    fn reader_pool_runs_a_wide_burst_but_retains_a_bounded_idle_set() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap());
+        let burst = MAX_IDLE_READERS * 4;
+        let all_checked_out = Arc::new(std::sync::Barrier::new(burst));
+        let all_queried = Arc::new(std::sync::Barrier::new(burst));
+
+        std::thread::scope(|scope| {
+            for _ in 0..burst {
+                let store = Arc::clone(&store);
+                let all_checked_out = Arc::clone(&all_checked_out);
+                let all_queried = Arc::clone(&all_queried);
+                scope.spawn(move || {
+                    let reader = store.read_conn().unwrap();
+                    all_checked_out.wait();
+                    let tables: i64 = reader
+                        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+                        .unwrap();
+                    assert!(tables > 0);
+                    all_queried.wait();
+                });
+            }
+        });
+
+        assert_eq!(
+            store.readers.idle_len(),
+            MAX_IDLE_READERS,
+            "a {burst}-wide burst must leave only {MAX_IDLE_READERS} readers resident"
+        );
+    }
+
     #[test]
     fn active_symbol_candidate_scan_batches_languages() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -10213,7 +10674,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_import_facts_include_complete_files_without_import_details() {
+    fn bulk_import_facts_include_complete_files_without_import_rows() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
         let file = write_file(
@@ -10358,10 +10819,12 @@ mod tests {
                 &["java".to_string()],
                 &generations,
                 "Sample",
+                None,
             )
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].first_start_byte, Some(5));
+        assert!(rows.complete);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].first_start_byte, Some(5));
 
         {
             let conn = store.conn.lock().unwrap();
@@ -10387,10 +10850,120 @@ mod tests {
                 &["java".to_string()],
                 &generations,
                 "Sample",
+                None,
             )
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].first_start_byte, None);
+        assert!(rows.complete);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].first_start_byte, None);
+    }
+
+    /// One short name, more rows than a poll interval, written across many
+    /// blobs -- the shape a hot name has on a large workspace (`main` is 22k
+    /// rows on the rustc tree).
+    fn store_with_repeated_short_name(blobs: usize) -> (tempfile::TempDir, AnalyzerStore) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "src/demo/Sample.java",
+            "package demo; class Sample {}\n",
+        );
+        let adapter = JavaAdapter;
+        let state = parse_state(&adapter, &file);
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        for index in 0..blobs {
+            let oid = oid_for(format!("sample blob {index}").as_bytes());
+            store
+                .write_parsed_blob(oid, "java", &adapter, &state)
+                .unwrap();
+        }
+        (temp, store)
+    }
+
+    /// A candidate-row seek must observe its caller's deadline *inside* the
+    /// statement, not only around it.
+    ///
+    /// The seek for one short name is a single read, and for a hot name it is
+    /// the longest single thing a `scan_usages` request does -- 1.14 s for
+    /// `main` on the rustc tree, issued from inside a candidate walk that polls
+    /// its own deadline once per file. The walk stopped on time; the read it had
+    /// already started did not, and that one read was the whole of the measured
+    /// 0.57 s overshoot of a 3 s budget.
+    ///
+    /// Without the in-statement poll this returns all 1,200 rows and reports
+    /// `complete`.
+    #[test]
+    fn a_cancelled_candidate_row_seek_stops_inside_the_statement() {
+        const BLOBS: usize = 1_200;
+        let (_temp, store) = store_with_repeated_short_name(BLOBS);
+        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+        let langs = ["java".to_string()];
+
+        let complete = store
+            .declaration_order_candidate_rows_by_short_name_for_langs(
+                &langs,
+                &generations,
+                "Sample",
+                None,
+            )
+            .unwrap();
+        assert!(complete.complete);
+        assert_eq!(
+            BLOBS,
+            complete.rows.len(),
+            "the fixture must hold more rows than one poll interval"
+        );
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let stopped = store
+            .declaration_order_candidate_rows_by_short_name_for_langs(
+                &langs,
+                &generations,
+                "Sample",
+                Some(&cancellation),
+            )
+            .unwrap();
+        assert!(
+            !stopped.complete,
+            "a seek that stopped at its deadline must not report a complete row set"
+        );
+        assert_eq!(
+            CANDIDATE_ROWS_PER_CANCELLATION_POLL,
+            stopped.rows.len(),
+            "the seek must stop at its first poll, not run the statement out"
+        );
+    }
+
+    /// The poll is per row block, not per row: a completing seek of 1,200 rows
+    /// must cost a handful of deadline checks, so the deadline costs nothing
+    /// measurable on the path that answers.
+    ///
+    /// The token trips on its eighth check, which is generous against the three
+    /// this seek needs (`1200 / 512` blocks plus the end-of-language check) and
+    /// far under the 1,200 a per-row poll would spend.
+    #[test]
+    fn a_completing_candidate_row_seek_polls_once_per_row_block() {
+        const BLOBS: usize = 1_200;
+        const GENEROUS_CHECK_BUDGET: usize = 8;
+        let (_temp, store) = store_with_repeated_short_name(BLOBS);
+        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+        let cancellation = CancellationToken::cancel_after_checks_for_test(GENEROUS_CHECK_BUDGET);
+
+        let rows = store
+            .declaration_order_candidate_rows_by_short_name_for_langs(
+                &["java".to_string()],
+                &generations,
+                "Sample",
+                Some(&cancellation),
+            )
+            .unwrap();
+
+        assert!(
+            rows.complete,
+            "a seek that polls per row would spend its whole check budget and report incomplete"
+        );
+        assert_eq!(BLOBS, rows.rows.len());
     }
 
     #[test]
@@ -10548,14 +11121,12 @@ mod tests {
         ] {
             assert_deleting_side_table_marks_incomplete(&RubyAdapter, "ruby", &ruby_file, table);
         }
-        for table in ["import_statements", "import_details"] {
-            assert_deleting_side_table_marks_incomplete(
-                &PythonAdapter,
-                "python",
-                &python_file,
-                table,
-            );
-        }
+        assert_deleting_side_table_marks_incomplete(
+            &PythonAdapter,
+            "python",
+            &python_file,
+            "import_statements",
+        );
         for table in ["unit_supertypes", "type_identifiers"] {
             assert_deleting_side_table_marks_incomplete(&JavaAdapter, "java", &java_file, table);
         }
@@ -11983,7 +12554,8 @@ mod tests {
             "unit_signature_metadata",
             "unit_supertypes",
             "import_statements",
-            "import_details",
+            "import_path_segments",
+            "import_lexical_prefixes",
             "type_identifiers",
         ] {
             assert!(
@@ -12005,6 +12577,45 @@ mod tests {
                 .all(|detail| !detail.contains("USE TEMP B-TREE")),
             "legacy replacement-cost fallback must not materialize grouping state: {fallback_plan:#?}"
         );
+    }
+
+    // The C# arity-free lookup (#1063) reaches ``Widget`1`` through an
+    // identifier *prefix*, which is only affordable as an index range. If the
+    // planner ever reads `code_units` end to end for it, symbol lookup is back
+    // to the per-language table walk #1688 and #1758 removed (194.3 s and
+    // 443.1 s on the measured workspaces).
+    #[test]
+    fn identifier_prefix_lookup_seeks_the_identifier_index() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = format!("EXPLAIN QUERY PLAN {}", identifier_prefix_candidate_sql());
+        let mut statement = conn.prepare(&sql).unwrap();
+        let plan = statement
+            .query_map(params_from_iter(["csharp", "Widget`", "Widgeta"]), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter().any(|detail| detail
+                .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
+            "the prefix range must seek the identifier index: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN units")),
+            "the prefix range must never scan code_units: {plan:#?}"
+        );
+    }
+
+    #[test]
+    fn byte_successor_bounds_a_prefix_range() {
+        assert_eq!(Some("Widgeta".to_string()), byte_successor("Widget`"));
+        assert_eq!(Some("create%".to_string()), byte_successor("create$"));
+        assert_eq!(None, byte_successor(""));
+        // A multi-byte tail has no single-byte successor that stays UTF-8.
+        assert_eq!(None, byte_successor("Wid\u{00e9}"));
     }
 
     #[test]
@@ -13105,7 +13716,6 @@ mod tests {
             top_level_declarations: parsed.top_level_declarations,
             declarations,
             definition_lookup_units: parsed.definition_lookup_units,
-            import_statements: parsed.import_statements,
             imports: parsed.imports,
             scala_exports: parsed.scala_exports,
             raw_supertypes: parsed.raw_supertypes,
@@ -13138,7 +13748,6 @@ mod tests {
             actual.definition_lookup_units,
             expected.definition_lookup_units
         );
-        assert_eq!(actual.import_statements, expected.import_statements);
         assert_eq!(actual.imports, expected.imports);
         assert_eq!(
             non_empty_string_vec_entries(&actual.raw_supertypes),
@@ -13192,6 +13801,635 @@ mod tests {
     }
 
     const TEST_OID: &str = "1111111111111111111111111111111111111111";
+
+    /// The bincode encoding migration 0018 retired, frozen here so the
+    /// equivalence test below cannot drift with the production encoders.
+    ///
+    /// `import_details.info` was written by `bincode::serialize`, whose legacy
+    /// defaults are fixed-width integers, u64 length prefixes, and u32 enum
+    /// discriminants. Round-tripping a fixture through it reproduces exactly
+    /// what the old reader would have handed a consumer.
+    fn frozen_import_blob_round_trip(import: &ImportInfo) -> ImportInfo {
+        let bytes = bincode::serialize(import).expect("frozen import encode");
+        bincode::deserialize(&bytes).expect("frozen import decode")
+    }
+
+    /// One `ImportInfo` per shape the ten language adapters actually produce,
+    /// from `.agents/docs/opaque-blob-inventory-2026-08.md` section 1.3.
+    ///
+    /// The point is coverage of the SHAPE space, not of any one language's
+    /// grammar: a pathless import, every path kind, a path with prefixes, a
+    /// path with scopes, a wildcard, an alias, a global, and the empty
+    /// segment/scope/prefix lists that make `Some(path)` and `None` distinct.
+    fn import_shape_fixture() -> Vec<ImportInfo> {
+        let path = |segments: &[&str],
+                    kind: Option<StructuredImportPathKind>,
+                    prefixes: &[&str],
+                    scopes: &[(usize, usize)],
+                    declaration_start_byte: usize| {
+            Some(StructuredImportPath {
+                segments: segments.iter().map(|value| value.to_string()).collect(),
+                kind,
+                lexical_prefixes: prefixes.iter().map(|value| value.to_string()).collect(),
+                lexical_scopes: scopes
+                    .iter()
+                    .map(|(start_byte, end_byte)| StructuredImportScope {
+                        start_byte: *start_byte,
+                        end_byte: *end_byte,
+                    })
+                    .collect(),
+                declaration_start_byte,
+            })
+        };
+        vec![
+            // cpp: only the snippet is meaningful; no path, no binder.
+            ImportInfo {
+                raw_snippet: "#include <vector>".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: None,
+                alias: None,
+                path: None,
+                binder_span: None,
+            },
+            // ruby: the required path string rides in `identifier`, still no path.
+            ImportInfo {
+                raw_snippet: "require 'json'".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("json".to_string()),
+                alias: None,
+                path: None,
+                binder_span: None,
+            },
+            // js/ts named import: no path, but a binder span for the bound name.
+            ImportInfo {
+                raw_snippet: "import { Alpha as Beta } from 'm'".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("Alpha".to_string()),
+                alias: Some("Beta".to_string()),
+                path: None,
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 9,
+                    end_byte: 14,
+                }),
+            },
+            // ts namespace import: wildcard with an alias and no path.
+            ImportInfo {
+                raw_snippet: "import * as ns from 'm'".to_string(),
+                is_wildcard: true,
+                is_global: false,
+                identifier: None,
+                alias: Some("ns".to_string()),
+                path: None,
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 12,
+                    end_byte: 14,
+                }),
+            },
+            // java wildcard: Namespace kind, no binder because nothing is bound.
+            ImportInfo {
+                raw_snippet: "import java.util.*;".to_string(),
+                is_wildcard: true,
+                is_global: false,
+                identifier: None,
+                alias: None,
+                path: path(
+                    &["java", "util"],
+                    Some(StructuredImportPathKind::Namespace),
+                    &[],
+                    &[],
+                    0,
+                ),
+                binder_span: None,
+            },
+            // java static member import.
+            ImportInfo {
+                raw_snippet: "import static java.util.Map.entry;".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("entry".to_string()),
+                alias: None,
+                path: path(
+                    &["java", "util", "Map", "entry"],
+                    Some(StructuredImportPathKind::StaticMember),
+                    &[],
+                    &[],
+                    20,
+                ),
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 42,
+                    end_byte: 47,
+                }),
+            },
+            // python from-import.
+            ImportInfo {
+                raw_snippet: "from pkg import alpha".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("alpha".to_string()),
+                alias: None,
+                path: path(
+                    &["pkg", "alpha"],
+                    Some(StructuredImportPathKind::ImportFrom),
+                    &[],
+                    &[],
+                    3,
+                ),
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 19,
+                    end_byte: 24,
+                }),
+            },
+            // go: a '/'-segmented path with an alias.
+            ImportInfo {
+                raw_snippet: "import svc \"example.com/app/service\"".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("svc".to_string()),
+                alias: Some("svc".to_string()),
+                path: path(
+                    &["example.com", "app", "service"],
+                    Some(StructuredImportPathKind::Namespace),
+                    &[],
+                    &[],
+                    11,
+                ),
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 4,
+                    end_byte: 7,
+                }),
+            },
+            // rust: lexical scopes, no prefixes, no kind distinctions beyond Namespace.
+            ImportInfo {
+                raw_snippet: "use serde::Deserialize;".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("Deserialize".to_string()),
+                alias: None,
+                path: path(
+                    &["serde", "Deserialize"],
+                    Some(StructuredImportPathKind::Namespace),
+                    &[],
+                    &[(100, 400), (150, 260)],
+                    686,
+                ),
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 698,
+                    end_byte: 709,
+                }),
+            },
+            // scala: the only shape with lexical prefixes, and no path kind.
+            ImportInfo {
+                raw_snippet: "import a.B".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: Some("B".to_string()),
+                alias: None,
+                path: path(
+                    &["a", "B"],
+                    None,
+                    &["outer", "inner"],
+                    &[(0, 900), (40, 300)],
+                    64,
+                ),
+                binder_span: Some(crate::analyzer::structural::facts::Span {
+                    start_byte: 71,
+                    end_byte: 72,
+                }),
+            },
+            // csharp: a plain `global using`, wildcard with a structured path.
+            ImportInfo {
+                raw_snippet: "global using System.Text;".to_string(),
+                is_wildcard: true,
+                is_global: true,
+                identifier: Some("Text".to_string()),
+                alias: None,
+                path: path(
+                    &["System", "Text"],
+                    Some(StructuredImportPathKind::Namespace),
+                    &[],
+                    &[],
+                    0,
+                ),
+                binder_span: None,
+            },
+            // An empty structured path still round-trips as `Some`, not `None`:
+            // `declaration_start_byte` is the presence marker, and NULL vs 0 is
+            // the difference the child tables cannot express.
+            ImportInfo {
+                raw_snippet: "using;".to_string(),
+                is_wildcard: false,
+                is_global: false,
+                identifier: None,
+                alias: None,
+                path: path(&[], None, &[], &[], 0),
+                binder_span: None,
+            },
+        ]
+    }
+
+    fn write_import_fixture(store: &AnalyzerStore, lang: &str, imports: &[ImportInfo]) {
+        let mut conn = store.conn.lock().expect("store mutex");
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, ?2)",
+            params![TEST_OID, lang],
+        )
+        .unwrap();
+        insert_import_rows(
+            &tx,
+            TEST_OID,
+            lang,
+            &ImportRows::from_imports(imports).unwrap(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    /// The relational rows must hand back exactly what the retired bincode
+    /// decoder would have. Every language's variance is in the fixture, so a
+    /// field this migration forgot to persist shows up as a mismatch here
+    /// rather than as a resolution bug in one language months later.
+    #[test]
+    fn import_rows_hydrate_what_the_frozen_blob_decoder_produced() {
+        let imports = import_shape_fixture();
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        write_import_fixture(&store, "rust", &imports);
+
+        let conn = store.conn.lock().expect("store mutex");
+        let hydrated = read_import_infos(&conn, TEST_OID, "rust").unwrap();
+        let frozen: Vec<ImportInfo> = imports.iter().map(frozen_import_blob_round_trip).collect();
+        assert_eq!(hydrated, frozen);
+        assert_eq!(hydrated, imports);
+
+        let bulk = read_import_infos_bulk(&conn, "rust", &[TEST_OID.to_string()]).unwrap();
+        assert_eq!(
+            bulk.get(TEST_OID).map(Vec::as_slice),
+            None,
+            "a blob with no blob_meta row is not complete, so the bulk read skips it"
+        );
+    }
+
+    /// The child tables exist to hold the three variable-length parts, and
+    /// they only exist where the language builds a structured path.
+    #[test]
+    fn import_child_rows_follow_the_structured_path() {
+        let imports = import_shape_fixture();
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        write_import_fixture(&store, "rust", &imports);
+        let conn = store.conn.lock().expect("store mutex");
+
+        let count = |table: &str| -> i64 {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1 AND lang = 'rust'"),
+                [TEST_OID],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let expected_segments: usize = imports
+            .iter()
+            .filter_map(|import| import.path.as_ref())
+            .map(|path| path.segments.len())
+            .sum();
+        assert_eq!(count("import_statements"), imports.len() as i64);
+        assert_eq!(count("import_path_segments"), expected_segments as i64);
+        assert_eq!(count("import_lexical_scopes"), 4);
+        assert_eq!(count("import_lexical_prefixes"), 2);
+
+        let pathless: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM import_statements
+                 WHERE blob_oid = ?1 AND lang = 'rust' AND declaration_start_byte IS NULL",
+                [TEST_OID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pathless, 4,
+            "cpp, ruby and the two js/ts shapes store no structured path"
+        );
+    }
+
+    /// Deleting the blob has to reach all four tables. The child tables cascade
+    /// through `import_statements`, not directly from `blobs`, so this pins the
+    /// two-hop chain rather than one FK.
+    #[test]
+    fn deleting_a_blob_cascades_every_import_table() {
+        let imports = import_shape_fixture();
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        write_import_fixture(&store, "rust", &imports);
+        let conn = store.conn.lock().expect("store mutex");
+        conn.execute("DELETE FROM blobs WHERE blob_oid = ?1", [TEST_OID])
+            .unwrap();
+        for table in [
+            "import_statements",
+            "import_path_segments",
+            "import_lexical_scopes",
+            "import_lexical_prefixes",
+        ] {
+            let remaining: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1"),
+                    [TEST_OID],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "{table} must cascade with its blob");
+        }
+    }
+
+    /// The schema, not Rust, rejects a malformed import row.
+    #[test]
+    fn import_row_constraints_are_enforced_by_the_schema() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        conn.execute(
+            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
+            [TEST_OID],
+        )
+        .unwrap();
+        let insert = |columns: &str, values: &str| -> rusqlite::Error {
+            conn.execute(
+                &format!(
+                    "INSERT INTO import_statements(blob_oid, lang, ordinal, statement, {columns})
+                     VALUES(?1, 'rust', 0, 'use x;', {values})"
+                ),
+                [TEST_OID],
+            )
+            .unwrap_err()
+        };
+        assert_constraint_error(insert("is_wildcard, is_global", "2, 0"), "CHECK");
+        assert_constraint_error(insert("is_wildcard, is_global", "0, 7"), "CHECK");
+        assert_constraint_error(
+            insert(
+                "is_wildcard, is_global, path_kind, declaration_start_byte",
+                "0, 0, 'not_a_kind', 0",
+            ),
+            "CHECK",
+        );
+        assert_constraint_error(
+            insert("is_wildcard, is_global, path_kind", "0, 0, 'namespace'"),
+            "CHECK",
+        );
+        assert_constraint_error(
+            insert(
+                "is_wildcard, is_global, binder_start, binder_end",
+                "0, 0, 9, 3",
+            ),
+            "CHECK",
+        );
+        assert_constraint_error(
+            insert("is_wildcard, is_global, binder_start", "0, 0, 9"),
+            "CHECK",
+        );
+        let negative_ordinal = conn
+            .execute(
+                "INSERT INTO import_statements(
+                   blob_oid, lang, ordinal, statement, is_wildcard, is_global
+                 ) VALUES(?1, 'rust', -1, 'use x;', 0, 0)",
+                [TEST_OID],
+            )
+            .unwrap_err();
+        assert_constraint_error(negative_ordinal, "CHECK");
+
+        conn.execute(
+            "INSERT INTO import_statements(
+               blob_oid, lang, ordinal, statement, is_wildcard, is_global
+             ) VALUES(?1, 'rust', 0, 'use x;', 0, 0)",
+            [TEST_OID],
+        )
+        .unwrap();
+        let inverted_scope = conn
+            .execute(
+                "INSERT INTO import_lexical_scopes(
+                   blob_oid, lang, ordinal, scope_ordinal, start_byte, end_byte
+                 ) VALUES(?1, 'rust', 0, 0, 20, 10)",
+                [TEST_OID],
+            )
+            .unwrap_err();
+        assert_constraint_error(inverted_scope, "CHECK");
+        let orphan_segment = conn
+            .execute(
+                "INSERT INTO import_path_segments(
+                   blob_oid, lang, ordinal, seg_ordinal, segment
+                 ) VALUES(?1, 'rust', 41, 0, 'nobody')",
+                [TEST_OID],
+            )
+            .unwrap_err();
+        assert_constraint_error(orphan_segment, "FOREIGN KEY");
+    }
+
+    /// Nothing an import row stores may depend on where the file lives: two
+    /// byte-identical files share one blob row. Writing the same source at two
+    /// paths must therefore produce identical import rows.
+    #[test]
+    fn import_rows_are_content_stable_across_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = "package demo\nimport a.{B, C}\nimport d.E as F\nclass Uses\n";
+        let first = write_file(temp.path(), "one/Uses.scala", source);
+        let second = write_file(temp.path(), "two/other/Uses.scala", source);
+        let oid = oid_for(source.as_bytes());
+
+        let dump = |file: &ProjectFile| {
+            let state = parse_state(&ScalaAdapter, file);
+            let store = AnalyzerStore::open_in_memory().unwrap();
+            store
+                .write_parsed_blob(oid, "scala", &ScalaAdapter, &state)
+                .unwrap();
+            let conn = store.conn.lock().expect("store mutex");
+            let mut statement = conn
+                .prepare(
+                    "SELECT ordinal, statement, is_wildcard, is_global, identifier, alias,
+                            path_kind, declaration_start_byte, binder_start, binder_end
+                     FROM import_statements WHERE blob_oid = ?1 AND lang = 'scala'
+                     ORDER BY ordinal",
+                )
+                .unwrap();
+            let rows = statement
+                .query_map([oid.to_string()], |row| {
+                    Ok(format!(
+                        "{:?}",
+                        (
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, Option<i64>>(8)?,
+                            row.get::<_, Option<i64>>(9)?,
+                        )
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            let mut children = conn
+                .prepare(
+                    "SELECT 'seg', ordinal, seg_ordinal, segment
+                     FROM import_path_segments WHERE blob_oid = ?1 AND lang = 'scala'
+                     UNION ALL
+                     SELECT 'prefix', ordinal, prefix_ordinal, prefix
+                     FROM import_lexical_prefixes WHERE blob_oid = ?1 AND lang = 'scala'
+                     ORDER BY 1, 2, 3",
+                )
+                .unwrap()
+                .query_map([oid.to_string()], |row| {
+                    Ok(format!(
+                        "{:?}",
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                        )
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            children.sort();
+            (rows, children)
+        };
+
+        assert!(!dump(&first).0.is_empty(), "fixture must persist imports");
+        assert_eq!(dump(&first), dump(&second));
+    }
+
+    /// Every row the four import tables write is priced by the batch cost
+    /// model. Before this migration the child rows did not exist; if a later
+    /// change adds a fourth child table and forgets the accounting, the
+    /// prepared path and the SQL fallback stop agreeing here.
+    #[test]
+    fn import_child_rows_are_counted_by_the_cost_model() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Uses.scala",
+            "package demo\nimport a.{B, C}\nclass Uses\n",
+        );
+        let state = parse_state(&ScalaAdapter, &file);
+        let rows = ImportRows::from_imports(&state.imports).unwrap();
+        assert!(
+            !rows.segments.is_empty() && !rows.prefixes.is_empty(),
+            "the Scala fixture must exercise segments and prefixes"
+        );
+        assert_eq!(
+            rows.logical_rows(),
+            rows.statements.len() + rows.segments.len() + rows.scopes.len() + rows.prefixes.len()
+        );
+
+        let source = file.read_to_string().unwrap();
+        let oid = oid_for(source.as_bytes());
+        let prepared = AnalyzerStore::open_in_memory().unwrap();
+        let generation = prepared
+            .ensure_language_epoch_value("scala", "import-cost-accounting-v1")
+            .unwrap();
+        let blob = prepare_parsed_blob(
+            oid,
+            "scala",
+            generation,
+            &ScalaAdapter,
+            Arc::new(state.clone()),
+        )
+        .unwrap();
+        let direct = AnalyzerStore::open_in_memory().unwrap();
+        let direct_generation = direct
+            .ensure_language_epoch_value("scala", "import-cost-accounting-v1")
+            .unwrap();
+        direct
+            .write_parsed_blob_at_generation(oid, "scala", direct_generation, &ScalaAdapter, &state)
+            .unwrap();
+        prepared.persist_prepared_blobs(vec![blob], PersistBatchLimits::PRODUCTION);
+
+        let cost = |store: &AnalyzerStore| {
+            let conn = store.conn.lock().expect("store mutex");
+            let mut statement = conn
+                .prepare_cached(persisted_blob_mutation_cost_fallback_sql())
+                .unwrap();
+            persisted_blob_mutation_cost_fallback_statement(
+                &mut statement,
+                oid.to_string().as_str(),
+                "scala",
+            )
+            .unwrap()
+        };
+        assert_eq!(cost(&prepared), cost(&direct));
+    }
+
+    /// Every new import read is an indexed seek. The child reads are the ones
+    /// this migration added, and their `ORDER BY` matches the primary key, so
+    /// they must not need an ordering b-tree either.
+    #[test]
+    fn import_reads_use_the_import_primary_keys() {
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let explain = |query: &str, parameters: &[&str]| {
+            let sql = format!("EXPLAIN QUERY PLAN {query}");
+            let mut statement = conn.prepare(&sql).unwrap();
+            statement
+                .query_map(params_from_iter(parameters.iter().copied()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let per_blob = explain(
+            &format!(
+                "SELECT {IMPORT_STATEMENT_COLUMNS} FROM import_statements
+                 WHERE blob_oid = ?1 AND lang = ?2
+                 ORDER BY ordinal"
+            ),
+            &[TEST_OID, "rust"],
+        );
+        assert!(
+            per_blob
+                .iter()
+                .any(|detail| detail.contains("SEARCH import_statements USING PRIMARY KEY")),
+            "{per_blob:#?}"
+        );
+        assert!(
+            per_blob
+                .iter()
+                .all(|detail| !detail.contains("SCAN import_statements")
+                    && !detail.contains("USE TEMP B-TREE")),
+            "{per_blob:#?}"
+        );
+
+        for (table, value_columns) in [
+            ("import_path_segments", "segment"),
+            ("import_lexical_prefixes", "prefix"),
+            ("import_lexical_scopes", "start_byte, end_byte"),
+        ] {
+            let plan = explain(
+                &format!(
+                    "SELECT blob_oid, ordinal, {value_columns}
+                     FROM {table}
+                     WHERE lang = ? AND blob_oid IN (?, ?)
+                     ORDER BY blob_oid, ordinal"
+                ),
+                &["rust", TEST_OID, TEST_OID],
+            );
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
+                "{table}: {plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .all(|detail| !detail.contains(&format!("SCAN {table}"))
+                        && !detail.contains("USE TEMP B-TREE")),
+                "{table}: {plan:#?}"
+            );
+        }
+    }
 
     fn insert_test_blob_and_unit(conn: &Connection) {
         conn.execute(
@@ -13566,5 +14804,116 @@ mod tests {
 
     fn oid_for(contents: &[u8]) -> Oid {
         Oid::hash_object(ObjectType::Blob, contents).unwrap()
+    }
+
+    /// Every `short_name` the store holds for one parsed blob.
+    fn persisted_short_names<A: LanguageAdapter>(
+        adapter: &A,
+        lang: &str,
+        file: &ProjectFile,
+    ) -> Vec<String> {
+        let state = parse_state(adapter, file);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_in_memory().unwrap();
+        let generation = store
+            .ensure_language_epoch_value(lang, "short-name-vocabulary-pin-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, lang, generation, adapter, &state)
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare("SELECT short_name FROM code_units WHERE blob_oid = ?1 AND lang = ?2")
+            .unwrap();
+        let names: Vec<String> = statement
+            .query_map(params![oid.to_string(), lang], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        assert!(
+            !names.is_empty(),
+            "the {lang} fixture must persist declarations for the pin to mean anything"
+        );
+        names
+    }
+
+    /// The storage contract issue #1748's structural-miss filter rests on,
+    /// pinned end to end rather than inferred from the renderer.
+    ///
+    /// `definition_candidate_short_names` drops a lookup spelling that carries
+    /// a separator `absent_segment_separators` reports for the adapter's
+    /// language, on the ground that no stored `short_name` for that language
+    /// can contain one. `.agents/docs/graph-read-cost-investigation-2026-08.md`
+    /// measured that property over 324,891 rustc rows (0 containing `::`);
+    /// this asserts it against rows the store actually wrote, over the rust
+    /// shapes most likely to smuggle a path separator into a name -- nested
+    /// inline modules, a generic inherent impl, a qualified trait impl, and an
+    /// associated const.
+    ///
+    /// If a future extractor or schema change starts persisting `::`-bearing
+    /// rust short names, the filter would begin dropping spellings that can
+    /// match. This fails first, and says so.
+    #[test]
+    fn short_name_vocabulary_excludes_separators_absent_from_the_renderer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "src/lib.rs",
+            "pub mod outer {\n\
+             \x20   pub mod inner {\n\
+             \x20       pub struct Widget<T> { pub value: T }\n\
+             \x20       impl<T: core::fmt::Debug> Widget<T> {\n\
+             \x20           pub const LIMIT: usize = 4;\n\
+             \x20           pub fn make(value: T) -> Self { Widget { value } }\n\
+             \x20       }\n\
+             \x20       impl<T> core::default::Default for Widget<T>\n\
+             \x20       where T: core::default::Default {\n\
+             \x20           fn default() -> Self { Widget { value: T::default() } }\n\
+             \x20       }\n\
+             \x20   }\n\
+             }\n\
+             pub fn top() -> usize { outer::inner::Widget::<usize>::LIMIT }\n",
+        );
+
+        let names = persisted_short_names(&RustAdapter, "rust", &file);
+        let absent = crate::analyzer::fq_name::absent_segment_separators(Language::Rust);
+        assert_eq!(
+            &["::"],
+            absent,
+            "rust has no `::` rendering rule, so `::` is the separator the filter drops"
+        );
+        let offenders: Vec<&String> = names
+            .iter()
+            .filter(|name| absent.iter().any(|separator| name.contains(separator)))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "persisted rust short names must not contain {absent:?}; offenders: {offenders:?} \
+             out of {names:?}"
+        );
+    }
+
+    /// The contract is per language, not global. C++ renders `::` between
+    /// namespace segments, so nothing may be dropped for it -- and its
+    /// persisted vocabulary is free to carry `::`.
+    #[test]
+    fn cpp_short_name_vocabulary_is_not_narrowed_by_the_filter() {
+        assert!(
+            crate::analyzer::fq_name::absent_segment_separators(Language::Cpp).is_empty(),
+            "cpp renders every separator the lookup vocabulary can carry"
+        );
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "sample.cpp",
+            "namespace ns1 { namespace ns2 { struct Outer { void method(); }; } }\n\
+             void ns1::ns2::Outer::method() {}\n",
+        );
+        let names = persisted_short_names(&CppAdapter, "cpp", &file);
+        assert!(
+            names.iter().any(|name| name.contains("Outer")),
+            "cpp fixture should persist the nested type: {names:?}"
+        );
     }
 }

@@ -84,7 +84,9 @@ Put code in `brokk-bifrost-analysis` when the code needs one or more of these it
 
 Do not move such code to `brokk-bifrost-core`, even when the move appears convenient.
 
-`analyzer/capabilities.rs` is the standard example. It remains in analysis because `TypeHierarchyProvider::get_polymorphic_matches` and `build_direct_descendant_index` are generic over `IAnalyzer`.
+`analyzer/capabilities.rs` no longer illustrates this rule. The file moved to `crates/bifrost-core/src/analyzer/capabilities.rs` when the nine language crates were split out. The move is correct: the capability traits name only core types, and every language crate implements them, so leaving the traits in analysis would have made each language crate depend on the largest compilation unit. The parts that are generic over `IAnalyzer` -- `TypeHierarchyProvider::get_polymorphic_matches` and `build_direct_descendant_index` -- stayed in `brokk-bifrost-analysis`, which is what the rule above actually requires.
+
+Read the rule as stated, not through that example. What must stay in analysis is code that needs an `IAnalyzer`, a store, a grammar, or a language module. A trait definition that needs none of them belongs in core.
 
 # Analyzer Test Guidance
 
@@ -389,6 +391,18 @@ Read AST fields such as `path`, `name`, `type`, `value`, and `field`.
 If more than one location needs the same interpretation, add a shared structured helper.
 
 Backward compatibility is not yet a requirement. When requirements change, simplify or correct the APIs instead.
+
+# SQL and the analyzer store
+
+The analyzer cache is a SQLite database. The schema and its views are the interface.
+
+- Prefer SQL at the call site to a data-access layer. Write the query that fits the problem at hand. Do not add a wrapper method for each question. Half the value of SQL is that you can adapt the query to the problem.
+- When more than one client uses one query shape, create a view for that shape. Put the shared predicates in the view, not in each query.
+- Put domain invariants in the schema and in views, not in Rust method bodies. Examples: live-blob and generation filtering, definition-lookup membership, language scope. A call-site query against a view cannot forget the invariant.
+- Keep connection handling, transactions, write batching, and cancellation in the store infrastructure. That layer is infrastructure, not wrapping.
+- Pin query cost in tests with EXPLAIN QUERY PLAN assertions. Assert that the query uses the intended index and does not scan a large table. Prefer this to Rust-side scan counters for new pins.
+- Do not store serialized Rust structures as opaque blobs when the data has queryable structure. Store rows. Binary payloads that SQL cannot usefully query, such as embedding vectors, can stay binary.
+- A JSON column is an acceptable exception for a genuinely heterogeneous or open shape that is not on a hot read path. It must carry CHECK(json_valid(...)), hold one shape per column, and contain no field that needs a foreign key or its own CHECK. When a second reader wants a field from it, promote that field to a generated column with an index.
 
 # Implementation details
 

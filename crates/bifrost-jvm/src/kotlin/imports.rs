@@ -121,6 +121,7 @@ pub fn kotlin_import_info_from_node(node: Node<'_>, source: &str) -> Option<Impo
     Some(ImportInfo {
         raw_snippet: render_kotlin_import(&segments, is_wildcard, alias.as_deref()),
         is_wildcard,
+        is_global: false,
         identifier,
         alias,
         path: Some(StructuredImportPath {

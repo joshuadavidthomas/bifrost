@@ -1,7 +1,8 @@
-use crate::common::InlineTestProject;
+use crate::common::{BuiltInlineTestProject, InlineTestProject};
 use brokk_bifrost::{
-    CSharpAnalyzer, CancellationToken, CppAnalyzer, GoAnalyzer, IAnalyzer, JavaAnalyzer,
-    JavascriptAnalyzer, Language, PhpAnalyzer, RustAnalyzer, ScalaAnalyzer, TypescriptAnalyzer,
+    AnalyzerConfig, CSharpAnalyzer, CancellationToken, CppAnalyzer, GoAnalyzer, IAnalyzer,
+    JavaAnalyzer, JavascriptAnalyzer, Language, PhpAnalyzer, RustAnalyzer, ScalaAnalyzer,
+    TypescriptAnalyzer,
     searchtools::{
         ScanUsagesByReferenceParams, ScanUsagesEntry, ScanUsagesResult, ScanUsagesStatus,
         SearchSymbolsParams, SymbolLookupParams, SymbolSourcesResult, get_symbol_ancestors,
@@ -2273,4 +2274,296 @@ fn source_for(analyzer: &dyn IAnalyzer, symbol: &str) -> SymbolSourcesResult {
             symbols: vec![symbol.to_string()],
         },
     )
+}
+
+/// A multi-language workspace whose Go target is spelled with a foreign owner
+/// separator, so the short-name stage of symbol lookup can only offer it as a
+/// *suffix* match and resolution falls through to the suffix-pattern stage.
+/// The PHP file keeps `has_complete_symbol_lookup_index` false workspace-wide,
+/// which is what let the pattern stage run at all on the measured corpora.
+fn issue_1688_multi_language_project() -> BuiltInlineTestProject {
+    InlineTestProject::new()
+        .file("go.mod", "module github.com/example/app\n\ngo 1.22\n")
+        .file(
+            "kvserver/replica.go",
+            "package kvserver\n\ntype Replica struct{}\n\nfunc (r *Replica) handleRaftReady() {}\n",
+        )
+        .file(
+            "analysis/summary.py",
+            "class Report:\n    def render(self):\n        return None\n",
+        )
+        .file(
+            "src/util.cpp",
+            "namespace util {\nvoid compute();\n}\nvoid util::compute() {}\n",
+        )
+        .file(
+            "src/Legacy.php",
+            "<?php\nnamespace App;\nclass Legacy {\n    public function run() {}\n}\n",
+        )
+        .build()
+}
+
+// Issue #1688: the suffix-pattern stage asked each language's store for
+// candidates by regex, which the store can only answer by reading every
+// declaration it holds for that language -- once per workspace language, for a
+// query that returns one unit. The stage now seeks the persisted terminal
+// identifier instead. The selector must resolve exactly as before, and no
+// language may pay a full declaration scan for it.
+#[test]
+fn issue_1688_qualified_go_selector_resolves_without_a_full_declaration_scan() {
+    let project = issue_1688_multi_language_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+
+    let result = source_for(analyzer, "kvserver/Replica.handleRaftReady");
+
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.sources.len(), "{result:#?}");
+    assert_eq!("kvserver/replica.go", result.sources[0].path);
+    assert_eq!(
+        0,
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        "resolving one qualified selector must not read any language's whole declaration table"
+    );
+}
+
+// The same stage on a total miss: still conclusive, still no full scan.
+#[test]
+fn issue_1688_unresolvable_qualified_selector_stays_not_found() {
+    let project = issue_1688_multi_language_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+
+    let result = source_for(analyzer, "kvserver/Replica.handleRaftNotReady");
+
+    assert!(result.sources.is_empty(), "{result:#?}");
+    assert!(result.ambiguous.is_empty(), "{result:#?}");
+    assert_eq!(1, result.not_found.len(), "{result:#?}");
+    assert_eq!(
+        "kvserver/Replica.handleRaftNotReady",
+        result.not_found[0].input
+    );
+}
+
+// `has_complete_symbol_lookup_index` is an AND over the workspace's delegates,
+// so one PHP file used to turn the #1688 conclusive-miss gate off for every
+// language. With PhpAnalyzer advertising its (persisted, complete) index, a
+// qualified miss is decided by the identifier index again and never reaches the
+// whole-workspace declaration scan. The PHP symbols themselves must keep
+// resolving, which is what makes the advertisement true.
+#[test]
+fn php_in_a_mixed_workspace_keeps_the_conclusive_miss_gate() {
+    let project = issue_1688_multi_language_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    let resolved = source_for(analyzer, "App/Legacy.run");
+    assert!(resolved.not_found.is_empty(), "{resolved:#?}");
+    assert_eq!(1, resolved.sources.len(), "{resolved:#?}");
+    assert_eq!("src/Legacy.php", resolved.sources[0].path);
+
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+    let missing = source_for(analyzer, "App/Legacy.neverDeclared");
+
+    assert_eq!(1, missing.not_found.len(), "{missing:#?}");
+    assert_eq!(
+        0,
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        "a qualified miss must stay conclusive on the identifier index, not fall through to a workspace scan"
+    );
+}
+
+// A terminal identifier that two languages both persist must keep reporting the
+// same ambiguity it reported when the stage scanned: the seek narrows the
+// candidate set by terminal segment, which every match of the suffix pattern
+// carries by construction, so both languages' declarations still arrive.
+#[test]
+fn issue_1688_terminal_shared_across_languages_keeps_its_ambiguity() {
+    let project = InlineTestProject::new()
+        .file("go.mod", "module github.com/example/app\n\ngo 1.22\n")
+        .file(
+            "kvserver/replica.go",
+            "package kvserver\n\ntype Replica struct{}\n\nfunc (r *Replica) handleRaftReady() {}\n",
+        )
+        .file(
+            "src/replica.cpp",
+            "namespace kvserver {\nclass Replica {\npublic:\n    void handleRaftReady();\n};\nvoid Replica::handleRaftReady() {}\n}\n",
+        )
+        .file(
+            "src/Legacy.php",
+            "<?php\nnamespace App;\nclass Legacy {\n    public function run() {}\n}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    let result = source_for(analyzer, "Replica.handleRaftReady");
+
+    assert!(result.sources.is_empty(), "{result:#?}");
+    assert!(result.not_found.is_empty(), "{result:#?}");
+    assert_eq!(1, result.ambiguous.len(), "{result:#?}");
+    assert_eq!(
+        vec![
+            "github.com/example/app/kvserver.Replica.handleRaftReady".to_string(),
+            "kvserver.Replica.handleRaftReady".to_string(),
+        ],
+        result.ambiguous[0].matches
+    );
+}
+
+/// A workspace whose qualified selector `Widget.render` is declared by five
+/// Rust modules, so the indexed suffix stage can never return a unique
+/// resolution and fuzzy resolution has to fall through to the ambiguity
+/// decision. `Gauge.calibrate` is the unique twin of that shape, and the Go and
+/// Python files make a per-language cost visible as a per-language count.
+fn issue_1758_ambiguous_selector_project() -> BuiltInlineTestProject {
+    let widget = "pub struct Widget;\n\nimpl Widget {\n    pub fn render(&self) {}\n}\n";
+    InlineTestProject::new()
+        .file("go.mod", "module github.com/example/app\n\ngo 1.22\n")
+        .file("src/left.rs", widget)
+        .file("src/right.rs", widget)
+        .file("src/third.rs", widget)
+        .file("src/fourth.rs", widget)
+        .file("src/fifth.rs", widget)
+        .file(
+            "src/only.rs",
+            "pub struct Gauge;\n\nimpl Gauge {\n    pub fn calibrate(&self) {}\n}\n",
+        )
+        .file(
+            "kvserver/replica.go",
+            "package kvserver\n\ntype Replica struct{}\n\nfunc (r *Replica) handleRaftReady() {}\n",
+        )
+        .file(
+            "analysis/summary.py",
+            "class Report:\n    def render(self):\n        return None\n",
+        )
+        .build()
+}
+
+/// Issue #1063, re-broken and re-fixed. A declaration's lookup aliases are
+/// built from its *source* spelling, but the identifier index is keyed on the
+/// persisted one, and the two differ for a C# generic type (``Widget`1``) and
+/// a TypeScript static member (`create$static`). While symbol lookup fell back
+/// to a whole-workspace scan the difference only cost time; once `7e7ac9ee`
+/// (#1688) and `0b35bb12` (#1758) made an indexed miss conclusive, it became a
+/// wrong `NotFound` -- `csharp_generic_type_resolves_without_arity_spelling`
+/// and `scan_usages_resolves_public_typescript_static_method_symbol` are the
+/// resolution pins for that.
+///
+/// This is the cost pin for the repair: the decorated spellings are reached by
+/// widening the *seek* (`decorated_identifier_seeks`), so both conclusive-miss
+/// gates stay in force and neither language's declaration table is read end to
+/// end.
+#[test]
+fn issue_1063_decorated_identifier_spellings_resolve_without_a_full_declaration_scan() {
+    let project = InlineTestProject::new()
+        .file(
+            "src/Primitives.cs",
+            "namespace ScottPlot;\n\npublic class CountingCollection<T> {\n    public void Add(T item) {}\n}\n",
+        )
+        .file(
+            "src/api.ts",
+            "export class ApiClient {\n  static create(baseUrl: string): ApiClient {\n    return new ApiClient();\n  }\n}\n",
+        )
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+
+    let arity_free = source_for(analyzer, "CountingCollection");
+    assert!(arity_free.not_found.is_empty(), "{arity_free:#?}");
+    assert_eq!(1, arity_free.sources.len(), "{arity_free:#?}");
+    assert_eq!(
+        "src/Primitives.cs", arity_free.sources[0].path,
+        "{arity_free:#?}"
+    );
+
+    let static_member = source_for(analyzer, "ApiClient.create");
+    assert!(static_member.not_found.is_empty(), "{static_member:#?}");
+    assert_eq!(1, static_member.sources.len(), "{static_member:#?}");
+    assert_eq!(
+        "src/api.ts", static_member.sources[0].path,
+        "{static_member:#?}"
+    );
+
+    // A genuine miss must still be conclusive, not a scan.
+    let miss = source_for(analyzer, "NoSuchDeclaration");
+    assert!(miss.sources.is_empty(), "{miss:#?}");
+    assert_eq!(1, miss.not_found.len(), "{miss:#?}");
+
+    assert_eq!(
+        0,
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        "reaching a decorated identifier spelling must stay an index seek"
+    );
+}
+
+/// Issue #1758: fuzzy resolution's last stage decided ambiguity by
+/// materializing `get_all_declarations()` -- every declaration of every
+/// workspace language -- and rescanning it. Measured on the reported
+/// workspace: 443.1 s and 4.4 GB for a `Vec` of 3,480,147 `CodeUnit`s, plus a
+/// whole-workspace live-path scan per language inside each of those reads, to
+/// feed a 2.6 s match loop. The stage now decides from the candidates the
+/// indexed suffix stage already matched.
+///
+/// The three outcomes it can reach -- a unique hit, a miss, and an ambiguity
+/// that only this stage reports -- must be unchanged, and none of them may
+/// charge a declaration-table scan.
+#[test]
+fn issue_1758_fuzzy_resolution_decides_ambiguity_without_a_full_declaration_scan() {
+    let project = issue_1758_ambiguous_selector_project();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+
+    analyzer
+        .test_hooks()
+        .reset_full_declaration_scan_count_for_test();
+    let hit = source_for(analyzer, "Gauge.calibrate");
+    assert!(hit.not_found.is_empty(), "{hit:#?}");
+    assert!(hit.ambiguous.is_empty(), "{hit:#?}");
+    assert_eq!(1, hit.sources.len(), "{hit:#?}");
+    assert_eq!("src/only.rs", hit.sources[0].path, "{hit:#?}");
+
+    let miss = source_for(analyzer, "Widget.nosuchmember");
+    assert!(miss.sources.is_empty(), "{miss:#?}");
+    assert!(miss.ambiguous.is_empty(), "{miss:#?}");
+    assert_eq!(1, miss.not_found.len(), "{miss:#?}");
+    assert_eq!("Widget.nosuchmember", miss.not_found[0].input, "{miss:#?}");
+
+    // The stage under test: five declarations answer this selector, so no
+    // indexed stage can return a unique resolution and the ambiguity decision
+    // is what reports them.
+    let ambiguous = source_for(analyzer, "Widget.render");
+    assert!(ambiguous.sources.is_empty(), "{ambiguous:#?}");
+    assert!(ambiguous.not_found.is_empty(), "{ambiguous:#?}");
+    assert_eq!(1, ambiguous.ambiguous.len(), "{ambiguous:#?}");
+    assert_eq!(
+        vec![
+            "fifth.Widget.render".to_string(),
+            "fourth.Widget.render".to_string(),
+            "left.Widget.render".to_string(),
+            "right.Widget.render".to_string(),
+            "third.Widget.render".to_string(),
+        ],
+        ambiguous.ambiguous[0].matches,
+        "{ambiguous:#?}"
+    );
+
+    assert_eq!(
+        0,
+        analyzer.test_hooks().full_declaration_scan_count_for_test(),
+        "deciding fuzzy ambiguity must not read any language's whole declaration table"
+    );
 }

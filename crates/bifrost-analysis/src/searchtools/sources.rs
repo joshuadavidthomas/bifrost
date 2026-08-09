@@ -75,6 +75,8 @@ pub struct SymbolSourcesResult {
     pub ambiguous: Vec<AmbiguousSymbol>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub ambiguous_paths: Vec<AmbiguousPathInput>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub too_broad: Vec<TooBroadScope>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -101,6 +103,7 @@ pub(super) enum SourceLookupOutcome {
     NotFound(NotFoundInput),
     Ambiguous(AmbiguousSymbol),
     AmbiguousPath(AmbiguousPathInput),
+    TooBroad(TooBroadScope),
     BudgetExceeded,
 }
 
@@ -350,11 +353,20 @@ pub fn get_symbol_sources_with_source_budget(
     get_symbol_sources_with_budget(analyzer, params, &SourceByteBudget::new(max_source_bytes))
 }
 
+/// Two independent bounds apply here. `source_budget` caps the total bytes of
+/// source text one call may return, and exceeding it fails the whole call.
+/// `GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET` caps how many files ONE
+/// glob-shaped symbol argument may expand to; a target over that bound is
+/// reported through `too_broad` and contributes no source blocks at all,
+/// because the full text of an arbitrary subset of a huge match looks complete
+/// while meaning nothing. The per-target cap is checked first: a too-broad
+/// target is a bad request, not an oversized answer.
 fn get_symbol_sources_with_budget(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
     source_budget: &SourceByteBudget,
 ) -> Result<SymbolSourcesResult, SymbolSourcesBudgetExceeded> {
+    let max_files_per_target = GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET;
     // One tool call is one read-only analyzer request. The scope is what lets
     // every `WorkspaceFileResolver` built below -- one per call site, times one
     // per symbol in the parallel loop -- share a single workspace listing
@@ -467,6 +479,9 @@ fn get_symbol_sources_with_budget(
                         SourceLookupOutcome::BudgetExceeded => {
                             (index, SourceLookupOutcome::BudgetExceeded)
                         }
+                        SourceLookupOutcome::TooBroad(item) => {
+                            (index, SourceLookupOutcome::TooBroad(item))
+                        }
                     };
                 }
                 Some(PathQualifiedSelector::AmbiguousPath(item)) => {
@@ -517,6 +532,16 @@ fn get_symbol_sources_with_budget(
                 return (index, SourceLookupOutcome::AmbiguousPath(item.clone()));
             }
             if !file_matches.files.is_empty() {
+                if file_matches.files.len() > max_files_per_target {
+                    return (
+                        index,
+                        SourceLookupOutcome::TooBroad(too_broad_scope(
+                            &symbol,
+                            &file_matches.files,
+                            max_files_per_target,
+                        )),
+                    );
+                }
                 let sources = match source_blocks_for_files_with_budget(
                     analyzer,
                     file_matches.files,
@@ -620,12 +645,14 @@ fn get_symbol_sources_with_budget(
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
     let mut ambiguous_paths = Vec::new();
+    let mut too_broad = Vec::new();
     for (_, outcome) in outcomes {
         match outcome {
             SourceLookupOutcome::Found(blocks) => sources.extend(dedup_source_blocks(blocks)),
             SourceLookupOutcome::NotFound(symbol) => not_found.push(symbol),
             SourceLookupOutcome::Ambiguous(item) => ambiguous.push(item),
             SourceLookupOutcome::AmbiguousPath(item) => ambiguous_paths.push(item),
+            SourceLookupOutcome::TooBroad(item) => too_broad.push(item),
             SourceLookupOutcome::BudgetExceeded => {
                 return Err(SymbolSourcesBudgetExceeded {
                     max_source_bytes: source_budget.max_source_bytes,
@@ -639,6 +666,7 @@ fn get_symbol_sources_with_budget(
         not_found,
         ambiguous,
         ambiguous_paths,
+        too_broad,
     })
 }
 

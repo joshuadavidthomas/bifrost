@@ -11,7 +11,7 @@ use crate::declarations::{
     collect_go_import_infos, go_embedded_type_nodes, go_field_declaration_is_embedded,
 };
 use crate::graph::ast::{field_owner_token, first_named_child, selector_parts, type_ref_from_node};
-use crate::imports::{default_go_import_local_name, extract_go_import_path};
+use crate::imports::{default_go_import_local_name, go_import_path};
 use crate::packages::{GO_MODULE_SCOPE_SEGMENT, GoWorkspacePathIndex, canonical_go_package_name};
 use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeAliasProvider};
 use brokk_bifrost_core::analyzer::common::language_for_file;
@@ -978,7 +978,7 @@ fn import_bindings_from_imports(
         if alias == Some("_") {
             continue;
         }
-        let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+        let Some(path) = go_import_path(import) else {
             continue;
         };
         let resolved = resolve_go_module(file, &path, dir_index, workspace_paths);
@@ -1210,7 +1210,7 @@ fn import_binder_of(
         if import.alias.as_deref() == Some("_") {
             continue;
         }
-        let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+        let Some(path) = go_import_path(&import) else {
             continue;
         };
         match import.alias.as_deref() {

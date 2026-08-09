@@ -7,7 +7,7 @@
 use crate::declarations::{
     determine_go_package_name, go_field_declaration_is_embedded, go_node_text,
 };
-use crate::imports::{default_go_import_local_name, extract_go_import_path};
+use crate::imports::{default_go_import_local_name, go_import_path};
 use crate::packages::canonical_go_package_name;
 use brokk_bifrost_core::analyzer::capabilities::ImportAnalysisProvider;
 use brokk_bifrost_core::analyzer::type_relations::{MethodKey, MethodSet};
@@ -784,7 +784,7 @@ fn import_packages(
         if alias == Some("_") {
             continue;
         }
-        let Some(path) = extract_go_import_path(&import.raw_snippet) else {
+        let Some(path) = go_import_path(&import) else {
             continue;
         };
         let mut packages: Vec<_> = package_index

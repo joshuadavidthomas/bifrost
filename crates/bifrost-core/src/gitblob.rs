@@ -13,8 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use git2::{
-    AttrCheckFlags, AttrValue, DiffOptions, IndexEntry, ObjectType, Oid, Repository, Status,
-    StatusOptions,
+    AttrCheckFlags, AttrValue, IndexEntry, ObjectType, Oid, Repository, Status, StatusOptions,
 };
 use growable_bloom_filter::GrowableBloom;
 
@@ -309,6 +308,34 @@ fn canonical_blob_size(repo: &Repository, oid: Oid) -> Option<u64> {
         .get(&oid)
         .copied()
         .flatten()
+}
+
+/// Resolve every existing tracked and untracked path in one repository snapshot.
+///
+/// The Git index supplies clean tracked paths without reading their bytes. The
+/// worktree diff supplies only changed, deleted, and untracked paths that need
+/// filesystem checks. Callers that need the blob identity should use
+/// [`all_working_tree_oid_values`]; this path-only form avoids hashing dirty
+/// files when a caller only needs the active file set.
+pub fn all_working_tree_paths(repo: &Repository) -> Result<HashSet<String>> {
+    let workdir = workdir(repo)?;
+    let mut index = repo.index().map_err(|e| e.to_string())?;
+    index.read(true).map_err(|e| e.to_string())?;
+    let dirty = dirty_worktree_paths(repo)?;
+    let mut paths = HashSet::with_capacity(index.len() + dirty.len());
+
+    for entry in index.iter() {
+        let rel = index_path_to_string(&entry)?;
+        if !dirty.contains(&rel) || workdir.join(&rel).is_file() {
+            paths.insert(rel);
+        }
+    }
+    for rel in dirty {
+        if index.get_path(Path::new(&rel), 0).is_none() && workdir.join(&rel).is_file() {
+            paths.insert(rel);
+        }
+    }
+    Ok(paths)
 }
 
 fn resolve_working_tree_oid_values(
@@ -638,25 +665,46 @@ fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
 }
 
 fn dirty_worktree_paths(repo: &Repository) -> Result<HashSet<String>> {
-    let mut options = DiffOptions::new();
-    options
-        .include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_typechange(true)
-        .ignore_submodules(true)
-        .skip_binary_check(true);
-    let mut index = repo.index().map_err(|error| error.to_string())?;
-    index.read(true).map_err(|error| error.to_string())?;
-    let diff = repo
-        .diff_index_to_workdir(Some(&index), Some(&mut options))
-        .map_err(|error| error.to_string())?;
+    let _scope = crate::profiling::scope("gitblob::dirty_worktree_paths");
+    let workdir = workdir(repo)?;
+    // libgit2's recursive index-to-worktree diff can rescan very large trees
+    // one entry at a time. Native Git uses its optimized index and filesystem
+    // checks for the same dirty overlay. This matters for repositories such as
+    // Firefox, where the libgit2 scan exceeded the MCP request budget.
+    let output = Command::new("git")
+        .current_dir(workdir)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .map_err(|error| format!("git status failed to spawn: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
     let mut dirty = HashSet::new();
-    for delta in diff.deltas() {
-        if let Some(path) = delta.old_file().path() {
-            dirty.insert(path.to_string_lossy().into_owned());
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            continue;
         }
-        if let Some(path) = delta.new_file().path() {
-            dirty.insert(path.to_string_lossy().into_owned());
+        // Porcelain v1 records two status bytes, one space, then the path.
+        // With -z, rename and copy records contain the second path as the next
+        // NUL-delimited field. Keep both paths so deletions and additions are
+        // removed or overlaid correctly by callers.
+        if field.len() < 4 {
+            continue;
+        }
+        let status = &field[..2];
+        let path = &field[3..];
+        if status != b"  " && status != b"!!" {
+            dirty.insert(String::from_utf8_lossy(path).into_owned());
+            if (status.contains(&b'R') || status.contains(&b'C'))
+                && let Some(previous) = fields.next().filter(|previous| !previous.is_empty())
+            {
+                dirty.insert(String::from_utf8_lossy(previous).into_owned());
+            }
         }
     }
     Ok(dirty)
@@ -803,6 +851,24 @@ mod tests {
             0,
             "clean tracked content must use its index OID"
         );
+    }
+
+    #[test]
+    fn all_working_tree_paths_use_index_and_dirty_overlay() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("tracked.rs"), "fn tracked() {}\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("dirty.rs"), "fn dirty() {}\n").unwrap();
+
+        let paths = all_working_tree_paths(&repo).unwrap();
+        assert!(paths.contains("tracked.rs"), "{paths:?}");
+        assert!(paths.contains("dirty.rs"), "{paths:?}");
+
+        std::fs::remove_file(temp.path().join("tracked.rs")).unwrap();
+        let paths = all_working_tree_paths(&repo).unwrap();
+        assert!(!paths.contains("tracked.rs"), "{paths:?}");
+        assert!(paths.contains("dirty.rs"), "{paths:?}");
     }
 
     #[test]

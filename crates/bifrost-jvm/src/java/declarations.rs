@@ -1432,7 +1432,6 @@ pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
             }
             "import_declaration" => {
                 let raw = node_text(child, source).trim().to_string();
-                parsed.import_statements.push(raw.clone());
                 parsed.imports.push(parse_import_info(child, source, raw));
             }
             "class_declaration"
