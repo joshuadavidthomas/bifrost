@@ -6,7 +6,7 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredTypeIdentity, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
-use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportKind};
+use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportBinding, ImportKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -1843,6 +1843,28 @@ fn rust_declared_impl_owner(
         .cloned()
 }
 
+/// The module path that a `use` binding's local name stands for when that name
+/// roots a qualified `impl` owner path such as `impl Trait for m::Writer`.
+///
+/// A namespace binding already names its module. A renamed import keeps the
+/// imported terminal name apart from the module it came from, so `m` in
+/// `use crate::model as m;` stands for `crate::model` - the two joined. A glob
+/// binding names no path root at all.
+fn rust_import_binding_module_route(binding: &ImportBinding) -> Option<String> {
+    match binding.kind {
+        ImportKind::Namespace => Some(binding.module_specifier.clone()),
+        ImportKind::Named => {
+            let imported_name = binding.imported_name.as_deref()?;
+            Some(if binding.module_specifier.is_empty() {
+                imported_name.to_string()
+            } else {
+                format!("{}::{imported_name}", binding.module_specifier)
+            })
+        }
+        _ => None,
+    }
+}
+
 fn rust_impl_owner_identity_from_path(
     file: &ProjectFile,
     lexical_package: &str,
@@ -1855,12 +1877,12 @@ fn rust_impl_owner_identity_from_path(
     let (package_name, module_specifier) = if let Some((root, remainder)) =
         module_path.split_first()
         && let Some(binding) = import_binder.bindings.get(root)
-        && binding.kind == ImportKind::Namespace
+        && let Some(root_specifier) = rust_import_binding_module_route(binding)
     {
         let mut resolved = crate::imports::resolve_rust_module_path_with_crate(
             lexical_package,
             &crate_package,
-            &binding.module_specifier,
+            &root_specifier,
         )?;
         for component in remainder {
             if !resolved.is_empty() {
@@ -1868,7 +1890,7 @@ fn rust_impl_owner_identity_from_path(
             }
             resolved.push_str(component);
         }
-        (resolved, binding.module_specifier.clone())
+        (resolved, root_specifier)
     } else {
         let module_specifier = module_path.join("::");
         let resolved = crate::imports::resolve_rust_module_path_with_crate(
