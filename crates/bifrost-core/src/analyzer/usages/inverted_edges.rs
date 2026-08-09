@@ -459,6 +459,16 @@ pub struct FileDeclarations<K = String> {
     pub definitions: HashMap<K, Vec<(usize, usize)>>,
 }
 
+impl<K> FileDeclarations<K> {
+    /// Add a whole-file caller span for a graph-specific synthetic scope.
+    ///
+    /// Public declaration APIs omit file scopes. A language edge pass can use
+    /// this narrow hook when a file-level construct has no named declaration.
+    pub fn add_file_scope(&mut self, key: K, source_len: usize) {
+        self.enclosers.push((0, source_len, key));
+    }
+}
+
 /// Everything one file's edge scan reads: the parsed tree and its source text,
 /// the node domain the build is keyed on, and this file's declaration index.
 ///
@@ -511,7 +521,7 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
 
     /// The key of the smallest declaration whose byte span contains `[start, end)`
     /// -- the call site's enclosing caller. Mirrors `IAnalyzer::enclosing_code_unit`.
-    fn enclosing(&self, start: usize, end: usize) -> Option<&K> {
+    pub fn enclosing(&self, start: usize, end: usize) -> Option<&K> {
         self.declarations
             .enclosers
             .iter()

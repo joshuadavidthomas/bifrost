@@ -1106,6 +1106,84 @@ pub fn is_ignored_type_context(node: Node<'_>) -> bool {
     ) && parent.child_by_field_name("name") == Some(node)
 }
 
+/// Whether `node` is a class-name position in a Java module descriptor.
+///
+/// The Java grammar uses the general `_name` production for the `uses` and
+/// `provides` directive fields. This means an unqualified class name is an
+/// `identifier`, not a `type_identifier`, even though it names a type. Keep
+/// this test tied to the directive fields so module names and package names in
+/// `requires`, `exports`, and `opens` never enter the type-reference surface.
+pub fn is_module_type_reference(node: Node<'_>) -> bool {
+    let mut reference = node;
+    while let Some(parent) = reference.parent()
+        && parent.kind() == "scoped_identifier"
+    {
+        reference = parent;
+    }
+    let Some(parent) = reference.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "uses_module_directive" => parent.child_by_field_name("type") == Some(reference),
+        "provides_module_directive" => {
+            if parent.child_by_field_name("provided") == Some(reference) {
+                return true;
+            }
+
+            // The grammar assigns the repeated `provider` field to providers
+            // after the first one. The first `_name` after `with` is unnamed,
+            // so use the structured child order after the `provided` field to
+            // include it as well. No source text is inspected here.
+            let Some(provided) = parent.child_by_field_name("provided") else {
+                return false;
+            };
+            let mut seen_provided = false;
+            let mut cursor = parent.walk();
+            parent
+                .children(&mut cursor)
+                .enumerate()
+                .any(|(index, child)| {
+                    if child == provided {
+                        seen_provided = true;
+                        return false;
+                    }
+                    seen_provided
+                        && child == reference
+                        && matches!(child.kind(), "identifier" | "scoped_identifier")
+                        && (parent.field_name_for_child(index as u32) == Some("provider")
+                            || parent.field_name_for_child(index as u32).is_none())
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Whether `node` names a module or package in a Java module directive.
+///
+/// These names use the same `_name` grammar production as class names, but
+/// they are not type references. Keep them out of the inverted type graph.
+pub fn is_non_type_module_reference(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "requires_module_directive" => parent.child_by_field_name("module") == Some(node),
+        "exports_module_directive" | "opens_module_directive" => {
+            if parent.child_by_field_name("package") == Some(node) {
+                return true;
+            }
+            let mut cursor = parent.walk();
+            parent
+                .children(&mut cursor)
+                .enumerate()
+                .any(|(index, child)| {
+                    child == node && parent.field_name_for_child(index as u32) == Some("modules")
+                })
+        }
+        _ => false,
+    }
+}
+
 pub fn is_declaration_name(node: Node<'_>) -> bool {
     node.parent()
         .and_then(|parent| parent.child_by_field_name("name"))

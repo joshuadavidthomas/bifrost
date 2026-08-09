@@ -4,9 +4,9 @@ use super::resolver::{
     ReceiverTargetMatch, TargetKind, TargetSpec, argument_list_arity,
     bare_field_context_matches_target, bare_method_context_matches_target,
     constructor_method_reference_receiver, has_proven_static_import, infer_type_from_value,
-    is_declaration_name, is_ignored_type_context, java_method_signatures_match,
-    nested_type_for_owner, node_text, receiver_matches_target, receiver_type_matches_target,
-    resolve_field_access_type, resolve_field_access_type_segments,
+    is_declaration_name, is_ignored_type_context, is_module_type_reference,
+    java_method_signatures_match, nested_type_for_owner, node_text, receiver_matches_target,
+    receiver_type_matches_target, resolve_field_access_type, resolve_field_access_type_segments,
     resolve_non_nested_type_from_node, resolve_type_from_node, resolve_type_segments,
     same_owner_context, seed_class_binding,
 };
@@ -887,6 +887,7 @@ fn maybe_record_field_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 fn type_reference_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "type_identifier" | "scoped_type_identifier" | "generic_type" => Some(node),
+        "identifier" | "scoped_identifier" if is_module_type_reference(node) => Some(node),
         "annotation" | "marker_annotation" => node.child_by_field_name("name"),
         _ => None,
     }

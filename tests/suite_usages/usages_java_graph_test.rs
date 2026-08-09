@@ -209,6 +209,108 @@ fn java_import_hits_are_editor_visible_but_external_usage_free() {
 }
 
 #[test]
+fn java_module_info_uses_and_provides_are_type_usage_hits() {
+    let (project, analyzer) = java_analyzer_with_files(&[
+        ("p/Service.java", "package p; public interface Service {}\n"),
+        ("p/Dep.java", "package p; public class Dep {}\n"),
+        ("p/Api.java", "package p; public class Api {}\n"),
+        ("p/Internal.java", "package p; public class Internal {}\n"),
+        ("app/Marker.java", "package app; public class Marker {}\n"),
+        (
+            "p/impl/ProviderOne.java",
+            "package p.impl; public class ProviderOne {}\n",
+        ),
+        (
+            "p/impl/ProviderTwo.java",
+            "package p.impl; public class ProviderTwo {}\n",
+        ),
+        (
+            "p/impl/ProviderThree.java",
+            "package p.impl; public class ProviderThree {}\n",
+        ),
+        (
+            "module-info.java",
+            "import p.impl.*;\nmodule app {\n    uses p.Service;\n    provides p.Service with ProviderOne, ProviderThree, p.impl.ProviderTwo;\n    requires p.Dep;\n    exports p.Api;\n    opens p.Internal;\n}\n",
+        ),
+    ]);
+
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let strategy = JavaUsageGraphStrategy::new();
+
+    let service = definition(&analyzer, "p.Service");
+    let service_hits =
+        hits(strategy.find_usages(&analyzer, std::slice::from_ref(&service), &candidates, 1000));
+    assert_hit_contains(&service_hits, "uses p.Service");
+    assert_hit_contains(&service_hits, "provides p.Service");
+
+    let provider_one = definition(&analyzer, "p.impl.ProviderOne");
+    let provider_one_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&provider_one),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&provider_one_hits, "ProviderOne");
+
+    let provider_two = definition(&analyzer, "p.impl.ProviderTwo");
+    let provider_two_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&provider_two),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&provider_two_hits, "p.impl.ProviderTwo");
+
+    let provider_three = definition(&analyzer, "p.impl.ProviderThree");
+    let provider_three_hits = hits(strategy.find_usages(
+        &analyzer,
+        std::slice::from_ref(&provider_three),
+        &candidates,
+        1000,
+    ));
+    assert_hit_contains(&provider_three_hits, "ProviderThree");
+
+    for name in ["p.Dep", "p.Api", "p.Internal"] {
+        let target = definition(&analyzer, name);
+        let target_hits =
+            hits(strategy.find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000));
+        assert_no_hit_contains(&target_hits, "module app");
+    }
+
+    let graph = call_search_tool_json(project.root(), "usage_graph", "{}");
+    let has_edge = |to: &str| {
+        graph["edges"].as_array().is_some_and(|edges| {
+            edges
+                .iter()
+                .any(|edge| edge["from"] == "module-info.java" && edge["to"] == to)
+        })
+    };
+    for target in [
+        "p.Service",
+        "p.impl.ProviderOne",
+        "p.impl.ProviderThree",
+        "p.impl.ProviderTwo",
+    ] {
+        assert!(
+            has_edge(target),
+            "module descriptor edge should resolve to {target}: {graph}"
+        );
+    }
+    for target in ["p.Dep", "p.Api", "p.Internal"] {
+        assert!(
+            !has_edge(target),
+            "module names and package names must not become type edges to {target}: {graph}"
+        );
+    }
+    assert!(
+        graph["edges"]
+            .as_array()
+            .is_some_and(|edges| { edges.iter().all(|edge| edge["from"] != "app") }),
+        "the named module must not collide with the package module: {graph}"
+    );
+}
+
+#[test]
 fn java_graph_counts_static_qualifier_references_for_class_targets() {
     let (_project, analyzer) = java_analyzer_with_files(&[
         (

@@ -511,6 +511,12 @@ pub struct SignatureMetadata {
     /// Whether this class-like declaration is an interface.
     #[serde(default)]
     class_like_is_interface: bool,
+    /// Whether this class-like declaration has the Java `static` modifier.
+    ///
+    /// Java uses this fact to determine whether an unqualified reference in a
+    /// nested class can reach an instance member of an enclosing class.
+    #[serde(default)]
+    class_like_is_static: bool,
 }
 
 /// A parser-derived nominal type name, including the lexical scope in which an
@@ -1692,6 +1698,7 @@ impl SignatureMetadata {
             callable_modifiers_recorded: false,
             callable_parameter_types: None,
             class_like_is_interface: false,
+            class_like_is_static: false,
         }
     }
 
@@ -1754,6 +1761,11 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_class_like_static(mut self, is_static: bool) -> Self {
+        self.class_like_is_static = is_static;
+        self
+    }
+
     pub fn callable_is_static(&self) -> bool {
         self.callable_is_static
     }
@@ -1776,6 +1788,10 @@ impl SignatureMetadata {
 
     pub fn class_like_is_interface(&self) -> bool {
         self.class_like_is_interface
+    }
+
+    pub fn class_like_is_static(&self) -> bool {
+        self.class_like_is_static
     }
 
     pub fn with_return_type_text(mut self, return_type_text: Option<impl Into<String>>) -> Self {

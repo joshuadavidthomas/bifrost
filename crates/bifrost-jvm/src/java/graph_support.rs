@@ -164,6 +164,36 @@ pub fn resolve_java_forward_type_name(
     ))
 }
 
+/// Resolve a simple type name through the lexical classes that enclose
+/// `owner`. Java checks these nested scopes before package and import tiers.
+/// The hierarchy walker uses this for a nested `extends Base` declaration;
+/// member lookup then sees the same ancestor edge (#1905).
+pub fn resolve_java_lexical_type_name(
+    source: &dyn JavaSource,
+    owner: &CodeUnit,
+    raw_name: &str,
+) -> Option<CodeUnit> {
+    let normalized = raw_name.trim();
+    if normalized.is_empty() || normalized.contains('.') {
+        return None;
+    }
+
+    let mut enclosing = source.parent_of(owner).filter(CodeUnit::is_class);
+    while let Some(current) = enclosing {
+        let fqn = format!("{}.{}", current.fq_name(), normalized);
+        let candidates = source
+            .forward_definition_fqn(&fqn)
+            .into_iter()
+            .filter(|unit| unit.is_class() && unit.fq_name() == fqn)
+            .collect();
+        if let Some(unit) = unique_candidate(candidates) {
+            return Some(unit);
+        }
+        enclosing = source.parent_of(&current).filter(CodeUnit::is_class);
+    }
+    None
+}
+
 /// The full candidate set a forward type-name lookup produces. More than
 /// one entry means colliding on-demand imports: each candidate is a peer
 /// no wildcard tier can prove unique, and the ambiguity stays explicit as
