@@ -501,30 +501,44 @@ impl ScalaAnalyzer {
         let indexed = |ty: crate::analyzer::jvm::external::JvmExternalType| {
             (BoundaryStatus::ExternalIndexed, Some(ty.fqn().to_owned()))
         };
-        if name.contains('.')
-            && let Some(ty) = external.resolve_qualified_name(name, &package_name)
-        {
-            return indexed(ty);
-        }
-        if let Some(ty) = external.resolve_java_lang(name) {
-            return indexed(ty);
-        }
-        for import in self.inner.import_info_of(file) {
-            let Some(path) = scala_import_path(&import) else {
-                continue;
-            };
-            if import.is_wildcard {
-                if let Some(ty) = external.resolve_wildcard_import(&path, name, &package_name) {
-                    return indexed(ty);
-                }
-            } else if import.local_name() == Some(name)
-                && let Some(ty) = external.resolve_explicit_import(&path, &package_name)
+        let external_type = |spelling: &str| {
+            if spelling.contains('.')
+                && let Some(ty) = external.resolve_qualified_name(spelling, &package_name)
             {
-                return indexed(ty);
+                return Some(ty);
             }
-        }
-        if let Some(ty) = external.resolve_same_package(&package_name, name) {
+            if let Some(ty) = external.resolve_java_lang(spelling) {
+                return Some(ty);
+            }
+            for import in self.inner.import_info_of(file) {
+                let Some(path) = scala_import_path(&import) else {
+                    continue;
+                };
+                if import.is_wildcard {
+                    if let Some(ty) =
+                        external.resolve_wildcard_import(&path, spelling, &package_name)
+                    {
+                        return Some(ty);
+                    }
+                } else if import.local_name() == Some(spelling)
+                    && let Some(ty) = external.resolve_explicit_import(&path, &package_name)
+                {
+                    return Some(ty);
+                }
+            }
+            external.resolve_same_package(&package_name, spelling)
+        };
+        if let Some(ty) = external_type(name) {
             return indexed(ty);
+        }
+        // A member spelling leaves the workspace exactly as its owner type
+        // does, so the member tier runs where the type tier found nothing
+        // (#1900). A member the surface does not declare changes nothing.
+        if let Some(member) = external.resolve_member_spelling(name, &package_name, external_type) {
+            return (
+                BoundaryStatus::ExternalIndexed,
+                Some(member.fqn().to_owned()),
+            );
         }
         if self
             .external_declaration_index()

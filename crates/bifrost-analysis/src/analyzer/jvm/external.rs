@@ -1544,6 +1544,44 @@ impl<'a> JvmExternalDeclarations<'a> {
             .filter(|external_type| external_type.is_accessible_from_package(access_package))
     }
 
+    /// The external member a written `Owner.member` spelling names (#1900).
+    ///
+    /// A reference-site spelling that crosses a `.` is one written name whose
+    /// head is a type and whose last segment is a member: `Collections.sort`
+    /// spells the `sort` member of `java.util.Collections`. The head is
+    /// resolved by `resolve_owner`, which is the caller's own type ladder --
+    /// Java's import tiers, Kotlin's name scope, Scala's import tiers -- so a
+    /// member spelling reaches the same owner a type spelling would.
+    ///
+    /// Only a spelling the type ladder has already failed to answer belongs
+    /// here. A nested type is spelled with the same dot, and its declaration is
+    /// a type, so it is decided by the type ladder before this runs.
+    ///
+    /// The artifact half declares nothing here yet: the jar- and class-backed
+    /// [`JvmExternalDeclarationIndex`] stores a type's name, package, kind,
+    /// visibility and origin artifact and no members at all, which is the
+    /// remaining half of #1900. So today only the activated packs answer, and a
+    /// jar-backed owner has no member surface to consult.
+    ///
+    /// A miss is never a proof of absence. The surface reports what it
+    /// declares; a caller that finds nothing keeps the status it had, so a type
+    /// whose pack declares no members leaves every member spelling exactly as
+    /// unknown as it was before activation.
+    pub(crate) fn resolve_member_spelling(
+        &self,
+        spelling: &str,
+        access_package: &str,
+        resolve_owner: impl FnOnce(&str) -> Option<JvmExternalType>,
+    ) -> Option<JvmExternalMember> {
+        let (owner_spelling, member_name) = spelling.trim().rsplit_once('.')?;
+        if owner_spelling.is_empty() || member_name.is_empty() {
+            return None;
+        }
+        let owner = resolve_owner(owner_spelling)?;
+        self.pack_member(&owner, member_name)
+            .filter(|member| member.is_accessible_from_package(access_package))
+    }
+
     /// The one declaration the activated packs publish for `fqn`, if exactly
     /// one does.
     ///
@@ -1572,6 +1610,90 @@ impl<'a> JvmExternalDeclarations<'a> {
         // decided, so no single external type can be reported. Reporting none
         // understates what is known and never overstates it.
         declarations.next().is_none().then_some(declared)
+    }
+
+    /// The member an activated pack publishes on `owner`, searched over the
+    /// owner's whole inherited surface.
+    ///
+    /// The surface is the closure `SemanticModelOverlay::owner_surface` builds,
+    /// because a JVM member is as often inherited as declared: `sort` sits on
+    /// `java.util.Collections` while `toString` sits on `java.lang.Object`, and
+    /// a reference spells both the same way. The declaration that answers keeps
+    /// its own qualified name, so the reported target names where the member is
+    /// declared rather than where it was written.
+    ///
+    /// More than one hit is the ordinary shape of an override or an overload --
+    /// a class and the interface it implements both declare the method, and
+    /// `sort(List)` and `sort(List, Comparator)` are two declarations of one
+    /// name -- so it is not ambiguity. Only a declaration an indexed pack itself
+    /// flagged ambiguous is, which is the same rule PHP's external surface
+    /// applies.
+    fn pack_member(&self, owner: &JvmExternalType, member_name: &str) -> Option<JvmExternalMember> {
+        let overlay = self.packs.as_ref()?;
+        // Only a pack-declared owner has a pack member surface: an artifact
+        // owner carries no declaration identity to look members up by.
+        let JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } = &owner.source
+        else {
+            return None;
+        };
+        let owner_symbol = overlay
+            .symbols_with_id(declaration_id)
+            .records
+            .first()
+            .copied()?;
+        let surface = overlay.owner_surface(owner_symbol);
+        surface.closure.iter().find_map(|declaring| {
+            let member = overlay
+                .members_of(&declaring.id)
+                .records
+                .into_iter()
+                .find(|symbol| {
+                    symbol.name == member_name
+                        && !symbol.provenance.ambiguous
+                        && JVM_PACK_LANGUAGES.contains(&symbol.language.as_str())
+                })?;
+            Some(JvmExternalMember {
+                fqn: member.qualified_name.clone(),
+                // The package split is the one [`pack_external_type`] makes on
+                // a type's declared name, taken from the declaring type rather
+                // than from the type the reference wrote.
+                declaring_package: declaring
+                    .qualified_name
+                    .rsplit_once('.')
+                    .map_or("", |(package, _)| package)
+                    .to_owned(),
+                visibility: semantic_visibility(member.visibility),
+            })
+        })
+    }
+}
+
+/// One member an activated pack declares on an external type (#1900): the
+/// `sort` of `Collections.sort`, not the `Collections`.
+///
+/// A member is not a type, so it is not a [`JvmExternalType`]: nothing may
+/// resolve a type name to it, and [`pack_type_kind`] rejects every member kind
+/// precisely so that cannot happen. What a member shares with a type is the
+/// question a boundary asks -- does an external declaration spell this name,
+/// and may this package see it -- so it carries exactly what answers that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JvmExternalMember {
+    fqn: String,
+    /// The package of the type that *declares* the member, which is what
+    /// `protected` and package-private accessibility are measured against. An
+    /// inherited member is declared in its own supertype's package, not in the
+    /// package of the type the reference wrote.
+    declaring_package: String,
+    visibility: JvmVisibility,
+}
+
+impl JvmExternalMember {
+    pub(crate) fn fqn(&self) -> &str {
+        &self.fqn
+    }
+
+    fn is_accessible_from_package(&self, package_name: &str) -> bool {
+        is_visible_from_package(self.visibility, &self.declaring_package, package_name)
     }
 }
 
@@ -1721,12 +1843,26 @@ impl JvmExternalType {
     }
 
     fn is_accessible_from_package(&self, package_name: &str) -> bool {
-        self.visibility == JvmVisibility::Public
-            || (matches!(
-                self.visibility,
-                JvmVisibility::Protected | JvmVisibility::PackagePrivate
-            ) && self.package_name == package_name)
+        is_visible_from_package(self.visibility, &self.package_name, package_name)
     }
+}
+
+/// Whether a declaration of `visibility` sitting in `declaring_package` is
+/// visible to code compiled in `access_package`.
+///
+/// One rule for types and members, because the JVM applies one: a `protected`
+/// declaration is also visible to a subtype, which this deliberately does not
+/// admit, so the answer understates what is reachable and never overstates it.
+fn is_visible_from_package(
+    visibility: JvmVisibility,
+    declaring_package: &str,
+    access_package: &str,
+) -> bool {
+    visibility == JvmVisibility::Public
+        || (matches!(
+            visibility,
+            JvmVisibility::Protected | JvmVisibility::PackagePrivate
+        ) && declaring_package == access_package)
 }
 
 fn open_artifact_file(path: &Path) -> Option<File> {

@@ -306,11 +306,19 @@ impl KotlinAnalyzer {
             // tier still sees.
             scope_owners: Vec::new(),
         };
-        match resolve_kotlin_type_name(name, &scope, |candidate| {
+        let declares = |candidate: &str| {
             external
                 .resolve_qualified_name(candidate, &package_name)
                 .is_some()
-        }) {
+        };
+        let external_type =
+            |spelling: &str| match resolve_kotlin_type_name(spelling, &scope, declares) {
+                KotlinTypeName::Resolved(fqn) => {
+                    external.resolve_qualified_name(&fqn, &package_name)
+                }
+                KotlinTypeName::Ambiguous | KotlinTypeName::Unresolved => None,
+            };
+        match resolve_kotlin_type_name(name, &scope, declares) {
             KotlinTypeName::Resolved(fqn) => {
                 return (BoundaryStatus::ExternalIndexed, Some(fqn));
             }
@@ -318,6 +326,15 @@ impl KotlinAnalyzer {
             // certainly indexed, but no single target can be reported.
             KotlinTypeName::Ambiguous => return (BoundaryStatus::ExternalIndexed, None),
             KotlinTypeName::Unresolved => {}
+        }
+        // A member spelling leaves the workspace exactly as its owner type
+        // does, so the member tier runs where the type tier found nothing
+        // (#1900). A member the surface does not declare changes nothing.
+        if let Some(member) = external.resolve_member_spelling(name, &package_name, external_type) {
+            return (
+                BoundaryStatus::ExternalIndexed,
+                Some(member.fqn().to_owned()),
+            );
         }
         if self
             .external_declaration_index()

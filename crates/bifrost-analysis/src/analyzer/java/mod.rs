@@ -234,7 +234,7 @@ impl JavaAnalyzer {
     }
 
     /// How far a lookup for `name` from `file` could see past the workspace,
-    /// and the external type it landed on when it landed on one.
+    /// and the external declaration it landed on when it landed on one.
     ///
     /// This reads the external declaration surface that the resolver itself
     /// consults -- the jar index and the activated packs' declaration facts --
@@ -243,6 +243,13 @@ impl JavaAnalyzer {
     /// bucket cannot: the name is externally indexed, the build declared
     /// artifacts the index could not finish reading (so the name may be there),
     /// or nothing is known.
+    ///
+    /// A reference-site spelling is a type name or a member name, and both
+    /// leave the workspace the same way: `Collections` names the type and
+    /// `Collections.sort` names its member, so the member tier runs where the
+    /// type tier found nothing (#1900). A member the surface does not declare
+    /// changes nothing, so a type whose pack declares no members leaves every
+    /// member spelling exactly as unknown as it was before activation.
     pub(crate) fn external_boundary_evidence(
         &self,
         packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
@@ -250,11 +257,17 @@ impl JavaAnalyzer {
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
         if let Some(JavaTypeResolution::External(external_type)) =
-            self.resolve_type_name_with_external(packs, file, name)
+            self.resolve_type_name_with_external(packs.clone(), file, name)
         {
             return (
                 BoundaryStatus::ExternalIndexed,
                 Some(external_type.fqn().to_owned()),
+            );
+        }
+        if let Some(member) = self.resolve_member_name_with_external(packs, file, name) {
+            return (
+                BoundaryStatus::ExternalIndexed,
+                Some(member.fqn().to_owned()),
             );
         }
         if self
