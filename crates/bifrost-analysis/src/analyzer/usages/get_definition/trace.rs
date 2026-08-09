@@ -503,7 +503,10 @@ pub(super) fn record_selected_lexical(outcome: &DefinitionLookupOutcome) {
 /// otherwise; [`finish_boundary`] fills an empty name from the outcome's own
 /// resolved reference. The status starts at [`BoundaryStatus::ExternalUnknown`]
 /// because the gate knows only that the lookup left the workspace, and
-/// [`finish_boundary`] upgrades it where the analyzer holds evidence.
+/// [`finish_boundary`] upgrades it where the analyzer holds evidence. The row
+/// starts rejected for the same reason: the gate has found nothing to resolve
+/// to yet, and [`finish_boundary`] turns it into a selection where the evidence
+/// names an exact external declaration.
 pub(super) fn record_boundary_gate() {
     if !recording() {
         return;
@@ -659,6 +662,23 @@ fn finish_boundary(
         if row.boundary == BoundaryStatus::ExternalUnknown {
             row.boundary = status;
             row.external_target.clone_from(&external_target);
+        }
+        // An external route that named an exact external declaration is the
+        // answer this reference resolved to. The resolver cannot return a
+        // workspace `CodeUnit` for a declaration that is not in the workspace,
+        // and `external_target` is what it resolved instead, so recording the
+        // row as a rejection would say the resolver discarded the only answer
+        // it found. `debug_assert_selection_agrees` already admits exactly this
+        // selection: a route may be selected at a boundary outcome.
+        //
+        // A route with no named target stays rejected, because nothing was
+        // decided: either no index and no activated pack spells the name, or
+        // more than one does and the reference is ambiguous.
+        if matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. })
+            && row.boundary == BoundaryStatus::ExternalIndexed
+            && row.external_target.is_some()
+        {
+            row.outcome = CandidateOutcome::Selected;
         }
     }
 }
@@ -1902,6 +1922,53 @@ mod boundary_evidence_tests {
                     && target.as_deref() == Some("java.util.Collections")
             }),
             "the activated pack declares `java.util.Collections`: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn an_indexed_external_route_is_the_selection_and_an_unknown_one_is_not() {
+        // The trace's outcome column, not just its boundary column: a route
+        // that named an exact external declaration is what the reference
+        // resolved to, so a policy asking "did this resolve through a real
+        // route" has a selection to read. A route that named nothing stays
+        // rejected, so the same question is honestly unanswerable.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        let (_, pack) = jdk_collections_pack();
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &pack,
+            activation_evidence("java", "jdk", "java.base"),
+        );
+
+        let (_, trace) = fixture.trace("Collections helper");
+        let declared: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !declared.is_empty()
+                && declared.iter().all(|row| {
+                    row.is_selected() && row.tier == Some(PrecedenceTier::ExternalRoot)
+                }),
+            "the pack named the declaration, so the route is the selection: {declared:?}"
+        );
+
+        let (_, trace) = fixture.trace("ArrayList names");
+        let unknown: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !unknown.is_empty() && unknown.iter().all(|row| !row.is_selected()),
+            "nothing named this declaration, so nothing was selected: {unknown:?}"
         );
     }
 }
