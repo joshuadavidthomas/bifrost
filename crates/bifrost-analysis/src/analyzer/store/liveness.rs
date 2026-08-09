@@ -1,5 +1,6 @@
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -28,6 +29,11 @@ pub struct Liveness {
     working_tree_oids: Mutex<Option<HashMap<String, TrackedOid>>>,
     snapshot: Mutex<Option<MemoizedSnapshot>>,
     overlay: Mutex<OverlayState>,
+    /// Canonical form of each project root this handle has been asked about.
+    /// A workspace has one root, so this is one entry and one `canonicalize`.
+    canonical_roots: Mutex<HashMap<PathBuf, Arc<Path>>>,
+    /// Canonicalizations performed after construction, for the regression pin.
+    canonicalizations: AtomicUsize,
 }
 
 /// One path's last resolved blob identity and the stat it was resolved
@@ -53,6 +59,8 @@ impl Liveness {
             working_tree_oids: Mutex::new(None),
             snapshot: Mutex::new(None),
             overlay: Mutex::new(OverlayState::default()),
+            canonical_roots: Mutex::new(HashMap::default()),
+            canonicalizations: AtomicUsize::new(0),
         })
     }
 
@@ -268,12 +276,39 @@ impl Liveness {
         }
     }
 
+    /// The repository-relative path of an analyzer file.
+    ///
+    /// The canonicalization here exists to reconcile a project root reached
+    /// through a symlink with the canonical git workdir `new` recorded -- the
+    /// workspace of issue #1793 is a symlink to a package directory inside the
+    /// repository. That is a property of the ROOT, so it is resolved once per
+    /// root and the file's relative path is joined onto the result. Doing it
+    /// per file cost one `readlink` per path component per workspace file:
+    /// 352,494 always-`EINVAL` `readlink` calls in one profiled process, the
+    /// largest syscall count observed.
+    ///
+    /// The literal path is tried next, and a per-file canonicalization only
+    /// after both have failed -- a symlink BELOW the root that redirects a file
+    /// out of the workspace. That ordering also puts this function in agreement
+    /// with `oids_for_files`, the batched path, which has always resolved
+    /// repository-relative paths by plain `strip_prefix` with no
+    /// canonicalization at all.
     fn rel_path_from_workdir(&self, file: &ProjectFile) -> Result<PathBuf> {
-        let abs_path = file.abs_path();
-        let canonical_abs = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
-        canonical_abs
+        if let Ok(rel) = self
+            .canonical_root(file.root())
+            .join(file.rel_path())
             .strip_prefix(&self.workdir)
-            .or_else(|_| abs_path.strip_prefix(&self.workdir))
+        {
+            return Ok(rel.to_path_buf());
+        }
+        let abs_path = file.abs_path();
+        if let Ok(rel) = abs_path.strip_prefix(&self.workdir) {
+            return Ok(rel.to_path_buf());
+        }
+        self.canonicalize_counted(&abs_path)
+            .as_deref()
+            .unwrap_or(abs_path.as_path())
+            .strip_prefix(&self.workdir)
             .map(Path::to_path_buf)
             .map_err(|_| {
                 format!(
@@ -282,6 +317,41 @@ impl Liveness {
                     self.workdir.display()
                 )
             })
+    }
+
+    /// The canonical form of one workspace root, resolved once.
+    fn canonical_root(&self, root: &Path) -> Arc<Path> {
+        if let Some(cached) = self
+            .canonical_roots
+            .lock()
+            .expect("liveness canonical-root mutex poisoned")
+            .get(root)
+        {
+            return Arc::clone(cached);
+        }
+        let canonical: Arc<Path> = self
+            .canonicalize_counted(root)
+            .map_or_else(|| Arc::from(root), |resolved| Arc::from(resolved.as_path()));
+        self.canonical_roots
+            .lock()
+            .expect("liveness canonical-root mutex poisoned")
+            .insert(root.to_path_buf(), Arc::clone(&canonical));
+        canonical
+    }
+
+    /// Every `canonicalize` this type performs after construction goes through
+    /// here, so the regression pin can count them.
+    fn canonicalize_counted(&self, path: &Path) -> Option<PathBuf> {
+        self.canonicalizations.fetch_add(1, AtomicOrdering::Relaxed);
+        path.canonicalize().ok()
+    }
+
+    /// Canonicalizations performed since construction. The pin: this is one per
+    /// workspace root plus the rare below-root symlink fallback, not one per
+    /// workspace file.
+    #[cfg(test)]
+    pub(crate) fn canonicalizations(&self) -> usize {
+        self.canonicalizations.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -774,6 +844,90 @@ mod tests {
 
     fn project_file(root: &Path, rel: &str) -> ProjectFile {
         ProjectFile::new(root.canonicalize().unwrap(), PathBuf::from(rel))
+    }
+
+    /// The canonicalize storm: `rel_path_from_workdir` used to canonicalize
+    /// every file's absolute path, which is one `readlink` per path component
+    /// per workspace file. The reconciliation it performs is a property of the
+    /// root, so it is resolved once per root.
+    #[test]
+    fn the_workspace_root_is_canonicalized_once_not_once_per_file() {
+        const FILES: usize = 24;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        for index in 0..FILES {
+            std::fs::write(
+                temp.path().join(format!("f{index}.rs")),
+                format!("fn f{index}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        commit_all(&repo, "init");
+
+        let liveness = Liveness::new(repo).unwrap();
+        assert_eq!(
+            liveness.canonicalizations(),
+            0,
+            "construction resolves the git workdir on its own, before this counter exists"
+        );
+        for index in 0..FILES {
+            let file = project_file(temp.path(), &format!("f{index}.rs"));
+            assert!(
+                liveness.oid_for_path(&file).unwrap().is_some(),
+                "f{index}.rs resolves"
+            );
+        }
+        assert_eq!(
+            liveness.canonicalizations(),
+            1,
+            "one canonicalize for the workspace root, not one per file"
+        );
+    }
+
+    /// The guard the storm fix has to keep: a workspace root that IS a symlink
+    /// into the repository -- the #1793 shape -- still yields
+    /// repository-relative paths, because it is exactly the root that gets
+    /// canonicalized.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_workspace_root_still_resolves_repository_relative_paths() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo_root = temp.path().join("repo");
+        std::fs::create_dir(&repo_root).unwrap();
+        let repo = init_repo(&repo_root);
+        std::fs::create_dir_all(repo_root.join("packages/app/src")).unwrap();
+        std::fs::write(
+            repo_root.join("packages/app/src/db.rs"),
+            "pub fn connection() {}\n",
+        )
+        .unwrap();
+        commit_all(&repo, "init");
+        let linked_root = temp.path().join("linked-app");
+        std::os::unix::fs::symlink(repo_root.join("packages/app"), &linked_root).unwrap();
+
+        let liveness = Liveness::new(repo).unwrap();
+        let file = ProjectFile::new(linked_root, "src/db.rs");
+        assert_eq!(
+            liveness.rel_path_from_workdir(&file).unwrap(),
+            PathBuf::from("packages/app/src/db.rs")
+        );
+
+        let index_oid = liveness
+            .repo
+            .lock()
+            .unwrap()
+            .index()
+            .unwrap()
+            .get_path(Path::new("packages/app/src/db.rs"), 0)
+            .unwrap()
+            .id;
+        assert_eq!(liveness.oid_for_path(&file).unwrap().unwrap(), index_oid);
+        assert_eq!(
+            liveness.canonicalizations(),
+            1,
+            "resolving the symlinked root is the one canonicalize"
+        );
     }
 
     #[test]
