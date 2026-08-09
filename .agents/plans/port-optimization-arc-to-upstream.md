@@ -57,7 +57,7 @@ A **pin** is a test that fails before a fix and passes after it. When this plan 
 - [x] (2026-08-09) Phase 2 Step 2a -- Cargo routes composed from per-blob module-route rows. `RustCargoRouteIndex::build_while` takes plain fact data instead of a `prepared_syntax` closure and a `parallel` flag; `RustAnalyzer::rust_module_route_facts` is the one batched store read that feeds it.
 - [x] (2026-08-09) Phase 2 Step 2b -- the read path. `usage.rs`, `usage_walks.rs`, `usage_queries.rs` and a new `cache.rs` in `crates/bifrost-rust/src/`, over the new `RustFactSource` trait; `fact_catch_up.rs` in `crates/bifrost-analysis/src/analyzer/rust/`. The ninth parked test is restored in `workspace.rs`.
 - [x] (2026-08-09) Phase 2 Step 3 -- include-expansion routes on the v2 substrate. Migration 0020 adds `rust_include_edges` and `rust_include_host_bindings`; `crates/bifrost-rust/src/usage_includes.rs` composes routes backwards from those rows. Dave's four regression suites pass against the rebuilt routes.
-- [ ] Phase 2 Step 4: delete `RustUsageIndex`.
+- [ ] Phase 2 Step 4: delete `RustUsageIndex`. **STOPPED, owner decision needed.** The rewiring itself is done and compiles; swapping the resolvers from the v1 free functions to the v2 ones loses upstream's post-merge-base inverse import shadow resolution and turns eleven green tests red. See "Step 4: the stop" below. The attempt is parked at `.agents/phase2/step4-delete-usage-index/step4-attempt.patch`.
 
 ## Surprises & Discoveries
 
@@ -782,6 +782,99 @@ surface is `crates/bifrost-rust/src/graph/resolver.rs` (47 references),
 `crates/bifrost-analysis/src/analyzer/usages/rust_graph/extractor.rs`, and
 `crates/bifrost-analysis/src/analyzer/rust/{mod,usage_index,hierarchy}.rs`.
 Then remove `.agents/phase2/rust-usage-v2/` and update the tables above.
+
+### Step 4: the stop
+
+Step 4 was described above as a rewiring surface: point the resolvers at the v2
+free functions, drop the trait method that hands out the index, delete the two
+files. That part is done and compiles -- the parked patch does exactly it, and
+`cargo check --workspace --all-targets` is clean on it. The tree it produces is
+not green, and the reason is not a defect in the rewiring.
+
+    cargo nextest run --workspace --all-targets --no-fail-fast
+      Summary [283.976s] 9899 tests run: 9883 passed, 16 failed, 42 skipped
+
+Five are the upstream baseline. The other eleven, by name:
+
+    suite_usages rust_top30_inverse_regression::generated_super_imports_are_inverse_hits
+    suite_usages rust_top30_inverse_regression::extern_crate_alias_stays_namespace_scoped
+    suite_usages rust_top30_inverse_regression::cfg_test_external_crate_alias_imports_are_inverse_hits
+    suite_usages rust_top30_inverse_regression::nested_bench_group_imports_are_inverse_hits_for_private_items
+    suite_usages rust_include_inverse_regression::included_file_inherits_host_extern_crate_alias
+    suite_usages rust_1280_namespace_regression::function_local_namespace_import_resolves_nested_type_without_cross_scope_fallback
+    suite_usages usages_rust_graph_test::issue_1377_function_scoped_import_beats_enclosing_function_name
+    suite_usages usages_rust_graph_test::issue_1377_cfg_alternatives_keep_both_inverse_targets
+    suite_usages usages_rust_graph_test::authoritative_rust_path_attribute_module_keeps_terminal_trait_import
+    suite_usages usages_rust_graph_test::rust_bench_targets_own_their_crate_root_and_still_share_helper_modules
+    suite_usages usages_rust_graph_test::rust_graph_strategy_resolves_path_attribute_module_qualified_function_call
+
+The semantic gap, stated precisely. Upstream's `46e7bf58` -- inverse import
+shadow resolution -- is a second body of new capability upstream built on
+`RustUsageIndex`, alongside the include routes step 3 rebuilt. It is not in the
+merge base and it has no counterpart in the arc, which was written before it.
+Five of its pieces are load-bearing for the eleven tests, and every one of them
+is state or logic on the v1 index:
+
+    RustCfgCondition                             10 references, upstream only
+    declaration_cfg_conditions                    8 references, upstream only
+    visible_namespace_module_routes               3 references, upstream only
+    seed_identities_for_resolved_module_route     3 references, upstream only
+    local_import_visible                          2 references, upstream only
+
+Confirmed by `git grep -c <name> db9f60c3 -- <the merge-base index>` returning
+nothing for all five, and `git grep -c <name> origin/master` returning the
+counts above.
+
+The consequence for the two functions the resolvers actually call is that they
+are no longer the same function with a different backing store. Measured as
+text similarity between the v1 and v2 bodies:
+
+    usage_reference_at                    v1 368 lines, v2 323 lines, 0.18
+    usage_local_module_prefix_visible_at  v1 127 lines, v2  81 lines, 0.20
+
+Every other shared entry point sits between 0.32 and 0.97. Those two are where
+`46e7bf58` landed, and porting it means carrying cfg-condition provenance onto
+`RustOriginRoute` and onto the per-declaration domains, adding the local-import
+visibility gate, and rebuilding the namespace-scoped module-route resolution --
+on the lazy substrate, with the same candidate-then-verify discipline step 3
+used. That is a rebuild of the same shape and size as step 3, not a rewiring,
+and it is not what this plan scoped step 4 as. It needs its own design pass and
+its own owner decision, which is why the work stops here rather than proceeding
+on a guess.
+
+Two of the eleven are worth calling out because they are NOT obviously in that
+group: `authoritative_rust_path_attribute_module_keeps_terminal_trait_import`
+and `rust_graph_strategy_resolves_path_attribute_module_qualified_function_call`
+both exist on the arc at `0a53a550` and passed there. They differ from their
+current form only in the fully-qualified name they spell, which upstream's
+crate-aware package naming changed (`benches.common.report_failures` became
+`bench_path.benches.common.report_failures`). So the v2 substrate did once
+answer these; whether the current failure is the same `46e7bf58` gap reaching
+them through `resolve_segments` or a separate interaction with crate-aware
+naming was not determined, and it is the first thing to look at when this
+resumes.
+
+What is parked, and what is not lost. The whole attempt is one patch at
+`.agents/phase2/step4-delete-usage-index/step4-attempt.patch`, applying cleanly
+to the step 3 commit. It contains the resolver import swap, the
+`RustUsageSource` to `RustFactSource` merge (the four reference-context methods
+move onto `RustFactSource`, which loses its `RustUsageSource` supertrait), the
+removal of the `usage_index` memo and its warm path, the `warm_query_indexes`
+and `query_indexes_warm` re-pointing at the fact catch-up, the re-enabled arc
+test name `warm_query_indexes_builds_the_hierarchy_and_catches_up_the_usage_facts`,
+and the deletion of both `usage_index.rs` files.
+
+What this means for step 3's acceptance. The four regression suites pass on the
+step 3 tree, where `RustUsageIndex` still answers everything except include
+routes -- so they demonstrate that the rebuilt include routes are correct
+against the resolution the rest of the tree provides, but they cannot yet
+demonstrate that they are correct against v2 resolution alone. One of the four,
+`included_file_inherits_host_extern_crate_alias`, is in the eleven; its first
+assertion is the `extern crate dep as tk` alias, and the sibling failure
+`extern_crate_alias_stays_namespace_scoped` is a plain non-include test, so the
+shared cause is alias resolution rather than the include walk. That is
+consistent with the `46e7bf58` diagnosis and is not evidence against the include
+rebuild, but it is not proof for it either. Step 4 is what would settle it.
 
 ## Validation and Acceptance
 

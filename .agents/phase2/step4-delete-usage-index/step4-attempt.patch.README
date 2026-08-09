@@ -1,0 +1,13 @@
+Parked by Phase 2 step 4 of `.agents/plans/port-optimization-arc-to-upstream.md`.
+
+`step4-attempt.patch` applies to the step 3 commit and performs the whole
+mechanical half of "delete RustUsageIndex": the resolver import swap from
+`crate::usage_index` to `crate::usage`, the merge of `RustUsageSource` into
+`RustFactSource`, the removal of the `usage_index` memo and its warm path, and
+the deletion of both `usage_index.rs` files. It compiles clean.
+
+It is parked rather than committed because the tree it produces fails eleven
+tests that the step 3 tree passes. The gap and the eleven names are in the
+plan's "Step 4: the stop" section. Do not apply this patch without first
+reading that section: the rewiring is not the missing piece, upstream's
+`46e7bf58` inverse import shadow resolution is.
