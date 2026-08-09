@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ActivationSelector, CatalogCoordinate, CatalogMiss, CatalogPackSourceKind,
-    CompiledPackManifest, CompiledProcedureSummary, CompiledShard, GeneratorRule, MemberFact,
-    PayloadKind, RelationFact, RuleTrigger, SemanticModelOverlay, SemanticModelOverlayBuildError,
-    SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
+    CompiledPackManifest, CompiledProcedureSummary, CompiledShard, DeclarationGuard, GeneratorRule,
+    MemberFact, PayloadKind, RelationFact, RuleTrigger, SemanticModelOverlay,
+    SemanticModelOverlayBuildError, SemanticPackCatalog, SemanticPackSelectorQuery, TypeFact,
 };
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::is_lower_sha256;
@@ -133,6 +133,10 @@ pub struct SemanticModelActivationReport {
     pub catalog_candidates: usize,
     pub loaded_shards: usize,
     pub loaded_records: usize,
+    /// Declarations a loaded shard publishes that the pinned activation
+    /// coordinates prove absent, so the matcher never indexed them (#1899).
+    #[serde(default)]
+    pub guard_excluded_records: usize,
     pub index_entries: usize,
     pub working_bytes: u64,
     pub retained_bytes: u64,
@@ -157,6 +161,26 @@ pub struct ActiveSemanticModelShard {
     pub matched_evidence: SemanticModelActivationEvidence,
     evidence_rank: EvidenceRank,
     source_rank: u8,
+}
+
+impl ActiveSemanticModelShard {
+    /// Whether the evidence this shard activated against proves the guarded
+    /// record absent.
+    ///
+    /// This is the only place a declaration leaves an activated pack. An
+    /// unguarded record, and a guard whose constraints the pinned coordinates
+    /// satisfy or say nothing about, both stay active (#1899).
+    pub fn guard_excludes(&self, guard: Option<&DeclarationGuard>) -> bool {
+        guard.is_some_and(|guard| {
+            guard.excludes(
+                self.matched_evidence
+                    .toolchain
+                    .as_ref()
+                    .and_then(|toolchain| toolchain.version.as_ref()),
+                self.matched_evidence.target.as_deref(),
+            )
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -435,6 +459,7 @@ impl MatcherIndexes {
         let mut entries = 0usize;
         let mut working_bytes = 0u64;
         let mut records_visited = 0usize;
+        let mut guard_excluded_records = 0usize;
 
         for (shard_index, selection) in active.iter().enumerate() {
             let shard = u32::try_from(shard_index)
@@ -445,6 +470,10 @@ impl MatcherIndexes {
                 for (record_index, fact) in types.iter().enumerate() {
                     poll_matcher_cancellation(cancellation, records_visited)?;
                     records_visited += 1;
+                    if selection.active.guard_excludes(fact.guard.as_ref()) {
+                        guard_excluded_records += 1;
+                        continue;
+                    }
                     let address = record_address(shard, record_index)?;
                     insert_posting(
                         &mut indexes.types_by_id,
@@ -479,6 +508,10 @@ impl MatcherIndexes {
                 for (record_index, fact) in members.iter().enumerate() {
                     poll_matcher_cancellation(cancellation, records_visited)?;
                     records_visited += 1;
+                    if selection.active.guard_excludes(fact.guard.as_ref()) {
+                        guard_excluded_records += 1;
+                        continue;
+                    }
                     let address = record_address(shard, record_index)?;
                     insert_posting(
                         &mut indexes.members_by_id,
@@ -613,6 +646,7 @@ impl MatcherIndexes {
         report.index_entries = entries;
         report.working_bytes = working_bytes;
         report.retained_bytes = retained_bytes;
+        report.guard_excluded_records = guard_excluded_records;
         Ok(indexes)
     }
 }

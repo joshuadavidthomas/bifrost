@@ -834,6 +834,54 @@
         "complete"
       ]
     },
+    "DeclarationGuard": {
+      "description": "The condition under which one activation declares a record.\n\nA reference surface can spell a declaration inside a conditional block.\nTypeshed guards `builtins.float.from_number` with\n`if sys.version_info >= (3, 14):` and `os.startfile` with\n`if sys.platform == \"win32\":`. Publishing the union of every branch with no\nguard makes a published name mean only \"some supported toolchain declares\nthis somewhere\", which is a false positive for a presence claim (#1899).\n\nEvery recorded constraint is a *necessary* condition for the record to\nexist. A producer that cannot interpret part of a condition records\n[`Self::uninterpreted`] and drops that part rather than the declaration, so\nthe guard never claims more than the producer read. Activation may drop a\nrecord only when [`Self::excludes`] proves the pinned activation cannot\ndeclare it.",
+      "type": "object",
+      "properties": {
+        "excluded_targets": {
+          "description": "Activation targets that do not declare this record.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_toolchain_version_exclusive": {
+          "description": "Lowest toolchain version that no longer declares this record.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GuardVersion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "min_toolchain_version": {
+          "description": "Lowest toolchain version that declares this record, inclusive.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GuardVersion"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "required_targets": {
+          "description": "Activation targets that declare this record. Empty places no\nrequirement on the target.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "uninterpreted": {
+          "description": "The producer read a condition it could not express here. The recorded\nconstraints stay necessary, but they are not the whole condition, so a\nrecord this flag marks is never dropped for want of a constraint.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
     "EmbeddedTypeFact": {
       "type": "object",
       "properties": {
@@ -987,6 +1035,33 @@
         "emissions"
       ]
     },
+    "GuardVersion": {
+      "description": "One toolchain-version bound a guard names, padded to three components.\n\nA source condition can name fewer components than a toolchain version\ncarries, as `sys.version_info >= (3, 14)` does. Padding with zeros keeps\none comparable shape, and comparing only the three release components keeps\na pre-release toolchain on the same side of a bound as its release.",
+      "type": "object",
+      "properties": {
+        "major": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "minor": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "patch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "major",
+        "minor",
+        "patch"
+      ]
+    },
     "HierarchyFact": {
       "type": "object",
       "properties": {
@@ -1095,6 +1170,16 @@
           "items": {
             "$ref": "#/$defs/TypeRef"
           }
+        },
+        "guard": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeclarationGuard"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "id": {
           "type": "string"
@@ -1919,6 +2004,16 @@
           "items": {
             "type": "string"
           }
+        },
+        "guard": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeclarationGuard"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "has_explicit_type_terms": {
           "type": "boolean",

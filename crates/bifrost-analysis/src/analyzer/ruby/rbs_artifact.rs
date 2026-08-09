@@ -412,6 +412,7 @@ fn project_constant(
             hierarchy: Vec::new(),
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: Locator::Artifact {
                 path: logical_path(archive_sha256, entry_path),
                 symbol: owner_name,
@@ -447,6 +448,7 @@ fn project_constant(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        guard: None,
         locator: Locator::Artifact {
             path: logical_path(archive_sha256, entry_path),
             symbol: name,
@@ -731,6 +733,7 @@ fn project_type(
         hierarchy,
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
+        guard: None,
         locator,
     });
     members.append(&mut projected_members);
@@ -811,6 +814,7 @@ fn project_attribute(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        guard: None,
         locator: locator.clone(),
     })
 }
@@ -923,6 +927,7 @@ fn project_method(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            guard: None,
             locator: locator.clone(),
         });
     }

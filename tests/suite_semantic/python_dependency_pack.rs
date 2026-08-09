@@ -1,12 +1,14 @@
 use brokk_bifrost::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProductionRequest, AuthoredPayload,
-    CatalogOptions, Compatibility, DependencyPackLimits, ExternalArtifactKind,
-    ExternalArtifactPackProducer, Provenance, Safety, SemanticModelActivationRequest,
-    SemanticModelRuntimeLimits, SemanticPackCatalog,
+    CatalogOptions, Compatibility, DeclarationGuard, DependencyPackLimits, ExternalArtifactKind,
+    ExternalArtifactPackProducer, GuardVersion, Provenance, ResolvedActiveSemanticModels, Safety,
+    SemanticModelActivationRequest, SemanticModelResolutionOutcome, SemanticModelRuntimeLimits,
+    SemanticPackCatalog, prepare_discovered_dependency_semantic_packs,
+    resolve_active_semantic_models,
 };
 use brokk_bifrost::analyzer::{
-    AnalyzerConfig, PythonAnalyzerConfig, PythonArtifactPackProducer, PythonEnvironmentConfig,
-    PythonEnvironmentLimits, PythonSemanticModelWorkspaceContext,
+    AnalyzerConfig, PythonAnalyzerConfig, PythonArtifactPackProducer, PythonDependencyPackAdapter,
+    PythonEnvironmentConfig, PythonEnvironmentLimits, PythonSemanticModelWorkspaceContext,
     resolve_python_semantic_pack_dependencies,
 };
 use brokk_bifrost::{CancellationToken, Language, Project};
@@ -22,7 +24,7 @@ fn environment(
         environment: Some(PythonEnvironmentConfig {
             implementation: "cpython".to_owned(),
             version: "3.12.3".to_owned(),
-            platform: "macos-arm64".to_owned(),
+            platform: "darwin".to_owned(),
             standard_library_root,
             bundled_stub_roots: Vec::new(),
             distribution_roots: vec![distribution_root],
@@ -418,6 +420,202 @@ def locate(path: os.PathLike[str], *parts: str) -> list[str]: ...
             .any(|fact| fact.name == "shapes.Pair" && fact.type_parameters == vec!["T".to_owned()]),
         "{types:#?}"
     );
+}
+
+/// Typeshed spells version- and platform-specific declarations inside
+/// `sys.version_info` and `sys.platform` blocks. Publishing them with no
+/// recorded condition makes a published name mean only "some supported
+/// interpreter declares this", which is a false positive for a presence claim
+/// (#1899).
+#[test]
+fn stub_producer_records_the_condition_of_each_guarded_declaration() {
+    let environment = tempfile::tempdir().unwrap();
+    let artifact = environment.path().join("guarded.pyi");
+    std::fs::write(
+        &artifact,
+        r#"
+import sys
+
+def getcwd() -> str: ...
+
+if sys.version_info >= (3, 14):
+    def from_number(value: object) -> float: ...
+
+if sys.platform == "win32":
+    def startfile(path: str) -> None: ...
+else:
+    def fork() -> int: ...
+
+if sys.version_info >= (3, 12) and sys.platform in ("linux", "darwin"):
+    def sendfile(target: int) -> int: ...
+
+if sys.version_info >= (3, 12):
+    def swap(value: int) -> int: ...
+else:
+    def swap(value: int) -> int: ...
+
+if _HAS_EXTENSION:
+    def mystery() -> None: ...
+"#,
+    )
+    .unwrap();
+
+    let production = PythonArtifactPackProducer.produce_exact_artifact(
+        &artifact_request(artifact, ExternalArtifactKind::PythonStub),
+        &ArtifactProducerLimits::default(),
+    );
+
+    let pack = production.pack.unwrap();
+    let AuthoredPayload::DeclarationFacts { members, .. } = &pack.shards[0].payload else {
+        panic!("expected declaration facts");
+    };
+    let guard_of = |name: &str| {
+        members
+            .iter()
+            .find(|fact| fact.name == name)
+            .unwrap_or_else(|| panic!("`{name}` must stay in the pack: {members:#?}"))
+            .guard
+            .clone()
+    };
+    assert_eq!(guard_of("getcwd"), None);
+    assert_eq!(
+        guard_of("from_number"),
+        Some(DeclarationGuard {
+            min_toolchain_version: Some(GuardVersion::new(3, 14, 0)),
+            ..DeclarationGuard::default()
+        })
+    );
+    assert_eq!(
+        guard_of("startfile"),
+        Some(DeclarationGuard {
+            required_targets: vec!["win32".to_owned()],
+            ..DeclarationGuard::default()
+        })
+    );
+    // The `else` branch is the negation of the branch above it.
+    assert_eq!(
+        guard_of("fork"),
+        Some(DeclarationGuard {
+            excluded_targets: vec!["win32".to_owned()],
+            ..DeclarationGuard::default()
+        })
+    );
+    // Both sides of an `and` stay necessary conditions.
+    assert_eq!(
+        guard_of("sendfile"),
+        Some(DeclarationGuard {
+            min_toolchain_version: Some(GuardVersion::new(3, 12, 0)),
+            required_targets: vec!["linux".to_owned(), "darwin".to_owned()],
+            ..DeclarationGuard::default()
+        })
+    );
+    // Two branches declare one identity, so no branch's condition survives as
+    // a necessary one and the record must not be droppable.
+    assert_eq!(guard_of("swap"), Some(DeclarationGuard::uninterpreted()));
+    // A condition this producer cannot read keeps the declaration and says so.
+    assert_eq!(guard_of("mystery"), Some(DeclarationGuard::uninterpreted()));
+}
+
+/// The probes from #1869's typeshed slice: an activation that pins one
+/// interpreter must stop resolving a declaration whose recorded condition that
+/// interpreter cannot satisfy, and must keep everything else.
+#[test]
+fn activation_drops_only_declarations_the_pinned_interpreter_cannot_declare() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("app.py", "import os\n")
+        .build();
+    let environment_root = tempfile::tempdir().unwrap();
+    let standard_library = environment_root.path().join("stdlib");
+    let distributions = environment_root.path().join("site-packages");
+    std::fs::create_dir_all(&standard_library).unwrap();
+    std::fs::create_dir_all(&distributions).unwrap();
+    std::fs::write(
+        standard_library.join("builtins.pyi"),
+        r#"
+import sys
+
+class float:
+    def hex(self) -> str: ...
+    if sys.version_info >= (3, 14):
+        def from_number(self, value: object) -> float: ...
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        standard_library.join("os.pyi"),
+        r#"
+import sys
+
+def getcwd() -> str: ...
+
+if sys.platform == "win32":
+    def startfile(path: str) -> None: ...
+
+if _HAS_EXTENSION:
+    def mystery() -> None: ...
+"#,
+    )
+    .unwrap();
+
+    let activate = |version: &str, platform: &str| {
+        let mut config = environment(standard_library.clone(), distributions.clone());
+        let environment = config.environment.as_mut().unwrap();
+        environment.version = version.to_owned();
+        environment.platform = platform.to_owned();
+        let limits = DependencyPackLimits::default();
+        let discovery =
+            resolve_python_semantic_pack_dependencies(&config, workspace.project(), &limits, None);
+        assert!(discovery.complete, "{:#?}", discovery.diagnostics);
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_discovered_dependency_semantic_packs(
+            &catalog,
+            &PythonDependencyPackAdapter,
+            discovery,
+            &limits,
+            None,
+        );
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        let request = prepared
+            .compose_activation_request(SemanticModelActivationRequest {
+                bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                evidence: Vec::new(),
+                controls: Vec::new(),
+                limits: SemanticModelRuntimeLimits::default(),
+            })
+            .unwrap();
+        let SemanticModelResolutionOutcome::Ready(active) =
+            resolve_active_semantic_models(&catalog, &request, &CancellationToken::default())
+        else {
+            panic!("the exact Python stub pack must activate");
+        };
+        active
+    };
+    let resolves = |active: &ResolvedActiveSemanticModels, owner: &str, name: &str| {
+        let matched = active.types_named(owner);
+        assert_eq!(matched.records.len(), 1, "{matched:#?}");
+        !active
+            .members_named(&matched.records[0].record.id, name)
+            .records
+            .is_empty()
+    };
+
+    let pinned = activate("3.13.5", "linux");
+    assert!(!resolves(&pinned, "builtins.float", "from_number"));
+    assert!(resolves(&pinned, "builtins.float", "hex"));
+    assert!(!resolves(&pinned, "os", "startfile"));
+    assert!(resolves(&pinned, "os", "getcwd"));
+    // A condition the producer could not read is not proof of anything.
+    assert!(resolves(&pinned, "os", "mystery"));
+    // Two dropped members, one per probe. Nothing else leaves the pack.
+    assert_eq!(pinned.activation_report().guard_excluded_records, 2);
+
+    let matching = activate("3.14.1", "win32");
+    assert!(resolves(&matching, "builtins.float", "from_number"));
+    assert!(resolves(&matching, "builtins.float", "hex"));
+    assert!(resolves(&matching, "os", "startfile"));
+    assert!(resolves(&matching, "os", "getcwd"));
+    assert!(resolves(&matching, "os", "mystery"));
+    assert_eq!(matching.activation_report().guard_excluded_records, 0);
 }
 
 #[test]

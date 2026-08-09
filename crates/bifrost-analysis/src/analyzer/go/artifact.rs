@@ -968,6 +968,7 @@ fn module_type_drafts(
                         hierarchy: Vec::new(),
                         aliases,
                         extension_surfaces: Vec::new(),
+                        guard: None,
                         locator: artifact_locator(&path, &name),
                     },
                     exported: false,
@@ -1224,6 +1225,7 @@ fn collect_type_draft(
                 .into_iter()
                 .collect(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: artifact_locator(&parsed.path, &canonical_name),
         },
         exported,
@@ -1633,6 +1635,7 @@ fn push_member(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            guard: None,
             locator,
         },
         surface,

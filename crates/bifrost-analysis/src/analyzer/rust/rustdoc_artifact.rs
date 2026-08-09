@@ -445,6 +445,7 @@ fn produce_document(
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: locator(name),
         });
         push_generic_relations(id, generics, document, &type_ids, &mut relations);
@@ -625,6 +626,7 @@ fn produce_document(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            guard: None,
             locator: locator(&format!("{path}#{member_id}")),
         });
     }
