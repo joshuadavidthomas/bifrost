@@ -41,6 +41,12 @@ mod policy_source;
 mod policy_suppression_evaluation;
 mod policy_suppression_loading;
 mod scan_usages_same_owner_policy;
+// Milestone 3 of the procedure-summary foundry (#1871). The fixture engine and
+// its runner are generation-time tooling behind `release-tooling`, so this
+// acceptance runs with that feature enabled and is absent from a featureless
+// build, exactly like the rest of the foundry.
+#[cfg(feature = "release-tooling")]
+mod summary_foundry_fixtures;
 mod taint_policy_adapter;
 #[cfg(unix)]
 mod temp_storage_scripts;
