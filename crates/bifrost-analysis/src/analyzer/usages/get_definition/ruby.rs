@@ -1161,12 +1161,14 @@ fn ruby_constant_outcome(
 
 /// Whether an unresolved constant reference routes out of the workspace.
 ///
-/// Only an explicitly qualified path (`Widget::Config`) can say so, which is
-/// the same candidate shape Ruby's proof-gated diagnostics judge. Ruby's
-/// top-level constant surface includes the core library, everything `Object`
-/// inherits, and whatever every loaded gem defined as a side effect, none of
-/// which Bifrost publishes, so a bare constant that misses proves nothing about
-/// where the name lives (#1624).
+/// Only an explicitly qualified path whose owner is itself written as constants
+/// (`Widget::Config`) can say so, which is the same candidate shape Ruby's
+/// proof-gated diagnostics judge. Ruby's top-level constant surface includes the
+/// core library, everything `Object` inherits, and whatever every loaded gem
+/// defined as a side effect, none of which Bifrost publishes, so a bare constant
+/// that misses proves nothing about where the name lives (#1624). An owner that
+/// is an arbitrary expression (`registry.current::Config`) names its namespace
+/// only while the program runs, so nothing static can place it either.
 ///
 /// The owner is then checked against the workspace's own declarations
 /// regardless of which files this one can reach. That is the #1089
@@ -1179,7 +1181,10 @@ fn ruby_constant_path_leaves_the_workspace(
     node: Node<'_>,
     source: &str,
 ) -> bool {
-    let Some(owner) = node.child_by_field_name("scope") else {
+    let Some(owner) = node
+        .child_by_field_name("scope")
+        .filter(|owner| matches!(owner.kind(), "constant" | "scope_resolution"))
+    else {
         return false;
     };
     !semantic.declares_constant_anywhere(&context.lexical_stack, owner, source)

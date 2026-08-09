@@ -1456,6 +1456,9 @@ fn kotlin_type_leaves_the_workspace(
     let head = segments[0];
 
     for import in &scope.facts.imports {
+        if import.is_wildcard || import.local_name() != Some(head) {
+            continue;
+        }
         let Some(path) = import
             .path
             .as_ref()
@@ -1463,16 +1466,17 @@ fn kotlin_type_leaves_the_workspace(
         else {
             continue;
         };
-        if !import.is_wildcard && import.local_name() == Some(head) {
-            let owner = path.segments[..path.segments.len() - 1].join(".");
-            return !kotlin_workspace_package_exists(ctx.support, &owner);
-        }
+        let owner = path.segments[..path.segments.len() - 1].join(".");
+        return !kotlin_workspace_package_exists(ctx.support, &owner);
     }
     for import in &scope.facts.imports {
+        if !import.is_wildcard {
+            continue;
+        }
         let Some(path) = import
             .path
             .as_ref()
-            .filter(|path| import.is_wildcard && !path.segments.is_empty())
+            .filter(|path| !path.segments.is_empty())
         else {
             continue;
         };
