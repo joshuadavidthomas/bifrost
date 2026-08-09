@@ -10,7 +10,8 @@ inputs:
     description: >-
       Bifrost release tag to install (see BrokkAi/bifrost releases). Pin an
       exact tag for reproducible gates. The special value `local` skips the
-      install and uses the `bifrost` already on PATH.
+      install and uses `target/release/bifrost` from the checkout when it
+      exists, otherwise the `bifrost` already on PATH.
     required: false
     default: v0.8.24
   policy-packs:
@@ -81,9 +82,11 @@ runs:
         BIFROST_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
+        bin=bifrost
+        if [ "${RUNNER_OS}" = Windows ]; then bin=bifrost.exe; fi
         if [ "${BIFROST_VERSION}" = local ]; then
-          if [ -x "${GITHUB_WORKSPACE}/target/release/bifrost" ]; then
-            echo "bifrost_bin=${GITHUB_WORKSPACE}/target/release/bifrost" >> "${GITHUB_OUTPUT}"
+          if [ -x "${GITHUB_WORKSPACE}/target/release/${bin}" ]; then
+            echo "bifrost_bin=${GITHUB_WORKSPACE}/target/release/${bin}" >> "${GITHUB_OUTPUT}"
           else
             command -v bifrost >/dev/null || { echo "::error::version=local but no bifrost is available"; exit 1; }
             echo "bifrost_bin=$(command -v bifrost)" >> "${GITHUB_OUTPUT}"
@@ -119,7 +122,9 @@ runs:
         else
           tar -xzf "${stage}.tar.gz"
         fi
-        echo "bifrost_bin=${dir}/${stage}" >> "${GITHUB_OUTPUT}"
+        # The archive extracts to a directory named after the stage; the
+        # executable lives inside it, next to the license files.
+        echo "bifrost_bin=${dir}/${stage}/${bin}" >> "${GITHUB_OUTPUT}"
 
     - name: Analyzer cache
       if: inputs.cache == 'true'
