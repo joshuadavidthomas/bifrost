@@ -8,6 +8,8 @@ This work will produce a valid CodeScaleBench comparison for Bifrost symbol and 
 
 If Luna does not use semantic search often enough, the final NLP arm will add a synthetic step zero. A small query model will produce only necessary initial queries. The harness will run those queries before Luna starts. Luna will not see the query-model turn, but it will receive the semantic results.
 
+Status of that condition, 2026-08-09: arm 04 measured high natural use, so the condition is not met. The synthetic step zero is now an owner choice. See the Progress list and the Decision Log.
+
 ## Progress
 
 - [x] (2026-08-05 20:10Z) Confirmed that `grep_hard/suite_final.jsonl` contains 67 unique tasks.
@@ -47,10 +49,13 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - [x] (2026-08-09 11:07Z) Built runtime r26 from `bifrost-nlp-ft` at `74ff5cbd`, created 6 per-repository analyzer caches (11 GB at schema v18, against 96 GB for the superseded merged v15 database), prewarmed all 14 workspaces analyzer-only on the host, and passed a one-task smoke. Provenance: `PHASE1-r26-record.md` in the campaign directory.
 - [x] (2026-08-09 11:40Z) Ran all 14 tasks with symbol tools on runtime r26 in `symbols-r26-final`. Validity gate passed: 0 MCP-start errors, 14/14 server-ready, 14/14 with a successful Bifrost call, 14/14 archives. 12 tasks scored; 2 failed the answer contract.
 - [x] (2026-08-09) Produced the three-arm paired report. On the 12 comparable tasks: bare 0.5872 vs r26 symbols 0.5768 mean composite, 0 solves in both. On the 10 three-arm tasks: bare 0.6019, r25 0.6021, r26 0.5940. Latency at eval scale fell hard: Bifrost calls over 5 s went from 148/381 to 105/375, median call 3.24 s to 0.96 s, total tool time 10,431 s to 3,382 s, worst call 1,200.3 s to 330.3 s. Quantified the exact-match symbol-scoring artifact and found it symmetric between arms. Report: `paired14-r26-vs-bare-v1.json` and `.md`. Checkpoint: `.agents/docs/codescale-grep-hard-checkpoint-2026-08-09.md`.
+- [x] (2026-08-09 13:31Z) Prewarmed semantic vectors for all 14 workspaces on the host against the same 6 per-repository caches. 5,520,349 chunks, 5,569 s elapsed, 14 of 14 exit 0. One shared voyage-4-nano DW10 sidecar on GPU 1. No task container performed prewarm. Provenance: `PHASE2-NLP-r26-record.md`.
+- [x] (2026-08-09 14:24Z) Ran all 14 tasks with symbol and NLP tools on runtime r26 in `symbols-nlp-r26-final`. Validity gate passed: 14/14 `mcp server ready` with `tool_count=8` and toolset `symbol|nlp`, 0 MCP-start errors, 14/14 with a successful Bifrost call, 14/14 archives. 9 tasks scored, 2 failed the answer contract, 3 hit the 1,800 s agent limit.
+- [x] (2026-08-09) Produced the four-arm paired report. On the 8 three-arm tasks: bare 0.6090, r25 0.6093, r26 symbols 0.6117, r26 symbols+NLP 0.6042. All four arms sit inside 0.008 mean composite and no arm solves a task. NLP costs $1.1771 against $0.6137 over all 14 tasks, and 43.5 percent of its tokens go to the semantic reranker. Report: `fourarm14-r26nlp-v1.json` and `.md`, generator `build-fourarm-r26nlp-report-v1.py`. Checkpoint: `.agents/docs/codescale-grep-hard-checkpoint-2026-08-09.md`.
+- [x] (2026-08-09) Answered the natural-semantic-use question. 13 of 14 tasks called `semantic_search`, 46 agent-issued calls and 112 query runs, 0 synthetic. Natural use is not sparse, so the plan's trigger for a synthetic step zero is not met. An earlier count of zero came from reading `toolCalls.byTool`, which cannot see `semantic_search`.
 - [ ] Owner decision: version the scorer to `canonical_grep_hard_v2` with tail-normalized symbol matching and rescore all arms, or record the artifact and treat every published composite as a spelling-sensitive lower bound.
-- [ ] Run the same tasks with symbol and NLP tools.
-- [ ] Add synthetic semantic step zero if natural semantic use is too low.
-- [ ] Produce a paired report and complete the requirement audit.
+- [ ] Owner decision: build the synthetic semantic step zero, or record that natural use makes it unnecessary. It is now optional, not a repair. See the Decision Log entry of 2026-08-09 for what it requires and for its measurement side effect.
+- [ ] Complete the requirement audit against the Validation and Acceptance section.
 
 ## Surprises & Discoveries
 
@@ -132,6 +137,22 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
   Evidence: `ccx-dep-trace-273` scored 0.4545 in the r26 smoke and then failed `invalid_answer_contract` in the arm hours later on the same runtime, cache and guidance. The failure is agent output-format variance, not a harness change.
 - Observation: Some lost symbol recall is file localization, not naming.
   Evidence: On `ccx-incident-110` and `ccx-onboard-103` the path-agnostic match rate is 1.0 while the tail-normalized rate stays at 0.5 and 0.2. The agent named the right symbol against the wrong file. On `ccx-platform-242` all three arms score file_f1 0.4000 with symbol_recall 0.7500.
+- Observation: `toolCalls.byTool` cannot see `semantic_search`, so a byTool census reports zero NLP use on every task.
+  Evidence: `byTool` contains no `semantic_search` key in any of the 14 arm 04 tasks, because the tool emits no `tool_timing` record. The traces carry 46 agent-issued `semantic_search` calls in `llm_response.tool_calls`, and `result.json.semanticSearch` reports 42 agent calls and 112 query runs. The execution appears only as `semantic_search_batch`, `semantic_search_phase` and `semantic_search_rerank` events.
+- Observation: Luna uses semantic search without prompting, on almost every task.
+  Evidence: 13 of 14 arm 04 tasks called `semantic_search`, between 1 and 9 times each, for 46 calls and 112 query runs. Only `ccx-onboard-103` never called it. `syntheticCalls` is 0 everywhere. The plan's condition for adding a synthetic step zero is therefore not met.
+- Observation: Adding NLP roughly doubles cost and tokens and returns no measured composite gain.
+  Evidence: Over all 14 tasks arm 04 spent $1.1771 and 13,583,588 tokens against arm 03's $0.6137 and 8,968,471. 5,907,615 tokens, 43.5 percent of arm 04's total, went to the `deepseek::deepseek-v4-flash` semantic reranker. On the 8 three-arm tasks the mean composite is bare 0.6090, r26 symbols 0.6117, r26 symbols+NLP 0.6042.
+- Observation: `semantic_search` is the slowest tool in the campaign by a wide margin.
+  Evidence: All 40 completed batches exceed five seconds. The median batch is 71.1 s, the worst is 1,000.6 s, and the total is 6,442 s. That total is larger than arm 03's whole Bifrost tool time of 3,382 s.
+- Observation: The embedding sidecar is not the semantic cost. The semantic index readiness wait is.
+  Evidence: Over 106 query runs `embedding_service_ms` totals 2.5 s with a 21.9 ms median and a 0.0 s queue, while `wait_ready_ms` totals 1,731 s with a single worst wait of 451.4 s on Firefox. Only 14 of 106 runs wait more than a second, so this is one-time container hydration charged in full to whichever agent call happens to be first. Context fetch is the second cost at 7,434 s of per-query span and a 559.7 s worst.
+- Observation: The three arm 04 timeouts are semantic waits, not agent loops and not `scan_usages_by_reference`.
+  Evidence: Main-model time is 35.2 s, 32.8 s and 149.4 s across 8, 10 and 22 turns. `ccx-domain-112` spent 932 s in two semantic batches and then stalled in `context_fetch`, and it made no `scan_usages_by_reference` call at all. `ccx-incident-125` spent 1,026 s in two batches and stalled in `context_fetch` for its final 325 s; its 3 `scan_usages_by_reference` calls total 64.4 s. `ccx-dep-trace-264` spent 1,000.6 s in one semantic call, of which 451.4 s was the readiness wait. Arm 03 finished the same three tasks in 748 s, 613 s and 659 s of agent time and scored two of them.
+- Observation: A completed agent run can still be recorded as a timeout, and its scorable answer is then discarded.
+  Evidence: `ccx-dep-trace-264` wrote a `task-output` with `files`, `symbols`, `chain` and `text`, and its tool loop exited `stop=Completed { had_text: true }` about 107 s before the 1,800 s limit. The harness recorded `stopReason: TIMEOUT`, `timedOut: true` and no reward record, and mjolnir wrote `stop_reason: cancelled`.
+- Observation: Bifrost timing logs reach gigabyte scale inside a task container.
+  Evidence: `anvil-stderr.txt` is 1,169 MB and 18.0 million lines on `ccx-incident-125`, 423 MB on `ccx-incident-032` and 326 MB on `ccx-dep-trace-264`, almost all `[bifrost-timing]` BEGIN/END pairs at `sql_definition_candidates` granularity. Arm 03 shows the same class at 198 MB and 211 MB. This overhead sits inside the timed window and no one has measured it.
 
 ## Decision Log
 
@@ -207,6 +228,16 @@ If Luna does not use semantic search often enough, the final NLP arm will add a 
 - Decision: Task containers keep read-write access to the analyzer cache. The Idempotence section's older "read-only task runs" language is superseded, not the engine.
   Rationale: Read-only mounts would make complete prewarm a hard precondition and would break tasks that modify files, because incremental analysis must write rows for changed or missing blobs. The 2026-08-07 investigation measured writer contention as a minor term (total concurrency overhead at most 1.3x, dominated by the query defect, not locking), so the read-write mount was not the harm it first appeared to be. The per-repository cache decision above removes most residual writer overlap structurally: concurrent tasks on different repositories write disjoint databases. Known accepted side effect: when two concurrent tasks share one repository, an earlier task's writes can warm rows for a later task, a small ordering wrinkle in comparability rather than a defect.
   Date/Author: 2026-08-07 / Jonathan (instruction), recorded by Fable
+
+- Decision: Do not add the synthetic semantic step zero on the evidence of arm 04. Record it as an owner choice instead.
+  Rationale: The plan makes the step zero conditional on sparse natural use. Arm 04 measured 46 agent-issued `semantic_search` calls and 112 query runs on 13 of 14 tasks, so the condition is not met. If the owner still wants it, it requires a `semantic-synthetic` evaluation mode in Brokkbench, a query model configured separately from the utility reranker, harness-run queries whose results are injected before Luna's first turn with the query-model turn kept out of Luna's history, query selection by necessity with deduplication rather than a fixed count, and the `querygen` record populated, which today returns None outside `semantic-synthetic`. Record one measurement side effect before building it: a step zero moves the 451 s semantic index readiness wait out of the agent's visible loop, so it changes what the latency comparison measures.
+  Date/Author: 2026-08-09 / Claude Opus 4.8
+- Decision: Report `semantic_search` use from the traces and from `result.json.semanticSearch`. Never from `toolCalls.byTool`.
+  Rationale: `semantic_search` emits no `tool_timing` record, so `byTool` shows zero on every task even when the agent calls it nine times. A byTool census silently reports the opposite of the truth.
+  Date/Author: 2026-08-09 / Claude Opus 4.8
+- Decision: Count `semantic_search` as its own interval class in the latency census, beside the MCP tool calls, and keep the per-task union method for both.
+  Rationale: The two classes have no common timing record, so a single pooled census cannot hold them. Separate classes keep the arm 03 to arm 04 MCP comparison like for like, and the combined union still states the honest wall clock.
+  Date/Author: 2026-08-09 / Claude Opus 4.8
 
 ## Outcomes & Retrospective
 
@@ -306,3 +337,5 @@ Revision note: The first replacement smoke still exposed generic workspace tools
 Revision note: Arm 03 ran the same 14 tasks with symbol tools on runtime r26 and per-repository caches. The latency question from 2026-08-07 is answered: total Bifrost tool time fell 68 percent, wall-clock occupancy fell 77 percent, the median call fell from 3.24 s to 0.96 s, and the 1,200 s `get_symbol_sources` calls that lost two Firefox tasks are gone. Both Firefox tasks completed. The tool-value answer did not change: bare 0.5872 against r26 symbols 0.5768 on the 12 comparable tasks, 0 solves in every arm. The exact-match symbol scorer costs each arm about 0.08 composite and two near-solves, but it is symmetric, so no arm comparison depends on it. `scan_usages_by_reference` is the remaining slow path. Three arms inside 0.01 mean composite on 10 to 12 tasks cannot separate the tools; a larger manifest or repeated runs is required before any claim of gain or of no gain is supported.
 
 Revision note: The complete symbols arm shows no localization gain over bare on the 10 comparable tasks (+0.0003 mean, identical file F1 everywhere, 0 solves in both arms). The measurement itself is clean, but 39 percent of Bifrost calls exceeded the 5 s product limit under 10-way shared-cache concurrency, and two Firefox tasks were lost to 1,200 s get_symbol_sources budget exhaustion. Latency is now the gating question for the tool comparison: the two lost tasks are the ones where symbol tools had the most room to help. Evidence on #1688 and #1748; isolated warm reruns must split contention from single-request cost before any conclusion about tool value at Firefox scale.
+
+Revision note: Arm 04, symbols plus NLP on runtime r26, is complete. Natural semantic use is high, so the conditional synthetic step zero becomes an owner choice and not a required repair. The remaining open items are the scorer v2 decision, the synthetic step-zero decision, and the requirement audit.
