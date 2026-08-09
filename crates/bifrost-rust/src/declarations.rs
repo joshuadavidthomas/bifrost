@@ -249,6 +249,12 @@ pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
         }
     }
 
+    // The per-file usage facts persisted to the `rust_*` fact tables. Extracted
+    // here, from the tree this pass already holds, so nothing re-parses later
+    // to answer a usage query (ExecPlan `.agents/plans/rust-usage-index-v2.md`).
+    parsed.rust_usage_facts =
+        crate::facts::extract_rust_usage_facts(root, source, &item_macro_definitions);
+
     parsed
 }
 
@@ -989,14 +995,9 @@ fn rust_is_identifier_like(node: Node<'_>) -> bool {
     )
 }
 
-#[derive(Debug, Clone)]
-pub struct RustRulesItemMacroDefinition {
-    pub name: String,
-    pub visible_after: usize,
-    pub scope_start: usize,
-    pub scope_end: usize,
-    pub passthrough: bool,
-}
+/// Re-exported from core, where the persisted Rust module-route facts that
+/// carry it live.
+pub use brokk_bifrost_core::analyzer::rust_facts::RustRulesItemMacroDefinition;
 
 pub fn rust_rules_item_macro_definitions(
     root: Node<'_>,

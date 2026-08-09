@@ -52,7 +52,11 @@ A **pin** is a test that fails before a fix and passes after it. When this plan 
 - [x] (2026-08-09 14:40Z) Phase 1 Step 5: workspace compiles featureless and with all features, no warnings.
 - [x] (2026-08-09 15:30Z) Phase 1 Step 6: featureless nextest matches the upstream baseline exactly; doctests pass; all-features clippy clean.
 - [x] (2026-08-09 16:20Z) Phase 1 Step 7: committed on `bifrost-nlp-ft` as a merge commit. Not pushed. The comprehensive `nlp,python` gate also ran and matches the baseline.
-- [ ] Phase 2 (owner-gated, do not start without explicit authorization): re-land usage v2 on the nine-crate topology and rebuild upstream's include-expansion routes on the v2 substrate.
+- [x] (2026-08-09) Phase 2 authorized by the owner. Started.
+- [x] (2026-08-09) Phase 2 Step 1 -- restore the write path. Fact value types in `crates/bifrost-core/src/analyzer/rust_facts.rs`; extraction in `crates/bifrost-rust/src/facts.rs`; `extract_rust_module_route_facts` back in `crates/bifrost-rust/src/cargo_routes.rs`; `ParsedFile`/`FileState` carry `rust_usage_facts`; the store writes and reads the eight `rust_*` tables; the two detector salt tokens added. Eight parked store tests restored and green.
+- [ ] Phase 2 Step 2: restore the read path (`usage_queries`, `usage_walks`, `usage`, `fact_catch_up`) on the nine-crate topology.
+- [ ] Phase 2 Step 3: rebuild upstream's include-expansion routes on the v2 substrate.
+- [ ] Phase 2 Step 4: delete `RustUsageIndex`.
 
 ## Surprises & Discoveries
 
@@ -120,6 +124,14 @@ A **pin** is a test that fails before a fix and passes after it. When this plan 
   Rationale: upstream moved the file to `crates/bifrost-core/src/analyzer/capabilities.rs`, which contradicts the documented rule. Upstream's move is the base and reverting it is out of scope, so the documentation is what is wrong. The correction records why the exception holds.
   Date/Author: 2026-08-09, integration agent.
 
+- Decision: the Rust usage fact VALUE types live in `crates/bifrost-core/src/analyzer/rust_facts.rs`, not in `brokk-bifrost-rust`, and `RustVisibility` and `RustRulesItemMacroDefinition` move there with them (re-exported from their old Rust-crate homes so no call site changes).
+  Rationale: the plan requires `ParsedFile` to regain a `rust_usage_facts` field, and `ParsedFile` is in core, which may not depend on `brokk-bifrost-rust`. The precedent is exact: `ScalaExportInfo` and `CppTemplateMetadata` are language-specific plain data on `ParsedFile` and already live in core's model. The types name no `IAnalyzer`, store, grammar, or language module, so `CLAUDE.md`'s rule puts them in core. The tree-sitter extraction that fills them stays in `brokk-bifrost-rust`; the SQL that persists them stays in `brokk-bifrost-analysis`.
+  Date/Author: 2026-08-09, integration agent.
+
+- Decision: Phase 2 lands in four steps, each of which leaves the workspace compiling and green, rather than as one change. Step 1 is the write path with `RustUsageIndex` still in place and still the only reader.
+  Rationale: the two sides cannot be swapped atomically without a tree that neither compiles nor runs a test for the length of the work. With the fact rows written but unread, the eight parked store tests become the first executable evidence that the v2 substrate is correct on upstream's topology, and every later step has a green base to bisect against.
+  Date/Author: 2026-08-09, integration agent.
+
 ## Outcomes & Retrospective
 
 ### Phase 1, 2026-08-09
@@ -155,9 +167,50 @@ What went wrong, and the lesson. Resolving a conflicted file with `git checkout 
 
 What is unfinished. The Rust usage rewrite is not in this tree; `RustUsageIndex` lives again, and with it the 88 second, 30 gigabyte whole-workspace build. That is the deliberate shape of Phase 1, not a regression against the merge base, but it is a regression against `bifrost-nlp-ft` as it stood at `0a53a550`, and it stays one until Phase 2 lands. Nine tests and seven source files are parked, all listed above.
 
-### Phase 2
+### Phase 2, step 1, 2026-08-09
 
-Not started. Owner-gated.
+Step 1 of four is complete and validated. The Rust usage-v2 WRITE path is back,
+on upstream's nine-crate topology: every per-file Rust usage fact is extracted
+during the parse that already happens and persisted with the blob that produced
+it, into the eight `rust_*` tables migrations 0017 and 0018 created empty in
+Phase 1. `RustUsageIndex` is untouched and still the only reader, so no usage
+answer changed.
+
+Measured, in the working tree, on the featureless gate:
+
+    $ cargo nextest run --workspace --all-targets --no-fail-fast
+    Summary [146.938s] 9872 tests run: 9867 passed (1 slow), 5 failed, 42 skipped
+
+    FAIL suite_cross_language code_query_resolution_conformance::an_unindexed_declared_dependency_is_a_boundary_row_rather_than_an_empty_answer
+    FAIL suite_symbols       diff_analysis_test::analyze_diff_gives_introduced_and_deleted_symbols_their_whole_callee_list
+    FAIL suite_symbols       searchtools_service::scan_usages_by_reference_finds_exact_rust_scoped_members_inside_macros
+    FAIL suite_symbols       get_definition_test::rust_scoped_owner_resolution_preserves_namespace_and_canonical_identity
+    FAIL brokk-bifrost-analysis analyzer::jvm::java_artifact::tests::source_and_class_jars_share_declaration_ids_and_keep_distinct_origins
+
+Those are the five upstream fails at its own tip, by name, and nothing else.
+The tree runs twenty-three more tests than Phase 1 recorded and passes all of
+them; fourteen of the twenty-three are the restored v2 pins (eight store, five
+Rust extraction, one core encoding round trip).
+
+    $ cargo fmt --check                                  -> clean
+    $ cargo test --workspace --doc                       -> ok
+    $ scripts/with-isolated-cargo-target.sh cargo clippy \
+        --workspace --all-targets --all-features -- -D warnings
+                                                         -> clean
+
+What is unfinished. Steps 2a, 2b, 3 and 4 -- Cargo routes from per-blob rows,
+the read path, the include-expansion route rebuild, and the deletion of
+`RustUsageIndex` -- have not started. The 88 second, 30 gigabyte per-edit index
+build is therefore still in this tree. Their design, and the crate-boundary
+survey that decides their shape, is in "Phase 2, as executed" above; that
+survey is the expensive part and it came out better than this plan feared,
+because upstream had already abstracted the analyzer behind `RustSource` and
+exposes as free functions nearly every analyzer method the parked walks call.
+
+The four acceptance suites for step 3 --
+`rust_include_inverse_regression.rs`, `rust_top30_inverse_regression.rs`,
+`rust_top30_forward_regression.rs` and `rust_top30_macro_regression.rs` -- all
+pass today against upstream's index, which is the green base the rebuild needs.
 
 
 
@@ -525,6 +578,205 @@ Rebuild include-expansion routes on the v2 substrate. This is the genuinely new 
 Delete `RustUsageIndex` last, exactly as the arc's Milestone 5 did, once nothing reads it.
 
 Finally, re-enable every row of the cfg-ignored table, remove `.agents/phase2/rust-usage-v2/`, and update this plan's `Outcomes & Retrospective`.
+
+## Phase 2, as executed: the four steps and their seams
+
+Phase 2 is authorized and under way. It is split into four steps because the
+two Rust usage designs cannot be swapped atomically: there is no single change
+that removes `RustUsageIndex` and installs the v2 substrate while leaving a
+tree anyone can compile or test. Each step below leaves the workspace green.
+
+The crate-boundary survey that decides the shape of steps 2 to 4 is recorded
+here rather than rediscovered, because it is the expensive part and it came out
+better than the plan feared.
+
+### What the survey found
+
+The parked v2 sources call thirty-three distinct methods on a `RustAnalyzer`
+receiver, across `usage.rs`, `usage_walks.rs`, `usage_queries.rs` and
+`fact_catch_up.rs`. Upstream's own split already provides nearly all of them to
+`brokk-bifrost-rust` as free functions over `&dyn RustSource` or
+`&dyn CodeUnitIndex`:
+
+    rust_declaration_visibility            graph_support.rs:1431   over RustSource
+    is_rust_trait_declaration              graph_support.rs:1366   over CodeUnitIndex
+    is_rust_macro_export_declaration       graph_support.rs:1417   over CodeUnitIndex
+    is_external_module_declaration         graph_support.rs:1576   over RustSource
+    rust_named_declaration_node            graph_support.rs:1611
+    resolve_imported_export_from_binder_forward  graph_support.rs:559
+    get_analyzed_files / is_analyzed / declarations / project    CodeUnitIndex
+    prepared_syntax / cargo_routes(_while) / package_file_index
+    export_index_of / structural_parent_of / note_module_file_resolution   RustSource
+    is_type_alias                          TypeAliasProvider
+    files_share_cargo_target               RustCargoRouteIndex::files_share_target
+
+so the walks port into `brokk-bifrost-rust` against a trait rather than against
+an analyzer, and the genuinely new trait surface is seven methods, not thirty.
+
+### Step 1 (landed): the write path
+
+Described in its own commit message. The fact value types are in
+`crates/bifrost-core/src/analyzer/rust_facts.rs`, the extraction in
+`crates/bifrost-rust/src/facts.rs` and `cargo_routes.rs`, the persistence in
+`crates/bifrost-analysis/src/analyzer/store/mod.rs`. The eight parked store
+tests are restored and green. `RustUsageIndex` is untouched and is still the
+only reader, so no behaviour changed.
+
+### Step 2a: Cargo routes composed from per-blob rows (#1793, #1817)
+
+This is the next step, and it needs no new trait at all -- which is why it goes
+before the walks. The arc's signature is
+
+    pub fn build_while(
+        files: &[ProjectFile],
+        module_route_facts: &HashMap<ProjectFile, RustModuleRouteFacts>,
+        keep_going: &impl Fn() -> bool,
+    ) -> Option<Self>
+
+Plain data in, index out. The only caller is
+`RustAnalyzer::build_cargo_routes_while` in
+`crates/bifrost-analysis/src/analyzer/rust/mod.rs`, which today passes a
+`|file| self.prepared_syntax(file)` closure and a `parallel` flag; it becomes
+one batched `AnalyzerStore::rust_module_route_facts(oids)` read -- a method Step
+1 already landed -- and the flag disappears, because the build stops being a
+rayon fan-out over every file's syntax tree.
+
+The port is a three-way merge of `crates/bifrost-rust/src/cargo_routes.rs`.
+`git merge-file` reports sixteen conflicts, but the shape is favourable and is
+worth stating so nobody re-derives it: the arc only ADDED symbols to this file
+(`CargoManifestTopology`, `ModuleEdgeCache`, `extract_rust_module_route_facts`
+and its helpers, `files_by_target_root`, `workspace_file_sweeps_of`, ...) and
+removed none, while upstream's substantive delta over the merge base is about a
+hundred lines: the crate-path rewrite (`super::` to `crate::`,
+`crate::hash::HashSet` to an imported `HashSet`), a blanket widening of
+`pub(super)` / `pub(crate)` to `pub`, two extracted manifest helpers
+(`cargo_manifest_package_name`, `cargo_manifest_library_name`), one new method
+(`RustCargoRouteIndex::files_share_target`), and a set of test expectations
+updated for crate-aware package naming (`matcher.src` became `matcher_lib`,
+`options` became `selfroute.options`). Resolve by taking the arc's side and
+re-applying that list, not by hand-merging sixteen regions.
+
+Acceptance: the existing `cargo_routes` unit suite, unchanged, plus
+`module_route_fact_fallback_count` reading zero on a warm workspace -- the
+structural claim of #1793 is that the index composes from rows and never from a
+workspace parse.
+
+### Step 2b: the read path
+
+`usage_queries.rs`, `usage_walks.rs`, `usage.rs` and `fact_catch_up.rs` port
+into `crates/bifrost-rust/src/`, with `&RustAnalyzer` receivers replaced by
+`&dyn RustFactSource`. That trait extends `RustSource` with the seven things
+the survey found are genuinely missing:
+
+    fn rust_usage_facts_of_blob(&self, oid: Oid) -> Option<Arc<RustUsageFacts>>;
+    fn rust_import_target_blobs(&self, module_path: &str) -> Vec<Oid>;
+    fn rust_export_blobs(&self, exported_name: &str) -> Vec<Oid>;
+    fn rust_identifier_occurrence_blobs(&self, identifier: &str) -> Vec<(Oid, u32)>;
+    fn live_blobs(&self) -> Arc<dyn RustLiveBlobs>;
+    fn walk_caches(&self) -> &RustWalkCaches;
+    fn ensure_rust_facts_caught_up(&self);
+
+`RustLiveBlobs` is a two-method object-safe view (`oid_for_path`,
+`paths_for_oid`) that exists because `LiveSnapshot` lives in
+`brokk-bifrost-analysis` and `brokk-bifrost-rust` may not name it. The
+`AnalyzerStore` readers Step 1 landed carry `#[allow(dead_code)]`; this step
+removes it.
+
+`fact_catch_up.rs` stays on the analysis side, because it is the one piece that
+genuinely needs the analyzer: it re-parses and re-persists live blobs whose
+rows are missing, and it hands batches to the dedicated build pool. The #549
+invariant applies to it directly -- the pool spawn helper Phase 1 landed as a
+public core API is its only caller, and the inline/background split at
+`RUST_FACT_CATCH_UP_INLINE_LIMIT` is what keeps a rayon worker from parking on
+a pool-dependent build.
+
+Re-enable `rust_usage_readiness_and_warmth_are_distinct_and_vacuous_without_rust`
+from `.agents/phase2/rust-usage-v2/workspace-rust-facts-tests.rs` at the end of
+this step; it is the pin for the readiness/warmth distinction the catch-up
+introduces.
+
+### Step 3: include-expansion routes on the v2 substrate
+
+This is the design work, and it is expressible as rows plus bounded walks. It
+does need one new migration (0020), which is a deliberate departure from Phase
+1's "Phase 2 adds code, not schema" note; the note's reason was to avoid
+rebuilding a user's cache twice, and Step 1 already bumped the Rust detector
+salt, so the second rebuild does not exist. Record the departure, do not work
+around it.
+
+Upstream's algorithm, read out of `crates/bifrost-rust/src/usage_index.rs`:
+
+  - `rust_include_edges(file, root, source)` finds every `include!("...")`
+    invocation, resolves the literal against the host's directory, and captures
+    the host's import bindings visible at the invocation's start byte.
+  - The build seeds one route per (file, owning root) pair, where owning roots
+    are the actual crate roots, `RustPhysicalOwnerIndex::roots_by_file`, and
+    `RustCargoRouteIndex::target_roots_for_file`.
+  - `build_include_routes` then runs a forward breadth-first walk over those
+    edges, threading `(root_file, crate_package, module_package, host_bindings)`
+    and deduping on `(host_file, route)`, and produces a whole-workspace map
+    keyed by the INCLUDED file.
+
+The four provenance kinds the commit message names -- Cargo, module, host
+import, nested include -- are not a tagged enum; they are the four sources the
+seed roots and the threaded bindings come from. That matters for the rebuild,
+because each maps to a different lazy source.
+
+The v2 form, direction by direction:
+
+  Write. Two new content-only tables, `rust_include_edges`
+  `(blob_oid, lang, ordinal, relative_path, file_name, include_start)` and
+  `rust_include_host_bindings`
+  `(blob_oid, lang, edge_ordinal, ordinal, local_name, module_specifier,
+  imported_name, scope_start, kind)`. `relative_path` is the literal as
+  written and `file_name` is its last component, indexed. Neither the resolved
+  target nor the host's package is stored, for the same reason nothing else
+  path-derived is: two byte-identical files at different paths share one row
+  set.
+
+  Read. `include_routes_for(included_file)` must not sweep the workspace, so it
+  runs backwards. `rust_include_edges` indexed by `file_name` answers "which
+  blobs include something whose last path component is this" -- CANDIDATES,
+  under the same IntelliJ contract `usage_queries.rs` already documents for
+  `rust_identifier_occurrences`. Each candidate is verified by resolving its
+  own stored `relative_path` against its own directory and comparing to the
+  file being asked about. Verification is per candidate and touches only that
+  candidate's row, so the cost is the number of files that include a file of
+  that name, not the workspace.
+
+  From each verified includer, compose the route by walking UP: the includer's
+  own includers (nested-include provenance, the same backward step, bounded by
+  a visited set on `(host_file, route)`), and the includer's owning roots
+  (Cargo and module provenance) through the physical-owner walk that Step 2b's
+  `usage_walks.rs` already provides lazily. Host-import provenance is the
+  includer's own `rust_include_host_bindings` rows for the matching edge,
+  composed with `lexical_package_at` exactly as upstream composes it. Memoize
+  the composed result per `(analyzer generation, included file)` in
+  `RustWalkCaches`, which is where every other cross-file walk's cache lives
+  and which retires with the analyzer generation.
+
+  The walk is iterative with an explicit queue, never recursive, and it is
+  bounded by the visited set upstream already relies on for the same cycle.
+
+Nothing here materializes a whole-workspace map. If a route turns out not to be
+expressible this way, STOP and report the route rather than reintroducing one.
+
+Acceptance for this step is the four regression suites, unmodified:
+
+    tests/suite_usages/rust_include_inverse_regression.rs
+    tests/suite_usages/rust_top30_inverse_regression.rs
+    tests/suite_usages/rust_top30_forward_regression.rs
+    tests/suite_usages/rust_top30_macro_regression.rs
+
+### Step 4: delete `RustUsageIndex`
+
+Last, exactly as the arc's Milestone 5 did, once nothing reads it. The rewiring
+surface is `crates/bifrost-rust/src/graph/resolver.rs` (47 references),
+`graph/inverted.rs`, `graph_support.rs`'s `RustUsageSource` (which becomes
+`RustFactSource`), `hierarchy.rs`, `diagnostics.rs`,
+`crates/bifrost-analysis/src/analyzer/usages/rust_graph/extractor.rs`, and
+`crates/bifrost-analysis/src/analyzer/rust/{mod,usage_index,hierarchy}.rs`.
+Then remove `.agents/phase2/rust-usage-v2/` and update the tables above.
 
 ## Validation and Acceptance
 

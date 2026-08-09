@@ -25,6 +25,7 @@ pub mod cargo_routes;
 pub mod crate_naming;
 pub mod declarations;
 pub mod diagnostics;
+pub mod facts;
 pub mod field_roles;
 pub mod graph;
 pub mod graph_support;
