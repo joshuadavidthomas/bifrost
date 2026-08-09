@@ -77,7 +77,7 @@ use crate::analyzer::languages::{
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
     StructuralReceiverResolver,
 };
-use crate::analyzer::pool_memo::PoolSafeMemo;
+use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo};
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_kotlin_bounded,
@@ -136,8 +136,22 @@ pub struct KotlinAnalyzer {
     /// index cells above: these whole-workspace builds are reached from rayon
     /// workers during cold scans, and a blocking `get_or_init` parks every one
     /// of them behind the single initializer for its full duration.
-    direct_descendant_index: Arc<PoolSafeMemo<crate::analyzer::DirectDescendantIndex>>,
-    realm_direct_descendant_index: Arc<PoolSafeMemo<crate::analyzer::DirectDescendantIndex>>,
+    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
+    /// gets an index that was never built over them (issue #1748). Two cells at
+    /// most, because the exclusion verdict is a pure function of the analyzer
+    /// and the file.
+    direct_descendant_index: Arc<
+        KeyedPoolSafeMemo<
+            crate::analyzer::DescendantIndexVariant,
+            crate::analyzer::DirectDescendantIndex,
+        >,
+    >,
+    realm_direct_descendant_index: Arc<
+        KeyedPoolSafeMemo<
+            crate::analyzer::DescendantIndexVariant,
+            crate::analyzer::DirectDescendantIndex,
+        >,
+    >,
 }
 
 crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
@@ -213,8 +227,8 @@ impl KotlinAnalyzer {
                 memo_budget / 16,
                 weight_code_unit_vec_by_unit,
             ),
-            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
-            realm_direct_descendant_index: Arc::new(PoolSafeMemo::new()),
+            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
+            realm_direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
         }
     }
 

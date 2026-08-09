@@ -19,7 +19,16 @@ use brokk_bifrost_core::profiling;
 /// This is the builder behind [`CppSource::visible_type_units`]; the
 /// analyzer memoizes the result per file and records the build for the
 /// `visible_type_units_build_count_for_test` counter before calling in.
-pub fn build_cpp_visible_type_units(cpp: &dyn CppSource, file: &ProjectFile) -> Vec<CodeUnit> {
+///
+/// `keep_going` is polled once per file popped from the pending stack, which is
+/// the natural checkpoint: one pop is one file's declarations plus one file's
+/// imports. `None` means the walk stopped short, and the caller must not
+/// memoize it (issue #1748).
+pub fn build_cpp_visible_type_units(
+    cpp: &dyn CppSource,
+    file: &ProjectFile,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Vec<CodeUnit>> {
     let _scope =
         profiling::scope_with(|| format!("cpp.visible_types.build[{}]", rel_path_string(file)));
     let include_targets = cpp.include_target_index();
@@ -29,6 +38,9 @@ pub fn build_cpp_visible_type_units(cpp: &dyn CppSource, file: &ProjectFile) -> 
     visited.insert(file.clone());
 
     while let Some(current) = pending.pop() {
+        if !keep_going() {
+            return None;
+        }
         {
             let _decls = profiling::scope("cpp.visible_types.decls");
             declarations.extend(
@@ -61,17 +73,25 @@ pub fn build_cpp_visible_type_units(cpp: &dyn CppSource, file: &ProjectFile) -> 
             declarations.len()
         )
     });
-    declarations
+    Some(declarations)
 }
 
 /// The direct base classes of `code_unit`, resolved through the include-visible
 /// class table and canonicalized past any type-alias hops.
-pub fn cpp_resolve_direct_ancestors(cpp: &dyn CppSource, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+///
+/// `None` means the include-closure walk this resolution needs stopped at the
+/// caller's deadline. An empty vector still means "no resolvable bases", so the
+/// two outcomes stay distinguishable.
+pub fn cpp_resolve_direct_ancestors(
+    cpp: &dyn CppSource,
+    code_unit: &CodeUnit,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<Vec<CodeUnit>> {
     if !code_unit.is_class() || cpp.is_type_alias(code_unit) {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
-    let visible = cpp.visible_type_units(code_unit.source());
+    let visible = cpp.visible_type_units_while(code_unit.source(), keep_going)?;
     let mut ancestors = Vec::new();
     for raw in cpp.raw_supertypes_of(code_unit) {
         if let Some(ancestor) = resolve_base_type(cpp, code_unit, &raw, &visible)
@@ -80,7 +100,7 @@ pub fn cpp_resolve_direct_ancestors(cpp: &dyn CppSource, code_unit: &CodeUnit) -
             ancestors.push(ancestor);
         }
     }
-    ancestors
+    Some(ancestors)
 }
 
 fn resolve_base_type(

@@ -52,10 +52,11 @@ use crate::analyzer::weighted_cache::{
 };
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, BulkFileStateSource, CloneSmell,
-    CloneSmellWeights, CodeUnit, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer,
-    ImportAnalysisProvider, Language, PoolSafeMemo, Project, ProjectFile, SignatureMetadata,
-    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, build_reverse_import_index, resolve_analyzer,
+    CloneSmellWeights, CodeUnit, DescendantIndexVariant, DirectDescendantIndex,
+    ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, KeyedPoolSafeMemo, Language,
+    PoolSafeMemo, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    build_reverse_import_index, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::profiling;
@@ -122,7 +123,11 @@ pub struct PythonAnalyzer {
     // PoolSafeMemo, not OnceLock: same constraint as `usage_index` below. The
     // build walks every workspace class and is reached from rayon workers, so a
     // blocking get_or_init parks each arriving worker behind one initializer.
-    direct_descendant_index: Arc<PoolSafeMemo<DirectDescendantIndex>>,
+    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
+    /// gets an index that was never built over them (issue #1748). Two cells at
+    /// most, because the exclusion verdict is a pure function of the analyzer
+    /// and the file.
+    direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     // PoolSafeMemo, not OnceLock: this cell is reached from inside rayon workers -- the graph
     // extractor's per-file fan-out resolves module bindings through it. The builder is serial, so
@@ -267,7 +272,7 @@ impl PythonAnalyzer {
             import_binder: build_weighted_cache(memo_budget / 8, weight_import_binder),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
             usage_edges: build_weighted_cache(memo_budget / 8, weight_python_usage_edges),
-            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
+            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
         }
@@ -690,7 +695,7 @@ impl IAnalyzer for PythonAnalyzer {
             import_binder: build_weighted_cache(self.memo_budget / 8, weight_import_binder),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
-            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
+            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
         }
@@ -711,7 +716,7 @@ impl IAnalyzer for PythonAnalyzer {
             import_binder: build_weighted_cache(self.memo_budget / 8, weight_import_binder),
             direct_ancestors: build_weighted_cache(self.memo_budget / 8, weight_code_unit_vec),
             usage_edges: build_weighted_cache(self.memo_budget / 8, weight_python_usage_edges),
-            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
+            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             usage_index: Arc::new(PoolSafeMemo::new()),
         }

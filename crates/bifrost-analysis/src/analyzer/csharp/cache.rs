@@ -1,4 +1,7 @@
-use crate::analyzer::{CodeUnit, DirectDescendantIndex, PoolSafeMemo, ProjectFile};
+use crate::analyzer::{
+    CodeUnit, DescendantIndexVariant, DirectDescendantIndex, KeyedPoolSafeMemo, PoolSafeMemo,
+    ProjectFile,
+};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::mem::size_of;
@@ -29,7 +32,12 @@ pub(super) struct CSharpMemoCaches {
     /// cells below: this whole-workspace build is reached from rayon workers
     /// during cold scans, and a blocking `get_or_init` parks every one of them
     /// behind the single initializer for its full duration.
-    pub(super) direct_descendant_index: PoolSafeMemo<DirectDescendantIndex>,
+    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
+    /// gets an index that was never built over them (issue #1748). Two cells at
+    /// most, because the exclusion verdict is a pure function of the analyzer
+    /// and the file.
+    pub(super) direct_descendant_index:
+        KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>,
     pub(super) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) implicit_reference_index:
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
@@ -66,7 +74,7 @@ impl CSharpMemoCaches {
             ),
             referencing_files: build_weighted_cache(budget_bytes / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec),
-            direct_descendant_index: PoolSafeMemo::new(),
+            direct_descendant_index: KeyedPoolSafeMemo::new(),
             reverse_import_index: PoolSafeMemo::new(),
             implicit_reference_index: PoolSafeMemo::new(),
             global_using_namespaces: OnceLock::new(),

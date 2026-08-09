@@ -11,8 +11,10 @@
 
 use crate::analyzer::tree_sitter_analyzer::HierarchyDeclarationFacts;
 use crate::analyzer::{
-    CodeUnit, CodeUnitType, DirectDescendantIndex, ImportInfo, TypeHierarchyProvider,
+    CodeUnit, CodeUnitType, DescendantIndexScope, DirectDescendantIndex, ImportInfo,
+    TypeHierarchyProvider, descendants_from_variant_index,
 };
+use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
 use brokk_bifrost_jvm::kotlin::hierarchy::{
     KotlinHierarchyFact, build_kotlin_direct_descendant_index, kotlin_resolve_direct_ancestors,
@@ -42,7 +44,21 @@ impl TypeHierarchyProvider for KotlinAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        self.direct_descendants_in_realm(code_unit, None)
+        let uncancelled = CancellationToken::default();
+        self.direct_descendants_in_realm(
+            code_unit,
+            None,
+            &DescendantIndexScope::whole_workspace(&uncancelled),
+        )
+        .expect("a descendant index that cannot stop always completes")
+    }
+
+    fn get_direct_descendants_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
+        self.direct_descendants_in_realm(code_unit, None, scope)
     }
 }
 
@@ -70,25 +86,22 @@ impl KotlinAnalyzer {
         &self,
         code_unit: &CodeUnit,
         realm: Option<&JvmSourceRealm<'_>>,
-    ) -> HashSet<CodeUnit> {
+        scope: &DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
         let index = match realm {
             Some(_) => &self.realm_direct_descendant_index,
             None => &self.direct_descendant_index,
         };
-        // The builder itself is serial, so the same closure serves both memo
-        // arms; the memo's value here is the non-blocking claim protocol.
-        index
-            .get_or_build(
-                || self.build_direct_descendant_index(realm),
-                || self.build_direct_descendant_index(realm),
-            )
-            .descendants(code_unit)
+        descendants_from_variant_index(index, scope, code_unit, || {
+            self.build_direct_descendant_index(realm, scope)
+        })
     }
 
     fn build_direct_descendant_index(
         &self,
         realm: Option<&JvmSourceRealm<'_>>,
-    ) -> DirectDescendantIndex {
+        scope: &DescendantIndexScope<'_>,
+    ) -> Option<DirectDescendantIndex> {
         let _scope = crate::profiling::scope("KotlinAnalyzer::build_direct_descendant_index");
         let candidates = self
             .inner
@@ -103,6 +116,7 @@ impl KotlinAnalyzer {
             },
             self,
             realm,
+            scope,
         )
     }
 }

@@ -39,10 +39,11 @@ use crate::analyzer::weighted_cache::{
 };
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    DirectDescendantIndex, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, Language,
-    PoolSafeMemo, Project, ProjectFile, Range, RubyMethodDispatchMode, SignatureMetadata,
-    TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider, resolve_analyzer,
+    DescendantIndexVariant, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer,
+    ImportAnalysisProvider, KeyedPoolSafeMemo, Language, PoolSafeMemo, Project, ProjectFile, Range,
+    RubyMethodDispatchMode, SignatureMetadata, TestAssertionAnalysis, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
+    resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -76,7 +77,11 @@ pub struct RubyAnalyzer {
     /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
     /// from rayon workers during cold scans, and a blocking `get_or_init` parks
     /// every one of them behind the single initializer for its full duration.
-    direct_descendant_index: Arc<PoolSafeMemo<DirectDescendantIndex>>,
+    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
+    /// gets an index that was never built over them (issue #1748). Two cells at
+    /// most, because the exclusion verdict is a pure function of the analyzer
+    /// and the file.
+    direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     autoload_constant_files: Arc<OnceLock<HashMap<String, HashSet<ProjectFile>>>>,
     zeitwerk_project: Arc<OnceLock<bool>>,
@@ -136,7 +141,7 @@ impl RubyAnalyzer {
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec),
-            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
+            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             autoload_constant_files: Arc::new(OnceLock::new()),
             zeitwerk_project: Arc::new(OnceLock::new()),

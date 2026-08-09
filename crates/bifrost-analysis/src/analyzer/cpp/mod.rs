@@ -36,10 +36,11 @@ use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CloneSmell, CloneSmellWeights, CodeUnit,
-    CppFieldLinkage, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, Language, PoolSafeMemo, Project, ProjectFile, Range,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, resolve_analyzer,
+    CppFieldLinkage, DescendantIndexVariant, DirectDescendantIndex, ForwardQueryProvider,
+    IAnalyzer, ImportAnalysisProvider, ImportInfo, KeyedPoolSafeMemo, Language, PoolSafeMemo,
+    Project, ProjectFile, Range, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
+    resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
@@ -92,7 +93,13 @@ pub struct CppAnalyzer {
     /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
     /// from rayon workers during cold scans, and a blocking `get_or_init` parks
     /// every one of them behind the single initializer for its full duration.
-    direct_descendant_index: Arc<PoolSafeMemo<DirectDescendantIndex>>,
+    ///
+    /// Keyed by [`DescendantIndexVariant`], so a request that excluded test
+    /// files gets an index that was never built over them (issue #1748: 52.3%
+    /// of the include-closure builds in the incident trace were test-side, and
+    /// the request had already said `include_tests: false`). Two cells at most:
+    /// the exclusion verdict is a pure function of the analyzer and the file.
+    direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
     compile_contexts: Arc<OnceLock<CppCompileContexts>>,
     #[cfg(test)]
     type_alias_classification_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -163,7 +170,7 @@ impl CppAnalyzer {
             reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
-            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
+            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -217,7 +224,7 @@ impl CppAnalyzer {
             reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
-            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
+            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             compile_contexts: Arc::new(OnceLock::new()),
             #[cfg(test)]
             type_alias_classification_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -517,6 +524,14 @@ impl CppSource for CppAnalyzer {
 
     fn visible_type_units(&self, file: &ProjectFile) -> Arc<Vec<CodeUnit>> {
         CppAnalyzer::visible_type_units(self, file)
+    }
+
+    fn visible_type_units_while(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<Arc<Vec<CodeUnit>>> {
+        CppAnalyzer::visible_type_units_while(self, file, keep_going)
     }
 
     fn file_source(&self, file: &ProjectFile) -> Option<String> {

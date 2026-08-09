@@ -49,11 +49,12 @@ use crate::analyzer::usages::php_graph::{
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{build_weighted_cache, weight_code_unit_vec_by_unit};
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DirectDescendantIndex,
-    ForwardQueryProvider, IAnalyzer, Language, PoolSafeMemo, Project, ProjectFile, Range,
-    SignatureMetadata, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
-    TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index,
-    resolve_analyzer,
+    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CodeUnit, DescendantIndexScope,
+    DescendantIndexVariant, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer,
+    KeyedPoolSafeMemo, Language, Project, ProjectFile, Range, SignatureMetadata,
+    TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
+    TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index,
+    descendants_from_variant_index, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -92,7 +93,11 @@ pub struct PhpAnalyzer {
     /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
     /// from rayon workers during cold scans, and a blocking `get_or_init` parks
     /// every one of them behind the single initializer for its full duration.
-    direct_descendant_index: Arc<PoolSafeMemo<DirectDescendantIndex>>,
+    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
+    /// gets an index that was never built over them (issue #1748). Two cells at
+    /// most, because the exclusion verdict is a pure function of the analyzer
+    /// and the file.
+    direct_descendant_index: Arc<KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>>,
     composer_autoload: Arc<PhpComposerAutoload>,
 }
 
@@ -146,7 +151,7 @@ impl PhpAnalyzer {
             inner,
             memo_budget,
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
-            direct_descendant_index: Arc::new(PoolSafeMemo::new()),
+            direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             composer_autoload,
         }
     }
@@ -286,14 +291,22 @@ impl TypeHierarchyProvider for PhpAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        // The builder itself is serial, so the same closure serves both memo
-        // arms; the memo's value here is the non-blocking claim protocol.
-        self.direct_descendant_index
-            .get_or_build(
-                || build_direct_descendant_index(self, self),
-                || build_direct_descendant_index(self, self),
-            )
-            .descendants(code_unit)
+        let uncancelled = crate::cancellation::CancellationToken::default();
+        self.get_direct_descendants_within(
+            code_unit,
+            &DescendantIndexScope::whole_workspace(&uncancelled),
+        )
+        .expect("a descendant index that cannot stop always completes")
+    }
+
+    fn get_direct_descendants_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
+        descendants_from_variant_index(&self.direct_descendant_index, scope, code_unit, || {
+            build_direct_descendant_index(self, self, scope)
+        })
     }
 }
 

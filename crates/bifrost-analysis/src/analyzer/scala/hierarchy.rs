@@ -29,9 +29,34 @@ impl TypeHierarchyProvider for ScalaAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
+        let uncancelled = crate::cancellation::CancellationToken::default();
+        self.get_direct_descendants_within(
+            code_unit,
+            &crate::analyzer::DescendantIndexScope::whole_workspace(&uncancelled),
+        )
+        .expect("a descendant walk that cannot stop always completes")
+    }
+
+    /// Scala keeps one index, not one per [`crate::analyzer::DescendantIndexVariant`].
+    ///
+    /// The #908 lazy index is a single cheap global pass that records only the
+    /// simple supertype names each class spells; ancestor resolution is
+    /// deferred to the candidates that could match the queried owner. There is
+    /// no eager per-class ancestor build to prune, so a second variant would
+    /// double a cheap pass to save nothing. What the scope does carry here is
+    /// the deadline, polled once per candidate whose ancestors are resolved --
+    /// that resolution is the expensive step.
+    fn get_direct_descendants_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &crate::analyzer::DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
+        if scope.cancellation().is_cancelled() {
+            return None;
+        }
         self.lazy_hierarchy_index
             .get_or_init(|| self.build_lazy_hierarchy_index())
-            .direct_descendants(self, code_unit)
+            .direct_descendants_while(self, code_unit, scope)
     }
 }
 
@@ -65,16 +90,27 @@ pub(crate) struct ScalaLazyHierarchyIndex {
 }
 
 impl ScalaLazyHierarchyIndex {
-    fn direct_descendants(&self, scala: &ScalaAnalyzer, owner: &CodeUnit) -> HashSet<CodeUnit> {
+    /// Every class that spells `owner` as a direct supertype, under the
+    /// caller's deadline. Polled once per candidate: one candidate is one
+    /// ancestor resolution, which is the whole cost of this walk.
+    fn direct_descendants_while(
+        &self,
+        scala: &ScalaAnalyzer,
+        owner: &CodeUnit,
+        scope: &crate::analyzer::DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
         if !owner.is_class() {
-            return HashSet::default();
+            return Some(HashSet::default());
         }
         let simple = crate::analyzer::scala::scala_simple_type_name(owner);
         let Some(candidates) = self.candidates_by_supertype_simple.get(&simple) else {
-            return HashSet::default();
+            return Some(HashSet::default());
         };
         let mut descendants = HashSet::default();
         for candidate in candidates {
+            if scope.cancellation().is_cancelled() {
+                return None;
+            }
             let ancestors = self.ancestors_of(scala, candidate);
             if ancestors
                 .iter()
@@ -83,7 +119,7 @@ impl ScalaLazyHierarchyIndex {
                 descendants.insert(candidate.clone());
             }
         }
-        descendants
+        Some(descendants)
     }
 
     /// Resolve a candidate's direct ancestors, reading through the analyzer's
@@ -599,12 +635,16 @@ trait External
         crate::analyzer::capabilities::build_direct_descendant_index_from_candidates(
             candidates,
             |candidate| {
-                ancestors_by_owner
-                    .get(candidate)
-                    .cloned()
-                    .unwrap_or_default()
+                Some(
+                    ancestors_by_owner
+                        .get(candidate)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
             },
+            &|| true,
         )
+        .expect("a reference index that cannot stop always completes")
     }
 
     fn sorted_fq_names(units: &crate::hash::HashSet<CodeUnit>) -> Vec<String> {

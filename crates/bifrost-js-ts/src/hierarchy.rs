@@ -2,7 +2,9 @@ use crate::graph::resolver::JsTsUsageIndex;
 use crate::imports::resolve_js_ts_module_specifier;
 use crate::model::node_text;
 use crate::tsconfig::AliasResolver;
-use brokk_bifrost_core::analyzer::capabilities::{DirectDescendantIndex, TypeHierarchyProvider};
+use brokk_bifrost_core::analyzer::capabilities::{
+    DescendantIndexScope, DirectDescendantIndex, TypeHierarchyProvider,
+};
 use brokk_bifrost_core::analyzer::usages::model::ImportKind;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -96,16 +98,24 @@ pub fn resolve_direct_ancestors(
     ancestors
 }
 
+/// Invert the ancestor relation over every class in the workspace.
+///
+/// Unlike the shared core builder this one keys its nodes by declaration
+/// identity rather than by fully qualified name, which is what JS/TS needs.
+/// `scope` carries the same two duties it does there: it drops out-of-slice
+/// declarations before their ancestors are resolved, and it bounds the loop --
+/// `None` means the build stopped short and must not be published (#1748).
 pub fn build_direct_descendant_index_by_unit<P>(
     analyzer: &dyn CodeUnitIndex,
     provider: &P,
-) -> DirectDescendantIndex
+    scope: &DescendantIndexScope<'_>,
+) -> Option<DirectDescendantIndex>
 where
     P: TypeHierarchyProvider + ?Sized,
 {
     let mut nodes = analyzer
         .all_declarations()
-        .filter(|candidate| candidate.is_class())
+        .filter(|candidate| candidate.is_class() && scope.admits(candidate))
         .collect::<Vec<_>>();
     nodes.sort();
     let mut index_by_node: HashMap<_, _> = nodes
@@ -121,8 +131,11 @@ where
     let candidates = nodes.clone();
     let mut edges = Vec::new();
     for candidate in candidates {
+        if scope.cancellation().is_cancelled() {
+            return None;
+        }
         let descendant = index_by_node[&candidate];
-        for ancestor in provider.get_direct_ancestors(&candidate) {
+        for ancestor in provider.get_direct_ancestors_within(&candidate, scope)? {
             let ancestor = *index_by_node.entry(ancestor.clone()).or_insert_with(|| {
                 let index = u32::try_from(nodes.len())
                     .expect("hierarchy index declarations must fit in a u32");
@@ -132,7 +145,11 @@ where
             edges.push((ancestor, descendant));
         }
     }
-    DirectDescendantIndex::from_indexed_nodes(nodes, index_by_node, edges)
+    Some(DirectDescendantIndex::from_indexed_nodes(
+        nodes,
+        index_by_node,
+        edges,
+    ))
 }
 
 fn collect_heritage_clause_types(

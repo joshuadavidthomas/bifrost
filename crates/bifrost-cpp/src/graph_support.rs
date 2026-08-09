@@ -48,6 +48,24 @@ pub trait CppSource:
     /// `#include` closure, memoized per file. See this module's note.
     fn visible_type_units(&self, file: &ProjectFile) -> Arc<Vec<CodeUnit>>;
 
+    /// [`Self::visible_type_units`] under a caller's deadline.
+    ///
+    /// `None` means the include-closure walk stopped short. Nothing is
+    /// memoized in that case: a truncated class table is indistinguishable
+    /// from a file that simply sees fewer types, so every later base-specifier
+    /// resolution reading it would silently lose ancestors.
+    ///
+    /// This is the shape issue #1748 needed. The closure walk is individually
+    /// cheap -- a fraction of a millisecond to about 180 ms -- but the
+    /// descendant-index build above it runs one per class in the workspace,
+    /// which on a large tree is tens of thousands of them inside a single
+    /// request that asked for thirty seconds.
+    fn visible_type_units_while(
+        &self,
+        file: &ProjectFile,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<Arc<Vec<CodeUnit>>>;
+
     /// The indexed source of `file` (`TreeSitterAnalyzer::file_source`).
     fn file_source(&self, file: &ProjectFile) -> Option<String>;
 

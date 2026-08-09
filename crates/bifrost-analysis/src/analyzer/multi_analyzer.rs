@@ -637,11 +637,46 @@ impl TypeHierarchyProvider for MultiAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        let mut descendants = self
+        let uncancelled = crate::cancellation::CancellationToken::default();
+        self.get_direct_descendants_within(
+            code_unit,
+            &crate::analyzer::DescendantIndexScope::whole_workspace(&uncancelled),
+        )
+        .expect("a descendant index that cannot stop always completes")
+    }
+
+    fn get_direct_ancestors_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &crate::analyzer::DescendantIndexScope<'_>,
+    ) -> Option<Vec<CodeUnit>> {
+        if language_for_file(code_unit.source()) == Language::Kotlin
+            && let Some((kotlin, realm)) = self.kotlin_realm()
+        {
+            return (!scope.cancellation().is_cancelled())
+                .then(|| kotlin.direct_ancestors_in_realm(code_unit, Some(&realm)));
+        }
+        match self
             .delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::type_hierarchy_provider)
-            .map(|provider| provider.get_direct_descendants(code_unit))
-            .unwrap_or_default();
+        {
+            Some(provider) => provider.get_direct_ancestors_within(code_unit, scope),
+            None => Some(Vec::new()),
+        }
+    }
+
+    fn get_direct_descendants_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &crate::analyzer::DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
+        let mut descendants = match self
+            .delegate_for_code_unit(code_unit)
+            .and_then(AnalyzerDelegate::type_hierarchy_provider)
+        {
+            Some(provider) => provider.get_direct_descendants_within(code_unit, scope)?,
+            None => HashSet::default(),
+        };
         // Kotlin subclasses of a Java or Scala type are invisible to that
         // language's own descendant index, which only walks its own
         // declarations. Kotlin's realm-aware index does resolve across the
@@ -663,9 +698,13 @@ impl TypeHierarchyProvider for MultiAnalyzer {
         if language_for_file(code_unit.source()) != Language::Kotlin
             && let Some((kotlin, realm)) = self.kotlin_realm()
         {
-            descendants.extend(kotlin.direct_descendants_in_realm(code_unit, Some(&realm)));
+            descendants.extend(kotlin.direct_descendants_in_realm(
+                code_unit,
+                Some(&realm),
+                scope,
+            )?);
         }
-        descendants
+        Some(descendants)
     }
 }
 

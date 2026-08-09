@@ -72,13 +72,13 @@ pub(crate) use brokk_bifrost_cpp::imports::{
     include_paths as cpp_include_paths, resolve_include_targets, resolve_include_targets_with_index,
 };
 pub use capabilities::{
-    CapabilityProvider, ImportAnalysisProvider, ImportReachability, TestDetectionProvider,
-    TypeAliasProvider, TypeHierarchyProvider,
+    CapabilityProvider, DescendantIndexScope, DescendantIndexVariant, ImportAnalysisProvider,
+    ImportReachability, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
 };
 pub(crate) use capabilities::{
     DirectDescendantIndex, build_direct_descendant_index, build_reverse_file_index,
-    build_reverse_import_index, memoized_reverse_file_index, memoized_reverse_import_index,
-    resolve_imported_files_from_infos,
+    build_reverse_import_index, descendants_from_variant_index, memoized_reverse_file_index,
+    memoized_reverse_import_index, resolve_imported_files_from_infos,
 };
 pub use config::{
     AnalyzerConfig, CSharpAnalyzerConfig, GoAnalyzerConfig, GoDependencyDiscoveryConfig,
@@ -175,7 +175,7 @@ pub use php::{
     PhpAnalyzer, PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
-pub(crate) use pool_memo::{PoolSafeMemo, spawn_on_dedicated_build_pool};
+pub(crate) use pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo, spawn_on_dedicated_build_pool};
 pub use project::{
     BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,
     MultiRootProject, OverlayProject, OverlayRevision, Project, ProjectSourceOrigin,

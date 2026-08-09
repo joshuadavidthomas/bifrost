@@ -14,8 +14,9 @@
 
 use crate::analyzer::js_ts::cache::JsTsMemoCaches;
 use crate::analyzer::{
-    CodeUnit, IAnalyzer, ImportInfo, JavascriptAnalyzer, Language, ProjectFile, TypescriptAnalyzer,
-    memoized_reverse_import_index, resolve_analyzer,
+    CodeUnit, DescendantIndexScope, IAnalyzer, ImportInfo, JavascriptAnalyzer, Language,
+    ProjectFile, TypescriptAnalyzer, descendants_from_variant_index, memoized_reverse_import_index,
+    resolve_analyzer,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -223,16 +224,29 @@ pub(crate) fn get_direct_descendants(
     host: &dyn JsTsMemoSource,
     code_unit: &CodeUnit,
 ) -> HashSet<CodeUnit> {
-    // The builder itself is serial; the memo exists because its per-class
-    // ancestor misses transitively enter the rayon-built usage index, so the
-    // same closure serves both the off-pool and on-pool arms.
-    host.memo_caches()
-        .direct_descendant_index
-        .get_or_build(
-            || build_direct_descendant_index_by_unit(host, host),
-            || build_direct_descendant_index_by_unit(host, host),
-        )
-        .descendants(code_unit)
+    let uncancelled = crate::cancellation::CancellationToken::default();
+    get_direct_descendants_within(
+        host,
+        code_unit,
+        &DescendantIndexScope::whole_workspace(&uncancelled),
+    )
+    .expect("a descendant index that cannot stop always completes")
+}
+
+/// The memo exists because the per-class ancestor misses behind this build
+/// transitively enter the rayon-built usage index, so the same closure serves
+/// both the off-pool and on-pool arms.
+pub(crate) fn get_direct_descendants_within(
+    host: &dyn JsTsMemoSource,
+    code_unit: &CodeUnit,
+    scope: &DescendantIndexScope<'_>,
+) -> Option<HashSet<CodeUnit>> {
+    descendants_from_variant_index(
+        &host.memo_caches().direct_descendant_index,
+        scope,
+        code_unit,
+        || build_direct_descendant_index_by_unit(host, host, scope),
+    )
 }
 
 // --- Usage index -----------------------------------------------------------

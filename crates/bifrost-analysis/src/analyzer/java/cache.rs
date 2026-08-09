@@ -1,5 +1,7 @@
 use super::*;
-use crate::analyzer::{DirectDescendantIndex, PoolSafeMemo};
+use crate::analyzer::{
+    DescendantIndexVariant, DirectDescendantIndex, KeyedPoolSafeMemo, PoolSafeMemo,
+};
 use moka::sync::Cache;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -15,7 +17,12 @@ pub(super) struct JavaMemoCaches {
     /// cells below: this whole-workspace build is reached from rayon workers
     /// during cold scans, and a blocking `get_or_init` parks every one of them
     /// behind the single initializer for its full duration.
-    pub(super) direct_descendant_index: PoolSafeMemo<DirectDescendantIndex>,
+    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
+    /// gets an index that was never built over them (issue #1748). Two cells at
+    /// most, because the exclusion verdict is a pure function of the analyzer
+    /// and the file.
+    pub(super) direct_descendant_index:
+        KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>,
     pub(super) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) same_package_reference_index:
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
@@ -30,7 +37,7 @@ impl JavaMemoCaches {
             referencing_files: Self::build_cache(budget_bytes / 8, weight_project_file_set),
             relevant_imports: Self::build_cache(budget_bytes / 8, weight_string_set),
             direct_ancestors: Self::build_cache(budget_bytes / 8, weight_code_unit_vec),
-            direct_descendant_index: PoolSafeMemo::new(),
+            direct_descendant_index: KeyedPoolSafeMemo::new(),
             reverse_import_index: PoolSafeMemo::new(),
             same_package_reference_index: PoolSafeMemo::new(),
         }

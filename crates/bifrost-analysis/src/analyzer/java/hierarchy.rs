@@ -7,7 +7,11 @@
 
 use super::*;
 use crate::analyzer::tree_sitter_analyzer::HierarchyDeclarationFacts;
-use crate::analyzer::{CodeUnitType, DirectDescendantIndex, ImportInfo, Range};
+use crate::analyzer::{
+    CodeUnitType, DescendantIndexScope, DirectDescendantIndex, ImportInfo, Range,
+    descendants_from_variant_index,
+};
+use crate::cancellation::CancellationToken;
 use brokk_bifrost_jvm::java::hierarchy::{
     JavaHierarchyFact, build_java_direct_descendant_index, java_direct_ancestors,
 };
@@ -45,30 +49,47 @@ impl TypeHierarchyProvider for JavaAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        // The builder itself is serial, so the same closure serves both memo
-        // arms; the memo's value here is the non-blocking claim protocol.
-        self.memo_caches
-            .direct_descendant_index
-            .get_or_build(
-                || self.build_direct_descendant_index(),
-                || self.build_direct_descendant_index(),
-            )
-            .descendants(code_unit)
+        let uncancelled = CancellationToken::default();
+        self.get_direct_descendants_within(
+            code_unit,
+            &DescendantIndexScope::whole_workspace(&uncancelled),
+        )
+        .expect("a descendant index that cannot stop always completes")
+    }
+
+    fn get_direct_descendants_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
+        descendants_from_variant_index(
+            &self.memo_caches.direct_descendant_index,
+            scope,
+            code_unit,
+            || self.build_direct_descendant_index(scope),
+        )
     }
 }
 
 impl JavaAnalyzer {
-    fn build_direct_descendant_index(&self) -> DirectDescendantIndex {
+    fn build_direct_descendant_index(
+        &self,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Option<DirectDescendantIndex> {
         let _scope = crate::profiling::scope("JavaAnalyzer::build_direct_descendant_index");
         let candidates = self
             .inner
             .hierarchy_declaration_facts_by_kind(CodeUnitType::Class)
             .unwrap_or_default();
-        build_java_direct_descendant_index(candidates, |batch| {
-            self.inner
-                .hydrate_hierarchy_declaration_facts(batch)
-                .is_some()
-        })
+        build_java_direct_descendant_index(
+            candidates,
+            |batch| {
+                self.inner
+                    .hydrate_hierarchy_declaration_facts(batch)
+                    .is_some()
+            },
+            scope,
+        )
     }
 
     #[doc(hidden)]
