@@ -54,7 +54,8 @@ A **pin** is a test that fails before a fix and passes after it. When this plan 
 - [x] (2026-08-09 16:20Z) Phase 1 Step 7: committed on `bifrost-nlp-ft` as a merge commit. Not pushed. The comprehensive `nlp,python` gate also ran and matches the baseline.
 - [x] (2026-08-09) Phase 2 authorized by the owner. Started.
 - [x] (2026-08-09) Phase 2 Step 1 -- restore the write path. Fact value types in `crates/bifrost-core/src/analyzer/rust_facts.rs`; extraction in `crates/bifrost-rust/src/facts.rs`; `extract_rust_module_route_facts` back in `crates/bifrost-rust/src/cargo_routes.rs`; `ParsedFile`/`FileState` carry `rust_usage_facts`; the store writes and reads the eight `rust_*` tables; the two detector salt tokens added. Eight parked store tests restored and green.
-- [ ] Phase 2 Step 2: restore the read path (`usage_queries`, `usage_walks`, `usage`, `fact_catch_up`) on the nine-crate topology.
+- [x] (2026-08-09) Phase 2 Step 2a -- Cargo routes composed from per-blob module-route rows. `RustCargoRouteIndex::build_while` takes plain fact data instead of a `prepared_syntax` closure and a `parallel` flag; `RustAnalyzer::rust_module_route_facts` is the one batched store read that feeds it.
+- [ ] Phase 2 Step 2b: restore the read path (`usage_queries`, `usage_walks`, `usage`, `fact_catch_up`) on the nine-crate topology.
 - [ ] Phase 2 Step 3: rebuild upstream's include-expansion routes on the v2 substrate.
 - [ ] Phase 2 Step 4: delete `RustUsageIndex`.
 
@@ -127,6 +128,10 @@ A **pin** is a test that fails before a fix and passes after it. When this plan 
 - Decision: the Rust usage fact VALUE types live in `crates/bifrost-core/src/analyzer/rust_facts.rs`, not in `brokk-bifrost-rust`, and `RustVisibility` and `RustRulesItemMacroDefinition` move there with them (re-exported from their old Rust-crate homes so no call site changes).
   Rationale: the plan requires `ParsedFile` to regain a `rust_usage_facts` field, and `ParsedFile` is in core, which may not depend on `brokk-bifrost-rust`. The precedent is exact: `ScalaExportInfo` and `CppTemplateMetadata` are language-specific plain data on `ParsedFile` and already live in core's model. The types name no `IAnalyzer`, store, grammar, or language module, so `CLAUDE.md`'s rule puts them in core. The tree-sitter extraction that fills them stays in `brokk-bifrost-rust`; the SQL that persists them stays in `brokk-bifrost-analysis`.
   Date/Author: 2026-08-09, integration agent.
+
+- Decision: the two include-expansion tables land as cache migration 0020 and `CURRENT_MIGRATION_VERSION` becomes 20.
+  Rationale: owner decision, converting the flagged deviation in "Step 3" below into a settled one. Phase 1's note that "Phase 2 adds code, not schema" existed only to avoid rebuilding a user's cache twice. Step 1 already bumped the Rust detector salt, which spends that rebuild; a second schema version therefore costs nothing a user has not already paid. The compile-time assertion `CACHE_MIGRATION_SQL.len() == CURRENT_MIGRATION_VERSION` stays true because the two tables land in one numbered file.
+  Date/Author: 2026-08-09, integration agent, on owner direction.
 
 - Decision: Phase 2 lands in four steps, each of which leaves the workspace compiling and green, rather than as one change. Step 1 is the write path with `RustUsageIndex` still in place and still the only reader.
   Rationale: the two sides cannot be swapped atomically without a tree that neither compiles nor runs a test for the length of the work. With the fact rows written but unread, the eight parked store tests become the first executable evidence that the v2 substrate is correct on upstream's topology, and every later step has a green base to bisect against.

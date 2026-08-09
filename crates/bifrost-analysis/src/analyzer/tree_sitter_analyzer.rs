@@ -5318,6 +5318,27 @@ where
         self.store_context.live_paths.snapshot()
     }
 
+    /// The analyzer store, for a language module that answers a question from
+    /// persisted rows rather than from a materialized in-heap index.
+    ///
+    /// The `IAnalyzer` surface deliberately does not carry it: only the store-
+    /// backed Rust fact paths need it, and they reach it through their own
+    /// analyzer shim.
+    pub(crate) fn analyzer_store(&self) -> &Arc<AnalyzerStore> {
+        &self.store_context.store
+    }
+
+    /// The current file-to-blob mapping, in both directions.
+    ///
+    /// This is how a caller turns a blob oid an inverted store lookup returned
+    /// into the live `ProjectFile`s that currently have those bytes, and how it
+    /// turns a file back into the blob whose rows describe it. Populated with
+    /// or without a git-backed `Liveness` (see `resolve_live_oids`), so a
+    /// store-backed query works in a plain directory too.
+    pub(crate) fn live_path_snapshot(&self) -> Arc<LiveSnapshot> {
+        self.live_snapshot()
+    }
+
     /// Whether this adapter analyzes `file`.
     ///
     /// The extension registry is the rule. Include-driven inference (#1837)
