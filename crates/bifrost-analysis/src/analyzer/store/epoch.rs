@@ -438,11 +438,17 @@ lang_epoch!(
 // reproduce; and Rust packages are now anchored on the Cargo crate name rather
 // than the extracting mount's directory path, so cached names differ outright.
 // No other language's persisted encoding changed.
+// Rust salt bumped again (#1898): an `impl` owner path rooted at a renamed
+// import (`use crate::model as m;` then `impl Trait for m::Writer`) now routes
+// through the binding's module and imported name. Rows written while that root
+// resolved as a bare module name carry the phantom owner package (`impls.m`)
+// for every member of such an impl, so a warm workspace would answer the alias
+// spelling and never the real owner (`model.Writer.act`).
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08"
 );
 
 #[cfg(test)]
