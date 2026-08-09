@@ -18,6 +18,9 @@ use brokk_bifrost_semantic_packs::release_bundle::{
     BundleInput, ReleaseBundleRejects, generate_release_bundle, install_release_bundle,
     verify_release_bundle,
 };
+use brokk_bifrost_semantic_packs::summary_foundry::{
+    FoundryPins, FoundryRunInputs, run_foundry_join,
+};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use serde::Serialize;
@@ -74,6 +77,7 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
         "generate" => generate_command(arguments, format),
         "verify" => verify_command(arguments, format),
         "install" => install_command(arguments, format),
+        "summary-corpus-join" => summary_corpus_join_command(arguments, format),
         _ => Err(failure(2, usage(), format)),
     }
 }
@@ -361,6 +365,91 @@ fn install_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8,
     Ok(0)
 }
 
+/// Translate both pinned summary corpora, round-trip them, and join them.
+///
+/// The report is written to a file rather than to stdout because it carries
+/// every dispute, gap, and skipped row, which is the point of the artifact.
+fn summary_corpus_join_command(
+    arguments: Vec<OsString>,
+    format: OutputFormat,
+) -> Result<u8, CommandFailure> {
+    require_human_release_output(format)?;
+    let [pins, codeql_models, joern_source, report] = arguments.as_slice() else {
+        return Err(failure(2, usage(), format));
+    };
+    let report_path = PathBuf::from(report);
+    let pins = FoundryPins::read(Path::new(pins))
+        .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+    let inputs = FoundryRunInputs::from_pins(
+        &pins,
+        PathBuf::from(codeql_models),
+        PathBuf::from(joern_source),
+    )
+    .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+    let joined = run_foundry_join(&inputs)
+        .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+    if let Some(parent) = report_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error_value| {
+            failure(
+                2,
+                format!("cannot create {}: {error_value}", parent.display()),
+                format,
+            )
+        })?;
+    }
+    fs::write(&report_path, joined.to_json()).map_err(|error_value| {
+        failure(
+            2,
+            format!("cannot write {}: {error_value}", report_path.display()),
+            format,
+        )
+    })?;
+    for translation in &joined.translation {
+        println!(
+            "{} entries={} ({} flow, {} no-flow) transfers={} rows={} skipped={}",
+            translation.corpus.as_str(),
+            translation.entries,
+            translation.flow_entries,
+            translation.no_flow_entries,
+            translation.transfers,
+            translation.rows_read,
+            translation.skipped_rows
+        );
+        for (reason, count) in &translation.skips_by_reason {
+            println!("  skipped {reason}: {count}");
+        }
+        for (note, count) in &translation.notes_by_kind {
+            println!("  note {note}: {count}");
+        }
+    }
+    for round_trip in &joined.round_trip {
+        println!(
+            "{} round-trip entries={} shards={} manifest={}",
+            round_trip.corpus.as_str(),
+            round_trip.entries,
+            round_trip.shards,
+            round_trip
+                .manifest_content_sha256
+                .as_deref()
+                .unwrap_or("<failed>")
+        );
+        for diagnostic in &round_trip.diagnostics {
+            println!("  {diagnostic}");
+        }
+    }
+    println!(
+        "join agreements={} disputes={} gaps={}",
+        joined.join.agreement_count, joined.join.dispute_count, joined.join.gap_count
+    );
+    for (corpus, count) in &joined.join.gaps_by_missing_slot {
+        println!("  gaps missing from {corpus}: {count}");
+    }
+    println!("wrote {}", report_path.display());
+    Ok(u8::from(!joined.round_trip_is_clean()))
+}
+
 fn require_human_release_output(format: OutputFormat) -> Result<(), CommandFailure> {
     if format == OutputFormat::Json {
         Err(failure(
@@ -624,5 +713,5 @@ impl ActivationControlInput {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG"
+    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json"
 }
