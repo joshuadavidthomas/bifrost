@@ -6,9 +6,10 @@
 
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
-    ActivationSelector, ArtifactProducerLimits, AuthoredPayload, AuthoredSemanticModelPack,
-    AuthoredShard, BoundedProducerDiagnostics, Compatibility, Completeness, DependencyArtifactRole,
-    DependencyPackAdapter, DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind,
+    ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
+    AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
+    Compatibility, Completeness, DependencyArtifactRole, DependencyPackAdapter,
+    DependencyPackProduction, ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind,
     MemberFact, NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
     ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION, Safety, TypeFact,
 };
@@ -223,6 +224,201 @@ impl DependencyPackAdapter for PhpDependencyPackAdapter {
                     },
                 }],
             }),
+            diagnostics,
+            suppressed_diagnostics,
+        }
+    }
+}
+
+/// One Composer autoload rule as a pinned release spec declares it.
+///
+/// A workspace dependency learns its autoload rules from an installed
+/// package's `composer.lock`/`installed.json` autoload block. A pinned spec
+/// names the rule and the files it admits explicitly instead, exactly as the
+/// pinned Go module names its packages: the structure is spec-authored, not
+/// derived from an on-disk vendor tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerPinnedAutoloadRule {
+    Psr4 {
+        namespace_prefix: String,
+        files: Vec<String>,
+    },
+    Classmap {
+        files: Vec<String>,
+    },
+    Files {
+        files: Vec<String>,
+    },
+}
+
+impl ComposerPinnedAutoloadRule {
+    fn files(&self) -> &[String] {
+        match self {
+            Self::Psr4 { files, .. } | Self::Classmap { files } | Self::Files { files } => files,
+        }
+    }
+
+    fn autoload_rule(&self) -> PhpAutoloadRule<'_> {
+        match self {
+            Self::Psr4 {
+                namespace_prefix, ..
+            } => PhpAutoloadRule::Psr4 { namespace_prefix },
+            Self::Classmap { .. } => PhpAutoloadRule::Classmap,
+            Self::Files { .. } => PhpAutoloadRule::Files,
+        }
+    }
+}
+
+/// Produce one pack from a pinned exact source set of Composer package
+/// sources, grouped into autoload rules the spec names explicitly.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ComposerPackagePackProducer;
+
+impl ComposerPackagePackProducer {
+    pub fn produce_loaded_source_set(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+        rules: &[ComposerPinnedAutoloadRule],
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::ComposerPackageSourceSet {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.kind".to_owned(),
+                    location: None,
+                    message: "Composer package producer requires a Composer source-set artifact"
+                        .to_owned(),
+                },
+                limits,
+            );
+        }
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        let mut types: HashMap<String, TypeFact> = HashMap::default();
+        let mut members: HashMap<String, MemberFact> = HashMap::default();
+        let mut complete = true;
+
+        for rule in rules {
+            let autoload_rule = rule.autoload_rule();
+            for path in rule.files() {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    diagnostics.error(
+                        "composer.projection.cancelled",
+                        None,
+                        "Composer declaration projection was cancelled",
+                    );
+                    complete = false;
+                    break;
+                }
+                let Some(entry) = artifact
+                    .source_entries()
+                    .iter()
+                    .find(|entry| entry.relative_path() == path)
+                else {
+                    diagnostics.error(
+                        "composer.declarations.missing",
+                        Some(path.clone()),
+                        "pinned Composer source set does not contain its declared file",
+                    );
+                    complete = false;
+                    continue;
+                };
+                if !is_php_entry(entry.relative_path()) {
+                    continue;
+                }
+                let Ok(source) = std::str::from_utf8(entry.bytes()) else {
+                    diagnostics.error(
+                        "composer.source.encoding",
+                        Some(path.clone()),
+                        "PHP source entry is not valid UTF-8",
+                    );
+                    complete = false;
+                    continue;
+                };
+                let projection = project_php_source(
+                    artifact.sha256(),
+                    entry.relative_path(),
+                    source,
+                    autoload_rule,
+                    limits,
+                    cancellation,
+                );
+                complete &= projection.complete && projection.suppressed_diagnostics == 0;
+                append_diagnostics(&mut diagnostics, projection.diagnostics);
+                for fact in projection.types {
+                    merge_type(&mut types, fact, &mut diagnostics, &mut complete);
+                }
+                for fact in projection.members {
+                    members.entry(fact.id.clone()).or_insert(fact);
+                }
+                if types.len().saturating_add(members.len()) >= limits.max_records {
+                    diagnostics.error(
+                        "limit.records",
+                        Some(path.clone()),
+                        format!(
+                            "Composer declarations exceed the {} record limit",
+                            limits.max_records
+                        ),
+                    );
+                    complete = false;
+                    break;
+                }
+            }
+        }
+
+        if types.is_empty() && members.is_empty() {
+            diagnostics.error(
+                "composer.package.no_declarations",
+                None,
+                "Composer package autoloads no projectable PHP declarations",
+            );
+            complete = false;
+        }
+        let completeness = if complete && diagnostics.is_empty() {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        };
+        let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+        let mut types = types.into_values().collect::<Vec<_>>();
+        let mut members = members.into_values().collect::<Vec<_>>();
+        types.sort_by(|left, right| left.id.cmp(&right.id));
+        members.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut activation = request.activation.clone();
+        for selector in &mut activation {
+            selector.artifact_sha256 = Some(artifact.sha256().to_owned());
+        }
+        ArtifactProduction {
+            artifact_sha256: Some(artifact.sha256().to_owned()),
+            pack: (!types.is_empty() || !members.is_empty()).then(|| AuthoredSemanticModelPack {
+                schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
+                pack_id: request.pack_id.clone(),
+                version: request.pack_version.clone(),
+                producer: Producer {
+                    name: "bifrost-composer-package".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                },
+                language: "php".to_owned(),
+                ecosystem: request.ecosystem.clone(),
+                compatibility: request.compatibility.clone(),
+                provenance: request.provenance.clone(),
+                license: request.license.clone(),
+                completeness,
+                safety: request.safety.clone(),
+                shards: vec![AuthoredShard {
+                    id: "declarations.php.external".to_owned(),
+                    activation,
+                    payload: AuthoredPayload::DeclarationFacts {
+                        types,
+                        members,
+                        relations: Vec::new(),
+                    },
+                }],
+            }),
+            completeness,
             diagnostics,
             suppressed_diagnostics,
         }
