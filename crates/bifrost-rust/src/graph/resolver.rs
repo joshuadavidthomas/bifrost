@@ -177,10 +177,41 @@ pub fn resolve_rust_token_tree_paths_admitting<'tree>(
     if token_tree.kind() != "token_tree" {
         return Vec::new();
     }
-
-    let mut cursor = token_tree.walk();
-    let children: Vec<_> = token_tree.children(&mut cursor).collect();
     let mut resolved = Vec::new();
+    let mut containers = vec![token_tree];
+    while let Some(container) = containers.pop() {
+        resolve_token_tree_path_container(
+            rust,
+            support,
+            refs,
+            file,
+            source,
+            container,
+            admits,
+            &mut resolved,
+        );
+        let mut cursor = container.walk();
+        containers.extend(container.named_children(&mut cursor).filter(|child| {
+            child.kind() == "token_repetition"
+                || (container.kind() == "token_repetition" && child.kind() == "token_tree")
+        }));
+    }
+    resolved
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_token_tree_path_container<'tree>(
+    rust: &dyn RustUsageSource,
+    support: &dyn RustDefinitionProvider,
+    refs: &RustReferenceContext,
+    file: &ProjectFile,
+    source: &str,
+    container: Node<'tree>,
+    admits: &dyn Fn(&str) -> bool,
+    resolved: &mut Vec<ResolvedRustTokenPathSegment<'tree>>,
+) {
+    let mut cursor = container.walk();
+    let children: Vec<_> = container.children(&mut cursor).collect();
     let mut index = 0;
     while index + 2 < children.len() {
         if !rust_token_path_segment(children[index])
@@ -294,7 +325,6 @@ pub fn resolve_rust_token_tree_paths_admitting<'tree>(
             segment_index += 2;
         }
     }
-    resolved
 }
 
 fn resolve_crate_exported_token_path_child(

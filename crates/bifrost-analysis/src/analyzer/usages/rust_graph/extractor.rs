@@ -29,9 +29,10 @@ use crate::analyzer::usages::rust_graph::hits::{
     record_hit, record_import_hit, record_module_qualified_hits, rust_path_segments,
 };
 use crate::analyzer::usages::rust_graph::resolver::{
-    RustBareTokenTreeRole, RustTokenTreeRoleCache, canonical_imported_impl_target,
-    is_graph_visible_member_target, is_trait_owner, resolve_exact_owner_associated_item_matching,
-    resolve_rust_path_fqn, rust_token_path_segment_is_qualified,
+    RustBareTokenTreeRole, RustTokenPathRole, RustTokenTreeRoleCache,
+    canonical_imported_impl_target, is_graph_visible_member_target, is_trait_owner,
+    resolve_exact_owner_associated_item_matching, resolve_rust_path_fqn,
+    resolve_rust_token_tree_paths, rust_token_path_segment_is_qualified,
     rust_unique_nominal_reference_namespace, token_tree_ancestor, trait_member_for_impl_member,
 };
 use crate::analyzer::usages::traits::UsageScanScope;
@@ -1903,6 +1904,28 @@ fn record_token_tree_static_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<
             continue;
         }
         record_static_member_name_hit(member, ctx);
+    }
+
+    // A macro token tree can put the owner path inside `$crate` or a token
+    // repetition. Resolve that structured path before the member scan's
+    // local owner-name checks, which cannot represent those raw token nodes.
+    for segment in
+        resolve_rust_token_tree_paths(ctx.rust, ctx.support, ctx.refs, ctx.file, ctx.source, node)
+    {
+        if !matches!(
+            segment.role,
+            RustTokenPathRole::Call | RustTokenPathRole::Value
+        ) || simple_node_text(segment.node, ctx.source).as_deref() != Some(ctx.member_name)
+            || segment.fqn != ctx.scan_target.fq_name()
+            || !ctx
+                .support
+                .fqn(&segment.fqn)
+                .iter()
+                .any(|candidate| same_rust_declaration_identity(candidate, ctx.scan_target))
+        {
+            continue;
+        }
+        record_static_member_name_hit(segment.node, ctx);
     }
 }
 
