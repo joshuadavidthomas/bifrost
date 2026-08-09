@@ -1605,6 +1605,39 @@ def shadow(expression):
 }
 
 #[test]
+fn from_imported_module_target_reports_annotation_qualifier_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("pkg/__init__.py", "")
+        .file("pkg/types.py", "Validator = object\n")
+        .file(
+            "pkg/consumer.py",
+            r#"from __future__ import annotations
+
+from pkg import types
+
+value: types.Validator
+
+def shadow(types):
+    local: types.Validator
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "pkg.types");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should retain the from-imported module qualifier");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let hit = hits.iter().next().expect("one module qualifier hit");
+    assert_eq!(hit.file, project.file("pkg/consumer.py"));
+    assert!(hit.snippet.contains("types.Validator"), "{hit:#?}");
+}
+
+#[test]
 fn imported_package_submodule_qualifier_reports_module_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("pkg/image.py", "VALUE = 1\n")
