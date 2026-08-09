@@ -524,10 +524,12 @@ name = "brokk-bifrost-semantic-packs"
 version = "0.8.24"
 dependencies = [
  "brokk-bifrost-analysis",
+ "flate2",
  "semver",
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tempfile",
  "zip",
 ]

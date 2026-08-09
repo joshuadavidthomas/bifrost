@@ -1,10 +1,14 @@
+use std::path::PathBuf;
+
 use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
-    ActivationSelector, ArtifactProducerLimits, AuthoredPayload, AuthoredSemanticModelPack,
-    AuthoredShard, BoundedProducerDiagnostics, Compatibility, Completeness, DependencyArtifactRole,
-    DependencyPackAdapter, DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind,
-    NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION, Safety, TypeFact, TypeRef,
+    ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
+    AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
+    Compatibility, Completeness, DependencyArtifactRole, DependencyPackAdapter,
+    DependencyPackProduction, ExactArtifact, ExactDependencyArtifact, ExternalArtifactKind,
+    ExternalArtifactPackProducer, NameSelector, Producer, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, Provenance, ResolvedDependency, SEMANTIC_MODEL_SCHEMA_VERSION,
+    Safety, TypeFact, TypeRef, read_exact_artifact_while,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -16,6 +20,132 @@ use super::source_artifact::project_ruby_source;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RubyDependencyPackAdapter;
+
+/// One pinned `.gem` archive, read and projected exactly as the dependency
+/// adapter projects an installed gem: RBS is authoritative where present,
+/// Sorbet RBI and plain Ruby fill the remainder.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RubyGemArchivePackProducer;
+
+impl ExternalArtifactPackProducer for RubyGemArchivePackProducer {
+    fn produce_exact_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+    ) -> ArtifactProduction {
+        self.produce(request, limits, None)
+    }
+
+    fn produce_exact_artifact_with_cancellation(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> ArtifactProduction {
+        self.produce(request, limits, cancellation)
+    }
+}
+
+impl RubyGemArchivePackProducer {
+    fn produce(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::RubyGemArchive {
+            return ArtifactProduction::failed(
+                ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.kind".to_owned(),
+                    location: None,
+                    message: "Ruby gem producer requires a gem archive artifact".to_owned(),
+                },
+                limits,
+            );
+        }
+        let artifact = match read_exact_artifact_while(&request.path, limits, || {
+            cancellation.is_some_and(CancellationToken::is_cancelled)
+        }) {
+            Ok(artifact) => artifact,
+            Err(diagnostic) => return ArtifactProduction::failed(diagnostic, limits),
+        };
+        self.produce_loaded_artifact(request, limits, cancellation, &artifact)
+    }
+
+    pub fn produce_loaded_artifact(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+    ) -> ArtifactProduction {
+        let archive =
+            read_gem_declaration_entries(artifact.sha256(), artifact.bytes(), limits, cancellation);
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        append_diagnostics(&mut diagnostics, archive.diagnostics);
+        let mut complete = archive.complete && archive.suppressed_diagnostics == 0;
+        let (types, members, projection_complete) = merge_entries(
+            artifact.sha256(),
+            &archive.entries,
+            limits,
+            &mut diagnostics,
+            cancellation,
+        );
+        complete &= projection_complete;
+        if types.is_empty() && members.is_empty() {
+            diagnostics.error(
+                "ruby.gem.no_declarations",
+                None,
+                "Ruby gem contains no supported RBS, RBI, or Ruby declarations",
+            );
+            complete = false;
+        }
+        let completeness = if complete && diagnostics.is_empty() {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        };
+        let (diagnostics, mut suppressed_diagnostics) = diagnostics.finish();
+        suppressed_diagnostics =
+            suppressed_diagnostics.saturating_add(archive.suppressed_diagnostics);
+        let mut activation = request.activation.clone();
+        for selector in &mut activation {
+            selector.artifact_sha256 = Some(artifact.sha256().to_owned());
+        }
+        ArtifactProduction {
+            artifact_sha256: Some(artifact.sha256().to_owned()),
+            pack: (!types.is_empty() || !members.is_empty()).then(|| AuthoredSemanticModelPack {
+                schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
+                pack_id: request.pack_id.clone(),
+                version: request.pack_version.clone(),
+                producer: Producer {
+                    name: "bifrost-ruby-gem".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                },
+                language: "ruby".to_owned(),
+                ecosystem: request.ecosystem.clone(),
+                compatibility: request.compatibility.clone(),
+                provenance: request.provenance.clone(),
+                license: request.license.clone(),
+                completeness,
+                safety: request.safety.clone(),
+                shards: vec![AuthoredShard {
+                    id: "declarations.ruby.external".to_owned(),
+                    activation,
+                    payload: AuthoredPayload::DeclarationFacts {
+                        types,
+                        members,
+                        relations: Vec::new(),
+                    },
+                }],
+            }),
+            completeness,
+            diagnostics,
+            suppressed_diagnostics,
+        }
+    }
+}
 
 impl DependencyPackAdapter for RubyDependencyPackAdapter {
     fn adapter_name(&self) -> &str {
@@ -58,98 +188,69 @@ impl DependencyPackAdapter for RubyDependencyPackAdapter {
                 "Ruby dependency production requires one declaration-role gem archive",
             );
         }
-        let archive =
-            read_gem_declaration_entries(artifact.sha256(), artifact.bytes(), limits, cancellation);
-        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-        append_diagnostics(&mut diagnostics, archive.diagnostics);
-        let mut complete = archive.complete && archive.suppressed_diagnostics == 0;
-        let (types, members, projection_complete) = merge_entries(
-            artifact.sha256(),
-            &archive.entries,
-            limits,
-            &mut diagnostics,
-            cancellation,
-        );
-        complete &= projection_complete;
-        if types.is_empty() && members.is_empty() {
-            diagnostics.error(
-                "ruby.gem.no_declarations",
-                None,
-                "Ruby gem contains no supported RBS, RBI, or Ruby declarations",
-            );
-            complete = false;
-        }
-        let completeness = if complete && diagnostics.is_empty() {
-            Completeness::Complete
-        } else {
-            Completeness::Partial
-        };
-        let (diagnostics, mut suppressed_diagnostics) = diagnostics.finish();
-        suppressed_diagnostics =
-            suppressed_diagnostics.saturating_add(archive.suppressed_diagnostics);
-        let activation = vec![ActivationSelector {
-            package: dependency
-                .evidence
-                .package
-                .as_ref()
-                .map(|coordinate| NameSelector {
-                    name: coordinate.name.clone(),
-                    version: coordinate
-                        .version
-                        .as_ref()
-                        .map(|version| format!("={version}")),
-                }),
-            module: None,
-            toolchain: None,
-            targets: dependency.evidence.target.clone().into_iter().collect(),
-            configurations: dependency
-                .evidence
-                .configuration
-                .clone()
-                .into_iter()
-                .collect(),
-            artifact_sha256: Some(artifact.sha256().to_owned()),
-        }];
         let source = dependency
             .provenance
             .iter()
             .find(|entry| entry.key == "rubygems.source")
             .map(|entry| entry.value.clone())
             .unwrap_or_else(|| "exact Ruby gem".to_owned());
+        let request = ArtifactProductionRequest {
+            path: PathBuf::new(),
+            artifact_kind: ExternalArtifactKind::RubyGemArchive,
+            pack_id: "bifrost.external.ruby".to_owned(),
+            pack_version: env!("CARGO_PKG_VERSION").to_owned(),
+            ecosystem: "rubygems".to_owned(),
+            compatibility: Compatibility {
+                bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                toolchains: Vec::new(),
+            },
+            activation: vec![ActivationSelector {
+                package: dependency
+                    .evidence
+                    .package
+                    .as_ref()
+                    .map(|coordinate| NameSelector {
+                        name: coordinate.name.clone(),
+                        version: coordinate
+                            .version
+                            .as_ref()
+                            .map(|version| format!("={version}")),
+                    }),
+                module: None,
+                toolchain: None,
+                targets: dependency.evidence.target.clone().into_iter().collect(),
+                configurations: dependency
+                    .evidence
+                    .configuration
+                    .clone()
+                    .into_iter()
+                    .collect(),
+                artifact_sha256: None,
+            }],
+            provenance: Provenance {
+                source,
+                revision: Some(artifact.sha256().to_owned()),
+            },
+            license: "NOASSERTION".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+        };
+        let production = RubyGemArchivePackProducer.produce_loaded_artifact(
+            &request,
+            limits,
+            cancellation,
+            artifact.exact(),
+        );
+        debug_assert_eq!(
+            production.artifact_sha256.as_deref(),
+            Some(artifact.sha256())
+        );
         DependencyPackProduction {
-            pack: (!types.is_empty() || !members.is_empty()).then(|| AuthoredSemanticModelPack {
-                schema_version: SEMANTIC_MODEL_SCHEMA_VERSION,
-                pack_id: "bifrost.external.ruby".to_owned(),
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                producer: self.producer(),
-                language: "ruby".to_owned(),
-                ecosystem: "rubygems".to_owned(),
-                compatibility: Compatibility {
-                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
-                    toolchains: Vec::new(),
-                },
-                provenance: Provenance {
-                    source,
-                    revision: Some(artifact.sha256().to_owned()),
-                },
-                license: "NOASSERTION".to_owned(),
-                completeness,
-                safety: Safety {
-                    generated_code_only: false,
-                    review_required: false,
-                },
-                shards: vec![AuthoredShard {
-                    id: "declarations.ruby.external".to_owned(),
-                    activation,
-                    payload: AuthoredPayload::DeclarationFacts {
-                        types,
-                        members,
-                        relations: Vec::new(),
-                    },
-                }],
-            }),
-            diagnostics,
-            suppressed_diagnostics,
+            pack: production.pack,
+            diagnostics: production.diagnostics,
+            suppressed_diagnostics: production.suppressed_diagnostics,
         }
     }
 }
