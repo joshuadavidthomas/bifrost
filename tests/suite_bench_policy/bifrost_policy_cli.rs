@@ -2465,10 +2465,6 @@ const JDK_21_FIXTURE_PACK: &str = r#"{
 /// One Java workspace whose packs document opts into the jvm ecosystem and
 /// names a catalog pre-loaded with the JDK 21 fixture pack.
 fn packs_document_project() -> BuiltInlineTestProject {
-    use brokk_bifrost::analyzer::semantic_model::{
-        CatalogOpenMode, CatalogOptions, CompilerOptions, DurablePackSource, DurablePackSourceKind,
-        SemanticPackCatalog, SourceFormat, compile_source,
-    };
     let project = InlineTestProject::new()
         .file("src/Main.java", JAVA_RESOURCE_SOURCE)
         .file(
@@ -2476,14 +2472,31 @@ fn packs_document_project() -> BuiltInlineTestProject {
             r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#,
         )
         .build();
+    install_jdk_fixture_pack(project.root());
+    project
+}
+
+/// Compile the JDK 21 fixture pack and install it into the workspace's
+/// configured catalog directory.
+fn install_jdk_fixture_pack(root: &Path) {
+    install_fixture_pack(root, JDK_21_FIXTURE_PACK);
+}
+
+/// Compile `source` as a fixture pack and install it into the workspace's
+/// configured catalog directory.
+fn install_fixture_pack(root: &Path, source: &str) {
+    use brokk_bifrost::analyzer::semantic_model::{
+        CatalogOpenMode, CatalogOptions, CompilerOptions, DurablePackSource, DurablePackSourceKind,
+        SemanticPackCatalog, SourceFormat, compile_source,
+    };
     let compiled = compile_source(
         SourceFormat::Json,
-        JDK_21_FIXTURE_PACK.as_bytes(),
+        source.as_bytes(),
         &CompilerOptions::default(),
     )
     .unwrap_or_else(|diagnostics| panic!("fixture pack compilation failed: {diagnostics:#?}"));
     let catalog = SemanticPackCatalog::open(
-        &project.root().join(".bifrost/packs-catalog"),
+        &root.join(".bifrost/packs-catalog"),
         CatalogOpenMode::ReadWrite,
         CatalogOptions::default(),
     )
@@ -2497,7 +2510,6 @@ fn packs_document_project() -> BuiltInlineTestProject {
             },
         )
         .expect("install the fixture pack");
-    project
 }
 
 /// One fake JDK home: a `release` file with the exact version and no
@@ -2643,4 +2655,156 @@ fn a_malformed_packs_document_is_loud_and_makes_the_run_unreliable() {
         "the diagnostic must name the invalid ecosystem: {message}"
     );
     assert!(report.get("packs").is_none());
+}
+
+/// One Java file whose only unresolved references are standard-library: the
+/// probe workspace for the epic #1877 acceptance shape. `Collections` is an
+/// expression-position reference (a static receiver), the site shape the
+/// resolution asserts examine.
+const STDLIB_PROBE_SOURCE: &str = r#"import java.util.ArrayList;
+import java.util.Collections;
+
+class Main {
+  int run() {
+    ArrayList<String> names = new ArrayList<>();
+    names.add("x");
+    Collections.sort(names);
+    return names.size();
+  }
+}
+"#;
+
+/// The JDK fixture pack extended with `java.util.Collections`, the type the
+/// probe's asserted reference must resolve to.
+const STDLIB_PROBE_PACK: &str = r#"{
+  "schema_version": 1,
+  "pack_id": "fixture.jdk",
+  "version": "21.0.2",
+  "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "jdk", "requirement": "=21.0.2" }]
+  },
+  "provenance": { "source": "checked-in test source", "revision": "fixture-v1" },
+  "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "jdk.core",
+    "activation": [{
+      "toolchain": { "name": "jdk", "version": "=21.0.2" },
+      "targets": ["jvm"]
+    }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "jdk.java-util-collections",
+        "name": "java.util.Collections",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/Collections.java",
+          "symbol": "java.util.Collections"
+        }
+      }],
+      "members": [],
+      "relations": []
+    }
+  }]
+}"#;
+
+/// The epic #1877 contract over the stdlib reference: the site resolves
+/// through a real route (`external_root` or stronger, never name fallback),
+/// and the winning selection never falls back past an authoritative boundary.
+const STDLIB_BOUNDARY_POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "probe.stdlib.boundary"
+  :name "Stdlib references resolve without name fallback"
+  :message "a standard-library reference did not resolve through a real route"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    :subject (rql (identifier :text/regex "^Collections$" :capture "target"))
+    :asserts [(assert-resolution :id stdlib-route :at "target" :role receiver_position
+                :expect-tier external_root :at-least true)
+              (assert-boundary :id stdlib-boundary :at "target" :role receiver_position
+                :forbid-fallback-past external_declared_unindexed)]))
+"#;
+
+const STDLIB_PROBE_ARGS: &[&str] = &[
+    "--policy-file",
+    "policies/stdlib-boundary.rqlp",
+    "--evaluation-date",
+    "2026-07-28",
+    "--fail-on",
+    "warning",
+    "--format",
+    "json",
+];
+
+/// The epic #1877 acceptance shape, end to end: a fixture that references a
+/// standard-library API runs an exhaustive resolution-and-boundary assertion
+/// to completion. With the JDK fixture pack selected the run concludes (exit
+/// 0 or 1, never 2). Without a packs document the same policy is inconclusive
+/// and the run honestly exits 2 instead of passing vacuously.
+///
+/// Ignored until #1893: activation selects the pack (`packs.complete` is true
+/// and the decisions say `selected`), but the pack's declaration facts never
+/// reach definition resolution, so the with-pack run today still reports
+/// `inconclusive [CapabilityIncomplete]` and exits 2 - the probe run that
+/// discovered the gap. The no-pack half additionally rests on Java growing
+/// candidate traces for positive tier requirements (today a documented
+/// selection-only boundary, see the resolution-conformance Scenario 7 notes).
+#[test]
+#[ignore = "epic #1877 acceptance: blocked on #1893, selected declaration-facts packs are not consumed by resolution"]
+fn packs_document_lets_a_stdlib_boundary_assertion_conclude() {
+    let with_pack = InlineTestProject::new()
+        .file("src/Main.java", STDLIB_PROBE_SOURCE)
+        .file("policies/stdlib-boundary.rqlp", STDLIB_BOUNDARY_POLICY)
+        .file(
+            ".bifrost/packs.json",
+            r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#,
+        )
+        .build();
+    install_fixture_pack(with_pack.root(), STDLIB_PROBE_PACK);
+    let homes = tempfile::tempdir().expect("fake JDK home root");
+    let concluded = run_with_java_home(
+        with_pack.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        STDLIB_PROBE_ARGS,
+    );
+    let code = concluded.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "with the pack selected the assertion must conclude, not report \
+         unreliable: exit {code:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&concluded.stdout),
+        String::from_utf8_lossy(&concluded.stderr)
+    );
+    let report = json_stdout(&concluded);
+    assert_eq!(report["packs"]["complete"], true, "report: {report}");
+    assert_eq!(
+        report["runs"][0]["completion"]["type"], "complete",
+        "report: {report}"
+    );
+
+    let without_pack = InlineTestProject::new()
+        .file("src/Main.java", STDLIB_PROBE_SOURCE)
+        .file("policies/stdlib-boundary.rqlp", STDLIB_BOUNDARY_POLICY)
+        .build();
+    let degraded = run(without_pack.root(), STDLIB_PROBE_ARGS);
+    assert_status(&degraded, 2);
+    let degraded_report = json_stdout(&degraded);
+    assert_eq!(
+        degraded_report["runs"][0]["completion"]["type"], "inconclusive",
+        "without the pack the assertion must be inconclusive, not vacuously \
+         clean: {degraded_report}"
+    );
 }
