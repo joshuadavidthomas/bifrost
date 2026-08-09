@@ -2658,9 +2658,9 @@ fn a_malformed_packs_document_is_loud_and_makes_the_run_unreliable() {
 }
 
 /// One Java file whose only unresolved references are standard-library: the
-/// probe workspace for the epic #1877 acceptance shape. `Collections` is an
-/// expression-position reference (a static receiver), the site shape the
-/// resolution asserts examine.
+/// probe workspace for the epic #1877 acceptance shape. `ArrayList` is a
+/// type-position reference and `Collections` a static receiver, so the file
+/// carries both site shapes the resolution asserts can examine.
 const STDLIB_PROBE_SOURCE: &str = r#"import java.util.ArrayList;
 import java.util.Collections;
 
@@ -2674,8 +2674,9 @@ class Main {
 }
 "#;
 
-/// The JDK fixture pack extended with `java.util.Collections`, the type the
-/// probe's asserted reference must resolve to.
+/// The JDK fixture pack extended with every standard-library type the probe
+/// workspace names, so an exhaustive assertion over that workspace has a
+/// declaration to reach for each one.
 const STDLIB_PROBE_PACK: &str = r#"{
   "schema_version": 1,
   "pack_id": "fixture.jdk",
@@ -2700,6 +2701,20 @@ const STDLIB_PROBE_PACK: &str = r#"{
     "payload": {
       "kind": "declaration_facts",
       "types": [{
+        "id": "jdk.java-util-arraylist",
+        "name": "java.util.ArrayList",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": ["E"],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/ArrayList.java",
+          "symbol": "java.util.ArrayList"
+        }
+      }, {
         "id": "jdk.java-util-collections",
         "name": "java.util.Collections",
         "type_kind": "class",
@@ -2723,6 +2738,15 @@ const STDLIB_PROBE_PACK: &str = r#"{
 /// The epic #1877 contract over the stdlib reference: the site resolves
 /// through a real route (`external_root` or stronger, never name fallback),
 /// and the winning selection never falls back past an authoritative boundary.
+///
+/// The asserted site is the type-position `ArrayList`, not the static receiver
+/// `Collections`. A receiver spells a *member* (`Collections.sort`), and no JVM
+/// external surface carries member declarations: the jar-backed index stores a
+/// type's name, package, kind, visibility and origin artifact and nothing else,
+/// and `brokk_bifrost_jvm::proof` records the same gap for diagnostics. So a
+/// receiver-position assertion is unanswerable through a pack for the same
+/// reason it is unanswerable through a source jar, which is a member-surface
+/// gap rather than an activation one.
 const STDLIB_BOUNDARY_POLICY: &str = r#"(policy
   :schema-version 1
   :id "probe.stdlib.boundary"
@@ -2731,10 +2755,10 @@ const STDLIB_BOUNDARY_POLICY: &str = r#"(policy
   :severity warning
   :analysis (analysis
     :type assertion
-    :subject (rql (identifier :text/regex "^Collections$" :capture "target"))
-    :asserts [(assert-resolution :id stdlib-route :at "target" :role receiver_position
+    :subject (rql (identifier :text/regex "^ArrayList$" :capture "target"))
+    :asserts [(assert-resolution :id stdlib-route :at "target" :role type_operand
                 :expect-tier external_root :at-least true)
-              (assert-boundary :id stdlib-boundary :at "target" :role receiver_position
+              (assert-boundary :id stdlib-boundary :at "target" :role type_operand
                 :forbid-fallback-past external_declared_unindexed)]))
 "#;
 
@@ -2755,15 +2779,13 @@ const STDLIB_PROBE_ARGS: &[&str] = &[
 /// 0 or 1, never 2). Without a packs document the same policy is inconclusive
 /// and the run honestly exits 2 instead of passing vacuously.
 ///
-/// Ignored until #1893: activation selects the pack (`packs.complete` is true
-/// and the decisions say `selected`), but the pack's declaration facts never
-/// reach definition resolution, so the with-pack run today still reports
-/// `inconclusive [CapabilityIncomplete]` and exits 2 - the probe run that
-/// discovered the gap. The no-pack half additionally rests on Java growing
-/// candidate traces for positive tier requirements (today a documented
-/// selection-only boundary, see the resolution-conformance Scenario 7 notes).
+/// The whole chain runs here: the packs document opts the workspace in, the
+/// catalog serves the installed pack, the fake JDK home satisfies the
+/// toolchain gate, the pack's declaration facts reach the JVM external
+/// declaration surface, and the resolver selects the external route they name
+/// (#1893). No jar and no `src.zip` exists anywhere in the fixture, so the
+/// pack is the only thing that can carry the assertion.
 #[test]
-#[ignore = "epic #1877 acceptance: blocked on #1893, selected declaration-facts packs are not consumed by resolution"]
 fn packs_document_lets_a_stdlib_boundary_assertion_conclude() {
     let with_pack = InlineTestProject::new()
         .file("src/Main.java", STDLIB_PROBE_SOURCE)
@@ -2794,7 +2816,11 @@ fn packs_document_lets_a_stdlib_boundary_assertion_conclude() {
         report["runs"][0]["completion"]["type"], "complete",
         "report: {report}"
     );
-
+    // A prohibition over zero rows is complete-and-clean by design, so
+    // "complete" alone could also describe a run that concluded vacuously.
+    // The paired run below is the discriminator: the same policy over the same
+    // workspace is inconclusive without the pack, so only the pack can have
+    // carried this conclusion.
     let without_pack = InlineTestProject::new()
         .file("src/Main.java", STDLIB_PROBE_SOURCE)
         .file("policies/stdlib-boundary.rqlp", STDLIB_BOUNDARY_POLICY)

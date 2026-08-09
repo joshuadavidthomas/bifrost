@@ -21,7 +21,7 @@ use crate::analyzer::clone_detection::{
 };
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
-use crate::analyzer::jvm::external::JvmExternalDeclarationIndex;
+use crate::analyzer::jvm::external::{JvmExternalDeclarationIndex, JvmExternalDeclarations};
 use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
@@ -463,6 +463,20 @@ impl ScalaAnalyzer {
         })
     }
 
+    /// The external declaration surface Scala resolution reads: the shared
+    /// jar-backed index plus the declaration facts the activated semantic packs
+    /// publish (#1893).
+    ///
+    /// `packs` is the *dispatching* analyzer's overlay; see
+    /// [`crate::analyzer::JavaAnalyzer::resolve_type_name_with_external`] on
+    /// why activation state arrives as a parameter.
+    pub(crate) fn external_declarations(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> JvmExternalDeclarations<'_> {
+        JvmExternalDeclarations::new(self.external_declaration_index(), packs)
+    }
+
     /// How far a lookup for `name` from `file` could see past the workspace,
     /// and the external type it landed on when it landed on one.
     ///
@@ -478,12 +492,13 @@ impl ScalaAnalyzer {
     /// declared artifacts the index never finished reading.
     pub(crate) fn external_boundary_evidence(
         &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         name: &str,
     ) -> (BoundaryStatus, Option<String>) {
-        let external = self.external_declaration_index();
+        let external = self.external_declarations(packs);
         let package_name = self.inner.package_name_of(file).unwrap_or_default();
-        let indexed = |ty: &crate::analyzer::jvm::external::JvmExternalType| {
+        let indexed = |ty: crate::analyzer::jvm::external::JvmExternalType| {
             (BoundaryStatus::ExternalIndexed, Some(ty.fqn().to_owned()))
         };
         if name.contains('.')
@@ -511,7 +526,11 @@ impl ScalaAnalyzer {
         if let Some(ty) = external.resolve_same_package(&package_name, name) {
             return indexed(ty);
         }
-        if external.production_diagnostic_count() > 0 {
+        if self
+            .external_declaration_index()
+            .production_diagnostic_count()
+            > 0
+        {
             return (BoundaryStatus::ExternalDeclaredUnindexed, None);
         }
         (BoundaryStatus::ExternalUnknown, None)

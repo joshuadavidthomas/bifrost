@@ -503,7 +503,10 @@ pub(super) fn record_selected_lexical(outcome: &DefinitionLookupOutcome) {
 /// otherwise; [`finish_boundary`] fills an empty name from the outcome's own
 /// resolved reference. The status starts at [`BoundaryStatus::ExternalUnknown`]
 /// because the gate knows only that the lookup left the workspace, and
-/// [`finish_boundary`] upgrades it where the analyzer holds evidence.
+/// [`finish_boundary`] upgrades it where the analyzer holds evidence. The row
+/// starts rejected for the same reason: the gate has found nothing to resolve
+/// to yet, and [`finish_boundary`] turns it into a selection where the evidence
+/// names an exact external declaration.
 pub(super) fn record_boundary_gate() {
     if !recording() {
         return;
@@ -660,6 +663,23 @@ fn finish_boundary(
             row.boundary = status;
             row.external_target.clone_from(&external_target);
         }
+        // An external route that named an exact external declaration is the
+        // answer this reference resolved to. The resolver cannot return a
+        // workspace `CodeUnit` for a declaration that is not in the workspace,
+        // and `external_target` is what it resolved instead, so recording the
+        // row as a rejection would say the resolver discarded the only answer
+        // it found. `debug_assert_selection_agrees` already admits exactly this
+        // selection: a route may be selected at a boundary outcome.
+        //
+        // A route with no named target stays rejected, because nothing was
+        // decided: either no index and no activated pack spells the name, or
+        // more than one does and the reference is ambiguous.
+        if matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. })
+            && row.boundary == BoundaryStatus::ExternalIndexed
+            && row.external_target.is_some()
+        {
+            row.outcome = CandidateOutcome::Selected;
+        }
     }
 }
 
@@ -683,13 +703,21 @@ pub(in crate::analyzer::usages) fn boundary_evidence(
             // there -- retained discovery evidence still distinguishes "the
             // build declares dependencies discovery could not read to the end"
             // from "nothing is known".
+            // The activated packs are the *dispatching* analyzer's, never a
+            // language delegate's own: activation publishes onto the analyzer a
+            // host asked, which in a mixed JVM workspace is the `MultiAnalyzer`.
+            // This is the same reason `collect_java_semantic_diagnostics` takes
+            // its `JvmOverlayModel` as a parameter (#1893).
             let evidence = match language {
-                Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer)
-                    .map(|java| java.external_boundary_evidence(file, name)),
-                Language::Kotlin => resolve_analyzer::<KotlinAnalyzer>(analyzer)
-                    .map(|kotlin| kotlin.external_boundary_evidence(file, name)),
-                Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer)
-                    .map(|scala| scala.external_boundary_evidence(file, name)),
+                Language::Java => resolve_analyzer::<JavaAnalyzer>(analyzer).map(|java| {
+                    java.external_boundary_evidence(analyzer.semantic_model_overlay(), file, name)
+                }),
+                Language::Kotlin => resolve_analyzer::<KotlinAnalyzer>(analyzer).map(|kotlin| {
+                    kotlin.external_boundary_evidence(analyzer.semantic_model_overlay(), file, name)
+                }),
+                Language::Scala => resolve_analyzer::<ScalaAnalyzer>(analyzer).map(|scala| {
+                    scala.external_boundary_evidence(analyzer.semantic_model_overlay(), file, name)
+                }),
                 Language::CSharp => resolve_analyzer::<CSharpAnalyzer>(analyzer)
                     .map(|csharp| csharp.external_boundary_evidence(file, name)),
                 _ => unreachable!("the arm pattern admits exactly these four languages"),
@@ -1754,5 +1782,234 @@ mod boundary_evidence_tests {
         // so a bare miss says nothing about where the name lives (#1624).
         let fixture = BoundaryFixture::new(Language::Ruby, "app.rb", "Missing\n");
         assert_no_boundary_was_drawn("Missing", &fixture);
+    }
+
+    // -----------------------------------------------------------------------
+    // JVM declaration-facts packs: the same route the source jars feed (#1893).
+    // -----------------------------------------------------------------------
+
+    /// One file whose two imports are both standard-library types, only one of
+    /// which the activated pack declares. The pair is the whole point: the pack
+    /// must decide its own type and must leave the other one alone.
+    const JVM_PACK_JAVA_SOURCE: &str = concat!(
+        "package app;\n",
+        "\n",
+        "import java.util.ArrayList;\n",
+        "import java.util.Collections;\n",
+        "\n",
+        "class Caller {\n",
+        "  Collections helper() { return null; }\n",
+        "  ArrayList names() { return null; }\n",
+        "}\n",
+    );
+
+    const JVM_PACK_KOTLIN_SOURCE: &str = concat!(
+        "package app\n",
+        "import java.util.Collections\n",
+        "class Caller {\n",
+        "  fun helper(): Collections? = null\n",
+        "}\n",
+    );
+
+    /// The declaration-facts pack the JVM boundary tests activate: one public
+    /// JDK class, published for `language: java`, and no artifact anywhere on
+    /// disk.
+    fn jdk_collections_pack() -> (String, serde_json::Value) {
+        use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
+
+        let type_id = type_declaration_id(TypeIdentity {
+            ecosystem: "jdk",
+            name: "java.util.Collections",
+        });
+        let pack = single_type_pack(
+            "fixture.jdk",
+            "java",
+            "jdk",
+            "java.base",
+            &type_id,
+            "java.util.Collections",
+        );
+        (type_id, pack)
+    }
+
+    #[test]
+    fn a_java_import_of_a_pack_declared_type_reports_external_indexed() {
+        // #1893 acceptance: no source jar, no class jar, no JDK home -- the
+        // activated pack's declaration facts are the only external evidence
+        // there is, and they carry the reference all the way to the same
+        // `external_indexed` verdict the source-jar route produces.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        let (_, pack) = jdk_collections_pack();
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &pack,
+            activation_evidence("java", "jdk", "java.base"),
+        );
+
+        let (_, trace) = fixture.trace("Collections helper");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("java.util.Collections")
+            }),
+            "the activated pack declares `java.util.Collections`: {routes:?}"
+        );
+
+        // Boundary honesty: a pack decides the types it declares and nothing
+        // else. `java.util.ArrayList` is imported from the same package and is
+        // not in the pack, so it keeps the answer it had before activation.
+        let (_, trace) = fixture.trace("ArrayList names");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "a type the pack does not declare must not be upgraded: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn a_java_reference_without_the_pack_stays_external_unknown() {
+        // The same fixture with no activation at all: the honest answer before
+        // #1893 and after it, so the test above measures the pack and not the
+        // fixture.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        let (_, trace) = fixture.trace("Collections helper");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "with nothing activated and no artifact, nothing is known: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn a_kotlin_import_of_a_pack_declared_jvm_type_reports_external_indexed() {
+        // Java, Kotlin and Scala share one classpath and therefore one external
+        // declaration surface, so a pack published for `language: java` answers
+        // a Kotlin reference to the same type.
+        let fixture = BoundaryFixture::with_config(
+            Language::Kotlin,
+            "app/Caller.kt",
+            JVM_PACK_KOTLIN_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        let (_, pack) = jdk_collections_pack();
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &pack,
+            activation_evidence("java", "jdk", "java.base"),
+        );
+        let (_, trace) = fixture.trace("Collections? = null");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("java.util.Collections")
+            }),
+            "the activated pack declares `java.util.Collections`: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn a_pack_for_another_language_never_answers_a_jvm_name() {
+        // Near miss: an activated pack that publishes the very same qualified
+        // name for a different ecosystem's language. The JVM realm is Java,
+        // Kotlin and Scala, so this one is not on the classpath and must not
+        // upgrade the reference.
+        use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
+
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        let type_id = type_declaration_id(TypeIdentity {
+            ecosystem: "composer",
+            name: "java.util.Collections",
+        });
+        activate_fixture_pack(
+            &fixture,
+            "fixture.php.impostor",
+            &single_type_pack(
+                "fixture.php.impostor",
+                "php",
+                "composer",
+                "vendor/impostor",
+                &type_id,
+                "java.util.Collections",
+            ),
+            activation_evidence("php", "composer", "vendor/impostor"),
+        );
+        let (_, trace) = fixture.trace("Collections helper");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "a pack for another language declares nothing on the classpath: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn an_indexed_external_route_is_the_selection_and_an_unknown_one_is_not() {
+        // The trace's outcome column, not just its boundary column: a route
+        // that named an exact external declaration is what the reference
+        // resolved to, so a policy asking "did this resolve through a real
+        // route" has a selection to read. A route that named nothing stays
+        // rejected, so the same question is honestly unanswerable.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        let (_, pack) = jdk_collections_pack();
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &pack,
+            activation_evidence("java", "jdk", "java.base"),
+        );
+
+        let (_, trace) = fixture.trace("Collections helper");
+        let declared: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !declared.is_empty()
+                && declared.iter().all(|row| {
+                    row.is_selected() && row.tier == Some(PrecedenceTier::ExternalRoot)
+                }),
+            "the pack named the declaration, so the route is the selection: {declared:?}"
+        );
+
+        let (_, trace) = fixture.trace("ArrayList names");
+        let unknown: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !unknown.is_empty() && unknown.iter().all(|row| !row.is_selected()),
+            "nothing named this declaration, so nothing was selected: {unknown:?}"
+        );
     }
 }

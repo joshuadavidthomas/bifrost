@@ -171,14 +171,20 @@ impl<'a> JavaResolutionSession<'a> {
         self.query_rows(|| java.resolve_type_name_candidates_in_file(file, name))
     }
 
+    /// Whether `name` resolves once the external surface is consulted. The
+    /// activated packs come from the dispatching analyzer, which is the only
+    /// one activation publishes onto (#1893).
     fn type_name_resolves_with_external(
         &self,
+        analyzer: &dyn IAnalyzer,
         java: &JavaAnalyzer,
         file: &ProjectFile,
         name: &str,
     ) -> bool {
-        self.query_optional_row(|| java.resolve_type_name_with_external(file, name))
-            .is_some()
+        self.query_optional_row(|| {
+            java.resolve_type_name_with_external(analyzer.semantic_model_overlay(), file, name)
+        })
+        .is_some()
     }
 
     fn import_infos(
@@ -791,7 +797,7 @@ fn java_explicit_scoped_type_reference(
     if let Some(unit) = java_qualified_nested_type(analyzer, java, session, file, source, node) {
         return Some(candidates_outcome(vec![unit]));
     }
-    if session.type_name_resolves_with_external(java, file, normalized) {
+    if session.type_name_resolves_with_external(analyzer, java, file, normalized) {
         // gated upstream: `resolve_type_name_in_file` and `java_qualified_nested_type`
         // above return early for any workspace-internal type; reaching here means
         // the name only resolves once external imports are considered.
