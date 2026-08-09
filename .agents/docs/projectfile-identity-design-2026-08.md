@@ -1,7 +1,7 @@
 # Design: ProjectFile identity cost - staged repair
 
-Status: Stage 1 APPROVED, IMPLEMENTING. Stage 2 remains unapproved and is gated on the Stage 1
-re-profile; see the OWNER REVIEW NOTE below. Author: Fable, 2026-08-09.
+Status: Stage 1 LANDED. **Stage 2 CLOSED as not warranted** by the re-profile gate; see "The
+Stage-2 gate: VERDICT" below. Author: Fable, 2026-08-09.
 Substrate: `.agents/docs/` companions (graph-read-cost-investigation, gate-cell-overhead) and the
 fresh profile `graph-churn-profile-v1.md` (session scratchpad; check in with the first
 implementation commit). Governing rule: AGENTS.md Implementation details - "Do not use reference
@@ -65,10 +65,46 @@ reasoning and the fail-before evidence.
 | 4 probe memo + components | `65ae9be4` | `ModuleKey::new` skipped: its `components` and `crate_root` are the key's own retained storage and cannot borrow |
 | ride-along canonicalize | `e7831df9` | root canonicalized once per root, per-file only on the below-root-symlink fallback; measured 24 files -> 1 canonicalization |
 
-Stage 2 remains gated on the re-profile of the same cell against
-`graph-churn-profile-2026-08.md`, same windows, same method.
+### The Stage-2 gate: VERDICT, Stage 2 is NOT warranted (2026-08-09, m14)
 
-## Stage 2 - interned file IDs (only if Stage 1's re-profile says so)
+Re-profiled at `d91dbabd` on the same cell, same rustc tree, same perf event config
+(`perf evlist -v` byte-identical), same bucket script; recorded in
+`projectfile-stage1-reprofile-v1.md` (session scratchpad).
+
+**The gate asked whether path handling still holds a double-digit share. It does not,
+on any measure:**
+
+| measure | m8 | m13 A / B | now A / B |
+| --- | ---: | ---: | ---: |
+| `path` bucket, self | 18.95 | 21.91 / 22.16 | **4.97 / 6.17** |
+| `path` + `ProjectFile` own, self | 21.63 | 25.10 / 27.15 | **6.27 / 7.06** |
+| stacks naming any path/`ProjectFile` frame | 28.49 | 30.71 / 38.19 | **6.94 / 8.04** |
+| `ProjectFile::cmp`, with children | 14.90 | 18.04 / 16.29 | **4.25 / 4.41** |
+
+The design's sized target of "~38% of graph-phase CPU" is now 8.04% by the identical
+attribution script. `NormalizePath::normalize`, `rust_module_files_from_segments` and
+`ProjectFile::exists` no longer clear the 0.4% children limit at all.
+
+**The churn question is CLOSED. Stage 2 is not implemented, in either the fragile or
+the boring-safe shape.** End to end the same cell went 1,076.6 s -> 585.6 s wall,
+4,350.7 s -> 2,977.3 s user CPU, 1,411.2 s -> 918.9 s sys CPU, and returned 17 hits
+instead of 11 - the same 11 plus 6 more, none lost, still `time_budget`. The
+canonicalize ride-along removed the storm: `readlink` 352,706 -> 211 per process. Gate
+cell (a) sys CPU fell 23.42 -> 6.90 s median.
+
+**What leads now is `moka`, at 32.5% of window A and 20.5% of window B** (up from
+11.30% / 9.67%), of which 20.1% is lookup and 11.9% is LRU/eviction bookkeeping. The
+growth is absolute, not only a share: 1.39 -> 3.43 cores in window A. Two causes, one
+by construction - item 4 routed the module probe through a new
+`RustWalkCaches::module_probes` moka cache, trading four `ProjectFile::new` plus four
+`exists()` syscalls per specifier for one lookup; and the surviving lookups got cheap
+enough that the walk issues them faster. **This falsifies the design's prediction that
+"Moka+crossbeam ... are expected to shrink with them"**: they went 19.94% -> 38.05%.
+moka's caller tree is not attributable from this profile (30.1% of window A is an
+all-moka truncated stack), so no intervention is sized here; a frame-pointer build
+must come first.
+
+## Stage 2 - interned file IDs (NOT WARRANTED; the gate above closed it)
 
 Per-generation interner: the workspace listing is already a sorted `BTreeSet`; assign
 sequential `u32` IDs in sorted order at listing construction, so **ID order equals path order
