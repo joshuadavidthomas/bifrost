@@ -1091,6 +1091,20 @@ impl RustModuleAliasRoutes {
         importing_module: &str,
         segments: &[String],
     ) -> Vec<RustResolvedModuleRoute> {
+        // Resolve bare paths against the physical module graph first. A child
+        // module with the same name as an ancestor alias owns that path in
+        // Rust's module namespace. Cargo paths keep their routed provenance.
+        if !segments.is_empty()
+            && !matches!(
+                segments.first().map(String::as_str),
+                Some("crate" | "self" | "super")
+            )
+        {
+            let direct = module_files.resolve_segments(importing_file, importing_module, segments);
+            if !direct.is_empty() {
+                return direct;
+            }
+        }
         let crate_package = rust_crate_root_package(importing_file);
         let owner_relative = if segments.is_empty() {
             Some(importing_module.to_string())
