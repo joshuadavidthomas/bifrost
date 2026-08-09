@@ -21,6 +21,7 @@
 //! production. External facts arrive through [`RustExternalEvidence`], whose
 //! implementations read retained analyzer state only.
 
+use crate::graph::ast::is_rust_declaration_name;
 use crate::graph_support::RustUsageSource;
 use crate::proof::{RustNameProof, RustProofGap, record_rust_name_proof};
 use brokk_bifrost_core::analyzer::model::{
@@ -957,7 +958,7 @@ fn subtree_suppression(node: Node<'_>, source: &str) -> Option<RustProofGap> {
 }
 
 fn is_type_reference_identifier(node: Node<'_>) -> bool {
-    if node.kind() != "type_identifier" || is_declaration_name(node) || is_inside_use(node) {
+    if node.kind() != "type_identifier" || is_rust_declaration_name(node) || is_inside_use(node) {
         return false;
     }
     let Some(parent) = node.parent() else {
@@ -975,7 +976,7 @@ fn is_type_reference_identifier(node: Node<'_>) -> bool {
 }
 
 fn is_scoped_reference(node: Node<'_>) -> bool {
-    !is_declaration_name(node)
+    !is_rust_declaration_name(node)
         && !is_inside_use(node)
         && !is_inside_macro_invocation(node)
         && node.child_by_field_name("name").is_some()
@@ -983,7 +984,7 @@ fn is_scoped_reference(node: Node<'_>) -> bool {
 
 fn is_value_reference_identifier(node: Node<'_>) -> bool {
     if node.kind() != "identifier"
-        || is_declaration_name(node)
+        || is_rust_declaration_name(node)
         || is_inside_use(node)
         || is_pattern_identifier(node)
     {
@@ -1002,28 +1003,6 @@ fn is_value_reference_identifier(node: Node<'_>) -> bool {
         "let_declaration" | "parameter" | "self_parameter" => false,
         _ => true,
     }
-}
-
-fn is_declaration_name(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    matches!(
-        parent.kind(),
-        "function_item"
-            | "struct_item"
-            | "enum_item"
-            | "trait_item"
-            | "type_item"
-            | "const_item"
-            | "static_item"
-            | "mod_item"
-            | "field_declaration"
-            | "enum_variant"
-            | "function_signature_item"
-    ) && parent
-        .child_by_field_name("name")
-        .is_some_and(|name| same_node(name, node))
 }
 
 fn is_pattern_identifier(node: Node<'_>) -> bool {
