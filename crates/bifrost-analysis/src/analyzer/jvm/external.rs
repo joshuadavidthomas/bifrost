@@ -1628,6 +1628,13 @@ impl<'a> JvmExternalDeclarations<'a> {
     /// name -- so it is not ambiguity. Only a declaration an indexed pack itself
     /// flagged ambiguous is, which is the same rule PHP's external surface
     /// applies.
+    ///
+    /// Staticness and arity are deliberately not filtered on. The question this
+    /// surface answers is whether an external declaration spells the name, not
+    /// whether the written use of it compiles: the workspace member tier does
+    /// not refuse a static member written through an instance either, and a
+    /// Scala `object` or Kotlin companion member is published without the
+    /// static flag a Java static carries.
     fn pack_member(&self, owner: &JvmExternalType, member_name: &str) -> Option<JvmExternalMember> {
         let overlay = self.packs.as_ref()?;
         // Only a pack-declared owner has a pack member surface: an artifact
