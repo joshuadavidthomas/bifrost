@@ -7,7 +7,7 @@
 //! through the *new* import. A cache keyed by path -- or one carrying any
 //! stale-content path at all -- keeps reporting the old module's hit here.
 
-use brokk_bifrost::SearchToolsService;
+use brokk_bifrost::{SearchToolsService, searchtools::disable_time_budget_for_test};
 use git2::{Repository, Signature};
 use serde_json::Value;
 use std::fs;
@@ -115,6 +115,9 @@ fn caller_lines(value: &Value) -> Vec<u64> {
 
 #[test]
 fn a_rewritten_import_is_rehydrated_rather_than_served_from_the_retained_infos() {
+    // This test pins cache rehydration across four scans. Suite load must not
+    // replace that result with the independent interactive time budget.
+    let _time_budget_guard = disable_time_budget_for_test();
     let temp = committed_repo();
     let service = SearchToolsService::new_manual_without_semantic_index(temp.path().to_path_buf())
         .expect("searchtools service");

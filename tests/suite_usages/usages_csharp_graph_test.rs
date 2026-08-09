@@ -8,6 +8,7 @@ use brokk_bifrost::usages::{
 };
 use brokk_bifrost::{
     AnalyzerConfig, CSharpAnalyzer, CodeUnit, CodeUnitType, IAnalyzer, Language, WorkspaceAnalyzer,
+    searchtools::disable_time_budget_for_test,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -8565,6 +8566,9 @@ namespace App
 
 #[test]
 fn csharp_scan_usages_truncated_scan_does_not_report_verified_absent() {
+    // This test pins the candidate-file cap, not the wall-clock budget. Disable
+    // the independent deadline so suite load cannot change the reason.
+    let _time_budget_guard = disable_time_budget_for_test();
     let mut builder = InlineTestProject::with_language(Language::CSharp).file(
         "Service.cs",
         r#"
