@@ -623,6 +623,13 @@ pub struct FileState {
     pub(crate) definition_lookup_units: HashSet<CodeUnit>,
     pub(crate) imports: Vec<ImportInfo>,
     pub(crate) scala_exports: HashMap<CodeUnit, Vec<crate::analyzer::ScalaExportInfo>>,
+    /// Per-file Rust usage facts on their way to the `rust_*` fact tables (see
+    /// [`brokk_bifrost_core::analyzer::rust_facts`]). Empty for every other
+    /// language, and empty on a `FileState` hydrated from the store: the query
+    /// side reads those rows straight from SQL by blob oid rather than through
+    /// a materialized `FileState`, so hydrating them here would be dead weight
+    /// on every cache hit. Same rule as `parse_errors` below.
+    pub(crate) rust_usage_facts: brokk_bifrost_core::analyzer::rust_facts::RustUsageFacts,
     pub(crate) raw_supertypes: HashMap<CodeUnit, Vec<String>>,
     pub(crate) supertype_lookup_paths: HashMap<CodeUnit, Vec<String>>,
     pub(crate) type_identifiers: HashSet<String>,
@@ -2742,6 +2749,7 @@ where
             definition_lookup_units: parsed.definition_lookup_units,
             imports: parsed.imports,
             scala_exports: parsed.scala_exports,
+            rust_usage_facts: parsed.rust_usage_facts,
             raw_supertypes: parsed.raw_supertypes,
             supertype_lookup_paths: parsed.supertype_lookup_paths,
             type_identifiers: parsed.type_identifiers,
@@ -10822,6 +10830,7 @@ mod tests {
             definition_lookup_units: HashSet::default(),
             imports: Vec::new(),
             scala_exports: HashMap::default(),
+            rust_usage_facts: Default::default(),
             raw_supertypes: HashMap::default(),
             supertype_lookup_paths: HashMap::default(),
             type_identifiers: HashSet::default(),

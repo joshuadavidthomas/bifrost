@@ -449,11 +449,20 @@ lang_epoch!(
 // resolved as a bare module name carry the phantom owner package (`impls.m`)
 // for every member of such an impl, so a warm workspace would answer the alias
 // spelling and never the real owner (`model.Writer.act`).
+// Rust salt bumped again (Phase 2 of
+// `.agents/plans/port-optimization-arc-to-upstream.md`): the Rust walk now
+// records per-file usage facts (`rust_exports`, `rust_import_targets`,
+// `rust_modules`, `rust_identifier_occurrences`) and per-file Cargo module
+// routes (`rust_module_scopes`, `rust_module_routes`,
+// `rust_module_route_gates`, `rust_item_macros`) alongside its declarations.
+// A blob analyzed before this change carries none of those rows, and a reader
+// cannot tell that blob from one whose file genuinely declares nothing, so the
+// old rows must not be reused.
 lang_epoch!(
     Rust,
     "rust",
     "treesitter/rust/",
-    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08"
+    "synthetic-file-scope-code-units-2026-07;embedded-macro-rules-code-units-2026-07;ast-test-detection-2026-07;canonical-impl-owner-identities-2026-07;macro-invocation-item-reparse-2026-07;proven-macro-definition-replay-2026-07;per-declaration-test-taint-2026-07;raw-identifier-normalization-2026-07;inline-module-const-static-type-items-2026-07;fq-interned-segments-2026-07;structural-macro-invocation-arguments-2026-08;structural-attributes-and-fields-2026-08;anchored-fq-encoding-2026-08;crate-aware-packages-2026-08;rust-query-assets-in-brokk-bifrost-rust-2026-08;renamed-import-impl-owner-route-2026-08;per-file-usage-facts-2026-08;cargo-route-facts-2026-08"
 );
 
 #[cfg(test)]

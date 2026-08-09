@@ -8,6 +8,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tree_sitter::{Node, Parser};
 
+use brokk_bifrost_core::analyzer::rust_facts::{
+    RustMacroGateFact, RustModuleRouteFact, RustModuleRouteFacts, RustModuleScopeFact,
+    RustRulesItemMacroDefinition,
+};
+
 use crate::declarations::{
     rust_macro_invocation_arguments, rust_package_name, rust_rules_item_macro_definitions,
     rust_unqualified_macro_invocation_name,
@@ -1611,7 +1616,181 @@ fn rust_macro_argument_items<'a>(arguments: Node<'_>, source: &'a str) -> Option
     (start <= end).then(|| source.get(start..end)).flatten()
 }
 
-fn rust_path_attribute(module: Node<'_>, source: &str) -> Option<PathBuf> {
+/// Extract what the Cargo route index needs from one parsed Rust file.
+///
+/// Called from `parse_rust_file` with the tree that pass already holds, and
+/// content-only by construction: nothing here reads the file's path or the file
+/// system, because the rows are keyed by content hash and two byte-identical
+/// files at different paths share them. Directory resolution, `#[path]`
+/// normalization and the on-disk existence check are
+/// [`module_child_edges`]'s job.
+///
+/// Item-position macro invocations are expanded OPTIMISTICALLY: whether the
+/// invoked name resolves to a macro that replays its item parameters verbatim
+/// depends on the `#[macro_use]` graph across files, which no single file's
+/// bytes can answer. Each route the expansion produces records the invocations
+/// it came out of, and the reader drops it unless every one of them resolves.
+pub fn extract_rust_module_route_facts(
+    root: Node<'_>,
+    source: &str,
+    item_macros: &[RustRulesItemMacroDefinition],
+) -> RustModuleRouteFacts {
+    let mut facts = RustModuleRouteFacts {
+        scopes: vec![RustModuleScopeFact {
+            parent: None,
+            module_name: String::new(),
+            path_attribute: None,
+            imports_macros: true,
+            body_start: root.start_byte(),
+            body_end: root.end_byte(),
+        }],
+        routes: Vec::new(),
+        item_macros: item_macros.to_vec(),
+    };
+    let mut pending_fragments = VecDeque::new();
+    collect_module_route_facts(root, source, 0, 0, &[], &mut pending_fragments, &mut facts);
+    let mut parser = None;
+    while let Some(fragment) = pending_fragments.pop_front() {
+        if parser.is_none() {
+            let mut prepared_parser = Parser::new();
+            if prepared_parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .is_err()
+            {
+                break;
+            }
+            parser = Some(prepared_parser);
+        }
+        let Some(parser) = parser.as_mut() else {
+            break;
+        };
+        let Some(tree) = parser.parse(&fragment.source, None) else {
+            continue;
+        };
+        if tree.root_node().has_error() {
+            continue;
+        }
+        collect_module_route_facts(
+            tree.root_node(),
+            &fragment.source,
+            fragment.source_base_byte,
+            fragment.scope,
+            &fragment.gates,
+            &mut pending_fragments,
+            &mut facts,
+        );
+    }
+    facts
+}
+
+/// The item stream of one macro invocation, waiting to be parsed and walked.
+struct RustPendingRouteFragment {
+    source: String,
+    /// Where `source` starts in the declaring file, so every recorded byte
+    /// offset is a file offset.
+    source_base_byte: usize,
+    /// The scope the invocation was written in; a fragment introduces no scope
+    /// of its own, because a macro's items land where it was invoked.
+    scope: usize,
+    gates: Vec<RustMacroGateFact>,
+}
+
+/// Walk one item stream, recording the scopes it opens and the external `mod`
+/// declarations it writes.
+///
+/// Explicit stack, never recursion: this runs over every analyzed Rust file.
+fn collect_module_route_facts(
+    node: Node<'_>,
+    source: &str,
+    source_base_byte: usize,
+    scope: usize,
+    gates: &[RustMacroGateFact],
+    pending_fragments: &mut VecDeque<RustPendingRouteFragment>,
+    facts: &mut RustModuleRouteFacts,
+) {
+    let mut pending_nodes = vec![(node, scope)];
+    while let Some((node, scope)) = pending_nodes.pop() {
+        let mut cursor = node.walk();
+        let named_children: Vec<_> = node.named_children(&mut cursor).collect();
+        // Inline bodies are collected here and pushed in reverse below, so the
+        // stack pops them in source order: the rows are then a plain
+        // source-order pre-order walk, which is what makes a re-analysis of
+        // unchanged bytes produce byte-identical rows.
+        let mut descend = Vec::new();
+        for child in named_children {
+            if child.kind() == "macro_invocation" {
+                let Some(name) = rust_unqualified_macro_invocation_name(child, source) else {
+                    continue;
+                };
+                let Some(arguments) = rust_macro_invocation_arguments(child) else {
+                    continue;
+                };
+                let Some(items) = rust_macro_argument_items(arguments, source) else {
+                    continue;
+                };
+                let mut nested = gates.to_vec();
+                nested.push(RustMacroGateFact {
+                    macro_name: name.to_string(),
+                    invocation_start: source_base_byte.saturating_add(child.start_byte()),
+                });
+                pending_fragments.push_back(RustPendingRouteFragment {
+                    source: items.to_string(),
+                    source_base_byte: source_base_byte
+                        .saturating_add(arguments.start_byte().saturating_add(1)),
+                    scope,
+                    gates: nested,
+                });
+                continue;
+            }
+            if child.kind() != "mod_item" {
+                continue;
+            }
+            let Some(name) = child.child_by_field_name("name") else {
+                continue;
+            };
+            let Some(name) = source.get(name.start_byte()..name.end_byte()) else {
+                continue;
+            };
+            let inherits_macros = facts.scopes[scope].imports_macros;
+            let imports_macros = inherits_macros && rust_has_macro_use_attribute(child, source);
+            let path_attribute = rust_path_attribute_value(child, source);
+            if let Some(body) = child.child_by_field_name("body") {
+                facts.scopes.push(RustModuleScopeFact {
+                    parent: Some(scope),
+                    module_name: name.to_string(),
+                    path_attribute,
+                    imports_macros,
+                    body_start: source_base_byte.saturating_add(body.start_byte()),
+                    body_end: source_base_byte.saturating_add(body.end_byte()),
+                });
+                // A scope is appended before its body is walked, so a parent
+                // index is always smaller than its children's -- the pre-order
+                // the stored rows and the reader both rely on.
+                descend.push((body, facts.scopes.len().saturating_sub(1)));
+                continue;
+            }
+            facts.routes.push(RustModuleRouteFact {
+                scope,
+                module_name: name.to_string(),
+                path_attribute,
+                visibility: rust_item_visibility(child, source),
+                imports_macros,
+                test_gated: rust_declaration_is_bare_cfg_test_gated(child, source),
+                declaration_start: source_base_byte.saturating_add(child.start_byte()),
+                declaration_end: source_base_byte.saturating_add(child.end_byte()),
+                gates: gates.to_vec(),
+            });
+        }
+        pending_nodes.extend(descend.into_iter().rev());
+    }
+}
+
+/// The `#[path = "..."]` value written on `module`, decoded but not resolved.
+///
+/// The persisted module-route facts carry this verbatim string, because
+/// resolving it needs the declaring file's own location and the fact rows are
+/// content-keyed.
+fn rust_path_attribute_value(module: Node<'_>, source: &str) -> Option<String> {
     let mut sibling = module.prev_named_sibling();
     while let Some(attribute_item) = sibling {
         if attribute_item.kind() != "attribute_item" {
@@ -1622,13 +1801,15 @@ fn rust_path_attribute(module: Node<'_>, source: &str) -> Option<PathBuf> {
         let path = source.get(path.start_byte()..path.end_byte())?;
         if path == "path" {
             let value = attribute.child_by_field_name("value")?;
-            return rust_static_string_literal(value, source)
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from);
+            return rust_static_string_literal(value, source).filter(|path| !path.is_empty());
         }
         sibling = attribute_item.prev_named_sibling();
     }
     None
+}
+
+fn rust_path_attribute(module: Node<'_>, source: &str) -> Option<PathBuf> {
+    rust_path_attribute_value(module, source).map(PathBuf::from)
 }
 
 /// Decode a static Rust string literal from its tree-sitter node.
