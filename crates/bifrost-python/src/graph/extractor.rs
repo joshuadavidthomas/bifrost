@@ -12,7 +12,7 @@ use crate::graph::resolver::{
     target_owner_code_unit, top_level_identifier,
 };
 use crate::graph_support::{PythonSource, PythonUsageSource};
-use crate::imports::resolve_fqn_candidates;
+use crate::imports::{PythonImportBinding, parse_python_import_bindings, resolve_fqn_candidates};
 use crate::usage_index::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
     usage_matching_edges, usage_module_binding_timeline, usage_resolve_module_files,
@@ -200,6 +200,7 @@ pub fn scan_files_for_seeds(
                 &edges,
             )
         };
+        let scoped_import_bindings = parse_python_import_bindings(source_str);
         let target_self_file = *file == target.source();
         let scope_facts = {
             let _scope = brokk_bifrost_core::profiling::scope("python_graph::scope_facts");
@@ -236,6 +237,7 @@ pub fn scan_files_for_seeds(
             target_self_file,
             member_best_effort_unique: target_self_file && member_unique_in_target_file,
             module_bindings: &module_bindings,
+            scoped_import_bindings: &scoped_import_bindings,
             scope_facts: scope_facts.as_ref(),
             scope_range_index: &scope_range_index,
             hits: &mut local_hits,
@@ -334,6 +336,7 @@ pub struct ScanCtx<'a> {
     /// untyped receivers stay conservative.
     member_best_effort_unique: bool,
     module_bindings: &'a HashMap<String, Vec<ClassifiedModuleBindingEvent>>,
+    scoped_import_bindings: &'a [PythonImportBinding],
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     scope_range_index: &'a [ScopeRangeEntry],
     pub hits: &'a mut BTreeSet<UsageHit>,
@@ -539,18 +542,42 @@ impl ScanCtx<'_> {
     }
 
     fn module_binding_targets_query(&self, ident: &str, node: Node<'_>) -> bool {
+        if let Some(matches) = self.function_import_binding_targets_query(ident, node) {
+            return matches;
+        }
         self.module_binding_matches_query(ident, node, true, |kind| {
             kind != ModuleBindingKind::Other
         })
     }
 
     fn module_binding_targets_symbol(&self, ident: &str, node: Node<'_>) -> bool {
+        if let Some(matches) = self.function_import_binding_targets_query(ident, node) {
+            return matches;
+        }
         let unclassified_named_import = self.edges.iter().any(|edge| {
             edge.local_name == ident && !matches!(edge.kind, ImportEdgeKind::Namespace)
         });
         self.module_binding_matches_query(ident, node, unclassified_named_import, |kind| {
             kind == ModuleBindingKind::TargetSymbolImport
         })
+    }
+
+    /// Resolve the nearest function-local import before the module timeline.
+    ///
+    /// Candidate discovery retains all imports. A local import with the same
+    /// binder must still override the module binding only inside its function.
+    fn function_import_binding_targets_query(&self, ident: &str, node: Node<'_>) -> Option<bool> {
+        let binding = self.scoped_import_bindings.iter().rev().find(|binding| {
+            binding.is_function_scoped()
+                && binding.start_byte <= node.start_byte()
+                && binding.scope_start_byte <= node.start_byte()
+                && node.end_byte() <= binding.scope_end_byte
+                && binding.local_name == ident
+        })?;
+        let candidates = resolve_fqn_candidates(self.python, &binding.qualified_name, |name| {
+            self.graph.index.definitions(name).collect()
+        });
+        Some(candidates.iter().any(|candidate| candidate == self.target))
     }
 
     fn module_binding_matches_query(
@@ -2191,8 +2218,27 @@ fn collect_scope_facts_from_events(
     factory_return_types: &HashMap<String, String>,
 ) -> LocalBindingsSnapshot<String> {
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    let globals: HashSet<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            ScopeFactEvent::Global { symbol } => Some(symbol.as_str()),
+            _ => None,
+        })
+        .collect();
+    let nonlocals: HashSet<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            ScopeFactEvent::Nonlocal { symbol } => Some(symbol.as_str()),
+            _ => None,
+        })
+        .collect();
+    for symbol in &nonlocals {
+        engine.declare_shadow((*symbol).to_string());
+    }
     for event in events {
         if let ScopeFactEvent::Parameter { symbol, .. } = event
+            && !globals.contains(symbol.as_str())
+            && !nonlocals.contains(symbol.as_str())
             && !engine.is_shadowed(symbol)
         {
             engine.declare_shadow(symbol.clone());
@@ -2210,6 +2256,9 @@ fn collect_scope_facts_from_events(
                     annotation: Some(annotation),
                 }
                 | ScopeFactEvent::Annotation { symbol, annotation } => {
+                    if globals.contains(symbol.as_str()) || nonlocals.contains(symbol.as_str()) {
+                        continue;
+                    }
                     apply_annotation_event(
                         symbol,
                         annotation,
@@ -2222,6 +2271,9 @@ fn collect_scope_facts_from_events(
                     annotation: None, ..
                 } => {}
                 ScopeFactEvent::Assignment { lhs, rhs } => {
+                    if globals.contains(lhs.as_str()) {
+                        continue;
+                    }
                     if !engine.is_shadowed(lhs) {
                         engine.declare_shadow(lhs.clone());
                     }
@@ -2272,6 +2324,7 @@ fn collect_scope_facts_from_events(
                         AssignmentRhs::Unknown => {}
                     }
                 }
+                ScopeFactEvent::Global { .. } | ScopeFactEvent::Nonlocal { .. } => {}
             }
         }
         let before = engine.snapshot();
@@ -2318,6 +2371,12 @@ fn apply_annotation_event(
 }
 
 enum ScopeFactEvent {
+    Global {
+        symbol: String,
+    },
+    Nonlocal {
+        symbol: String,
+    },
     Parameter {
         symbol: String,
         annotation: Option<String>,
@@ -2400,6 +2459,14 @@ fn collect_scope_fact_events_from_node(
             continue;
         }
         match node.kind() {
+            "global_statement" => collect_scope_directive_events(node, source, events, |symbol| {
+                ScopeFactEvent::Global { symbol }
+            }),
+            "nonlocal_statement" => {
+                collect_scope_directive_events(node, source, events, |symbol| {
+                    ScopeFactEvent::Nonlocal { symbol }
+                })
+            }
             "parameters" | "lambda_parameters" => collect_parameter_events(node, source, events),
             "assignment" => collect_assignment_events(node, source, events),
             _ => {}
@@ -2413,6 +2480,24 @@ fn collect_scope_fact_events_from_node(
                 .into_iter()
                 .map(|child| (child, next_inside_function)),
         );
+    }
+}
+
+fn collect_scope_directive_events(
+    node: Node<'_>,
+    source: &str,
+    events: &mut Vec<ScopeFactEvent>,
+    make_event: impl Fn(String) -> ScopeFactEvent,
+) {
+    let mut cursor = node.walk();
+    for identifier in node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "identifier")
+    {
+        let Some(symbol) = non_empty_node_text(identifier, source) else {
+            continue;
+        };
+        events.push(make_event(symbol));
     }
 }
 
@@ -2548,8 +2633,7 @@ fn push_factory_index_children<'tree>(
 
 fn factory_return_type(function: Node<'_>, source: &str) -> Option<String> {
     if let Some(return_type) = function.child_by_field_name("return_type") {
-        let raw = slice(return_type, source).trim();
-        return normalized_receiver_type(raw);
+        return receiver_type_from_annotation_node(return_type, source);
     }
 
     let body = function.child_by_field_name("body")?;
@@ -2584,6 +2668,56 @@ fn factory_return_type(function: Node<'_>, source: &str) -> Option<String> {
     (candidates.len() == 1)
         .then(|| candidates.into_iter().next())
         .flatten()
+}
+
+/// Return the runtime class named by a structured Python return annotation.
+///
+/// For `Manager[A, B]`, the constructed class is the subscript base `Manager`.
+/// `Optional[T]` is different: it denotes `T | None`, so retain the existing
+/// supported-wrapper behavior and inspect its structured type argument.
+fn receiver_type_from_annotation_node(annotation: Node<'_>, source: &str) -> Option<String> {
+    match annotation.kind() {
+        "type" => receiver_type_from_annotation_node(annotation.named_child(0)?, source),
+        "identifier" | "attribute" | "member_type" | "string" => {
+            normalized_receiver_type(slice(annotation, source).trim())
+        }
+        "generic_type" => {
+            let base = annotation.named_child(0)?;
+            if optional_annotation_wrapper(base, source) {
+                let parameter = annotation.named_child(1)?;
+                return receiver_type_from_annotation_node(parameter.named_child(0)?, source);
+            }
+            receiver_type_from_annotation_node(base, source)
+        }
+        "subscript" => {
+            let value = annotation.child_by_field_name("value")?;
+            if optional_annotation_wrapper(value, source) {
+                let inner = annotation.child_by_field_name("subscript")?;
+                return receiver_type_from_annotation_node(inner, source);
+            }
+            normalized_receiver_type(slice(value, source).trim())
+        }
+        _ => None,
+    }
+}
+
+fn optional_annotation_wrapper(node: Node<'_>, source: &str) -> bool {
+    match node.kind() {
+        "identifier" => slice(node, source) == "Optional",
+        "attribute" => {
+            let (Some(object), Some(attribute)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("attribute"),
+            ) else {
+                return false;
+            };
+            object.kind() == "identifier"
+                && attribute.kind() == "identifier"
+                && slice(object, source) == "typing"
+                && slice(attribute, source) == "Optional"
+        }
+        _ => false,
+    }
 }
 
 fn returned_receiver_type(node: Node<'_>, source: &str) -> Option<String> {

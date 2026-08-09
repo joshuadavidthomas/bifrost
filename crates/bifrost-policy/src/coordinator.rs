@@ -1182,7 +1182,13 @@ fn evaluate_prepared_policy_inputs(
     // activation lifecycle (LSP, MCP), and re-activating here would race it.
     // The diff-base run activates against its exported base tree inside
     // `evaluate_policy_diff_baseline` for the same ownership reason.
-    let packs_review = match (&packs_config, owned_analyzer.as_ref()) {
+    // The document-driven activation transaction is retained, not just
+    // projected into the review: its already-resolved runtime carries the
+    // procedure summaries the taint evaluator reads, so the CLI/document route
+    // reuses this one activation rather than opening a second (#1915). The
+    // declaration-facts strand (#1893) reaches the resolver through the overlay
+    // this same transaction publishes onto the owned analyzer.
+    let document_activation = match (&packs_config, owned_analyzer.as_ref()) {
         (Some(config), Some(analyzer_workspace)) => {
             match activate_workspace_packs(
                 analyzer_workspace,
@@ -1191,7 +1197,7 @@ fn evaluate_prepared_policy_inputs(
                 config,
                 semantic_cancellation,
             ) {
-                Ok(activation) => Some(pack_activation_review(config, activation.as_ref())),
+                Ok(activation) => Some(activation),
                 Err(error) => {
                     secondary_diagnostics.push(report_diagnostic(
                         PolicyReportDiagnosticCode::PackActivationFailed,
@@ -1206,8 +1212,31 @@ fn evaluate_prepared_policy_inputs(
         }
         _ => None,
     };
+    let packs_review = match (&packs_config, document_activation.as_ref()) {
+        (Some(config), Some(activation)) => {
+            Some(pack_activation_review(config, activation.as_ref()))
+        }
+        _ => None,
+    };
+    // The summaries an activated pack publishes reach taint only through
+    // `PolicySemanticModelContext`. An API caller supplies that context; the
+    // CLI/document route supplies none, so without this strand an activated
+    // summary pack changed taint results for an API caller alone (#1915).
+    // Reuse the resolved runtime the document activation already built, exactly
+    // as an API caller would, and only when it is `Ready`: an incomplete
+    // activation must not silently model calls it never resolved.
+    let document_summary_models = document_activation
+        .as_ref()
+        .and_then(|activation| activation.as_ref())
+        .and_then(|activation| activation.outcome.runtime.as_ref())
+        .and_then(|runtime| match runtime {
+            SemanticModelRuntimeOutcome::Ready { active, .. } => Some(Arc::clone(active)),
+            SemanticModelRuntimeOutcome::Incomplete { .. }
+            | SemanticModelRuntimeOutcome::Cancelled(_)
+            | SemanticModelRuntimeOutcome::Unavailable(_) => None,
+        });
     let active_semantic_models = match semantic_models {
-        None => Ok(None),
+        None => Ok(document_summary_models),
         Some(context) => {
             let workspace = workspace.ok_or_else(|| {
                 PolicyCoordinatorError::new(
@@ -2566,7 +2595,7 @@ fn report_exit_status(report: &PolicyReportDocument, threshold_exceeded: bool) -
             && report
                 .runs()
                 .iter()
-                .any(|run| !run.completion().is_exhaustive()));
+                .any(|run| !run.completion().permits_clean_negative()));
     if unreliable {
         return POLICY_EXIT_UNRELIABLE;
     }
@@ -2990,6 +3019,57 @@ mod tests {
 
         assert_eq!(
             report_exit_status(outcome.report(), false),
+            POLICY_EXIT_UNRELIABLE
+        );
+    }
+
+    fn single_run_report(completion: PolicyRunCompletion) -> PolicyReportDocument {
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry =
+            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+        registry
+            .register_policy_bytes(
+                PolicySourceIdentity::new("test:exit-gate"),
+                match_policy("test.exit-gate", "Exit gate").as_bytes(),
+            )
+            .expect("valid policy");
+        let policy = registry.policies().next().expect("one policy");
+        let descriptor = PolicyRuleDescriptor::from_loaded(policy);
+        let run = PolicyRun::try_new(
+            policy.definition().metadata.id.clone(),
+            policy.semantic_hash(),
+            policy.definition().analysis.analysis_type(),
+            completion,
+            Vec::new(),
+            Vec::new(),
+            false,
+            PolicyWorkReport::default(),
+            &PolicyBudget::default(),
+        )
+        .expect("synthetic run");
+        PolicyReportDocument::try_new(vec![descriptor], vec![run], Vec::new(), false, 0, None)
+            .expect("canonical report")
+    }
+
+    #[test]
+    fn issue_1916_proven_by_summary_passes_the_exit_gate_but_inconclusive_does_not() {
+        // A summary-backed run with no findings is trustworthy under the
+        // require-model contract, so it exits clean rather than unreliable.
+        let proven_by_summary = single_run_report(PolicyRunCompletion::ProvenBySummary);
+        assert_eq!(
+            report_exit_status(&proven_by_summary, false),
+            POLICY_EXIT_CLEAN
+        );
+
+        // A genuinely inconclusive run with no findings still exits unreliable.
+        let inconclusive = single_run_report(
+            PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
+                .unwrap(),
+        );
+        assert_eq!(
+            report_exit_status(&inconclusive, false),
             POLICY_EXIT_UNRELIABLE
         );
     }

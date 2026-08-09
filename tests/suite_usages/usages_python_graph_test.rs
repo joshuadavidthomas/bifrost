@@ -143,6 +143,49 @@ fn call_result_receiver_resolves_member_usage() {
 }
 
 #[test]
+fn same_class_method_return_receiver_resolves_member_usage() {
+    let source = r#"from __future__ import annotations
+
+class Manager:
+    def as_frame(self):
+        return object()
+
+    def apply(self) -> Manager[int, str]:
+        return self
+
+    def other(self) -> Other:
+        return Other()
+
+    def render(self):
+        return self.apply().as_frame(), self.other().as_frame()
+
+class Other:
+    def as_frame(self):
+        return object()
+"#;
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("manager.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "manager.Manager.as_frame");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve a same-class method return receiver");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let (expected_start, _) = nth_occurrence_range(source, "as_frame()", 0);
+    let expected = (expected_start, expected_start + "as_frame".len());
+    assert!(
+        hits.iter()
+            .any(|hit| (hit.start_offset, hit.end_offset) == expected),
+        "{hits:#?}"
+    );
+}
+
+#[test]
 fn shadowed_bare_factory_does_not_resolve_member_usage() {
     assert_no_python_member_hit(
         "class Foo:\n    bar: int\n\ndef build() -> Foo:\n    return Foo()\n",
@@ -1526,6 +1569,45 @@ import service as x
             .any(|hit| { hit.file == project.file("consumer.py") && hit.snippet.contains("x()") }),
         "later namespace binding must not suppress an earlier symbol call: {hits:#?}"
     );
+}
+
+#[test]
+fn nested_import_with_same_local_name_does_not_hide_module_import_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("primary.py", "def get_service():\n    return object()\n")
+        .file("nested.py", "def get_service():\n    return object()\n")
+        .file(
+            "consumer.py",
+            r#"from primary import (
+    get_service,
+)
+
+def outer():
+    return get_service()
+
+def inner():
+    from nested import get_service
+    return get_service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "primary.get_service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should retain the module-level grouped import");
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "nested import must remain a near miss: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("one module-level function call");
+    assert_eq!(hit.file, project.file("consumer.py"));
+    assert!(hit.snippet.contains("return get_service()"), "{hit:#?}");
 }
 
 #[test]
@@ -3469,6 +3551,52 @@ fn module_level_field_resolves_despite_reassignment() {
             "m.SOME_CONST",
         ),
         1,
+    );
+}
+
+#[test]
+fn global_statement_identifier_is_a_module_field_reference() {
+    let source = concat!(
+        "VALUE = None\n",
+        "\n",
+        "def update():\n",
+        "    global VALUE\n",
+        "    if VALUE is None:\n",
+        "        VALUE = 1\n",
+        "\n",
+        "def local():\n",
+        "    VALUE = 2\n",
+        "    return VALUE\n",
+        "\n",
+        "def outer():\n",
+        "    VALUE = 3\n",
+        "    def nested():\n",
+        "        nonlocal VALUE\n",
+        "        return VALUE\n",
+        "    return nested()\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("m.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "m.VALUE");
+    let hits = UsageFinder::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), 100, 100)
+        .all_hits_including_imports();
+
+    let global_start = source.find("VALUE\n    if").expect("global identifier");
+    let read_start = source.find("VALUE is None").expect("module field read");
+    let ranges: BTreeSet<_> = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+    assert_eq!(
+        ranges,
+        BTreeSet::from([
+            (global_start, global_start + "VALUE".len()),
+            (read_start, read_start + "VALUE".len()),
+        ]),
+        "{hits:#?}"
     );
 }
 

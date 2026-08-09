@@ -5,9 +5,9 @@ use brokk_bifrost::analyzer::dataflow::{
     ExternalSummaryContentHash, ExternalSummaryModelId, ExternalSummaryOrigin, PathQuality,
     ProcedureSummaryIdentity, ProcedureSummaryKey, SemanticInputStatus, SemanticProcedureSummary,
     SolverBudget, SummaryBehaviorKey, SummaryCompleteness, SummaryContextKey, SummaryEvidence,
-    SummaryExit, SummaryExitKind, SummaryLocationKey, SummaryOrigin, SummaryPort,
-    SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer, UnmodeledCallBehavior,
-    WitnessReconstructionLimits, WitnessRetentionLimits,
+    SummaryExit, SummaryExitKind, SummaryIncompleteReason, SummaryLocationKey, SummaryOrigin,
+    SummaryPort, SummarySchemaVersion, SummarySemanticsVersion, SummaryTransfer,
+    UnmodeledCallBehavior, WitnessReconstructionLimits, WitnessRetentionLimits,
 };
 use brokk_bifrost::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathRoot,
@@ -273,9 +273,70 @@ fn solve(fixture: &Fixture) -> brokk_bifrost::analyzer::value_flow::ValueFlowSum
     .expect("value-flow solve")
 }
 
+/// The external procedure summary a harness run binds over the call boundary.
+///
+/// `Absent` binds none. `Present` binds one whose transfer evidence and
+/// completeness the caller chooses, so a test can distinguish a derived-proof
+/// model from an authored-complete model that carries only authored evidence
+/// (#1916): the latter is not `Complete` but is proven-by-summary.
+#[derive(Clone)]
+enum ExternalSummarySpec {
+    Absent,
+    Present {
+        evidence: SummaryEvidence,
+        completeness: SummaryCompleteness,
+    },
+}
+
+impl ExternalSummarySpec {
+    /// A derived, proven-complete model. Discharges the boundary to `Complete`.
+    fn proven_complete() -> Self {
+        Self::Present {
+            evidence: SummaryEvidence::proven_complete(),
+            completeness: SummaryCompleteness::Complete,
+        }
+    }
+
+    /// An authored-complete model whose evidence is complete but unproven, the
+    /// exact shape `bind_compiled_procedure_summaries` produces (#1916).
+    fn authored_complete_unproven() -> Self {
+        Self::Present {
+            evidence: SummaryEvidence::try_new(
+                vec!["external semantic model row is not source-backed proof".to_owned()],
+                Vec::new(),
+            )
+            .expect("a single unproven reason is canonical"),
+            completeness: SummaryCompleteness::Complete,
+        }
+    }
+
+    /// An authored model that does not claim to describe the boundary fully.
+    fn authored_partial_unproven() -> Self {
+        Self::Present {
+            evidence: SummaryEvidence::try_new(
+                vec!["external semantic model row is not source-backed proof".to_owned()],
+                Vec::new(),
+            )
+            .expect("a single unproven reason is canonical"),
+            completeness: SummaryCompleteness::partial(vec![SummaryIncompleteReason::Cancelled])
+                .expect("a single incomplete reason is canonical"),
+        }
+    }
+
+    fn present(&self) -> Option<(&SummaryEvidence, &SummaryCompleteness)> {
+        match self {
+            Self::Absent => None,
+            Self::Present {
+                evidence,
+                completeness,
+            } => Some((evidence, completeness)),
+        }
+    }
+}
+
 fn solve_unmodeled_call(
     behavior: UnmodeledCallBehavior,
-    exact_external_summary: bool,
+    external_summary: ExternalSummarySpec,
     curated_transfers: Option<Vec<SummaryTransfer>>,
 ) -> (
     brokk_bifrost::analyzer::value_flow::ValueFlowSummaryResult,
@@ -285,7 +346,7 @@ fn solve_unmodeled_call(
     solve_call_source(
         UNMODELED_CALL_SOURCE,
         behavior,
-        exact_external_summary,
+        external_summary,
         curated_transfers,
     )
 }
@@ -293,7 +354,7 @@ fn solve_unmodeled_call(
 fn solve_call_source(
     source_text: &str,
     behavior: UnmodeledCallBehavior,
-    exact_external_summary: bool,
+    external_summary: ExternalSummarySpec,
     curated_transfers: Option<Vec<SummaryTransfer>>,
 ) -> (
     brokk_bifrost::analyzer::value_flow::ValueFlowSummaryResult,
@@ -391,7 +452,7 @@ fn solve_call_source(
             )])
             .unwrap();
     }
-    if exact_external_summary {
+    if let Some((summary_evidence, summary_completeness)) = external_summary.present() {
         let cancellation = CancellationToken::default();
         let mut semantic_budget = SemanticBudget::default();
         let transfer_outcome = analyzer
@@ -431,7 +492,7 @@ fn solve_call_source(
         let transfer = SummaryTransfer::try_new(
             SummaryPort::Parameter(0),
             SummaryExit::try_new(SummaryExitKind::Normal, SummaryPort::NormalReturn).unwrap(),
-            SummaryEvidence::proven_complete(),
+            summary_evidence.clone(),
         )
         .unwrap();
         let summary = SemanticProcedureSummary::try_new(
@@ -439,7 +500,7 @@ fn solve_call_source(
             vec![transfer],
             Vec::new(),
             Vec::new(),
-            SummaryCompleteness::Complete,
+            summary_completeness.clone(),
         )
         .unwrap();
         let incompatible_behavior = match behavior {
@@ -1031,8 +1092,11 @@ fn omitted_snapshot_closure_keeps_results_incomplete() {
 
 #[test]
 fn unmodeled_call_profiles_are_distinct_and_paranoid_is_conservative() {
-    let (paranoid, paranoid_result, paranoid_preserved) =
-        solve_unmodeled_call(UnmodeledCallBehavior::Paranoid, false, None);
+    let (paranoid, paranoid_result, paranoid_preserved) = solve_unmodeled_call(
+        UnmodeledCallBehavior::Paranoid,
+        ExternalSummarySpec::Absent,
+        None,
+    );
     let ValueFlowSinkOutcome::Reached(result_meetings) = paranoid.sink_outcome(paranoid_result)
     else {
         panic!("paranoid fallback must propagate the argument to the call result");
@@ -1044,8 +1108,11 @@ fn unmodeled_call_profiles_are_distinct_and_paranoid_is_conservative() {
     ));
     assert!(!paranoid.is_complete());
 
-    let (optimistic, optimistic_result, optimistic_preserved) =
-        solve_unmodeled_call(UnmodeledCallBehavior::Optimistic, false, None);
+    let (optimistic, optimistic_result, optimistic_preserved) = solve_unmodeled_call(
+        UnmodeledCallBehavior::Optimistic,
+        ExternalSummarySpec::Absent,
+        None,
+    );
     assert!(matches!(
         optimistic.sink_outcome(optimistic_result),
         ValueFlowSinkOutcome::Inconclusive
@@ -1062,8 +1129,11 @@ fn unmodeled_call_profiles_are_distinct_and_paranoid_is_conservative() {
     );
     assert!(!optimistic.is_complete());
 
-    let (require_model, require_result, require_preserved) =
-        solve_unmodeled_call(UnmodeledCallBehavior::RequireModel, false, None);
+    let (require_model, require_result, require_preserved) = solve_unmodeled_call(
+        UnmodeledCallBehavior::RequireModel,
+        ExternalSummarySpec::Absent,
+        None,
+    );
     assert!(matches!(
         require_model.sink_outcome(require_result),
         ValueFlowSinkOutcome::Inconclusive
@@ -1177,8 +1247,11 @@ fn java_and_typescript_unary_and_binary_operations_emit_structured_flows() {
 
 #[test]
 fn exact_external_summary_precedes_require_model_fallback() {
-    let (result, result_sink, preserved_sink) =
-        solve_unmodeled_call(UnmodeledCallBehavior::RequireModel, true, None);
+    let (result, result_sink, preserved_sink) = solve_unmodeled_call(
+        UnmodeledCallBehavior::RequireModel,
+        ExternalSummarySpec::proven_complete(),
+        None,
+    );
     let ValueFlowSinkOutcome::Reached(meetings) = result.sink_outcome(result_sink) else {
         panic!("the exact external summary must propagate parameter zero to the return value");
     };
@@ -1198,7 +1271,7 @@ fn complete_exact_static_model_discharges_only_the_missing_body_boundary() {
     let (result, result_sink, _) = solve_call_source(
         EXACT_STATIC_CALL_SOURCE,
         UnmodeledCallBehavior::RequireModel,
-        true,
+        ExternalSummarySpec::proven_complete(),
         Some(vec![modeled_return_transfer(
             SummaryPort::Parameter(0),
             SummaryEvidence::proven_complete(),
@@ -1211,6 +1284,69 @@ fn complete_exact_static_model_discharges_only_the_missing_body_boundary() {
     assert!(
         result.is_complete(),
         "a compatible complete static model should make the missing body conclusive: {:#?}",
+        result.result().coverage()
+    );
+}
+
+/// A require-model run whose only unproven-but-fully-modeled boundary is an
+/// authored-complete external summary is not `Complete` -- the summary carries
+/// authored, not derived, evidence -- but it is proven by that summary (#1916).
+///
+/// The curated model resolves the dispatch (a Bifrost-authored, proven fallback
+/// keyed by call), leaving the authored summary as the sole boundary whose only
+/// defect is that its evidence is authored rather than derived.
+#[test]
+fn authored_complete_external_summary_is_proven_by_summary_not_complete() {
+    let (result, result_sink, _) = solve_call_source(
+        EXACT_STATIC_CALL_SOURCE,
+        UnmodeledCallBehavior::RequireModel,
+        ExternalSummarySpec::authored_complete_unproven(),
+        Some(vec![modeled_return_transfer(
+            SummaryPort::Parameter(0),
+            SummaryEvidence::proven_complete(),
+        )]),
+    );
+    assert!(
+        matches!(
+            result.sink_outcome(result_sink),
+            ValueFlowSinkOutcome::Reached(_)
+        ),
+        "the authored-complete summary still propagates parameter zero to the return"
+    );
+    assert!(
+        !result.is_complete(),
+        "an authored summary is not derived proof, so the run is never Complete: {:#?}",
+        result.result().coverage()
+    );
+    assert!(
+        result.is_proven_by_authored_summaries(),
+        "the only unproven-but-modeled boundary is an authored-complete summary, so the run is proven by it: {:#?}",
+        result.result().coverage()
+    );
+}
+
+/// An authored *partial* summary does not claim to close its boundary, so the
+/// run stays genuinely inconclusive: neither `Complete` nor proven-by-summary,
+/// even though the dispatch itself is resolved by the curated model.
+#[test]
+fn authored_partial_external_summary_stays_inconclusive() {
+    let (result, result_sink, _) = solve_call_source(
+        EXACT_STATIC_CALL_SOURCE,
+        UnmodeledCallBehavior::RequireModel,
+        ExternalSummarySpec::authored_partial_unproven(),
+        Some(vec![modeled_return_transfer(
+            SummaryPort::Parameter(0),
+            SummaryEvidence::proven_complete(),
+        )]),
+    );
+    assert!(matches!(
+        result.sink_outcome(result_sink),
+        ValueFlowSinkOutcome::Reached(_)
+    ));
+    assert!(!result.is_complete());
+    assert!(
+        !result.is_proven_by_authored_summaries(),
+        "a partial summary leaves the boundary genuinely open: {:#?}",
         result.result().coverage()
     );
 }
@@ -1232,7 +1368,7 @@ fn exact_external_summary_binds_a_bounded_heap_effect() {
 fn curated_call_model_precedes_require_model_fallback() {
     let (result, result_sink, _) = solve_unmodeled_call(
         UnmodeledCallBehavior::RequireModel,
-        false,
+        ExternalSummarySpec::Absent,
         Some(vec![modeled_return_transfer(
             SummaryPort::Parameter(0),
             SummaryEvidence::proven_complete(),
@@ -1249,7 +1385,7 @@ fn curated_call_model_precedes_require_model_fallback() {
 fn curated_model_keeps_bindable_rows_when_another_port_is_unbound() {
     let (result, result_sink, _) = solve_unmodeled_call(
         UnmodeledCallBehavior::RequireModel,
-        false,
+        ExternalSummarySpec::Absent,
         Some(vec![
             modeled_return_transfer(
                 SummaryPort::Parameter(0),
@@ -1280,7 +1416,7 @@ fn modeled_transfer_quality_requires_one_proven_complete_alternative() {
     let incomparable = proven_partial.join(&unproven_complete).unwrap();
     let (result, result_sink, _) = solve_unmodeled_call(
         UnmodeledCallBehavior::RequireModel,
-        false,
+        ExternalSummarySpec::Absent,
         Some(vec![modeled_return_transfer(
             SummaryPort::Parameter(0),
             incomparable,

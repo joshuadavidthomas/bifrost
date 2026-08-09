@@ -1112,7 +1112,9 @@ fn record_run_incomplete(
     budget: &PolicyBudget,
 ) {
     match completion {
-        PolicyRunCompletion::Complete | PolicyRunCompletion::ProvenSubset { .. } => {
+        PolicyRunCompletion::Complete
+        | PolicyRunCompletion::ProvenSubset { .. }
+        | PolicyRunCompletion::ProvenBySummary => {
             *completion = PolicyRunCompletion::inconclusive(vec![reason])
                 .expect("one typed incomplete reason is canonical");
         }

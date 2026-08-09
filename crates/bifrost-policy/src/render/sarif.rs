@@ -918,6 +918,12 @@ impl<'a> SarifNotification<'a> {
                 "Bifrost policy evaluation reported a proven subset, not an exhaustive result",
                 SarifNotificationLevel::Warning,
             ),
+            PolicyRunCompletion::ProvenBySummary => (
+                "BIFROST_POLICY_PROVEN_BY_SUMMARY",
+                "Bifrost policy evaluation was proven by authored external summaries, not \
+                 exhaustive from analyzed code",
+                SarifNotificationLevel::Warning,
+            ),
             PolicyRunCompletion::Inconclusive { .. } => (
                 "BIFROST_POLICY_INCONCLUSIVE",
                 "Bifrost policy evaluation was inconclusive",
