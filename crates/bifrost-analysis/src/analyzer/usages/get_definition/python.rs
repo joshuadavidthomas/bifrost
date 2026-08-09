@@ -79,6 +79,11 @@ impl<'a> PythonDefinitionProvider<'a> {
             .query_limited_rows(|limit| self.python.ranges_limited(unit, limit))
     }
 
+    /// The import bindings `file` declares, charged as one indexed query.
+    fn import_binder(&self, file: &ProjectFile) -> Option<Arc<ImportBinder>> {
+        self.session.query(|| self.python.import_binder_of(file))
+    }
+
     fn scope_step(&self) -> bool {
         self.session.scope_step()
     }
@@ -222,17 +227,48 @@ pub(crate) fn python_type_lookup_resolution_bounded(
         site.focus_start_byte,
         site.focus_end_byte,
     )?;
-    let target_kind = if node.kind() == "identifier"
-        && !python_has_lexical_binding_bounded(support, node, source)
-        && python_class_candidate_for_name(support, file, source, node, python_slice(node, source))
-            .is_some()
+    let expression = python_type_expression_node_bounded(support, node)?;
+    let target_kind = if expression.kind() == "identifier"
+        && !python_has_lexical_binding_bounded(support, expression, source)
+        && python_class_candidate_for_name(
+            support,
+            file,
+            source,
+            expression,
+            python_slice(expression, source),
+        )
+        .is_some()
     {
         TypeLookupTargetKind::TypeReference
     } else {
         TypeLookupTargetKind::ValueExpression
     };
-    let unit = python_type_for_expression_bounded(support, file, source, root, node, 0)?;
+    let unit = python_type_for_expression_bounded(support, file, source, root, expression, 0)?;
     Some(PythonTypeLookupResolution { unit, target_kind })
+}
+
+/// The expression whose type the caret asks for.
+///
+/// A caret on the member of `value.paint` covers the `paint` identifier alone,
+/// but the type owed is the attribute expression's, so climb to the outermost
+/// `attribute` the caret's node is the member of. A caret on the receiver stays
+/// where it is: `value` in `value.paint` still asks for `value`'s own type.
+fn python_type_expression_node_bounded<'tree>(
+    support: &PythonDefinitionProvider<'_>,
+    node: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if !support.scope_step() {
+            return None;
+        }
+        if parent.kind() != "attribute" || parent.child_by_field_name("attribute") != Some(current)
+        {
+            break;
+        }
+        current = parent;
+    }
+    Some(current)
 }
 
 fn python_smallest_named_node_covering_bounded<'tree>(
@@ -456,12 +492,134 @@ fn python_type_for_expression_bounded(
             }?;
             python_callable_return_type_in_tree(support, file, source, root, &callable, depth + 1)
         }
+        // `value.paint` outside a call: the receiver's type owns the member, so
+        // the member declaration's own type is the expression's type.
+        "attribute" => {
+            let object = node.child_by_field_name("object")?;
+            let member = python_slice(node.child_by_field_name("attribute")?, source);
+            if member.is_empty() {
+                return None;
+            }
+            let receiver =
+                python_type_for_expression_bounded(support, file, source, root, object, depth + 1)?;
+            let declaration = unique_python_candidate(
+                support.members_for_owner_name(&receiver.fq_name(), member),
+            )?;
+            python_member_declared_type_bounded(
+                support,
+                file,
+                source,
+                root,
+                &declaration,
+                depth + 1,
+            )
+        }
         "parenthesized_expression" => {
             let child = node.named_child(0)?;
             python_type_for_expression_bounded(support, file, source, root, child, depth + 1)
         }
         _ => None,
     }
+}
+
+/// The type a resolved member declaration carries: a nested class is its own
+/// type, a method's is its return type, and an attribute's is its annotation or
+/// the type of the value bound to it.
+///
+/// The syntax routes read the site's own tree, so a member declared in another
+/// file has no bounded answer here. That is the same in-file rule
+/// [`python_callable_return_type_in_tree`] applies to a resolved callable: the
+/// bounded core answers from the tree the caller already parsed and never
+/// cold-parses a second file to finish a step.
+fn python_member_declared_type_bounded(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    root: Node<'_>,
+    member: &CodeUnit,
+    depth: usize,
+) -> Option<CodeUnit> {
+    if depth >= 12 || !support.scope_step() {
+        return None;
+    }
+    if member.is_class() {
+        return Some(member.clone());
+    }
+    if member.source() != file {
+        return None;
+    }
+    let mut types = Vec::new();
+    for range in support.ranges(member) {
+        if range.start_byte >= range.end_byte || range.end_byte > source.len() {
+            continue;
+        }
+        let Some(mut node) = python_smallest_named_node_covering_bounded(
+            support,
+            root,
+            range.start_byte,
+            range.end_byte,
+        ) else {
+            continue;
+        };
+        loop {
+            if !support.scope_step() {
+                return None;
+            }
+            if node.kind() == "function_definition"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| python_slice(name, source) == member.identifier())
+            {
+                types.extend(python_function_return_type_from_node_bounded(
+                    support,
+                    file,
+                    source,
+                    root,
+                    node,
+                    depth + 1,
+                ));
+                break;
+            }
+            // `name: T = ..` at class level and `self.name = ..` in a method are
+            // both assignments whose bound name is the member's identifier.
+            let bound = (node.kind() == "assignment")
+                .then(|| node.child_by_field_name("left"))
+                .flatten()
+                .and_then(|left| match left.kind() {
+                    "identifier" => Some(left),
+                    "attribute" => left.child_by_field_name("attribute"),
+                    _ => None,
+                });
+            if bound.is_some_and(|bound| python_slice(bound, source) == member.identifier()) {
+                let declared = match node.child_by_field_name("type") {
+                    Some(annotation) => python_type_from_annotation_bounded(
+                        support,
+                        file,
+                        source,
+                        annotation,
+                        depth + 1,
+                    ),
+                    None => node.child_by_field_name("right").and_then(|value| {
+                        python_type_for_expression_bounded(
+                            support,
+                            file,
+                            source,
+                            root,
+                            value,
+                            depth + 1,
+                        )
+                    }),
+                };
+                types.extend(declared);
+                break;
+            }
+            let Some(parent) = node.parent() else {
+                break;
+            };
+            node = parent;
+        }
+    }
+    unique_python_candidate(types)
 }
 
 fn python_class_candidate_for_name(
@@ -485,6 +643,11 @@ fn python_class_candidate_for_name(
     if let Some(candidate) = unique_python_candidate(file_candidates) {
         return Some(candidate);
     }
+    // A same-file declaration shadows an import, so the binder is consulted only
+    // after the file's own classes cannot answer the name.
+    if let Some(candidate) = python_imported_class_candidate(support, file, name) {
+        return Some(candidate);
+    }
     if !name.contains('.') {
         return None;
     }
@@ -494,6 +657,34 @@ fn python_class_candidate_for_name(
         .filter(CodeUnit::is_class)
         .collect::<Vec<_>>();
     unique_python_candidate(exact_candidates)
+}
+
+/// The class an imported local name binds to.
+///
+/// `from widget import Widget` records the module the name came from, and a
+/// workspace declaration is indexed at `<module>.<imported name>`, so the
+/// binder plus one fq-name query resolves an annotation whose class lives in
+/// another file. Only a named import binds a declaration: a namespace binding
+/// names a module, not a type.
+fn python_imported_class_candidate(
+    support: &PythonDefinitionProvider<'_>,
+    file: &ProjectFile,
+    name: &str,
+) -> Option<CodeUnit> {
+    let binder = support.import_binder(file)?;
+    let binding = binder.bindings.get(name)?;
+    if binding.kind != ImportKind::Named {
+        return None;
+    }
+    let imported = binding.imported_name.as_ref()?;
+    let fqn = format!("{}.{}", binding.module_specifier, imported);
+    unique_python_candidate(
+        support
+            .fqn(&fqn)
+            .into_iter()
+            .filter(CodeUnit::is_class)
+            .collect(),
+    )
 }
 
 #[derive(Clone, Copy)]
