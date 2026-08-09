@@ -13,6 +13,28 @@
       "expires_at": null
     },
     {
+      "policy_id": "bifrost.performance.expensive-operation-in-nested-loop",
+      "finding_id": "0148f080c0a175799f611282026a9eeadd5bc0a9e7b5bf691fafe5e633b404bf",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "The nested walk visits each distinct Java file once and extracts that file's methods. The operation depends on both loop variables and cannot be hoisted.",
+      "policy_hash_at_acceptance": "df760c4255064035c9079548977b6cedb8032cd2c2d5f0af666fcca09b28ac1c",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "063dd3cdf02e9252812f94fff21c0f12615bf074d2b33152ae7663a4c1202d88",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration writes a distinct fixture file for a different revision. The file operation depends on the loop item and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
+      "expires_at": null
+    },
+    {
       "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "0b47fe211ee1b126ff437d52504819ca31b433007d080ed1115e1fc66f1ef433",
       "identity_stability": "strong",
@@ -25,6 +47,17 @@
     },
     {
       "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "59912940245dfa0a29fb4c972807745583eb59c479dc471851b542a51ab3adca",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "The fallback reads the one source file for the current method label. Each iteration has a different file and method, so the read cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
       "finding_id": "34f2f87a26b2058bccf802c0cc8fe515a980b32d8328cf077c76cc441c91c44b",
       "identity_stability": "strong",
       "status": "accepted",
@@ -32,6 +65,17 @@
       "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "7a7822f95a60a390623ca3d0983536cb74ca7c49744876818699d3615efb5dda",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each commit iteration reads its distinct metadata sidecar. The file path depends on that commit and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
       "expires_at": null
     },
     {
@@ -54,6 +98,17 @@
       "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "f12287edac77c4a41d87881ee258fb88642e6d418bf0948939940c74c1372a46",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration writes a distinct fixture file for a different revision. The file operation depends on the loop item and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
       "expires_at": null
     },
     {
@@ -1715,6 +1770,94 @@
       "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-04",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "76455504896afb8ed9292bf09008c174db7755608ed7a63f1b857effa21bacec",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each map value contains the files for one Cargo target root. Sorting each distinct value once gives deterministic output and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "8dbaa5f44130f74b08f879168b08bb99de1307ef2d84d2cba96a2b868f1b1636",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each endpoint has a different score list. Sorting that local list once keeps its two best scores and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "b52fd407a6ffef919ea6464f69de82537f7a903b9946756a2dfb3a4e4ce35b89",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each Cargo root owns a different file set. Sorting each distinct set once gives deterministic output and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "d6ae82e0dbd1ce0085ead46da802a3082a68044439a0bca1fb00a3910c9a21dd",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each similarity metric has a different candidate list. Sorting each list once supplies the deterministic greedy order and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "e58a6655df15549a7beaf9ac18f19305c74abfa0c001d59664ff67d0171cb289",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each target root has a different visible-root list. Sorting each list once enables deterministic deduplication and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "ecc6c71c62caa26f8a05ddc302d2acd4c6e781a30a835a0e145475efe55d34ee",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each callable signature has a different overload list. Sorting each list once records declaration source order and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "f0545ab414dede9e15d4afc561d77256c1e9faab74576529e36dc0d28425a7ac",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each dependency name has a different Cargo route list. Sorting each list once gives deterministic deduplication and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "f557cbf0eb8aa93fed0990a651c119c8125e2839958baaa167682ea8931f42b6",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each dependency name has a different Cargo route list. Sorting each list once gives deterministic deduplication and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-09",
       "expires_at": null
     }
   ]
