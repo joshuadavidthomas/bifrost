@@ -1827,16 +1827,10 @@ fn path_parent_candidates(file: &ProjectFile) -> Vec<ProjectFile> {
                 prefix.push(component);
             }
             for declaring_stem in ["lib", "main", "mod"] {
-                candidates.push(ProjectFile::new(
-                    file.root().to_path_buf(),
-                    prefix.join(format!("{declaring_stem}.rs")),
-                ));
+                candidates.push(file.with_rel_path(prefix.join(format!("{declaring_stem}.rs"))));
             }
             if length > 0 {
-                candidates.push(ProjectFile::new(
-                    file.root().to_path_buf(),
-                    prefix.with_extension("rs"),
-                ));
+                candidates.push(file.with_rel_path(prefix.with_extension("rs")));
             }
         }
     }

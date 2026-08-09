@@ -2004,7 +2004,7 @@ fn collect_external_module_children(
                 else {
                     continue;
                 };
-                let candidate = ProjectFile::new(source_file.root().to_path_buf(), relative);
+                let candidate = source_file.with_rel_path(relative);
                 if candidate.exists() {
                     let imports_macros =
                         imports_macros_to_file_scope && rust_has_macro_use_attribute(child, source);
@@ -2028,7 +2028,7 @@ fn collect_external_module_children(
                 module_directory.join(name).with_extension("rs"),
                 module_directory.join(name).join("mod.rs"),
             ] {
-                let candidate = ProjectFile::new(source_file.root().to_path_buf(), relative);
+                let candidate = source_file.with_rel_path(relative);
                 if candidate.exists() {
                     let imports_macros =
                         imports_macros_to_file_scope && rust_has_macro_use_attribute(child, source);
