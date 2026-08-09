@@ -290,6 +290,52 @@ pub fn annotation_reference_candidates(
     Some(candidates)
 }
 
+/// Return the exact qualifier token when a class target owns part of a
+/// structured annotation attribute chain.
+pub fn annotation_class_qualifier_site<'tree>(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'tree>,
+    target: &CodeUnit,
+) -> Option<Node<'tree>> {
+    if node.kind() != "attribute" || !target.is_class() || !is_annotation_reference_node(node) {
+        return None;
+    }
+
+    let (root, attributes) = annotation_attribute_chain(node)?;
+    let owners: Vec<_> =
+        resolve_bare_annotation_symbol(graph, python, file, source, root, node_text(root, source))
+            .into_iter()
+            .filter(CodeUnit::is_class)
+            .collect();
+    let [owner] = owners.as_slice() else {
+        return None;
+    };
+    let mut owner = owner.clone();
+    if &owner == target {
+        return Some(root);
+    }
+
+    // The final attribute is the annotation declaration itself. Only the
+    // preceding segments are class qualifiers.
+    let qualifier_count = attributes.len().saturating_sub(1);
+    for attribute in attributes.into_iter().take(qualifier_count) {
+        let next_candidates =
+            exact_nested_annotation_class(graph, &owner, node_text(attribute, source));
+        let [next] = next_candidates.as_slice() else {
+            return None;
+        };
+        owner = next.clone();
+        if &owner == target {
+            return Some(attribute);
+        }
+    }
+
+    None
+}
+
 fn resolve_annotation_attribute_types(
     graph: &PythonGraphSource<'_>,
     python: &dyn PythonUsageSource,
