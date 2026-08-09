@@ -2729,7 +2729,19 @@ const STDLIB_PROBE_PACK: &str = r#"{
           "symbol": "java.util.Collections"
         }
       }],
-      "members": [],
+      "members": [{
+        "id": "jdk.java-util-collections.sort",
+        "owner": "jdk.java-util-collections",
+        "name": "sort",
+        "member_kind": "method",
+        "visibility": "public",
+        "is_static": true,
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/Collections.java",
+          "symbol": "java.util.Collections.sort"
+        }
+      }],
       "relations": []
     }
   }]
@@ -2739,14 +2751,9 @@ const STDLIB_PROBE_PACK: &str = r#"{
 /// through a real route (`external_root` or stronger, never name fallback),
 /// and the winning selection never falls back past an authoritative boundary.
 ///
-/// The asserted site is the type-position `ArrayList`, not the static receiver
-/// `Collections`. A receiver spells a *member* (`Collections.sort`), and no JVM
-/// external surface carries member declarations: the jar-backed index stores a
-/// type's name, package, kind, visibility and origin artifact and nothing else,
-/// and `brokk_bifrost_jvm::proof` records the same gap for diagnostics. So a
-/// receiver-position assertion is unanswerable through a pack for the same
-/// reason it is unanswerable through a source jar, which is a member-surface
-/// gap rather than an activation one.
+/// The asserted site is the type-position `ArrayList`, so this policy measures
+/// the *type* half of the external surface. [`STDLIB_MEMBER_POLICY`] asserts
+/// the same contract over the member half.
 const STDLIB_BOUNDARY_POLICY: &str = r#"(policy
   :schema-version 1
   :id "probe.stdlib.boundary"
@@ -2762,9 +2769,43 @@ const STDLIB_BOUNDARY_POLICY: &str = r#"(policy
                 :forbid-fallback-past external_declared_unindexed)]))
 "#;
 
+/// The same epic #1877 contract asserted over the *member* half of the
+/// external surface (#1900).
+///
+/// The subject is the static receiver `Collections`, whose reference site spans
+/// the whole written name `Collections.sort`: a type for its head and a member
+/// for its last segment. The fixture pack declares both, and only the member
+/// declaration can carry this assertion -- the type alone leaves the spelling
+/// unresolved, which is exactly why #1893 had to assert the type-position site.
+const STDLIB_MEMBER_POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "probe.stdlib.member"
+  :name "Stdlib member references resolve without name fallback"
+  :message "a standard-library member reference did not resolve through a real route"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    :subject (rql (identifier :text/regex "^Collections$" :capture "target"))
+    :asserts [(assert-resolution :id stdlib-member-route :at "target" :role receiver_position
+                :expect-tier external_root :at-least true)
+              (assert-boundary :id stdlib-member-boundary :at "target" :role receiver_position
+                :forbid-fallback-past external_declared_unindexed)]))
+"#;
+
 const STDLIB_PROBE_ARGS: &[&str] = &[
     "--policy-file",
     "policies/stdlib-boundary.rqlp",
+    "--evaluation-date",
+    "2026-07-28",
+    "--fail-on",
+    "warning",
+    "--format",
+    "json",
+];
+
+const STDLIB_MEMBER_ARGS: &[&str] = &[
+    "--policy-file",
+    "policies/stdlib-member.rqlp",
     "--evaluation-date",
     "2026-07-28",
     "--fail-on",
@@ -2832,5 +2873,94 @@ fn packs_document_lets_a_stdlib_boundary_assertion_conclude() {
         degraded_report["runs"][0]["completion"]["type"], "inconclusive",
         "without the pack the assertion must be inconclusive, not vacuously \
          clean: {degraded_report}"
+    );
+}
+
+/// The same acceptance shape over the member half of the JVM external surface
+/// (#1900): the asserted site is the static receiver of `Collections.sort`,
+/// whose written name spells a member rather than a type.
+///
+/// #1893 had to assert a type-position site because no JVM external surface
+/// carried member declarations at all. With the pack's `sort` member reaching
+/// the surface, the receiver-position assertion concludes; the paired run
+/// without a packs document stays honestly inconclusive, so only the pack's
+/// member declaration can have carried it.
+#[test]
+fn packs_document_lets_a_stdlib_member_assertion_conclude() {
+    let with_pack = InlineTestProject::new()
+        .file("src/Main.java", STDLIB_PROBE_SOURCE)
+        .file("policies/stdlib-member.rqlp", STDLIB_MEMBER_POLICY)
+        .file(
+            ".bifrost/packs.json",
+            r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#,
+        )
+        .build();
+    install_fixture_pack(with_pack.root(), STDLIB_PROBE_PACK);
+    let homes = tempfile::tempdir().expect("fake JDK home root");
+    let concluded = run_with_java_home(
+        with_pack.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        STDLIB_MEMBER_ARGS,
+    );
+    let code = concluded.status.code();
+    assert!(
+        code == Some(0) || code == Some(1),
+        "with the pack's member declaration the assertion must conclude: exit \
+         {code:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&concluded.stdout),
+        String::from_utf8_lossy(&concluded.stderr)
+    );
+    let report = json_stdout(&concluded);
+    assert_eq!(report["packs"]["complete"], true, "report: {report}");
+    assert_eq!(
+        report["runs"][0]["completion"]["type"], "complete",
+        "report: {report}"
+    );
+
+    let without_pack = InlineTestProject::new()
+        .file("src/Main.java", STDLIB_PROBE_SOURCE)
+        .file("policies/stdlib-member.rqlp", STDLIB_MEMBER_POLICY)
+        .build();
+    let degraded = run(without_pack.root(), STDLIB_MEMBER_ARGS);
+    assert_status(&degraded, 2);
+    let degraded_report = json_stdout(&degraded);
+    assert_eq!(
+        degraded_report["runs"][0]["completion"]["type"], "inconclusive",
+        "without the pack the member assertion must be inconclusive, not \
+         vacuously clean: {degraded_report}"
+    );
+
+    // The discriminator that names the *member*: the very same pack with its
+    // members emptied still declares `java.util.Collections` and is still
+    // selected, and the assertion still cannot conclude. So the conclusion
+    // above rests on the `sort` declaration and not on the type, and a pack
+    // that declares no members proves nothing about them.
+    let mut types_only: serde_json::Value =
+        serde_json::from_str(STDLIB_PROBE_PACK).expect("the fixture pack is JSON");
+    types_only["shards"][0]["payload"]["members"] = serde_json::json!([]);
+    let without_member = InlineTestProject::new()
+        .file("src/Main.java", STDLIB_PROBE_SOURCE)
+        .file("policies/stdlib-member.rqlp", STDLIB_MEMBER_POLICY)
+        .file(
+            ".bifrost/packs.json",
+            r#"{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": ["jvm"] }"#,
+        )
+        .build();
+    install_fixture_pack(without_member.root(), &types_only.to_string());
+    let type_only = run_with_java_home(
+        without_member.root(),
+        &fake_jdk_home(homes.path(), "21.0.2"),
+        STDLIB_MEMBER_ARGS,
+    );
+    assert_status(&type_only, 2);
+    let type_only_report = json_stdout(&type_only);
+    assert_eq!(
+        type_only_report["packs"]["complete"], true,
+        "the type-only pack still activates: {type_only_report}"
+    );
+    assert_eq!(
+        type_only_report["runs"][0]["completion"]["type"], "inconclusive",
+        "a pack that declares the owner type and no members must not carry a \
+         member assertion: {type_only_report}"
     );
 }

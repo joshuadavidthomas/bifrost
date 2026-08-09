@@ -12,7 +12,7 @@
 
 use super::*;
 use crate::analyzer::ImportInfo;
-use crate::analyzer::jvm::external::{JvmExternalDeclarations, JvmExternalType};
+use crate::analyzer::jvm::external::{JvmExternalDeclarations, JvmExternalMember, JvmExternalType};
 use crate::analyzer::structural::resolution::{PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::get_definition::trace;
 use brokk_bifrost_jvm::java::graph_support::{
@@ -219,6 +219,44 @@ impl JavaAnalyzer {
         external
             .resolve_java_lang(normalized)
             .map(JavaTypeResolution::External)
+    }
+
+    /// Resolve `raw_name` in `file` as a member spelling -- a written
+    /// `Owner.member` whose head is a type and whose last segment is a member
+    /// the external declaration surface declares (#1900).
+    ///
+    /// This runs only after [`JavaAnalyzer::resolve_type_name_with_external`]
+    /// has failed, because the same written dot spells a nested type, and a
+    /// nested type is decided by the type ladder. The owner is resolved through
+    /// that very ladder, so a member reaches the same declaration a type
+    /// spelling would; a workspace owner answers nothing here, because a
+    /// workspace type's members are indexed and the resolver found them or did
+    /// not.
+    ///
+    /// `packs` reaches here for the same reason it reaches
+    /// [`JavaAnalyzer::resolve_type_name_with_external`]: activation publishes
+    /// onto the dispatching analyzer, never onto this Java delegate.
+    pub(crate) fn resolve_member_name_with_external(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<JvmExternalMember> {
+        let normalized = raw_name.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+        let external = self.external_declarations(packs.clone());
+        if external.is_empty() {
+            return None;
+        }
+        let access_package = self.package_name_of(file).unwrap_or_default();
+        external.resolve_member_spelling(normalized, &access_package, |owner_spelling| {
+            match self.resolve_type_name_with_external(packs, file, owner_spelling) {
+                Some(JavaTypeResolution::External(external_type)) => Some(external_type),
+                Some(JavaTypeResolution::Source(_)) | None => None,
+            }
+        })
     }
 
     fn resolve_visible_external_simple_type(

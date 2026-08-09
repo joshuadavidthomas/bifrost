@@ -1361,7 +1361,8 @@ mod boundary_evidence_tests {
         }
     }
 
-    /// One declaration-facts pack with a single public type.
+    /// One declaration-facts pack with a single public type, carrying whatever
+    /// `members` the caller declares on it.
     fn single_type_pack(
         pack_id: &str,
         language: &str,
@@ -1369,6 +1370,7 @@ mod boundary_evidence_tests {
         package: &str,
         type_id: &str,
         type_name: &str,
+        members: serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
             "schema_version": 1,
@@ -1399,7 +1401,7 @@ mod boundary_evidence_tests {
                             "symbol": type_name
                         }
                     }],
-                    "members": [],
+                    "members": members,
                     "relations": []
                 }
             }]
@@ -1568,6 +1570,7 @@ mod boundary_evidence_tests {
                 "vendor/widget",
                 &type_id,
                 "Vendor.Widget.Helper",
+                serde_json::json!([]),
             ),
             activation_evidence("php", "composer", "vendor/widget"),
         );
@@ -1724,6 +1727,7 @@ mod boundary_evidence_tests {
                 "widget",
                 &type_id,
                 "Widget::Config",
+                serde_json::json!([]),
             ),
             activation_evidence("ruby", "rubygems", "widget"),
         );
@@ -1811,25 +1815,66 @@ mod boundary_evidence_tests {
         "}\n",
     );
 
-    /// The declaration-facts pack the JVM boundary tests activate: one public
-    /// JDK class, published for `language: java`, and no artifact anywhere on
-    /// disk.
-    fn jdk_collections_pack() -> (String, serde_json::Value) {
+    /// One file whose standard-library call spells a *member*: the whole
+    /// written name `Collections.sort` has a type for its head and a member for
+    /// its last segment, which is the shape #1900 is about. `Collections.size`
+    /// is the near miss on the same owner -- a member no pack declares.
+    const JVM_PACK_JAVA_MEMBER_SOURCE: &str = concat!(
+        "package app;\n",
+        "\n",
+        "import java.util.ArrayList;\n",
+        "import java.util.Collections;\n",
+        "\n",
+        "class Caller {\n",
+        "  int run() {\n",
+        "    ArrayList<String> names = new ArrayList<>();\n",
+        "    Collections.sort(names);\n",
+        "    return Collections.size(names);\n",
+        "  }\n",
+        "}\n",
+    );
+
+    fn jdk_collections_type_id() -> String {
         use crate::analyzer::semantic_model::{TypeIdentity, type_declaration_id};
 
-        let type_id = type_declaration_id(TypeIdentity {
+        type_declaration_id(TypeIdentity {
             ecosystem: "jdk",
             name: "java.util.Collections",
-        });
-        let pack = single_type_pack(
+        })
+    }
+
+    /// The declaration-facts pack the JVM boundary tests activate: one public
+    /// JDK class, published for `language: java`, carrying `members`, and no
+    /// artifact anywhere on disk.
+    fn jdk_collections_pack(members: serde_json::Value) -> serde_json::Value {
+        single_type_pack(
             "fixture.jdk",
             "java",
             "jdk",
             "java.base",
-            &type_id,
+            &jdk_collections_type_id(),
             "java.util.Collections",
-        );
-        (type_id, pack)
+            members,
+        )
+    }
+
+    /// The one static method the member fixtures declare on
+    /// `java.util.Collections`.
+    fn collections_sort_member() -> serde_json::Value {
+        let owner = jdk_collections_type_id();
+        serde_json::json!([{
+            "id": format!("member.{owner}.sort"),
+            "owner": owner,
+            "name": "sort",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": true,
+            "locator": {
+                "kind": "artifact",
+                "path": "fixture-source",
+                "symbol": "java.util.Collections.sort"
+            }
+        }])
     }
 
     #[test]
@@ -1844,7 +1889,7 @@ mod boundary_evidence_tests {
             JVM_PACK_JAVA_SOURCE,
             |_| jvm_config_with_source_jar(None),
         );
-        let (_, pack) = jdk_collections_pack();
+        let pack = jdk_collections_pack(serde_json::json!([]));
         activate_fixture_pack(
             &fixture,
             "fixture.jdk",
@@ -1907,7 +1952,7 @@ mod boundary_evidence_tests {
             JVM_PACK_KOTLIN_SOURCE,
             |_| jvm_config_with_source_jar(None),
         );
-        let (_, pack) = jdk_collections_pack();
+        let pack = jdk_collections_pack(serde_json::json!([]));
         activate_fixture_pack(
             &fixture,
             "fixture.jdk",
@@ -1953,6 +1998,7 @@ mod boundary_evidence_tests {
                 "vendor/impostor",
                 &type_id,
                 "java.util.Collections",
+                serde_json::json!([]),
             ),
             activation_evidence("php", "composer", "vendor/impostor"),
         );
@@ -1979,7 +2025,7 @@ mod boundary_evidence_tests {
             JVM_PACK_JAVA_SOURCE,
             |_| jvm_config_with_source_jar(None),
         );
-        let (_, pack) = jdk_collections_pack();
+        let pack = jdk_collections_pack(serde_json::json!([]));
         activate_fixture_pack(
             &fixture,
             "fixture.jdk",
@@ -2010,6 +2056,221 @@ mod boundary_evidence_tests {
         assert!(
             !unknown.is_empty() && unknown.iter().all(|row| !row.is_selected()),
             "nothing named this declaration, so nothing was selected: {unknown:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // JVM declaration-facts packs: member declarations (#1900).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_java_member_of_a_pack_declared_type_reports_external_indexed() {
+        // #1900 acceptance: no source jar, no class jar, no JDK home. The
+        // activated pack declares `java.util.Collections` *and* its `sort`
+        // member, and the whole written name `Collections.sort` reaches the
+        // member declaration from both of the sites that spell it.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_MEMBER_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &jdk_collections_pack(collections_sort_member()),
+            activation_evidence("java", "jdk", "java.base"),
+        );
+
+        // Receiver position: the caret is on `Collections`, and the reference
+        // site spans the whole `Collections.sort` spelling.
+        let (_, trace) = fixture.trace("Collections.sort");
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("java.util.Collections.sort")
+            }),
+            "the activated pack declares the `sort` member: {routes:?}"
+        );
+
+        // Member position: the caret is on `sort`, whose receiver names a type
+        // this workspace does not index. Before #1900 that was a plain
+        // unresolved-receiver miss with no route at all.
+        let (outcome, trace) = fixture.trace("sort(names)");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::UnresolvableImportBoundary,
+            "the member is declared past a boundary, not absent: {:?}",
+            outcome.diagnostics
+        );
+        let routes = external_routes(&trace);
+        assert!(
+            routes.iter().all(|(boundary, target)| {
+                *boundary == BoundaryStatus::ExternalIndexed
+                    && target.as_deref() == Some("java.util.Collections.sort")
+            }),
+            "the member caret reaches the same declaration: {routes:?}"
+        );
+
+        // The route the member named is the reference's selection, which is
+        // what lets a positive tier requirement over it conclude (#1893).
+        let selected: Vec<_> = trace
+            .candidates
+            .iter()
+            .filter(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
+            .collect();
+        assert!(
+            !selected.is_empty()
+                && selected
+                    .iter()
+                    .all(|row| row.is_selected() && row.tier == Some(PrecedenceTier::ExternalRoot)),
+            "a named external member is the selection: {selected:?}"
+        );
+
+        // Boundary honesty on the same owner: `size` is not declared, so the
+        // spelling keeps the status it had before activation even though the
+        // owner type is decided.
+        let (_, trace) = fixture.trace("Collections.size");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "a member the pack does not declare must not be upgraded: {routes:?}"
+        );
+    }
+
+    #[test]
+    fn a_member_a_pack_does_not_declare_proves_nothing_about_it() {
+        // The honesty rule #1900 names: absence of a member declaration is not
+        // a declaration of absence. This pack declares the owner type and no
+        // members at all, so every member spelling on it stays exactly as
+        // unknown as it was before activation -- and the member-position caret
+        // keeps its plain miss rather than inventing a boundary.
+        let fixture = BoundaryFixture::with_config(
+            Language::Java,
+            "app/Caller.java",
+            JVM_PACK_JAVA_MEMBER_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        activate_fixture_pack(
+            &fixture,
+            "fixture.jdk",
+            &jdk_collections_pack(serde_json::json!([])),
+            activation_evidence("java", "jdk", "java.base"),
+        );
+
+        let (_, trace) = fixture.trace("Collections.sort");
+        let routes = external_routes(&trace);
+        assert!(
+            routes
+                .iter()
+                .all(|(boundary, _)| *boundary == BoundaryStatus::ExternalUnknown),
+            "a pack with no members decides no member: {routes:?}"
+        );
+
+        let (outcome, trace) = fixture.trace("sort(names)");
+        assert_eq!(
+            outcome.status,
+            DefinitionLookupStatus::NoDefinition,
+            "an undeclared member is not a boundary crossing: {:?}",
+            outcome.diagnostics
+        );
+        assert!(
+            route_rows(&trace).is_empty(),
+            "nothing declares the member, so no route out of the workspace: {:?}",
+            trace.candidates
+        );
+    }
+
+    #[test]
+    fn the_shared_surface_answers_a_kotlin_and_a_scala_member_spelling() {
+        // Java, Kotlin and Scala share one classpath and therefore one external
+        // declaration surface, members included: a pack published for
+        // `language: java` answers a member spelling written in any of them,
+        // each resolved through its own language's import ladder for the owner.
+        //
+        // This asserts at the boundary-evidence seam rather than end to end,
+        // because neither Kotlin's nor Scala's resolver routes a
+        // receiver-position `Collections.sort` to its import-boundary gate at
+        // all: both report a plain miss (`no_indexed_definition`,
+        // `receiver_type_unknown`) with no route out of the workspace. That is
+        // a gate gap in those two resolvers, not a gap in the member surface,
+        // and Java's end-to-end tests above cover the resolver half.
+        const KOTLIN_MEMBER_SOURCE: &str = concat!(
+            "package app\n",
+            "import java.util.Collections\n",
+            "class Caller {\n",
+            "  fun order(names: MutableList<String>) { Collections.sort(names) }\n",
+            "}\n",
+        );
+        const SCALA_MEMBER_SOURCE: &str = concat!(
+            "package app\n",
+            "import java.util.Collections\n",
+            "class Caller {\n",
+            "  def order(names: java.util.List[String]): Unit = Collections.sort(names)\n",
+            "}\n",
+        );
+
+        let kotlin = BoundaryFixture::with_config(
+            Language::Kotlin,
+            "app/Caller.kt",
+            KOTLIN_MEMBER_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        activate_fixture_pack(
+            &kotlin,
+            "fixture.jdk",
+            &jdk_collections_pack(collections_sort_member()),
+            activation_evidence("java", "jdk", "java.base"),
+        );
+        let analyzer = kotlin.workspace.analyzer();
+        let evidence =
+            crate::analyzer::resolve_analyzer::<crate::analyzer::KotlinAnalyzer>(analyzer)
+                .expect("the Kotlin fixture has a Kotlin analyzer")
+                .external_boundary_evidence(
+                    analyzer.semantic_model_overlay(),
+                    &kotlin.file,
+                    "Collections.sort",
+                );
+        assert_eq!(
+            evidence,
+            (
+                BoundaryStatus::ExternalIndexed,
+                Some("java.util.Collections.sort".to_owned())
+            ),
+            "Kotlin's import ladder reaches the pack-declared member"
+        );
+
+        let scala = BoundaryFixture::with_config(
+            Language::Scala,
+            "app/Caller.scala",
+            SCALA_MEMBER_SOURCE,
+            |_| jvm_config_with_source_jar(None),
+        );
+        activate_fixture_pack(
+            &scala,
+            "fixture.jdk",
+            &jdk_collections_pack(collections_sort_member()),
+            activation_evidence("java", "jdk", "java.base"),
+        );
+        let analyzer = scala.workspace.analyzer();
+        let evidence =
+            crate::analyzer::resolve_analyzer::<crate::analyzer::ScalaAnalyzer>(analyzer)
+                .expect("the Scala fixture has a Scala analyzer")
+                .external_boundary_evidence(
+                    analyzer.semantic_model_overlay(),
+                    &scala.file,
+                    "Collections.sort",
+                );
+        assert_eq!(
+            evidence,
+            (
+                BoundaryStatus::ExternalIndexed,
+                Some("java.util.Collections.sort".to_owned())
+            ),
+            "Scala's import ladder reaches the pack-declared member"
         );
     }
 }

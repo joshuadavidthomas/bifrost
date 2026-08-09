@@ -856,8 +856,13 @@ fn resolve_java_method_invocation(
                 Some(arity),
             );
         }
-        return no_definition(
-            "unsupported_java_receiver",
+        return java_unresolved_receiver_outcome(
+            analyzer,
+            session,
+            file,
+            source,
+            object,
+            name,
             format!("receiver for Java method `{name}` is not resolved"),
         );
     }
@@ -1258,9 +1263,56 @@ fn resolve_java_field_access(
             None,
         );
     }
-    no_definition(
-        "unsupported_java_receiver",
+    java_unresolved_receiver_outcome(
+        analyzer,
+        session,
+        file,
+        source,
+        object,
+        field,
         format!("receiver for Java field `{field}` is not resolved"),
+    )
+}
+
+/// What a member reference reports when its receiver is not a type this
+/// workspace indexes.
+///
+/// A receiver whose written spelling resolves to an *external* type, on which
+/// the external declaration surface declares `member`, is a reference the
+/// workspace cannot index rather than one nothing declares. That is the import
+/// boundary the resolver actually crossed, and reporting it is what lets the
+/// trace name the external declaration the reference landed on (#1900).
+/// Anything else keeps the plain unresolved-receiver miss, so a receiver of
+/// unknown type and a member no surface declares are both unchanged.
+fn java_unresolved_receiver_outcome(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    file: &ProjectFile,
+    source: &str,
+    object: Node<'_>,
+    member: &str,
+    unresolved_message: String,
+) -> DefinitionLookupOutcome {
+    let spelling = format!("{}.{}", java_node_text(object, source), member);
+    gated_boundary(
+        || {
+            resolve_analyzer::<JavaAnalyzer>(analyzer).is_none_or(|java| {
+                session
+                    .query_optional_row(|| {
+                        java.resolve_member_name_with_external(
+                            analyzer.semantic_model_overlay(),
+                            file,
+                            &spelling,
+                        )
+                    })
+                    .is_none()
+            })
+        },
+        format!(
+            "`{spelling}` appears to cross a Java import boundary not indexed in this workspace"
+        ),
+        "unsupported_java_receiver",
+        unresolved_message,
     )
 }
 
