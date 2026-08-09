@@ -15,6 +15,7 @@
 
 pub mod codeql;
 pub mod derive;
+pub mod fixture;
 pub mod ir;
 pub mod joern;
 pub mod join;
@@ -418,7 +419,7 @@ fn derivation_report(run: &derive::DerivationRun) -> FoundryDerivationReport {
         let Some(derivation) = &entry.derivation else {
             continue;
         };
-        if derivation.completeness == ir::FoundryCompleteness::Complete {
+        if entry.completeness == ir::FoundryCompleteness::Complete {
             complete_entries += 1;
         }
         qualified_flows += derivation.qualified_flows().len() as u32;

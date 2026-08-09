@@ -390,12 +390,12 @@ fn derive_procedure(
             parameter_count: shape.parameter_count,
         },
         claim,
+        completeness,
         transfers,
         artifact: FoundryArtifactBinding::Unresolved,
         evidence: Vec::new(),
         notes: Vec::new(),
         derivation: Some(FoundryDerivation {
-            completeness,
             unproven_transfers,
             closure_procedures: closure.procedures as u32,
             boundaries: boundaries.into_iter().collect(),
@@ -421,12 +421,12 @@ fn rejected_entry(
             parameter_count: shape.parameter_count,
         },
         claim: FoundryClaim::Flows,
+        completeness: FoundryCompleteness::Partial,
         transfers: Vec::new(),
         artifact: FoundryArtifactBinding::Unresolved,
         evidence: Vec::new(),
         notes: Vec::new(),
         derivation: Some(FoundryDerivation {
-            completeness: FoundryCompleteness::Partial,
             unproven_transfers: 0,
             closure_procedures: closure_procedures as u32,
             boundaries: boundaries.into_iter().collect(),
@@ -1091,7 +1091,7 @@ mod tests {
             "boundaries: {:?}",
             derivation.boundaries
         );
-        assert_eq!(derivation.completeness, FoundryCompleteness::Partial);
+        assert_eq!(entry.completeness, FoundryCompleteness::Partial);
         assert_eq!(entry.claim, FoundryClaim::Flows);
     }
 
@@ -1124,7 +1124,7 @@ mod tests {
         // `no_flow` claim here would be a silent false negative.
         assert!(entry.transfers.is_empty());
         assert_eq!(entry.claim, FoundryClaim::Flows);
-        assert_eq!(derivation.completeness, FoundryCompleteness::Partial);
+        assert_eq!(entry.completeness, FoundryCompleteness::Partial);
         assert!(
             derivation
                 .boundaries

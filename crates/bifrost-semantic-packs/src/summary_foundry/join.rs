@@ -342,9 +342,8 @@ mod tests {
 
     use super::*;
     use crate::summary_foundry::ir::{
-        FoundryAccessPath, FoundryCompleteness, FoundryDerivation, FoundryDerivationBoundary,
-        FoundryEntryBuilder, FoundryFineGrainedTransfer, FoundrySelector, FoundrySignature,
-        FoundryTarget,
+        FoundryAccessPath, FoundryDerivation, FoundryDerivationBoundary, FoundryEntryBuilder,
+        FoundryFineGrainedTransfer, FoundrySelector, FoundrySignature, FoundryTarget,
     };
 
     fn target(member: &str, types: &[&str]) -> FoundryTarget {
@@ -376,7 +375,6 @@ mod tests {
     fn derived_entry_with_element_granularity(member: &str, types: &[&str]) -> FoundryEntry {
         let mut entry = entry(FoundryCorpus::Derived, member, types, true);
         entry.derivation = Some(FoundryDerivation {
-            completeness: FoundryCompleteness::Partial,
             unproven_transfers: 0,
             closure_procedures: 1,
             boundaries: vec![FoundryDerivationBoundary::UnresolvedCall],
