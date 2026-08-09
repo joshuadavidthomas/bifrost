@@ -1594,7 +1594,11 @@ fn body_similarity(a: &[String], b: &[String]) -> f64 {
     let total = a.len() + b.len();
     let intersection = (total as i32 - symmetric_difference) as f64 / 2.0;
     let union = total as f64 - intersection;
-    if union == 0.0 { 0.0 } else { intersection / union }
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
 }
 
 /// Whether a paired symbol's line change is fully explained by edits ELSEWHERE
@@ -2052,7 +2056,12 @@ mod tests {
         }
     }
 
-    fn snapshot(fqn: &str, name: &str, path: &str, token_sig: Option<Vec<String>>) -> SymbolSnapshot {
+    fn snapshot(
+        fqn: &str,
+        name: &str,
+        path: &str,
+        token_sig: Option<Vec<String>>,
+    ) -> SymbolSnapshot {
         SymbolSnapshot {
             key: SymbolKey {
                 fqn: fqn.to_string(),
@@ -2128,8 +2137,14 @@ mod tests {
 
         // Reindented into a deeper scope with a blank line: whitespace is
         // dropped, so the score is unaffected.
-        let reindented = format!("\n        {}", accumulate_body("sum_all", "sum").replace('\n', "\n        "));
-        assert_eq!(similarity("compute_total", &foo, "sum_all", &reindented), 1.0);
+        let reindented = format!(
+            "\n        {}",
+            accumulate_body("sum_all", "sum").replace('\n', "\n        ")
+        );
+        assert_eq!(
+            similarity("compute_total", &foo, "sum_all", &reindented),
+            1.0
+        );
 
         // Move + rename + an internal variable rename (sum -> total): still well
         // above the pairing threshold.
@@ -2141,8 +2156,7 @@ mod tests {
         );
 
         // Unrelated function: must fall well below the threshold.
-        let unrelated =
-            "pub fn greet(name: &str) -> String {\n    let mut out = String::new();\n    out.push_str(name);\n    out.push('!');\n    out\n}\n";
+        let unrelated = "pub fn greet(name: &str) -> String {\n    let mut out = String::new();\n    out.push_str(name);\n    out.push('!');\n    out\n}\n";
         let score = similarity("compute_total", &foo, "greet", unrelated);
         assert!(
             score < BODY_MOVE_SIMILARITY_THRESHOLD,
@@ -2156,7 +2170,10 @@ mod tests {
         let n = src.lines().count();
         assert!(body_token_signature(&src, "f", 1, n).is_some());
         // One non-blank line is too weak a fingerprint.
-        assert_eq!(body_token_signature("pub fn f() { done() }\n", "f", 1, 1), None);
+        assert_eq!(
+            body_token_signature("pub fn f() { done() }\n", "f", 1, 1),
+            None
+        );
         // Degenerate ranges are rejected, not panicked on.
         assert_eq!(body_token_signature(&src, "f", 0, n), None);
         assert_eq!(body_token_signature(&src, "f", 5, 1), None);
@@ -2176,7 +2193,12 @@ mod tests {
         // compute_total moved a.rs -> b.rs, renamed sum_all, accumulator renamed.
         let before = BTreeMap::from([
             {
-                let s = snap_src("a::compute_total", "compute_total", "src/a.rs", &accumulate_body("compute_total", "sum"));
+                let s = snap_src(
+                    "a::compute_total",
+                    "compute_total",
+                    "src/a.rs",
+                    &accumulate_body("compute_total", "sum"),
+                );
                 (s.key.clone(), s)
             },
             {
@@ -2187,7 +2209,12 @@ mod tests {
             },
         ]);
         let after = BTreeMap::from([{
-            let s = snap_src("b::sum_all", "sum_all", "src/b.rs", &accumulate_body("sum_all", "total"));
+            let s = snap_src(
+                "b::sum_all",
+                "sum_all",
+                "src/b.rs",
+                &accumulate_body("sum_all", "total"),
+            );
             (s.key.clone(), s)
         }]);
 
@@ -2205,7 +2232,12 @@ mod tests {
         // rather than cross-pair. Give b a clearly-better match than a.
         let before = BTreeMap::from([
             {
-                let s = snap_src("a::compute_total", "compute_total", "src/a.rs", &accumulate_body("compute_total", "sum"));
+                let s = snap_src(
+                    "a::compute_total",
+                    "compute_total",
+                    "src/a.rs",
+                    &accumulate_body("compute_total", "sum"),
+                );
                 (s.key.clone(), s)
             },
             {
@@ -2216,7 +2248,12 @@ mod tests {
         ]);
         let after = BTreeMap::from([
             {
-                let s = snap_src("b::sum_all", "sum_all", "src/b.rs", &accumulate_body("sum_all", "total"));
+                let s = snap_src(
+                    "b::sum_all",
+                    "sum_all",
+                    "src/b.rs",
+                    &accumulate_body("sum_all", "total"),
+                );
                 (s.key.clone(), s)
             },
             {
