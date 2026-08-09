@@ -196,10 +196,10 @@
     "artifact": "org.owasp.encoder:encoder:1.4.0",
     "sanitized_input": {"kind": "parameter", "ordinal": 0},
     "output": {"kind": "normal_return"},
-    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "shell", "sql", "url", "xml", "xpath"],
-    "does_not_neutralize": ["path"],
+    "neutralizes": ["css", "html", "html_attr", "js", "log", "url", "xml"],
+    "does_not_neutralize": ["ldap", "path", "shell", "sql", "xpath"],
     "completeness": "complete",
-    "rationale": "The method UTF-8 percent-encodes every character outside the RFC 3986 unreserved set [A-Za-z0-9-._~], so the output can contain no URL delimiter, quote, angle bracket, ampersand, parenthesis, backslash, whitespace, or control character; the value cannot break out of a URI component or out of any quoted or delimited context in the neutralized list, which matches the javadoc note that the output is safe in HTML/XML, CSS, and JavaScript containing contexts. The only gap is path: '..' sequences survive unchanged, so the value can still express parent-directory traversal. Percent-decoding the value at a downstream component restores the original bytes; decode points are taint-restoring.",
+    "rationale": "The method UTF-8 percent-encodes every character outside the RFC 3986 unreserved set [A-Za-z0-9-._~], so the output can contain no URL delimiter, quote, angle bracket, ampersand, parenthesis, backslash, whitespace, or control character; the value cannot break out of a URI component or of a quoted markup, script-string, or CSS-string context, which matches the javadoc note that the output is safe in HTML/XML, CSS, and JavaScript containing contexts. The method is nevertheless not an injection sanitizer for sql, shell, ldap, or xpath: percent-encoding removes delimiter characters but leaves grammar-level metacharacters live. Every %XX escape emits a literal '%' and '_' survives, both SQL LIKE wildcards; '~' and a leading '-' survive as shell home-directory and option expansions; and the encoding does nothing about the wildcard and operator semantics of LDAP filters and XPath expressions. The path gap also remains: '..' sequences survive unchanged, so the value can still express parent-directory traversal. Percent-decoding the value at a downstream component restores the original bytes; decode points are taint-restoring.",
     "confidence": "high",
     "citations": "Javadoc of org.owasp.encoder.Encode.forUriComponent (encoder 1.4.0): lists the unencoded characters as exactly the unreserved set, and states \"this method is safe to be used in most containing contexts, including: HTML/XML, CSS, and JavaScript contexts.\" RFC 3986 section 2.3 for the unreserved set."
   },

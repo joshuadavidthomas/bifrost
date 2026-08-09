@@ -179,10 +179,10 @@
     "artifact": "org.owasp.esapi:esapi:2.7.0.0",
     "sanitized_input": {"kind": "parameter", "ordinal": 0},
     "output": {"kind": "normal_return"},
-    "neutralizes": ["css", "html", "html_attr", "js", "ldap", "log", "sql", "url", "xml", "xpath"],
-    "does_not_neutralize": ["path", "shell"],
+    "neutralizes": ["css", "html", "html_attr", "js", "log", "url", "xml"],
+    "does_not_neutralize": ["ldap", "path", "shell", "sql", "xpath"],
     "completeness": "partial",
-    "rationale": "The reference implementation delegates to java.net.URLEncoder, so the output alphabet is the alphanumerics plus '.', '-', '*', '_' and '+', with every other byte rendered as %XX; no quote, angle bracket, ampersand, parenthesis, backslash, control character, or URL delimiter can appear in the output. It is unsafe for shell because '*' survives and expands as a glob in unquoted use, and unsafe for path because '..' sequences survive unchanged. The form-urlencoded space-as-'+' rule makes the output semantically wrong (though injection-safe) in URL path segments, and the method throws EncodingException when the configured encoding fails.",
+    "rationale": "The reference implementation delegates to java.net.URLEncoder, so the output alphabet is the alphanumerics plus '.', '-', '*', '_' and '+', with every other byte rendered as %XX; the value cannot break out of a quoted markup attribute, a markup element, a quoted script string, or a URL component, and no control characters survive. The method is not an injection sanitizer for sql, shell, ldap, or xpath: percent-encoding removes the delimiter characters of those grammars but leaves their content metacharacters live. Every %XX escape emits a literal '%' and '_' passes through, both wildcards in SQL LIKE; '*' passes through as an LDAP wildcard and a shell glob, and a leading '-' passes through as a shell option prefix; '-' is also an XPath operator. It is unsafe for path because '..' sequences survive unchanged. The form-urlencoded space-as-'+' rule makes the output semantically wrong (though injection-safe) in URL path segments, and the method throws EncodingException when the configured encoding fails.",
     "confidence": "high",
     "citations": "Javadoc of org.owasp.esapi.Encoder.encodeForURL (esapi 2.7.0.0): \"performs URL encoding on the entire string\"; DefaultEncoder delegates to java.net.URLEncoder, whose javadoc fixes the output alphabet. Output-alphabet reasoning against RFC 3986 section 2."
   },
