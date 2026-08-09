@@ -195,6 +195,13 @@ impl TaintFindingReport {
         self.result.is_complete() && !self.collection_truncated
     }
 
+    /// Whether the run concludes precisely only because authored-complete
+    /// external procedure summaries closed every open boundary (#1916). A
+    /// truncated collection is a real gap, so it never earns this state.
+    pub fn is_proven_by_authored_summaries(&self) -> bool {
+        self.result.is_proven_by_authored_summaries() && !self.collection_truncated
+    }
+
     pub const fn omitted_findings_lower_bound(&self) -> usize {
         self.omitted_findings_lower_bound
     }

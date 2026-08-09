@@ -409,6 +409,85 @@ mod tests {
             .expect("canonical report")
     }
 
+    fn report_with_run_completion(completion: PolicyRunCompletion) -> PolicyReportDocument {
+        use crate::{PolicyAnalysisType, PolicyRun, PolicyWorkReport};
+
+        let catalogs = Arc::new(TaintCatalogRegistry::new_without_workspace(
+            CatalogRegistryLimits::default(),
+        ));
+        let mut registry =
+            PolicyRegistry::new_without_workspace(catalogs, PolicyRegistryLimits::default());
+        registry
+            .register_policy_bytes(
+                PolicySourceIdentity::new("test:render-completion"),
+                MATCHING_POLICY.as_bytes(),
+            )
+            .expect("valid policy");
+        let policy = registry.policies().next().expect("one policy");
+        let descriptor = PolicyRuleDescriptor::from_loaded(policy);
+        let run = PolicyRun::try_new(
+            policy.definition().metadata.id.clone(),
+            policy.semantic_hash(),
+            PolicyAnalysisType::Match,
+            completion,
+            Vec::new(),
+            Vec::new(),
+            false,
+            PolicyWorkReport::default(),
+            &PolicyBudget::default(),
+        )
+        .expect("synthetic run");
+        PolicyReportDocument::try_new(vec![descriptor], vec![run], Vec::new(), false, 0, None)
+            .expect("canonical report")
+    }
+
+    /// The `ProvenBySummary` tier (#1916) must stay distinct and visible in both
+    /// renderers, never collapsed into `complete`.
+    #[test]
+    fn issue_1916_proven_by_summary_renders_distinctly_in_human_and_sarif() {
+        let report = report_with_run_completion(PolicyRunCompletion::ProvenBySummary);
+
+        let mut human = Vec::new();
+        write_policy_human(
+            &report,
+            &HumanRenderOptions::default(),
+            &mut human,
+            usize::MAX,
+        )
+        .unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(
+            human.contains("proven by summary (precise via authored models, not exhaustive"),
+            "the per-run line must name the tier:\n{human}"
+        );
+        assert!(
+            human.contains("proven-by-summary (authored models) policy run"),
+            "the run summary must count the tier distinctly:\n{human}"
+        );
+        assert!(
+            !human.contains("complete policy run"),
+            "a summary-backed run must not be counted as complete:\n{human}"
+        );
+
+        let mut sarif = Vec::new();
+        write_policy_sarif(
+            &report,
+            &SarifToolIdentity::default(),
+            &mut sarif,
+            usize::MAX,
+        )
+        .unwrap();
+        let sarif = String::from_utf8(sarif).unwrap();
+        assert!(
+            sarif.contains("BIFROST_POLICY_PROVEN_BY_SUMMARY"),
+            "SARIF must emit a distinct completion notification:\n{sarif}"
+        );
+        assert!(
+            sarif.contains("\"executionSuccessful\":true"),
+            "a reliable summary-backed run reports a successful invocation:\n{sarif}"
+        );
+    }
+
     fn diagnostic_report(source: &str) -> PolicyReportDocument {
         let diagnostic = PolicyReportDiagnostic::try_new(
             PolicyReportDiagnosticCode::PolicyLoadFailed,

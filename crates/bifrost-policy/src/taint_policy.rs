@@ -1231,9 +1231,20 @@ fn solve_and_project_batch(
             u64::try_from(batch.projections().len().saturating_sub(1)).unwrap_or(u64::MAX),
         )?;
         if !retained.report().is_complete() {
-            payload.completion =
-                PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
-                    .map_err(|error| error.to_string())?;
+            if retained.report().is_proven_by_authored_summaries() {
+                // The run terminates precisely, but every open boundary was
+                // closed by an authored-complete external summary, not by
+                // derived proof (#1916). Only lower `Complete` to this tier;
+                // never lift a genuine `Inconclusive` from an earlier batch.
+                if matches!(payload.completion, PolicyRunCompletion::Complete) {
+                    payload.completion = PolicyRunCompletion::ProvenBySummary;
+                }
+            } else {
+                payload.completion = PolicyRunCompletion::inconclusive(vec![
+                    PolicyIncompleteReason::PartialDiscovery,
+                ])
+                .map_err(|error| error.to_string())?;
+            }
         }
     }
     let policy_projection_elapsed = policy_projection_started.elapsed();
