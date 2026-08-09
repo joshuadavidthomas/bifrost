@@ -57,7 +57,7 @@ A **pin** is a test that fails before a fix and passes after it. When this plan 
 - [x] (2026-08-09) Phase 2 Step 2a -- Cargo routes composed from per-blob module-route rows. `RustCargoRouteIndex::build_while` takes plain fact data instead of a `prepared_syntax` closure and a `parallel` flag; `RustAnalyzer::rust_module_route_facts` is the one batched store read that feeds it.
 - [x] (2026-08-09) Phase 2 Step 2b -- the read path. `usage.rs`, `usage_walks.rs`, `usage_queries.rs` and a new `cache.rs` in `crates/bifrost-rust/src/`, over the new `RustFactSource` trait; `fact_catch_up.rs` in `crates/bifrost-analysis/src/analyzer/rust/`. The ninth parked test is restored in `workspace.rs`.
 - [x] (2026-08-09) Phase 2 Step 3 -- include-expansion routes on the v2 substrate. Migration 0020 adds `rust_include_edges` and `rust_include_host_bindings`; `crates/bifrost-rust/src/usage_includes.rs` composes routes backwards from those rows. Dave's four regression suites pass against the rebuilt routes.
-- [ ] Phase 2 Step 4: delete `RustUsageIndex`. **STOPPED, owner decision needed.** The rewiring itself is done and compiles; swapping the resolvers from the v1 free functions to the v2 ones loses upstream's post-merge-base inverse import shadow resolution and turns eleven green tests red. See "Step 4: the stop" below. The attempt is parked at `.agents/phase2/step4-delete-usage-index/step4-attempt.patch`.
+- [x] (2026-08-09) Phase 2 Step 4 -- `RustUsageIndex` deleted. The parked rewiring patch was rebased onto the post-merge tree, and the four bodies of upstream-only capability the eleven red tests actually needed were ported onto the v2 substrate. Migration 0021 adds `rust_import_targets.cfg_condition` and `.is_extern_crate`; `CURRENT_MIGRATION_VERSION` is 21. See "Step 4: the stop, and what resolved it" below.
 
 ## Surprises & Discoveries
 
@@ -783,7 +783,11 @@ surface is `crates/bifrost-rust/src/graph/resolver.rs` (47 references),
 `crates/bifrost-analysis/src/analyzer/rust/{mod,usage_index,hierarchy}.rs`.
 Then remove `.agents/phase2/rust-usage-v2/` and update the tables above.
 
-### Step 4: the stop
+### Step 4: the stop, and what resolved it
+
+The stop below is preserved as written, because its diagnosis was only half
+right and the correction is the useful record. What actually resolved it is in
+"Step 4, as landed" after it.
 
 Step 4 was described above as a rewiring surface: point the resolvers at the v2
 free functions, drop the trait method that hands out the index, delete the two
@@ -875,6 +879,83 @@ assertion is the `extern crate dep as tk` alias, and the sibling failure
 shared cause is alias resolution rather than the include walk. That is
 consistent with the `46e7bf58` diagnosis and is not evidence against the include
 rebuild, but it is not proof for it either. Step 4 is what would settle it.
+
+### Step 4, as landed
+
+The eleven were not one gap. They were four, in three upstream commits, and
+only two of the eleven belonged to the commit the stop named.
+
+The stop's own "cheapest first lead" was the thread that unpicked it. The two
+`#[path]` bench tests were traced with a print at the top of
+`usage_reference_at`: it was never called for `common::report_failures()`,
+because `path_root_shadowed("common")` was true, because
+`usage_local_module_prefix_visible_at` said no, because
+`walks.resolve_segments` returned no route for `common` at all. The reason is
+not shadow resolution. Upstream's `9a7ff50c` added a second candidate to module
+resolution -- the same name re-spelled under the target KIND root, where the
+modules a bench shares with its sibling benches live -- and v2 did not have it.
+Porting `kind_root_alternative` turned three of the eleven green in one change,
+before any of `46e7bf58` was touched.
+
+The four capability bodies, and where each came from:
+
+| Capability | Upstream commit | Ledger tests it owned |
+| --- | --- | --- |
+| Kind-root alternative module route | `9a7ff50c` | the two `#[path]` tests, `rust_bench_targets_own_their_crate_root_and_still_share_helper_modules` |
+| Inverse import shadow resolution | `46e7bf58` | the two `issue_1377` tests |
+| Target-root domain widening + crate-root package re-spelling | `649bebcb` | `generated_super_imports_are_inverse_hits`, `nested_bench_group_imports_are_inverse_hits_for_private_items`, `function_local_namespace_import_resolves_nested_type_without_cross_scope_fallback` |
+| Extern-crate alias scoping (+ ancestor-scoped alias lookup) | `649bebcb` | `extern_crate_alias_stays_namespace_scoped`, `cfg_test_external_crate_alias_imports_are_inverse_hits`, `included_file_inherits_host_extern_crate_alias` |
+
+Only the second is what the stop named, and `usage_reference_at`'s 0.18 text
+similarity turned out to overstate the semantic distance: the shadow-resolution
+port is about ninety lines, not a step-3-sized rebuild.
+
+Nothing here materializes workspace state. `visible_namespace_module_routes`
+reads the reference file's own tree and resolves candidates through the store's
+indexed short-name lookup plus per-candidate verification, the same
+candidate-then-verify discipline step 3 used. `declaration_cfg_conditions` is
+derived in `rust_declaration_facts`, which already opens the declaring file's
+tree, and is memoized with the rest of that per-file product. The kind-root
+alternative and the ancestor alias walk are extra probes inside the existing
+memoized `resolve_segments`.
+
+Two data items were genuinely per-blob and became columns, in migration 0021
+(`CURRENT_MIGRATION_VERSION` 21, detector salt token
+`import-cfg-and-extern-crate-2026-08`):
+
+  - `rust_import_targets.cfg_condition`, the `#[cfg(...)]` predicate on the
+    `use`, reduced to `always` / `atom X` / `not X` / `unknown` -- only the
+    shapes a disjointness proof can use. `RustCfgCondition` moved to
+    `bifrost-core`'s `rust_facts` with the other persisted fact value types and
+    is re-exported from `lexical_scope`, on the `RustVisibility` precedent.
+  - `rust_import_targets.is_extern_crate`. `extern crate dep as tk;` and
+    `use dep as tk;` are identical in every other stored column and are not the
+    same binding: the first binds only the crate namespace. Without the column
+    `tk::Item` also reached a same-named local `mod dep`.
+
+Declaration cfg conditions needed no column, and no other stored shape changed.
+
+One plain defect surfaced on the way and is fixed: `usage_reference_at` tested a
+path root against `"analyzer"` where it meant `"self"`, a string literal caught
+by the receiver rename when the walks were ported in step 2b.
+
+Acceptance, in the working tree:
+
+    cargo nextest run --workspace --all-targets --no-fail-fast
+      Summary [284.556s] 9922 tests run: 9921 passed (2 slow), 1 failed, 42 skipped
+
+The one failure is `code_query_resolution_conformance::an_unindexed_declared_
+dependency_is_a_boundary_row_rather_than_an_empty_answer`, which is in the
+tolerated baseline. The other baseline name,
+`java_artifact::tests::source_and_class_jars_share_declaration_ids_and_keep_
+distinct_origins`, now passes, alone and in the full run. All four of Dave's
+acceptance suites and all eleven ledger tests are green with `RustUsageIndex`
+deleted.
+
+    cargo fmt                                                       -> clean
+    cargo test --workspace --doc                                    -> ok
+    scripts/with-isolated-cargo-target.sh cargo clippy \
+        --workspace --all-targets --all-features -- -D warnings     -> clean
 
 ## Validation and Acceptance
 
