@@ -748,11 +748,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 .unwrap_or_default();
             let type_parameters = definition
                 .child_by_field_name("type_parameters")
-                .map(|parameters| {
-                    named_children(parameters)
-                        .filter_map(|node| node_identifier(Some(node), self.source))
-                        .collect()
-                })
+                .map(|list| type_parameter_names(list, self.source))
                 .unwrap_or_default();
             self.push_type(
                 qualified.clone(),
@@ -866,14 +862,29 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         }
     }
 
+    /// A PEP 695 `type Alias[T] = ...` statement spells its declared name in
+    /// the `left` field, not a `name` field, and wraps it in a `type` node.
+    /// Reading that wrapper is what makes the alias exist in the pack at all.
     fn visit_type_alias(&mut self, node: Node<'_>, owner: &str) {
-        let Some(name) = node_identifier(node.child_by_field_name("name"), self.source) else {
+        let Some(left) = node.child_by_field_name("left") else {
             return;
         };
+        let Some(name) = type_name(left, self.source) else {
+            return;
+        };
+        // The statement has no `type_parameters` field: an alias spells its
+        // list inside its declared name, as `Alias[T]`.
+        let type_parameters = named_children(left)
+            .find(|child| child.kind() == "generic_type")
+            .and_then(|generic| {
+                named_children(generic).find(|child| child.kind() == "type_parameter")
+            })
+            .map(|list| type_parameter_names(list, self.source))
+            .unwrap_or_default();
         self.push_type(
             format!("{owner}.{name}"),
             TypeKind::TypeAlias,
-            Vec::new(),
+            type_parameters,
             Vec::new(),
         );
     }
@@ -1037,34 +1048,39 @@ fn is_type_alias_annotation(node: Node<'_>, source: &str) -> bool {
     false
 }
 
+/// Read one function's declared signature.
+///
+/// The grammar spells a parameter's binding name as a plain child rather than
+/// a `name` field on `typed_parameter` and on the two splat patterns, so the
+/// binding is read through the shared parameter-label reader that every other
+/// Python surface already uses. A parameter that reads its name from a
+/// missing field loses it silently, and an annotated parameter that loses its
+/// annotation makes two overloads of one name indistinguishable.
 fn function_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<Signature> {
     let parameters = node.child_by_field_name("parameters")?;
     let parameters = named_children(parameters)
         .filter_map(|parameter| {
-            let (name, annotation, optional, variadic) = match parameter.kind() {
-                "identifier" => (node_identifier(Some(parameter), source), None, false, false),
+            let (annotation, optional, variadic) = match parameter.kind() {
+                "identifier" => (None, false, false),
                 "typed_parameter" => (
-                    node_identifier(parameter.child_by_field_name("name"), source),
                     parameter.child_by_field_name("type"),
                     false,
-                    false,
+                    named_children(parameter).any(|child| {
+                        matches!(
+                            child.kind(),
+                            "list_splat_pattern" | "dictionary_splat_pattern"
+                        )
+                    }),
                 ),
-                "default_parameter" | "typed_default_parameter" => (
-                    node_identifier(parameter.child_by_field_name("name"), source),
-                    parameter.child_by_field_name("type"),
-                    true,
-                    false,
-                ),
-                "list_splat_pattern" | "dictionary_splat_pattern" => (
-                    node_identifier(parameter.child_by_field_name("name"), source),
-                    parameter.child_by_field_name("type"),
-                    false,
-                    true,
-                ),
+                "default_parameter" | "typed_default_parameter" => {
+                    (parameter.child_by_field_name("type"), true, false)
+                }
+                "list_splat_pattern" | "dictionary_splat_pattern" => (None, false, true),
                 _ => return None,
             };
             Some(Parameter {
-                name,
+                name: brokk_bifrost_python::declarations::python_parameter_label_node(parameter)
+                    .and_then(|label| node_identifier(Some(label), source)),
                 r#type: annotation
                     .map(|annotation| type_ref(annotation, source, max_depth))
                     .unwrap_or_else(any_type),
@@ -1076,11 +1092,7 @@ fn function_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
     Some(Signature {
         type_parameters: node
             .child_by_field_name("type_parameters")
-            .map(|parameters| {
-                named_children(parameters)
-                    .filter_map(|parameter| node_identifier(Some(parameter), source))
-                    .collect()
-            })
+            .map(|list| type_parameter_names(list, source))
             .unwrap_or_default(),
         parameters,
         returns: node
@@ -1089,18 +1101,45 @@ fn function_signature(node: Node<'_>, source: &str, max_depth: usize) -> Option<
     })
 }
 
+/// The names a PEP 695 `[T, S]` type-parameter list declares.
+///
+/// Every entry is a `type` node, so a declared parameter name comes from the
+/// same reader as any other annotation.
+fn type_parameter_names(list: Node<'_>, source: &str) -> Vec<String> {
+    named_children(list)
+        .filter_map(|parameter| type_name(parameter, source))
+        .collect()
+}
+
+/// Read one type reference.
+///
+/// Two spellings reach this function. A base-class list or an assignment
+/// annotation is an ordinary expression, so `os.PathLike` is an `attribute`
+/// and `list[int]` is a `subscript`. A parameter, return, or alias
+/// annotation is wrapped in a `type` node and uses the grammar's
+/// annotation-only kinds instead, so the same two shapes arrive as
+/// `member_type` and `generic_type`. Handling only the expression spelling
+/// degrades every annotated parameter and return to `Any`, which erases the
+/// difference between two overloads of one name.
 fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
     if max_depth == 0 {
         return any_type();
     }
     match node.kind() {
+        // An annotation wraps its shape in one `type` node. A PEP 695 bound
+        // and a `*Ts` unpack wrap the constrained or unpacked type the same
+        // way, and the shape is the first named child in each case.
+        "type" | "constrained_type" | "splat_type" => node
+            .named_child(0)
+            .map(|inner| type_ref(inner, source, max_depth - 1))
+            .unwrap_or_else(any_type),
         "identifier" => TypeRef::Named {
             name: node_identifier(Some(node), source).unwrap_or_else(|| "Any".to_owned()),
             arguments: Vec::new(),
             nullable: false,
         },
-        "attribute" => TypeRef::Named {
-            name: attribute_name(node, source).unwrap_or_else(|| "Any".to_owned()),
+        "attribute" | "member_type" => TypeRef::Named {
+            name: type_name(node, source).unwrap_or_else(|| "Any".to_owned()),
             arguments: Vec::new(),
             nullable: false,
         },
@@ -1129,6 +1168,26 @@ fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
                 _ => any_type(),
             }
         }
+        // `list[int]` in an annotation: the generic name comes first and the
+        // bracketed arguments follow as one `type_parameter` list.
+        "generic_type" => {
+            let mut children = named_children(node);
+            let name = children
+                .next()
+                .map(|name| type_ref(name, source, max_depth - 1));
+            let arguments = children
+                .flat_map(named_children)
+                .map(|argument| type_ref(argument, source, max_depth - 1))
+                .collect();
+            match name {
+                Some(TypeRef::Named { name, .. }) => TypeRef::Named {
+                    name,
+                    arguments,
+                    nullable: false,
+                },
+                _ => any_type(),
+            }
+        }
         "union_type" => TypeRef::Named {
             name: "Union".to_owned(),
             arguments: named_children(node)
@@ -1145,16 +1204,43 @@ fn type_ref(node: Node<'_>, source: &str, max_depth: usize) -> TypeRef {
     }
 }
 
-fn attribute_name(node: Node<'_>, source: &str) -> Option<String> {
-    let object = node.child_by_field_name("object")?;
-    let attribute = node.child_by_field_name("attribute")?;
-    let object = match object.kind() {
-        "identifier" => node_identifier(Some(object), source),
-        "attribute" => attribute_name(object, source),
-        _ => None,
-    }?;
-    let attribute = node_identifier(Some(attribute), source)?;
-    Some(format!("{object}.{attribute}"))
+/// The dotted name a type reference spells, e.g. `int`, `os.PathLike`, or
+/// the `list` of `list[int]`.
+///
+/// The walk is iterative because an annotation nests its qualifier on the
+/// left: `a.b.c` is `member_type(member_type(a, b), c)`.
+fn type_name(node: Node<'_>, source: &str) -> Option<String> {
+    let mut segments = Vec::new();
+    let mut current = node;
+    loop {
+        match current.kind() {
+            "identifier" => {
+                segments.push(node_identifier(Some(current), source)?);
+                break;
+            }
+            // One wrapper around the shape, and the generic name of a
+            // subscripted annotation, are both the first named child.
+            "type" | "generic_type" => current = current.named_child(0)?,
+            "attribute" => {
+                segments.push(node_identifier(
+                    current.child_by_field_name("attribute"),
+                    source,
+                )?);
+                current = current.child_by_field_name("object")?;
+            }
+            // `member_type` carries no fields: its children are the
+            // qualifying type and the member identifier, in that order.
+            "member_type" => {
+                let mut children = named_children(current);
+                let qualifier = children.next()?;
+                segments.push(node_identifier(children.next(), source)?);
+                current = qualifier;
+            }
+            _ => return None,
+        }
+    }
+    segments.reverse();
+    Some(segments.join("."))
 }
 
 fn any_type() -> TypeRef {
