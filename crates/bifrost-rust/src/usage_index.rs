@@ -2319,6 +2319,7 @@ fn rust_include_edges(file: &ProjectFile, root: Node<'_>, source: &str) -> Vec<R
     edges
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_include_routes(
     rust: &dyn RustSource,
     files: &[ProjectFile],
