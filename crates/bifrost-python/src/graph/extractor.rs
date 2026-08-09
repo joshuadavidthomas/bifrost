@@ -2633,8 +2633,7 @@ fn push_factory_index_children<'tree>(
 
 fn factory_return_type(function: Node<'_>, source: &str) -> Option<String> {
     if let Some(return_type) = function.child_by_field_name("return_type") {
-        let raw = slice(return_type, source).trim();
-        return normalized_receiver_type(raw);
+        return receiver_type_from_annotation_node(return_type, source);
     }
 
     let body = function.child_by_field_name("body")?;
@@ -2669,6 +2668,56 @@ fn factory_return_type(function: Node<'_>, source: &str) -> Option<String> {
     (candidates.len() == 1)
         .then(|| candidates.into_iter().next())
         .flatten()
+}
+
+/// Return the runtime class named by a structured Python return annotation.
+///
+/// For `Manager[A, B]`, the constructed class is the subscript base `Manager`.
+/// `Optional[T]` is different: it denotes `T | None`, so retain the existing
+/// supported-wrapper behavior and inspect its structured type argument.
+fn receiver_type_from_annotation_node(annotation: Node<'_>, source: &str) -> Option<String> {
+    match annotation.kind() {
+        "type" => receiver_type_from_annotation_node(annotation.named_child(0)?, source),
+        "identifier" | "attribute" | "member_type" | "string" => {
+            normalized_receiver_type(slice(annotation, source).trim())
+        }
+        "generic_type" => {
+            let base = annotation.named_child(0)?;
+            if optional_annotation_wrapper(base, source) {
+                let parameter = annotation.named_child(1)?;
+                return receiver_type_from_annotation_node(parameter.named_child(0)?, source);
+            }
+            receiver_type_from_annotation_node(base, source)
+        }
+        "subscript" => {
+            let value = annotation.child_by_field_name("value")?;
+            if optional_annotation_wrapper(value, source) {
+                let inner = annotation.child_by_field_name("subscript")?;
+                return receiver_type_from_annotation_node(inner, source);
+            }
+            normalized_receiver_type(slice(value, source).trim())
+        }
+        _ => None,
+    }
+}
+
+fn optional_annotation_wrapper(node: Node<'_>, source: &str) -> bool {
+    match node.kind() {
+        "identifier" => slice(node, source) == "Optional",
+        "attribute" => {
+            let (Some(object), Some(attribute)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("attribute"),
+            ) else {
+                return false;
+            };
+            object.kind() == "identifier"
+                && attribute.kind() == "identifier"
+                && slice(object, source) == "typing"
+                && slice(attribute, source) == "Optional"
+        }
+        _ => false,
+    }
 }
 
 fn returned_receiver_type(node: Node<'_>, source: &str) -> Option<String> {

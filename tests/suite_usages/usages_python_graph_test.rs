@@ -143,6 +143,49 @@ fn call_result_receiver_resolves_member_usage() {
 }
 
 #[test]
+fn same_class_method_return_receiver_resolves_member_usage() {
+    let source = r#"from __future__ import annotations
+
+class Manager:
+    def as_frame(self):
+        return object()
+
+    def apply(self) -> Manager[int, str]:
+        return self
+
+    def other(self) -> Other:
+        return Other()
+
+    def render(self):
+        return self.apply().as_frame(), self.other().as_frame()
+
+class Other:
+    def as_frame(self):
+        return object()
+"#;
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("manager.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "manager.Manager.as_frame");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve a same-class method return receiver");
+
+    assert_eq!(hits.len(), 1, "{hits:#?}");
+    let (expected_start, _) = nth_occurrence_range(source, "as_frame()", 0);
+    let expected = (expected_start, expected_start + "as_frame".len());
+    assert!(
+        hits.iter()
+            .any(|hit| (hit.start_offset, hit.end_offset) == expected),
+        "{hits:#?}"
+    );
+}
+
+#[test]
 fn shadowed_bare_factory_does_not_resolve_member_usage() {
     assert_no_python_member_hit(
         "class Foo:\n    bar: int\n\ndef build() -> Foo:\n    return Foo()\n",
