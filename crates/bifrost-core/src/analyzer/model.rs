@@ -1814,9 +1814,10 @@ fn intern_project_root(root: PathBuf) -> Arc<Path> {
 /// path followed by the relative path, fed to one hasher.
 ///
 /// Fixed-seed `FxHasher` rather than the caller's hasher, because the point is
-/// to compute this once at construction. The value is process-independent, but
-/// nothing persists or transmits it: `Hash for ProjectFile` only ever feeds
-/// in-memory `HashMap` / `HashSet` / `moka` keys.
+/// to compute this once at construction rather than once per touch. The value
+/// is stable within a build and nothing persists or transmits it -- `Hash for
+/// ProjectFile` only ever feeds in-memory `HashMap` / `HashSet` / `moka` keys
+/// -- so stability within a build is all it has to be.
 fn project_file_path_hash(root: &Path, rel_path: &Path) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
     root.hash(&mut hasher);
