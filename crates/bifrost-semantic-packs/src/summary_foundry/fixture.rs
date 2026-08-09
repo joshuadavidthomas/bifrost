@@ -35,8 +35,7 @@ use std::fmt;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, AuthoredPayload, AuthoredProcedureSummary, AuthoredProcedureTarget,
     AuthoredSemanticModelPack, AuthoredShard, AuthoredSummaryExitKind, AuthoredSummaryInput,
-    AuthoredSummaryOutput, AuthoredSummaryTransfer, Compatibility, Completeness, NameSelector,
-    Producer, Provenance, Safety,
+    AuthoredSummaryOutput, Compatibility, Completeness, NameSelector, Producer, Provenance, Safety,
 };
 use serde::Serialize;
 
@@ -271,10 +270,13 @@ pub fn generate_fixture_suite(
         return Err(FixtureUnsupported::NoAuthoredSummary);
     }
     for transfer in &entry.transfers {
-        if transfer.exit_kind != AuthoredSummaryExitKind::Normal {
-            return Err(FixtureUnsupported::ExitKindUnsupported {
-                exit_kind: "exceptional".to_owned(),
-            });
+        match transfer.exit_kind {
+            AuthoredSummaryExitKind::Normal => {}
+            AuthoredSummaryExitKind::Exceptional => {
+                return Err(FixtureUnsupported::ExitKindUnsupported {
+                    exit_kind: "exceptional".to_owned(),
+                });
+            }
         }
         if !matches!(transfer.output, AuthoredSummaryOutput::NormalReturn {}) {
             return Err(FixtureUnsupported::OutputPortUnsupported {
@@ -413,7 +415,6 @@ fn unclaimed_input_port(
         .find(|port| !claimed.contains(port))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn case(
     id: &str,
     polarity: FixturePolarity,
@@ -573,15 +574,15 @@ pub fn pack_source(
     rendered
 }
 
+/// The output port an entry names, spelled the way the join spells it.
 fn rendered_output(output: &AuthoredSummaryOutput) -> String {
-    render_transfer(&AuthoredSummaryTransfer {
-        input: AuthoredSummaryInput::Receiver {},
-        exit_kind: AuthoredSummaryExitKind::Normal,
-        output: output.clone(),
-    })
-    .trim_start_matches("receiver->")
-    .trim_end_matches("@normal")
-    .to_owned()
+    match output {
+        AuthoredSummaryOutput::NormalReturn {} => "normal_return".to_owned(),
+        AuthoredSummaryOutput::ExceptionalReturn {} => "exceptional_return".to_owned(),
+        AuthoredSummaryOutput::Receiver {} => "receiver".to_owned(),
+        AuthoredSummaryOutput::Capture { location } => format!("capture[{location}]"),
+        AuthoredSummaryOutput::Heap { location } => format!("heap[{location}]"),
+    }
 }
 
 /// Java's fixture template.
@@ -689,6 +690,8 @@ impl FixtureLanguage for JavaFixtureLanguage {
 
 #[cfg(test)]
 mod tests {
+    use brokk_bifrost_analysis::analyzer::semantic_model::AuthoredSummaryTransfer;
+
     use super::*;
     use crate::summary_foundry::ir::{
         FoundryArtifactBinding, FoundryBoundary, FoundryClaim, FoundryCorpus, FoundryTarget,

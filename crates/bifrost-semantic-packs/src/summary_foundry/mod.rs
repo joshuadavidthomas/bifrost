@@ -521,6 +521,16 @@ fn round_trip(
         };
     }
     let entry_count = summaries.len() as u32;
+    // A pack's claim has to dominate its members': the validator rejects a
+    // `complete` summary inside a `partial` pack (`summary.completeness_exceeds_pack`).
+    let completeness = if summaries
+        .iter()
+        .any(|summary| summary.completeness == Completeness::Complete)
+    {
+        Completeness::Complete
+    } else {
+        Completeness::Partial
+    };
     let pack = AuthoredSemanticModelPack {
         schema_version: 1,
         pack_id: format!("bifrost.summary-foundry.{}", corpus.as_str()),
@@ -540,9 +550,7 @@ fn round_trip(
             revision: Some(pin.revision.clone()),
         },
         license: pin.license.clone(),
-        // Corpus translation is not review, so the pack claims no more than
-        // its entries do.
-        completeness: Completeness::Partial,
+        completeness,
         safety: Safety {
             generated_code_only: false,
             review_required: true,
