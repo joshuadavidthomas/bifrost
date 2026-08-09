@@ -367,6 +367,7 @@ fn scala_entry_facts(
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: Locator::Source {
                 path: entry_name.to_owned(),
                 symbol: Some(declaration.fq_name()),
@@ -493,6 +494,7 @@ fn scala_entry_facts(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            guard: None,
             locator: Locator::Source {
                 path: entry_name.to_owned(),
                 symbol: Some(declaration.fq_name()),
@@ -536,6 +538,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        guard: None,
         locator: owner.locator.clone(),
     }
 }

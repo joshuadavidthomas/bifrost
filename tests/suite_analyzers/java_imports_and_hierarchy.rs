@@ -99,9 +99,9 @@ fn java_external_type_resolution_uses_exact_maven_coordinate_without_workspace_d
         .next()
         .unwrap();
 
-    assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalService"));
-    assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalService.Nested"));
-    assert!(analyzer.is_known_type_name_in_file(app.source(), "ExternalHelper"));
+    assert!(analyzer.is_known_type_name_in_file(None, app.source(), "ExternalService"));
+    assert!(analyzer.is_known_type_name_in_file(None, app.source(), "ExternalService.Nested"));
+    assert!(analyzer.is_known_type_name_in_file(None, app.source(), "ExternalHelper"));
     assert!(
         analyzer
             .resolve_type_name_in_file(app.source(), "ExternalService")

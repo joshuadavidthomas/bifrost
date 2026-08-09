@@ -246,33 +246,6 @@ impl TypeScriptDeclarationPackProducer {
                 );
             }
         };
-        let mut parser = Parser::new();
-        parser
-            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-            .expect("tree-sitter TypeScript language must load");
-        let Some(tree) = parser.parse(source, None) else {
-            return failed_loaded_production(
-                "typescript.declaration.parse",
-                "TypeScript declaration artifact could not be parsed",
-                artifact.sha256(),
-                limits,
-            );
-        };
-        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
-        if tree.root_node().has_error() {
-            diagnostics.error(
-                "typescript.declaration.parse",
-                Some(request.path.display().to_string()),
-                "TypeScript declaration artifact contains malformed or unsupported syntax",
-            );
-            return finish_typescript_production(
-                request,
-                artifact.sha256(),
-                Vec::new(),
-                Vec::new(),
-                diagnostics,
-            );
-        }
         let module_name = request
             .activation
             .iter()
@@ -287,23 +260,16 @@ impl TypeScriptDeclarationPackProducer {
                     .into_owned()
             });
         let locator_path = format!("{}.d.ts", module_name.replace(['/', '\\'], "_"));
-        let mut collector = DeclarationCollector::new(
+        let outcome = parse_and_collect_declarations(
             source,
+            &request.path.display().to_string(),
             locator_path,
             module_name,
             limits,
             cancellation,
-            diagnostics,
+            BoundedProducerDiagnostics::new(limits),
         );
-        collector.collect(tree.root_node());
-        let DeclarationCollector {
-            mut types,
-            mut members,
-            diagnostics,
-            cancelled: was_cancelled,
-            ..
-        } = collector;
-        if was_cancelled {
+        if outcome.cancelled {
             return failed_loaded_production(
                 "artifact.cancelled",
                 "TypeScript declaration production was cancelled",
@@ -311,13 +277,299 @@ impl TypeScriptDeclarationPackProducer {
                 limits,
             );
         }
+        finish_typescript_production(
+            request,
+            artifact.sha256(),
+            outcome.types,
+            outcome.members,
+            outcome.diagnostics,
+        )
+    }
+
+    /// Produce one pack from an exact source set of npm declaration files.
+    ///
+    /// Each entry's importable module name is pinned explicitly by the spec
+    /// (there is no on-disk `node_modules` layout to derive it from), and the
+    /// package manifest is read only far enough to confirm the pinned tree
+    /// actually names an npm package: a real `name` and an exact semantic
+    /// `version`. An entry that fails to parse becomes a bounded reject
+    /// diagnostic and makes the pack honestly partial, matching the Python
+    /// stub source-set producer.
+    pub fn produce_loaded_source_set(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+        manifest_path: &str,
+        declarations: &[(String, String)],
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::NpmPackageManifest {
+            return failed_production(
+                "artifact.kind",
+                "npm package source-set producer requires an npm_package_manifest artifact",
+                limits,
+            );
+        }
+        let mut diagnostics = Vec::new();
+        let mut suppressed_diagnostics = 0usize;
+        let partial = |diagnostics, suppressed_diagnostics| ArtifactProduction {
+            artifact_sha256: Some(artifact.sha256().to_owned()),
+            pack: None,
+            completeness: Completeness::Partial,
+            diagnostics,
+            suppressed_diagnostics,
+        };
+        let Some(manifest_entry) = artifact
+            .source_entries()
+            .iter()
+            .find(|entry| entry.relative_path() == manifest_path)
+        else {
+            diagnostics.push(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: "npm.package.manifest_missing".to_owned(),
+                location: Some(manifest_path.to_owned()),
+                message: "pinned npm source set does not contain its declared manifest".to_owned(),
+            });
+            return partial(diagnostics, suppressed_diagnostics);
+        };
+        if let Err(message) = validate_npm_manifest(manifest_entry.bytes()) {
+            diagnostics.push(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: "npm.package.identity".to_owned(),
+                location: Some(manifest_path.to_owned()),
+                message,
+            });
+            return partial(diagnostics, suppressed_diagnostics);
+        }
+
+        let mut types = Vec::new();
+        let mut members = Vec::new();
+        for (module_name, declaration_path) in declarations {
+            if cancelled(cancellation) {
+                diagnostics.push(ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.cancelled".to_owned(),
+                    location: None,
+                    message: "npm package source-set production was cancelled".to_owned(),
+                });
+                return partial(diagnostics, suppressed_diagnostics);
+            }
+            let Some(entry) = artifact
+                .source_entries()
+                .iter()
+                .find(|entry| entry.relative_path() == declaration_path)
+            else {
+                diagnostics.push(ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Warning,
+                    code: "npm.declarations.missing".to_owned(),
+                    location: Some(declaration_path.clone()),
+                    message: "pinned npm source set does not contain its declared declaration file"
+                        .to_owned(),
+                });
+                continue;
+            };
+            let Ok(source) = std::str::from_utf8(entry.bytes()) else {
+                diagnostics.push(ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Warning,
+                    code: "typescript.declaration.encoding".to_owned(),
+                    location: Some(declaration_path.clone()),
+                    message: "TypeScript declaration entry is not valid UTF-8".to_owned(),
+                });
+                continue;
+            };
+            let locator_path = format!("{}.d.ts", module_name.replace(['/', '\\'], "_"));
+            let outcome = parse_and_collect_declarations(
+                source,
+                declaration_path,
+                locator_path,
+                module_name.clone(),
+                limits,
+                cancellation,
+                BoundedProducerDiagnostics::new(limits),
+            );
+            if outcome.cancelled {
+                diagnostics.push(ProducerDiagnostic {
+                    severity: ProducerDiagnosticSeverity::Error,
+                    code: "artifact.cancelled".to_owned(),
+                    location: Some(declaration_path.clone()),
+                    message: "npm package source-set production was cancelled".to_owned(),
+                });
+                return partial(diagnostics, suppressed_diagnostics);
+            }
+            let (entry_diagnostics, entry_suppressed) = outcome.diagnostics.finish();
+            diagnostics.extend(entry_diagnostics);
+            suppressed_diagnostics = suppressed_diagnostics.saturating_add(entry_suppressed);
+            types.extend(outcome.types);
+            members.extend(outcome.members);
+        }
         types.sort_unstable_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
         members.sort_unstable_by(|left, right| {
             (&left.owner, &left.name, &left.id).cmp(&(&right.owner, &right.name, &right.id))
         });
         members.dedup_by(|left, right| left.id == right.id);
-        finish_typescript_production(request, artifact.sha256(), types, members, diagnostics)
+        let has_declarations =
+            !members.is_empty() || types.iter().any(|fact| fact.type_kind != TypeKind::Module);
+        if !has_declarations {
+            diagnostics.push(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: "npm.declarations.no_external_declarations".to_owned(),
+                location: None,
+                message: "pinned npm declaration files contain no exported or ambient declarations"
+                    .to_owned(),
+            });
+        }
+        let mut activation = request.activation.clone();
+        for selector in &mut activation {
+            selector.artifact_sha256 = Some(artifact.sha256().to_owned());
+        }
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        };
+        ArtifactProduction {
+            artifact_sha256: Some(artifact.sha256().to_owned()),
+            pack: has_declarations.then(|| AuthoredSemanticModelPack {
+                schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+                pack_id: request.pack_id.clone(),
+                version: request.pack_version.clone(),
+                producer: Producer {
+                    name: "bifrost-typescript-declaration".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                },
+                language: "typescript".to_owned(),
+                ecosystem: request.ecosystem.clone(),
+                compatibility: request.compatibility.clone(),
+                provenance: request.provenance.clone(),
+                license: request.license.clone(),
+                completeness,
+                safety: request.safety.clone(),
+                shards: vec![AuthoredShard {
+                    id: "declarations.typescript.external".to_owned(),
+                    activation,
+                    payload: AuthoredPayload::DeclarationFacts {
+                        types,
+                        members,
+                        relations: Vec::new(),
+                    },
+                }],
+            }),
+            completeness,
+            diagnostics,
+            suppressed_diagnostics,
+        }
     }
+}
+
+/// The result of parsing and collecting declarations from one TypeScript
+/// declaration source. `types`/`members` are empty on a parse failure, on a
+/// tree with syntax errors, and on cancellation; `diagnostics` names which.
+struct DeclarationCollectionOutcome {
+    types: Vec<TypeFact>,
+    members: Vec<MemberFact>,
+    diagnostics: BoundedProducerDiagnostics,
+    cancelled: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_and_collect_declarations(
+    source: &str,
+    diagnostic_path: &str,
+    locator_path: String,
+    module_name: String,
+    limits: &ArtifactProducerLimits,
+    cancellation: Option<&CancellationToken>,
+    mut diagnostics: BoundedProducerDiagnostics,
+) -> DeclarationCollectionOutcome {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .expect("tree-sitter TypeScript language must load");
+    let Some(tree) = parser.parse(source, None) else {
+        diagnostics.error(
+            "typescript.declaration.parse",
+            Some(diagnostic_path.to_owned()),
+            "TypeScript declaration artifact could not be parsed",
+        );
+        return DeclarationCollectionOutcome {
+            types: Vec::new(),
+            members: Vec::new(),
+            diagnostics,
+            cancelled: false,
+        };
+    };
+    if tree.root_node().has_error() {
+        diagnostics.error(
+            "typescript.declaration.parse",
+            Some(diagnostic_path.to_owned()),
+            "TypeScript declaration artifact contains malformed or unsupported syntax",
+        );
+        return DeclarationCollectionOutcome {
+            types: Vec::new(),
+            members: Vec::new(),
+            diagnostics,
+            cancelled: false,
+        };
+    }
+    let mut collector = DeclarationCollector::new(
+        source,
+        locator_path,
+        module_name,
+        limits,
+        cancellation,
+        diagnostics,
+    );
+    collector.collect(tree.root_node());
+    let DeclarationCollector {
+        mut types,
+        mut members,
+        diagnostics,
+        cancelled,
+        ..
+    } = collector;
+    if cancelled {
+        return DeclarationCollectionOutcome {
+            types: Vec::new(),
+            members: Vec::new(),
+            diagnostics,
+            cancelled: true,
+        };
+    }
+    types.sort_unstable_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
+    members.sort_unstable_by(|left, right| {
+        (&left.owner, &left.name, &left.id).cmp(&(&right.owner, &right.name, &right.id))
+    });
+    members.dedup_by(|left, right| left.id == right.id);
+    DeclarationCollectionOutcome {
+        types,
+        members,
+        diagnostics,
+        cancelled: false,
+    }
+}
+
+/// Validate that pinned npm manifest bytes name a real package: valid JSON
+/// with a non-empty `name` and an exact semantic `version`.
+fn validate_npm_manifest(bytes: &[u8]) -> Result<(), String> {
+    let manifest: Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("manifest is not valid JSON: {error}"))?;
+    let name = manifest
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if name.is_none() {
+        return Err("manifest package name is missing".to_owned());
+    }
+    let version_text = manifest
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "manifest package version is missing".to_owned())?;
+    Version::parse(version_text).map_err(|_| {
+        format!("manifest version is not an exact semantic version: {version_text}")
+    })?;
+    Ok(())
 }
 
 impl DependencyPackAdapter for JsTsDependencyPackAdapter {
@@ -822,6 +1074,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             hierarchy,
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: source_locator(&self.artifact_path, name, node),
         });
         Some(id)
@@ -873,6 +1126,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            guard: None,
             locator: source_locator(&self.artifact_path, &draft.name, node),
         });
     }

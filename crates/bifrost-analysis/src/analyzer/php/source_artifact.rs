@@ -372,6 +372,7 @@ fn project_type<'tree>(
         hierarchy: hierarchy_of(work.node, source, ctx),
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
+        guard: None,
         locator: artifact_locator(artifact_sha256, entry_path, &qualified),
     });
     if let Some(body) = type_body(work.node) {
@@ -503,6 +504,7 @@ fn project_callable(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        guard: None,
         locator: artifact_locator(
             artifact_sha256,
             entry_path,
@@ -604,6 +606,7 @@ fn project_properties(
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
+            guard: None,
             locator: artifact_locator(
                 artifact_sha256,
                 entry_path,
@@ -679,6 +682,7 @@ fn constant_member(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        guard: None,
         locator: artifact_locator(
             artifact_sha256,
             entry_path,
@@ -709,6 +713,7 @@ fn namespace_fact(namespace: &str, artifact_sha256: &str, entry_path: &str) -> T
         hierarchy: Vec::new(),
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
+        guard: None,
         locator: artifact_locator(artifact_sha256, entry_path, namespace),
     }
 }

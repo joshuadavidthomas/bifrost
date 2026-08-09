@@ -35,6 +35,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tree_sitter::Parser;
 use zip::ZipArchive;
 
@@ -92,6 +93,14 @@ pub(crate) enum JvmExternalDeclarationSource {
     ClassFile {
         artifact_path: PathBuf,
         class_entry: String,
+    },
+    /// A declaration-facts record an activated semantic pack publishes
+    /// (#1893). There is no artifact on disk to point at: the pack itself is
+    /// the evidence, so the provenance recorded here is the pack that declared
+    /// the type and the declaration identity inside it.
+    SemanticPack {
+        pack_id: String,
+        declaration_id: String,
     },
 }
 
@@ -1440,6 +1449,329 @@ fn semantic_visibility(visibility: Visibility) -> JvmVisibility {
     }
 }
 
+/// The manifest languages whose declaration facts answer a JVM name.
+///
+/// Java, Kotlin and Scala compile to one classpath, so a pack that declares a
+/// type for any of them declares it for all three. A pack for any other
+/// language never answers here, so activating a Python or npm pack cannot
+/// upgrade a JVM reference.
+const JVM_PACK_LANGUAGES: [&str; 3] = ["java", "kotlin", "scala"];
+
+/// The external declaration surface one JVM lookup reads: the artifact-derived
+/// index first, then the declaration facts the activated semantic packs
+/// publish (#1893).
+///
+/// Both halves answer the same question -- does an external declaration spell
+/// this fully-qualified name, and may this package see it -- so they are one
+/// lookup with one precedence, not two indexes with two vocabularies. The
+/// artifact half wins a tie: an artifact on disk is the classpath the build
+/// actually resolved, while a pack is a published claim about one.
+///
+/// # Why the pack half is read live
+///
+/// [`JvmExternalDeclarationIndex`] is memoized in an analyzer `OnceLock` that
+/// survives across activation transactions: a host activates, invalidates and
+/// re-activates packs while one analyzer generation stays alive, and only a
+/// changed build manifest drops the cell. Folding pack facts into that cell
+/// would therefore answer from a pack set the host has since replaced or
+/// withdrawn. This surface instead reads the published overlay on every
+/// lookup, so it always reports the currently activated set and cannot go
+/// stale. The read is a published `Arc` clone plus one hash lookup, which is
+/// the same cost the other seven languages already pay for their overlay-backed
+/// boundary evidence.
+pub(crate) struct JvmExternalDeclarations<'a> {
+    artifacts: &'a JvmExternalDeclarationIndex,
+    packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+}
+
+impl<'a> JvmExternalDeclarations<'a> {
+    pub(crate) fn new(
+        artifacts: &'a JvmExternalDeclarationIndex,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> Self {
+        Self { artifacts, packs }
+    }
+
+    /// Whether no surface can answer anything, so a caller may skip the ladder
+    /// altogether.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.artifacts.is_empty() && self.packs.is_none()
+    }
+
+    pub(crate) fn get(&self, fqn: &str) -> Option<JvmExternalType> {
+        if let Some(external_type) = self.artifacts.get(fqn) {
+            return Some(external_type.clone());
+        }
+        self.pack_declaration(fqn)
+    }
+
+    pub(crate) fn resolve_explicit_import(
+        &self,
+        import_path: &str,
+        access_package: &str,
+    ) -> Option<JvmExternalType> {
+        self.resolve_qualified_name(import_path, access_package)
+    }
+
+    pub(crate) fn resolve_wildcard_import(
+        &self,
+        package_name: &str,
+        short_name: &str,
+        access_package: &str,
+    ) -> Option<JvmExternalType> {
+        self.resolve_qualified_name(&qualified_name(package_name, short_name), access_package)
+    }
+
+    pub(crate) fn resolve_same_package(
+        &self,
+        package_name: &str,
+        short_name: &str,
+    ) -> Option<JvmExternalType> {
+        self.resolve_qualified_name(&qualified_name(package_name, short_name), package_name)
+    }
+
+    pub(crate) fn resolve_java_lang(&self, short_name: &str) -> Option<JvmExternalType> {
+        self.get(&qualified_name("java.lang", short_name))
+            .filter(|external_type| external_type.visibility == JvmVisibility::Public)
+    }
+
+    pub(crate) fn resolve_qualified_name(
+        &self,
+        fqn: &str,
+        access_package: &str,
+    ) -> Option<JvmExternalType> {
+        self.get(fqn)
+            .filter(|external_type| external_type.is_accessible_from_package(access_package))
+    }
+
+    /// The external member a written `Owner.member` spelling names (#1900).
+    ///
+    /// A reference-site spelling that crosses a `.` is one written name whose
+    /// head is a type and whose last segment is a member: `Collections.sort`
+    /// spells the `sort` member of `java.util.Collections`. The head is
+    /// resolved by `resolve_owner`, which is the caller's own type ladder --
+    /// Java's import tiers, Kotlin's name scope, Scala's import tiers -- so a
+    /// member spelling reaches the same owner a type spelling would.
+    ///
+    /// Only a spelling the type ladder has already failed to answer belongs
+    /// here. A nested type is spelled with the same dot, and its declaration is
+    /// a type, so it is decided by the type ladder before this runs.
+    ///
+    /// The artifact half declares nothing here yet: the jar- and class-backed
+    /// [`JvmExternalDeclarationIndex`] stores a type's name, package, kind,
+    /// visibility and origin artifact and no members at all, which is the
+    /// remaining half of #1900. So today only the activated packs answer, and a
+    /// jar-backed owner has no member surface to consult.
+    ///
+    /// A miss is never a proof of absence. The surface reports what it
+    /// declares; a caller that finds nothing keeps the status it had, so a type
+    /// whose pack declares no members leaves every member spelling exactly as
+    /// unknown as it was before activation.
+    pub(crate) fn resolve_member_spelling(
+        &self,
+        spelling: &str,
+        access_package: &str,
+        resolve_owner: impl FnOnce(&str) -> Option<JvmExternalType>,
+    ) -> Option<JvmExternalMember> {
+        let (owner_spelling, member_name) = spelling.trim().rsplit_once('.')?;
+        if owner_spelling.is_empty() || member_name.is_empty() {
+            return None;
+        }
+        let owner = resolve_owner(owner_spelling)?;
+        self.pack_member(&owner, member_name)
+            .filter(|member| member.is_accessible_from_package(access_package))
+    }
+
+    /// The one declaration the activated packs publish for `fqn`, if exactly
+    /// one does.
+    ///
+    /// `symbols_named` also posts every symbol under its simple name, so a bare
+    /// `Collections` would otherwise match `java.util.Collections` and let any
+    /// dependency type that happens to share a short name answer a JVM name.
+    /// The caller has already walked its own import tiers to produce a
+    /// qualified spelling, so only the qualified postings count: the declared
+    /// name, and the aliases, which are qualified too. This is the same rule
+    /// `JvmOverlayModel::qualified_name_disposition` applies on the
+    /// proof-gated diagnostic side, so a trace, a definition and a diagnostic
+    /// read one activated set the same way.
+    fn pack_declaration(&self, fqn: &str) -> Option<JvmExternalType> {
+        let overlay = self.packs.as_ref()?;
+        let mut declarations = overlay
+            .symbols_named(fqn)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.qualified_name == fqn || symbol.aliases.iter().any(|alias| alias == fqn)
+            })
+            .filter_map(pack_external_type);
+        let declared = declarations.next()?;
+        // Two activated packs claiming one qualified name is ambiguity, not a
+        // declaration: the name exists but which declaration it denotes is not
+        // decided, so no single external type can be reported. Reporting none
+        // understates what is known and never overstates it.
+        declarations.next().is_none().then_some(declared)
+    }
+
+    /// The member an activated pack publishes on `owner`, searched over the
+    /// owner's whole inherited surface.
+    ///
+    /// The surface is the closure `SemanticModelOverlay::owner_surface` builds,
+    /// because a JVM member is as often inherited as declared: `sort` sits on
+    /// `java.util.Collections` while `toString` sits on `java.lang.Object`, and
+    /// a reference spells both the same way. The declaration that answers keeps
+    /// its own qualified name, so the reported target names where the member is
+    /// declared rather than where it was written.
+    ///
+    /// More than one hit is the ordinary shape of an override or an overload --
+    /// a class and the interface it implements both declare the method, and
+    /// `sort(List)` and `sort(List, Comparator)` are two declarations of one
+    /// name -- so it is not ambiguity. Only a declaration an indexed pack itself
+    /// flagged ambiguous is, which is the same rule PHP's external surface
+    /// applies.
+    ///
+    /// Staticness and arity are deliberately not filtered on. The question this
+    /// surface answers is whether an external declaration spells the name, not
+    /// whether the written use of it compiles: the workspace member tier does
+    /// not refuse a static member written through an instance either, and a
+    /// Scala `object` or Kotlin companion member is published without the
+    /// static flag a Java static carries.
+    fn pack_member(&self, owner: &JvmExternalType, member_name: &str) -> Option<JvmExternalMember> {
+        let overlay = self.packs.as_ref()?;
+        // Only a pack-declared owner has a pack member surface: an artifact
+        // owner carries no declaration identity to look members up by.
+        let JvmExternalDeclarationSource::SemanticPack { declaration_id, .. } = &owner.source
+        else {
+            return None;
+        };
+        let owner_symbol = overlay
+            .symbols_with_id(declaration_id)
+            .records
+            .first()
+            .copied()?;
+        let surface = overlay.owner_surface(owner_symbol);
+        surface.closure.iter().find_map(|declaring| {
+            let member = overlay
+                .members_of(&declaring.id)
+                .records
+                .into_iter()
+                .find(|symbol| {
+                    symbol.name == member_name
+                        && !symbol.provenance.ambiguous
+                        && JVM_PACK_LANGUAGES.contains(&symbol.language.as_str())
+                })?;
+            Some(JvmExternalMember {
+                fqn: member.qualified_name.clone(),
+                // The package split is the one [`pack_external_type`] makes on
+                // a type's declared name, taken from the declaring type rather
+                // than from the type the reference wrote.
+                declaring_package: declaring
+                    .qualified_name
+                    .rsplit_once('.')
+                    .map_or("", |(package, _)| package)
+                    .to_owned(),
+                visibility: semantic_visibility(member.visibility),
+            })
+        })
+    }
+}
+
+/// One member an activated pack declares on an external type (#1900): the
+/// `sort` of `Collections.sort`, not the `Collections`.
+///
+/// A member is not a type, so it is not a [`JvmExternalType`]: nothing may
+/// resolve a type name to it, and [`pack_type_kind`] rejects every member kind
+/// precisely so that cannot happen. What a member shares with a type is the
+/// question a boundary asks -- does an external declaration spell this name,
+/// and may this package see it -- so it carries exactly what answers that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JvmExternalMember {
+    fqn: String,
+    /// The package of the type that *declares* the member, which is what
+    /// `protected` and package-private accessibility are measured against. An
+    /// inherited member is declared in its own supertype's package, not in the
+    /// package of the type the reference wrote.
+    declaring_package: String,
+    visibility: JvmVisibility,
+}
+
+impl JvmExternalMember {
+    pub(crate) fn fqn(&self) -> &str {
+        &self.fqn
+    }
+
+    fn is_accessible_from_package(&self, package_name: &str) -> bool {
+        is_visible_from_package(self.visibility, &self.declaring_package, package_name)
+    }
+}
+
+/// One activated pack symbol as the JVM realm's external declaration, when the
+/// symbol is a JVM type at all.
+///
+/// The package and short name are split out of the declared qualified name
+/// exactly as the pack-fact producers in this module already do
+/// ([`scala_external_type`]), because a declaration fact carries one dotted
+/// name and no separate package field.
+fn pack_external_type(
+    symbol: &crate::analyzer::semantic_model::SemanticModelSymbol,
+) -> Option<JvmExternalType> {
+    if !JVM_PACK_LANGUAGES.contains(&symbol.language.as_str()) {
+        return None;
+    }
+    let kind = pack_type_kind(symbol.kind)?;
+    let (package_name, short_name) = symbol
+        .qualified_name
+        .rsplit_once('.')
+        .map_or(("", symbol.qualified_name.as_str()), |(package, short)| {
+            (package, short)
+        });
+    (!short_name.is_empty()).then(|| JvmExternalType {
+        fqn: symbol.qualified_name.clone(),
+        package_name: package_name.to_owned(),
+        short_name: short_name.to_owned(),
+        kind,
+        visibility: semantic_visibility(symbol.visibility),
+        source: JvmExternalDeclarationSource::SemanticPack {
+            pack_id: symbol.provenance.pack_id.clone(),
+            declaration_id: symbol.id.clone(),
+        },
+    })
+}
+
+/// The JVM type shape an overlay symbol kind denotes, or `None` when the
+/// symbol is not a type a JVM reference can name.
+///
+/// The overlay keeps the pack's declared kind, so this is the inverse of the
+/// [`semantic_type_kind`] mapping the artifact producers use, narrowed to the
+/// kinds that exist on a classpath. Members, macros and namespace scaffolds
+/// are not type names; a Kotlin `typealias` is a source-level alias with no
+/// class of its own.
+fn pack_type_kind(
+    kind: crate::analyzer::semantic_model::SemanticModelSymbolKind,
+) -> Option<JvmExternalTypeKind> {
+    use crate::analyzer::semantic_model::SemanticModelSymbolKind as Kind;
+
+    match kind {
+        Kind::Class | Kind::Struct => Some(JvmExternalTypeKind::Class),
+        Kind::Interface | Kind::Trait => Some(JvmExternalTypeKind::Interface),
+        Kind::Enum => Some(JvmExternalTypeKind::Enum),
+        Kind::Annotation => Some(JvmExternalTypeKind::Annotation),
+        Kind::Record => Some(JvmExternalTypeKind::Record),
+        Kind::Delegate
+        | Kind::Union
+        | Kind::Module
+        | Kind::TypeAlias
+        | Kind::Constructor
+        | Kind::Method
+        | Kind::Function
+        | Kind::Field
+        | Kind::Property
+        | Kind::Constant
+        | Kind::Static
+        | Kind::Macro
+        | Kind::Event => None,
+    }
+}
+
 /// A source language Bifrost can read out of a published `-sources.jar`.
 ///
 /// All three compile to the same classpath, so one archive walk feeds one
@@ -1518,12 +1850,26 @@ impl JvmExternalType {
     }
 
     fn is_accessible_from_package(&self, package_name: &str) -> bool {
-        self.visibility == JvmVisibility::Public
-            || (matches!(
-                self.visibility,
-                JvmVisibility::Protected | JvmVisibility::PackagePrivate
-            ) && self.package_name == package_name)
+        is_visible_from_package(self.visibility, &self.package_name, package_name)
     }
+}
+
+/// Whether a declaration of `visibility` sitting in `declaring_package` is
+/// visible to code compiled in `access_package`.
+///
+/// One rule for types and members, because the JVM applies one: a `protected`
+/// declaration is also visible to a subtype, which this deliberately does not
+/// admit, so the answer understates what is reachable and never overstates it.
+fn is_visible_from_package(
+    visibility: JvmVisibility,
+    declaring_package: &str,
+    access_package: &str,
+) -> bool {
+    visibility == JvmVisibility::Public
+        || (matches!(
+            visibility,
+            JvmVisibility::Protected | JvmVisibility::PackagePrivate
+        ) && declaring_package == access_package)
 }
 
 fn open_artifact_file(path: &Path) -> Option<File> {
@@ -3061,7 +3407,7 @@ mod tests {
             TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
             config,
         );
-        assert!(analyzer.is_known_type_name_in_file(&app, "ExternalService"));
+        assert!(analyzer.is_known_type_name_in_file(None, &app, "ExternalService"));
     }
 
     #[test]
@@ -3108,7 +3454,7 @@ mod tests {
             config,
         );
         let resolution = analyzer
-            .resolve_type_name_with_external(&app, "ExternalService")
+            .resolve_type_name_with_external(None, &app, "ExternalService")
             .unwrap();
         let crate::analyzer::java::imports::JavaTypeResolution::External(external) = resolution
         else {
@@ -3183,7 +3529,7 @@ mod tests {
             TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
             config,
         );
-        assert!(!analyzer.is_known_type_name_in_file(&app, "ExternalService"));
+        assert!(!analyzer.is_known_type_name_in_file(None, &app, "ExternalService"));
     }
 
     #[test]
@@ -3213,14 +3559,14 @@ mod tests {
             TestProject::new(fixture.project_root().to_path_buf(), Language::Java),
             config,
         );
-        assert!(!analyzer.is_known_type_name_in_file(&app, "ExternalService"));
+        assert!(!analyzer.is_known_type_name_in_file(None, &app, "ExternalService"));
         let initial_index = analyzer.external_index.clone();
 
         pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
             .unwrap();
         let updated = analyzer.update(&BTreeSet::from([pom.clone()]));
         assert!(!Arc::ptr_eq(&initial_index, &updated.external_index));
-        assert!(updated.is_known_type_name_in_file(&app, "ExternalService"));
+        assert!(updated.is_known_type_name_in_file(None, &app, "ExternalService"));
 
         app.write(
             "package app; import com.example.dep.ExternalService; class App { ExternalService changed; }",
@@ -3281,13 +3627,13 @@ mod tests {
             ),
         ]));
         let java = resolve_analyzer::<JavaAnalyzer>(&multi).unwrap();
-        assert!(!java.is_known_type_name_in_file(&app, "ExternalService"));
+        assert!(!java.is_known_type_name_in_file(None, &app, "ExternalService"));
 
         pom.write("<project><dependencies><dependency><groupId>com.example</groupId><artifactId>external-lib</artifactId><version>1.2.3</version></dependency></dependencies></project>")
             .unwrap();
         let updated = multi.update(&BTreeSet::from([pom]));
         let java = resolve_analyzer::<JavaAnalyzer>(&updated).unwrap();
-        assert!(java.is_known_type_name_in_file(&app, "ExternalService"));
+        assert!(java.is_known_type_name_in_file(None, &app, "ExternalService"));
     }
 
     #[test]
@@ -3638,47 +3984,48 @@ mod tests {
         let analyzer = JavaAnalyzer::from_project_with_config(project.clone(), config);
 
         assert!(matches!(
-            analyzer.resolve_type_name_with_external(&app, "LocalType"),
+            analyzer.resolve_type_name_with_external(None, &app, "LocalType"),
             Some(crate::analyzer::java::imports::JavaTypeResolution::Source(
                 _
             ))
         ));
         assert!(matches!(
-            analyzer.resolve_type_name_with_external(&app, "ExternalService"),
+            analyzer.resolve_type_name_with_external(None, &app, "ExternalService"),
             Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
         ));
         assert!(matches!(
-            analyzer.resolve_type_name_with_external(&app, "ExternalService.Nested"),
+            analyzer.resolve_type_name_with_external(None, &app, "ExternalService.Nested"),
             Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
         ));
         assert!(
             analyzer
-                .resolve_type_name_with_external(&app, "ExternalService.ProtectedNested")
+                .resolve_type_name_with_external(None, &app, "ExternalService.ProtectedNested")
                 .is_none(),
             "protected nested dependency types should not resolve from unrelated packages"
         );
         assert!(matches!(
-            analyzer.resolve_type_name_with_external(&app, "PublicApi.Callback"),
+            analyzer.resolve_type_name_with_external(None, &app, "PublicApi.Callback"),
             Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
         ));
         assert!(
             analyzer
-                .resolve_type_name_with_external(&app, "Foo")
+                .resolve_type_name_with_external(None, &app, "Foo")
                 .is_none(),
             "ambiguous wildcard external types should not resolve arbitrarily"
         );
         assert!(
             analyzer
-                .resolve_type_name_with_external(&app, "PackageOuter.Nested")
+                .resolve_type_name_with_external(None, &app, "PackageOuter.Nested")
                 .is_none(),
             "public nested types under package-private outers should not resolve from other packages"
         );
         assert!(matches!(
-            analyzer.resolve_type_name_with_external(&same_package_app, "PackageHelper"),
+            analyzer.resolve_type_name_with_external(None, &same_package_app, "PackageHelper"),
             Some(crate::analyzer::java::imports::JavaTypeResolution::External(_))
         ));
         assert!(matches!(
             analyzer.resolve_type_name_with_external(
+                None,
                 &same_package_app,
                 "ExternalService.PackageNested"
             ),

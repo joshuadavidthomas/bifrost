@@ -1876,6 +1876,55 @@ impl RetainedSize for PolicyPackActivationReview {
     }
 }
 
+/// The optional top-level reviews a report attaches when the matching input
+/// (a diff base, a workspace packs document, or a baseline document) is
+/// present. Each review stays additive: a report without any of them keeps
+/// its exact schema-version-3 shape (#1880, #1868, #1881).
+///
+/// Folding the three into one collection gives them a single retained-size
+/// accounting site (the `RetainedSize` impl below) instead of a bespoke
+/// helper and bespoke arithmetic per field spread across every builder fit
+/// path (#1890). A fourth optional review joins by adding a field here, one
+/// line to `retained_size`, one accessor, and one typed `set_*` method on
+/// `PolicyReportBuilder` -- no other fit path changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PolicyOptionalReviews {
+    diff: Option<PolicyDiffReview>,
+    packs: Option<PolicyPackActivationReview>,
+    baseline: Option<PolicyBaselineReview>,
+}
+
+impl PolicyOptionalReviews {
+    const fn diff(&self) -> Option<&PolicyDiffReview> {
+        self.diff.as_ref()
+    }
+
+    const fn packs(&self) -> Option<&PolicyPackActivationReview> {
+        self.packs.as_ref()
+    }
+
+    const fn baseline(&self) -> Option<&PolicyBaselineReview> {
+        self.baseline.as_ref()
+    }
+
+    /// Count of the reviews that are present, for the additive field count
+    /// in [`PolicyReportDocument`]'s manual `Serialize` impl.
+    fn present_count(&self) -> usize {
+        usize::from(self.diff.is_some())
+            + usize::from(self.packs.is_some())
+            + usize::from(self.baseline.is_some())
+    }
+}
+
+impl RetainedSize for PolicyOptionalReviews {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(retained_extra(&self.diff))
+            .saturating_add(retained_extra(&self.packs))
+            .saturating_add(retained_extra(&self.baseline))
+    }
+}
+
 /// The sole canonical input to every policy-report renderer.
 #[derive(Debug, Clone)]
 pub struct PolicyReportDocument {
@@ -1886,9 +1935,7 @@ pub struct PolicyReportDocument {
     runs: Vec<PolicyRun>,
     suppressions: Vec<PolicySuppressionReview>,
     scope: Vec<PolicyScopeReview>,
-    diff: Option<PolicyDiffReview>,
-    packs: Option<PolicyPackActivationReview>,
-    baseline: Option<PolicyBaselineReview>,
+    reviews: PolicyOptionalReviews,
     diagnostics: Vec<PolicyReportDiagnostic>,
     diagnostics_truncated: bool,
     omitted_diagnostics_lower_bound: u64,
@@ -1948,9 +1995,7 @@ impl PolicyReportDocument {
             runs,
             suppressions,
             Vec::new(),
-            None,
-            None,
-            None,
+            PolicyOptionalReviews::default(),
             diagnostics,
             diagnostics_truncated,
             omitted_diagnostics_lower_bound,
@@ -1966,9 +2011,7 @@ impl PolicyReportDocument {
         mut runs: Vec<PolicyRun>,
         mut suppressions: Vec<PolicySuppressionReview>,
         mut scope: Vec<PolicyScopeReview>,
-        diff: Option<PolicyDiffReview>,
-        packs: Option<PolicyPackActivationReview>,
-        baseline: Option<PolicyBaselineReview>,
+        reviews: PolicyOptionalReviews,
         mut diagnostics: Vec<PolicyReportDiagnostic>,
         diagnostics_truncated: bool,
         omitted_diagnostics_lower_bound: u64,
@@ -1993,8 +2036,8 @@ impl PolicyReportDocument {
         validate_rule_run_joins(&rules, &runs)?;
         validate_suppression_joins(&runs, &suppressions)?;
         validate_scope_joins(&runs, &scope)?;
-        validate_diff_joins(&runs, diff.as_ref())?;
-        validate_baseline_joins(&runs, baseline.as_ref())?;
+        validate_diff_joins(&runs, reviews.diff())?;
+        validate_baseline_joins(&runs, reviews.baseline())?;
 
         Ok(Self {
             schema_version: Self::SCHEMA_VERSION,
@@ -2004,9 +2047,7 @@ impl PolicyReportDocument {
             runs,
             suppressions,
             scope,
-            diff,
-            packs,
-            baseline,
+            reviews,
             diagnostics,
             diagnostics_truncated,
             omitted_diagnostics_lower_bound,
@@ -2047,15 +2088,15 @@ impl PolicyReportDocument {
     }
 
     pub const fn diff(&self) -> Option<&PolicyDiffReview> {
-        self.diff.as_ref()
+        self.reviews.diff()
     }
 
     pub const fn packs(&self) -> Option<&PolicyPackActivationReview> {
-        self.packs.as_ref()
+        self.reviews.packs()
     }
 
     pub const fn baseline(&self) -> Option<&PolicyBaselineReview> {
-        self.baseline.as_ref()
+        self.reviews.baseline()
     }
 
     pub fn diagnostics(&self) -> &[PolicyReportDiagnostic] {
@@ -2083,10 +2124,7 @@ impl Serialize for PolicyReportDocument {
         // The `diff`, `packs`, and `baseline` fields are additive and
         // serialized only when present, so a report without them keeps its
         // exact schema-version-3 shape.
-        let field_count = 11
-            + usize::from(self.diff.is_some())
-            + usize::from(self.packs.is_some())
-            + usize::from(self.baseline.is_some());
+        let field_count = 11 + self.reviews.present_count();
         let mut state = serializer.serialize_struct("PolicyReportDocument", field_count)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("evaluation", &self.evaluation)?;
@@ -2095,13 +2133,13 @@ impl Serialize for PolicyReportDocument {
         state.serialize_field("runs", &self.runs)?;
         state.serialize_field("suppressions", &self.suppressions)?;
         state.serialize_field("scope", &self.scope)?;
-        if let Some(diff) = &self.diff {
+        if let Some(diff) = self.reviews.diff() {
             state.serialize_field("diff", diff)?;
         }
-        if let Some(packs) = &self.packs {
+        if let Some(packs) = self.reviews.packs() {
             state.serialize_field("packs", packs)?;
         }
-        if let Some(baseline) = &self.baseline {
+        if let Some(baseline) = self.reviews.baseline() {
             state.serialize_field("baseline", baseline)?;
         }
         state.serialize_field("diagnostics", &self.diagnostics)?;
@@ -2127,9 +2165,7 @@ impl RetainedSize for PolicyReportDocument {
             .saturating_add(retained_extra(&self.runs))
             .saturating_add(retained_extra(&self.suppressions))
             .saturating_add(retained_extra(&self.scope))
-            .saturating_add(retained_extra(&self.diff))
-            .saturating_add(retained_extra(&self.packs))
-            .saturating_add(retained_extra(&self.baseline))
+            .saturating_add(retained_extra(&self.reviews))
             .saturating_add(retained_extra(&self.diagnostics))
     }
 }
@@ -2323,9 +2359,7 @@ pub struct PolicyReportBuilder {
     runs: Vec<PolicyRun>,
     suppressions: Vec<PolicySuppressionReview>,
     scope: Vec<PolicyScopeReview>,
-    diff: Option<PolicyDiffReview>,
-    packs: Option<PolicyPackActivationReview>,
-    baseline: Option<PolicyBaselineReview>,
+    reviews: PolicyOptionalReviews,
     diagnostics: Vec<PolicyReportDiagnostic>,
     diagnostics_truncated: bool,
     omitted_diagnostics_lower_bound: u64,
@@ -2445,9 +2479,7 @@ impl PolicyReportBuilder {
             runs,
             suppressions,
             scope,
-            diff: None,
-            packs: None,
-            baseline: None,
+            reviews: PolicyOptionalReviews::default(),
             diagnostics,
             diagnostics_truncated: false,
             omitted_diagnostics_lower_bound: 0,
@@ -2638,9 +2670,7 @@ impl PolicyReportBuilder {
             &self.scope,
             &self.diagnostics,
         )
-        .checked_add(self.diff_extra())
-        .and_then(|bytes| bytes.checked_add(self.packs_extra()))
-        .and_then(|bytes| bytes.checked_add(self.baseline_extra()))
+        .checked_add(self.reviews_extra())
         .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if !policy_fits || !batch_fits {
@@ -2690,9 +2720,7 @@ impl PolicyReportBuilder {
             &self.scope,
             &self.diagnostics,
         )
-        .checked_add(self.diff_extra())
-        .and_then(|bytes| bytes.checked_add(self.packs_extra()))
-        .and_then(|bytes| bytes.checked_add(self.baseline_extra()))
+        .checked_add(self.reviews_extra())
         .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if cap_reached || !policy_fits || !batch_fits {
@@ -2728,9 +2756,7 @@ impl PolicyReportBuilder {
             &self.scope,
             &diagnostics,
         )
-        .checked_add(self.diff_extra())
-        .and_then(|bytes| bytes.checked_add(self.packs_extra()))
-        .and_then(|bytes| bytes.checked_add(self.baseline_extra()))
+        .checked_add(self.reviews_extra())
         .and_then(|bytes| bytes.checked_add(self.emergency_allowance))
         .is_some_and(|bytes| bytes <= self.budget.max_retained_report_bytes());
         if !fits {
@@ -2802,9 +2828,7 @@ impl PolicyReportBuilder {
             self.runs,
             self.suppressions,
             self.scope,
-            self.diff,
-            self.packs,
-            self.baseline,
+            self.reviews,
             self.diagnostics,
             self.diagnostics_truncated,
             self.omitted_diagnostics_lower_bound,
@@ -2831,9 +2855,7 @@ impl PolicyReportBuilder {
             &self.scope,
             &self.diagnostics,
         )
-        .saturating_add(self.diff_extra())
-        .saturating_add(self.packs_extra())
-        .saturating_add(self.baseline_extra())
+        .saturating_add(self.reviews_extra())
         .saturating_add(retained_extra(&execution));
         if retained > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::BatchRetentionExceeded {
@@ -2850,26 +2872,12 @@ impl PolicyReportBuilder {
     /// The review is bounded by construction; charging it against the batch
     /// budget keeps every later retention decision aware of its bytes.
     pub fn set_diff(&mut self, diff: PolicyDiffReview) -> Result<(), PolicyReportBuilderError> {
-        assert!(self.diff.is_none(), "diff review is set at most once");
-        let retained = report_storage_size(
-            &self.evaluation,
-            &self.rules,
-            &self.runs,
-            &self.suppressions,
-            &self.scope,
-            &self.diagnostics,
-        )
-        .saturating_add(retained_extra(&self.execution))
-        .saturating_add(self.packs_extra())
-        .saturating_add(self.baseline_extra())
-        .saturating_add(retained_extra(&diff));
-        if retained > self.budget.max_retained_report_bytes() {
-            return Err(PolicyReportBuilderError::BatchRetentionExceeded {
-                retained_bytes: retained,
-                max_bytes: self.budget.max_retained_report_bytes(),
-            });
-        }
-        self.diff = Some(diff);
+        assert!(
+            self.reviews.diff.is_none(),
+            "diff review is set at most once"
+        );
+        self.ensure_review_fits(retained_extra(&diff))?;
+        self.reviews.diff = Some(diff);
         Ok(())
     }
 
@@ -2882,28 +2890,11 @@ impl PolicyReportBuilder {
         packs: PolicyPackActivationReview,
     ) -> Result<(), PolicyReportBuilderError> {
         assert!(
-            self.packs.is_none(),
+            self.reviews.packs.is_none(),
             "pack-activation review is set at most once"
         );
-        let retained = report_storage_size(
-            &self.evaluation,
-            &self.rules,
-            &self.runs,
-            &self.suppressions,
-            &self.scope,
-            &self.diagnostics,
-        )
-        .saturating_add(retained_extra(&self.execution))
-        .saturating_add(self.diff_extra())
-        .saturating_add(self.baseline_extra())
-        .saturating_add(retained_extra(&packs));
-        if retained > self.budget.max_retained_report_bytes() {
-            return Err(PolicyReportBuilderError::BatchRetentionExceeded {
-                retained_bytes: retained,
-                max_bytes: self.budget.max_retained_report_bytes(),
-            });
-        }
-        self.packs = Some(packs);
+        self.ensure_review_fits(retained_extra(&packs))?;
+        self.reviews.packs = Some(packs);
         Ok(())
     }
 
@@ -2916,28 +2907,11 @@ impl PolicyReportBuilder {
         baseline: PolicyBaselineReview,
     ) -> Result<(), PolicyReportBuilderError> {
         assert!(
-            self.baseline.is_none(),
+            self.reviews.baseline.is_none(),
             "baseline review is set at most once"
         );
-        let retained = report_storage_size(
-            &self.evaluation,
-            &self.rules,
-            &self.runs,
-            &self.suppressions,
-            &self.scope,
-            &self.diagnostics,
-        )
-        .saturating_add(retained_extra(&self.execution))
-        .saturating_add(self.diff_extra())
-        .saturating_add(self.packs_extra())
-        .saturating_add(retained_extra(&baseline));
-        if retained > self.budget.max_retained_report_bytes() {
-            return Err(PolicyReportBuilderError::BatchRetentionExceeded {
-                retained_bytes: retained,
-                max_bytes: self.budget.max_retained_report_bytes(),
-            });
-        }
-        self.baseline = Some(baseline);
+        self.ensure_review_fits(retained_extra(&baseline))?;
+        self.reviews.baseline = Some(baseline);
         Ok(())
     }
 
@@ -2949,6 +2923,7 @@ impl PolicyReportBuilder {
         finding_id: PolicyFindingId,
     ) -> Result<(), PolicyReportBuilderError> {
         let baseline = self
+            .reviews
             .baseline
             .as_mut()
             .ok_or(PolicyReportBuilderError::UnknownBaselineReview)?;
@@ -2956,16 +2931,38 @@ impl PolicyReportBuilder {
         Ok(())
     }
 
-    fn diff_extra(&self) -> usize {
-        self.diff.as_ref().map_or(0, retained_extra)
+    /// Retained bytes contributed by whichever optional reviews are already
+    /// attached. This is the single site every fit path charges for the
+    /// diff, packs, and baseline reviews together (#1890): a new review type
+    /// only needs a field on [`PolicyOptionalReviews`] plus one line in its
+    /// `RetainedSize` impl, not a change here.
+    fn reviews_extra(&self) -> usize {
+        retained_extra(&self.reviews)
     }
 
-    fn packs_extra(&self) -> usize {
-        self.packs.as_ref().map_or(0, retained_extra)
-    }
-
-    fn baseline_extra(&self) -> usize {
-        self.baseline.as_ref().map_or(0, retained_extra)
+    /// Single accounting site for attaching one of the optional top-level
+    /// reviews: the shared budget arithmetic every `set_*` review method
+    /// uses to charge its already-attached siblings plus the new review's
+    /// own bytes against the batch budget (#1890).
+    fn ensure_review_fits(&self, new_review_extra: usize) -> Result<(), PolicyReportBuilderError> {
+        let retained = report_storage_size(
+            &self.evaluation,
+            &self.rules,
+            &self.runs,
+            &self.suppressions,
+            &self.scope,
+            &self.diagnostics,
+        )
+        .saturating_add(retained_extra(&self.execution))
+        .saturating_add(self.reviews_extra())
+        .saturating_add(new_review_extra);
+        if retained > self.budget.max_retained_report_bytes() {
+            return Err(PolicyReportBuilderError::BatchRetentionExceeded {
+                retained_bytes: retained,
+                max_bytes: self.budget.max_retained_report_bytes(),
+            });
+        }
+        Ok(())
     }
 
     fn ensure_input_slot(&self) -> Result<(), PolicyReportBuilderError> {
@@ -3010,9 +3007,7 @@ impl PolicyReportBuilder {
             &self.scope,
             diagnostics,
         )
-        .checked_add(self.diff_extra())
-        .and_then(|value| value.checked_add(self.packs_extra()))
-        .and_then(|value| value.checked_add(self.baseline_extra()))
+        .checked_add(self.reviews_extra())
         .and_then(|value| value.checked_add(outstanding_skeleton_allowance))
         .and_then(|value| value.checked_add(emergency))
         .ok_or(PolicyReportBuilderError::RetainedSizeOverflow)?;
@@ -3081,9 +3076,7 @@ impl PolicyReportBuilder {
             &self.scope,
             &self.diagnostics,
         )
-        .saturating_add(self.diff_extra())
-        .saturating_add(self.packs_extra())
-        .saturating_add(self.baseline_extra());
+        .saturating_add(self.reviews_extra());
         if actual > self.budget.max_retained_report_bytes() {
             return Err(PolicyReportBuilderError::EmergencyReservationInvariant);
         }
@@ -4808,6 +4801,139 @@ mod tests {
             document.runs()[0].completion(),
             PolicyRunCompletion::Inconclusive { reasons }
                 if reasons.contains(&PolicyIncompleteReason::ReportRetentionBudget)
+        ));
+    }
+
+    /// Build a batch budget whose retained-bytes ceiling is exactly `bytes`,
+    /// with a matching per-policy ceiling so `PolicyBatchBudgetBuilder::build`
+    /// accepts it.
+    fn batch_budget_capped_at(bytes: usize) -> PolicyBatchBudget {
+        let per_policy = super::super::budget::PolicyBudget::builder()
+            .with_max_retained_report_bytes(bytes)
+            .unwrap()
+            .build()
+            .unwrap();
+        PolicyBatchBudget::builder()
+            .with_max_retained_report_bytes(bytes)
+            .unwrap()
+            .with_per_policy(per_policy)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// Retained bytes of an empty schema-version-3 document (no reviews, no
+    /// policies, default execution metadata): the base every `set_*` review
+    /// method charges a new review's bytes on top of.
+    fn empty_document_retained_bytes() -> usize {
+        PolicyReportBuilder::new(PolicyBatchBudget::default(), 0)
+            .unwrap()
+            .finish()
+            .unwrap()
+            .retained_size()
+    }
+
+    /// The smallest `max_retained_report_bytes` a zero-input builder can be
+    /// constructed with. Below this, construction itself fails preflight
+    /// (it reserves `PolicyExecutionMetadata::maximum_retained_size` and
+    /// `EMERGENCY_DIAGNOSTIC_ALLOWANCE` before any review exists), so the
+    /// tests below build exactly at this floor and rely on the review's own
+    /// bytes, not construction overhead, to trip the batch budget.
+    fn minimum_construction_budget() -> usize {
+        match PolicyReportBuilder::new(batch_budget_capped_at(0), 0) {
+            Err(PolicyReportBuilderError::SkeletonPreflightExceeded { required_bytes, .. }) => {
+                required_bytes
+            }
+            Ok(_) => panic!("a zero-byte budget unexpectedly allowed builder construction"),
+            Err(other) => panic!("expected a skeleton preflight floor, got: {other}"),
+        }
+    }
+
+    // The next three tests pin the single-accounting-site property from
+    // #1890: each optional review (diff, packs, baseline) is charged through
+    // the same `ensure_review_fits`/`reviews_extra` pair, so a review whose
+    // own bytes alone exceed the batch budget is rejected the same way -- a
+    // `BatchRetentionExceeded` naming exactly the empty-report bytes plus the
+    // review's own bytes -- regardless of which review kind pushed it over.
+    // Each review is oversized only in one owned string, kept well above the
+    // construction-time preflight floor so it, not that floor, is what trips
+    // the budget.
+
+    #[test]
+    fn set_diff_over_budget_hits_the_single_review_retention_treatment() {
+        let review = PolicyDiffReview::new(
+            "x".repeat(10_000),
+            "0".repeat(40),
+            false,
+            1,
+            0,
+            Vec::new(),
+            1,
+        );
+        let review_extra = retained_extra(&review);
+        assert!(review_extra > EMERGENCY_DIAGNOSTIC_ALLOWANCE);
+
+        let empty_bytes = empty_document_retained_bytes();
+        let max_bytes = minimum_construction_budget();
+        let mut builder = PolicyReportBuilder::new(batch_budget_capped_at(max_bytes), 0).unwrap();
+        assert!(matches!(
+            builder.set_diff(review),
+            Err(PolicyReportBuilderError::BatchRetentionExceeded {
+                retained_bytes,
+                max_bytes: reported_max,
+            }) if retained_bytes == empty_bytes + review_extra && reported_max == max_bytes
+        ));
+    }
+
+    #[test]
+    fn set_packs_over_budget_hits_the_single_review_retention_treatment() {
+        let review =
+            PolicyPackActivationReview::new("x".repeat(10_000), Vec::new(), true, Vec::new());
+        let review_extra = retained_extra(&review);
+        assert!(review_extra > EMERGENCY_DIAGNOSTIC_ALLOWANCE);
+
+        let empty_bytes = empty_document_retained_bytes();
+        let max_bytes = minimum_construction_budget();
+        let mut builder = PolicyReportBuilder::new(batch_budget_capped_at(max_bytes), 0).unwrap();
+        assert!(matches!(
+            builder.set_packs(review),
+            Err(PolicyReportBuilderError::BatchRetentionExceeded {
+                retained_bytes,
+                max_bytes: reported_max,
+            }) if retained_bytes == empty_bytes + review_extra && reported_max == max_bytes
+        ));
+    }
+
+    #[test]
+    fn set_baseline_over_budget_hits_the_single_review_retention_treatment() {
+        use super::super::baseline::parse_policy_baseline_document;
+
+        let document = parse_policy_baseline_document(
+            &json!({
+                "schema_version": 1,
+                "reason": "Onboarding acceptance",
+                "accepted_at": "2026-08-08",
+                "policies": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // `document_path` is a raw caller-supplied string, not JSON wire
+        // content, so it carries no schema length cap and can stand in for
+        // an oversized review here.
+        let review = PolicyBaselineReview::new(&"x".repeat(10_000), &document, Vec::new());
+        let review_extra = retained_extra(&review);
+        assert!(review_extra > EMERGENCY_DIAGNOSTIC_ALLOWANCE);
+
+        let empty_bytes = empty_document_retained_bytes();
+        let max_bytes = minimum_construction_budget();
+        let mut builder = PolicyReportBuilder::new(batch_budget_capped_at(max_bytes), 0).unwrap();
+        assert!(matches!(
+            builder.set_baseline(review),
+            Err(PolicyReportBuilderError::BatchRetentionExceeded {
+                retained_bytes,
+                max_bytes: reported_max,
+            }) if retained_bytes == empty_bytes + review_extra && reported_max == max_bytes
         ));
     }
 }

@@ -12,7 +12,7 @@
 
 use super::*;
 use crate::analyzer::ImportInfo;
-use crate::analyzer::jvm::external::JvmExternalType;
+use crate::analyzer::jvm::external::{JvmExternalDeclarations, JvmExternalMember, JvmExternalType};
 use crate::analyzer::structural::resolution::{PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::get_definition::trace;
 use brokk_bifrost_jvm::java::graph_support::{
@@ -149,8 +149,18 @@ impl JavaAnalyzer {
         resolve_java_import_infos(self, imports)
     }
 
+    /// Resolve `raw_name` in `file` against the workspace and then the external
+    /// declaration surface.
+    ///
+    /// `packs` is the *dispatching* analyzer's activated semantic-model overlay,
+    /// passed in for the same reason `collect_java_semantic_diagnostics` takes
+    /// it as a parameter: activation publishes onto the analyzer a host asked,
+    /// which in a mixed JVM workspace is the `MultiAnalyzer` and never this Java
+    /// delegate. A caller that has no dispatching analyzer in hand passes
+    /// `None` and reads the artifact half alone.
     pub(crate) fn resolve_type_name_with_external(
         &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
         file: &ProjectFile,
         raw_name: &str,
     ) -> Option<JavaTypeResolution> {
@@ -163,7 +173,7 @@ impl JavaAnalyzer {
             return Some(JavaTypeResolution::Source(code_unit));
         }
 
-        let external = self.external_declaration_index();
+        let external = self.external_declarations(packs);
         if external.is_empty() {
             return None;
         }
@@ -173,69 +183,107 @@ impl JavaAnalyzer {
             && let Some(external_type) =
                 external.resolve_qualified_name(normalized, &access_package)
         {
-            return Some(JavaTypeResolution::External(external_type.clone()));
+            return Some(JavaTypeResolution::External(external_type));
         }
 
         if let Some(external_type) =
-            self.resolve_external_imports(file, normalized, &access_package)
+            self.resolve_external_imports(&external, file, normalized, &access_package)
         {
             return Some(JavaTypeResolution::External(external_type));
         }
 
         if let Some((first, rest)) = normalized.split_once('.')
             && let Some(owner) =
-                self.resolve_visible_external_simple_type(file, first, &access_package)
+                self.resolve_visible_external_simple_type(&external, file, first, &access_package)
         {
             let nested_fqn = format!("{}.{}", owner.fqn(), rest);
             if let Some(external_type) =
                 external.resolve_qualified_name(&nested_fqn, &access_package)
             {
-                return Some(JavaTypeResolution::External(external_type.clone()));
+                return Some(JavaTypeResolution::External(external_type));
             }
         }
 
         let same_package = java_same_package_fqn(self, file, normalized);
         if let Some(external_type) = external.resolve_same_package(&access_package, normalized) {
-            return Some(JavaTypeResolution::External(external_type.clone()));
+            return Some(JavaTypeResolution::External(external_type));
         }
 
         if same_package != normalized
             && let Some(external_type) =
                 external.resolve_qualified_name(&same_package, &access_package)
         {
-            return Some(JavaTypeResolution::External(external_type.clone()));
+            return Some(JavaTypeResolution::External(external_type));
         }
 
         external
             .resolve_java_lang(normalized)
-            .cloned()
             .map(JavaTypeResolution::External)
+    }
+
+    /// Resolve `raw_name` in `file` as a member spelling -- a written
+    /// `Owner.member` whose head is a type and whose last segment is a member
+    /// the external declaration surface declares (#1900).
+    ///
+    /// This runs only after [`JavaAnalyzer::resolve_type_name_with_external`]
+    /// has failed, because the same written dot spells a nested type, and a
+    /// nested type is decided by the type ladder. The owner is resolved through
+    /// that very ladder, so a member reaches the same declaration a type
+    /// spelling would; a workspace owner answers nothing here, because a
+    /// workspace type's members are indexed and the resolver found them or did
+    /// not.
+    ///
+    /// `packs` reaches here for the same reason it reaches
+    /// [`JavaAnalyzer::resolve_type_name_with_external`]: activation publishes
+    /// onto the dispatching analyzer, never onto this Java delegate.
+    pub(crate) fn resolve_member_name_with_external(
+        &self,
+        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+        file: &ProjectFile,
+        raw_name: &str,
+    ) -> Option<JvmExternalMember> {
+        let normalized = raw_name.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+        let external = self.external_declarations(packs.clone());
+        if external.is_empty() {
+            return None;
+        }
+        let access_package = self.package_name_of(file).unwrap_or_default();
+        external.resolve_member_spelling(normalized, &access_package, |owner_spelling| {
+            match self.resolve_type_name_with_external(packs, file, owner_spelling) {
+                Some(JavaTypeResolution::External(external_type)) => Some(external_type),
+                Some(JavaTypeResolution::Source(_)) | None => None,
+            }
+        })
     }
 
     fn resolve_visible_external_simple_type(
         &self,
+        external: &JvmExternalDeclarations<'_>,
         file: &ProjectFile,
         name: &str,
         access_package: &str,
     ) -> Option<JvmExternalType> {
-        if let Some(external_type) = self.resolve_external_imports(file, name, access_package) {
+        if let Some(external_type) =
+            self.resolve_external_imports(external, file, name, access_package)
+        {
             return Some(external_type);
         }
 
-        let external = self.external_declaration_index();
         external
             .resolve_same_package(access_package, name)
             .or_else(|| external.resolve_java_lang(name))
-            .cloned()
     }
 
     fn resolve_external_imports(
         &self,
+        external: &JvmExternalDeclarations<'_>,
         file: &ProjectFile,
         name: &str,
         access_package: &str,
     ) -> Option<JvmExternalType> {
-        let external = self.external_declaration_index();
         for import in self.inner.import_info_of(file) {
             let Some(import_path) = non_static_import_path(&import) else {
                 continue;
@@ -246,7 +294,7 @@ impl JavaAnalyzer {
                     && let Some(external_type) = external
                         .resolve_explicit_import(&import_path.render_segments("."), access_package)
                 {
-                    return Some(external_type.clone());
+                    return Some(external_type);
                 }
                 continue;
             }
@@ -270,7 +318,7 @@ impl JavaAnalyzer {
             match wildcard_match.as_ref() {
                 Some(existing) if existing.fqn() != external_type.fqn() => return None,
                 Some(_) => {}
-                None => wildcard_match = Some(external_type.clone()),
+                None => wildcard_match = Some(external_type),
             }
         }
 

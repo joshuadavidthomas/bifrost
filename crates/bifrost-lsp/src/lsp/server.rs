@@ -4246,7 +4246,7 @@ mod tests {
                 "pythonEnvironment": {
                     "implementation": "cpython",
                     "version": "3.12.3",
-                    "platform": "macos-arm64",
+                    "platform": "darwin",
                     "standardLibraryRoot": "stdlib",
                     "bundledStubRoots": ["stubs"],
                     "distributionRoots": ["site-packages"],

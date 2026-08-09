@@ -125,7 +125,10 @@ pub use global_usage_definition_index::{DefinitionIndexHandle, GlobalUsageDefini
 pub(crate) use brokk_bifrost_go::packages::{
     GO_MODULE_SCOPE_SEGMENT, GoModuleRoot, go_internal_import_allowed, go_module_roots,
 };
-pub use go::{GoAnalyzer, GoDependencyPackAdapter, resolve_go_semantic_pack_dependencies};
+pub use go::{
+    GoAnalyzer, GoDependencyPackAdapter, GoModulePackProducer, GoPinnedPackage,
+    resolve_go_semantic_pack_dependencies,
+};
 pub use i_analyzer::AnalyzerQueryScope;
 pub use i_analyzer::AnalyzerStreamingFileScope;
 pub use i_analyzer::{
@@ -165,10 +168,13 @@ pub(crate) use model::{CallableLinkage, CppFieldLinkage, CppTemplateMetadata};
 pub use multi_analyzer::resolve_analyzer;
 pub use multi_analyzer::{AnalyzerDelegate, MultiAnalyzer};
 pub use php::{
+    ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDependencyPackAdapter,
+    resolve_php_semantic_pack_dependencies,
+};
+pub use php::{
     PhpAnalyzer, PhpUseAliases, parse_php_use_aliases, parse_php_use_aliases_by_kind,
     parse_php_use_aliases_from_source, php_namespace_to_fq,
 };
-pub use php::{PhpDependencyPackAdapter, resolve_php_semantic_pack_dependencies};
 pub(crate) use pool_memo::PoolSafeMemo;
 pub use project::{
     BIFROST_IGNORE_FILE_NAME, DEFAULT_MAX_OVERLAY_BYTES, FileSetProject, FilesystemProject,
@@ -188,7 +194,9 @@ pub use python::{
     parse_python_import_bindings, parse_python_import_infos,
 };
 pub use ruby::RubyAnalyzer;
-pub use ruby::{RubyDependencyPackAdapter, resolve_ruby_semantic_pack_dependencies};
+pub use ruby::{
+    RubyDependencyPackAdapter, RubyGemArchivePackProducer, resolve_ruby_semantic_pack_dependencies,
+};
 pub(crate) use rust::is_rust_public_like_declaration;
 pub use rust::rust_is_field_declaration_name;
 pub use rust::{

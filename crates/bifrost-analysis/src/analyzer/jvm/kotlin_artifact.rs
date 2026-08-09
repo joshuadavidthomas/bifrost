@@ -529,6 +529,7 @@ fn entry_facts(
                 .collect(),
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
+            guard: None,
             locator: Locator::Source {
                 path: entry.to_owned(),
                 symbol: None,
@@ -697,6 +698,7 @@ fn entry_facts(
                 extension_receiver,
                 extension_receiver_constraints,
                 aliases: Vec::new(),
+                guard: None,
                 locator: Locator::Source {
                     path: entry.to_owned(),
                     symbol: None,
@@ -727,6 +729,7 @@ fn package_fact(entry: &str, name: &str) -> TypeFact {
         hierarchy: Vec::new(),
         aliases: vec![KOTLIN_PACKAGE_MARKER.to_owned()],
         extension_surfaces: Vec::new(),
+        guard: None,
         locator: Locator::Source {
             path: entry.to_owned(),
             symbol: None,

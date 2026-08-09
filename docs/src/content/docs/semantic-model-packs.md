@@ -518,12 +518,24 @@ discovers `sys.path`, starts Python, imports a module, executes package setup,
 or contacts a package index. It reads only `.pyi` and safe `.py` files plus
 static `.dist-info`/`.egg-info` metadata. Precedence is deterministic: bundled
 stubs, stub artifacts, inline `py.typed` source, then safe implementation
-source. Dynamic exports, unsupported guards, malformed files, and missing
-static surfaces remain partial coverage with diagnostics rather than invented
-declarations. Hosts activate the result explicitly with
+source. Dynamic exports, malformed files, and missing static surfaces remain
+partial coverage with diagnostics rather than invented declarations. Hosts
+activate the result explicitly with
 `WorkspaceAnalyzer::activate_python_environment_packs`; dependency files stay
 outside `Project::all_files()`, and external navigation uses `bifrost-model:`
 locations rather than synthetic workspace files.
+
+A stub declares part of its surface inside a `sys.version_info` or
+`sys.platform` block. The producer never evaluates such a block. It records the
+block's condition on each declaration the block encloses, as an inclusive
+minimum toolchain version, an exclusive maximum, and required or excluded
+activation targets. A condition it cannot express is recorded as an
+uninterpreted guard, which keeps the declaration and states that the pack read
+less than the whole condition. Activation then drops a declaration only when
+the pinned toolchain version or target *provably* fails a recorded constraint,
+so an unknown coordinate and an uninterpreted guard both keep the declaration.
+The declared `platform` is therefore the interpreter's own `sys.platform`
+value, the same vocabulary a stub's platform guard names.
 
 The LSP host accepts the same explicit boundary in initialization options. All
 paths are resolved from the workspace root; `semanticPackCatalog` is a
@@ -534,7 +546,7 @@ host-chosen writable catalog, never an interpreter or package-cache lookup.
   "pythonEnvironment": {
     "implementation": "cpython",
     "version": "3.12.3",
-    "platform": "macos-arm64",
+    "platform": "darwin",
     "standardLibraryRoot": "./.bifrost/python/stdlib",
     "bundledStubRoots": ["./.bifrost/python/stubs"],
     "distributionRoots": ["./.bifrost/python/site-packages"],

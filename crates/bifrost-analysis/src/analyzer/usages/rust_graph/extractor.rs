@@ -2096,6 +2096,12 @@ fn record_token_tree_static_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<
     // A macro token tree can put the owner path inside `$crate` or a token
     // repetition. Resolve that structured path before the member scan's
     // local owner-name checks, which cannot represent those raw token nodes.
+    //
+    // A resolved fqn names the target only when the target is the sole
+    // declaration that spells it. Two Cargo target roots can declare the same
+    // crate-relative fqn, and this path has no owner node to select between
+    // them, so an fqn that more than one declaration answers stays unproven
+    // and the structured owner scan above decides the site instead.
     for segment in
         resolve_rust_token_tree_paths(ctx.rust, ctx.support, ctx.refs, ctx.file, ctx.source, node)
     {
@@ -2104,11 +2110,15 @@ fn record_token_tree_static_member_hits(node: Node<'_>, ctx: &mut MemberScanCtx<
             RustTokenPathRole::Call | RustTokenPathRole::Value
         ) || simple_node_text(segment.node, ctx.source).as_deref() != Some(ctx.member_name)
             || segment.fqn != ctx.scan_target.fq_name()
-            || !ctx
-                .support
-                .fqn(&segment.fqn)
+        {
+            continue;
+        }
+        let candidates =
+            cargo_target_preferred_candidates(ctx.rust, ctx.file, ctx.support.fqn(&segment.fqn));
+        if candidates.is_empty()
+            || !candidates
                 .iter()
-                .any(|candidate| same_rust_declaration_identity(candidate, ctx.scan_target))
+                .all(|candidate| same_rust_declaration_identity(candidate, ctx.scan_target))
         {
             continue;
         }
@@ -2761,26 +2771,40 @@ fn structured_static_member_matches_target(
     associated_candidates_match_target(outcome, owner_node, Some(&owner), ctx)
 }
 
+/// `candidates` narrowed to the declarations that `file`'s own Cargo target
+/// root builds, when that root declares any of them.
+///
+/// A Rust fqn is a crate-relative module path, so a library root and a binary
+/// root in one workspace spell the same fqn for two different declarations.
+/// Equal fqns alone therefore admit a decoy from the other target; only the
+/// route from the referring file selects between them.
+fn cargo_target_preferred_candidates(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    candidates: Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
+    match rust.candidates_in_same_cargo_target_root(file, candidates.clone()) {
+        Some(physical) if !physical.is_empty() => physical,
+        _ => candidates,
+    }
+}
+
 fn exact_structured_static_owner(
     owner_node: Node<'_>,
     segments: &[Node<'_>],
     ctx: &MemberScanCtx<'_>,
 ) -> Option<CodeUnit> {
     let owner_fqn = structured_owner_candidate_fqn(owner_node, segments, ctx)?;
-    let mut candidates = ctx
-        .support
-        .fqn(&owner_fqn)
-        .into_iter()
-        .filter(|candidate| rust_is_type_definition(ctx.analyzer, candidate))
-        .filter_map(|candidate| canonical_rust_hierarchy_type(ctx.rust, candidate))
-        .collect::<Vec<_>>();
-    if let Some(physical) = ctx
-        .rust
-        .candidates_in_same_cargo_target_root(ctx.file, candidates.clone())
-        && !physical.is_empty()
-    {
-        candidates = physical;
-    }
+    let mut candidates = cargo_target_preferred_candidates(
+        ctx.rust,
+        ctx.file,
+        ctx.support
+            .fqn(&owner_fqn)
+            .into_iter()
+            .filter(|candidate| rust_is_type_definition(ctx.analyzer, candidate))
+            .filter_map(|candidate| canonical_rust_hierarchy_type(ctx.rust, candidate))
+            .collect(),
+    );
     candidates.sort();
     candidates.dedup();
     (candidates.len() == 1).then(|| candidates.remove(0))

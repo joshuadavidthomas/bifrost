@@ -413,8 +413,21 @@ impl SemanticModelOverlay {
                 return Err(SemanticModelOverlayBuildError::Cancelled);
             }
             if let Some((types, members, relations)) = shard.shard.payload().declaration_facts() {
-                type_ids.extend(types.iter().map(|record| record.id.clone()));
-                member_ids.extend(members.iter().map(|record| record.id.clone()));
+                // A guarded record the pinned activation coordinates exclude
+                // is not in the matcher indexes, so collecting its identity
+                // here would only resolve to nothing (#1899).
+                type_ids.extend(
+                    types
+                        .iter()
+                        .filter(|record| !shard.guard_excludes(record.guard.as_ref()))
+                        .map(|record| record.id.clone()),
+                );
+                member_ids.extend(
+                    members
+                        .iter()
+                        .filter(|record| !shard.guard_excludes(record.guard.as_ref()))
+                        .map(|record| record.id.clone()),
+                );
                 relation_ids.extend(relations.iter().map(|record| record.id.clone()));
             }
         }

@@ -13,12 +13,8 @@
 //! `resolved_imports` is the deepest, and its builder resolves through the
 //! workspace definition index rather than through another cell.
 //!
-//! Three members carry more than their signature:
+//! Two members carry more than their signature:
 //!
-//! * [`JavaSource::external_boundary_evidence`] reads `JvmExternalDeclarationIndex`,
-//!   which imports `semantic_model` and therefore stays in
-//!   `brokk-bifrost-analysis`. The evidence it returns is core-typed, so the
-//!   answer crosses even though the index cannot.
 //! * [`JavaSource::trace_type_name_tier`] and
 //!   [`JavaSource::trace_explicit_import_win`] hand a resolution decision to the
 //!   definition route's trace recorder, whose candidate vocabulary is
@@ -35,7 +31,7 @@ use brokk_bifrost_core::analyzer::capabilities::{
 };
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
-use brokk_bifrost_core::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier};
+use brokk_bifrost_core::analyzer::structural::resolution::PrecedenceTier;
 use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -90,19 +86,6 @@ pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
 
     /// The request-scoped prepared syntax tree for `file`, when one is available.
     fn prepared_syntax(&self, file: &ProjectFile) -> Option<Arc<PreparedSyntaxTree>>;
-
-    /// How far a lookup for `name` from `file` could see past the workspace, and
-    /// the external type it landed on when it landed on one. See this module's
-    /// note: the index behind it stays in `brokk-bifrost-analysis`.
-    ///
-    /// This is the *resolver's* question, and it builds the external index on
-    /// demand to answer it. Diagnostics must not: see the two `retained_`
-    /// members below.
-    fn external_boundary_evidence(
-        &self,
-        file: &ProjectFile,
-        name: &str,
-    ) -> (BoundaryStatus, Option<String>);
 
     /// What the analyzer has retained of the JVM dependency surface, read
     /// without building it. See [`crate::proof`] on why a diagnostic peeks.

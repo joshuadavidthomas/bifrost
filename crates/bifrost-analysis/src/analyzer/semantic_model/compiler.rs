@@ -250,6 +250,7 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                     fact.aliases.dedup();
                     fact.extension_surfaces.sort_unstable();
                     fact.extension_surfaces.dedup();
+                    normalize_guard(fact.guard.as_mut());
                     fact.hierarchy.sort_by_key(hierarchy_sort_key);
                     fact.type_parameter_constraints
                         .sort_by(|left, right| left.parameter.cmp(&right.parameter));
@@ -259,6 +260,7 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                 for fact in &mut *members {
                     fact.aliases.sort_unstable();
                     fact.aliases.dedup();
+                    normalize_guard(fact.guard.as_mut());
                 }
                 types.sort_by(|left, right| left.id.cmp(&right.id));
                 members.sort_by(|left, right| left.id.cmp(&right.id));
@@ -288,6 +290,18 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
     }
     pack.shards.sort_by(|left, right| left.id.cmp(&right.id));
     pack
+}
+
+/// A guard's target lists are sets, so one canonical order keeps two producers
+/// that read the same condition at the same content digest.
+fn normalize_guard(guard: Option<&mut DeclarationGuard>) {
+    let Some(guard) = guard else {
+        return;
+    };
+    for targets in [&mut guard.required_targets, &mut guard.excluded_targets] {
+        targets.sort_unstable();
+        targets.dedup();
+    }
 }
 
 fn selector_sort_key(selector: &ActivationSelector) -> Vec<u8> {

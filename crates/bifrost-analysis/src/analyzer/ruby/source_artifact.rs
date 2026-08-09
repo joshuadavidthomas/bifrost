@@ -291,6 +291,7 @@ fn project_constant_assignment(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        guard: None,
         locator: locator(archive_sha256, entry_path, name),
     });
 }
@@ -388,6 +389,7 @@ fn project_type<'tree>(
         hierarchy,
         aliases: Vec::new(),
         extension_surfaces: Vec::new(),
+        guard: None,
         locator: locator(archive_sha256, entry_path, &namespace.join("::")),
     });
     if let Some(body) = work.node.child_by_field_name("body") {
@@ -471,6 +473,7 @@ fn project_method(
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
         aliases: Vec::new(),
+        guard: None,
         locator: locator(archive_sha256, entry_path, name),
     })
 }
@@ -575,6 +578,7 @@ fn project_call(
                 extension_receiver: None,
                 extension_receiver_constraints: Vec::new(),
                 aliases: Vec::new(),
+                guard: None,
                 locator: locator(archive_sha256, entry_path, &name),
             });
         }
