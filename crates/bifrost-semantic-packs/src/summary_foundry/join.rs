@@ -341,7 +341,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::summary_foundry::ir::{FoundryEntryBuilder, FoundrySignature, FoundryTarget};
+    use crate::summary_foundry::ir::{
+        FoundryAccessPath, FoundryCompleteness, FoundryDerivation, FoundryDerivationBoundary,
+        FoundryEntryBuilder, FoundryFineGrainedTransfer, FoundrySelector, FoundrySignature,
+        FoundryTarget,
+    };
 
     fn target(member: &str, types: &[&str]) -> FoundryTarget {
         FoundryTarget {
@@ -365,6 +369,82 @@ mod tests {
             },
         });
         builder.finish(corpus, target(member, types), Some(types.len() as u32))
+    }
+
+    /// One derived entry that states the same argument-level transfer as the
+    /// corpus while knowing which element of the parameter carries it.
+    fn derived_entry_with_element_granularity(member: &str, types: &[&str]) -> FoundryEntry {
+        let mut entry = entry(FoundryCorpus::Derived, member, types, true);
+        entry.derivation = Some(FoundryDerivation {
+            completeness: FoundryCompleteness::Partial,
+            unproven_transfers: 0,
+            closure_procedures: 1,
+            boundaries: vec![FoundryDerivationBoundary::UnresolvedCall],
+            fine_grained: vec![FoundryFineGrainedTransfer {
+                input: FoundryAccessPath {
+                    port: "receiver".to_owned(),
+                    selectors: vec![FoundrySelector::AnyIndex],
+                },
+                output: FoundryAccessPath {
+                    port: "normal_return".to_owned(),
+                    selectors: Vec::new(),
+                },
+                exit_kind: "normal".to_owned(),
+            }],
+        });
+        entry
+    }
+
+    #[test]
+    fn an_agreement_says_when_it_holds_only_at_the_argument_level_projection() {
+        let codeql = [entry(FoundryCorpus::Codeql, "concat", &["String"], true)];
+        let derived = [derived_entry_with_element_granularity(
+            "concat",
+            &["String"],
+        )];
+
+        let join = join_corpora(&[
+            (FoundryCorpus::Codeql, &codeql),
+            (FoundryCorpus::Derived, &derived),
+        ]);
+
+        assert_eq!(join.agreement_count, 1);
+        assert_eq!(join.agreements_at_projection_only, 1);
+        assert!(join.agreements[0].at_projection_only);
+        assert_eq!(join.dispute_count, 0);
+    }
+
+    #[test]
+    fn a_derived_view_carries_its_boundaries_and_its_finer_flows() {
+        // Different arities, so the two keys never meet. The point is that a
+        // derived view states its typed extras wherever it is classified, and a
+        // translated corpus view never invents them.
+        let codeql = [entry(FoundryCorpus::Codeql, "trim", &[], true)];
+        let derived = [derived_entry_with_element_granularity("trim", &["String"])];
+
+        let join = join_corpora(&[
+            (FoundryCorpus::Codeql, &codeql),
+            (FoundryCorpus::Derived, &derived),
+        ]);
+
+        let derived_view = join
+            .gaps
+            .iter()
+            .find_map(|gap| gap.views.get("derived"))
+            .expect("the derived entry is classified");
+        assert_eq!(
+            derived_view.qualified_flows,
+            vec!["receiver.Element->normal_return@normal".to_owned()]
+        );
+        assert_eq!(derived_view.boundaries, vec!["unresolved_call".to_owned()]);
+
+        let codeql_view = join
+            .gaps
+            .iter()
+            .find_map(|gap| gap.views.get("codeql"))
+            .expect("the corpus entry is classified");
+        assert!(codeql_view.qualified_flows.is_empty());
+        assert!(codeql_view.boundaries.is_empty());
     }
 
     #[test]

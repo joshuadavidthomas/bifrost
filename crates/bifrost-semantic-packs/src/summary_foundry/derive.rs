@@ -206,7 +206,7 @@ fn derive_procedure(
         &mut semantic_budget,
         &cancellation,
         &mut boundaries,
-    )?;
+    );
 
     let entry_point = root
         .point_handle(root.semantics().entry_point())
@@ -655,7 +655,9 @@ impl ClosureInputs {
 /// aborts on the first interrupted oracle outcome because a policy verdict must
 /// not rest on a partial input; this one records the interruption as typed
 /// incompleteness on the entry and keeps going, because a partial derivation
-/// that names its boundary is exactly the artifact this stage ships.
+/// that names its boundary is exactly the artifact this stage ships. A provider
+/// error is treated the same way: over a whole standard library it is a finding
+/// about one target, not a reason to stop deriving the rest.
 fn discover_closure(
     analyzer: &WorkspaceAnalyzer,
     root: &ProcedureHandle,
@@ -664,7 +666,7 @@ fn discover_closure(
     semantic_budget: &mut SemanticBudget,
     cancellation: &CancellationToken,
     boundaries: &mut BTreeSet<FoundryDerivationBoundary>,
-) -> Result<ClosureInputs, FoundryError> {
+) -> ClosureInputs {
     let oracle = analyzer.semantic_oracle_provider();
     let context = OracleCallContext::empty();
     let mut pending = vec![root.clone()];
@@ -684,15 +686,19 @@ fn discover_closure(
             break;
         }
 
-        let outcome = oracle
-            .procedure_relations(
-                &procedure,
-                &context,
-                &mut SemanticRequest::new(semantic_budget, cancellation),
-            )
-            .map_err(|error| FoundryError::Derivation {
-                detail: format!("value-flow discovery failed: {error}"),
-            })?;
+        let outcome = match oracle.procedure_relations(
+            &procedure,
+            &context,
+            &mut SemanticRequest::new(semantic_budget, cancellation),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                boundaries.insert(FoundryDerivationBoundary::EngineRejected {
+                    detail: format!("relations: {error}"),
+                });
+                continue;
+            }
+        };
         let status = SemanticInputStatus::from_outcome(&outcome);
         record_status(boundaries, status);
         let Some(snapshot) = outcome.available_value().cloned() else {
@@ -707,14 +713,18 @@ fn discover_closure(
             let call = procedure
                 .call_site_handle(call_row.id)
                 .expect("a live procedure owns each retained call site");
-            let dispatch = oracle
-                .resolve_call(
-                    &call,
-                    &mut SemanticRequest::new(semantic_budget, cancellation),
-                )
-                .map_err(|error| FoundryError::Derivation {
-                    detail: format!("call dispatch failed: {error}"),
-                })?;
+            let dispatch = match oracle.resolve_call(
+                &call,
+                &mut SemanticRequest::new(semantic_budget, cancellation),
+            ) {
+                Ok(dispatch) => dispatch,
+                Err(error) => {
+                    boundaries.insert(FoundryDerivationBoundary::EngineRejected {
+                        detail: format!("dispatch: {error}"),
+                    });
+                    continue;
+                }
+            };
             let dispatch_status = SemanticInputStatus::from_outcome(&dispatch);
             record_status(boundaries, dispatch_status);
             let Some(dispatch) = dispatch.available_value() else {
@@ -729,16 +739,20 @@ fn discover_closure(
                 if !seen_bindings.insert(key) {
                     continue;
                 }
-                let outcome = oracle
-                    .call_bindings(
-                        &call,
-                        candidate,
-                        &context,
-                        &mut SemanticRequest::new(semantic_budget, cancellation),
-                    )
-                    .map_err(|error| FoundryError::Derivation {
-                        detail: format!("call binding failed: {error}"),
-                    })?;
+                let outcome = match oracle.call_bindings(
+                    &call,
+                    candidate,
+                    &context,
+                    &mut SemanticRequest::new(semantic_budget, cancellation),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        boundaries.insert(FoundryDerivationBoundary::EngineRejected {
+                            detail: format!("binding: {error}"),
+                        });
+                        continue;
+                    }
+                };
                 let status = dispatch_status.merge(SemanticInputStatus::from_outcome(&outcome));
                 record_status(boundaries, status);
                 if let Some(binding) = outcome.available_value().cloned() {
@@ -748,12 +762,12 @@ fn discover_closure(
             }
         }
     }
-    Ok(ClosureInputs {
+    ClosureInputs {
         snapshots,
         bindings,
         procedures: seen.len(),
         root_snapshot,
-    })
+    }
 }
 
 fn record_status(
