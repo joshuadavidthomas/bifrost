@@ -14,17 +14,24 @@ use brokk_bifrost_core::analyzer::CodeUnitIndex;
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::model::CodeUnitType;
 use brokk_bifrost_core::analyzer::symbol_path::{parse_symbol_path, strip_raw_identifier_prefix};
-use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ExportIndex, ImportKind};
+use brokk_bifrost_core::analyzer::usages::model::{
+    ExportEntry, ExportIndex, ImportBinding, ImportKind,
+};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::profiling;
 use rayon::prelude::*;
 use std::collections::{BTreeSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use tree_sitter::Node;
 
-use crate::cargo_routes::{RustCargoRouteIndex, RustCargoRouteKind, RustCargoTargetRelation};
-use crate::declarations::rust_package_name;
+use crate::cargo_routes::{
+    RustCargoRouteIndex, RustCargoRouteKind, RustCargoTargetRelation, rust_static_string_literal,
+};
+use crate::declarations::{
+    rust_macro_invocation_arguments, rust_package_name, rust_unqualified_macro_invocation_name,
+};
 use crate::graph_support::{
     RustSource, RustUsageSource, export_index_of_declarations, is_external_module_declaration,
     is_rust_macro_export_declaration, is_rust_trait_declaration,
@@ -38,7 +45,7 @@ use crate::imports::{
     rust_crate_root_package, rust_import_projection, rust_module_extents,
     rust_target_kind_root_package,
 };
-use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
+use crate::lexical_scope::{RustCfgCondition, lexical_package_at, rust_cfg_condition};
 
 /// How a local binding in an importer refers to its target: a named import
 /// (`use path::Item;`) or a namespace import (`use crate::module;`). A glob
@@ -278,6 +285,45 @@ impl Domain {
     }
 }
 
+/// Test visibility when Cargo uses a target root and its shared modules use a
+/// kind-root module key.
+fn domain_contains_module_from_target_roots(
+    domain: &Domain,
+    target_roots: &[ModuleKey],
+    caller_module: &ModuleKey,
+) -> bool {
+    match domain {
+        Domain::Public => true,
+        Domain::Crate(crate_package) => target_roots
+            .iter()
+            .any(|root| root.crate_root == *crate_package),
+        Domain::Module(domain_module) => target_roots.iter().any(|root| {
+            root.crate_root == domain_module.crate_root
+                && caller_module
+                    .components
+                    .starts_with(&domain_module.components)
+        }),
+    }
+}
+
+fn domain_contains_module_for_file(
+    domain: &Domain,
+    rust: &dyn RustSource,
+    caller_file: &ProjectFile,
+    caller_module: &ModuleKey,
+) -> bool {
+    if domain.contains_module(caller_module) {
+        return true;
+    }
+    let target_roots = rust
+        .cargo_routes()
+        .target_roots_for_file(caller_file)
+        .iter()
+        .map(|root| ModuleKey::new(root, &rust_package_name(root)))
+        .collect::<Vec<_>>();
+    domain_contains_module_from_target_roots(domain, &target_roots, caller_module)
+}
+
 pub struct RustBindingSeeds {
     roots: BTreeSet<CodeUnit>,
     root_origins: HashSet<RustSymbolIdentity>,
@@ -437,6 +483,45 @@ impl RustPhysicalOwnerIndex {
     }
 }
 
+/// The lexical owner route for a physical file consumed by `include!(...)`.
+///
+/// The declaration index keeps the included file's physical identity. Rust
+/// resolves its imports at the macro host, so this route carries the crate and
+/// module package that the included tokens inherit from that host.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RustIncludeRoute {
+    pub root_file: ProjectFile,
+    pub crate_package: String,
+    pub module_package: String,
+    pub host_bindings: Vec<RustIncludeHostBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RustIncludeHostBinding {
+    pub local_name: String,
+    pub module_specifier: String,
+    pub imported_name: Option<String>,
+    pub module_package: String,
+    pub scope_start: usize,
+    pub kind: ImportKind,
+}
+
+#[derive(Debug, Clone)]
+struct RustIncludeEdge {
+    target_file: ProjectFile,
+    include_start: usize,
+    host_bindings: Vec<RustIncludeHostBindingSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RustIncludeHostBindingSpec {
+    local_name: String,
+    module_specifier: String,
+    imported_name: Option<String>,
+    scope_start: usize,
+    kind: ImportKind,
+}
+
 #[derive(Debug)]
 pub enum RustReferenceResolution {
     Exact(RustSymbolIdentity),
@@ -505,6 +590,8 @@ pub struct RustUsageIndex {
     pub origin_routes_by_file: HashMap<ProjectFile, HashMap<String, Vec<RustOriginRoute>>>,
     pub macro_visible_ranges: RustMacroVisibleRanges,
     pub module_aliases: RustModuleAliasRoutes,
+    /// Structured lexical routes for physical files consumed by `include!`.
+    pub include_routes: HashMap<ProjectFile, Vec<RustIncludeRoute>>,
     pub module_files: RustModuleFiles,
 }
 
@@ -1010,14 +1097,30 @@ impl RustModuleAliasRoutes {
         ) {
             resolve_rust_module_segments_with_crate(importing_module, &crate_package, segments)
         } else {
-            Some(if importing_module.is_empty() {
-                segments.join(".")
-            } else {
-                format!("{importing_module}.{}", segments.join("."))
-            })
+            None
         };
-        if let Some(owner_relative) = owner_relative {
-            let candidate = ModuleKey::new(importing_file, &owner_relative);
+        let owner_candidates = owner_relative
+            .map(|owner_relative| vec![ModuleKey::new(importing_file, &owner_relative)])
+            .unwrap_or_else(|| {
+                // A module alias is visible in its declaring module and all
+                // child modules. Try the current module first, then each
+                // lexical ancestor, so aliases declared at a crate root (for
+                // example `extern crate dep as alias`) remain available to
+                // nested modules without widening visibility to sibling crates.
+                let module = ModuleKey::new(importing_file, importing_module);
+                (0..=module.components.len())
+                    .rev()
+                    .map(|length| ModuleKey {
+                        crate_root: module.crate_root.clone(),
+                        components: module.components[..length]
+                            .iter()
+                            .cloned()
+                            .chain(segments.iter().cloned())
+                            .collect(),
+                    })
+                    .collect()
+            });
+        for candidate in owner_candidates {
             let importing_key = ModuleKey::new(importing_file, importing_module);
             let longest = self
                 .by_alias
@@ -1085,6 +1188,141 @@ impl RustModuleAliasRoutes {
 }
 
 impl RustUsageIndex {
+    /// Return the immutable include-owner routes for `file`.
+    pub fn include_routes_for(&self, file: &ProjectFile) -> &[RustIncludeRoute] {
+        self.include_routes
+            .get(file)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn include_module_routes(
+        &self,
+        route: &RustIncludeRoute,
+        source: &str,
+        scope_start: usize,
+        module_specifier: &str,
+    ) -> Vec<RustResolvedModuleRoute> {
+        let lexical_package = lexical_package_at(&route.module_package, source, scope_start);
+        let segments = parse_symbol_path(Language::Rust, module_specifier);
+        self.module_files
+            .resolve_segments(&route.root_file, &lexical_package, &segments)
+    }
+
+    /// Resolve an import binder through an include route to canonical value
+    /// identities. The export walk keeps glob and re-export resolution in the
+    /// same module/Cargo graph as normal Rust usage analysis.
+    pub fn include_import_target_identities(
+        &self,
+        rust: &dyn RustSource,
+        route: &RustIncludeRoute,
+        source: &str,
+        scope_start: usize,
+        binding: &ImportBinding,
+        target_identifier: &str,
+    ) -> HashSet<RustSymbolIdentity> {
+        if binding.kind == ImportKind::Namespace {
+            let segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
+            let Some((target_name, module_segments)) = segments.split_last() else {
+                return HashSet::default();
+            };
+            let module_specifier = module_segments.join("::");
+            return self
+                .include_module_routes(route, source, scope_start, &module_specifier)
+                .into_iter()
+                .filter_map(|resolved| {
+                    self.declaration_identities
+                        .values()
+                        .find(|identity| {
+                            identity.namespace == RustSymbolNamespace::Value
+                                && identity.file == resolved.target_file
+                                && identity.module == resolved.target_module
+                                && identity.name == *target_name
+                        })
+                        .cloned()
+                })
+                .collect();
+        }
+        let Some(imported_name) = (match binding.kind {
+            ImportKind::Named => binding.imported_name.as_deref(),
+            ImportKind::Glob => Some(target_identifier),
+            _ => None,
+        }) else {
+            return HashSet::default();
+        };
+        let mut targets = HashSet::default();
+        for resolved in
+            self.include_module_routes(route, source, scope_start, &binding.module_specifier)
+        {
+            let module_files = vec![resolved.target_file.clone()];
+            for (target_file, target_name) in
+                self.export_targets_from_files(rust, &module_files, imported_name)
+            {
+                if let Some(identity) = self.declaration_identities.values().find(|identity| {
+                    identity.namespace == RustSymbolNamespace::Value
+                        && identity.file == target_file
+                        && identity.name == target_name
+                }) {
+                    targets.insert(identity.clone());
+                }
+            }
+            if let Some(identity) = self.declaration_identities.values().find(|identity| {
+                identity.namespace == RustSymbolNamespace::Value
+                    && identity.file == resolved.target_file
+                    && identity.module == resolved.target_module
+                    && identity.name == imported_name
+            }) {
+                targets.insert(identity.clone());
+            }
+        }
+        targets
+    }
+
+    /// Resolve a qualified path whose first segment comes from a host import.
+    pub fn include_path_target_identities(
+        &self,
+        route: &RustIncludeRoute,
+        binding: &RustIncludeHostBinding,
+        suffix: &[&str],
+    ) -> HashSet<RustSymbolIdentity> {
+        let module_segments = parse_symbol_path(Language::Rust, &binding.module_specifier);
+        if module_segments.is_empty() {
+            return HashSet::default();
+        }
+        let mut member_segments = Vec::new();
+        if let Some(imported_name) = &binding.imported_name {
+            if imported_name.is_empty() {
+                return HashSet::default();
+            }
+            member_segments.push(imported_name.clone());
+        }
+        for segment in suffix {
+            if segment.is_empty() {
+                return HashSet::default();
+            }
+            member_segments.push((*segment).to_string());
+        }
+        let Some(target_name) = member_segments.pop() else {
+            return HashSet::default();
+        };
+        self.module_files
+            .resolve_segments(&route.root_file, &binding.module_package, &module_segments)
+            .into_iter()
+            .filter_map(|resolved| {
+                let target_module = resolved.target_module.with_suffix(&member_segments);
+                self.declaration_identities
+                    .values()
+                    .find(|identity| {
+                        identity.namespace == RustSymbolNamespace::Value
+                            && identity.file == resolved.target_file
+                            && identity.module == target_module
+                            && identity.name == target_name
+                    })
+                    .cloned()
+            })
+            .collect()
+    }
+
     pub fn exact_root_for_resolution(
         &self,
         resolution: &RustReferenceResolution,
@@ -1131,9 +1369,9 @@ impl RustUsageIndex {
         self.module_domains
             .get(&identity.module)
             .is_some_and(|domains| {
-                domains
-                    .iter()
-                    .any(|domain| domain.contains_module(caller_module))
+                domains.iter().any(|domain| {
+                    domain_contains_module_for_file(domain, rust, caller_file, caller_module)
+                })
             })
             || self
                 .physical_roots
@@ -1206,9 +1444,12 @@ impl RustUsageIndex {
                 }
             }
         };
-        let Some(domain) =
-            direct_import_scope_for_module(declaration.source(), &owner.package(), visibility)
-        else {
+        let Some(domain) = direct_import_scope_for_module(
+            declaration.source(),
+            &owner.package(),
+            visibility,
+            self.actual_crate_roots.contains(declaration.source()),
+        ) else {
             return false;
         };
         if domain == Domain::Public {
@@ -1222,7 +1463,7 @@ impl RustUsageIndex {
                 .cargo_routes()
                 .files_share_target(declaration.source(), caller_file)
                 == Some(true))
-            && domain.contains_module(caller_module)
+            && domain_contains_module_for_file(&domain, rust, caller_file, caller_module)
     }
 
     pub fn build(rust: &dyn RustSource, parallel: bool) -> Self {
@@ -1248,6 +1489,7 @@ impl RustUsageIndex {
             value_constructor_identities: Vec<(CodeUnit, RustSymbolIdentity)>,
             exports: ExportIndex,
             imports: Vec<RustProjectedImport>,
+            include_edges: Vec<RustIncludeEdge>,
         }
 
         let _build_scope = profiling::scope("RustUsageIndex::build");
@@ -1259,6 +1501,8 @@ impl RustUsageIndex {
             .collect();
         let mut exports_by_file: HashMap<ProjectFile, ExportIndex> = HashMap::default();
         let mut imports_by_file: HashMap<ProjectFile, Vec<RustProjectedImport>> =
+            HashMap::default();
+        let mut include_edges_by_file: HashMap<ProjectFile, Vec<RustIncludeEdge>> =
             HashMap::default();
         let mut declaration_domains: HashMap<RustSymbolIdentity, Vec<Domain>> = HashMap::default();
         let mut declaration_identities: HashMap<CodeUnit, RustSymbolIdentity> = HashMap::default();
@@ -1275,7 +1519,7 @@ impl RustUsageIndex {
         };
         keep_going().then_some(())?;
         let mut module_files = RustModuleFiles::new(&files, cargo_routes);
-        let actual_crate_roots = {
+        let actual_crate_roots: HashSet<ProjectFile> = {
             let _scope = profiling::scope("RustUsageIndex::build::crate_roots");
             let is_crate_root = |file: &&ProjectFile| {
                 rust_package_name(file) == rust_crate_root_package(file)
@@ -1373,7 +1617,12 @@ impl RustUsageIndex {
                     rust_value_constructor_visibilities(node, syntax.source())?
                         .into_iter()
                         .map(|visibility| {
-                            direct_import_scope_for_module(file, &owner.package(), visibility)
+                            direct_import_scope_for_module(
+                                file,
+                                &owner.package(),
+                                visibility,
+                                actual_crate_roots.contains(file),
+                            )
                         })
                         .try_fold(Domain::Public, |effective, domain| {
                             effective.intersect(&domain?)
@@ -1388,6 +1637,7 @@ impl RustUsageIndex {
                         file,
                         &owner.package(),
                         rust_declaration_visibility(rust, declaration),
+                        actual_crate_roots.contains(file),
                     )
                 };
                 if let Some(domain) = declaration_domain {
@@ -1415,6 +1665,10 @@ impl RustUsageIndex {
             }
             facts.exports = export_index_of_declarations(rust, file, &declarations);
             facts.imports = imports;
+            facts.include_edges = prepared
+                .as_ref()
+                .map(|syntax| rust_include_edges(file, syntax.tree().root_node(), syntax.source()))
+                .unwrap_or_default();
             facts.declarations = declarations;
             Some(facts)
         };
@@ -1455,6 +1709,7 @@ impl RustUsageIndex {
             value_constructor_identities.extend(facts.value_constructor_identities);
             exports_by_file.insert(file.clone(), facts.exports);
             imports_by_file.insert(file.clone(), facts.imports);
+            include_edges_by_file.insert(file.clone(), facts.include_edges);
             module_files.index_inline_modules(file_id, &facts.declarations);
         }
         drop(per_file_scope);
@@ -1468,6 +1723,7 @@ impl RustUsageIndex {
                 &declaration.declaring_file,
                 &declaration.declaring_module,
                 declaration.visibility.clone(),
+                actual_crate_roots.contains(&declaration.declaring_file),
             ) else {
                 continue;
             };
@@ -1489,6 +1745,20 @@ impl RustUsageIndex {
                 &physical_roots,
                 &declaration_identities,
                 &actual_crate_roots,
+                keep_going,
+            )?
+        };
+        keep_going().then_some(())?;
+        let include_routes = {
+            let _scope = profiling::scope("RustUsageIndex::build::include_routes");
+            build_include_routes(
+                rust,
+                &files,
+                &physical_roots,
+                &actual_crate_roots,
+                &physical_owners,
+                &module_files,
+                &include_edges_by_file,
                 keep_going,
             )?
         };
@@ -1573,6 +1843,7 @@ impl RustUsageIndex {
             origin_routes_by_file,
             macro_visible_ranges,
             module_aliases,
+            include_routes,
             module_files,
         })
     }
@@ -1927,13 +2198,255 @@ fn effective_module_domains(
     effective
 }
 
+fn single_named_child(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    let mut children = node.named_children(&mut cursor);
+    let child = children.next()?;
+    children.next().is_none().then_some(child)
+}
+
+fn rust_include_host_bindings(
+    root: Node<'_>,
+    source: &str,
+    base_module: &str,
+    include_start: usize,
+) -> Vec<RustIncludeHostBindingSpec> {
+    let mut bindings = Vec::new();
+    for projected in rust_import_projection(root, source, base_module) {
+        let (scope_start, scope_end) = match projected.owner {
+            RustImportOwner::Module { start, end, .. } => (start, end),
+            RustImportOwner::LocalOnly {
+                module_start,
+                module_end,
+                ..
+            } => (module_start, module_end),
+        };
+        if !(scope_start <= include_start && include_start < scope_end) {
+            continue;
+        }
+        let (local_name, module_specifier, imported_name, kind) =
+            if projected.import.info.is_wildcard {
+                (
+                    "*".to_string(),
+                    projected.import.path.join("::"),
+                    None,
+                    ImportKind::Glob,
+                )
+            } else if projected.import.is_extern_crate || projected.import.path.len() <= 1 {
+                let Some(local_name) = projected.import.info.local_name() else {
+                    continue;
+                };
+                (
+                    local_name.to_string(),
+                    projected.import.path.join("::"),
+                    None,
+                    ImportKind::Namespace,
+                )
+            } else {
+                let Some((imported_name, module_path)) = projected.import.path.split_last() else {
+                    continue;
+                };
+                let Some(local_name) = projected.import.info.local_name() else {
+                    continue;
+                };
+                (
+                    local_name.to_string(),
+                    module_path.join("::"),
+                    Some(imported_name.clone()),
+                    ImportKind::Named,
+                )
+            };
+        if module_specifier.is_empty() {
+            continue;
+        }
+        bindings.push(RustIncludeHostBindingSpec {
+            local_name,
+            module_specifier,
+            imported_name,
+            scope_start,
+            kind,
+        });
+    }
+    bindings.sort_by(|left, right| {
+        left.scope_start
+            .cmp(&right.scope_start)
+            .then_with(|| left.local_name.cmp(&right.local_name))
+            .then_with(|| left.module_specifier.cmp(&right.module_specifier))
+    });
+    bindings.dedup();
+    bindings
+}
+
+fn rust_include_edges(file: &ProjectFile, root: Node<'_>, source: &str) -> Vec<RustIncludeEdge> {
+    let mut edges = Vec::new();
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "macro_invocation"
+            && rust_unqualified_macro_invocation_name(node, source) == Some("include")
+            && let Some(arguments) = rust_macro_invocation_arguments(node)
+            && let Some(literal) = single_named_child(arguments)
+            && let Some(relative_path) = rust_static_string_literal(literal, source)
+            && !relative_path.is_empty()
+            && !Path::new(&relative_path).is_absolute()
+        {
+            edges.push(RustIncludeEdge {
+                target_file: ProjectFile::new(
+                    file.root().to_path_buf(),
+                    file.parent().join(relative_path),
+                ),
+                include_start: node.start_byte(),
+                host_bindings: rust_include_host_bindings(
+                    root,
+                    source,
+                    &rust_package_name(file),
+                    node.start_byte(),
+                ),
+            });
+        }
+        let mut cursor = node.walk();
+        pending.extend(node.named_children(&mut cursor));
+    }
+    edges.sort_by(|left, right| {
+        left.target_file
+            .cmp(&right.target_file)
+            .then_with(|| left.include_start.cmp(&right.include_start))
+    });
+    edges.dedup_by(|left, right| {
+        left.target_file == right.target_file
+            && left.include_start == right.include_start
+            && left.host_bindings == right.host_bindings
+    });
+    edges
+}
+
+fn build_include_routes(
+    rust: &dyn RustSource,
+    files: &[ProjectFile],
+    physical_roots: &HashMap<ProjectFile, ModuleKey>,
+    actual_crate_roots: &HashSet<ProjectFile>,
+    physical_owners: &RustPhysicalOwnerIndex,
+    module_files: &RustModuleFiles,
+    edges_by_file: &HashMap<ProjectFile, Vec<RustIncludeEdge>>,
+    keep_going: &impl Fn() -> bool,
+) -> Option<HashMap<ProjectFile, Vec<RustIncludeRoute>>> {
+    let mut pending = VecDeque::new();
+    for file in files {
+        keep_going().then_some(())?;
+        let mut roots = HashSet::default();
+        if actual_crate_roots.contains(file) {
+            roots.insert(file.clone());
+        }
+        roots.extend(
+            physical_owners
+                .roots_by_file
+                .get(file)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        roots.extend(module_files.cargo_routes.target_roots_for_file(file));
+        let mut roots = roots.into_iter().collect::<Vec<_>>();
+        roots.sort();
+        for root in roots {
+            let crate_package = rust_crate_root_package(&root);
+            let module_package = if root == *file {
+                crate_package.clone()
+            } else {
+                physical_roots
+                    .get(file)
+                    .map(ModuleKey::package)
+                    .unwrap_or_else(|| rust_package_name(file))
+            };
+            pending.push_back((
+                file.clone(),
+                RustIncludeRoute {
+                    root_file: root,
+                    crate_package,
+                    module_package,
+                    host_bindings: Vec::new(),
+                },
+            ));
+        }
+    }
+
+    let mut routes_by_file: HashMap<ProjectFile, Vec<RustIncludeRoute>> = HashMap::default();
+    let mut visited = HashSet::default();
+    while let Some((host_file, route)) = pending.pop_front() {
+        keep_going().then_some(())?;
+        if !visited.insert((host_file.clone(), route.clone())) {
+            continue;
+        }
+        let Some(edges) = edges_by_file.get(&host_file) else {
+            continue;
+        };
+        let Some(prepared) = rust.prepared_syntax(&host_file) else {
+            continue;
+        };
+        let source = prepared.source();
+        for edge in edges {
+            keep_going().then_some(())?;
+            let module_package =
+                lexical_package_at(&route.module_package, source, edge.include_start);
+            let mut host_bindings = route.host_bindings.clone();
+            for binding in &edge.host_bindings {
+                if binding.kind != ImportKind::Glob {
+                    host_bindings.retain(|existing| {
+                        existing.kind == ImportKind::Glob
+                            || existing.local_name != binding.local_name
+                    });
+                }
+                host_bindings.push(RustIncludeHostBinding {
+                    local_name: binding.local_name.clone(),
+                    module_specifier: binding.module_specifier.clone(),
+                    imported_name: binding.imported_name.clone(),
+                    module_package: module_package.clone(),
+                    scope_start: binding.scope_start,
+                    kind: binding.kind,
+                });
+            }
+            host_bindings.sort_by(|left, right| {
+                left.local_name
+                    .cmp(&right.local_name)
+                    .then_with(|| left.module_specifier.cmp(&right.module_specifier))
+            });
+            host_bindings.dedup();
+            let child_route = RustIncludeRoute {
+                root_file: route.root_file.clone(),
+                crate_package: route.crate_package.clone(),
+                module_package,
+                host_bindings,
+            };
+            routes_by_file
+                .entry(edge.target_file.clone())
+                .or_default()
+                .push(child_route.clone());
+            pending.push_back((edge.target_file.clone(), child_route));
+        }
+    }
+    for routes in routes_by_file.values_mut() {
+        routes.sort_by(|left, right| {
+            left.root_file
+                .cmp(&right.root_file)
+                .then_with(|| left.crate_package.cmp(&right.crate_package))
+                .then_with(|| left.module_package.cmp(&right.module_package))
+        });
+        routes.dedup();
+    }
+    Some(routes_by_file)
+}
+
 fn direct_import_scope_for_module(
     file: &ProjectFile,
     package: &str,
     visibility: RustVisibility,
+    is_actual_crate_root: bool,
 ) -> Option<Domain> {
-    let package = package.to_string();
     let crate_package = rust_crate_root_package(file);
+    let package = if is_actual_crate_root && package == rust_package_name(file) {
+        crate_package.clone()
+    } else {
+        package.to_string()
+    };
     match visibility {
         RustVisibility::Private | RustVisibility::SelfModule => {
             Some(Domain::Module(ModuleKey::new(file, &package)))
@@ -3091,9 +3604,15 @@ fn build_module_alias_routes(
                     continue;
                 };
                 let import = &projected.import;
-                let Some(domain) =
-                    direct_import_scope_for_module(file, owner, import.visibility.clone())
-                else {
+                let Some(domain) = direct_import_scope_for_module(
+                    file,
+                    owner,
+                    import.visibility.clone(),
+                    module_files
+                        .cargo_routes
+                        .target_roots_for_file(file)
+                        .contains(file),
+                ) else {
                     continue;
                 };
                 if import.info.is_wildcard {
@@ -3220,9 +3739,15 @@ fn build_importer_reverse(
             };
             let propagate_alias = matches!(extent, RustImportExtent::Module { .. });
             let importer_module = ModuleKey::new(file, &owner);
-            let Some(edge_domain) =
-                direct_import_scope_for_module(file, &owner, import.visibility.clone())
-            else {
+            let Some(edge_domain) = direct_import_scope_for_module(
+                file,
+                &owner,
+                import.visibility.clone(),
+                module_files
+                    .cargo_routes
+                    .target_roots_for_file(file)
+                    .contains(file),
+            ) else {
                 continue;
             };
             let local_name = import.info.local_name().unwrap_or_default().to_string();
@@ -3253,35 +3778,37 @@ fn build_importer_reverse(
                 }
                 continue;
             }
-            let Some(imported_name) = import.path.last().cloned() else {
-                continue;
-            };
-            for resolved in module_aliases.resolve_segments(
-                module_files,
-                file,
-                &owner,
-                &import.path[..import.path.len() - 1],
-            ) {
-                keep_going().then_some(())?;
-                add_import_edge(
-                    &mut edges,
+            if !import.is_extern_crate {
+                let Some(imported_name) = import.path.last().cloned() else {
+                    continue;
+                };
+                for resolved in module_aliases.resolve_segments(
                     module_files,
-                    physical_owners,
-                    RustImportEdge {
-                        importer: file.clone(),
-                        importer_module: importer_module.clone(),
-                        extent: extent.clone(),
-                        local_name: local_name.clone(),
-                        target_file: resolved.target_file,
-                        target_module: resolved.target_module,
-                        kind: RustImportEdgeKind::Named(imported_name.clone()),
-                        propagate_alias,
-                        domain: edge_domain.clone(),
-                        namespace: None,
-                        provenance: resolved.provenance,
-                        cfg_condition: projected.cfg_condition.clone(),
-                    },
-                );
+                    file,
+                    &owner,
+                    &import.path[..import.path.len() - 1],
+                ) {
+                    keep_going().then_some(())?;
+                    add_import_edge(
+                        &mut edges,
+                        module_files,
+                        physical_owners,
+                        RustImportEdge {
+                            importer: file.clone(),
+                            importer_module: importer_module.clone(),
+                            extent: extent.clone(),
+                            local_name: local_name.clone(),
+                            target_file: resolved.target_file,
+                            target_module: resolved.target_module,
+                            kind: RustImportEdgeKind::Named(imported_name.clone()),
+                            propagate_alias,
+                            domain: edge_domain.clone(),
+                            namespace: None,
+                            provenance: resolved.provenance,
+                            cfg_condition: projected.cfg_condition.clone(),
+                        },
+                    );
+                }
             }
             for resolved in
                 module_aliases.resolve_segments(module_files, file, &owner, &import.path)
@@ -3395,6 +3922,100 @@ mod tests {
         );
         assert_eq!(Some(child.clone()), Domain::Public.intersect(&child));
     }
+
+    #[test]
+    fn target_root_domains_cover_shared_kind_modules_only_for_that_target() {
+        let target_root = ModuleKey {
+            crate_root: "candle_core.benches.bench_main".to_string(),
+            components: Vec::new(),
+        };
+        let caller = ModuleKey {
+            crate_root: "candle_core.benches".to_string(),
+            components: vec!["benchmarks".to_string(), "cat".to_string()],
+        };
+        let target_domain = Domain::Module(target_root.clone());
+        assert!(domain_contains_module_from_target_roots(
+            &target_domain,
+            &[target_root],
+            &caller,
+        ));
+        assert!(!domain_contains_module_from_target_roots(
+            &target_domain,
+            &[ModuleKey {
+                crate_root: "candle_core.benches.other".to_string(),
+                components: Vec::new(),
+            }],
+            &caller,
+        ));
+    }
+
+    #[test]
+    fn target_root_visibility_uses_crate_root_without_widening_modules() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        let main = ProjectFile::new(root.clone(), "src/main.rs");
+        let bench = ProjectFile::new(root.clone(), "benches/bench.rs");
+        let bin = ProjectFile::new(root.clone(), "src/bin/tool.rs");
+        let sibling = ProjectFile::new(root, "src/service.rs");
+        let bench_domain = direct_import_scope_for_module(
+            &bench,
+            &rust_package_name(&bench),
+            RustVisibility::Private,
+            true,
+        );
+        let main_domain = direct_import_scope_for_module(
+            &main,
+            &rust_package_name(&main),
+            RustVisibility::Private,
+            true,
+        );
+        let sibling_domain = direct_import_scope_for_module(
+            &sibling,
+            &rust_package_name(&sibling),
+            RustVisibility::Private,
+            false,
+        );
+        assert_eq!(
+            bench_domain,
+            Some(Domain::Module(ModuleKey::new(
+                &bench,
+                &rust_crate_root_package(&bench),
+            )))
+        );
+        assert_eq!(
+            main_domain,
+            Some(Domain::Module(ModuleKey::new(
+                &main,
+                &rust_crate_root_package(&main),
+            )))
+        );
+        let bin_domain = direct_import_scope_for_module(
+            &bin,
+            &rust_package_name(&bin),
+            RustVisibility::Private,
+            true,
+        );
+        assert_eq!(
+            bin_domain,
+            Some(Domain::Module(ModuleKey::new(
+                &bin,
+                &rust_crate_root_package(&bin),
+            )))
+        );
+        assert_eq!(
+            sibling_domain,
+            Some(Domain::Module(ModuleKey::new(
+                &sibling,
+                &rust_package_name(&sibling),
+            )))
+        );
+    }
+
     #[test]
     fn module_file_snapshot_preserves_package_inline_and_path_candidates() {
         let temp = tempfile::tempdir().expect("tempdir");

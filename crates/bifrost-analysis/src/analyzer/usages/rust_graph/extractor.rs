@@ -48,6 +48,7 @@ pub(super) use brokk_bifrost_rust::graph::ast::{
     first_generic_type_argument, rust_reference_namespace, type_node_last_segment,
 };
 use brokk_bifrost_rust::lexical_scope::{self, RustLexicalScopeIndex};
+use brokk_bifrost_rust::usage_index::RustUsageIndex;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -66,20 +67,44 @@ pub(super) fn effective_scan_files(
         .filter(|file| analyzed.contains(*file))
         .cloned()
         .collect();
+    let seed_names: HashSet<&str> = seeds.candidate_names().collect();
+    let include_files: HashSet<_> = if scan_scope.is_authoritative() {
+        HashSet::default()
+    } else {
+        analyzer
+            .usage_index()
+            .include_routes
+            .keys()
+            .filter(|file| analyzed.contains(*file))
+            .filter(|file| {
+                file.read_to_string().ok().is_some_and(|source| {
+                    source.contains(target.identifier())
+                        || seed_names
+                            .iter()
+                            .any(|seed_name| source.contains(seed_name))
+                })
+            })
+            .cloned()
+            .collect()
+    };
 
     if scan_scope.is_authoritative() {
         return filtered_candidates;
     }
 
     if !candidate_files.is_empty() && filtered_candidates.is_empty() {
-        return [target.source().clone()].into_iter().collect();
+        return std::iter::once(target.source().clone())
+            .chain(include_files)
+            .collect();
     }
 
     if !filtered_candidates.is_empty() {
-        return filtered_candidates;
+        return filtered_candidates
+            .into_iter()
+            .chain(include_files)
+            .collect();
     }
 
-    let seed_names: HashSet<&str> = seeds.candidate_names().collect();
     let textual_candidates = analyzed.into_iter().filter(|file| {
         if scan_scope.is_cancelled() {
             return false;
@@ -98,6 +123,7 @@ pub(super) fn effective_scan_files(
     usage_importers(analyzer, seeds)
         .into_iter()
         .chain(analyzer.referencing_files_of(target.source()))
+        .chain(include_files)
         .chain(textual_candidates)
         .chain(std::iter::once(target.source().clone()))
         .collect()
@@ -116,6 +142,7 @@ pub(super) fn scan_files_for_target(
     let support = analyzer.global_usage_definition_index();
     let hits = Mutex::new(BTreeSet::new());
     let files_vec: Vec<_> = files.into_iter().collect();
+    let include_routes = rust.usage_index();
     // Shared across every file: the alias closure reachable from the target
     // roots. `effective_scan_files` already treats these names as the textual
     // universe a hit can be written under.
@@ -192,6 +219,7 @@ pub(super) fn scan_files_for_target(
             },
             direct_names: &direct_names,
             lexical_scope: &lexical_scope,
+            include_routes: &include_routes,
             token_tree_roles: RustTokenTreeRoleCache::default(),
             cancellation,
             cancellation_checks_remaining: 0,
@@ -232,10 +260,142 @@ pub(super) struct ScanCtx<'a> {
     name_gate: ScanNameGate<'a>,
     direct_names: &'a HashSet<String>,
     lexical_scope: &'a RustLexicalScopeIndex,
+    include_routes: &'a RustUsageIndex,
     token_tree_roles: RustTokenTreeRoleCache,
     pub(super) cancellation: Option<&'a CancellationToken>,
     cancellation_checks_remaining: usize,
     pub(super) hits: &'a mut BTreeSet<UsageHit>,
+}
+
+fn included_import_resolves_to_target(
+    rust: &RustAnalyzer,
+    file: &ProjectFile,
+    source: &str,
+    byte: usize,
+    local_name: &str,
+    target: &CodeUnit,
+    include_routes: &RustUsageIndex,
+) -> bool {
+    let routes = include_routes.include_routes_for(file);
+    if routes.is_empty() {
+        return false;
+    }
+    let binders = lexical_scope::visible_import_binders_with_scopes_at(source, byte);
+    for (scope_start, binder) in binders {
+        if let Some(binding) = binder.bindings.get(local_name) {
+            let candidates = routes
+                .iter()
+                .flat_map(|route| {
+                    include_routes.include_import_target_identities(
+                        rust,
+                        route,
+                        source,
+                        scope_start,
+                        binding,
+                        target.identifier(),
+                    )
+                })
+                .collect::<HashSet<_>>();
+            return candidates.len() == 1
+                && candidates.iter().any(|identity| {
+                    identity.file == *target.source() && identity.name == target.identifier()
+                });
+        }
+        let glob_targets = binder
+            .bindings
+            .values()
+            .filter(|binding| binding.kind == ImportKind::Glob)
+            .flat_map(|binding| {
+                routes.iter().filter_map(|route| {
+                    let candidates = include_routes.include_import_target_identities(
+                        rust,
+                        route,
+                        source,
+                        scope_start,
+                        binding,
+                        target.identifier(),
+                    );
+                    (candidates.len() == 1)
+                        .then(|| candidates.into_iter().next().expect("one candidate"))
+                })
+            })
+            .collect::<HashSet<_>>();
+        if !glob_targets.is_empty() {
+            return glob_targets.len() == 1
+                && glob_targets.iter().any(|identity| {
+                    identity.file == *target.source() && identity.name == target.identifier()
+                });
+        }
+    }
+    let host_targets = routes
+        .iter()
+        .flat_map(|route| {
+            let has_named_binding = route.host_bindings.iter().any(|binding| {
+                binding.kind != ImportKind::Glob && binding.local_name == local_name
+            });
+            route
+                .host_bindings
+                .iter()
+                .filter(move |binding| {
+                    (binding.kind != ImportKind::Glob && binding.local_name == local_name)
+                        || (!has_named_binding
+                            && binding.kind == ImportKind::Glob
+                            && binding.local_name == "*")
+                })
+                .flat_map(|binding| {
+                    let suffix = if binding.kind == ImportKind::Glob {
+                        vec![target.identifier()]
+                    } else {
+                        Vec::new()
+                    };
+                    include_routes.include_path_target_identities(route, binding, &suffix)
+                })
+        })
+        .collect::<HashSet<_>>();
+    if !host_targets.is_empty() {
+        return host_targets.len() == 1
+            && host_targets.iter().any(|identity| {
+                identity.file == *target.source() && identity.name == target.identifier()
+            });
+    }
+    false
+}
+
+fn included_host_path_resolves_to_target(
+    file: &ProjectFile,
+    source: &str,
+    byte: usize,
+    segments: &[&str],
+    target: &CodeUnit,
+    include_routes: &RustUsageIndex,
+) -> bool {
+    let Some(local_name) = segments.first() else {
+        return false;
+    };
+    if lexical_scope::visible_import_binders_with_scopes_at(source, byte)
+        .iter()
+        .any(|(_, binder)| binder.bindings.contains_key(*local_name))
+    {
+        return false;
+    }
+    let routes = include_routes.include_routes_for(file);
+    let suffix = &segments[1..];
+    let candidates = routes
+        .iter()
+        .flat_map(|route| {
+            route
+                .host_bindings
+                .iter()
+                .filter(|binding| binding.local_name == *local_name)
+                .flat_map(|binding| {
+                    include_routes.include_path_target_identities(route, binding, suffix)
+                })
+        })
+        .collect::<HashSet<_>>();
+    candidates.len() == 1
+        && candidates.iter().any(|identity| {
+            identity.file == *target.source() && identity.name == target.identifier()
+        })
 }
 
 /// The names a source token must carry before resolution can possibly prove it
@@ -487,6 +647,23 @@ impl ScanCtx<'_> {
         byte: usize,
         namespace: RustReferenceNamespace,
     ) -> bool {
+        let shadowed = namespace != RustReferenceNamespace::Macro
+            && (self.lexical_scope.name_bound_at(text, byte)
+                || self.item_shadows_target(text, byte));
+        if !shadowed
+            && namespace == RustReferenceNamespace::Value
+            && included_import_resolves_to_target(
+                self.rust,
+                self.file,
+                self.source,
+                byte,
+                text,
+                self.target,
+                self.include_routes,
+            )
+        {
+            return true;
+        }
         if !self.direct_names.contains(text)
             && !self.seeds.is_some_and(|seeds| {
                 usage_has_exact_scoped_binding(self.rust, self.file, seeds, text, byte, namespace)
@@ -494,9 +671,6 @@ impl ScanCtx<'_> {
         {
             return false;
         }
-        let shadowed = namespace != RustReferenceNamespace::Macro
-            && (self.lexical_scope.name_bound_at(text, byte)
-                || self.item_shadows_target(text, byte));
         if self.seeds.is_none_or(|seeds| {
             let resolution = usage_reference_at(
                 self.rust,
@@ -555,6 +729,19 @@ impl ScanCtx<'_> {
         root_shadowed: bool,
         leading_absolute: bool,
     ) -> bool {
+        if namespace == RustReferenceNamespace::Value
+            && !root_shadowed
+            && included_host_path_resolves_to_target(
+                self.file,
+                self.source,
+                byte,
+                segments,
+                self.target,
+                self.include_routes,
+            )
+        {
+            return true;
+        }
         if self.seeds.is_some_and(|seeds| {
             let resolution = usage_reference_at(
                 self.rust,

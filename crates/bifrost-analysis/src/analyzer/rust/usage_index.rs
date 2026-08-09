@@ -210,4 +210,32 @@ mod tests {
             Some(target)
         );
     }
+
+    #[test]
+    fn target_root_private_visibility_reaches_shared_kind_module() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        ProjectFile::new(root.clone(), "benches/bench_main.rs")
+            .write("pub(crate) struct BenchPrivate; mod benchmarks;\n")
+            .expect("bench root");
+        let caller = ProjectFile::new(root, "benches/benchmarks/mod.rs");
+        caller
+            .write("use crate::BenchPrivate;\nfn consume(_: BenchPrivate) {}\n")
+            .expect("shared module");
+        let analyzer = analyzer_for(caller.root());
+        let target = analyzer
+            .get_definitions("sample.benches.bench_main.BenchPrivate")
+            .into_iter()
+            .next()
+            .expect("bench-root declaration");
+
+        assert!(crate::analyzer::rust::usage_declaration_visible_at(
+            &analyzer, &target, &caller, 0
+        ));
+    }
 }

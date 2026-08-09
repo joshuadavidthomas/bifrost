@@ -29,6 +29,9 @@ pub struct RustImportInfo {
     pub info: ImportInfo,
     pub visibility: RustVisibility,
     pub path: Vec<String>,
+    /// An `extern crate` declaration binds the crate namespace only. It must
+    /// not produce the zero-prefix named edge that a normal `use item` emits.
+    pub is_extern_crate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +65,12 @@ pub fn rust_import_projection(
     let mut projected = Vec::new();
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
+        if node.kind() == "extern_crate_declaration" {
+            if let Some(import) = rust_external_crate_import(node, source, base_module) {
+                projected.push(import);
+            }
+            continue;
+        }
         if node.kind() == "use_declaration" {
             let owner = rust_import_owner(node, source, base_module);
             let cfg_condition = rust_cfg_condition(node, source);
@@ -81,6 +90,47 @@ pub fn rust_import_projection(
         pending.extend(children.into_iter().rev());
     }
     projected
+}
+
+fn rust_external_crate_import(
+    node: Node<'_>,
+    source: &str,
+    base_module: &str,
+) -> Option<RustProjectedImport> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = rust_node_text(name_node, source).trim();
+    if name.is_empty() {
+        return None;
+    }
+    let alias_node = node.child_by_field_name("alias");
+    let alias = alias_node
+        .map(|node| rust_node_text(node, source).trim().to_string())
+        .filter(|alias| !alias.is_empty());
+    let binder_node = alias_node.unwrap_or(name_node);
+    let import = RustImportInfo {
+        info: ImportInfo {
+            raw_snippet: rust_node_text(node, source).to_string(),
+            is_wildcard: false,
+            identifier: Some(name.to_string()),
+            alias,
+            path: Some(StructuredImportPath {
+                segments: vec![name.to_string()],
+                kind: Some(StructuredImportPathKind::Namespace),
+                lexical_prefixes: Vec::new(),
+                lexical_scopes: Vec::new(),
+                declaration_start_byte: node.start_byte(),
+            }),
+            binder_span: Some(node_span(binder_node)),
+        },
+        visibility: rust_item_visibility(node, source),
+        path: vec![name.to_string()],
+        is_extern_crate: true,
+    };
+    Some(RustProjectedImport {
+        import,
+        owner: rust_import_owner(node, source, base_module),
+        cfg_condition: rust_cfg_condition(node, source),
+    })
 }
 
 pub fn rust_module_extents(
@@ -544,6 +594,7 @@ impl RustUseDeclaration {
             },
             visibility: self.visibility.clone(),
             path,
+            is_extern_crate: false,
         }
     }
 

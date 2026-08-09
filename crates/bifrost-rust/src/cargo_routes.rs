@@ -1631,12 +1631,13 @@ fn rust_path_attribute(module: Node<'_>, source: &str) -> Option<PathBuf> {
     None
 }
 
-/// Decode a static Rust string literal from its tree-sitter nodes.
+/// Decode a static Rust string literal from its tree-sitter node.
 ///
-/// `#[path]` accepts both cooked and raw strings.  Decode cooked escape nodes
-/// individually so the filesystem path sees the value Rust assigns the
-/// attribute, rather than the literal's source spelling.
-fn rust_static_string_literal(literal: Node<'_>, source: &str) -> Option<String> {
+/// `#[path]` and filesystem macros accept both cooked and raw strings. Decode
+/// cooked escape nodes individually so consumers see the assigned path rather
+/// than the literal's source spelling. This helper is public for structured
+/// consumers that read paths from macro arguments.
+pub fn rust_static_string_literal(literal: Node<'_>, source: &str) -> Option<String> {
     match literal.kind() {
         "raw_string_literal" => {
             let spelling = source.get(literal.start_byte()..literal.end_byte())?;
