@@ -12,7 +12,7 @@ use crate::graph::resolver::{
     target_owner_code_unit, top_level_identifier,
 };
 use crate::graph_support::{PythonSource, PythonUsageSource};
-use crate::imports::resolve_fqn_candidates;
+use crate::imports::{PythonImportBinding, parse_python_import_bindings, resolve_fqn_candidates};
 use crate::usage_index::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
     usage_matching_edges, usage_module_binding_timeline, usage_resolve_module_files,
@@ -200,6 +200,7 @@ pub fn scan_files_for_seeds(
                 &edges,
             )
         };
+        let scoped_import_bindings = parse_python_import_bindings(source_str);
         let target_self_file = *file == target.source();
         let scope_facts = {
             let _scope = brokk_bifrost_core::profiling::scope("python_graph::scope_facts");
@@ -236,6 +237,7 @@ pub fn scan_files_for_seeds(
             target_self_file,
             member_best_effort_unique: target_self_file && member_unique_in_target_file,
             module_bindings: &module_bindings,
+            scoped_import_bindings: &scoped_import_bindings,
             scope_facts: scope_facts.as_ref(),
             scope_range_index: &scope_range_index,
             hits: &mut local_hits,
@@ -334,6 +336,7 @@ pub struct ScanCtx<'a> {
     /// untyped receivers stay conservative.
     member_best_effort_unique: bool,
     module_bindings: &'a HashMap<String, Vec<ClassifiedModuleBindingEvent>>,
+    scoped_import_bindings: &'a [PythonImportBinding],
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     scope_range_index: &'a [ScopeRangeEntry],
     pub hits: &'a mut BTreeSet<UsageHit>,
@@ -539,18 +542,42 @@ impl ScanCtx<'_> {
     }
 
     fn module_binding_targets_query(&self, ident: &str, node: Node<'_>) -> bool {
+        if let Some(matches) = self.function_import_binding_targets_query(ident, node) {
+            return matches;
+        }
         self.module_binding_matches_query(ident, node, true, |kind| {
             kind != ModuleBindingKind::Other
         })
     }
 
     fn module_binding_targets_symbol(&self, ident: &str, node: Node<'_>) -> bool {
+        if let Some(matches) = self.function_import_binding_targets_query(ident, node) {
+            return matches;
+        }
         let unclassified_named_import = self.edges.iter().any(|edge| {
             edge.local_name == ident && !matches!(edge.kind, ImportEdgeKind::Namespace)
         });
         self.module_binding_matches_query(ident, node, unclassified_named_import, |kind| {
             kind == ModuleBindingKind::TargetSymbolImport
         })
+    }
+
+    /// Resolve the nearest function-local import before the module timeline.
+    ///
+    /// Candidate discovery retains all imports. A local import with the same
+    /// binder must still override the module binding only inside its function.
+    fn function_import_binding_targets_query(&self, ident: &str, node: Node<'_>) -> Option<bool> {
+        let binding = self.scoped_import_bindings.iter().rev().find(|binding| {
+            binding.is_function_scoped()
+                && binding.start_byte <= node.start_byte()
+                && binding.scope_start_byte <= node.start_byte()
+                && node.end_byte() <= binding.scope_end_byte
+                && binding.local_name == ident
+        })?;
+        let candidates = resolve_fqn_candidates(self.python, &binding.qualified_name, |name| {
+            self.graph.index.definitions(name).collect()
+        });
+        Some(candidates.iter().any(|candidate| candidate == self.target))
     }
 
     fn module_binding_matches_query(

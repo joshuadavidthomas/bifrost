@@ -137,8 +137,15 @@ pub struct PythonImportBinding {
     pub start_byte: usize,
     pub scope_start_byte: usize,
     pub scope_end_byte: usize,
+    function_scoped: bool,
     pub local_name: String,
     pub qualified_name: String,
+}
+
+impl PythonImportBinding {
+    pub fn is_function_scoped(&self) -> bool {
+        self.function_scoped
+    }
 }
 
 /// Return source-ordered, parser-derived local bindings for explicit Python
@@ -166,7 +173,7 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
     nodes
         .into_iter()
         .flat_map(|node| {
-            let (scope_start_byte, scope_end_byte) =
+            let (scope_start_byte, scope_end_byte, function_scoped) =
                 python_import_binding_scope(node, source.len());
             python_import_infos_from_node(node, source)
                 .into_iter()
@@ -179,6 +186,7 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
                                 start_byte: node.start_byte(),
                                 scope_start_byte,
                                 scope_end_byte,
+                                function_scoped,
                                 local_name: alias.or_else(|| path.segments.first().cloned())?,
                                 qualified_name: module,
                             })
@@ -192,6 +200,7 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
                             start_byte: node.start_byte(),
                             scope_start_byte,
                             scope_end_byte,
+                            function_scoped,
                             local_name: alias.unwrap_or(name.clone()),
                             qualified_name: format!("{module}.{name}"),
                         }),
@@ -202,15 +211,15 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
         .collect()
 }
 
-fn python_import_binding_scope(node: Node<'_>, source_len: usize) -> (usize, usize) {
+fn python_import_binding_scope(node: Node<'_>, source_len: usize) -> (usize, usize, bool) {
     let mut parent = node.parent();
     while let Some(scope) = parent {
         if matches!(scope.kind(), "function_definition" | "lambda") {
-            return (scope.start_byte(), scope.end_byte());
+            return (scope.start_byte(), scope.end_byte(), true);
         }
         parent = scope.parent();
     }
-    (0, source_len)
+    (0, source_len, false)
 }
 
 #[cfg(test)]
