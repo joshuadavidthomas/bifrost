@@ -2191,8 +2191,27 @@ fn collect_scope_facts_from_events(
     factory_return_types: &HashMap<String, String>,
 ) -> LocalBindingsSnapshot<String> {
     let mut engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    let globals: HashSet<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            ScopeFactEvent::Global { symbol } => Some(symbol.as_str()),
+            _ => None,
+        })
+        .collect();
+    let nonlocals: HashSet<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            ScopeFactEvent::Nonlocal { symbol } => Some(symbol.as_str()),
+            _ => None,
+        })
+        .collect();
+    for symbol in &nonlocals {
+        engine.declare_shadow((*symbol).to_string());
+    }
     for event in events {
         if let ScopeFactEvent::Parameter { symbol, .. } = event
+            && !globals.contains(symbol.as_str())
+            && !nonlocals.contains(symbol.as_str())
             && !engine.is_shadowed(symbol)
         {
             engine.declare_shadow(symbol.clone());
@@ -2210,6 +2229,9 @@ fn collect_scope_facts_from_events(
                     annotation: Some(annotation),
                 }
                 | ScopeFactEvent::Annotation { symbol, annotation } => {
+                    if globals.contains(symbol.as_str()) || nonlocals.contains(symbol.as_str()) {
+                        continue;
+                    }
                     apply_annotation_event(
                         symbol,
                         annotation,
@@ -2222,6 +2244,9 @@ fn collect_scope_facts_from_events(
                     annotation: None, ..
                 } => {}
                 ScopeFactEvent::Assignment { lhs, rhs } => {
+                    if globals.contains(lhs.as_str()) {
+                        continue;
+                    }
                     if !engine.is_shadowed(lhs) {
                         engine.declare_shadow(lhs.clone());
                     }
@@ -2272,6 +2297,7 @@ fn collect_scope_facts_from_events(
                         AssignmentRhs::Unknown => {}
                     }
                 }
+                ScopeFactEvent::Global { .. } | ScopeFactEvent::Nonlocal { .. } => {}
             }
         }
         let before = engine.snapshot();
@@ -2318,6 +2344,12 @@ fn apply_annotation_event(
 }
 
 enum ScopeFactEvent {
+    Global {
+        symbol: String,
+    },
+    Nonlocal {
+        symbol: String,
+    },
     Parameter {
         symbol: String,
         annotation: Option<String>,
@@ -2400,6 +2432,14 @@ fn collect_scope_fact_events_from_node(
             continue;
         }
         match node.kind() {
+            "global_statement" => collect_scope_directive_events(node, source, events, |symbol| {
+                ScopeFactEvent::Global { symbol }
+            }),
+            "nonlocal_statement" => {
+                collect_scope_directive_events(node, source, events, |symbol| {
+                    ScopeFactEvent::Nonlocal { symbol }
+                })
+            }
             "parameters" | "lambda_parameters" => collect_parameter_events(node, source, events),
             "assignment" => collect_assignment_events(node, source, events),
             _ => {}
@@ -2413,6 +2453,24 @@ fn collect_scope_fact_events_from_node(
                 .into_iter()
                 .map(|child| (child, next_inside_function)),
         );
+    }
+}
+
+fn collect_scope_directive_events(
+    node: Node<'_>,
+    source: &str,
+    events: &mut Vec<ScopeFactEvent>,
+    make_event: impl Fn(String) -> ScopeFactEvent,
+) {
+    let mut cursor = node.walk();
+    for identifier in node
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "identifier")
+    {
+        let Some(symbol) = non_empty_node_text(identifier, source) else {
+            continue;
+        };
+        events.push(make_event(symbol));
     }
 }
 

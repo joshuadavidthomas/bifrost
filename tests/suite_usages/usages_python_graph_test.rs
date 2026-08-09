@@ -3472,6 +3472,52 @@ fn module_level_field_resolves_despite_reassignment() {
     );
 }
 
+#[test]
+fn global_statement_identifier_is_a_module_field_reference() {
+    let source = concat!(
+        "VALUE = None\n",
+        "\n",
+        "def update():\n",
+        "    global VALUE\n",
+        "    if VALUE is None:\n",
+        "        VALUE = 1\n",
+        "\n",
+        "def local():\n",
+        "    VALUE = 2\n",
+        "    return VALUE\n",
+        "\n",
+        "def outer():\n",
+        "    VALUE = 3\n",
+        "    def nested():\n",
+        "        nonlocal VALUE\n",
+        "        return VALUE\n",
+        "    return nested()\n",
+    );
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("m.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "m.VALUE");
+    let hits = UsageFinder::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), 100, 100)
+        .all_hits_including_imports();
+
+    let global_start = source.find("VALUE\n    if").expect("global identifier");
+    let read_start = source.find("VALUE is None").expect("module field read");
+    let ranges: BTreeSet<_> = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+    assert_eq!(
+        ranges,
+        BTreeSet::from([
+            (global_start, global_start + "VALUE".len()),
+            (read_start, read_start + "VALUE".len()),
+        ]),
+        "{hits:#?}"
+    );
+}
+
 // The `from service import Widget` binding is an Import-kind hit: excluded from
 // the call-graph hit set (all_hits / into_either) but included by the IDE
 // find-references accessor (all_hits_including_imports).
