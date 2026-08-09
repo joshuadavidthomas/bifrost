@@ -1529,6 +1529,45 @@ import service as x
 }
 
 #[test]
+fn nested_import_with_same_local_name_does_not_hide_module_import_usage() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("primary.py", "def get_service():\n    return object()\n")
+        .file("nested.py", "def get_service():\n    return object()\n")
+        .file(
+            "consumer.py",
+            r#"from primary import (
+    get_service,
+)
+
+def outer():
+    return get_service()
+
+def inner():
+    from nested import get_service
+    return get_service()
+"#,
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "primary.get_service");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should retain the module-level grouped import");
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "nested import must remain a near miss: {hits:#?}"
+    );
+    let hit = hits.iter().next().expect("one module-level function call");
+    assert_eq!(hit.file, project.file("consumer.py"));
+    assert!(hit.snippet.contains("return get_service()"), "{hit:#?}");
+}
+
+#[test]
 fn nested_namespace_direct_module_resolves_function_usage() {
     let project = InlineTestProject::with_language(Language::Python)
         .file("pkg/__init__.py", "")

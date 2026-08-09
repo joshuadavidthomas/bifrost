@@ -376,6 +376,24 @@ pub fn import_binder_from_imports(
 ) -> ImportBinder {
     let mut binder = ImportBinder::empty();
 
+    for (local_name, binding) in import_bindings_from_imports(python, file, imports) {
+        binder.bindings.insert(local_name, binding);
+    }
+
+    binder
+}
+
+/// Resolve each structured import without collapsing repeated local names.
+///
+/// Candidate discovery needs every lexical binding. The ordinary binder keeps
+/// one effective binding for simple lookups.
+pub fn import_bindings_from_imports(
+    python: &dyn PythonSource,
+    file: &ProjectFile,
+    imports: &[ImportInfo],
+) -> Vec<(String, ImportBinding)> {
+    let mut bindings = Vec::new();
+
     for import in imports {
         let Some(details) = python_import_details(import) else {
             continue;
@@ -385,7 +403,7 @@ pub fn import_binder_from_imports(
                 let local_name = python_namespace_binding_name(import, alias.as_deref(), &module);
                 let module_specifier =
                     python_namespace_binding_module(import, alias.as_deref(), &module);
-                binder.bindings.insert(
+                bindings.push((
                     local_name,
                     ImportBinding {
                         module_specifier,
@@ -393,7 +411,7 @@ pub fn import_binder_from_imports(
                         kind: ImportKind::Namespace,
                         imported_name: None,
                     },
-                );
+                ));
             }
             PythonImportDetails::FromImport {
                 module,
@@ -422,7 +440,7 @@ pub fn import_binder_from_imports(
                     .unwrap_or_else(|| name.clone());
                 let module_candidate = format!("{resolved_module}.{name}");
                 if resolve_module_code_unit(python, &module_candidate).is_some() {
-                    binder.bindings.insert(
+                    bindings.push((
                         local_name,
                         ImportBinding {
                             module_specifier: module_candidate,
@@ -430,10 +448,10 @@ pub fn import_binder_from_imports(
                             kind: ImportKind::Namespace,
                             imported_name: None,
                         },
-                    );
+                    ));
                     continue;
                 }
-                binder.bindings.insert(
+                bindings.push((
                     local_name,
                     ImportBinding {
                         module_specifier: resolved_module,
@@ -441,12 +459,12 @@ pub fn import_binder_from_imports(
                         kind: ImportKind::Named,
                         imported_name: Some(name),
                     },
-                );
+                ));
             }
         }
     }
 
-    binder
+    bindings
 }
 
 pub fn public_declarations_in_module(python: &dyn PythonSource, module_fq: &str) -> Vec<CodeUnit> {

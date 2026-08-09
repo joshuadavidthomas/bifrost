@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use crate::declarations::python_module_name;
 use crate::graph_support::{
     PythonSource, PythonUsageSource, export_index_from_file_facts, import_binder_from_imports,
+    import_bindings_from_imports,
 };
 use crate::imports::{module_replacement_of, resolve_python_relative_module};
 
@@ -107,6 +108,8 @@ impl PythonUsageIndex {
         let mut module_index: HashMap<String, Vec<ProjectFile>> = HashMap::default();
         let mut exports_by_file: HashMap<ProjectFile, Arc<ExportIndex>> = HashMap::default();
         let mut binders_by_file: HashMap<ProjectFile, Arc<ImportBinder>> = HashMap::default();
+        let mut import_bindings_by_file: HashMap<ProjectFile, Vec<(String, ImportBinding)>> =
+            HashMap::default();
         let mut replacement_modules: HashMap<ProjectFile, String> = HashMap::default();
         python.visit_file_facts(&files, &mut |file, facts| {
             let module_name = facts
@@ -123,6 +126,7 @@ impl PythonUsageIndex {
                 .or_default()
                 .push(file.clone());
             if let Some(facts) = facts {
+                let import_bindings = import_bindings_from_imports(python, file, facts.imports());
                 let binder = Arc::new(import_binder_from_imports(python, file, facts.imports()));
                 if binder.bindings.values().any(is_sys_namespace_binding)
                     && let Some(replacement) = module_replacement_of(python, file, facts.source())
@@ -139,6 +143,7 @@ impl PythonUsageIndex {
                         &binder,
                     )),
                 );
+                import_bindings_by_file.insert(file.clone(), import_bindings);
                 binders_by_file.insert(file.clone(), binder);
             } else {
                 exports_by_file.insert(file.clone(), python.export_index_of(file));
@@ -149,6 +154,11 @@ impl PythonUsageIndex {
                 {
                     replacement_modules.insert(file.clone(), replacement.target_module);
                 }
+                let imports = python.import_info_of(file);
+                import_bindings_by_file.insert(
+                    file.clone(),
+                    import_bindings_from_imports(python, file, &imports),
+                );
                 binders_by_file.insert(file.clone(), binder);
             }
         });
@@ -236,8 +246,12 @@ impl PythonUsageIndex {
             }
         }
 
-        let importer_reverse =
-            build_importer_reverse(&module_index, &files, &binders_by_file, &exports_by_file);
+        let importer_reverse = build_importer_reverse(
+            &module_index,
+            &files,
+            &import_bindings_by_file,
+            &exports_by_file,
+        );
 
         Self {
             module_index,
@@ -425,15 +439,15 @@ fn canonical_module_replacement(
 fn build_importer_reverse(
     module_index: &HashMap<String, Vec<ProjectFile>>,
     files: &[ProjectFile],
-    binders_by_file: &HashMap<ProjectFile, Arc<ImportBinder>>,
+    bindings_by_file: &HashMap<ProjectFile, Vec<(String, ImportBinding)>>,
     exports_by_file: &HashMap<ProjectFile, Arc<ExportIndex>>,
 ) -> HashMap<ProjectFile, Vec<ImportEdge>> {
     let mut reverse: HashMap<ProjectFile, Vec<ImportEdge>> = HashMap::default();
     for file in files {
-        let Some(binder) = binders_by_file.get(file) else {
+        let Some(bindings) = bindings_by_file.get(file) else {
             continue;
         };
-        for (local_name, binding) in &binder.bindings {
+        for (local_name, binding) in bindings {
             let imported_module = binding
                 .namespace_imported_module
                 .as_deref()
