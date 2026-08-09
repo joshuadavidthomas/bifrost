@@ -127,7 +127,6 @@ pub fn translate_codeql_models(
     let mut builders: BTreeMap<FoundryTarget, FoundryEntryBuilder> = BTreeMap::new();
     let mut rows_by_kind: BTreeMap<String, u32> = BTreeMap::new();
     let mut skips = Vec::new();
-    let mut declared_arity: BTreeMap<FoundryTarget, Option<u32>> = BTreeMap::new();
 
     for (file, bytes) in files {
         let document: MadDocument = serde_saphyr::from_slice_with_options(bytes, yaml_options())
@@ -142,22 +141,12 @@ pub fn translate_codeql_models(
                 ordinal += 1;
                 *rows_by_kind.entry(kind.to_owned()).or_default() += 1;
                 match kind {
-                    SUMMARY_MODEL => translate_summary_row(
-                        file,
-                        ordinal,
-                        row,
-                        &mut builders,
-                        &mut declared_arity,
-                        &mut skips,
-                    ),
-                    NEUTRAL_MODEL => translate_neutral_row(
-                        file,
-                        ordinal,
-                        row,
-                        &mut builders,
-                        &mut declared_arity,
-                        &mut skips,
-                    ),
+                    SUMMARY_MODEL => {
+                        translate_summary_row(file, ordinal, row, &mut builders, &mut skips)
+                    }
+                    NEUTRAL_MODEL => {
+                        translate_neutral_row(file, ordinal, row, &mut builders, &mut skips)
+                    }
                     _ => skips.push(FoundrySkip {
                         file: file.clone(),
                         row: ordinal,
@@ -172,10 +161,7 @@ pub fn translate_codeql_models(
     let entries = builders
         .into_iter()
         .map(|(target, builder)| {
-            let arity = declared_arity
-                .get(&target)
-                .copied()
-                .unwrap_or_else(|| target.signature.arity());
+            let arity = target.signature.arity();
             builder.finish(FoundryCorpus::Codeql, target, arity)
         })
         .collect::<Vec<_>>();
@@ -188,13 +174,11 @@ pub fn translate_codeql_models(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn translate_summary_row(
     file: &str,
     ordinal: u32,
     row: &[MadCell],
     builders: &mut BTreeMap<FoundryTarget, FoundryEntryBuilder>,
-    declared_arity: &mut BTreeMap<FoundryTarget, Option<u32>>,
     skips: &mut Vec<FoundrySkip>,
 ) {
     let mut skip = |reason: FoundrySkipReason, detail: String| {
@@ -321,7 +305,6 @@ fn translate_summary_row(
             }
         }
     }
-    declared_arity.insert(target.clone(), target.signature.arity());
     let builder = builders.entry(target).or_default();
     for input in inputs {
         builder.add_transfer(AuthoredSummaryTransfer {
@@ -350,7 +333,6 @@ fn translate_neutral_row(
     ordinal: u32,
     row: &[MadCell],
     builders: &mut BTreeMap<FoundryTarget, FoundryEntryBuilder>,
-    declared_arity: &mut BTreeMap<FoundryTarget, Option<u32>>,
     skips: &mut Vec<FoundrySkip>,
 ) {
     if row.len() != NEUTRAL_ROW_COLUMNS {
@@ -397,7 +379,6 @@ fn translate_neutral_row(
         member: member_name(type_name, name),
         signature,
     };
-    declared_arity.insert(target.clone(), target.signature.arity());
     let builder = builders.entry(target).or_default();
     builder.declare_no_flow();
     builder.add_evidence(FoundryEvidence {

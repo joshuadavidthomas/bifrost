@@ -659,7 +659,6 @@ fn lex_scala_string(text: &str, line: u32) -> Result<(String, usize), JoernParse
 /// Translate parsed Joern semantics into foundry entries.
 pub fn translate_joern_semantics(file: &str, semantics: &[JoernFlowSemantic]) -> JoernTranslation {
     let mut builders: BTreeMap<FoundryTarget, FoundryEntryBuilder> = BTreeMap::new();
-    let mut arity_by_target: BTreeMap<FoundryTarget, u32> = BTreeMap::new();
     let mut skips = Vec::new();
     for (index, semantic) in semantics.iter().enumerate() {
         let row = index as u32 + 1;
@@ -781,7 +780,6 @@ pub fn translate_joern_semantics(file: &str, semantics: &[JoernFlowSemantic]) ->
             }
             continue;
         }
-        arity_by_target.insert(target.clone(), arity);
         let builder = builders.entry(target).or_default();
         for transfer in transfers {
             builder.add_transfer(transfer);
@@ -801,7 +799,7 @@ pub fn translate_joern_semantics(file: &str, semantics: &[JoernFlowSemantic]) ->
     let entries = builders
         .into_iter()
         .map(|(target, builder)| {
-            let arity = arity_by_target.get(&target).copied();
+            let arity = target.signature.arity();
             builder.finish(FoundryCorpus::Joern, target, arity)
         })
         .collect::<Vec<_>>();
@@ -814,10 +812,12 @@ pub fn translate_joern_semantics(file: &str, semantics: &[JoernFlowSemantic]) ->
 }
 
 fn render_semantic(semantic: &JoernFlowSemantic) -> String {
+    use std::fmt::Write as _;
+
     let mut rendered = semantic.method_full_name.clone();
     for mapping in &semantic.mappings {
-        rendered.push(' ');
-        rendered.push_str(&format!("{}->{}", mapping.source, mapping.destination));
+        write!(rendered, " {}->{}", mapping.source, mapping.destination)
+            .expect("writing to a String cannot fail");
     }
     if semantic.passthrough {
         rendered.push_str(" PASSTHROUGH");
