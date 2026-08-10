@@ -25,7 +25,7 @@ use brokk_bifrost_core::analyzer::usages::local_inference::{
 };
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ExportIndex, UsageHit};
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
-    ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
+    ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
 };
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile, Range};
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -1897,10 +1897,10 @@ fn receiver_fact_match_status(node: Node<'_>, ctx: &ScanCtx<'_>) -> ReceiverMatc
         .resolve_receiver_node(node, ReceiverAnalysisBudget::default())
     {
         ReceiverAnalysisOutcome::Precise(values) => {
-            if values.iter().any(|value| {
-                let resolved = value.owner();
-                resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
-            }) {
+            if values
+                .iter()
+                .any(|value| receiver_value_matches_owner(value, owner))
+            {
                 ReceiverMatchStatus::Proven
             } else if node.kind() == "call_expression" {
                 ReceiverMatchStatus::Unproven
@@ -1909,10 +1909,10 @@ fn receiver_fact_match_status(node: Node<'_>, ctx: &ScanCtx<'_>) -> ReceiverMatc
             }
         }
         ReceiverAnalysisOutcome::Ambiguous(values) => {
-            if values.iter().any(|value| {
-                let resolved = value.owner();
-                resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
-            }) {
+            if values
+                .iter()
+                .any(|value| receiver_value_matches_owner(value, owner))
+            {
                 ReceiverMatchStatus::Unproven
             } else {
                 ReceiverMatchStatus::NoMatch
@@ -1921,6 +1921,27 @@ fn receiver_fact_match_status(node: Node<'_>, ctx: &ScanCtx<'_>) -> ReceiverMatc
         ReceiverAnalysisOutcome::Unknown
         | ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. } => ReceiverMatchStatus::Unproven,
+    }
+}
+
+fn receiver_value_matches_owner(mut value: &ReceiverValue, owner: &CodeUnit) -> bool {
+    loop {
+        match value {
+            ReceiverValue::FactoryReturn {
+                factory,
+                value: returned,
+            } => {
+                if factory.source() == owner.source() && factory.fq_name() == owner.fq_name() {
+                    return true;
+                }
+                value = returned;
+            }
+            _ => {
+                let resolved = value.owner();
+                return resolved.source() == owner.source()
+                    && resolved.fq_name() == owner.fq_name();
+            }
+        }
     }
 }
 

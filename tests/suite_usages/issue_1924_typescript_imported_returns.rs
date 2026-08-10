@@ -84,3 +84,68 @@ export function refreshOther(state: OtherState): OtherState {
         "the same-named field on OtherState must not become a State.value usage: {result:#?}"
     );
 }
+
+#[test]
+fn imported_factory_return_surface_preserves_the_factory_member_identity() {
+    let consumer = r#"
+import { fetchLatest, fetchOther } from "./fetch";
+
+export async function run() {
+  const result = await fetchLatest();
+  const wanted = result.sha;
+  const other = await fetchOther();
+  const decoy = other.sha;
+  return wanted + decoy;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "fetch.ts",
+            r#"
+export type LatestResult = { success: boolean; sha?: string };
+export type OtherResult = { success: boolean; sha?: string };
+
+export async function fetchLatest(): Promise<LatestResult> {
+  if (Date.now() > 0) return { success: false, sha: undefined };
+  return { success: true, sha: "latest" };
+}
+
+export async function fetchOther(): Promise<OtherResult> {
+  return { success: true, sha: "other" };
+}
+"#,
+        )
+        .file("consumer.ts", consumer)
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let analyzer = workspace.analyzer();
+    let fetch_file = project.file("fetch.ts");
+    let target = analyzer
+        .get_declarations(&fetch_file)
+        .into_iter()
+        .find(|unit| unit.is_field() && unit.fq_name() == "fetchLatest.sha")
+        .expect("synthetic fetchLatest.sha return-surface declaration");
+    assert!(target.is_synthetic());
+
+    let result = UsageFinder::new()
+        .query(analyzer, std::slice::from_ref(&target), 1000, 1000)
+        .result;
+    let consumer_file = project.file("consumer.ts");
+    let offsets = result
+        .all_hits_including_imports()
+        .into_iter()
+        .filter(|hit| hit.file == consumer_file)
+        .map(|hit| hit.start_offset)
+        .collect::<Vec<_>>();
+    let wanted = consumer.find("result.sha").expect("wanted reference") + "result.".len();
+    let decoy = consumer.find("other.sha").expect("decoy reference") + "other.".len();
+
+    assert!(
+        offsets.contains(&wanted),
+        "the imported factory return must retain the synthetic factory member: {result:#?}"
+    );
+    assert!(
+        !offsets.contains(&decoy),
+        "a different factory's same-named return member must stay excluded: {result:#?}"
+    );
+}
