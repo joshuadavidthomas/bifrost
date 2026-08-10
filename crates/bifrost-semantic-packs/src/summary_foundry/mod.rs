@@ -19,6 +19,8 @@ pub mod demand;
 pub mod derive;
 pub mod driver;
 pub mod fixture;
+pub mod framework_pack;
+pub mod golden_pack;
 pub mod ir;
 pub mod joern;
 pub mod join;

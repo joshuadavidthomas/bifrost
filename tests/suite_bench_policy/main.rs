@@ -46,6 +46,11 @@ mod sanitizer_summary_pack;
 // behind `release-tooling`, so this acceptance runs with that feature enabled.
 #[cfg(feature = "release-tooling")]
 mod sanitizer_pack_shipping;
+// The golden-core JDK flow-through summary pack for OWASP Benchmark blocker 4
+// (#1935). Its converter is generation-time tooling behind `release-tooling`,
+// so this acceptance runs with that feature enabled.
+#[cfg(feature = "release-tooling")]
+mod golden_summary_pack_shipping;
 mod scan_usages_same_owner_policy;
 // Milestone 3 of the procedure-summary foundry (#1871). The fixture engine and
 // its runner are generation-time tooling behind `release-tooling`, so this
