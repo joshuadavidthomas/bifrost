@@ -342,21 +342,6 @@ Do these tasks:
 
 This work schedule does not authorize a version change, tag, publication, or deployment. You need an explicit instruction for those actions.
 
-Before you complete a task that changes code, use the `bifrost-policy-checking` skill when it is installed.
-
-Use one MCP `run_policy` request against the active workspace. In the request, run these policy sources together:
-
-- The `bifrost.code-smells` pack
-- Each executable repository policy root that the project explicitly identifies
-
-Treat `finding` as work that you must review or correct.
-
-Treat `unreliable` as a failed validation result.
-
-After changes, run the same policy selection again.
-
-Do not infer success only because the skill is visible. The `list_policies` and `run_policy` MCP tools must be available.
-
 # Design philosophy
 
 Build for correctness and general use.
