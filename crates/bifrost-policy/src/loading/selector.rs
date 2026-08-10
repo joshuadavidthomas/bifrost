@@ -8,15 +8,13 @@ use crate::{
     LoadedModelError, PolicySelector, PolicySelectorPath, ResolvedPolicySelector, SelectorOrigin,
 };
 use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
-use brokk_bifrost_analysis::analyzer::structural::query::schema::resolve_rql_schema_version;
-use brokk_bifrost_analysis::analyzer::structural::query::sexp::{
-    code_query_from_expr, validate_policy_selector_expr,
-};
 use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
-use brokk_bifrost_analysis::sexp::{Expr, parse_sexp};
 use brokk_bifrost_analysis::workspace_document::{
     WorkspaceDocument, WorkspaceDocumentError, WorkspaceRoot, read_workspace_document,
 };
+use brokk_bifrost_rql::query::sexp::{code_query_from_expr, validate_policy_selector_expr};
+use brokk_bifrost_rql::schema::resolve_rql_schema_version;
+use brokk_bifrost_rql::sexp::{Expr, parse_sexp};
 
 use super::super::source::{
     ParsedRqlpDocument, PolicySourceDiagnostic, PolicySourceDiagnosticSeverity,

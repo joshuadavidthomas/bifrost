@@ -20,6 +20,7 @@ nlp = ["dep:brokk-bifrost-nlp"]
 brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.24" }
 brokk-bifrost-nlp = { path = "../bifrost-nlp", version = "=0.8.24", optional = true }
 brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.8.24" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.8.24" }
 brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.8.24" }
 git2 = { version = "0.20.2", default-features = false }
 glob = "0.3.3"

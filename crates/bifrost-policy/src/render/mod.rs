@@ -728,10 +728,9 @@ mod tests {
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();
-        let compatible_rql_version =
-            brokk_bifrost_analysis::analyzer::structural::query::schema::resolve_rql_schema_version(None)
-                .expect("compiled-in RQL schema lineage is valid")
-                .version;
+        let compatible_rql_version = brokk_bifrost_rql::schema::resolve_rql_schema_version(None)
+            .expect("compiled-in RQL schema lineage is valid")
+            .version;
         let note = format!(
             "note: policy test.render inferred policy schema 1 and RQL schema {compatible_rql_version}\n"
         );

@@ -114,6 +114,7 @@ brokk-bifrost-lsp = { path = "crates/bifrost-lsp", version = "=0.8.24" }
 brokk-bifrost-mcp = { path = "crates/bifrost-mcp", version = "=0.8.24" }
 brokk-bifrost-nlp = { path = "crates/bifrost-nlp", version = "=0.8.24", optional = true }
 brokk-bifrost-policy = { path = "crates/bifrost-policy", version = "=0.8.24" }
+brokk-bifrost-rql = { path = "crates/bifrost-rql", version = "=0.8.24" }
 brokk-bifrost-runtime = { path = "crates/bifrost-runtime", version = "=0.8.24" }
 brokk-bifrost-semantic-packs = { path = "crates/bifrost-semantic-packs", version = "=0.8.24" }
 bincode = "1.3.3"

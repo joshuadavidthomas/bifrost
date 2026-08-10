@@ -24,7 +24,7 @@ pub mod process;
 pub mod relevance;
 pub mod searchtools;
 pub mod searchtools_render;
-pub mod sexp;
+pub use brokk_bifrost_rql::sexp;
 pub mod summary;
 pub mod symbol_rename;
 #[cfg(test)]

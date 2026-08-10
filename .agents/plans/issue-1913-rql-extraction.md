@@ -22,12 +22,12 @@ the new crate in the dependency graph.
 - [x] (2026-08-10) Read `CLAUDE.md`, `.agents/PLANS.md`, and issue #1913.
 - [x] (2026-08-10) Mapped the query directory and found one execution-coupled
   `EdgeFilter::matches` method.
-- [ ] Create `crates/bifrost-rql/Cargo.toml` and its library root.
-- [ ] Move the pure query modules and shared S-expression parser.
-- [ ] Move the bounded registration-reference value types needed by the IR.
-- [ ] Reconnect analysis execution and compatibility re-exports.
-- [ ] Update workspace call sites and direct crate dependencies.
-- [ ] Add the dependency graph rule and release inventory entry.
+- [x] (2026-08-10) Create `crates/bifrost-rql/Cargo.toml` and its library root.
+- [x] (2026-08-10) Move the pure query modules and shared S-expression parser.
+- [x] (2026-08-10) Move the bounded registration-reference value types needed by the IR.
+- [x] (2026-08-10) Reconnect analysis execution and compatibility re-exports.
+- [x] (2026-08-10) Update workspace call sites and direct crate dependencies.
+- [x] (2026-08-10) Add the dependency graph rule and release inventory entry.
 - [ ] Run all required featureless validation commands.
 - [ ] Commit the skeleton, move, and graph/inventory changes in logical commits.
 
@@ -76,12 +76,20 @@ the new crate in the dependency graph.
   query meaning.
   Date/Author: 2026-08-10, Codex.
 
+- Observation: The moved JSON canonicalization methods were `pub(crate)` in
+  analysis, but execution uses them from the new crate boundary.
+  Decision: Make only those existing syntax methods public. This exposes the
+  same behavior to the execution crate without adding an analysis dependency.
+  Date/Author: 2026-08-10, Codex.
+
 ## Outcomes & Retrospective
 
-At completion, record the files moved and kept, the number of updated RQL use
-paths, dependency-check behavior, validation results, and any coupling that
-remained in analysis. Note that crates.io bootstrapping and trusted publisher
-configuration remain release-owner work before the next version release.
+The pure query modules, shared S-expression parser, and bounded query-input
+reference values now live in `brokk-bifrost-rql`. Analysis keeps execution,
+registration sets, and the reference-edge row matcher. The new crate has only
+the core workspace dependency. Focused RQL tests, the workspace check, and the
+featureless workspace check pass. Full validation and the logical commits
+remain.
 
 ## Context and Orientation
 

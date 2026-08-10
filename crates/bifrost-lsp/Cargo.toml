@@ -15,6 +15,7 @@ name = "brokk_bifrost_lsp"
 [dependencies]
 brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.8.24" }
 brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.8.24" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.8.24" }
 brokk-bifrost-runtime = { path = "../bifrost-runtime", version = "=0.8.24" }
 # The same channel implementation `lsp-server` exposes through
 # `Connection::{sender,receiver}`. The main loop selects over the client

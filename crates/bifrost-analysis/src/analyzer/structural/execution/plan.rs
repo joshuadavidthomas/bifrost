@@ -4,13 +4,13 @@ use serde::Serialize;
 
 use crate::hash::HashMap;
 
-use super::super::query::schema::QuerySemanticFacet;
-use super::super::query::{
+use super::derived::DerivedLayerRequest;
+use brokk_bifrost_rql::schema::QuerySemanticFacet;
+use brokk_bifrost_rql::{
     BindingSeed, CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, ExportSeed,
     GenerationSiteSeed, OccurrenceSeed, PathSeed, QueryError, QueryStep, QueryValueKind, ScopeSeed,
     SetOperator,
 };
-use super::derived::DerivedLayerRequest;
 
 /// A dense, plan-local identifier for one logical operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -929,7 +929,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::analyzer::structural::query::{
+    use brokk_bifrost_rql::{
         CallTraversalCompleteness, CallTraversalFilter, CodeQueryResultDetail, Pattern,
         SCHEMA_VERSION, StringPredicate,
     };
@@ -1290,10 +1290,10 @@ mod tests {
             seed("lifecycle"),
             vec![
                 QueryStep::ProcedureOf,
-                QueryStep::Typestate(crate::analyzer::structural::query::TypestateTraversal {
+                QueryStep::Typestate(brokk_bifrost_rql::TypestateTraversal {
                     protocol_ref: "test:lifecycle".parse().unwrap(),
                 }),
-                QueryStep::Witness(crate::analyzer::structural::query::WitnessTraversal::default()),
+                QueryStep::Witness(brokk_bifrost_rql::WitnessTraversal::default()),
             ],
         ));
         let physical =
@@ -1337,10 +1337,10 @@ mod tests {
             seed("run"),
             vec![
                 QueryStep::ProcedureOf,
-                QueryStep::ValueFlow(crate::analyzer::structural::query::ValueFlowTraversal {
+                QueryStep::ValueFlow(brokk_bifrost_rql::ValueFlowTraversal {
                     plan_ref: "test:request-to-sink".parse().unwrap(),
                 }),
-                QueryStep::Witness(crate::analyzer::structural::query::WitnessTraversal::default()),
+                QueryStep::Witness(brokk_bifrost_rql::WitnessTraversal::default()),
             ],
         ));
         let physical =

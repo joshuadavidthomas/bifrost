@@ -43,7 +43,7 @@ pub mod occurrence_rows;
 pub mod planner;
 pub mod provider;
 pub mod qualified_paths;
-pub mod query;
+pub use brokk_bifrost_rql::query;
 pub mod reference_edges;
 pub mod rune_ir;
 pub mod search;

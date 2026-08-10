@@ -16,13 +16,13 @@ use super::super::occurrence_rows::{
     OccurrenceTarget, occurrences_for_file,
 };
 use super::super::occurrences::OccurrenceRole;
-use super::super::query::OccurrenceFilter;
 use super::results::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryRange,
 };
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_rql::OccurrenceFilter;
 use std::sync::Arc;
 
 /// Per-request memo of derived occurrence rows plus the diagnostics already

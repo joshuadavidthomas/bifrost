@@ -8,7 +8,6 @@ use json::analyze_json_with_schema_registry;
 use rql::{analyze_rql, validate_rql_query};
 use shared::*;
 
-use super::super::edges::{OwnerRelation, SiteClass};
 use super::ir::MAX_BINDING_NAME_LENGTH;
 use super::schema;
 use super::schema::{
@@ -30,15 +29,16 @@ use super::{
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
     MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
 };
-use crate::analyzer::Language;
-use crate::analyzer::structural::kinds::{
+use crate::sexp::{Expr, ExprKind};
+use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
+use brokk_bifrost_core::analyzer::structural::kinds::{
     ALL_KINDS, ALL_ROLES, NormalizedKind, Role, RoleValueShape,
 };
-use crate::analyzer::structural::materialization::{
+use brokk_bifrost_core::analyzer::structural::materialization::{
     ALL_EXPORT_FORMS, ALL_GENERATION_INPUT_CLASSES, ALL_GENERATION_KINDS,
 };
-use crate::schema_version::SchemaVersionRegistry;
-use crate::sexp::{Expr, ExprKind};
+use brokk_bifrost_core::schema_version::SchemaVersionRegistry;
 use json_spanned_value::{ErrorExt, spanned};
 use regex::Regex;
 use serde_json::{Map, Value};

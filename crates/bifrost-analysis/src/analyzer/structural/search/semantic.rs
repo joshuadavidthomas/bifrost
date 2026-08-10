@@ -26,11 +26,11 @@ use crate::analyzer::semantic::{
 use crate::analyzer::structural::analysis_context::{
     ProtocolRef, QueryAnalysisContext, TaintResultRef, ValueFlowPlanRef,
 };
-use crate::analyzer::structural::query::WitnessTraversal;
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
+use brokk_bifrost_rql::WitnessTraversal;
 
 #[derive(Debug, Clone)]
 struct SemanticSourceSnapshot {
