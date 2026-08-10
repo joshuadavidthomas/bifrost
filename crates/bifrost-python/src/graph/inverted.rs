@@ -22,7 +22,8 @@ use super::extractor::{
     slice,
 };
 use super::resolver::{
-    annotation_reference_candidates, resolve_constructor_types, resolve_receiver_type,
+    annotation_reference_candidates, resolve_callable_parameter_default_types,
+    resolve_constructor_types, resolve_receiver_type,
 };
 use crate::graph::PythonGraphSource;
 use crate::graph_support::PythonUsageSource;
@@ -630,16 +631,38 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[Funct
     if member.is_empty() || !ctx.targets_by_terminal.contains_key(member) {
         return;
     }
-    let classes = if function.kind() == "identifier" && slice(function, ctx.source) == "cls" {
+    let scoped_class_fqn = if function.kind() == "identifier" {
+        enclosing_scope_facts(ctx.graph.index, ctx.file, ctx.scope_facts, function)
+            .and_then(|facts| ctx.receiver_type_fqn(facts, slice(function, ctx.source)))
+    } else {
+        None
+    };
+    let function_name = (function.kind() == "identifier").then(|| slice(function, ctx.source));
+    let mut default_classes = function_name.map_or_else(Vec::new, |local_name| {
+        resolve_callable_parameter_default_types(
+            ctx.graph, ctx.python, ctx.file, ctx.source, function, local_name,
+        )
+    });
+    let root_shadowed = leftmost_identifier(function)
+        .is_some_and(|root| is_shadowed(scopes, slice(root, ctx.source)));
+    let mut classes = if function_name == Some("cls") {
         lexical_class(ctx, function).into_iter().collect()
     } else {
-        if leftmost_identifier(function)
-            .is_some_and(|root| is_shadowed(scopes, slice(root, ctx.source)))
-        {
+        if root_shadowed && scoped_class_fqn.is_none() && default_classes.is_empty() {
             return;
         }
-        resolve_constructor_types(ctx.graph, ctx.python, ctx.file, ctx.source, function)
+        if !root_shadowed {
+            default_classes.extend(resolve_constructor_types(
+                ctx.graph, ctx.python, ctx.file, ctx.source, function,
+            ));
+        }
+        default_classes
     };
+    if let Some(fqn) = scoped_class_fqn {
+        classes.extend(ctx.graph.index.definitions(&fqn).filter(CodeUnit::is_class));
+        classes.sort();
+        classes.dedup();
+    }
     for class in classes {
         let direct = format!("{}.{member}", class.fq_name());
         if ctx.targets.contains(&direct) {

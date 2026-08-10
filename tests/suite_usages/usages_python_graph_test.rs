@@ -135,6 +135,14 @@ fn subclass_constructor_keyword_argument_is_an_inherited_field_usage() {
 }
 
 #[test]
+fn callable_parameter_default_class_resolves_keyword_field_usage() {
+    assert_single_python_member_hit(
+        "class Foo:\n    bar: int\n\nclass Other:\n    bar: int\n",
+        "from service import Foo, Other\n\ndef call(Foo: type = Foo):\n    return Foo(bar=1)\n\ndef decoy(Foo: type = Other):\n    return Foo(bar=2)\n\ndef unknown(Foo: type):\n    return Foo(bar=3)\n",
+    );
+}
+
+#[test]
 fn call_result_receiver_resolves_member_usage() {
     assert_single_python_member_hit(
         "class Foo:\n    bar: int\n\ndef build() -> Foo:\n    return Foo()\n",

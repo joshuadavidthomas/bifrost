@@ -571,6 +571,56 @@ pub fn resolve_constructor_types(
     classes
 }
 
+/// Resolve the class in the nearest enclosing callable parameter default.
+///
+/// For `def run(Foo: type = Foo): Foo(bar=1)`, the body binding shadows the
+/// imported class name. The structured default still proves which class the
+/// keyword belongs to when the default callable is used.
+pub fn resolve_callable_parameter_default_types(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    file: &ProjectFile,
+    source: &str,
+    reference: Node<'_>,
+    local_name: &str,
+) -> Vec<CodeUnit> {
+    let site_start = reference.start_byte();
+    let site_end = reference.end_byte();
+    let mut current = reference;
+    while let Some(parent) = current.parent() {
+        current = parent;
+        if !matches!(current.kind(), "function_definition" | "lambda") {
+            continue;
+        }
+        if current
+            .child_by_field_name("body")
+            .is_none_or(|body| !(body.start_byte() <= site_start && site_end <= body.end_byte()))
+        {
+            continue;
+        }
+        let Some(parameters) = current.child_by_field_name("parameters") else {
+            return Vec::new();
+        };
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            let name = if parameter.kind() == "identifier" {
+                Some(parameter)
+            } else {
+                parameter.child_by_field_name("name")
+            };
+            if name.is_none_or(|name| node_text(name, source) != local_name) {
+                continue;
+            }
+            let Some(value) = parameter.child_by_field_name("value") else {
+                return Vec::new();
+            };
+            return resolve_constructor_types(graph, python, file, source, value);
+        }
+        return Vec::new();
+    }
+    Vec::new()
+}
+
 /// The declarations a namespace-qualified attribute path names (`module.Name`,
 /// `pkg.module.Name`), walked structurally through the import binder.
 ///
