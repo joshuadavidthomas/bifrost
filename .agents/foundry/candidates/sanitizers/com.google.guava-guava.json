@@ -1,0 +1,87 @@
+[
+  {
+    "target": {
+      "path": "com/google/common/html/HtmlEscapers.java",
+      "symbol": "com.google.common.html.HtmlEscapers.htmlEscaper().escape",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "com.google.guava:guava:33.6.0-jre",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The composed call HtmlEscapers.htmlEscaper().escape(input) replaces '&', '<', '>', '\"', and '\\'' with HTML entity references, so the value cannot open a tag or attribute boundary in HTML content or in a quoted HTML attribute, and the same references are well-formed in XML content and quoted XML attributes. The claim is partial because spaces and CR/LF pass through raw: the attribute claims assume a quoted attribute value, and the value is not single-line for log. Envelope note: the context is fixed by the factory, not by the method; com.google.common.escape.Escaper.escape is shared with the URL escapers, which do not neutralize these contexts, so a downstream step must bind this claim only to Escaper receivers produced by HtmlEscapers.htmlEscaper() and must not bind it to Escaper.escape unconditionally.",
+    "confidence": "medium",
+    "citations": "Javadoc of com.google.common.html.HtmlEscapers (guava 33.6.0-jre): htmlEscaper returns an Escaper that escapes the five HTML metacharacters."
+  },
+  {
+    "target": {
+      "path": "com/google/common/net/UrlEscapers.java",
+      "symbol": "com.google.common.net.UrlEscapers.urlFormParameterEscaper().escape",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "com.google.guava:guava:33.6.0-jre",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "log", "url", "xml"],
+    "does_not_neutralize": ["ldap", "path", "shell", "sql", "xpath"],
+    "completeness": "partial",
+    "rationale": "The composed call UrlEscapers.urlFormParameterEscaper().escape(input) keeps only the alphanumerics and '.', '-', '*', '_', converts space to '+', and UTF-8 percent-encodes everything else, so the output can contain no quote, angle bracket, ampersand, equals sign, parenthesis, backslash, or control character; the javadoc states the escaper is suitable for parameter names and values even with the semicolon delimiter convention. The method is not an injection sanitizer for sql, shell, ldap, or xpath: percent-encoding removes delimiter characters but leaves grammar-level metacharacters live. Every %XX escape emits a literal '%' and '_' passes through, both SQL LIKE wildcards; '*' passes through as an LDAP wildcard and a shell glob, and a leading '-' passes through as a shell option prefix; '-' is also an XPath operator. It is unsafe for path because '..' sequences survive unchanged. Envelope note: bind this claim only to Escaper receivers produced by UrlEscapers.urlFormParameterEscaper(); the shared com.google.common.escape.Escaper.escape method must not carry the claim unconditionally. The javadoc also directs the caller to normalize unpaired CR or LF to CR+LF on non-file inputs before escaping; that is a form-data correctness requirement, not an injection gap.",
+    "confidence": "medium",
+    "citations": "Javadoc of com.google.common.net.UrlEscapers.urlFormParameterEscaper (guava 33.6.0-jre): lists the kept characters, the space-to-plus rule, the %XX rule, and the CR/LF normalization note."
+  },
+  {
+    "target": {
+      "path": "com/google/common/net/UrlEscapers.java",
+      "symbol": "com.google.common.net.UrlEscapers.urlFragmentEscaper().escape",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "com.google.guava:guava:33.6.0-jre",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["log", "url"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "path", "shell", "sql", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The composed call UrlEscapers.urlFragmentEscaper().escape(input) percent-encodes everything outside the fragment-legal set, which deliberately keeps '/', '?', and all sub-delimiters (including '&', '=', and the single quote) raw. The url claim is therefore partial and position-specific: the value is safe only inside the fragment portion of a URL, where those characters have no delimiting meaning; placed in a query or path position the surviving '&', '=', and '?' inject structure. No control characters survive, so the value is single-line for log, and '..' survives, so the value is not safe for path. Envelope note: bind this claim only to Escaper receivers produced by UrlEscapers.urlFragmentEscaper().",
+    "confidence": "medium",
+    "citations": "Javadoc of com.google.common.net.UrlEscapers.urlFragmentEscaper (guava 33.6.0-jre): lists the kept unreserved, general-delimiter, and sub-delimiter characters and notes that fragments allow unescaped '/' and '?'."
+  },
+  {
+    "target": {
+      "path": "com/google/common/net/UrlEscapers.java",
+      "symbol": "com.google.common.net.UrlEscapers.urlPathSegmentEscaper().escape",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "com.google.guava:guava:33.6.0-jre",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["log", "url"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "path", "shell", "sql", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The composed call UrlEscapers.urlPathSegmentEscaper().escape(input) percent-encodes every character outside the path-segment set, including '/', so the value cannot add path segments and cannot escape into the query or fragment. The url claim is partial: the sub-delimiters (including ';', '=', '&', and the single quote) survive by design, so matrix-parameter injection within the segment remains possible and the value must not be used as a query parameter; '..' sequences also survive, so the value is not safe for path. No control characters survive, so the value is single-line for log. Envelope note: bind this claim only to Escaper receivers produced by UrlEscapers.urlPathSegmentEscaper().",
+    "confidence": "medium",
+    "citations": "Javadoc of com.google.common.net.UrlEscapers.urlPathSegmentEscaper (guava 33.6.0-jre): lists the kept unreserved, general-delimiter ('@', ':'), and sub-delimiter characters, and notes that '/' is escaped because it separates path segments."
+  },
+  {
+    "target": {
+      "path": "com/google/common/xml/XmlEscapers.java",
+      "symbol": "com.google.common.xml.XmlEscapers.xmlEscaper().escape",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "artifact": "com.google.guava:guava:33.6.0-jre",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The composed call XmlEscapers.xmlEscaper().escape(input) replaces '&', '<', '>', '\"', and '\\'' with numeric character references, so the value is safe in XML content and quoted XML attributes and, because the same five characters cover the HTML breakout set, in HTML content and quoted HTML attributes. The claim is partial because spaces and CR/LF pass through raw: the attribute claims assume a quoted attribute value, and the value is not single-line for log. Envelope note: bind this claim only to Escaper receivers produced by XmlEscapers.xmlEscaper(); the shared com.google.common.escape.Escaper.escape method must not carry the claim unconditionally.",
+    "confidence": "medium",
+    "citations": "Javadoc of com.google.common.xml.XmlEscapers (guava 33.6.0-jre): xmlEscaper returns an Escaper that escapes the five XML predefined metacharacters as numeric character references."
+  }
+]

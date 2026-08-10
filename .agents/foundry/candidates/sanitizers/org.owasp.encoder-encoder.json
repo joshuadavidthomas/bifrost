@@ -1,0 +1,257 @@
+[
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forCDATA",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["xml"],
+    "does_not_neutralize": ["css", "html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method encodes data for an XML CDATA section by replacing any terminating \"]]>\" sequence with \"]]>]]<![CDATA[>\", so the value cannot close the enclosing CDATA section. The claim holds only when the caller places the result inside CDATA section boundaries that the caller provides; outside a CDATA section the method escapes nothing, so '<' and '&' pass through raw. Characters invalid in XML are replaced by a space.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forCDATA (encoder 1.4.0): \"Caller must provide the CDATA section boundaries\"; describes the \"]]>]]<![CDATA[>\" replacement and XML character validity handling."
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forCssString",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css"],
+    "does_not_neutralize": ["html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method encodes data for a quoted CSS string: control characters, both quotes, backslash, '<', '&', '/', '>', DEL, and the Unicode line and paragraph separators become CSS hexadecimal escapes of the form \\xxx with a lookahead space so the next character cannot join the escape. The value cannot terminate the string literal or inject a rule, but the method assumes placement inside a quoted CSS string; it does not neutralize a full CSS declaration or selector context. The backslash-escape output is not valid in HTML, XML, JavaScript, SQL, or URL grammars.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forCssString (encoder 1.4.0): lists the encoded character set and the \\xxx shortest-hex encoding with one-character lookahead; example usage places the result inside a quoted CSS string."
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forCssUrl",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css"],
+    "does_not_neutralize": ["html", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method applies the CSS string encoder for use inside a CSS url(...) construct, so the value cannot close the url token or the surrounding rule. The javadoc explicitly states that the method does not check the quality or safety of the URL itself: a javascript: or otherwise dangerous scheme passes through unchanged, so the claim covers only CSS tokenization, not the semantics of the URL. It neutralizes no other context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forCssUrl (encoder 1.4.0): \"this does not do any checking on the quality or safety of the URL itself. The caller should insure that the URL is safe for embedding (e.g. input validation) by other means.\""
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forHtml",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method delegates to forXml and encodes '&', '<', '>', '\"', and '\\'' as entity or numeric references, so the value cannot open a tag, comment, or attribute boundary in HTML content or in a quoted HTML attribute, and the same encoding is well-formed in XML content and quoted XML attributes. Space, tab, CR, and LF pass through raw, so the attribute claim assumes the caller quotes the attribute value; in an unquoted HTML attribute a raw space terminates the value. The raw CR and LF also mean the value is not safe for log, and it contains no encoding for the metacharacters of any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forHtml (encoder 1.4.0): encoding table for & < > \" ' and the note that CR, LF, tab, and space are valid in quoted attributes and pass through unescaped; implementation delegates to forXml."
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forHtmlAttribute",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method delegates to forXmlAttribute and encodes '&', '<', '\"', and '\\'', so the value is safe inside a quoted HTML attribute of either quote style and, because '<' and '&' are encoded, also in HTML content and in quoted XML attributes and XML content. The javadoc states that the caller must provide the quotes around the attribute value: space passes through raw, so in an unquoted attribute a space breaks the value out. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forHtmlAttribute (encoder 1.4.0): \"When using this method, the caller must provide quotes around the attribute value\"; both quote characters are encoded; '>' is intentionally not encoded for attributes."
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forHtmlContent",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "xml"],
+    "does_not_neutralize": ["css", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "complete",
+    "rationale": "The method delegates to forXmlContent and encodes '&', '<', and '>', which is the full breakout set for HTML element content and for XML element content. Quotes are deliberately not encoded, so the value is not safe inside an attribute; that exclusion is a placement constraint, not an input-dependent gap, so the content claim itself holds for all inputs. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forHtmlContent (encoder 1.4.0): \"Single-quote character and double-quote character do not require encoding in HTML blocks, unlike other HTML contexts\"; implementation delegates to forXmlContent."
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forHtmlUnquotedAttribute",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "complete",
+    "rationale": "The method encodes every character that can terminate an unquoted HTML attribute value: space, tab, CR, LF, form feed, both quotes, '=', '`', '/', '<', '>', '&', and the Unicode line separators. Because space itself is encoded, the value is safe in quoted and unquoted attributes alike, and the '<' and '&' encoding also covers HTML content and XML. The immune set intentionally leaves many shell- and CSS-relevant punctuation characters raw, but those are irrelevant to the claimed markup contexts.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forHtmlUnquotedAttribute (encoder 1.4.0): encoding table including space, quotes, '=', backtick, '/', and U+2028/U+2029; immune set is alphanumerics plus a listed punctuation set that excludes space."
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forJavaScript",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["js"],
+    "does_not_neutralize": ["css", "html", "html_attr", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "complete",
+    "rationale": "The method encodes both quotes as \\x22/\\x27 (chosen so the output is also safe inside HTML attribute quoting), '&' as \\x26, '/' as \\/ (so an input \"</\" cannot terminate a script block), backslash as \\\\, and all control characters as \\x## or short escapes. The result cannot terminate a JavaScript string literal, cannot break out of a script block, and cannot open an HTML event-handler attribute, so it covers string-literal, script-block, and script-attribute placements for all inputs. The claim does not extend to placement as raw JavaScript code, where no output encoding can help.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forJavaScript (encoder 1.4.0): encoding description table for quotes, &, /, backslash, and U+0000-U+001F; notes that \\x22 is used instead of \\\" because the latter is not safe in HTML attributes; example usage in onclick and script blocks."
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forJavaScriptAttribute",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["js"],
+    "does_not_neutralize": ["css", "html", "html_attr", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method performs the forJavaScript encoding except that '/' is not escaped, and it is documented for JavaScript strings inside HTML event-handler attributes such as onclick. It is explicitly not safe for use in script blocks, and the caller must provide the surrounding quotation characters. Within those documented constraints the js claim holds for all inputs; the constraints are placement assumptions, hence partial.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forJavaScriptAttribute (encoder 1.4.0): \"It is NOT safe for use in script blocks. The caller MUST provide the surrounding quotation characters.\""
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forJavaScriptBlock",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["js"],
+    "does_not_neutralize": ["css", "html", "html_attr", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method performs the forJavaScript encoding except that quotes become \\\" and \\' instead of the \\x## forms, which keeps the output safe for a JavaScript string inside an HTML script block but unsafe inside an HTML event-handler attribute, where the backslash does not protect the quote from the HTML parser. The caller must provide the surrounding quotation characters. Within the documented script-block placement the js claim holds for all inputs.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forJavaScriptBlock (encoder 1.4.0): \"It is NOT safe for use in script attributes (such as onclick). The caller must provide the surrounding quotation characters.\""
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forJavaScriptSource",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["js"],
+    "does_not_neutralize": ["css", "html", "html_attr", "ldap", "log", "path", "shell", "sql", "url", "xml", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method performs the forJavaScript encoding except that '/' and '&' are not escaped and quotes become \\\" and \\', which is documented for JavaScript strings inside a standalone JavaScript or JSON file. The javadoc warns in strong terms that the output is not safe for use in any context embedded in HTML, because an unescaped \"</\" terminates a script block and an unescaped quote terminates an event-handler attribute. The js claim holds only for standalone source files, hence partial.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forJavaScriptSource (encoder 1.4.0): \"This method is NOT safe for use in ANY context embedded in HTML.\""
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forUriComponent",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["css", "html", "html_attr", "js", "log", "url", "xml"],
+    "does_not_neutralize": ["ldap", "path", "shell", "sql", "xpath"],
+    "completeness": "complete",
+    "rationale": "The method UTF-8 percent-encodes every character outside the RFC 3986 unreserved set [A-Za-z0-9-._~], so the output can contain no URL delimiter, quote, angle bracket, ampersand, parenthesis, backslash, whitespace, or control character; the value cannot break out of a URI component or of a quoted markup, script-string, or CSS-string context, which matches the javadoc note that the output is safe in HTML/XML, CSS, and JavaScript containing contexts. The method is nevertheless not an injection sanitizer for sql, shell, ldap, or xpath: percent-encoding removes delimiter characters but leaves grammar-level metacharacters live. Every %XX escape emits a literal '%' and '_' survives, both SQL LIKE wildcards; '~' and a leading '-' survive as shell home-directory and option expansions; and the encoding does nothing about the wildcard and operator semantics of LDAP filters and XPath expressions. The path gap also remains: '..' sequences survive unchanged, so the value can still express parent-directory traversal. Percent-decoding the value at a downstream component restores the original bytes; decode points are taint-restoring.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forUriComponent (encoder 1.4.0): lists the unencoded characters as exactly the unreserved set, and states \"this method is safe to be used in most containing contexts, including: HTML/XML, CSS, and JavaScript contexts.\" RFC 3986 section 2.3 for the unreserved set."
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forXml",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method encodes '&', '<', '>', '\"', and '\\'' as entity or numeric references and replaces characters that are invalid per the XML specification with a space, so the value is safe in XML content, in quoted XML attributes, in HTML content, and in quoted HTML attributes. Space, tab, CR, and LF pass through raw, so the attribute claims assume a quoted attribute value; the raw CR and LF also keep the value unsafe for log. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forXml (encoder 1.4.0): encoding table for & < > \" '; notes that CR, LF, tab, and space are valid in quoted attributes and pass through unescaped, and that XML-invalid characters are replaced by a space."
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forXmlAttribute",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "html_attr", "xml"],
+    "does_not_neutralize": ["css", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "partial",
+    "rationale": "The method encodes '&', '<', and both quote characters for use in an XML attribute value, and because '<' and '&' are encoded the output is also safe in HTML content, quoted HTML attributes, and XML content. Space passes through raw, so the HTML attribute claim assumes a quoted attribute; XML attributes are always quoted by the grammar, so the XML claim has no such gap. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forXmlAttribute (encoder 1.4.0): encoding table for & < \" '; '>' intentionally not encoded for attributes."
+  },
+  {
+    "target": {
+      "path": "org/owasp/encoder/Encode.java",
+      "symbol": "org.owasp.encoder.Encode.forXmlContent",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "artifact": "org.owasp.encoder:encoder:1.4.0",
+    "sanitized_input": {"kind": "parameter", "ordinal": 0},
+    "output": {"kind": "normal_return"},
+    "neutralizes": ["html", "xml"],
+    "does_not_neutralize": ["css", "html_attr", "js", "ldap", "log", "path", "shell", "sql", "url", "xpath"],
+    "completeness": "complete",
+    "rationale": "The method encodes '&', '<', and '>', the full breakout set for XML element content and HTML element content, and replaces XML-invalid characters with a space. Quotes are deliberately not encoded, so the value is unsafe inside attributes; that is a documented placement constraint, not an input-dependent gap, so the content claim holds for all inputs. It encodes nothing for any other named context.",
+    "confidence": "high",
+    "citations": "Javadoc of org.owasp.encoder.Encode.forXmlContent (encoder 1.4.0): encoding table for & < > and the note that quotes do not require encoding in content contexts."
+  }
+]
