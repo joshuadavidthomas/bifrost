@@ -1551,8 +1551,8 @@ fn arity_predicate_selects_a_call_overload_by_argument_count() {
         execute_workspace(&workspace, &query)
             .results
             .into_iter()
-            .filter_map(|item| match item.value {
-                CodeQueryResultValue::StructuralMatch { value } => Some(value.text),
+            .map(|item| match item.value {
+                CodeQueryResultValue::StructuralMatch { value } => value.text,
                 other => panic!("expected a structural match, got {other:?}"),
             })
             .collect()
