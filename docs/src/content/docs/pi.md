@@ -49,8 +49,8 @@ for the resolution order, cache locations, and controls for automatic downloads.
 
 Pi-visible tools use a `bifrost_` prefix. For example, Bifrost's canonical
 `get_summaries` and `query_code` tools appear as `bifrost_get_summaries` and
-`bifrost_query_code`. The bundled code-navigation, code-reading, and
-codebase-search skills keep their canonical names.
+`bifrost_query_code`. The extension keeps Bifrost's canonical tool names behind
+the `bifrost_` namespace.
 
 The extension scopes its Bifrost child to Pi's explicit session workspace. It
 does not analyze the installed package directory and does not expose Bifrost's

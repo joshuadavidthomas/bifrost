@@ -288,9 +288,6 @@ jobs:
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
 
-      - name: Generate Amp skill bundle
-        run: node scripts/generate-amp-skill-bundle.mjs
-
       - name: Test agent plugin launcher
         run: node --test plugins/bifrost-agent/test/launcher.test.mjs
 
@@ -878,9 +875,6 @@ jobs:
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
 
-      - name: Generate Amp skill bundle
-        run: node scripts/generate-amp-skill-bundle.mjs
-
       - name: Test agent plugin launcher
         run: node --test plugins/bifrost-agent/test/launcher.test.mjs
 
@@ -1298,9 +1292,6 @@ jobs:
           --plugin-release plugins/bifrost-agent/bifrost-release.json
           --dist dist
 
-      - name: Regenerate Amp skill bundle
-        run: node scripts/generate-amp-skill-bundle.mjs
-
       - name: Validate synchronized release projections
         run: node scripts/release-version.mjs check
 
@@ -1311,12 +1302,10 @@ jobs:
         shell: bash
         run: |
           allowed_canonical="plugins/bifrost-agent/bifrost-release.json"
-          allowed_amp="plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json"
           allowed_vscode="editors/vscode/package.json"
           while IFS= read -r changed_file; do
             [ -z "$changed_file" ] && continue
             if [ "$changed_file" != "$allowed_canonical" ] && \
-              [ "$changed_file" != "$allowed_amp" ] && \
               [ "$changed_file" != "$allowed_vscode" ]; then
               echo "Refusing to commit unexpected generated change: $changed_file" >&2
               exit 1
@@ -1333,7 +1322,6 @@ jobs:
             exit 0
           fi
           git add -- plugins/bifrost-agent/bifrost-release.json \
-            plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json \
             editors/vscode/package.json
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

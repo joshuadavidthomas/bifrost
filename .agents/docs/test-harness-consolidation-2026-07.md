@@ -222,11 +222,11 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 
 - `bifrost_benchmark_cli`
 - `bifrost_benchmark_run`
+- `bifrost_install_cli`
 - `bifrost_lsp_server`
 - `bifrost_mcp_property_fuzzer_cli`
 - `bifrost_mcp_server`
 - `bifrost_reference_differential_cli`
-- `bifrost_skill_install_cli`
 - `bifrost_tool_cli`
 - `binary_file_handling`
 - `code_intelligence_runtime`

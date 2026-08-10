@@ -208,16 +208,6 @@ require_archive_file brokk-bifrost scripts/embedding_sidecar.py
 require_archive_file brokk-bifrost scripts/voyage_sidecar.py
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v1.schema.json
 
-embedded_skill_count=0
-while IFS= read -r skill_file; do
-  require_archive_file brokk-bifrost "$skill_file"
-  embedded_skill_count=$((embedded_skill_count + 1))
-done < <(grep -oE 'plugins/bifrost-agent/skills/[^" ]+/SKILL[.]md' src/skill_install.rs | sort -u)
-if (( embedded_skill_count == 0 )); then
-  echo "Failed to derive the embedded skill roster from src/skill_install.rs" >&2
-  exit 1
-fi
-
 root_archive=$(archive_for brokk-bifrost)
 root_files="$temporary/root-files.txt"
 tar -tzf "$root_archive" | sed 's@^[^/]*/@@' > "$root_files"

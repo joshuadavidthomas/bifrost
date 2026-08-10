@@ -3,7 +3,7 @@ title: Claude Code
 description: Install and validate Bifrost in Claude Code.
 ---
 
-Claude Code can use Bifrost through the Brokk agent plugin or through a manual MCP server entry. The plugin path is preferred because it includes Bifrost skills, registers both MCP and native LSP code intelligence, and provides a launcher that resolves the Bifrost binary.
+Claude Code can use Bifrost through the Brokk agent plugin or through a manual MCP server entry. The plugin path is preferred because it registers both MCP and native LSP code intelligence, and provides a launcher that resolves the Bifrost binary.
 
 ## Authenticate Claude Code
 

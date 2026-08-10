@@ -100,37 +100,6 @@ Zed asks for confirmation before MCP calls by default. Approve the first
 Bifrost call when prompted, or configure Zed's tool permissions if you want a
 different approval policy.
 
-## Add Skills
-
-Zed skills are separate from MCP tools. The MCP server makes Bifrost tools
-available; skills provide reusable agent instructions for when and how to use
-those tools.
-
-Zed loads skills only from `~/.agents/skills/` and
-`<worktree>/.agents/skills/`. It does not discover skills directly from
-`plugins/bifrost-agent/skills`. If you want Zed to see the Bifrost
-code-intelligence skills, use the Bifrost CLI to install them into one of Zed's
-supported skill roots:
-
-```bash
-bifrost --root /path/to/project --install-skills --target project
-```
-
-Use `--target global` for `~/.agents/skills`, or `--mode copy` when you want a
-self-contained install instead of a checkout-local symlink. See
-[CLI](/cli/#install-agent-skills) for the full option list.
-
-The recommended first set is:
-
-- `bifrost-code-navigation`
-- `bifrost-code-reading`
-- `bifrost-codebase-search`
-- `bifrost-policy-checking`
-
-Workflow skills such as guided review or PR review may depend on host-specific
-tools and should be installed only after validating that the host provides the
-needed capabilities.
-
 ## Validate the Setup
 
 Use a prompt that requires a Bifrost MCP tool result instead of ordinary file
@@ -165,4 +134,4 @@ configured binary's install directory or another repository.
 
 The configuration above uses `symbol|extended`. In a new Agent thread, confirm that the Bifrost tool list includes `query_code`, then call it with the inline JSON fields `{"match":{"kind":"declaration"},"limit":1}`. To validate saved RQL, check a workspace file named `bifrost-smoke.rql` containing `(limit 1 (declaration))`, then call `query_code` with `{"query_file":"bifrost-smoke.rql"}`.
 
-The inline call is canonical JSON. MCP accepts RQL only from a workspace `.rql` file through `query_file`. Zed skills remain separate instructions and cannot expose Bifrost tools without the context server. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the full surface matrix and [Agent Result Safety](/agent-result-safety/) before making completeness claims.
+The inline call is canonical JSON. MCP accepts RQL only from a workspace `.rql` file through `query_file`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the full surface matrix and [Agent Result Safety](/agent-result-safety/) before making completeness claims.

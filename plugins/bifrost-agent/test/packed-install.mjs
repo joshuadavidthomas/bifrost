@@ -13,12 +13,6 @@ assert.ok(npmExecPath, "npm_execpath is required to run npm portably");
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(packageDir, "..", "..");
 
-const canonicalSkillNames = [
-  "bifrost-code-navigation",
-  "bifrost-code-reading",
-  "bifrost-codebase-search",
-  "bifrost-policy-checking",
-];
 const sourceManifest = JSON.parse(await fsp.readFile(path.join(packageDir, "package.json"), "utf8"));
 const piPeerPackages = [
   "@earendil-works/pi-coding-agent",
@@ -79,10 +73,6 @@ try {
   const installedPackageDir = path.join(consumerDir, "node_modules", "@brokk", "bifrost-agent");
   assert.ok(fs.existsSync(installedPackageDir), "installed tarball is missing @brokk/bifrost-agent in node_modules");
 
-  const installedManifest = JSON.parse(
-    await fsp.readFile(path.join(installedPackageDir, "package.json"), "utf8"),
-  );
-
   const installedLicenseNotices = [
     { packaged: "LICENSE.md", source: "LICENSE.md" },
     { packaged: "GPL-3.0.md", source: "licenses/GPL-3.0.md" },
@@ -117,27 +107,15 @@ try {
     1,
     `expected the installed tarball to load exactly one extension, got ${probeResult.extensionCount}`,
   );
-  assert.deepEqual(
-    probeResult.skillDiagnostics,
-    [],
-    `Pi's skill loader reported diagnostics for the installed package: ${JSON.stringify(probeResult.skillDiagnostics)}`,
-  );
-  assert.deepEqual(
-    probeResult.skillNames,
-    canonicalSkillNames,
-    "installed tarball must load exactly the four canonical Bifrost skills",
-  );
-  assert.equal(installedManifest.pi.skills.length, canonicalSkillNames.length);
-
   console.log(
-    `Installed ${tarballName} into a clean package and verified Pi's extension and skill loaders discover 1 extension and ${canonicalSkillNames.length} skills without starting Bifrost.`,
+    `Installed ${tarballName} into a clean package and verified Pi discovers 1 extension without starting Bifrost.`,
   );
 } finally {
   await cleanup();
 }
 
 function probeScript() {
-  return `import { discoverAndLoadExtensions, loadSkills } from "@earendil-works/pi-coding-agent";
+  return `import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -145,15 +123,12 @@ import { fileURLToPath } from "node:url";
 
 const consumerDir = path.dirname(fileURLToPath(import.meta.url));
 const pkgDir = path.join(consumerDir, "node_modules", "@brokk", "bifrost-agent");
-const manifest = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
 
 const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-agent-probe-cwd-"));
 const tmpAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-agent-probe-agent-"));
 
 try {
   const extensionsResult = await discoverAndLoadExtensions([pkgDir], tmpCwd, tmpAgentDir);
-  const skillPaths = manifest.pi.skills.map((relativePath) => path.resolve(pkgDir, relativePath));
-  const skillsResult = loadSkills({ cwd: tmpCwd, agentDir: tmpAgentDir, skillPaths, includeDefaults: false });
 
   process.stdout.write(JSON.stringify({
     extensionErrors: extensionsResult.errors.map((entry) => ({
@@ -161,8 +136,6 @@ try {
       message: String(entry.error?.message ?? entry.error),
     })),
     extensionCount: extensionsResult.extensions.length,
-    skillDiagnostics: skillsResult.diagnostics,
-    skillNames: skillsResult.skills.map((skill) => skill.name).sort(),
   }));
 } finally {
   fs.rmSync(tmpCwd, { recursive: true, force: true });

@@ -16,7 +16,7 @@ import {
   type BifrostSettingsStore,
 } from "./bifrost-settings.ts";
 
-export const BIFROST_PROMPT_NOTE = "Bifrost MCP tools are namespaced as bifrost_<name> in Pi. When a Bifrost skill refers to query_code, for example, call bifrost_query_code. Bifrost is fixed to the current Pi workspace; do not activate another workspace.";
+export const BIFROST_PROMPT_NOTE = "Bifrost MCP tools are namespaced as bifrost_<name> in Pi. For example, call bifrost_query_code for the query_code tool. Bifrost is fixed to the current Pi workspace; do not activate another workspace.";
 
 interface BifrostExtensionDependencies {
   createSession(pi: ExtensionAPI): BifrostSessionController;
