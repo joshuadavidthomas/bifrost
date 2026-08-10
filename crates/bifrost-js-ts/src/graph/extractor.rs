@@ -188,6 +188,7 @@ pub fn scan_files_for_seeds(
         let lexical_bindings = (((browser_global_object.is_some() || direct_local_property)
             && target_self_file)
             || !global_property_receivers.is_empty()
+            || !target_property_receivers.is_empty()
             || script_global_bare_target)
             .then(|| JsTsLexicalBindingIndex::build(root, source_str));
         // Both remaining same-file models read the declaring file's byte ranges, so
@@ -231,6 +232,9 @@ pub fn scan_files_for_seeds(
             root,
             imports.clone(),
         );
+        let initial_binding_engine = binding_engine.clone();
+        let initial_type_binding_engine =
+            LocalInferenceEngine::new(LocalInferenceConfig::default());
         let mut scan_ctx = ScanCtx {
             file,
             source: source_str,
@@ -260,12 +264,23 @@ pub fn scan_files_for_seeds(
             scope_stack: vec![HashMap::default()],
             lexical_shadow_scopes: Vec::new(),
             binding_engine,
-            type_binding_engine: LocalInferenceEngine::new(LocalInferenceConfig::default()),
+            type_binding_engine: initial_type_binding_engine.clone(),
+            target_object_parameters: HashMap::default(),
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
 
-        scan_node(tree_ref.root_node(), &mut scan_ctx);
+        loop {
+            let parameter_count = scan_ctx.target_object_parameter_count();
+            scan_node(tree_ref.root_node(), &mut scan_ctx);
+            if scan_ctx.target_object_parameter_count() == parameter_count {
+                break;
+            }
+            scan_ctx.reset_for_additional_pass(
+                initial_binding_engine.clone(),
+                initial_type_binding_engine.clone(),
+            );
+        }
 
         if !local_hits.is_empty() {
             let mut sink = collected
@@ -418,6 +433,7 @@ pub struct ScanCtx<'a> {
     lexical_shadow_scopes: Vec<HashSet<String>>,
     binding_engine: LocalInferenceEngine<&'static str>,
     type_binding_engine: LocalInferenceEngine<()>,
+    target_object_parameters: HashMap<CodeUnit, HashSet<usize>>,
     pub hits: &'a mut BTreeSet<UsageHit>,
     pub unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
@@ -794,6 +810,25 @@ fn global_property_read_matches(object: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 }
 
 impl ScanCtx<'_> {
+    fn target_object_parameter_count(&self) -> usize {
+        self.target_object_parameters
+            .values()
+            .map(HashSet::len)
+            .sum()
+    }
+
+    fn reset_for_additional_pass(
+        &mut self,
+        binding_engine: LocalInferenceEngine<&'static str>,
+        type_binding_engine: LocalInferenceEngine<()>,
+    ) {
+        self.scope_stack.clear();
+        self.scope_stack.push(HashMap::default());
+        self.lexical_shadow_scopes.clear();
+        self.binding_engine = binding_engine;
+        self.type_binding_engine = type_binding_engine;
+    }
+
     /// Whether `name` has a lexical binding covering `byte` in this file. A
     /// bound name is the file's own, which disproves every global-identity
     /// read of the same spelling.
@@ -935,6 +970,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.binding_engine.enter_scope();
         ctx.type_binding_engine.enter_scope();
         register_function_parameters(node, ctx);
+        seed_target_object_function_parameters(node, ctx);
         register_named_function_expression_shadow(node, ctx);
         ctx.scope_stack.push(HashMap::default());
         register_scope_parameters(node, ctx);
@@ -991,6 +1027,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             handle_identifier_candidate(node, ctx);
         }
         "member_expression" => handle_member_expression(node, ctx),
+        "call_expression" => register_target_object_call_arguments(node, ctx),
         "object" => handle_contextual_object_literal(node, ctx),
         "jsx_opening_element" | "jsx_self_closing_element" => handle_jsx_element(node, ctx),
         _ => {}
@@ -1582,6 +1619,146 @@ fn register_function_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     register_pattern_bindings(parameters, ctx);
+}
+
+fn register_target_object_call_arguments(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.target_property_receivers.is_empty() {
+        return;
+    }
+    let Some(callee) = node.child_by_field_name("function") else {
+        return;
+    };
+    let Some(target) = local_function_target_for_reference(callee, ctx) else {
+        return;
+    };
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = arguments.walk();
+    for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
+        if expression_carries_target_object(argument, ctx) {
+            ctx.target_object_parameters
+                .entry(target.clone())
+                .or_default()
+                .insert(index);
+        }
+    }
+}
+
+fn seed_target_object_function_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.target_object_parameters.is_empty() {
+        return;
+    }
+    let Some(target) = local_function_target_for_declaration(node, ctx) else {
+        return;
+    };
+    let Some(indices) = ctx.target_object_parameters.get(&target) else {
+        return;
+    };
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for (index, parameter) in parameters.named_children(&mut cursor).enumerate() {
+        if !indices.contains(&index) {
+            continue;
+        }
+        if let Some(binding) = direct_function_parameter_binding(parameter) {
+            let name = slice(binding, ctx.source);
+            if !name.is_empty() {
+                ctx.binding_engine
+                    .seed_symbol(name.to_string(), TARGET_OBJECT_BINDING);
+            }
+        }
+    }
+}
+
+fn direct_function_parameter_binding(node: Node<'_>) -> Option<Node<'_>> {
+    let pattern = match node.kind() {
+        "required_parameter" | "optional_parameter" => node
+            .child_by_field_name("pattern")
+            .or_else(|| node.child_by_field_name("name"))?,
+        _ => node,
+    };
+    direct_pattern_binding(pattern)
+}
+
+fn local_function_target_for_reference(reference: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    let name = simple_identifier_text(reference, ctx.source)?;
+    let scope = ctx
+        .lexical_bindings
+        .as_ref()?
+        .binding_scope_at(name, reference.start_byte())?;
+    let mut candidates = ctx
+        .host
+        .usage_definitions()
+        .file_identifier(ctx.file, name)
+        .into_iter()
+        .filter(|candidate| candidate.source() == ctx.file && candidate.is_function())
+        .filter(|candidate| {
+            ctx.analyzer.ranges(candidate).iter().any(|range| {
+                ctx.lexical_bindings
+                    .as_ref()
+                    .and_then(|bindings| bindings.binding_scope_at(name, range.start_byte))
+                    == Some(scope)
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn local_function_target_for_declaration(
+    function: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let name = local_function_binding_name(function, ctx.source)?;
+    let function_range = Range {
+        start_byte: function.start_byte(),
+        end_byte: function.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    let mut candidates = ctx
+        .host
+        .usage_definitions()
+        .file_identifier(ctx.file, name)
+        .into_iter()
+        .filter(|candidate| candidate.source() == ctx.file && candidate.is_function())
+        .filter(|candidate| {
+            ctx.analyzer
+                .ranges(candidate)
+                .iter()
+                .any(|range| range_within(&function_range, range))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn local_function_binding_name<'a>(function: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if matches!(
+        function.kind(),
+        "function_declaration" | "generator_function_declaration"
+    ) {
+        return function
+            .child_by_field_name("name")
+            .and_then(|name| simple_identifier_text(name, source));
+    }
+    let declarator = function
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")?;
+    if declarator
+        .child_by_field_name("value")
+        .is_none_or(|value| value.id() != function.id())
+    {
+        return None;
+    }
+    declarator
+        .child_by_field_name("name")
+        .and_then(|name| simple_identifier_text(name, source))
 }
 
 fn register_scope_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
