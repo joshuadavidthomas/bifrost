@@ -5,12 +5,9 @@
 //! symbol graph.  Resolving them from the current syntax tree keeps overlays
 //! authoritative and avoids adding short-lived lexical facts to the store.
 
-use brokk_bifrost_js_ts::syntax::{
-    js_ts_var_declarator_binding_scope, js_ts_variable_declarator_binding_scope,
-};
 use tree_sitter::Node;
 
-use super::languages::language_support;
+use super::languages::{LocalDeclarationVisibility, language_support};
 use super::{DeclarationKind, Language, Range};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -604,7 +601,6 @@ fn scope_matching_local(
     focus_start: usize,
     identifier: &str,
 ) -> Option<LexicalDefinition> {
-    let js_ts = matches!(language, Language::JavaScript | Language::TypeScript);
     let mut nearest_before: Option<(Node<'_>, Node<'_>)> = None;
     let mut first_any: Option<(Node<'_>, Node<'_>)> = None;
     let mut hoisted: Option<(Node<'_>, Node<'_>)> = None;
@@ -626,17 +622,20 @@ fn scope_matching_local(
             continue;
         }
         let starts_after_focus = node.start_byte() > focus_start;
-        if starts_after_focus && !js_ts {
+        let support = language_support(language);
+        let binding_scope =
+            support.and_then(|support| support.local_declaration_binding_scope(node));
+        if starts_after_focus
+            && binding_scope.is_none()
+            && !support.is_some_and(|support| support.scans_local_declarations_after_focus())
+        {
             continue;
         }
         if is_local_declaration(language, node.kind()) {
-            if js_ts && node.kind() == "variable_declarator" {
-                if js_ts_variable_declarator_binding_scope(node)
-                    .is_none_or(|binding_scope| binding_scope.id() != scope.id())
-                {
-                    continue;
-                }
-            } else if starts_after_focus {
+            if binding_scope.is_some_and(|binding| binding.scope.id() != scope.id()) {
+                continue;
+            }
+            if starts_after_focus && binding_scope.is_none() {
                 continue;
             }
             if language == Language::Rust && node.end_byte() > focus_start {
@@ -756,10 +755,13 @@ fn js_ts_hoisted_var_binder<'tree>(
             continue;
         }
         if node.kind() == "variable_declarator"
-            && js_ts_var_declarator_binding_scope(node).is_some_and(|binding_scope| {
-                binding_scope.start_byte() <= scope.start_byte()
-                    && scope.end_byte() <= binding_scope.end_byte()
-            })
+            && language_support(language)
+                .and_then(|support| support.local_declaration_binding_scope(node))
+                .is_some_and(|binding| {
+                    binding.visibility == LocalDeclarationVisibility::Hoisted
+                        && binding.scope.start_byte() <= scope.start_byte()
+                        && scope.end_byte() <= binding.scope.end_byte()
+                })
         {
             for name in binding_name_nodes(language, node, false) {
                 if !identifier_matches(language, name, source, identifier) {
