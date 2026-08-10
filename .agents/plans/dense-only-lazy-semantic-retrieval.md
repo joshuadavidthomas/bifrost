@@ -10,7 +10,7 @@ Bifrost has an optional semantic code search tool named `semantic_search`. It is
 
 Two independent facts make that work unnecessary.
 
-First, the owner A/B tested "hybrid" retrieval (dense vector search fused with BM25 lexical search) against a deeper purely dense arm and found hybrid a net loss in retrieval quality. BM25 is therefore being removed outright, not made optional. This deletes the single most expensive hydration step.
+First, the owner A/B tested "hybrid" retrieval (dense vector search fused with BM25 lexical search) against deeper dense-only arms and found hybrid a net loss: it cost more tokens and money for no measurable task benefit (the numbers are quoted in the Decision Log). BM25 is therefore being removed outright, not made optional. This deletes the single most expensive hydration step.
 
 Second, the persistent per-repository cache database already holds everything retrieval needs: chunk rows (`semantic_file_chunks`) keyed by `(blob_oid, rel_path, chunk_ord)` with an index on `vector_hash`, and quantized vectors (`semantic_vectors`) keyed by `vector_hash`. The only thing that is specific to one checkout is the answer to "which `(rel_path, blob_oid)` pairs are live right now", and the indexer already computes exactly that map during its git identity walk. There is no need to project the cache through that map ahead of time. Retrieval can score vectors straight out of the persistent table and check liveness per hit, skipping hits that belong to a blob the working tree no longer has.
 
@@ -26,7 +26,9 @@ You can see it working by running the semantic test suite and by timing the two 
 - [x] (2026-08-10 11:30Z) Milestone 1: deleted BM25 (module, FTS build, fusion leg, tokenizer version, `fts_tokens` writes).
 - [x] (2026-08-10 12:10Z) Milestone 2: replaced `ActiveIndex` with `LiveSet` lazy retrieval in `crates/bifrost-nlp/src/retrieval.rs`.
 - [x] (2026-08-10 12:40Z) Milestone 3: status/readiness semantics and the persistent-schema migration `0022`.
-- [x] (2026-08-10 13:30Z) Milestone 4: tests, gate, measurement.
+- [x] (2026-08-10 13:30Z) Milestone 4: tests and gate.
+- [x] (2026-08-10 15:10Z) Fail-before evidence captured against 960ec591 in a throwaway detached worktree.
+- [x] (2026-08-10 16:05Z) Before/after measurement on a synthetic 100k-file corpus (see `Outcomes & Retrospective`).
 
 ## Surprises & Discoveries
 
@@ -40,6 +42,13 @@ You can see it working by running the semantic test suite and by timing the two 
 
 - Observation: `ALTER TABLE ... DROP COLUMN` works on a `WITHOUT ROWID, STRICT` table in the bundled SQLite as long as the column is not part of the primary key, an index, a CHECK, or a foreign key. `fts_tokens` is none of those, so the migration does not have to rebuild `semantic_file_chunks` (which on a large cache would be a multi-gigabyte table copy).
   Evidence: migration `0022-drop-bm25-lexical-columns.sql` applies cleanly against a cache built by migration 14, verified by `cargo nextest run -p brokk-bifrost-nlp`.
+
+- Observation: the old vector scan was not a scan. `ActiveIndex::scan_vectors` selected from the TEMP `active_vectors` table joined to `semantic_vectors`, so every vector cost a B-tree probe into the persistent table. The lazy path reads `semantic_vectors` directly, which is a bare `SCAN`. On the synthetic 300k-vector corpus that alone moved the query's scan phase from about 915 ms to about 835 ms even though the new scan visits strictly more rows (it does not pre-filter to the active set).
+
+- Observation: dropping `fts_tokens` shrank the synthetic 300k-chunk cache from 414.0 MiB to 263.0 MiB, a 36% reduction. The exact fraction is corpus-dependent -- the synthetic chunks carry about 480 bytes of tokens each, which is in the range `fts_text` produced for a small function but is not a measurement of any real repository.
+
+- Observation: the 11 `bifrost_benchmark_run` failures seen in the first featureless run were an artifact of running the suite against a dirty working tree. That harness compares the benchmark binary's build identity against the checkout and refuses a `-dirty` mismatch. Re-running with the measurement scaffolding removed gave 9,953 passed and 0 failed.
+  Evidence: `benchmark harness build identity d00b41e2... does not match current checkout d00b41e2...-dirty.19904a61...; rebuild both bifrost and bifrost_benchmark`.
 
 ## Decision Log
 
@@ -55,12 +64,16 @@ You can see it working by running the semantic test suite and by timing the two 
   Rationale: `embed_fingerprint` and `chunker_version` describe what is stored; neither the documents nor the vectors change. Only the retrieval path and a lexical-only column change. A salt bump would needlessly discard warmed multi-gigabyte caches. `bm25_tokenizer_version` is not bumped either -- it is removed.
   Date/Author: 2026-08-10, Claude.
 
-- Decision: remove the `BIFROST_SEMANTIC_SEARCH_PROFILE` environment knob and its three profiles, and make the dense leg depth `3 * k` unconditionally while keeping the git co-edit leg at `k`.
-  Rationale: the knob existed to run the A/B that has now concluded. The winning arm was the deeper dense one, so `3 * k` becomes the default rather than an opt-in. The co-edit leg is a git-history signal, not a lexical one; removing it was not part of the owner's decision, so it stays, seeded now from the dense leg alone.
+- Decision: remove the `BIFROST_SEMANTIC_SEARCH_PROFILE` environment knob and its three profiles, and fix the dense leg at `2 * k` with the git co-edit leg at `k`.
+  Rationale: the knob existed to run the A/B that has now concluded. Its results are recorded in `.agents/plans/bifrost-localizer-cim-eval.md` under "Results": at a constant nominal pool of `3 * k`, the arm budgets `k/k/k` (vector/BM25/co-edit) resolved 53.8%, `3k/0/0` resolved 54.6%, and `2k/0/k` resolved 54.9%, against a 52.0% no-semantic baseline. The best arm keeps the co-edit leg, so `2 * k` dense plus `k` co-edit becomes the only behavior. The total nominal pool is unchanged, so the caller's token cost does not move. Note the plan's own caveat that no arm's improvement over baseline is statistically established; what the campaign does establish is that the lexical leg cost tokens and money without a measurable benefit, which is what this change acts on.
+  Date/Author: 2026-08-10, Claude.
+
+- Decision: propagate a vector-scoring error instead of skipping the row.
+  Rationale: the previous scan did `scorer.score(..).ok()`, silently dropping any vector the quantizer could not decode. The house rule forbids error handling with no recovery action, and a corrupt or wrong-dimension code blob is a structured failure the caller should see rather than a silently shorter result. Dimension drift cannot occur in practice because `ensure_index_compatible` wipes the vectors when the embedder fingerprint changes.
   Date/Author: 2026-08-10, Claude.
 
 - Decision: over-retrieve by a factor of 8 over the dense leg depth, and stop resolving as soon as the leg is full.
-  Rationale: the factor bounds work in the pathological case where many top-scoring vectors belong to dead blobs or collapse onto the same symbol. A warmed exact checkout has a near-zero dead fraction, so the pool is nearly always resolved after a handful of lookups; the bound only matters for a long-lived cache between garbage collections. Eight was chosen because a single symbol can legitimately own several chunk vectors and because the cost of the bound is at most `8 * 3 * k` indexed point lookups (2,400 at the maximum `k` of 100), which is microseconds each.
+  Rationale: the factor bounds work in the pathological case where many top-scoring vectors belong to dead blobs or collapse onto the same symbol. A warmed exact checkout has a near-zero dead fraction, so the pool is nearly always resolved after a handful of lookups; the bound only matters for a long-lived cache between garbage collections. Eight was chosen because a single symbol can legitimately own several chunk vectors and because the cost of the bound is at most `8 * 2 * k` indexed point lookups (1,600 at the maximum `k` of 100), which is microseconds each.
   Date/Author: 2026-08-10, Claude.
 
 - Decision: rename the status field `indexed_chunks` to `indexed_files` rather than keep a chunk count.
@@ -101,7 +114,7 @@ In `crates/bifrost-nlp/src/store.rs`, remove the `fts_tokens` field from `FileCh
 
 In `crates/bifrost-nlp/src/indexer.rs`, drop `BM25_TOKENIZER_VERSION` from the `ensure_index_compatible` call.
 
-In `crates/bifrost-nlp/src/query.rs`, delete the whole lexical leg: `bm25_symbol_candidates`, the `bm25_ranked` field of `SemanticSearchResult`, the `bm25` field of `RetrievalLegCounts`, the BM25 section of `render_text`, and the second argument of `build_seeds`. Delete the `SearchProfile` enum and the `BIFROST_SEMANTIC_SEARCH_PROFILE` environment variable; replace them with two constants: the dense leg takes `3 * k` and the co-edit leg takes `k`.
+In `crates/bifrost-nlp/src/query.rs`, delete the whole lexical leg: `bm25_symbol_candidates`, the `bm25_ranked` field of `SemanticSearchResult`, the `bm25` field of `RetrievalLegCounts`, the BM25 section of `render_text`, and the second argument of `build_seeds`. Delete the `SearchProfile` enum and the `BIFROST_SEMANTIC_SEARCH_PROFILE` environment variable; replace them with two constants: the dense leg takes `2 * k` and the co-edit leg takes `k`, the budgets of the winning arm in the sweep cited in the Decision Log.
 
 In `crates/bifrost-mcp/src/mcp_nlp.rs`, the tool description mentions nothing lexical, so no change is needed there; verify this rather than assume it.
 
@@ -132,7 +145,7 @@ and keeps only rows where `self.oids.get(rel_path) == Some(blob_oid)`. This is t
 
 `LiveSet::live_file_count(&self) -> usize` returns `self.oids.len()`, for status reporting.
 
-In `crates/bifrost-nlp/src/query.rs`, the dense leg becomes: embed the query, build the scorer, take `top_candidates(scorer, 8 * vector_limit)`, then walk the candidates in order calling `resolve_live`, recording each symbol's best score and its file, and stopping as soon as `vector_limit` distinct symbols have been collected. If the pool runs out first, push a note saying the candidate pool was exhausted.
+In `crates/bifrost-nlp/src/query.rs`, the dense leg becomes: embed the query, build the scorer, take `top_candidates(scorer, 8 * vector_limit)`, then walk the candidates in order calling `resolve_live`, recording each symbol's best score and its file, and stopping as soon as `vector_limit` distinct symbols have been collected. `vector_limit` is `2 * k` and the co-edit leg takes `k`, per the arm sweep cited in the Decision Log. If the whole pool is consumed without filling the leg, push a note saying so; a merely short candidate list (a store with fewer vectors than the pool) is not worth a note.
 
 In `crates/bifrost-nlp/src/indexer.rs`, change the shared handle from `Arc<RwLock<Option<ActiveIndex>>>` to `Arc<RwLock<Option<LiveSet>>>`, rename the accessor `active_index()` to `live_set()`, and make `full_build` call `LiveSet::open` and `update_files` call `apply_changes`.
 
@@ -246,4 +259,52 @@ No new external dependency is introduced. `rayon`, `rusqlite`, and `fastrq` are 
 
 ## Outcomes & Retrospective
 
-To be completed at the end of Milestone 4.
+The change landed as one commit on `bifrost-nlp-ft`. Net effect on the crate: 1,122 lines deleted (`crates/bifrost-nlp/src/bm25.rs` at 421 lines and `crates/bifrost-nlp/src/active_index.rs` at 701 lines) against 427 lines added in `crates/bifrost-nlp/src/retrieval.rs`, plus a 339-line `query.rs` reduced to roughly half its former size.
+
+### Fail-before evidence
+
+The structural pin was run against the pre-change tree in a throwaway detached worktree at commit `960ec591`, with the same test body expressed against the old API (`ActiveIndex::build` instead of `LiveSet::open`):
+
+    thread 'active_index::tests::hydration_reads_no_semantic_content_table' panicked at
+    crates/bifrost-nlp/src/active_index.rs:609:10:
+    hydration must not depend on the chunk tables: "no such table: semantic_file_chunks"
+    Summary [0.095s] 1 test run: 0 passed, 1 failed, 65 skipped
+
+The same assertion passes on the new tree. The other three pins are preservation pins, not fail-before pins: the old TEMP projection also filtered by exact `(blob_oid, rel_path)`, so dead-blob exclusion and correct file/span mapping were already true; what changed is the mechanism that has to keep them true.
+
+### Measurement
+
+Measured on the WSL host, CPU basis, release profile, synthetic corpus: 100,000 files, 3 chunks each, 300,000 distinct 512-dimension vectors, warm page cache, identity map supplied pre-built so the git walk (which this change does not touch) is excluded from both sides. The pre-change side carries about 480 bytes of `fts_tokens` per chunk so its FTS build is representative. Each query figure is the last of three consecutive iterations; the spread across iterations was under 6%.
+
+The warmed LLVM and Firefox caches under `/mnt/T9/repo-clones/.codescale-cache-perrepo-r26` could not be used: they are cache schema v18, the pre-change tree writes v21, and this tree writes v22, and the schema version is part of the database file name, so no single warmed cache can serve both sides. Re-indexing either repository twice would mean hours of GPU embedding. The synthetic corpus is roughly a seventeenth of LLVM's 5.5M chunks, so the absolute hydration figure below should be read as a shape, not as an LLVM prediction.
+
+    phase                    before (960ec591)   after      delta
+    hydration to ready        3,344.8 ms          0.5 ms     -99.98%
+    first-query vector scan     894.1 ms        804.3 ms     -10%
+    first-query hit resolve      95.6 ms          0.3 ms     -99.7%
+    first-query lexical leg      12.2 ms            n/a      removed
+    first query total         ~1,002 ms         ~805 ms      -20%
+    cache file size             414.0 MiB       263.0 MiB    -36%
+
+Hydration after the change is one SQLite connection open. The hit-resolve column is not a like-for-like comparison of the same work: the old code resolved every one of the 300,000 scored hashes through its Rust maps before ranking, whereas the new code resolves candidates in score order and stops at the leg limit, so it performed 20 indexed point lookups.
+
+### Gate
+
+    cargo fmt                                                   clean
+    cargo nextest run -p brokk-bifrost-nlp                      54 passed
+    cargo nextest run --workspace --all-targets --no-fail-fast  9,953 passed, 0 failed, 42 skipped
+    cargo check --features nlp --all-targets                    clean
+    cargo nextest run --features nlp (semantic_search suite)     12 passed
+    cargo test --doc --workspace                                0 doctests exist in this workspace
+    scripts/with-isolated-cargo-target.sh cargo clippy
+      --workspace --all-targets --all-features -- -D warnings   clean
+
+### What remains
+
+Issue #1929 also asked for the git identity map itself to be cached against the git index checksum, since the Firefox walk was 115.6 s over 170,889 paths. That is untouched here and is now the whole of hydration: with the active set gone, "hydrate faster" means "walk git less". Commit 2fb18154 (batching the walk's attribute questions) already reduced it; whether more is needed should be re-measured before any further work.
+
+The `.agents/plans/bifrost-localizer-cim-eval.md` campaign should be re-run at some point against dense-only retrieval to confirm the arm choice holds now that the pool is no longer split three ways. That is the owner's call, not a prerequisite for this change.
+
+## Revision note
+
+2026-08-10: the plan originally proposed a dense leg of `3 * k`, reasoning only from the owner's summary that "the deeper semantic arm won". Reading the actual campaign results in `.agents/plans/bifrost-localizer-cim-eval.md` showed the best arm was `2 * k` dense plus `k` co-edit, not `3 * k` dense alone, so the constant and every reference to it were corrected before implementation. The `Outcomes & Retrospective` section was added after the gate and the measurement completed. Both changes are recorded in the Decision Log with their evidence, because a future reader deciding whether to re-tune these depths needs to know they came from a measured sweep rather than from taste.
