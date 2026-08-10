@@ -42,17 +42,27 @@ Issue: <https://github.com/BrokkAi/bifrost/issues/1738>.
       code citation at HEAD `bc85ec9f`. Recorded the line-number drift in
       `Context and Orientation`.
 - [x] (2026-08-09 19:20Z) Wrote this ExecPlan into `.agents/plans/`.
-- [ ] Step 0: add profiling scopes to the glob-resolution legs and to the two previously
-      invisible analyzer/store calls.
-- [ ] Step 0b: re-measure the baseline at HEAD on the Firefox clone with the new scopes.
-      Record the result in `Artifacts and Notes`.
-- [ ] Step 1: swap the glob match universe to the session listing and add batched
-      per-candidate validation.
-- [ ] Step 2: apply the per-target fan-out cap to the cheap match count before any
-      validation work.
-- [ ] Tests: call-count pins, budget-before-work pin, membership and ordering contract pins.
-- [ ] Re-measure after the change; before/after table in `Artifacts and Notes`.
-- [ ] Gate: fmt, workspace nextest, doctests, all-features clippy.
+- [x] (2026-08-09 19:35Z) Step 0: added profiling scopes to the glob-resolution legs and to
+      the two previously invisible analyzer/store calls.
+- [x] (2026-08-09 19:45Z) Built the Firefox index at this tree's cache schema (v21). The
+      prewarmed per-repo cache on this box is v18 and unusable; a cold index build took
+      8m20s wall / 902 s CPU and produced a 5.2 GB store in the clone.
+- [x] (2026-08-09 20:40Z) Step 0b: re-measured the baseline at HEAD on the Firefox clone.
+      The route span decomposes for the first time; result in `Artifacts and Notes`.
+- [x] (2026-08-09 21:10Z) Step 1: swapped the glob and directory-prefix match universe to
+      the session listing and added batched per-candidate validation
+      (`CodeUnitIndex::retain_analyzed`).
+- [x] (2026-08-09 21:20Z) Step 2: applied the per-target fan-out cap to the cheap match
+      count before any validation work.
+- [x] (2026-08-09 21:50Z) Tests: two call-count pins, a budget-before-work pin, and three
+      end-to-end contract pins. Every one demonstrated failing before its change.
+- [x] (2026-08-09 22:20Z) Re-measured after the change; before/after table in
+      `Artifacts and Notes`. Warm glob routing 11.3 s -> 0.1 s; responses byte-identical
+      except the one documented `too_broad` count change.
+- [x] (2026-08-09 23:05Z) Gate: `cargo fmt`; `cargo nextest run --workspace --all-targets
+      --no-fail-fast` = 9946 passed, 0 failed, 42 skipped, 284 s; `cargo test --workspace
+      --doc` = 18 suites, 0 failures; `scripts/with-isolated-cargo-target.sh cargo clippy
+      --workspace --all-targets --all-features -- -D warnings` = exit 0, no diagnostics.
 
 ## Surprises & Discoveries
 
@@ -62,9 +72,31 @@ Issue: <https://github.com/BrokkAi/bifrost/issues/1738>.
   it concluded the glob cost was "contention-dominated, not intrinsic" because identical
   globs routed in about 0-1.3 s once the warm finished. The usage-v2 re-land replaced that
   warm. Re-measuring at HEAD is therefore mandatory before claiming any delta, and the
-  honest claim is bounded by what the post-v2 baseline actually shows.
-  Evidence: pending Step 0b; to be recorded in `Artifacts and Notes`, section
-  "Baseline at HEAD".
+  honest claim is bounded by what the post-v2 baseline actually shows. Re-measured: the
+  cost survives the warm's replacement, but at a tenth of the magnitude. With nothing else
+  touching the store, a warm glob target routes in 10.4-11.9 s, every time, repeatably --
+  not 123.5 s, and not the "about 0-1.3 s" the post-warm calls in the incident showed. The
+  contention hypothesis was therefore only half right: contention was a multiplier, and
+  roughly 11 s of per-request whole-workspace store work was always underneath it.
+  Evidence: `Artifacts and Notes`, "Baseline at HEAD".
+
+- Observation: the directory target is already cheap and this change does not improve it.
+  A warm `["layout/style"]` call costs 55-62 ms before and after; its whole cost is the
+  `searchtools::directory_listing` scan, which already reads the session listing. The
+  109.1 s the incident recorded for that target was 94.9 s of one-time cold readiness plus
+  a 14.0 s first listing walk, neither of which is glob routing.
+  Evidence: `Artifacts and Notes`, before/after table.
+
+- Observation: the `too_broad` count can now exceed the analyzed match count, and the
+  Firefox reproducer shows exactly the predicted margin. `dom/*Parser*` reported
+  `matched: 58` before and `matched: 60` after, with an identical verdict, cap, and
+  ten-path sample. The two extra files are the `.idl` and `.webidl` under `dom/` whose
+  paths contain `Parser`: `git ls-files` finds 60 matches (32 `.cpp`, 24 `.h`, 1 `.webidl`,
+  1 `.mjs`, 1 `.js`, 1 `.idl`), and the two unclaimed extensions are lexically eligible
+  because the workspace contains C++, whose adapter adopts files by include inference.
+  They are candidates, they are not analyzed, and validation would have removed them --
+  but validation is precisely what a rejected target must not pay for.
+  Evidence: `Artifacts and Notes`, "Response equality".
 
 - Observation: the workspace listing is a strict superset of the analyzed file set, by
   construction, so swapping the glob universe cannot lose a file that validation would
@@ -116,16 +148,37 @@ Issue: <https://github.com/BrokkAi/bifrost/issues/1738>.
   working unchanged.
   Date/Author: 2026-08-09, Claude (Opus 5).
 
-- Decision: introduce a second, purely lexical analyzer predicate
-  `CodeUnitIndex::may_analyze(&ProjectFile) -> bool` and filter listing candidates through
-  it before counting them against the fan-out cap.
+- Decision: introduce a purely lexical eligibility predicate and filter listing candidates
+  through it before counting them against the fan-out cap.
   Rationale: the cap must be decided before validation or the rejection is not cheap, and
   counting raw listing matches would count files no analyzer could ever summarize (README,
-  test data, images). `may_analyze` answers "could this path belong to my indexed set" from
+  test data, images). The predicate answers "could this path belong to an indexed set" from
   the path alone, with no store and no filesystem access; it is the exact lexical half of
-  `TreeSitterAnalyzer::adapter_owns_file` (`tree_sitter_analyzer.rs:5414-5421`). Putting it
-  on the analyzer contract keeps the C++ "claims included files" rule where it already
-  lives instead of duplicating a language special case inside `searchtools`.
+  `TreeSitterAnalyzer::adapter_owns_file` (`tree_sitter_analyzer.rs:5414-5421`).
+  Date/Author: 2026-08-09, Claude (Opus 5).
+
+- Decision: make that predicate the free function
+  `brokk_bifrost_core::analyzer::common::languages_may_analyze(&BTreeSet<Language>,
+  &ProjectFile)` rather than a `CodeUnitIndex::may_analyze` trait method, as this plan
+  first proposed.
+  Rationale: a trait method would have been called once per listing entry, and its only
+  input beyond the path is the analyzer's language set -- so every call would have rebuilt
+  or cloned that set for a quarter of a million files. The caller now asks
+  `analyzer.languages()` once and applies a free function per candidate. It needs no
+  override anywhere: `INCLUDE_CLAIMING_LANGUAGE` already names, in core, the single
+  language whose adapter adopts files by include inference
+  (`crates/bifrost-core/src/analyzer/common.rs:47`), and
+  `core_claiming_language_matches_the_claims_seam` already asserts core and the analysis
+  registry agree, so the one-line rule is exact for every analyzer rather than approximated
+  per implementation.
+  Date/Author: 2026-08-09, Claude (Opus 5).
+
+- Decision: `get_symbol_sources` gets the budget too -- its call to `resolve_file_patterns`
+  now passes its own `GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET`.
+  Rationale: it is the same call site with the same cap and the same late check
+  (`crates/bifrost-analysis/src/searchtools/sources.rs:528-546`), and leaving it behind
+  would have made two tools that share one guard disagree about when it costs anything. Its
+  behavior is already pinned by `tests/suite_symbols/searchtools_too_broad_scope.rs`.
   Date/Author: 2026-08-09, Claude (Opus 5).
 
 - Decision: when the lexical candidate count exceeds the per-target cap, report `too_broad`
@@ -184,7 +237,48 @@ Issue: <https://github.com/BrokkAi/bifrost/issues/1738>.
 
 ## Outcomes & Retrospective
 
-Filled in at completion; see the bottom of this document.
+Delivered, 2026-08-09. A warm `get_summaries` glob target on the Firefox clone went from
+10.4-11.9 s to 39-106 ms, and a rejected too-broad target from 11.3 s to 106 ms. The tool's
+answers are unchanged, verified by diffing full response bodies before and after, with the
+one documented exception of the `too_broad` upper-bound count. The whole eleven-call probe
+session dropped from 106.6 s wall / 198 s CPU to 42.3 s wall / 67 s CPU, and what remains in
+it is one cold analyzer construction (41 s) that has nothing to do with routing.
+
+Compared against the original purpose: yes. The stated goal was that a directory or glob
+target cost time proportional to what it matches rather than to the workspace, and the
+route span now contains no whole-workspace store work at all.
+
+What the numbers did not support, and the plan now says so plainly:
+
+- The directory target was never the expensive case at HEAD. Warm, it costs 55-62 ms before
+  and after -- the listing scan -- because that leg already used the cheap universe. The
+  incident's 109.1 s for `["layout/style"]` was cold readiness plus a first listing walk.
+- The 123.5 s worst case does not reproduce without the background warm that used to
+  contend for the store. About 11 s does, repeatably, and that is what this change removes.
+  Claiming a 123 s fix would have been claiming someone else's contention.
+
+What remains open:
+
+- The client-side head-of-line wait (about 491 s of the incident's 943.7 s) is untouched and
+  belongs to whatever serializes requests on the client connection.
+- Cold analyzer construction on a 250k-file workspace is 41 s from a warm 5.2 GB store. Not
+  this issue, but it is now the largest single cost in the reproducer.
+- `list_symbols` and `get_symbol_sources` share the universe fix, but `list_symbols` still
+  has no fan-out budget by design, so a `**/*` there still validates every match. That is
+  bounded by the match count now rather than the workspace, but it is not free.
+
+Lessons:
+
+- Instrumenting first was not ceremony. The whole attribution rested on a 123.5 s span with
+  no children; five profiling scopes turned an eleven-second mystery into a table of eleven
+  store queries with their key counts, and that table is what made the fix obvious and the
+  claim checkable.
+- Re-measuring the baseline before touching anything was the single most valuable step. The
+  design was written against a measurement whose dominant mechanism no longer exists.
+- Two of the four planned end-to-end pins turned out to be untestable where they were
+  planned, because the byte budget and the degrade path live in the MCP host rather than in
+  the service. Discovering that by writing the test and watching it pass for the wrong
+  reason is worth more than the test would have been.
 
 ## Context and Orientation
 
@@ -441,10 +535,23 @@ Behavioral acceptance, in order of how directly it proves the issue is fixed:
      `glob_file_pattern_scans_analyzed_files`, which asserted the old behavior (exactly one
      whole-universe enumeration).
 3. `cargo test --test suite_symbols` passes, including the existing
-   `searchtools_too_broad_scope.rs` behavior pins unchanged, and these new end-to-end pins:
+   `searchtools_too_broad_scope.rs` behavior pins unchanged, and the new
+   `tests/suite_symbols/searchtools_glob_routing.rs` end-to-end pins:
    - `glob_summaries_keep_deterministic_path_order`
-   - `directory_listing_reports_total_entries_and_truncation_flag`
-   - `too_broad_glob_response_does_not_issue_a_second_list_symbols_call`
+   - `bifrostignored_file_is_listed_but_never_summarized_by_a_glob` (the membership pin;
+     `.bifrostignore` is the honest way to build a file that is in the listing and not in
+     the analyzed set, since it excludes a file from `Project::analyzable_files` while
+     leaving it in `Project::all_files`)
+   - `directory_listing_reports_every_entry_and_marks_itself_complete`
+
+   Note on what could not be pinned in this suite: the byte-budget listing truncation and
+   the `compact_symbols` degrade path both live in `fit_get_summaries_output_to_budget`,
+   which only `crates/bifrost-mcp/src/rmcp_host.rs:1195` calls.
+   `SearchToolsService::call_tool_json` does not go through it, so a service-level
+   assertion about `truncated: true` or about a second `list_symbols` call proves nothing
+   and was dropped rather than left as a test that cannot fail. What the work layer owes is
+   pinned instead: the listing's `total_entries` and `truncated` agree with the entries it
+   shipped.
 4. The full gate passes: `cargo fmt`, workspace `nextest`, doctests, and all-features
    clippy with `-D warnings`.
 
@@ -461,14 +568,138 @@ and harmless if unused.
 
 ## Artifacts and Notes
 
-Filled in as measurements are taken. See "Baseline at HEAD" and "Before and after" below.
+### Reproducer setup
+
+The Firefox clone is `/mnt/T9/repo-clones/firefox--871325b8` (about 250,000 git-visible
+files, 11 analyzer languages). The prewarmed per-repo cache under
+`/mnt/T9/repo-clones/.codescale-cache-perrepo-r26/firefox--871325b8-3842dd366ab4` is a
+12 GB `bifrost_cache.v18.db`; this tree's `CURRENT_MIGRATION_VERSION` is 21
+(`crates/bifrost-core/src/cache_db.rs:28`), so that cache cannot be read and was not used.
+The index was rebuilt once into the clone:
+
+    cd /mnt/T9/repo-clones/firefox--871325b8
+    BIFROST_SEMANTIC_INDEX=off BIFROST_TIMING=1 /usr/bin/time -v \
+      target/release/bifrost --tool get_summaries \
+      --args '{"targets":["layout/style"]}' --root /mnt/T9/repo-clones/firefox--871325b8
+
+    Elapsed (wall clock) time: 8:19.64
+    User time (seconds): 655.50   System time (seconds): 246.47
+    -> .bifrost/cache/bifrost_cache.v21.db, 5.2 GB
+
+Every before/after number below then ran against that one store, with the same client
+driver, on the same box, minutes apart. Caveat on absolute wall times: this box was under
+concurrent load from an unrelated eight-job corpus run (load average 9-20), so treat the
+per-call numbers as upper bounds. The comparison is still sound -- both runs paid the same
+tax -- and the span decomposition and CPU totals corroborate the wall deltas.
+
+The driver binds the workspace as a real agent client does (roots capability), then issues
+each target twice; pass 0 for the first target absorbs the cold analyzer construction, and
+pass 1 is unambiguously warm. It is measurement scaffolding, kept in the session scratchpad
+rather than the repository, and reuses `McpClient` from `scripts/mcp-replay.py`. Note that
+`BIFROST_MCP_REQUEST_BUDGET_SECS=0` is rejected by design (`mcp_common.rs:75-87`); the
+driver passes 3600 so the server's deadline cannot cancel the calls being measured.
+
+### Baseline at HEAD
+
+Step 0's scopes turn the previously childless route span into a full decomposition. One
+warm `["layout/style/**/*.cpp","layout/style/**/*.h"]` call, baseline binary:
+
+    END searchtools::directory_listing                                (   55.3 ms)   [directory target, separate call]
+    ...
+    END store::parsed_blob_keys_at_generations[Java,1075 keys]        (   78.0 ms)
+    END analyzer::analyzed_live_files[Java]                           (   80.8 ms)
+    END store::parsed_blob_keys_at_generations[Go,2 keys]             (    0.2 ms)
+    END analyzer::analyzed_live_files[Go]                             (    0.3 ms)
+    END store::parsed_blob_keys_at_generations[Cpp,40046 keys]        ( 3012.3 ms)
+    END analyzer::analyzed_live_files[Cpp]                            ( 3111.4 ms)
+    END store::parsed_blob_keys_at_generations[JavaScript,99653 keys] ( 5220.0 ms)
+    END analyzer::analyzed_live_files[JavaScript]                     ( 5522.9 ms)
+    END store::parsed_blob_keys_at_generations[TypeScript,1838 keys]  (  119.2 ms)
+    END analyzer::analyzed_live_files[TypeScript]                     (  123.5 ms)
+    END store::parsed_blob_keys_at_generations[Python,9712 keys]      (  569.3 ms)
+    END analyzer::analyzed_live_files[Python]                         (  592.7 ms)
+    END store::parsed_blob_keys_at_generations[Rust,13803 keys]       ( 1125.1 ms)
+    END analyzer::analyzed_live_files[Rust]                           ( 1158.5 ms)
+    END store::parsed_blob_keys_at_generations[Php,2 keys]            (    0.4 ms)
+    END store::parsed_blob_keys_at_generations[CSharp,20 keys]        (    1.8 ms)
+    END store::parsed_blob_keys_at_generations[Ruby,16 keys]          (    1.0 ms)
+    END store::parsed_blob_keys_at_generations[Kotlin,5029 keys]      (  308.1 ms)
+    END analyzer::analyzed_live_files[Kotlin]                         (  319.8 ms)
+    END analyzer::analyzed_files.fan_out                              (11055.4 ms)
+    END searchtools::resolve_file_patterns.glob                       (11078.8 ms)
+    END searchtools::resolve_file_patterns                            (11078.9 ms)
+    END searchtools::route_summary_targets                            (11078.9 ms)
+
+That is the whole answer: 11.1 s of route time is 11 per-language whole-workspace store
+queries over about 170,000 blob keys, of which 10.4 s is inside the queries themselves. No
+background warm was running. The glob pattern never enters the cost -- a glob matching
+nothing (`layout/style/**/*.zzz`) paid 10.7 s to report `not_found`.
+
+### Before and after
+
+Warm per-call wall time from the client, Firefox clone, same store, `#1` rows are the
+second pass:
+
+    call                                                    before      after
+    ["layout/style"]                          (cold #0)   41429 ms   41827 ms
+    ["layout/style"]                          (warm #1)      59 ms      62 ms
+    ["layout/style/**/*.cpp", "...**/*.h"]    (warm #1)   11253 ms     106 ms
+    ["dom/*Parser*"]                          (warm #1)   10583 ms      52 ms
+    ["layout/style/**/*.zzz"] (matches none)  (warm #1)   11084 ms      39 ms
+
+    whole 11-call session, wall                           106608 ms   42265 ms
+    whole 11-call session, CPU (user+sys)                    198 s       67 s
+
+The cold row is analyzer construction from the 5.2 GB store and is untouched by this change,
+as expected: it is not routing. The warm directory row is unchanged, also as expected: that
+leg already read the session listing. The three glob rows are the fix -- 106x, 204x, and
+284x -- and the largest of them is now dominated by the listing scan, not by any store work.
+
+### Response equality
+
+The same driver captured full response bodies from both binaries and diffed them:
+
+    directory          IDENTICAL
+    glob-pair          IDENTICAL
+    glob-broad         DIFFERS   (matched: 58 -> 60; same verdict, cap, and 10-path sample)
+    glob-miss          IDENTICAL
+
+The single difference is the documented upper-bound `too_broad` count; see
+`Surprises & Discoveries`.
+
+### Fail-before evidence
+
+Each pin was demonstrated failing against a temporarily reverted tree, then the revert was
+undone:
+
+- Universe reverted to `analyzer.analyzed_files()`:
+  `glob_file_pattern_validates_only_matched_files` fails with
+  "a glob must not enumerate the analyzed universe: left 0, right 1", and
+  `glob_target_excludes_listed_but_unanalyzed_file` fails with candidate count 2 vs 1.
+- Budget branch disabled: `too_broad_glob_reports_before_validating_any_file` fails with
+  "a rejected target must cost the match count and nothing else: left 0, right 1".
+- Validation dropped (`matched.extend(candidates)`):
+  `bifrostignored_file_is_listed_but_never_summarized_by_a_glob` fails with
+  `["src/Real.java"]` vs `["src/Real.java", "vendor/Ghost.java"]` -- the ignored file comes
+  back with a full declaration summary, which is exactly the silent-membership-change the
+  contract forbids.
 
 ## Interfaces and Dependencies
 
 In `crates/bifrost-core/src/analyzer/code_unit_index.rs`, `pub trait CodeUnitIndex` gains:
 
-    fn may_analyze(&self, file: &ProjectFile) -> bool { ... }
     fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> { ... }
+
+overridden by `TreeSitterAnalyzer` (ownership and liveness per candidate, then one
+`parsed_blob_keys_at_generations` query for the survivors), by `MultiAnalyzer` (union over
+delegates), and forwarded by each language wrapper that already forwards `is_analyzed`.
+
+In `crates/bifrost-core/src/analyzer/common.rs`:
+
+    pub fn languages_may_analyze(
+        languages: &std::collections::BTreeSet<Language>,
+        file: &ProjectFile,
+    ) -> bool
 
 In `crates/bifrost-analysis/src/searchtools/mod.rs`:
 
@@ -485,3 +716,19 @@ In `crates/bifrost-analysis/src/searchtools/mod.rs`:
     ) -> ResolvedFilePatterns;
 
 No new crate, no new dependency, no schema change.
+
+## Revision note
+
+2026-08-09, after implementation: this plan was revised end to end against what was
+actually built and measured. The Progress list, the measurement sections, and the
+Outcomes were filled from real runs rather than intentions. Three substantive
+corrections were folded in and recorded in the Decision Log rather than silently
+applied: the lexical eligibility predicate became a free function instead of a trait
+method (it is called once per listing entry, and a trait method would have rebuilt the
+language set each time); `get_symbol_sources` was brought into the budget-before-work
+change because it shares the same cap at the same call site; and two planned
+end-to-end pins were dropped after they proved untestable in `tests/suite_symbols/`,
+since the byte budget and the compaction degrade path are reached only through
+`crates/bifrost-mcp/src/rmcp_host.rs`. The `Surprises & Discoveries` section gained the
+two findings that change how this issue should be read: the post-warm-replacement
+baseline is about 11 s rather than 123.5 s, and the directory target was already cheap.
