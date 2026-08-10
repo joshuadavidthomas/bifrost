@@ -3270,3 +3270,81 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
         assert!(rendered.contains("untrusted"));
     }
 }
+
+/// The same call name resolves to both a no-argument and a one-argument call
+/// site. `{sink_arity}` is either empty or ` :arity 1`; the arity form drops the
+/// no-arg site so the operand at index 0 always exists.
+fn arity_overloaded_sink_policy(id: &str, sink_arity: &str) -> String {
+    format!(
+        r#"(policy
+          :schema-version 1
+          :id "{id}"
+          :name "Arity-disambiguated sink"
+          :message "attacker data reached an arity-overloaded sink"
+          :severity warning
+          :analysis (analysis
+            :type taint
+            :mode may
+            :call-modeling (call-modeling :unmodeled optimistic)
+            :sources (endpoint-set :entries [
+              (source :id first :display-name "first source" :categories [input.user]
+                :selector (rql :schema-version 1
+                  (language python (call :callee (name "source_one"))))
+                :bind return-value :labels [untrusted])])
+            :sinks (endpoint-set :entries [
+              (sink :id store :display-name "sink" :categories [data.sensitive]
+                :selector (rql :schema-version 1
+                  (language python (call :callee (name "sink_one"){sink_arity})))
+                :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+          :classification (classification
+            :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+    )
+}
+
+/// The Benchmark headline, reduced: a sink name shared by a no-arg overload
+/// aborts the operand binding, and an arity predicate on the sink selector
+/// restores it. Drives the production policy registry exactly as the other
+/// adapter tests do.
+#[test]
+fn arity_predicate_binds_a_sink_whose_name_is_arity_overloaded() {
+    const OVERLOADED_SINK_SOURCE: &str = r#"
+def source_one():
+    return "one"
+
+def sink_one(value):
+    pass
+
+def run():
+    first = source_one()
+    sink_one()
+    sink_one(first)
+"#;
+
+    // Without an arity predicate the sink selector also matches the no-arg
+    // sink_one(), which has no argument at the dangerous-operand index, so the
+    // sink cannot bind and the tainted flow is never reported.
+    let without = evaluate_one(
+        OVERLOADED_SINK_SOURCE,
+        &arity_overloaded_sink_policy("test.arity-overloaded-abort", ""),
+    );
+    assert!(
+        without.taint_findings().is_empty(),
+        "the no-arg overload must prevent a finding without an arity predicate; findings={:#?}",
+        without.taint_findings()
+    );
+
+    // Constraining the sink to arity 1 drops the no-arg overload, so the
+    // operand binds and the source->sink flow is found.
+    let with = evaluate_one(
+        OVERLOADED_SINK_SOURCE,
+        &arity_overloaded_sink_policy("test.arity-overloaded-bound", " :arity 1"),
+    );
+    let [finding] = with.taint_findings() else {
+        panic!(
+            "the arity-constrained sink must bind and find the flow; findings={:#?}; report={:#?}",
+            with.taint_findings(),
+            with.report()
+        );
+    };
+    assert!(!finding.witnesses.is_empty());
+}

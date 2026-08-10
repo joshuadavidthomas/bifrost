@@ -200,6 +200,19 @@ fn eval_pattern_inner_with_name(
     }
     let roles = facts.roles(node);
 
+    // Arity constrains the matched call's positional argument count, read
+    // straight from the already-extracted `Arg` role edges -- no re-parse. A
+    // fact without argument edges (any non-call) has arity zero.
+    if let Some(arity) = &pattern.arity {
+        let positional = roles
+            .iter()
+            .filter(|target| target.role == Role::Arg)
+            .count();
+        if !arity.matches(positional) {
+            return false;
+        }
+    }
+
     // Single-target roles: the first (typically only) edge of that role must
     // match the sub-pattern; a role constraint on a fact without that edge
     // fails.
@@ -351,6 +364,7 @@ fn eval_span_only(
     // fail, while `not_kind` is vacuously satisfied (the target provably is
     // none of the normalized kinds).
     if !pattern.kinds.is_empty()
+        || pattern.arity.is_some()
         || pattern.has.is_some()
         || pattern.not_has.is_some()
         || !pattern.args.is_empty()

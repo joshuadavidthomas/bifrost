@@ -24,7 +24,7 @@ use super::schema::{
 use super::schema::{ExportFilterField, GenerationSiteFilterField};
 use super::sexp::{parse_query_sexp, query_to_json};
 use super::{
-    CodeQuery, CodeQueryResultDetail, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
+    CodeQuery, CodeQueryResultDetail, MAX_ARITY, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES,
     MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_QUERY_BRANCHES,
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
     MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,

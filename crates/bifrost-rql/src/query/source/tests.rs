@@ -952,3 +952,102 @@ fn accepted_language_aliases_do_not_produce_diagnostics() {
         );
     }
 }
+
+#[test]
+fn arity_help_covers_the_predicate_form_property_and_json_field() {
+    // Predicate form and inline property both hover on the `arity` token.
+    let form = "(call (arity :min 1 :max 3))";
+    let form_help =
+        query_source_help_at(form, form.find("arity").unwrap()).expect("arity form help");
+    assert_eq!(&form[form_help.range.clone()], "arity");
+    assert!(
+        form_help.description.contains("argument count"),
+        "{form_help:?}"
+    );
+
+    let property = r#"(call :callee (name "execute") :arity 1)"#;
+    let property_help =
+        query_source_help_at(property, property.find(":arity").unwrap()).expect("arity property");
+    assert_eq!(&property[property_help.range], ":arity");
+    assert!(!property_help.description.is_empty());
+
+    // The JSON `arity` field carries the same vocabulary help.
+    let json = r#"{"match":{"kind":"call","arity":1}}"#;
+    let json_help =
+        query_source_help_at(json, json.find("\"arity\"").unwrap()).expect("arity json help");
+    assert_eq!(&json[json_help.range], "\"arity\"");
+    assert!(json_help.description.contains("argument count"));
+}
+
+#[test]
+fn arity_frontends_validate_ranges_at_exact_positions() {
+    // Well-formed exact and range forms validate clean in both frontends.
+    for source in [
+        r#"(call :callee (name "execute") :arity 1)"#,
+        r#"(call (arity :min 1 :max 3))"#,
+        r#"(call (arity :min 1))"#,
+        r#"{"match":{"kind":"call","arity":1}}"#,
+        r#"{"match":{"kind":"call","arity":{"min":1,"max":3}}}"#,
+        r#"{"match":{"kind":"call","arity":{"max":2}}}"#,
+    ] {
+        assert!(
+            validate_query_source(source).is_empty(),
+            "well-formed arity should validate: {source}: {:#?}",
+            validate_query_source(source)
+        );
+    }
+
+    // A min above max is rejected at the offending predicate/object.
+    let rql = r#"(call (arity :min 3 :max 1))"#;
+    let diagnostic = validate_query_source(rql).pop().expect("range diagnostic");
+    assert_eq!(diagnostic.code, "invalid-query");
+    assert!(
+        diagnostic.message.contains("must not exceed"),
+        "{diagnostic:?}"
+    );
+
+    let json = r#"{"match":{"kind":"call","arity":{"min":3,"max":1}}}"#;
+    let diagnostic = validate_query_source(json)
+        .pop()
+        .expect("json range diagnostic");
+    assert!(
+        diagnostic.message.contains("must not exceed"),
+        "{diagnostic:?}"
+    );
+
+    // An empty range constrains nothing.
+    let json = r#"{"match":{"kind":"call","arity":{}}}"#;
+    let diagnostic = validate_query_source(json)
+        .pop()
+        .expect("empty range diagnostic");
+    assert!(
+        diagnostic.message.contains("at least one"),
+        "{diagnostic:?}"
+    );
+
+    // A bound above MAX_ARITY.
+    let rql = "(call (arity 100000))";
+    let diagnostic = validate_query_source(rql).pop().expect("bound diagnostic");
+    assert!(diagnostic.message.contains("at most"), "{diagnostic:?}");
+
+    // An unknown range key is flagged at that key.
+    let json = r#"{"match":{"kind":"call","arity":{"exactly":1}}}"#;
+    let diagnostics = validate_query_source(json);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| &json[diagnostic.range.clone()] == "\"exactly\""),
+        "{diagnostics:#?}"
+    );
+
+    // The `:arity` property does not take a range list.
+    let rql = r#"(call :arity [1 3])"#;
+    assert!(!validate_query_source(rql).is_empty());
+
+    // Arity alone cannot anchor the root pattern.
+    let rql = "(arity 1)";
+    let diagnostic = validate_query_source(rql)
+        .pop()
+        .expect("root anchor diagnostic");
+    assert!(diagnostic.message.contains("kind"), "{diagnostic:?}");
+}
