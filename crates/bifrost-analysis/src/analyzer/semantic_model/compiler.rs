@@ -277,8 +277,19 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                     summary.transfers.sort_by_cached_key(canonical_sort_key);
                     summary.transfers.dedup();
                     for effect in &mut summary.effects {
-                        if let AuthoredSummaryEffect::AmbiguousCall { candidates, .. } = effect {
-                            candidates.sort_unstable();
+                        match effect {
+                            AuthoredSummaryEffect::AmbiguousCall { candidates, .. } => {
+                                candidates.sort_unstable();
+                            }
+                            AuthoredSummaryEffect::Sanitize { removes, .. } => {
+                                removes.sort_unstable();
+                                removes.dedup();
+                            }
+                            AuthoredSummaryEffect::Allocation { .. }
+                            | AuthoredSummaryEffect::Call { .. }
+                            | AuthoredSummaryEffect::Escape { .. }
+                            | AuthoredSummaryEffect::UnknownCall { .. }
+                            | AuthoredSummaryEffect::UnknownCallBoundary { .. } => {}
                         }
                     }
                     summary.effects.sort_by_cached_key(canonical_sort_key);
@@ -456,6 +467,15 @@ fn compile_summary_effect(effect: &AuthoredSummaryEffect) -> CompiledSummaryEffe
             event: event.clone(),
             input: compile_summary_input(input),
             candidates: candidates.clone(),
+        },
+        AuthoredSummaryEffect::Sanitize {
+            input,
+            output,
+            removes,
+        } => CompiledSummaryEffect::Sanitize {
+            input: compile_summary_input(input),
+            output: compile_summary_output(output),
+            removes: removes.clone(),
         },
     }
 }

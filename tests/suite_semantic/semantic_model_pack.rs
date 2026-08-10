@@ -261,6 +261,46 @@ fn ruby_mixin_hierarchy_retains_declaration_order() {
 }
 
 #[test]
+fn a_sanitize_effect_round_trips_through_compile_and_decode() {
+    let mut authored = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload else {
+        unreachable!()
+    };
+    // summary.helper transfers parameter 0 to the normal return; the sanitize
+    // removes `sql` on that exact modeled transfer (#1923).
+    summaries[0].effects.push(AuthoredSummaryEffect::Sanitize {
+        input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+        output: AuthoredSummaryOutput::NormalReturn {},
+        removes: vec!["sql".to_owned()],
+    });
+    let compiled = compile_pack(&authored, &CompilerOptions::default())
+        .expect("a sanitize effect that matches a transfer compiles");
+    let decoded = decode_shard_for_manifest(
+        &compiled.manifest,
+        &compiled.shards[0].descriptor,
+        &compiled.shards[0].bytes,
+        &DecodeLimits::default(),
+    )
+    .unwrap();
+    let summaries = decoded.payload().procedure_summaries().unwrap();
+    let sanitize = summaries[0]
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            CompiledSummaryEffect::Sanitize {
+                input,
+                output,
+                removes,
+            } => Some((input.clone(), output.clone(), removes.clone())),
+            _ => None,
+        })
+        .expect("the compiled summary keeps its sanitize effect");
+    assert_eq!(sanitize.0, CompiledSummaryInput::Parameter { ordinal: 0 });
+    assert_eq!(sanitize.1, CompiledSummaryOutput::NormalReturn {});
+    assert_eq!(sanitize.2, vec!["sql".to_owned()]);
+}
+
+#[test]
 fn invalid_procedure_summary_targets_ports_locations_and_completeness_fail_closed() {
     let mut cases = Vec::new();
 
@@ -398,6 +438,52 @@ fn invalid_procedure_summary_targets_ports_locations_and_completeness_fail_close
     summaries[0].transfers =
         vec![summaries[0].transfers[0].clone(); MAX_PROCEDURE_SUMMARY_TRANSFERS + 1];
     cases.push((oversized_transfers, "limit.summary_transfers"));
+
+    // A sanitize effect with no labels removes nothing, so it is rejected.
+    let mut empty_sanitize = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } = &mut empty_sanitize.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[0].effects.push(AuthoredSummaryEffect::Sanitize {
+        input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+        output: AuthoredSummaryOutput::NormalReturn {},
+        removes: Vec::new(),
+    });
+    cases.push((empty_sanitize, "summary.empty_sanitize_labels"));
+
+    // A repeated label is a set violation.
+    let mut duplicate_sanitize = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } =
+        &mut duplicate_sanitize.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[0].effects.push(AuthoredSummaryEffect::Sanitize {
+        input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+        output: AuthoredSummaryOutput::NormalReturn {},
+        removes: vec!["sql".to_owned(), "sql".to_owned()],
+    });
+    cases.push((duplicate_sanitize, "summary.duplicate_sanitize_label"));
+
+    // A sanitize whose ports name no declared transfer would silently do
+    // nothing, so it fails closed. summary.helper has no receiver-to-return
+    // transfer.
+    let mut sanitize_without_transfer = authored_procedures();
+    let AuthoredPayload::ProcedureSummaries { summaries } =
+        &mut sanitize_without_transfer.shards[0].payload
+    else {
+        unreachable!()
+    };
+    summaries[0].effects.push(AuthoredSummaryEffect::Sanitize {
+        input: AuthoredSummaryInput::Receiver {},
+        output: AuthoredSummaryOutput::NormalReturn {},
+        removes: vec!["sql".to_owned()],
+    });
+    cases.push((
+        sanitize_without_transfer,
+        "summary.sanitize_without_transfer",
+    ));
 
     for (authored, expected_code) in cases {
         let diagnostics = compile_pack(&authored, &CompilerOptions::default()).unwrap_err();

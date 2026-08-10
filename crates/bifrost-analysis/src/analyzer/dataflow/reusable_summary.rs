@@ -860,9 +860,39 @@ pub enum SummaryEffectKey {
         input: SummaryPort,
         candidates: Box<[SummaryDependencyKey]>,
     },
+    /// Remove the named labels as a value crosses the `input`-to-`output`
+    /// modeled transfer. The labels are stable, universe-independent identity
+    /// strings; the taint client resolves them against its run universe and
+    /// composes `TaintEdgeFunction::kill` at the transfer seam (#1923). Value
+    /// flow treats them as opaque, so this variant carries no dense taint id.
+    Sanitize {
+        input: SummaryPort,
+        output: SummaryPort,
+        removed: Box<[Box<str>]>,
+    },
 }
 
 impl SummaryEffectKey {
+    /// Build a sanitize effect key with a canonical (sorted, deduplicated)
+    /// label set, so two summaries that remove the same labels compare equal.
+    pub fn sanitize<'a>(
+        input: SummaryPort,
+        output: SummaryPort,
+        labels: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let mut removed = labels
+            .into_iter()
+            .map(|label| label.to_owned().into_boxed_str())
+            .collect::<Vec<_>>();
+        removed.sort_unstable();
+        removed.dedup();
+        Self::Sanitize {
+            input,
+            output,
+            removed: removed.into_boxed_slice(),
+        }
+    }
+
     pub fn ambiguous_call(
         event: SummaryEventKey,
         input: SummaryPort,
@@ -2386,7 +2416,8 @@ fn validate_effect_dependencies(
             SummaryEffectKey::Allocation { .. }
             | SummaryEffectKey::Escape { .. }
             | SummaryEffectKey::UnknownCall { .. }
-            | SummaryEffectKey::UnknownCallBoundary { .. } => {}
+            | SummaryEffectKey::UnknownCallBoundary { .. }
+            | SummaryEffectKey::Sanitize { .. } => {}
         }
     }
     referenced.sort_unstable();
@@ -2488,7 +2519,8 @@ fn effect_reference_count(effect: &SummaryEffectKey) -> usize {
         SummaryEffectKey::Allocation { .. }
         | SummaryEffectKey::Escape { .. }
         | SummaryEffectKey::UnknownCall { .. }
-        | SummaryEffectKey::UnknownCallBoundary { .. } => 0,
+        | SummaryEffectKey::UnknownCallBoundary { .. }
+        | SummaryEffectKey::Sanitize { .. } => 0,
     }
 }
 
@@ -2580,6 +2612,12 @@ fn effect_heap_bytes(effect: &SummaryEffect) -> usize {
                     .map(dependency_heap_bytes)
                     .fold(0_usize, usize::saturating_add),
             ),
+        SummaryEffectKey::Sanitize { removed, .. } => size_of_val(removed.as_ref()).saturating_add(
+            removed
+                .iter()
+                .map(|label| label.len())
+                .fold(0_usize, usize::saturating_add),
+        ),
         SummaryEffectKey::Allocation { .. }
         | SummaryEffectKey::Escape { .. }
         | SummaryEffectKey::UnknownCall { .. }

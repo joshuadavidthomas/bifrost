@@ -427,6 +427,35 @@
             "input",
             "candidates"
           ]
+        },
+        {
+          "description": "Remove the named labels as a tainted value crosses this input-to-output\ntransfer. This is the shipped-pack mirror of the policy-local\n`(sanitize :removes [LABEL...])` effect (#1923). The `input` and `output`\nports identify a declared transfer; the effect neutralizes the named\nlabels on that modeled flow and leaves every other label flowing.",
+          "type": "object",
+          "properties": {
+            "input": {
+              "$ref": "#/$defs/AuthoredSummaryInput"
+            },
+            "kind": {
+              "type": "string",
+              "const": "sanitize"
+            },
+            "output": {
+              "$ref": "#/$defs/AuthoredSummaryOutput"
+            },
+            "removes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "input",
+            "output",
+            "removes"
+          ]
         }
       ]
     },

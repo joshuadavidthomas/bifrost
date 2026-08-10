@@ -447,6 +447,32 @@ impl<'plan> TaintFlowProblem<'plan> {
         Self { plan }
     }
 
+    /// Compose a modeled transfer's label function with the labels a pack-shipped
+    /// sanitize effect removes on that transfer (#1923). This reuses the single
+    /// label-removal primitive, `TaintEdgeFunction::kill`, that a policy-local
+    /// sanitizer also composes. A removed label absent from the run universe
+    /// cannot appear in any fact, so it is skipped rather than treated as an
+    /// error.
+    fn sanitized_transfer_function(
+        &self,
+        base: &TaintEdgeFunction,
+        removed_labels: &[Box<str>],
+    ) -> TaintEdgeFunction {
+        if removed_labels.is_empty() {
+            return base.clone();
+        }
+        let universe = self.plan.universe();
+        let mut removed = universe.empty_set();
+        for label in removed_labels {
+            if let Ok(class) = SourceClassId::new(label.as_ref())
+                && let Some(id) = universe.class_id(&class)
+            {
+                removed.insert_dense(id);
+            }
+        }
+        base.compose(&TaintEdgeFunction::kill(&removed))
+    }
+
     fn initial_active(
         &self,
         point: &crate::analyzer::semantic::ProgramPointHandle,
@@ -888,7 +914,10 @@ impl<'plan> TaintFlowProblem<'plan> {
                             propagated.push(ActiveTaint {
                                 carrier: transfer.target,
                                 uncertain: flow.uncertain || !transfer.proven_complete,
-                                function: flow.function.clone(),
+                                function: self.sanitized_transfer_function(
+                                    &flow.function,
+                                    transfer.removed_labels,
+                                ),
                             });
                             true
                         },
@@ -1049,7 +1078,8 @@ impl<'plan> TaintFlowProblem<'plan> {
                     let transferred = ActiveTaint {
                         carrier: transfer.target,
                         uncertain: flow.uncertain || !transfer.proven_complete,
-                        function: flow.function.clone(),
+                        function: self
+                            .sanitized_transfer_function(&flow.function, transfer.removed_labels),
                     };
                     emitting =
                         out.emit(IdeTransition::new(transferred.fact(), transferred.function));

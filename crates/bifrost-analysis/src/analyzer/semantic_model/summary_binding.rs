@@ -444,7 +444,8 @@ fn resolve_dependency_graph(
                 CompiledSummaryEffect::Allocation { .. }
                 | CompiledSummaryEffect::Escape { .. }
                 | CompiledSummaryEffect::UnknownCall { .. }
-                | CompiledSummaryEffect::UnknownCallBoundary { .. } => {}
+                | CompiledSummaryEffect::UnknownCallBoundary { .. }
+                | CompiledSummaryEffect::Sanitize { .. } => {}
             }
         }
         dependencies[caller].sort_unstable();
@@ -768,6 +769,23 @@ fn lower_effect(
     key_by_node: &[Option<ProcedureSummaryKey>],
     records: &[&CompiledProcedureSummary],
 ) -> Result<SummaryEffect, ProcedureSummaryBindingError> {
+    // A sanitize effect carries ports and labels, not an event. It removes the
+    // named labels as the tainted value crosses the matching modeled transfer
+    // (#1923); the taint client composes `TaintEdgeFunction::kill` from these
+    // labels at the transfer seam.
+    if let CompiledSummaryEffect::Sanitize {
+        input,
+        output,
+        removes,
+    } = effect
+    {
+        let key = SummaryEffectKey::sanitize(
+            lower_input(summary, binding, input)?,
+            lower_output(summary, binding, locations, output)?,
+            removes.iter().map(String::as_str),
+        );
+        return Ok(SummaryEffect::new(key, evidence.clone()));
+    }
     let event_name = match effect {
         CompiledSummaryEffect::Allocation { event, .. }
         | CompiledSummaryEffect::Call { event, .. }
@@ -775,6 +793,7 @@ fn lower_effect(
         | CompiledSummaryEffect::UnknownCall { event, .. }
         | CompiledSummaryEffect::UnknownCallBoundary { event }
         | CompiledSummaryEffect::AmbiguousCall { event, .. } => event,
+        CompiledSummaryEffect::Sanitize { .. } => unreachable!("sanitize handled above"),
     };
     let event =
         SummaryEventKey::from_digest(stable_record_key(EVENT_KEY_DOMAIN, summary, event_name));
@@ -804,6 +823,7 @@ fn lower_effect(
         CompiledSummaryEffect::UnknownCallBoundary { .. } => {
             SummaryEffectKey::UnknownCallBoundary { event }
         }
+        CompiledSummaryEffect::Sanitize { .. } => unreachable!("sanitize handled above"),
         CompiledSummaryEffect::AmbiguousCall {
             input, candidates, ..
         } => {
