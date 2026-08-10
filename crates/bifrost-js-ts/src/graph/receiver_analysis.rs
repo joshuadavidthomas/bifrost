@@ -252,7 +252,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 if targets.is_empty() {
                     ReceiverAnalysisOutcome::Ambiguous(Vec::new())
                 } else {
-                    ReceiverAnalysisOutcome::Ambiguous(dedup_units(targets, budget.max_targets))
+                    ReceiverAnalysisOutcome::single_precise_or_ambiguous(targets, budget)
                 }
             }
             ReceiverAnalysisOutcome::Unknown => ReceiverAnalysisOutcome::Unknown,
@@ -437,7 +437,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             "call_expression" => self.summarize_call_node(
                 expression,
                 expression.start_byte(),
-                depth + 1,
+                depth,
                 budget,
                 tracker,
             ),
@@ -446,7 +446,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 if name.is_empty() {
                     ReceiverAnalysisOutcome::Unknown
                 } else {
-                    self.resolve_identifier_binding(expression, name, depth + 1, budget, tracker)
+                    self.resolve_identifier_binding(expression, name, depth, budget, tracker)
                 }
             }
             "conditional_expression" | "ternary_expression" => {
@@ -692,12 +692,8 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 && let Some(name) = node.child_by_field_name("name")
                 && node_text_matches(name, self.source, receiver)
             {
-                latest = Some(self.resolve_variable_declarator_binding(
-                    node,
-                    depth + 1,
-                    budget,
-                    tracker,
-                ));
+                latest =
+                    Some(self.resolve_variable_declarator_binding(node, depth, budget, tracker));
             } else if node.kind() == "assignment_expression"
                 && let Some(left) = node.child_by_field_name("left")
                 && matches!(left.kind(), "identifier" | "type_identifier")
@@ -855,10 +851,10 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         match function.kind() {
             "identifier" | "type_identifier" => {
                 let name = slice(function, self.source);
-                self.summarize_named_function(name, call, depth + 1, budget, tracker)
+                self.summarize_named_function(name, call, depth, budget, tracker)
             }
             "member_expression" => {
-                self.summarize_member_call(function, call_byte, depth + 1, budget, tracker)
+                self.summarize_member_call(function, call_byte, depth, budget, tracker)
             }
             _ => ReceiverAnalysisOutcome::Unsupported {
                 reason: "unsupported_call_callee",
@@ -951,7 +947,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             );
             for node in nodes_for_code_unit(self.host, &function, tree.root_node()) {
                 outcomes.push(wrap_factory_outcome(
-                    provider.summarize_function_body(node, depth + 1, budget, tracker),
+                    provider.summarize_function_body(node, depth, budget, tracker),
                     &function,
                 ));
             }
@@ -1798,11 +1794,4 @@ fn sort_units(units: &mut [CodeUnit]) {
             .cmp(right.source())
             .then_with(|| left.fq_name().cmp(&right.fq_name()))
     });
-}
-
-fn dedup_units(mut units: Vec<CodeUnit>, limit: usize) -> Vec<CodeUnit> {
-    sort_units(&mut units);
-    units.dedup();
-    units.truncate(limit.saturating_add(1));
-    units
 }
