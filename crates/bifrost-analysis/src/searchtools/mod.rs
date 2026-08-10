@@ -388,6 +388,38 @@ pub fn refresh_result(analyzer: &dyn IAnalyzer) -> RefreshResult {
 struct ResolvedFilePatterns {
     files: Vec<ProjectFile>,
     ambiguous_paths: Vec<AmbiguousPathInput>,
+    /// Set when the caller supplied a fan-out budget and the glob patterns
+    /// matched more of the workspace than the budget allows. The matches were
+    /// counted but never validated against the store, which is the whole point:
+    /// the caller is going to skip this target, so it must not first pay for it
+    /// (#1738). `files` then carries only what the non-glob legs resolved.
+    glob_overflow: Option<GlobFanout>,
+}
+
+/// A glob leg abandoned for matching more files than the caller's budget.
+///
+/// The caller turns this into the [`TooBroadScope`] it reports, supplying the
+/// target as the user spelled it.
+struct GlobFanout {
+    /// Workspace files the patterns matched whose paths this analyzer's
+    /// languages could analyze. Nothing was asked of the store, so this is an
+    /// upper bound on how many of them are analyzed -- which is what a
+    /// "narrow your target" reply needs, and all it can afford.
+    matched: usize,
+    /// The first [`FILE_PATTERN_FANOUT_SAMPLE`] matched paths, sorted so the
+    /// rendered order is path-lexicographic on every platform.
+    sample: Vec<String>,
+}
+
+impl GlobFanout {
+    fn too_broad_scope(self, target: &str, cap: usize) -> TooBroadScope {
+        TooBroadScope {
+            target: target.to_string(),
+            matched: self.matched,
+            cap,
+            sample: self.sample,
+        }
+    }
 }
 
 fn code_unit_kind_name(kind: CodeUnitType) -> &'static str {
@@ -484,7 +516,19 @@ fn primary_range_from_ranges(
         .min_by_key(|range| (range.start_line, range.start_byte))
 }
 
-fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> ResolvedFilePatterns {
+/// Expand `patterns` into workspace files the analyzer has analyzed.
+///
+/// `max_glob_matches` bounds how many files the glob patterns may match before
+/// the whole glob leg is abandoned and reported through
+/// [`ResolvedFilePatterns::glob_overflow`]. `None` means no bound; a caller that
+/// reports its own total (`list_symbols`) must not have its match set silently
+/// cut short.
+fn resolve_file_patterns(
+    analyzer: &dyn IAnalyzer,
+    patterns: &[String],
+    max_glob_matches: Option<usize>,
+) -> ResolvedFilePatterns {
+    let _scope = profiling::scope("searchtools::resolve_file_patterns");
     let mut matched = BTreeSet::new();
     let mut globs = Vec::new();
     let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
@@ -545,24 +589,68 @@ fn resolve_file_patterns(analyzer: &dyn IAnalyzer, patterns: &[String]) -> Resol
         }
     }
 
+    let mut glob_overflow = None;
     if !globs.is_empty() {
-        let glob_matches: BTreeSet<_> = analyzer
-            .analyzed_files()
-            .into_iter()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .filter(|file| {
-                let path = rel_path_string(file);
-                globs.iter().any(|glob| glob.matches(&path))
-            })
-            .collect();
-        matched.extend(glob_matches);
+        let candidates = glob_candidates(analyzer, &globs);
+        match max_glob_matches {
+            // Over budget: the caller is going to skip this target, so counting
+            // the matches is all the work it may cost. Validating them first is
+            // what made a 1.3 KB `too_broad` reply take 248 s on a 250k-file
+            // workspace (#1738). `matched` is therefore the eligible-candidate
+            // count, which bounds the analyzed matches from above.
+            Some(budget) if candidates.len() > budget => {
+                let mut sample: Vec<_> = candidates
+                    .iter()
+                    .take(FILE_PATTERN_FANOUT_SAMPLE)
+                    .map(rel_path_string)
+                    .collect();
+                sample.sort();
+                glob_overflow = Some(GlobFanout {
+                    matched: candidates.len(),
+                    sample,
+                });
+            }
+            _ => matched.extend(analyzer.retain_analyzed(&candidates)),
+        }
     }
 
     ResolvedFilePatterns {
         files: matched.into_iter().collect(),
         ambiguous_paths,
+        glob_overflow,
     }
+}
+
+/// Workspace files `globs` matches that this analyzer's languages could have
+/// analyzed, in path order.
+///
+/// The universe is the session's cached workspace listing, not
+/// `analyzer.analyzed_files()`. Both describe the same tree -- every analyzer
+/// enumerates its files from `Project::analyzable_files`, which is this same
+/// listing filtered by extension and `.bifrostignore` -- but the listing is
+/// already materialized behind an `Arc` and costs a scan, while the analyzed set
+/// costs a live-filesystem walk plus a whole-workspace store query per language,
+/// per request (#1738). Candidates are only candidates: the caller confirms
+/// membership with `retain_analyzed`, which applies exactly the rule
+/// `analyzed_files` would have.
+fn glob_candidates(analyzer: &dyn IAnalyzer, globs: &[Pattern]) -> Vec<ProjectFile> {
+    let _scope = profiling::scope("searchtools::glob_candidates");
+    let Ok(listing) = analyzer.project().all_files_shared() else {
+        return Vec::new();
+    };
+    let languages = analyzer.languages();
+    let mut candidates: Vec<_> = listing
+        .par_iter()
+        .filter(|file| {
+            crate::analyzer::common::languages_may_analyze(&languages, file) && {
+                let path = rel_path_string(file);
+                globs.iter().any(|glob| glob.matches(&path))
+            }
+        })
+        .cloned()
+        .collect();
+    candidates.sort();
+    candidates
 }
 
 fn resolve_go_module_prefixed_file(
@@ -604,16 +692,31 @@ fn resolve_go_module_prefixed_file(
 }
 
 fn resolve_directory_target(analyzer: &dyn IAnalyzer, target: &str) -> Vec<ProjectFile> {
+    let _scope = profiling::scope("searchtools::resolve_directory_target");
     if target == "." {
+        // The workspace root asks for the analyzed universe itself, so ask for
+        // it directly. Routing this through the listing would validate every
+        // file in the workspace, which is strictly more work.
         return analyzer.analyzed_files().into_iter().collect();
     }
     let normalized = target.trim_end_matches('/');
     let prefix = format!("{normalized}/");
-    analyzer
-        .analyzed_files()
-        .into_iter()
-        .filter(|file| rel_path_string(file).starts_with(&prefix))
-        .collect()
+    // Same universe swap as the glob leg: scan the session's cached listing and
+    // confirm only what the prefix matched, instead of enumerating the analyzed
+    // set of every language to answer a question about one subtree (#1738).
+    let Ok(listing) = analyzer.project().all_files_shared() else {
+        return Vec::new();
+    };
+    let languages = analyzer.languages();
+    let candidates: Vec<_> = listing
+        .iter()
+        .filter(|file| {
+            crate::analyzer::common::languages_may_analyze(&languages, file)
+                && rel_path_string(file).starts_with(&prefix)
+        })
+        .cloned()
+        .collect();
+    analyzer.retain_analyzed(&candidates)
 }
 
 fn select_files_for_display(

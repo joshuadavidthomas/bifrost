@@ -281,9 +281,18 @@ fn route_summary_targets_with_cancellation(
             ResolvedFileInput::NotFound(_) => {}
         }
 
-        let matches = resolve_file_patterns(analyzer, &[target.to_string()]);
+        let matches =
+            resolve_file_patterns(analyzer, &[target.to_string()], Some(max_files_per_target));
         if !matches.ambiguous_paths.is_empty() {
             ambiguous_paths.extend(matches.ambiguous_paths);
+            continue;
+        }
+        // The glob leg counted its matches and stopped: the target is over the
+        // fan-out cap, so nothing about it was validated or summarized. Before
+        // #1738 the count came out of a fully validated match set, which meant
+        // the tool paid the whole cost of a target it was about to skip.
+        if let Some(fanout) = matches.glob_overflow {
+            too_broad.push(fanout.too_broad_scope(target, max_files_per_target));
             continue;
         }
         if !matches.files.is_empty() {
@@ -946,7 +955,11 @@ fn summarize_routed_targets_with_cancellation(
 }
 
 pub fn list_symbols(analyzer: &dyn IAnalyzer, params: FilePatternsParams) -> SkimFilesResult {
-    let expanded = resolve_file_patterns(analyzer, &params.file_patterns);
+    // No fan-out budget: this tool answers with `total_files` and a "showing X
+    // of Y" note computed from the whole match set, so cutting the expansion
+    // short would make it report a number it did not measure. It still resolves
+    // globs against the cheap listing universe rather than the analyzed set.
+    let expanded = resolve_file_patterns(analyzer, &params.file_patterns, None);
     let mut result = skim_files_for_files(analyzer, expanded.files);
     result.ambiguous_paths = expanded.ambiguous_paths;
     result

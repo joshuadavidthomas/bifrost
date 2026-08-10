@@ -19,6 +19,7 @@ mod optional_chain_reference_site;
 mod reusable_summaries;
 mod searchtools_definition_selectors;
 mod searchtools_fuzzy_symbol_lookup;
+mod searchtools_glob_routing;
 mod searchtools_list_symbols;
 mod searchtools_service;
 mod searchtools_source_budget;

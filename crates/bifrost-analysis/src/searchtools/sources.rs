@@ -527,9 +527,22 @@ fn get_symbol_sources_with_budget(
 
             let file_pattern_scope =
                 crate::profiling::scope(format!("get_symbol_sources.file_patterns[{symbol}]"));
-            let file_matches = resolve_file_patterns(analyzer, std::slice::from_ref(&symbol));
+            let file_matches = resolve_file_patterns(
+                analyzer,
+                std::slice::from_ref(&symbol),
+                Some(max_files_per_target),
+            );
             if let Some(item) = file_matches.ambiguous_paths.first() {
                 return (index, SourceLookupOutcome::AmbiguousPath(item.clone()));
+            }
+            // Over the fan-out cap: counted, not validated, not sourced (#1738).
+            if let Some(fanout) = file_matches.glob_overflow {
+                return (
+                    index,
+                    SourceLookupOutcome::TooBroad(
+                        fanout.too_broad_scope(&symbol, max_files_per_target),
+                    ),
+                );
             }
             if !file_matches.files.is_empty() {
                 if file_matches.files.len() > max_files_per_target {

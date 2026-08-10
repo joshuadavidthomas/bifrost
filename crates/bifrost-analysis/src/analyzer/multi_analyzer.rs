@@ -781,6 +781,10 @@ impl CodeUnitIndex for MultiAnalyzer {
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
+        // One visible parent for the per-language fan-out: on an 11-language
+        // workspace this is 11 whole-workspace scans and 11 store queries, and
+        // #1738's worst route span held nothing but this (uninstrumented).
+        let _scope = crate::profiling::scope("analyzer::analyzed_files.fan_out");
         let mut files: Vec<_> = self
             .delegates
             .values()
@@ -833,6 +837,21 @@ impl CodeUnitIndex for MultiAnalyzer {
         self.delegates
             .values()
             .any(|delegate| delegate.analyzer().is_analyzed(file))
+    }
+
+    /// Every delegate sees the whole candidate list and keeps the ones it owns,
+    /// so the workspace answer costs one store query per language over the
+    /// matched files -- not one whole-workspace enumeration per language, which
+    /// is what asking `analyzed_files` here used to cost (#1738).
+    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
+        let mut analyzed: Vec<_> = self
+            .delegates
+            .values()
+            .flat_map(|delegate| delegate.analyzer().retain_analyzed(candidates))
+            .collect();
+        analyzed.sort();
+        analyzed.dedup();
+        analyzed
     }
 
     fn languages(&self) -> BTreeSet<Language> {

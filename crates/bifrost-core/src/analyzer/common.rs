@@ -86,6 +86,29 @@ pub fn has_unclaimed_extension(file: &ProjectFile) -> bool {
     }
 }
 
+/// Whether an analyzer covering `languages` could have indexed `file`, judged
+/// from the path alone: no store query, no filesystem access, no snapshot.
+///
+/// This is the lexical half of the ownership test each language analyzer
+/// applies to a live path (`TreeSitterAnalyzer::adapter_owns_file`): the file's
+/// extension names one of the analyzer's languages, or the analyzer includes
+/// the one language whose adapter adopts files by include inference and the
+/// extension is claimed by no language at all.
+///
+/// A caller uses it to size a candidate set before spending store work on it.
+/// It over-approximates in exactly one direction -- a path can be eligible and
+/// still be unanalyzed -- so it may only decide how much work to attempt, never
+/// whether a file is a result. [`CodeUnitIndex::retain_analyzed`] decides that.
+///
+/// [`CodeUnitIndex::retain_analyzed`]: crate::analyzer::code_unit_index::CodeUnitIndex::retain_analyzed
+pub fn languages_may_analyze(
+    languages: &std::collections::BTreeSet<Language>,
+    file: &ProjectFile,
+) -> bool {
+    languages.contains(&language_for_file(file))
+        || (languages.contains(&INCLUDE_CLAIMING_LANGUAGE) && has_unclaimed_extension(file))
+}
+
 /// Default longest single line a source file may contain before tree-sitter parsing is
 /// skipped. Minified/generated single-line bundles (committed webpack output, mermaid.min.js,
 /// etc.) have 16KB+ lines and otherwise both livelock the parser and explode downstream

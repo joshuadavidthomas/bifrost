@@ -488,6 +488,10 @@ impl CodeUnitIndex for PythonAnalyzer {
         self.inner.is_analyzed(file)
     }
 
+    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
+        self.inner.retain_analyzed(candidates)
+    }
+
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
         self.inner.all_declarations()
     }
