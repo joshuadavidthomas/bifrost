@@ -57,7 +57,7 @@ Bifrost during installation. Upgrade it with `npm update -g
 @brokkai/bifrost`. Remove it with `npm uninstall -g @brokkai/bifrost`.
 
 The CLI package is `@brokkai/bifrost`. The separate
-`@brokk/bifrost-agent` package contains the Pi extension and agent skills.
+`@brokk/bifrost-agent` package contains the Pi extension and host MCP integration.
 
 ## Homebrew
 

@@ -16,7 +16,6 @@ mod python_module;
 // `bifrost_reference_differential` binary and `tests/suite_semantic`, both of
 // which belong to this package.
 pub mod reference_differential;
-pub mod skill_install;
 // Stage 4 of the procedure-summary foundry (#1871). It runs generated fixtures
 // through the production policy evaluator, so it needs both the foundry IR from
 // brokk-bifrost-semantic-packs and the evaluator from brokk-bifrost-policy;

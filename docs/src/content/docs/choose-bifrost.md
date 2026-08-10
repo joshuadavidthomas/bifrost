@@ -31,9 +31,9 @@ When a question begins with a known declaration, prefer symbol and usage tools. 
 | Terminal exploration | [CLI](/cli/) and [Rune Query Language](/rune-query-language/) | One-shot JSON queries, saved query files, and an interactive RQL prompt. |
 | Rust application | [Rust Library](/rust-library/) | In-process analyzer APIs for a Rust integration. |
 | Python application | [Python Client](/python-client/) | Native-backed Python access to Bifrost analysis and query results. |
-| Instruction-only agent setup | [Agent Instructions](/agents/) | Guidance for using tools that are configured separately; skills and `AGENTS.md` text do not expose tools. |
+| Instruction-only agent setup | [Agent Instructions](/agents/) | Guidance for using tools that are configured separately; instruction text does not expose tools. |
 
-MCP and LSP are separate Bifrost processes. A VS Code Play action proves that the extension's language server can execute RQL; it does not prove that an agent has MCP or `query_code`. Likewise, installing agent skills teaches a host how to use tools but does not start those tools. See the [MCP/RQL availability matrix](/mcp/#query-and-rql-availability) before configuring an agent.
+MCP and LSP are separate Bifrost processes. A VS Code Play action proves that the extension's language server can execute RQL; it does not prove that an agent has MCP or `query_code`. Configure the MCP server and verify a real tool call. See the [MCP/RQL availability matrix](/mcp/#query-and-rql-availability) before configuring an agent.
 
 ## Routes By User Goal
 

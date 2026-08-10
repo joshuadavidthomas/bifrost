@@ -89,11 +89,6 @@ exclude = [
     "benchmark/**",
     # Editor extension sources ship through the VS Code marketplace.
     "editors/**",
-    # Agent plugin manifests/tests ship through plugin marketplaces. Only
-    # the SKILL.md files embedded into the binary via include_str! stay;
-    # anything else placed under skills/ must not ship.
-    "plugins/**",
-    "!plugins/bifrost-agent/skills/*/SKILL.md",
     # Development tooling. The voyage sidecar script is a runtime input for
     # the nlp feature and stays. The mcp property fuzzer's repo-rank helper
     # (scripts/mcp-fuzzer-repo-rank.py) is deliberately dropped: the fuzzer

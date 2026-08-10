@@ -214,13 +214,6 @@ function collectProjectionUpdates(repoRoot, version) {
       }
       return source.replace(pattern, `pi install npm:@brokk/bifrost-agent@${version}`);
     }),
-    updateJson(
-      repoRoot,
-      "plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json",
-      (json) => {
-        json.binaryVersion = version;
-      },
-    ),
     updateJson(repoRoot, "editors/vscode/package.json", (json) => {
       json.version = version;
       json.bifrost ??= {};

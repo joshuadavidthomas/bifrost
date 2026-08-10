@@ -20,7 +20,6 @@ const jsonProjections = [
   "plugins/bifrost-agent/bifrost-release.json",
   "plugins/bifrost-agent/package.json",
   "plugins/bifrost-agent/package-lock.json",
-  "plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json",
   "editors/vscode/package.json",
   "editors/vscode/package-lock.json",
 ];
@@ -143,7 +142,6 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
     ["plugins/bifrost-agent/bifrost-release.json", release],
     ["plugins/bifrost-agent/package.json", basicPlugin],
     ["plugins/bifrost-agent/package-lock.json", packageLock],
-    ["plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json", release],
     ["editors/vscode/package.json", vscodePackage],
     ["editors/vscode/package-lock.json", packageLock],
   ]);

@@ -15,7 +15,6 @@
     "code-intelligence",
     "tree-sitter"
   ],
-  "skills": "./skills/",
   "agents": [
     "./agents/architect-reviewer.md",
     "./agents/devops-reviewer.md",

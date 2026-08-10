@@ -1,19 +1,17 @@
 ---
 title: OpenCode
-description: Configure and validate Bifrost LSP, MCP tools, and Agent Skills in OpenCode.
+description: Configure and validate Bifrost LSP and MCP tools in OpenCode.
 ---
 
 OpenCode can use Bifrost in three complementary ways. Its native LSP client
 provides definitions, references, hover, symbols, implementations, hierarchy,
 and diagnostics. MCP exposes Bifrost-specific analyzer tools such as
-`get_summaries` and `query_code`. Agent Skills separately teach OpenCode when
-and how to use those MCP tools.
+`get_summaries` and `query_code`.
 
 For OpenCode's underlying host conventions, see the official
 [LSP server](https://opencode.ai/docs/lsp/),
 [tools](https://opencode.ai/docs/tools/),
-[MCP server](https://opencode.ai/docs/mcp-servers/) and
-[Agent Skills](https://opencode.ai/docs/skills/) documentation.
+[MCP server](https://opencode.ai/docs/mcp-servers/) documentation.
 
 ## Configure LSP
 
@@ -248,60 +246,18 @@ opencode mcp list
 
 The output should list `bifrost` as connected.
 
-## Add Skills
-
-Install Bifrost's four generic agent skills into the project path
-that OpenCode discovers:
-
-```bash
-bifrost --root /absolute/path/to/project \
-  --install-skills --target project --mode copy
-```
-
-This installs:
-
-- `bifrost-code-navigation`
-- `bifrost-code-reading`
-- `bifrost-codebase-search`
-- `bifrost-policy-checking`
-
-Restart OpenCode after installing the skills. To inspect the skills OpenCode
-discovered, run:
-
-```bash
-opencode debug skill
-```
-
-OpenCode also scans the global `~/.agents/skills/` root. Avoid keeping different
-versions of the same Bifrost skill in both the project and global roots:
-same-named global copies can be selected instead of the project copies. Check
-the `location` reported for all four Bifrost skills and keep one intended
-scope current. To use global skills instead, install or refresh that scope:
-
-```bash
-bifrost --root /absolute/path/to/project \
-  --install-skills --target global --mode copy
-```
-
-If the installer reports local changes, review them before deciding whether to
-replace them with `--force`.
-
-Installing skills does not start Bifrost or expose analyzer tools by itself.
-Keep the MCP configuration above enabled when you want OpenCode to call
-Bifrost.
-
 ## Validate the Setup
 
 Start OpenCode from the configured project root and use a prompt that requires
-both a skill load and a Bifrost MCP result:
+an actual Bifrost MCP result:
 
 ```text
-Use the bifrost-code-reading skill. Call the Bifrost get_summaries MCP tool on src/main.rs and report only the declared symbol names returned by that tool.
+Call the Bifrost get_summaries MCP tool on src/main.rs and report only the declared symbol names returned by that tool.
 ```
 
 Replace `src/main.rs` with a source file that exists in the target repository.
-A successful smoke shows the `bifrost-code-reading` skill being loaded and a
-`bifrost_get_summaries` tool call before the answer. Avoid prompts that only
+A successful smoke shows a `bifrost_get_summaries` tool call before the answer.
+Avoid prompts that only
 ask about `README.md` or documentation files; those can pass through ordinary
 file reading without proving that the analyzer-backed MCP server ran.
 

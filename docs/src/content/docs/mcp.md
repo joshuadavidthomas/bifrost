@@ -9,7 +9,7 @@ Bifrost can run as a stdio MCP server. For a manual configuration, pass an expli
 bifrost --root /path/to/project --mcp "symbol|extended"
 ```
 
-Use `--mcp core` only for a navigation-focused setup that should not expose `query_code`. The chosen toolset controls whether an agent can query code; installing Bifrost skills does not add tools by itself.
+Use `--mcp core` only for a navigation-focused setup that should not expose `query_code`. The chosen toolset controls whether an agent can query code.
 
 Root and nested `.bifrostignore` files exclude matching tracked or untracked
 files from code intelligence without hiding them from text-level tools
@@ -29,7 +29,6 @@ RQL is the [Rune Query Language](/rune-query-language/), a human-friendly syntax
 | MCP `searchtools` | Yes | Yes | No | Yes, through `query_file` |
 | CLI | Yes | `--tool query_code` | REPL | `--query-file` |
 | VS Code RQL Play action | Separate LSP path | No | Yes, including unsaved text | Yes |
-| Skills without MCP | No tools exposed | No | No | No |
 
 For MCP, call `query_code` with either inline canonical JSON fields or one `query_file` field naming a workspace-relative `.rql` or `.json` file. `query_file` is exclusive: filters, limits, execution mode, and other query fields must be inside the referenced file. MCP never accepts raw inline RQL text. Inline JSON can set `execution_mode` to `explain` or `profile`; a saved RQL file can use the equivalent wrappers. The versioned response contracts are documented under [Explain and Profile CodeQuery](/code-query-explain-profile/).
 
@@ -223,20 +222,6 @@ Call `query_code` with exactly:
 Both calls should return a `results` array and a `truncated` field. A workspace with indexed declarations should return one result. If `query_code` is absent, check the configured toolset; if the saved query fails, check that the path is relative to the active workspace and that the agent session started after the configuration change.
 
 Before asking an agent to claim “all callers” or “no matches,” teach it the diagnostic, truncation, proof, and provenance checks in [Agent Result Safety](/agent-result-safety/).
-
-## Skills Are Separate
-
-MCP setup makes Bifrost tools available to an agent host. Agent Skills are
-separate instructions that teach the host when and how to use those tools. For
-hosts that load generic filesystem skills, install Bifrost's default code
-intelligence and policy-checking skills with:
-
-```bash
-bifrost --root /path/to/project --install-skills --target project
-```
-
-See [CLI](../cli/#install-agent-skills) for `--target global`,
-`--skills-root`, `--mode`, `--skill-set`, `--dry-run`, and `--force`.
 
 Use the host-specific pages for Pi, Codex, Claude Code, Cursor, OpenCode, Zed
 Agent, Amp, and Antigravity setup flows. The intended external manual client is
