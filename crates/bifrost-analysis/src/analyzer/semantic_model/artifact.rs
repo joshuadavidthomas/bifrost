@@ -239,6 +239,11 @@ pub enum CompiledSummaryEffect {
         input: CompiledSummaryInput,
         candidates: Vec<String>,
     },
+    Sanitize {
+        input: CompiledSummaryInput,
+        output: CompiledSummaryOutput,
+        removes: Vec<String>,
+    },
 }
 
 impl CompiledPayload {
@@ -1018,7 +1023,8 @@ pub(crate) fn payload_inventory(payload: &CompiledPayload) -> (Vec<String>, Vec<
                         CompiledSummaryEffect::Allocation { .. }
                         | CompiledSummaryEffect::Escape { .. }
                         | CompiledSummaryEffect::UnknownCall { .. }
-                        | CompiledSummaryEffect::UnknownCallBoundary { .. } => {}
+                        | CompiledSummaryEffect::UnknownCallBoundary { .. }
+                        | CompiledSummaryEffect::Sanitize { .. } => {}
                     }
                 }
             }
@@ -1223,6 +1229,15 @@ fn authored_summary_effect_from_compiled(effect: &CompiledSummaryEffect) -> Auth
             event: event.clone(),
             input: authored_summary_input_from_compiled(input),
             candidates: candidates.clone(),
+        },
+        CompiledSummaryEffect::Sanitize {
+            input,
+            output,
+            removes,
+        } => AuthoredSummaryEffect::Sanitize {
+            input: authored_summary_input_from_compiled(input),
+            output: authored_summary_output_from_compiled(output),
+            removes: removes.clone(),
         },
     }
 }

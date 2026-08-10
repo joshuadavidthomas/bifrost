@@ -160,6 +160,9 @@ fn effect_event(effect: &SummaryEffectKey) -> brokk_bifrost::analyzer::dataflow:
         | SummaryEffectKey::UnknownCall { event, .. }
         | SummaryEffectKey::UnknownCallBoundary { event }
         | SummaryEffectKey::AmbiguousCall { event, .. } => *event,
+        SummaryEffectKey::Sanitize { .. } => {
+            panic!("a sanitize effect carries labels and ports, not an event")
+        }
     }
 }
 

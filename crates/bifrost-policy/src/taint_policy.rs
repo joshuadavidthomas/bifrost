@@ -1023,7 +1023,8 @@ impl<'a> TaintPolicyCompiler<'a> {
                         CompiledSummaryEffect::Allocation { .. }
                         | CompiledSummaryEffect::Escape { .. }
                         | CompiledSummaryEffect::UnknownCall { .. }
-                        | CompiledSummaryEffect::UnknownCallBoundary { .. } => {}
+                        | CompiledSummaryEffect::UnknownCallBoundary { .. }
+                        | CompiledSummaryEffect::Sanitize { .. } => {}
                     }
                 }
             }

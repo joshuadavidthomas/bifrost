@@ -490,7 +490,8 @@ impl Validator {
                 AuthoredSummaryEffect::Allocation { .. }
                 | AuthoredSummaryEffect::Escape { .. }
                 | AuthoredSummaryEffect::UnknownCall { .. }
-                | AuthoredSummaryEffect::UnknownCallBoundary { .. } => 0,
+                | AuthoredSummaryEffect::UnknownCallBoundary { .. }
+                | AuthoredSummaryEffect::Sanitize { .. } => 0,
             })
         });
         if effect_references > MAX_PROCEDURE_SUMMARY_EFFECT_REFERENCES {
@@ -565,6 +566,7 @@ impl Validator {
                 effect,
                 &locations,
                 &summary.target,
+                &summary.transfers,
             );
         }
     }
@@ -652,8 +654,33 @@ impl Validator {
         effect: &AuthoredSummaryEffect,
         locations: &HashMap<&str, (AuthoredSummaryLocationKind, String)>,
         target: &AuthoredProcedureTarget,
+        transfers: &[AuthoredSummaryTransfer],
     ) {
+        // A sanitize effect names ports and labels, not an event, so it is
+        // validated separately from the event-bearing effects below.
+        if let AuthoredSummaryEffect::Sanitize {
+            input,
+            output,
+            removes,
+        } = effect
+        {
+            self.summary_input(&format!("{path}.input"), input, target);
+            self.summary_output(&format!("{path}.output"), output, locations, target);
+            self.sanitize_removes(&format!("{path}.removes"), removes);
+            if !transfers
+                .iter()
+                .any(|transfer| transfer.input == *input && transfer.output == *output)
+            {
+                self.error(
+                    "summary.sanitize_without_transfer",
+                    path,
+                    "a sanitize effect must match a declared transfer with the same input and output",
+                );
+            }
+            return;
+        }
         let event = match effect {
+            AuthoredSummaryEffect::Sanitize { .. } => unreachable!("sanitize handled above"),
             AuthoredSummaryEffect::Allocation { event, output } => {
                 self.summary_output(&format!("{path}.output"), output, locations, target);
                 event
@@ -715,6 +742,36 @@ impl Validator {
                 path,
                 format!("unknown procedure summary `{callee}`"),
             );
+        }
+    }
+
+    fn sanitize_removes(&mut self, path: &str, removes: &[String]) {
+        if removes.is_empty() {
+            self.error(
+                "summary.empty_sanitize_labels",
+                path,
+                "a sanitize effect must remove at least one label",
+            );
+        }
+        if removes.len() > MAX_PROCEDURE_SUMMARY_SANITIZE_LABELS {
+            self.error(
+                "limit.summary_sanitize_labels",
+                path,
+                format!(
+                    "sanitize effect removes more than {MAX_PROCEDURE_SUMMARY_SANITIZE_LABELS} labels"
+                ),
+            );
+        }
+        let mut seen = HashSet::new();
+        for (index, label) in removes.iter().enumerate() {
+            self.stable_component(&format!("{path}[{index}]"), label);
+            if !seen.insert(label) {
+                self.error(
+                    "summary.duplicate_sanitize_label",
+                    format!("{path}[{index}]"),
+                    format!("duplicate sanitize label `{label}`"),
+                );
+            }
         }
     }
 

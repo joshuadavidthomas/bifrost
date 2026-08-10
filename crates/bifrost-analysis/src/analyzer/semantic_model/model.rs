@@ -17,6 +17,9 @@ pub const MAX_PROCEDURE_SUMMARY_EFFECTS: usize = MAX_SUMMARY_EFFECTS;
 pub const MAX_PROCEDURE_SUMMARY_AMBIGUOUS_CALLEES: usize = MAX_AMBIGUOUS_SUMMARY_CALLEES;
 pub const MAX_PROCEDURE_SUMMARY_EFFECT_REFERENCES: usize = MAX_SUMMARY_EFFECT_REFERENCES;
 pub const MAX_PROCEDURE_SUMMARY_MODEL_ID_BYTES: usize = MAX_EXTERNAL_SUMMARY_MODEL_ID_BYTES;
+/// Upper bound on the labels one `sanitize` effect removes. It mirrors the
+/// policy-local `(sanitize :removes [LABEL...])` bound (#1923).
+pub const MAX_PROCEDURE_SUMMARY_SANITIZE_LABELS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -211,6 +214,16 @@ pub enum AuthoredSummaryEffect {
         event: String,
         input: AuthoredSummaryInput,
         candidates: Vec<String>,
+    },
+    /// Remove the named labels as a tainted value crosses this input-to-output
+    /// transfer. This is the shipped-pack mirror of the policy-local
+    /// `(sanitize :removes [LABEL...])` effect (#1923). The `input` and `output`
+    /// ports identify a declared transfer; the effect neutralizes the named
+    /// labels on that modeled flow and leaves every other label flowing.
+    Sanitize {
+        input: AuthoredSummaryInput,
+        output: AuthoredSummaryOutput,
+        removes: Vec<String>,
     },
 }
 
