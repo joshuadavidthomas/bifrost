@@ -1,11 +1,11 @@
 use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
-use brokk_bifrost::analyzer::structural::query::schema::ALL_RQL_FORMS;
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryMatch, CodeQueryPlan, CodeQueryPlanSource,
     CodeQueryResult, CodeQueryResultValue, Pattern, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
     StringPredicate, render_source_rune_ir,
 };
 use brokk_bifrost::{Language, SearchToolsService};
+use brokk_bifrost_rql::schema::ALL_RQL_FORMS;
 use nu_ansi_term::{Color, Style};
 use reedline::{
     ColumnarMenu, Completer, DefaultHinter, DefaultPrompt, Emacs, FileBackedHistory, Highlighter,

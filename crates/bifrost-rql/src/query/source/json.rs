@@ -1297,9 +1297,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 seen_protocol_ref = true;
                 match child.as_string() {
                     Some(value) => {
-                        if let Err(error) =
-                            value.parse::<super::super::super::analysis_context::ProtocolRef>()
-                        {
+                        if let Err(error) = value.parse::<crate::refs::ProtocolRef>() {
                             analysis.error(child.range(), "wrong-value-shape", error.to_string());
                         }
                     }
@@ -1323,9 +1321,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 seen_plan_ref = true;
                 match child.as_string() {
                     Some(value) => {
-                        if let Err(error) =
-                            value.parse::<super::super::super::analysis_context::ValueFlowPlanRef>()
-                        {
+                        if let Err(error) = value.parse::<crate::refs::ValueFlowPlanRef>() {
                             analysis.error(child.range(), "wrong-value-shape", error.to_string());
                         }
                     }
@@ -1349,9 +1345,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 seen_taint_ref = true;
                 match child.as_string() {
                     Some(value) => {
-                        if let Err(error) =
-                            value.parse::<super::super::super::analysis_context::TaintResultRef>()
-                        {
+                        if let Err(error) = value.parse::<crate::refs::TaintResultRef>() {
                             analysis.error(child.range(), "wrong-value-shape", error.to_string());
                         }
                     }

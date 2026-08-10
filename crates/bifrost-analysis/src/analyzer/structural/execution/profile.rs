@@ -2,7 +2,6 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use super::super::query::CodeQuery;
 use super::super::search::{CodeQueryResult, CodeQuerySemanticWork};
 use super::plan::{
     CodeQueryExplain, CodeQueryPhysicalOperator, PhysicalQueryNodeId, PhysicalQueryOperator,
@@ -10,6 +9,7 @@ use super::plan::{
 };
 use super::scheduler::SchedulerRunProfile;
 use crate::hash::HashSet;
+use brokk_bifrost_rql::CodeQuery;
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub(crate) enum QueryRetainedValueKind {
@@ -1259,7 +1259,7 @@ mod public_contract_tests {
 
     use super::*;
     use crate::analyzer::structural::execution::plan::{LogicalQueryOperator, LogicalQueryPlan};
-    use crate::analyzer::structural::query::SCHEMA_VERSION;
+    use brokk_bifrost_rql::SCHEMA_VERSION;
 
     #[test]
     fn retained_value_census_deduplicates_by_kind_and_identity() {

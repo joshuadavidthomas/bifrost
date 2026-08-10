@@ -1,5 +1,22 @@
 use super::*;
 
+fn edge_filter_matches(
+    filter: &EdgeFilter,
+    row: &super::super::reference_edges::ReferenceEdgeRow,
+) -> bool {
+    (filter.reference_kinds.is_empty()
+        || row
+            .reference_kind
+            .is_some_and(|kind| filter.reference_kinds.contains(&kind)))
+        && filter.proof.is_none_or(|proof| row.proof == proof)
+        && filter
+            .surface
+            .is_none_or(|surface| row.included_in(surface))
+        && (filter.usage_kinds.is_empty() || filter.usage_kinds.contains(&row.usage_kind))
+        && (filter.relations.is_empty() || filter.relations.contains(&row.owner_relation))
+        && (filter.site_classes.is_empty() || filter.site_classes.contains(&row.site_class))
+}
+
 /// Expand one file's occurrence rows, optionally restricted to those lexically
 /// inside `containing`.
 ///
@@ -474,7 +491,7 @@ pub(super) fn edge_row_expansions(
         {
             continue;
         }
-        if !filter.matches(row) {
+        if !edge_filter_matches(filter, row) {
             continue;
         }
         let Some(target) = indexed.get(analyzer, &row.target) else {

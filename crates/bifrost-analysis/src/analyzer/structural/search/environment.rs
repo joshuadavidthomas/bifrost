@@ -22,7 +22,6 @@ use super::super::occurrence_rows::{
     occurrences_for_file_with_options,
 };
 use super::super::occurrences::OccurrenceRole;
-use super::super::query::{BindingFilter, CandidateFilter, ScopeFilter};
 use super::super::resolution::EnvironmentAxis;
 use super::results::{
     CodeQueryBinding, CodeQueryCandidateHop, CodeQueryCandidateRef, CodeQueryDeclaration,
@@ -37,6 +36,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_rql::{BindingFilter, CandidateFilter, ScopeFilter};
 use std::sync::Arc;
 
 /// Domain separator for a lexical scope row's stable id.

@@ -1,9 +1,10 @@
 use super::*;
-use crate::analyzer::Language;
-use crate::analyzer::structural::kinds::ALL_ROLES;
-use crate::analyzer::structural::occurrences::{Namespace, OccurrenceClass, OccurrenceRole};
-use crate::analyzer::structural::{NormalizedKind, Role};
-use crate::analyzer::usages::{ReferenceKind, UsageHitSurface, UsageProof};
+use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::kinds::{ALL_ROLES, NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::occurrences::{
+    Namespace, OccurrenceClass, OccurrenceRole,
+};
+use brokk_bifrost_core::analyzer::usages::model::{ReferenceKind, UsageHitSurface, UsageProof};
 use serde_json::{Value, json};
 
 fn parse(json: Value) -> Result<CodeQuery, QueryError> {
@@ -790,7 +791,7 @@ fn typed_cfg_set_branches_must_have_compatible_domains() {
 
 #[test]
 fn compatible_schema_successor_changes_only_the_emitted_version() {
-    use crate::schema_version::{SchemaVersionDescriptor, SchemaVersionRegistry};
+    use brokk_bifrost_core::schema_version::{SchemaVersionDescriptor, SchemaVersionRegistry};
 
     let registry = SchemaVersionRegistry::new(&[
         SchemaVersionDescriptor::new(2, None, true),
@@ -1559,7 +1560,7 @@ fn required_roles_narrow_with_the_filter() {
     let unconstrained = OccurrenceFilter::default();
     assert_eq!(
         unconstrained.required_roles().len(),
-        crate::analyzer::structural::occurrences::ALL_OCCURRENCE_ROLES.len()
+        brokk_bifrost_core::analyzer::structural::occurrences::ALL_OCCURRENCE_ROLES.len()
     );
 
     let by_class = OccurrenceFilter {

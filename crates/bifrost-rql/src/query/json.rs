@@ -8,7 +8,7 @@ use super::ir::{
 use super::schema::{
     CallTraversalCompleteness, reference_kind_label, usage_proof_label, usage_surface_label,
 };
-use crate::analyzer::structural::kinds::{NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 use serde_json::{Map, Value, json};
 
 impl CodeQuery {
@@ -184,11 +184,11 @@ fn occurrence_seed_to_json(seed: &OccurrenceSeed) -> Map<String, Value> {
 }
 
 impl OccurrenceSeed {
-    pub(crate) fn to_canonical_json(&self) -> Value {
+    pub fn to_canonical_json(&self) -> Value {
         Value::Object(occurrence_seed_to_json(self))
     }
 
-    pub(crate) fn canonical_cache_key(&self) -> String {
+    pub fn canonical_cache_key(&self) -> String {
         serde_json::to_string(&self.to_canonical_json())
             .expect("canonical occurrence seed is serializable")
     }
@@ -476,7 +476,7 @@ fn path_seed_to_json(seed: &PathSeed) -> Map<String, Value> {
 /// The `where`/`languages` prefix every non-structural seed renders identically.
 fn environment_seed_scope_json(
     where_globs: &[glob::Pattern],
-    languages: &[crate::analyzer::Language],
+    languages: &[brokk_bifrost_core::analyzer::Language],
 ) -> Map<String, Value> {
     let mut object = Map::new();
     if !where_globs.is_empty() {
@@ -505,66 +505,66 @@ fn environment_seed_scope_json(
 }
 
 impl ScopeSeed {
-    pub(crate) fn to_canonical_json(&self) -> Value {
+    pub fn to_canonical_json(&self) -> Value {
         Value::Object(scope_seed_to_json(self))
     }
 
-    pub(crate) fn canonical_cache_key(&self) -> String {
+    pub fn canonical_cache_key(&self) -> String {
         serde_json::to_string(&self.to_canonical_json())
             .expect("canonical scope seed is serializable")
     }
 }
 
 impl BindingSeed {
-    pub(crate) fn to_canonical_json(&self) -> Value {
+    pub fn to_canonical_json(&self) -> Value {
         Value::Object(binding_seed_to_json(self))
     }
 
-    pub(crate) fn canonical_cache_key(&self) -> String {
+    pub fn canonical_cache_key(&self) -> String {
         serde_json::to_string(&self.to_canonical_json())
             .expect("canonical binding seed is serializable")
     }
 }
 
 impl GenerationSiteSeed {
-    pub(crate) fn to_canonical_json(&self) -> Value {
+    pub fn to_canonical_json(&self) -> Value {
         Value::Object(generation_site_seed_to_json(self))
     }
 
-    pub(crate) fn canonical_cache_key(&self) -> String {
+    pub fn canonical_cache_key(&self) -> String {
         serde_json::to_string(&self.to_canonical_json())
             .expect("canonical generation-site seed is serializable")
     }
 }
 
 impl PathSeed {
-    pub(crate) fn to_canonical_json(&self) -> Value {
+    pub fn to_canonical_json(&self) -> Value {
         Value::Object(path_seed_to_json(self))
     }
 
-    pub(crate) fn canonical_cache_key(&self) -> String {
+    pub fn canonical_cache_key(&self) -> String {
         serde_json::to_string(&self.to_canonical_json())
             .expect("canonical generation-site seed is serializable")
     }
 }
 
 impl ExportSeed {
-    pub(crate) fn to_canonical_json(&self) -> Value {
+    pub fn to_canonical_json(&self) -> Value {
         Value::Object(export_seed_to_json(self))
     }
 
-    pub(crate) fn canonical_cache_key(&self) -> String {
+    pub fn canonical_cache_key(&self) -> String {
         serde_json::to_string(&self.to_canonical_json())
             .expect("canonical export seed is serializable")
     }
 }
 
 impl CodeQuerySeed {
-    pub(crate) fn to_canonical_json(&self) -> Value {
+    pub fn to_canonical_json(&self) -> Value {
         Value::Object(seed_to_json(self))
     }
 
-    pub(crate) fn canonical_cache_key(&self) -> String {
+    pub fn canonical_cache_key(&self) -> String {
         serde_json::to_string(&self.to_canonical_json())
             .expect("canonical CodeQuery seed is serializable")
     }
@@ -735,7 +735,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
 }
 
 impl QueryStep {
-    pub(crate) fn to_canonical_json(&self) -> Value {
+    pub fn to_canonical_json(&self) -> Value {
         query_step_to_json(self)
     }
 }

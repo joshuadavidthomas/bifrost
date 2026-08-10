@@ -9,10 +9,10 @@ use super::edges::EdgeAxis;
 use super::kinds::{NormalizedKind, Role};
 use super::materialization::MaterializationAxis;
 use super::occurrences::OccurrenceRole;
-use super::query::{CodeQuerySeed, OccurrenceFilter};
 use super::resolution::EnvironmentAxis;
 use super::routes::{IdentityAxis, RouteHopKind};
 use crate::analyzer::Language;
+use brokk_bifrost_rql::{CodeQuerySeed, OccurrenceFilter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum QueryFeature {

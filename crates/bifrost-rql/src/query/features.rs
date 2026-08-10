@@ -1,8 +1,8 @@
 use super::ir::{CodeQuerySeed, Pattern};
-use crate::analyzer::structural::kinds::{NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
 
 impl CodeQuerySeed {
-    pub(crate) fn referenced_kinds(&self) -> Vec<NormalizedKind> {
+    pub fn referenced_kinds(&self) -> Vec<NormalizedKind> {
         let mut kinds = Vec::new();
         collect_referenced_kinds(&self.root, &mut kinds);
         if let Some(pattern) = &self.inside {
@@ -19,7 +19,7 @@ impl CodeQuerySeed {
         kinds
     }
 
-    pub(crate) fn used_roles(&self) -> Vec<Role> {
+    pub fn used_roles(&self) -> Vec<Role> {
         let mut roles = Vec::new();
         collect_used_roles(&self.root, &mut roles);
         if let Some(pattern) = &self.inside {

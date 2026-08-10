@@ -15,8 +15,8 @@
 //! source span like any other.
 
 use super::capabilities::QueryFeatures;
-use super::query::{CodeQuerySeed, Pattern, StringPredicate};
 use crate::analyzer::structural::Role;
+use brokk_bifrost_rql::{CodeQuerySeed, Pattern, StringPredicate};
 
 /// Language-independent execution plan derived from a parsed query.
 ///

@@ -90,8 +90,7 @@ pub(super) fn call_declaration_expansions(
 ) -> (Vec<PipelineExpansion>, bool) {
     let incoming = matches!(step, QueryStep::Callers(_));
     let declared_non_exhaustive = incoming
-        && filter.completeness
-            == crate::analyzer::structural::query::CallTraversalCompleteness::ProvenSubset;
+        && filter.completeness == brokk_bifrost_rql::CallTraversalCompleteness::ProvenSubset;
     let diagnostic_start = diagnostics.len();
     let mut queue = VecDeque::from([CallTraversalWork {
         unit: declaration.unit.clone(),

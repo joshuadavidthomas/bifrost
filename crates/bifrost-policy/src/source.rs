@@ -14,12 +14,6 @@ use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::analyzer::structural::materialization::{
     DeclarationOrigin, GenerationKind,
 };
-use brokk_bifrost_analysis::analyzer::structural::query::schema::{
-    reference_kind_from_label, resolve_rql_schema_version, usage_kind_from_label,
-};
-use brokk_bifrost_analysis::analyzer::structural::query::sexp::{
-    code_query_from_expr, validate_policy_selector_expr,
-};
 use brokk_bifrost_analysis::analyzer::structural::{
     MAX_CAPTURE_LENGTH, PrecedenceTier, RouteHopKind,
     occurrences::{Namespace, OccurrenceClass, OccurrenceRole},
@@ -27,7 +21,11 @@ use brokk_bifrost_analysis::analyzer::structural::{
 use brokk_bifrost_analysis::analyzer::structural::{OwnerRelation, SiteClass};
 use brokk_bifrost_analysis::analyzer::usages::UsageHitSurface;
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
-use brokk_bifrost_analysis::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
+use brokk_bifrost_rql::query::sexp::{code_query_from_expr, validate_policy_selector_expr};
+use brokk_bifrost_rql::schema::{
+    reference_kind_from_label, resolve_rql_schema_version, usage_kind_from_label,
+};
+use brokk_bifrost_rql::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
 
 use super::classification::{TextValidationError, validate_single_line_text};
 use super::definition::*;

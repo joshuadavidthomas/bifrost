@@ -375,9 +375,7 @@ fn validate_wrapper(
                 analysis.path(&field_path, args[1].range.clone());
                 match args[1].as_symbol().or_else(|| args[1].as_string()) {
                     Some(value) => {
-                        if let Err(error) =
-                            value.parse::<super::super::super::analysis_context::ProtocolRef>()
-                        {
+                        if let Err(error) = value.parse::<crate::refs::ProtocolRef>() {
                             analysis.error(
                                 args[1].range.clone(),
                                 "wrong-value-shape",
@@ -424,9 +422,7 @@ fn validate_wrapper(
                 analysis.path(&field_path, args[1].range.clone());
                 match args[1].as_symbol().or_else(|| args[1].as_string()) {
                     Some(value) => {
-                        if let Err(error) =
-                            value.parse::<super::super::super::analysis_context::ValueFlowPlanRef>()
-                        {
+                        if let Err(error) = value.parse::<crate::refs::ValueFlowPlanRef>() {
                             analysis.error(
                                 args[1].range.clone(),
                                 "wrong-value-shape",
@@ -473,9 +469,7 @@ fn validate_wrapper(
                 analysis.path(&field_path, args[1].range.clone());
                 match args[1].as_symbol().or_else(|| args[1].as_string()) {
                     Some(value) => {
-                        if let Err(error) =
-                            value.parse::<super::super::super::analysis_context::TaintResultRef>()
-                        {
+                        if let Err(error) = value.parse::<crate::refs::TaintResultRef>() {
                             analysis.error(
                                 args[1].range.clone(),
                                 "wrong-value-shape",

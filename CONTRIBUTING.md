@@ -232,7 +232,8 @@ the dependency graph: `brokk-bifrost-core`, then the language crates
 `brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
 `brokk-bifrost-js-ts`, `brokk-bifrost-jvm`, `brokk-bifrost-php`,
 `brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` (which may
-run in parallel), then `brokk-bifrost-analysis`, then
+run in parallel), and `brokk-bifrost-rql` in parallel, then
+`brokk-bifrost-analysis`, then
 its direct dependents `brokk-bifrost-policy`, `brokk-bifrost-nlp`, and
 `brokk-bifrost-semantic-packs` (which may run in parallel), then
 `brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
@@ -255,6 +256,7 @@ This table is the expected crates.io publication set for the workspace.
 | `brokk-bifrost-python` | `crates/bifrost-python/Cargo.toml` | 2 |
 | `brokk-bifrost-ruby` | `crates/bifrost-ruby/Cargo.toml` | 2 |
 | `brokk-bifrost-rust` | `crates/bifrost-rust/Cargo.toml` | 2 |
+| `brokk-bifrost-rql` | `crates/bifrost-rql/Cargo.toml` | 2 |
 | `brokk-bifrost-analysis` | `crates/bifrost-analysis/Cargo.toml` | 3 |
 | `brokk-bifrost-nlp` | `crates/bifrost-nlp/Cargo.toml` | 4 |
 | `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 4 |

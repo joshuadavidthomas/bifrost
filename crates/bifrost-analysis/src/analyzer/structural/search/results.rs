@@ -6,7 +6,7 @@
 //! only reference these contract types.
 
 use super::*;
-use crate::analyzer::structural::query::QueryValueKind;
+use brokk_bifrost_rql::QueryValueKind;
 
 mod diagnostics;
 mod environment;

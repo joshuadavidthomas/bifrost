@@ -14,6 +14,7 @@ const PHP = "brokk-bifrost-php";
 const PYTHON = "brokk-bifrost-python";
 const RUBY = "brokk-bifrost-ruby";
 const RUST = "brokk-bifrost-rust";
+const RQL = "brokk-bifrost-rql";
 const ANALYSIS = "brokk-bifrost-analysis";
 const NLP = "brokk-bifrost-nlp";
 const POLICY = "brokk-bifrost-policy";
@@ -34,6 +35,7 @@ const EXPECTED_MEMBERS = new Set([
   PYTHON,
   RUBY,
   RUST,
+  RQL,
   ANALYSIS,
   NLP,
   POLICY,
@@ -43,7 +45,8 @@ const EXPECTED_MEMBERS = new Set([
   SEMANTIC_PACKS,
 ]);
 // Core is the bottom of the graph and depends on no workspace package; the
-// analysis crate sits directly on it. The per-language crates (cpp, csharp, go,
+// analysis crate sits directly on it. The RQL syntax crate sits directly on it.
+// The per-language crates (cpp, csharp, go,
 // jvm, php, python, ruby, rust) sit between the two and depend on core alone -- that is what keeps a
 // language's knowledge out of the analysis compilation unit. `jvm` is one crate
 // for Java, Scala and Kotlin because the JVM source realm makes their routes
@@ -51,7 +54,8 @@ const EXPECTED_MEMBERS = new Set([
 // crate for JavaScript and TypeScript for the same reason -- one module, one
 // `EdgePassId`, one usage strategy and one `JsTsAnalyzerConfig`. Policy and nlp sit directly
 // on analysis as siblings (#1548) so that neither can be pulled into the
-// analysis compilation unit again.
+// analysis compilation unit again. Analysis owns RQL execution and sits above
+// the analyzer-independent RQL syntax crate.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
   [CPP, new Set([CORE])],
@@ -63,14 +67,15 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [PYTHON, new Set([CORE])],
   [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
+  [RQL, new Set([CORE])],
+  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST, RQL])],
   [NLP, new Set([ANALYSIS])],
-  [POLICY, new Set([ANALYSIS])],
+  [POLICY, new Set([ANALYSIS, RQL])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
   [RUNTIME, new Set([ANALYSIS, POLICY])],
-  [MCP, new Set([ANALYSIS, NLP, POLICY, RUNTIME])],
-  [LSP, new Set([ANALYSIS, POLICY, RUNTIME])],
-  [FACADE, new Set([ANALYSIS, NLP, POLICY, RUNTIME, MCP, LSP, SEMANTIC_PACKS])],
+  [MCP, new Set([ANALYSIS, NLP, POLICY, RUNTIME, RQL])],
+  [LSP, new Set([ANALYSIS, POLICY, RUNTIME, RQL])],
+  [FACADE, new Set([ANALYSIS, NLP, POLICY, RUNTIME, MCP, LSP, SEMANTIC_PACKS, RQL])],
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
@@ -83,7 +88,8 @@ const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [PYTHON, new Set([CORE])],
   [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
+  [RQL, new Set([CORE])],
+  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST, RQL])],
   [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS])],
   [SEMANTIC_PACKS, new Set([ANALYSIS])],
