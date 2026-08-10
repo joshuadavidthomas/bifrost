@@ -580,12 +580,12 @@ fn scan_composite_literal_field_label(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> 
     let Some(type_node) = composite_literal_owner_type_for_key(node) else {
         return false;
     };
-    // A keyed element in a map literal is an ordinary key expression, not a
-    // struct-field label. Let the normal identifier/selector scanners resolve
-    // it (for example `map[Feature]Spec{MyFeature: {...}}`). The explicit
-    // composite-literal type is the structured distinction; guessing from the
-    // key spelling would conflate same-named fields and constants.
-    if type_node.kind() == "map_type" {
+    // A keyed element in a map, array, or slice literal is an ordinary key or
+    // index expression, not a struct-field label. Let the normal identifier or
+    // selector scanners resolve it. The explicit composite-literal type is the
+    // structured distinction; guessing from the key spelling would conflate
+    // same-named fields and constants.
+    if matches!(type_node.kind(), "map_type" | "array_type" | "slice_type") {
         return false;
     }
     if node_text(node, ctx.source) == ctx.spec.identifier

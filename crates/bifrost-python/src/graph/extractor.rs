@@ -8,8 +8,9 @@ use crate::graph::hits::{
 };
 use crate::graph::resolver::{
     annotation_class_qualifier_site, annotation_reference_candidates, member_name,
-    normalized_receiver_type, receiver_annotation_matches_target, resolve_constructor_types,
-    resolve_receiver_type, target_owner_code_unit, top_level_identifier,
+    normalized_receiver_type, receiver_annotation_matches_target,
+    resolve_callable_parameter_default_types, resolve_constructor_types, resolve_receiver_type,
+    target_owner_code_unit, top_level_identifier,
 };
 use crate::graph_support::{PythonSource, PythonUsageSource};
 use crate::imports::{PythonImportBinding, parse_python_import_bindings, resolve_fqn_candidates};
@@ -810,14 +811,27 @@ fn handle_keyword_argument_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(target_owner) = ctx.target_owner.as_ref() else {
         return;
     };
-    if let Some(root) = leftmost_identifier(function)
-        && ctx
-            .scope_facts_for_node(function)
-            .is_some_and(|facts| facts.is_shadowed(slice(root, ctx.source)))
-    {
-        return;
-    }
-    let matches = resolve_constructor_types(ctx.graph, ctx.python, ctx.file, ctx.source, function)
+    let scoped_callee_matches = if function.kind() == "identifier" {
+        ctx.scope_facts_for_node(function)
+            .and_then(|facts| {
+                facts
+                    .resolution_for(slice(function, ctx.source))
+                    .as_precise()
+                    .and_then(|targets| targets.iter().next().cloned())
+            })
+            .is_some_and(|raw_type| ctx.receiver_type_matches_target(&raw_type))
+    } else {
+        false
+    };
+    let default_callee_matches = if function.kind() == "identifier" {
+        resolve_callable_parameter_default_types(
+            ctx.graph,
+            ctx.python,
+            ctx.file,
+            ctx.source,
+            function,
+            slice(function, ctx.source),
+        )
         .into_iter()
         .any(|class| {
             &class == target_owner
@@ -828,7 +842,32 @@ fn handle_keyword_argument_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                     .unwrap_or_default()
                     .into_iter()
                     .any(|ancestor| &ancestor == target_owner)
-        });
+        })
+    } else {
+        false
+    };
+    let root_shadowed = leftmost_identifier(function).is_some_and(|root| {
+        ctx.scope_facts_for_node(function)
+            .is_some_and(|facts| facts.is_shadowed(slice(root, ctx.source)))
+    });
+    if root_shadowed && !scoped_callee_matches && !default_callee_matches {
+        return;
+    }
+    let matches = scoped_callee_matches
+        || default_callee_matches
+        || (!root_shadowed
+            && resolve_constructor_types(ctx.graph, ctx.python, ctx.file, ctx.source, function)
+                .into_iter()
+                .any(|class| {
+                    &class == target_owner
+                        || ctx
+                            .graph
+                            .hierarchy
+                            .map(|provider| provider.get_ancestors(&class))
+                            .unwrap_or_default()
+                            .into_iter()
+                            .any(|ancestor| &ancestor == target_owner)
+                }));
     if matches {
         record_hit(name, ctx);
     }

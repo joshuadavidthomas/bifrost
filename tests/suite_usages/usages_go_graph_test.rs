@@ -587,6 +587,7 @@ type Other struct {
 }
 
 const BareMapKey = "Field"
+const IndexKey = 1
 "#,
         ),
         (
@@ -612,6 +613,8 @@ func build() {
     _ = map[string]string{Field: "map key"}
     _ = map[string]string{BareMapKey: "bare map expression"}
     _ = map[string]string{keys.MapKey: "map expression"}
+    _ = []string{IndexKey: "slice index expression"}
+    _ = [3]string{IndexKey: "array index expression"}
     _ = Field
 }
 "#,
@@ -647,6 +650,17 @@ func build() {
         1,
         bare_map_key_hits.len(),
         "bare map-key hits: {bare_map_key_hits:?}"
+    );
+
+    let index_key = definition(&analyzer, "example.com/app._module_.IndexKey");
+    let index_key_hits = GoUsageGraphStrategy::new()
+        .find_usages(&analyzer, &[index_key], &candidates, 1000)
+        .into_either()
+        .expect("keyed array and slice indexes remain ordinary references");
+    assert_eq!(
+        2,
+        index_key_hits.len(),
+        "array and slice index hits: {index_key_hits:?}"
     );
 }
 
