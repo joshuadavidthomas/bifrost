@@ -1633,7 +1633,11 @@ fn parses_exact_arity_from_json_and_rql() {
             Some(ArityConstraint::exact(1)),
             "{source}"
         );
-        assert_eq!(rql.to_canonical_json()["match"]["arity"], json!(1), "{source}");
+        assert_eq!(
+            rql.to_canonical_json()["match"]["arity"],
+            json!(1),
+            "{source}"
+        );
     }
 }
 
@@ -1655,8 +1659,8 @@ fn parses_arity_ranges_from_json_and_rql() {
         );
     }
 
-    let range = CodeQuery::from_sexp(r#"(call (arity :min 1 :max 3))"#)
-        .expect("range RQL should lower");
+    let range =
+        CodeQuery::from_sexp(r#"(call (arity :min 1 :max 3))"#).expect("range RQL should lower");
     assert_eq!(
         range.seed().expect("seed").root.arity,
         Some(ArityConstraint {
@@ -1744,5 +1748,8 @@ fn rejects_invalid_arity_specifications() {
 
     // The `:arity` property does not take a range; a non-integer is rejected.
     assert!(CodeQuery::from_sexp(r#"(call :arity [1 3])"#).is_err());
-    assert!(CodeQuery::from_sexp(r#"(arity 1)"#).is_err(), "arity alone is not a root anchor");
+    assert!(
+        CodeQuery::from_sexp(r#"(arity 1)"#).is_err(),
+        "arity alone is not a root anchor"
+    );
 }

@@ -1501,7 +1501,12 @@ fn validate_predicate_fragment(
     // Arity is the one predicate whose paren form takes more than a single
     // value: `(arity :min .. :max ..)` carries keyword bounds.
     if form == RqlForm::Arity {
-        validate_arity_predicate_args(args, &head_range, &rql_property_path(path, RqlProperty::Arity), analysis);
+        validate_arity_predicate_args(
+            args,
+            &head_range,
+            &rql_property_path(path, RqlProperty::Arity),
+            analysis,
+        );
         record_duplicate(RqlProperty::Arity.label(), head_range, seen, analysis);
         return;
     }

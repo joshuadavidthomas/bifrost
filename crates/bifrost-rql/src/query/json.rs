@@ -1,10 +1,9 @@
 use super::ir::{
     ArityConstraint, BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery,
-    CodeQueryPlan,
-    CodeQueryPlanSource, CodeQuerySeed, DeclarationStateFilter, EdgeFilter, ExportFilter,
-    ExportSeed, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, OccurrenceFilter,
-    OccurrenceSeed, PathSeed, Pattern, QueryStep, ScopeFilter, ScopeSeed, StringPredicate,
-    UNATTRIBUTED_TIER_LABEL,
+    CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, DeclarationStateFilter, EdgeFilter,
+    ExportFilter, ExportSeed, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
+    OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryStep, ScopeFilter, ScopeSeed,
+    StringPredicate, UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, reference_kind_label, usage_proof_label, usage_surface_label,

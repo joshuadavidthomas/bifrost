@@ -1001,16 +1001,29 @@ fn arity_frontends_validate_ranges_at_exact_positions() {
     let rql = r#"(call (arity :min 3 :max 1))"#;
     let diagnostic = validate_query_source(rql).pop().expect("range diagnostic");
     assert_eq!(diagnostic.code, "invalid-query");
-    assert!(diagnostic.message.contains("must not exceed"), "{diagnostic:?}");
+    assert!(
+        diagnostic.message.contains("must not exceed"),
+        "{diagnostic:?}"
+    );
 
     let json = r#"{"match":{"kind":"call","arity":{"min":3,"max":1}}}"#;
-    let diagnostic = validate_query_source(json).pop().expect("json range diagnostic");
-    assert!(diagnostic.message.contains("must not exceed"), "{diagnostic:?}");
+    let diagnostic = validate_query_source(json)
+        .pop()
+        .expect("json range diagnostic");
+    assert!(
+        diagnostic.message.contains("must not exceed"),
+        "{diagnostic:?}"
+    );
 
     // An empty range constrains nothing.
     let json = r#"{"match":{"kind":"call","arity":{}}}"#;
-    let diagnostic = validate_query_source(json).pop().expect("empty range diagnostic");
-    assert!(diagnostic.message.contains("at least one"), "{diagnostic:?}");
+    let diagnostic = validate_query_source(json)
+        .pop()
+        .expect("empty range diagnostic");
+    assert!(
+        diagnostic.message.contains("at least one"),
+        "{diagnostic:?}"
+    );
 
     // A bound above MAX_ARITY.
     let rql = "(call (arity 100000))";
@@ -1033,6 +1046,8 @@ fn arity_frontends_validate_ranges_at_exact_positions() {
 
     // Arity alone cannot anchor the root pattern.
     let rql = "(arity 1)";
-    let diagnostic = validate_query_source(rql).pop().expect("root anchor diagnostic");
+    let diagnostic = validate_query_source(rql)
+        .pop()
+        .expect("root anchor diagnostic");
     assert!(diagnostic.message.contains("kind"), "{diagnostic:?}");
 }

@@ -1770,7 +1770,12 @@ fn arity_value(expr: &Expr, tail: &[Expr]) -> LowerResult<Value> {
         let field = match key {
             ":min" => "min",
             ":max" => "max",
-            _ => return Err(lower_error(&pair[0], "(arity ...) accepts only :min and :max")),
+            _ => {
+                return Err(lower_error(
+                    &pair[0],
+                    "(arity ...) accepts only :min and :max",
+                ));
+            }
         };
         let ExprKind::Number(count) = pair[1].kind else {
             return Err(lower_error(
