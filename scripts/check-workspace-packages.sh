@@ -13,6 +13,7 @@ readonly packages=(
   brokk-bifrost-python
   brokk-bifrost-ruby
   brokk-bifrost-rust
+  brokk-bifrost-rql
   brokk-bifrost-analysis
   brokk-bifrost-nlp
   brokk-bifrost-policy
@@ -45,6 +46,7 @@ readonly cargo_patch_args=(
   --config 'patch.crates-io.brokk-bifrost-python.path="crates/bifrost-python"'
   --config 'patch.crates-io.brokk-bifrost-ruby.path="crates/bifrost-ruby"'
   --config 'patch.crates-io.brokk-bifrost-rust.path="crates/bifrost-rust"'
+  --config 'patch.crates-io.brokk-bifrost-rql.path="crates/bifrost-rql"'
   --config 'patch.crates-io.brokk-bifrost-analysis.path="crates/bifrost-analysis"'
   --config 'patch.crates-io.brokk-bifrost-nlp.path="crates/bifrost-nlp"'
   --config 'patch.crates-io.brokk-bifrost-policy.path="crates/bifrost-policy"'
@@ -254,6 +256,7 @@ brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
 brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
 brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
+brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 brokk-bifrost-nlp = { path = "$unpacked/brokk-bifrost-nlp-$version" }
 brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
@@ -295,6 +298,7 @@ brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
 brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
 brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
+brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
 EOF
 cat > "$analysis_consumer/src/main.rs" <<'EOF'
 fn main() {
