@@ -1580,3 +1580,169 @@ fn required_roles_narrow_with_the_filter() {
         "an explicit role list is the narrowest claim and wins"
     );
 }
+
+#[test]
+fn arity_constraint_matches_bounds_inclusively() {
+    assert!(ArityConstraint::exact(1).matches(1));
+    assert!(!ArityConstraint::exact(1).matches(0));
+    assert!(!ArityConstraint::exact(1).matches(2));
+
+    let at_least_one = ArityConstraint {
+        min: Some(1),
+        max: None,
+    };
+    assert!(!at_least_one.matches(0));
+    assert!(at_least_one.matches(1));
+    assert!(at_least_one.matches(9));
+
+    let range = ArityConstraint {
+        min: Some(1),
+        max: Some(3),
+    };
+    assert!(!range.matches(0));
+    assert!(range.matches(1));
+    assert!(range.matches(3));
+    assert!(!range.matches(4));
+
+    let at_most_two = ArityConstraint {
+        min: None,
+        max: Some(2),
+    };
+    assert!(at_most_two.matches(0));
+    assert!(at_most_two.matches(2));
+    assert!(!at_most_two.matches(3));
+}
+
+#[test]
+fn parses_exact_arity_from_json_and_rql() {
+    let query = parse_ok(json!({
+        "match": { "kind": "call", "callee": { "name": "execute" }, "arity": 1 }
+    }));
+    let root = &query.seed().expect("structural seed").root;
+    assert_eq!(root.arity, Some(ArityConstraint::exact(1)));
+
+    // The inline `:arity` property and the `(arity N)` predicate form both
+    // lower to the same exact constraint.
+    for source in [
+        r#"(call :callee (name "execute") :arity 1)"#,
+        r#"(call :callee (name "execute") (arity 1))"#,
+    ] {
+        let rql = CodeQuery::from_sexp(source).expect("arity RQL should lower");
+        assert_eq!(
+            rql.seed().expect("structural seed").root.arity,
+            Some(ArityConstraint::exact(1)),
+            "{source}"
+        );
+        assert_eq!(rql.to_canonical_json()["match"]["arity"], json!(1), "{source}");
+    }
+}
+
+#[test]
+fn parses_arity_ranges_from_json_and_rql() {
+    let cases = [
+        (json!({ "min": 1, "max": 3 }), Some(1u32), Some(3u32)),
+        (json!({ "min": 2 }), Some(2), None),
+        (json!({ "max": 4 }), None, Some(4)),
+    ];
+    for (spec, min, max) in cases {
+        let query = parse_ok(json!({
+            "match": { "kind": "call", "arity": spec }
+        }));
+        assert_eq!(
+            query.seed().expect("seed").root.arity,
+            Some(ArityConstraint { min, max }),
+            "{spec}"
+        );
+    }
+
+    let range = CodeQuery::from_sexp(r#"(call (arity :min 1 :max 3))"#)
+        .expect("range RQL should lower");
+    assert_eq!(
+        range.seed().expect("seed").root.arity,
+        Some(ArityConstraint {
+            min: Some(1),
+            max: Some(3),
+        })
+    );
+
+    let open_top = CodeQuery::from_sexp(r#"(call (arity :min 1))"#).expect("open-top RQL");
+    assert_eq!(
+        open_top.seed().expect("seed").root.arity,
+        Some(ArityConstraint {
+            min: Some(1),
+            max: None,
+        })
+    );
+}
+
+#[test]
+fn arity_round_trips_through_canonical_json() {
+    // Exact stays a bare number; an open-ended or asymmetric range stays an
+    // object; a symmetric range collapses to the exact number.
+    let range = json!({
+        "schema_version": 1,
+        "match": { "kind": "call", "arity": { "min": 1, "max": 3 } }
+    });
+    assert_eq!(
+        parse_ok(range.clone()).to_canonical_json()["match"]["arity"],
+        range["match"]["arity"]
+    );
+
+    let open = json!({ "match": { "kind": "call", "arity": { "min": 2 } } });
+    assert_eq!(
+        parse_ok(open.clone()).to_canonical_json()["match"]["arity"],
+        open["match"]["arity"]
+    );
+
+    let symmetric = parse_ok(json!({
+        "match": { "kind": "call", "arity": { "min": 2, "max": 2 } }
+    }));
+    assert_eq!(symmetric.to_canonical_json()["match"]["arity"], json!(2));
+
+    // RQL and JSON exact forms lower to the same IR.
+    let rql = CodeQuery::from_sexp(r#"(call :arity 2)"#).expect("rql exact arity");
+    let json_query = parse_ok(json!({ "match": { "kind": "call", "arity": 2 } }));
+    assert_eq!(rql.to_canonical_json(), json_query.to_canonical_json());
+}
+
+#[test]
+fn rejects_invalid_arity_specifications() {
+    // min greater than max.
+    let error = error_of(json!({
+        "match": { "kind": "call", "arity": { "min": 3, "max": 1 } }
+    }));
+    assert_eq!(error.path, "match.arity");
+    assert!(error.message.contains("must not exceed"), "{error}");
+
+    // An empty range object constrains nothing.
+    let error = error_of(json!({
+        "match": { "kind": "call", "arity": {} }
+    }));
+    assert_eq!(error.path, "match.arity");
+    assert!(error.message.contains("at least one"), "{error}");
+
+    // A bound above MAX_ARITY.
+    let error = error_of(json!({
+        "match": { "kind": "call", "arity": (MAX_ARITY as u64) + 1 }
+    }));
+    assert_eq!(error.path, "match.arity");
+    assert!(error.message.contains("at most"), "{error}");
+
+    // A negative or fractional exact count is not a non-negative integer.
+    for bad in [json!(-1), json!(1.5), json!("two")] {
+        let error = error_of(json!({
+            "match": { "kind": "call", "arity": bad }
+        }));
+        assert_eq!(error.path, "match.arity", "{bad}");
+    }
+
+    // An unknown range key.
+    let error = error_of(json!({
+        "match": { "kind": "call", "arity": { "exactly": 1 } }
+    }));
+    assert!(error.path.starts_with("match.arity"), "{error}");
+
+    // The `:arity` property does not take a range; a non-integer is rejected.
+    assert!(CodeQuery::from_sexp(r#"(call :arity [1 3])"#).is_err());
+    assert!(CodeQuery::from_sexp(r#"(arity 1)"#).is_err(), "arity alone is not a root anchor");
+}
