@@ -647,7 +647,18 @@ fn jsts_module_export_candidates(
     let bindings = index.local_bindings_for_exported_name(files, exported_name);
     let mut candidates = Vec::new();
     for (file, local_name) in bindings {
-        let file_candidates = support.file_identifier_in_files(&[file], &local_name);
+        // An export names one exact local binding. Prefer its exact FQN before
+        // the broad file-identifier index, which also returns same-terminal
+        // class members such as `Store.getPreferences` for an exported
+        // top-level `getPreferences` function.
+        let mut file_candidates: Vec<_> = support
+            .fqn(&local_name)
+            .into_iter()
+            .filter(|candidate| candidate.source() == &file)
+            .collect();
+        if file_candidates.is_empty() {
+            file_candidates = support.file_identifier_in_files(&[file], &local_name);
+        }
         candidates.extend(file_candidates);
     }
 
