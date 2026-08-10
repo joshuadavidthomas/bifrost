@@ -676,7 +676,8 @@ fn validate_wrapper(
         | RqlForm::Capture
         | RqlForm::Has
         | RqlForm::NotHas
-        | RqlForm::NotKind => unreachable!("predicate cannot be a query wrapper"),
+        | RqlForm::NotKind
+        | RqlForm::Arity => unreachable!("predicate cannot be a query wrapper"),
     }
     validate_rql_query(query, path, analysis, depth, plan_budget);
 }
@@ -1497,6 +1498,13 @@ fn validate_predicate_fragment(
         return;
     }
     analysis.add_help(head_range.clone(), form.signature(), form.description());
+    // Arity is the one predicate whose paren form takes more than a single
+    // value: `(arity :min .. :max ..)` carries keyword bounds.
+    if form == RqlForm::Arity {
+        validate_arity_predicate_args(args, &head_range, &rql_property_path(path, RqlProperty::Arity), analysis);
+        record_duplicate(RqlProperty::Arity.label(), head_range, seen, analysis);
+        return;
+    }
     if args.len() != 1 {
         analysis.error(
             head_range,
@@ -1510,6 +1518,98 @@ fn validate_predicate_fragment(
         .expect("predicate forms have an explicit property lowering");
     validate_property_value(property, &args[0], path, analysis);
     record_duplicate(property.label(), head_range, seen, analysis);
+}
+
+/// Validate the tail of an `(arity ...)` predicate: a single non-negative
+/// integer (exact), or `:min`/`:max` non-negative-integer bounds. Mirrors the
+/// sexp lowering so the editor rejects what the parser would.
+fn validate_arity_predicate_args(
+    args: &[Expr],
+    head_range: &Range<usize>,
+    path: &str,
+    analysis: &mut Analysis,
+) {
+    analysis.path(path, head_range.clone());
+    if let [only] = args
+        && matches!(only.kind, ExprKind::Number(_))
+    {
+        validate_arity_scalar(only, analysis);
+        return;
+    }
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        analysis.error(
+            head_range.clone(),
+            "wrong-value-shape",
+            "arity expects a count or :min/:max integer pairs",
+        );
+        return;
+    }
+    let mut seen_bounds = HashSet::new();
+    let mut min = None;
+    let mut max = None;
+    for pair in args.chunks_exact(2) {
+        let Some(key) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "wrong-value-shape",
+                "arity bound names must be :min or :max",
+            );
+            continue;
+        };
+        if key != ":min" && key != ":max" {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "arity accepts only :min and :max",
+            );
+            continue;
+        }
+        if !seen_bounds.insert(key.to_string()) {
+            analysis.error(
+                pair[0].range.clone(),
+                "duplicate-property",
+                format!("duplicate arity bound '{key}'"),
+            );
+        }
+        if let Some(value) = validate_arity_scalar(&pair[1], analysis) {
+            if key == ":min" {
+                min = Some(value);
+            } else {
+                max = Some(value);
+            }
+        }
+    }
+    if let (Some(min), Some(max)) = (min, max)
+        && min > max
+    {
+        analysis.error(
+            head_range.clone(),
+            "invalid-query",
+            format!("arity :min {min} must not exceed :max {max}"),
+        );
+    }
+}
+
+/// Validate one arity integer literal, returning its value when it is a valid
+/// non-negative count within [`MAX_ARITY`].
+fn validate_arity_scalar(value: &Expr, analysis: &mut Analysis) -> Option<u64> {
+    let ExprKind::Number(count) = value.kind else {
+        analysis.error(
+            value.range.clone(),
+            "wrong-value-shape",
+            "arity must be a non-negative integer",
+        );
+        return None;
+    };
+    if count > u64::from(MAX_ARITY) {
+        analysis.error(
+            value.range.clone(),
+            "invalid-query",
+            format!("arity must be at most {MAX_ARITY}"),
+        );
+        return None;
+    }
+    Some(count)
 }
 
 fn validate_rql_property(
@@ -1643,6 +1743,9 @@ fn validate_property_value(
         }
         super::schema::ValueShape::RegexString => validate_rql_regex(value, &child, analysis),
         super::schema::ValueShape::KindList => validate_kind_value(value, &child, analysis),
+        super::schema::ValueShape::Arity => {
+            validate_arity_scalar(value, analysis);
+        }
         super::schema::ValueShape::Pattern => validate_rql_pattern(value, &child, analysis),
         super::schema::ValueShape::PatternList
         | super::schema::ValueShape::PatternMap
@@ -1702,6 +1805,7 @@ fn rql_property_path(path: &str, property: RqlProperty) -> String {
         RqlProperty::TextRegex => "text.regex",
         RqlProperty::Capture => "capture",
         RqlProperty::NotKind => "not_kind",
+        RqlProperty::Arity => "arity",
         RqlProperty::Has => "has",
         RqlProperty::NotHas => "not_has",
     };
@@ -1728,6 +1832,7 @@ fn validate_plain_string(property: RqlProperty, value: &Expr, analysis: &mut Ana
         RqlProperty::NameRegex
         | RqlProperty::TextRegex
         | RqlProperty::NotKind
+        | RqlProperty::Arity
         | RqlProperty::Has
         | RqlProperty::NotHas => unreachable!("property is not a plain string"),
     };

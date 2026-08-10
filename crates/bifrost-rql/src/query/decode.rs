@@ -1,6 +1,7 @@
 use super::ir::{
-    BindingFilter, BindingSeed, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter,
-    CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
+    ArityConstraint, BindingFilter, BindingSeed, CallInputSelector, CallSiteTraversalFilter,
+    CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan,
+    CodeQueryPlanSource, MAX_ARITY,
     CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, DeclarationStateFilter, EdgeFilter,
     ExportFilter, ExportSeed, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
     MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
@@ -1602,6 +1603,7 @@ struct PatternFields<'a> {
     not_kind: Option<&'a Value>,
     name: Option<&'a Value>,
     text: Option<&'a Value>,
+    arity: Option<&'a Value>,
     capture: Option<&'a Value>,
     has: Option<&'a Value>,
     not_has: Option<&'a Value>,
@@ -1620,6 +1622,7 @@ fn collect_pattern_fields<'a>(
                 PatternField::NotKind => fields.not_kind = Some(value),
                 PatternField::Name => fields.name = Some(value),
                 PatternField::Text => fields.text = Some(value),
+                PatternField::Arity => fields.arity = Some(value),
                 PatternField::Capture => fields.capture = Some(value),
                 PatternField::Has => fields.has = Some(value),
                 PatternField::NotHas => fields.not_has = Some(value),
@@ -1677,6 +1680,11 @@ fn decode_pattern(
         .map(|value| decode_string_predicate(value, &child_path(path, "text"), false))
         .transpose()?;
 
+    let arity = fields
+        .arity
+        .map(|value| decode_arity_constraint(value, &child_path(path, "arity")))
+        .transpose()?;
+
     let capture = fields
         .capture
         .map(|value| {
@@ -1703,6 +1711,7 @@ fn decode_pattern(
         not_kinds,
         name,
         text,
+        arity,
         capture,
         has,
         not_has,
@@ -1711,6 +1720,60 @@ fn decode_pattern(
 
     decode_role_fields(&fields.roles, path, &mut pattern, budget, depth + 1)?;
     Ok(pattern)
+}
+
+/// Decode an `arity` value: a non-negative integer (exact), or an object with
+/// optional `min`/`max` non-negative-integer bounds (inclusive range). At
+/// least one bound must be present and `min <= max` when both are, so the
+/// decoded constraint is always satisfiable.
+fn decode_arity_constraint(value: &Value, path: &str) -> Result<ArityConstraint, QueryError> {
+    match value {
+        Value::Number(_) => Ok(ArityConstraint::exact(decode_arity_bound(value, path)?)),
+        Value::Object(object) => {
+            reject_unknown_filter_fields(object, path, &["min", "max"], "arity")?;
+            let min = object
+                .get("min")
+                .map(|value| decode_arity_bound(value, &child_path(path, "min")))
+                .transpose()?;
+            let max = object
+                .get("max")
+                .map(|value| decode_arity_bound(value, &child_path(path, "max")))
+                .transpose()?;
+            if min.is_none() && max.is_none() {
+                return Err(QueryError::new(
+                    path,
+                    "arity range must set at least one of \"min\" or \"max\"",
+                ));
+            }
+            if let (Some(min), Some(max)) = (min, max)
+                && min > max
+            {
+                return Err(QueryError::new(
+                    path,
+                    format!("arity \"min\" {min} must not exceed \"max\" {max}"),
+                ));
+            }
+            Ok(ArityConstraint { min, max })
+        }
+        _ => Err(QueryError::new(
+            path,
+            "arity must be a non-negative integer or a { \"min\", \"max\" } range object",
+        )),
+    }
+}
+
+/// Decode a single arity bound: a JSON non-negative integer within [`MAX_ARITY`].
+fn decode_arity_bound(value: &Value, path: &str) -> Result<u32, QueryError> {
+    let count = value
+        .as_u64()
+        .ok_or_else(|| QueryError::new(path, "arity bound must be a non-negative integer"))?;
+    if count > u64::from(MAX_ARITY) {
+        return Err(QueryError::new(
+            path,
+            format!("arity bound must be at most {MAX_ARITY}"),
+        ));
+    }
+    Ok(count as u32)
 }
 
 /// Decode a `kind` / `not_kind` value: a single kind label or a non-empty

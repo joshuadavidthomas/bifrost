@@ -17,11 +17,13 @@ pub mod sexp;
 mod source;
 
 pub use ir::{
-    BindingFilter, BindingSeed, CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter,
+    ArityConstraint, BindingFilter, BindingSeed, CallInputSelector, CallSiteTraversalFilter,
+    CallTraversalFilter,
     CandidateFilter, CandidateOutcomeLabel, CodeQuery, CodeQueryPlan, CodeQueryPlanSource,
     CodeQueryResultDetail, CodeQuerySeed, DEFAULT_LIMIT, DeclarationStateFilter, EdgeFilter,
     ExportFilter, ExportSeed, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
-    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
+    MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES,
+    MAX_GLOB_LENGTH,
     MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
     MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
     MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,

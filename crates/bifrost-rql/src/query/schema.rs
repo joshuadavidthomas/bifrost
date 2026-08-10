@@ -79,6 +79,7 @@ pub enum ValueShape {
     LanguageList,
     PositiveInteger,
     NonNegativeInteger,
+    Arity,
     ResultDetail,
     ExecutionMode,
     SchemaVersion,
@@ -136,6 +137,7 @@ impl ValueShape {
             Self::LanguageList => "one or more language labels",
             Self::PositiveInteger => "a positive integer",
             Self::NonNegativeInteger => "a non-negative integer",
+            Self::Arity => "an exact non-negative count, or :min/:max argument-count bounds",
             Self::ResultDetail => "compact or full",
             Self::ExecutionMode => "results, explain, or profile",
             Self::SchemaVersion => "a supported schema version",
@@ -636,6 +638,7 @@ macro_rules! rql_forms {
                     Self::Has => Some(RqlProperty::Has),
                     Self::NotHas => Some(RqlProperty::NotHas),
                     Self::NotKind => Some(RqlProperty::NotKind),
+                    Self::Arity => Some(RqlProperty::Arity),
                 }
             }
         }
@@ -1306,6 +1309,13 @@ rql_forms! {
         signature: "(not-kind kind|[kinds...])",
         description: "Exclude one or more normalized kinds using subtype-aware matching.",
     }
+    Arity {
+        labels: ["arity"],
+        class: Predicate,
+        shape: Arity,
+        signature: "(arity count | :min count :max count)",
+        description: "Match a call by its positional argument count: an exact count, or inclusive :min/:max bounds.",
+    }
 }
 
 macro_rules! rql_properties {
@@ -1395,6 +1405,12 @@ rql_properties! {
         shape: KindList,
         signature: ":not-kind kind|[kinds...]",
         description: "Exclude one or more normalized kinds.",
+    }
+    Arity {
+        labels: ["arity"],
+        shape: Arity,
+        signature: ":arity count",
+        description: "Match a call by its exact positional argument count.",
     }
     Has {
         labels: ["has"],
@@ -1897,6 +1913,7 @@ json_fields! {
     Name { label: "name", shape: StringPredicate, signature: "\"name\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match the node's normalized name." }
     Text { label: "text", shape: RegexPredicate, signature: "\"text\": { \"regex\": \"pattern\" }", description: "Match the node's source text with a regular expression." }
     Capture { label: "capture", shape: String, signature: "\"capture\": \"label\"", description: "Capture the matching node under a result label." }
+    Arity { label: "arity", shape: Arity, signature: "\"arity\": count | { \"min\": count, \"max\": count }", description: "Match a call by its positional argument count: an exact count, or inclusive min/max bounds." }
     Has { label: "has", shape: Pattern, signature: "\"has\": { pattern }", description: "Require a matching descendant." }
     NotHas { label: "not_has", shape: Pattern, signature: "\"not_has\": { pattern }", description: "Exclude nodes containing a matching descendant." }
 }

@@ -1,5 +1,6 @@
 use super::ir::{
-    BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery, CodeQueryPlan,
+    ArityConstraint, BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery,
+    CodeQueryPlan,
     CodeQueryPlanSource, CodeQuerySeed, DeclarationStateFilter, EdgeFilter, ExportFilter,
     ExportSeed, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, OccurrenceFilter,
     OccurrenceSeed, PathSeed, Pattern, QueryStep, ScopeFilter, ScopeSeed, StringPredicate,
@@ -765,6 +766,9 @@ fn pattern_to_json(pattern: &Pattern) -> Value {
     if let Some(predicate) = &pattern.text {
         object.insert("text".to_string(), string_predicate_to_json(predicate));
     }
+    if let Some(arity) = &pattern.arity {
+        object.insert("arity".to_string(), arity_to_json(arity));
+    }
     if let Some(capture) = &pattern.capture {
         object.insert("capture".to_string(), json!(capture));
     }
@@ -803,4 +807,22 @@ fn string_predicate_to_json(predicate: &StringPredicate) -> Value {
         StringPredicate::Exact(text) => json!(text),
         StringPredicate::Regex(regex) => json!({ "regex": regex.as_str() }),
     }
+}
+
+/// Render an arity constraint as the exact-count number when both inclusive
+/// bounds coincide, or a `{ "min", "max" }` object that omits an open side.
+fn arity_to_json(arity: &ArityConstraint) -> Value {
+    if let (Some(min), Some(max)) = (arity.min, arity.max)
+        && min == max
+    {
+        return json!(min);
+    }
+    let mut object = Map::new();
+    if let Some(min) = arity.min {
+        object.insert("min".to_string(), json!(min));
+    }
+    if let Some(max) = arity.max {
+        object.insert("max".to_string(), json!(max));
+    }
+    Value::Object(object)
 }

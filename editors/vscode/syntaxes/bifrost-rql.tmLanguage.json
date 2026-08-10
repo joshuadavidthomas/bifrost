@@ -54,7 +54,7 @@
     },
     {
       "name": "variable.parameter.role.bifrost-rql",
-      "match": ":(?:args|callee|capture|class(?:es)?|completeness|config[-_]gated|declaration[-_]only|decorators|depth|field|forms?|has|inputs?|kwargs|left|boundar(?:y|ies)|hoisting|include[-_]shadowed|min[-_]segments|origins?|resolved|max-(?:bytes|steps)|module|name(?:/regex)?|namespaces?|outcomes?|not[-_]has|not[-_]kind|object|parameter-(?:index|name)|plan-ref|proof|protocol-ref|receiver|reference-kinds|relation|right|roles?|site[-_]class|surface|tiers?|taint[-_]ref|text/regex|transitive|usage)(?=$|[\\s()\\[\\]])"
+      "match": ":(?:args|arity|callee|capture|class(?:es)?|completeness|config[-_]gated|declaration[-_]only|decorators|depth|field|forms?|has|inputs?|kwargs|left|boundar(?:y|ies)|hoisting|include[-_]shadowed|min[-_]segments|origins?|resolved|max-(?:bytes|steps)|max|min|module|name(?:/regex)?|namespaces?|outcomes?|not[-_]has|not[-_]kind|object|parameter-(?:index|name)|plan-ref|proof|protocol-ref|receiver|reference-kinds|relation|right|roles?|site[-_]class|surface|tiers?|taint[-_]ref|text/regex|transitive|usage)(?=$|[\\s()\\[\\]])"
     },
     {
       "name": "support.function.wrapper.bifrost-rql",
@@ -66,7 +66,7 @@
     },
     {
       "name": "support.function.predicate.bifrost-rql",
-      "match": "\\b(?:capture|has|name(?:/regex)?|not[-_]has|not[-_]kind|text/regex)\\b"
+      "match": "\\b(?:arity|capture|has|name(?:/regex)?|not[-_]has|not[-_]kind|text/regex)\\b"
     },
     {
       "name": "meta.hierarchy-depth.bifrost-rql",
