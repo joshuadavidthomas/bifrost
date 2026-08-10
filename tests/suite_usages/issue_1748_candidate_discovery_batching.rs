@@ -28,6 +28,7 @@ use brokk_bifrost::analyzer::CodeUnitIndex;
 
 use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::AnalyzerQueryScope;
+use brokk_bifrost::path_utils::rel_path_string;
 use brokk_bifrost::usages::{UsageFinder, UsageHitKind};
 use brokk_bifrost::{
     AnalyzerConfig, AnalyzerDelegate, CancellationToken, CodeUnit, IAnalyzer, Language,
@@ -187,7 +188,7 @@ fn issue_1748_batched_discovery_finds_the_same_usages() {
         .result
         .all_hits_including_imports()
         .iter()
-        .map(|hit| hit.enclosing.source().to_string())
+        .map(|hit| rel_path_string(hit.enclosing.source()))
         .collect();
 
     for index in 0..CALLER_COUNT {
@@ -296,7 +297,7 @@ fn issue_1748_a_multi_language_workspace_gets_the_same_batched_read() {
         .result
         .all_hits_including_imports()
         .iter()
-        .map(|hit| hit.enclosing.source().to_string())
+        .map(|hit| rel_path_string(hit.enclosing.source()))
         .collect();
     for index in 0..CALLER_COUNT {
         let expected = format!("src/caller_{index}.rs");

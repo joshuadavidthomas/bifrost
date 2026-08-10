@@ -47,6 +47,11 @@ mod scan_usages_same_owner_policy;
 // build, exactly like the rest of the foundry.
 #[cfg(feature = "release-tooling")]
 mod summary_foundry_fixtures;
+// Milestone 4.5 of the procedure-summary foundry (#1871): the demand sweep. Its
+// extraction proof and its env-gated corpus driver are generation-time tooling
+// behind `release-tooling`, like the rest of the foundry.
+#[cfg(feature = "release-tooling")]
+mod summary_foundry_demand;
 mod taint_policy_adapter;
 #[cfg(unix)]
 mod temp_storage_scripts;

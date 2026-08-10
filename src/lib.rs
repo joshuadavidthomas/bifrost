@@ -16,6 +16,13 @@ pub mod skill_install;
 // this package is the only one that depends on both.
 #[cfg(feature = "release-tooling")]
 pub mod summary_foundry_fixtures;
+// Milestone 4.5 of the procedure-summary foundry (#1871): the demand-sweep fleet
+// runner. It runs the require-model taint policy over a fixed corpus slice
+// through the production evaluator, so like the milestone-3 fixture runner it
+// needs both the foundry IR and the policy evaluator, which only this package
+// depends on together.
+#[cfg(feature = "release-tooling")]
+pub mod summary_foundry_demand;
 
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CancellationToken, CapabilityProvider,

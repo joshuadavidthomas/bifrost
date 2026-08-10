@@ -2304,11 +2304,18 @@ fn analyze_diff_reports_no_call_edge_churn_for_a_pure_module_move() {
         )
     };
     fs::write(root.join("pkg_a").join("mod.py"), module("callee")).unwrap();
-    commit(root, "base");
+    let base = commit(root, "base");
     fs::write(root.join("pkg_a").join("mod.py"), module("other")).unwrap();
     let swapped = commit(root, "swap the callee in place");
 
-    let control = analyze(root, serde_json::json!({"target": swapped}));
+    fs::create_dir(root.join("pkg_b")).unwrap();
+    git(root, &["mv", "pkg_a/mod.py", "pkg_b/mod.py"]);
+    let head = commit(root, "move the module");
+
+    // Build the complete history before analysis. A service can still have a
+    // Git reader in flight when it closes on Windows, so a later `git mv`
+    // could contend for `.git/index.lock`.
+    let control = analyze(root, serde_json::json!({"base": base, "target": swapped}));
     let control_caller = edited(&control, "caller").expect("caller edited");
     assert_eq!(
         callee_targets(control_caller, "added_calls"),
@@ -2321,11 +2328,7 @@ fn analyze_diff_reports_no_call_edge_churn_for_a_pure_module_move() {
         "{control}"
     );
 
-    fs::create_dir(root.join("pkg_b")).unwrap();
-    git(root, &["mv", "pkg_a/mod.py", "pkg_b/mod.py"]);
-    let head = commit(root, "move the module");
-
-    let result = analyze(root, serde_json::json!({"target": head}));
+    let result = analyze(root, serde_json::json!({"base": swapped, "target": head}));
     let moved_caller = moved(&result, "caller").expect("caller moved");
     assert_eq!(
         moved_caller["before"]["fqn"], "pkg_a.mod.caller",
@@ -2376,7 +2379,7 @@ fn analyze_diff_cancels_a_renamed_callee_for_an_untouched_caller() {
     };
     fs::write(root.join("pkg").join("helper.py"), helper("1")).unwrap();
     fs::write(root.join("pkg").join("app.py"), app("0", "1", "helper")).unwrap();
-    commit(root, "base");
+    let base = commit(root, "base");
     // The control has to touch both files: an endpoint analyzer only sees the
     // paths the diff names, so a callee whose file is unchanged is not there to
     // resolve against.
@@ -2388,7 +2391,17 @@ fn analyze_diff_cancels_a_renamed_callee_for_an_untouched_caller() {
     .unwrap();
     let wired = commit(root, "call the helper");
 
-    let control = analyze(root, serde_json::json!({"target": wired}));
+    // Create both endpoints before analysis. This avoids a Windows Git index
+    // lock race between a closing analysis service and the fixture mutation.
+    git(root, &["mv", "pkg/helper.py", "pkg/support.py"]);
+    fs::write(
+        root.join("pkg").join("app.py"),
+        app("target()", "2", "support"),
+    )
+    .unwrap();
+    let head = commit(root, "rename the helper module");
+
+    let control = analyze(root, serde_json::json!({"base": base, "target": wired}));
     assert_eq!(
         callee_targets(
             edited(&control, "use_target").expect("use_target edited"),
@@ -2400,15 +2413,7 @@ fn analyze_diff_cancels_a_renamed_callee_for_an_untouched_caller() {
 
     // Rename the callee's module and update the import. `use_target`'s own
     // lines are untouched; only the import line and `unrelated` change.
-    git(root, &["mv", "pkg/helper.py", "pkg/support.py"]);
-    fs::write(
-        root.join("pkg").join("app.py"),
-        app("target()", "2", "support"),
-    )
-    .unwrap();
-    let head = commit(root, "rename the helper module");
-
-    let result = analyze(root, serde_json::json!({"target": head}));
+    let result = analyze(root, serde_json::json!({"base": wired, "target": head}));
     assert!(edited(&result, "unrelated").is_some(), "{result}");
     assert!(
         edited(&result, "use_target").is_none()

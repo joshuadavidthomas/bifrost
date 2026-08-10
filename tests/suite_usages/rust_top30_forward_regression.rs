@@ -5,6 +5,7 @@ use brokk_bifrost::analyzer::usages::get_definition::trace::{
 use brokk_bifrost::analyzer::usages::get_definition::{
     DefinitionLookupRequest, ResolutionTraceResult,
 };
+use brokk_bifrost::path_utils::rel_path_string;
 use brokk_bifrost::{AnalyzerConfig, CancellationToken, ProjectFile};
 use std::sync::Arc;
 
@@ -75,9 +76,7 @@ fn selected_paths(trace: &ResolutionTraceResult) -> Vec<String> {
         .iter()
         .filter(|row| row.is_selected())
         .filter_map(|row| match &row.candidate {
-            TraceCandidateRef::Unit(unit) => {
-                Some(unit.source().rel_path().to_string_lossy().into_owned())
-            }
+            TraceCandidateRef::Unit(unit) => Some(rel_path_string(unit.source())),
             _ => None,
         })
         .collect()
