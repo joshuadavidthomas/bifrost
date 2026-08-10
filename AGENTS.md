@@ -445,7 +445,7 @@ Harnesses and clients choose one of the two patterns above explicitly. A
 harness that measures tool latency must either call the readiness function
 first or report readiness wait separately from tool execution time.
 
-The PyTorch SDPA sidecar provides voyage-4-nano embeddings. The sidecar selects CUDA or Metal at run time. There are no compile-time backend features.
+The PyTorch SDPA sidecar provides Muninn embeddings. Bifrost uses Muninn with a GPU and Muninn-small without one. There are no compile-time backend features.
 
 Tests must not download models. Tests must not start indexer threads.
 

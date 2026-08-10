@@ -13,9 +13,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use fastrq::{Bits, Metric, QueryDistancer, RotationalQuantizer};
 
-/// Process-wide quantizers, one per input dimension (only the embedder's dim — 512
-/// — occurs in practice). Shared via `Arc`; building a rotation is cheap but not
-/// free, so we still cache rather than rebuild per call.
+/// Process-wide quantizers, one per input dimension. Muninn uses 512 dimensions,
+/// and Muninn-small uses 384. Shared via `Arc`; building a rotation is cheap but
+/// not free, so we still cache rather than rebuild per call.
 fn quantizer(dim: usize) -> Arc<RotationalQuantizer> {
     static CACHE: OnceLock<RwLock<HashMap<usize, Arc<RotationalQuantizer>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));

@@ -55,8 +55,6 @@ mod jvm_shared_realm;
 mod kotlin_analyzer_test;
 mod kotlin_imports_and_hierarchy;
 mod kotlin_test_detection_test;
-#[cfg(feature = "nlp")]
-mod nlp_voyage_parity;
 mod php_analyzer_test;
 mod php_analyzer_update_test;
 mod php_test_detection_test;
