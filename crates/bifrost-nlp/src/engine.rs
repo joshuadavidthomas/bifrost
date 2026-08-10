@@ -1,7 +1,7 @@
 //! Embedding engine.
 //!
 //! `Embedder` is the seam the indexer and query pipeline depend on; the production impl
-//! ([`super::voyage_sidecar`]) runs the selected model profile in a PyTorch SDPA sidecar
+//! ([`super::voyage_sidecar`]) runs the selected model in a PyTorch SDPA sidecar
 //! (one process per device, fused attention on CUDA/Metal/CPU), and a deterministic fake
 //! backs the model-free tests. Model files resolve from an env-pointed local directory
 //! first (fine-tune escape hatch), then the HF hub cache. The sidecar selects its device
@@ -17,69 +17,13 @@ use sha2::{Digest, Sha256};
 use super::DOCUMENT_CONTRACT_VERSION;
 use super::keys::l2_normalize;
 
-pub const EMBED_PROFILE_ENV: &str = "BIFROST_EMBED_PROFILE";
 pub const EMBED_ENDPOINT_ENV: &str = "BIFROST_EMBED_ENDPOINT";
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModelProfile {
-    pub name: &'static str,
-    pub model_id: &'static str,
-    pub dimension: usize,
-    pub query_prefix: &'static str,
-    pub passage_prefix: &'static str,
-    pub pooling: &'static str,
-    pub max_seq_tokens: usize,
-}
-
-pub const VOYAGE_PROFILE: ModelProfile = ModelProfile {
-    name: "voyage-4-nano",
-    model_id: "voyageai/voyage-4-nano",
-    dimension: 512,
-    query_prefix: "Represent the query for retrieving supporting documents: ",
-    passage_prefix: "Represent the document for retrieval: ",
-    pooling: "mean-mrl",
-    max_seq_tokens: 8192,
-};
-
-pub const GRANITE_R2_PROFILE: ModelProfile = ModelProfile {
-    name: "granite-r2",
-    model_id: "ibm-granite/granite-embedding-small-english-r2",
-    dimension: 384,
-    query_prefix: "Given a GitHub issue, retrieve code that must be changed to fix it.\nQuery: ",
-    passage_prefix: "Passage: Code chunk from repository.\n",
-    pooling: "cls",
-    max_seq_tokens: 8192,
-};
-
-pub const DW10_PROFILE: ModelProfile = ModelProfile {
-    name: "dw10",
-    model_id: "voyageai/voyage-4-nano",
-    dimension: 512,
-    query_prefix: "Represent the query for retrieving supporting documents: ",
-    passage_prefix: "Represent the document for retrieval: ",
-    pooling: "mean-mrl",
-    max_seq_tokens: 8192,
-};
-
-pub fn selected_model_profile() -> Result<ModelProfile, String> {
-    match std::env::var(EMBED_PROFILE_ENV).ok().as_deref() {
-        None | Some("") | Some("voyage") | Some("voyage-4-nano") => Ok(VOYAGE_PROFILE),
-        Some("granite-r2") => Ok(GRANITE_R2_PROFILE),
-        Some("dw10") => Ok(DW10_PROFILE),
-        Some(value) => Err(format!(
-            "unknown {EMBED_PROFILE_ENV} value '{value}'; expected voyage-4-nano, granite-r2, or dw10"
-        )),
-    }
-}
+pub const MUNINN_MODEL_ID: &str = "brokkai/Muninn";
+pub const MUNINN_SMALL_MODEL_ID: &str = "brokkai/Muninn-small";
 
 pub trait Embedder: Send + Sync {
-    fn profile(&self) -> ModelProfile {
-        VOYAGE_PROFILE
-    }
-
-    fn dim(&self) -> usize {
-        self.profile().dimension
-    }
+    fn dim(&self) -> usize;
 
     /// Embed document texts; the passage prefix is applied here, exactly once.
     /// Outputs are L2-normalized.
@@ -114,18 +58,13 @@ pub struct EmbeddingTiming {
     pub service: Duration,
 }
 
-/// Fingerprint recipe shared by all embedders: model label + dimensionality +
-/// the exact prefix strings + vector representation contract.
-pub(crate) fn fingerprint_for(label: &str, profile: ModelProfile) -> String {
+/// Fingerprint recipe shared by all embedders: model contract + dimensionality +
+/// vector representation contract.
+pub(crate) fn fingerprint_for(label: &str, dimension: usize) -> String {
     let mut hasher = Sha256::new();
     for part in [
         label,
-        profile.name,
-        &profile.dimension.to_string(),
-        profile.query_prefix,
-        profile.passage_prefix,
-        profile.pooling,
-        &format!("max_seq_tokens={}", profile.max_seq_tokens),
+        &dimension.to_string(),
         DOCUMENT_CONTRACT_VERSION,
         // Stored-vector format. Bumping this invalidates caches written in a prior
         // format (e.g. raw f32 before fastrq) without changing the content keys.
@@ -201,12 +140,20 @@ pub fn accelerator_available() -> bool {
 }
 
 pub(crate) fn embed_repo_id() -> String {
-    std::env::var(EMBED_MODEL_ID_ENV).unwrap_or_else(|_| {
-        selected_model_profile()
-            .unwrap_or(VOYAGE_PROFILE)
-            .model_id
-            .to_string()
-    })
+    selected_embed_repo_id(
+        std::env::var(EMBED_MODEL_ID_ENV).ok(),
+        accelerator_available(),
+    )
+}
+
+fn selected_embed_repo_id(explicit: Option<String>, has_accelerator: bool) -> String {
+    if let Some(model_id) = explicit {
+        model_id
+    } else if has_accelerator {
+        MUNINN_MODEL_ID.to_string()
+    } else {
+        MUNINN_SMALL_MODEL_ID.to_string()
+    }
 }
 
 /// Directory holding the model's `config.json`, `tokenizer.json`, and
@@ -241,9 +188,8 @@ pub fn resolve_tokenizer_dir() -> Result<PathBuf, String> {
 }
 
 pub fn load_production_embedder() -> Result<Arc<dyn Embedder>, String> {
-    // voyage-4-nano runs in the PyTorch SDPA sidecar (fused attention on every backend,
-    // incl. Blackwell sm_120 where candle/flash-attn could not). The sidecar spawns one
-    // process per device and fans the batch across them via `ScheduledEmbedder`.
+    // Muninn runs in the PyTorch SDPA sidecar. The sidecar spawns one process per
+    // device and fans the batch across them via `ScheduledEmbedder`.
     super::voyage_sidecar::load_sidecar_embedder()
 }
 
@@ -271,8 +217,8 @@ impl ScheduledEmbedder {
 }
 
 impl Embedder for ScheduledEmbedder {
-    fn profile(&self) -> ModelProfile {
-        self.workers[0].profile()
+    fn dim(&self) -> usize {
+        self.workers[0].dim()
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
@@ -382,11 +328,8 @@ impl FakeHashEmbedder {
 }
 
 impl Embedder for FakeHashEmbedder {
-    fn profile(&self) -> ModelProfile {
-        ModelProfile {
-            dimension: self.dim,
-            ..VOYAGE_PROFILE
-        }
+    fn dim(&self) -> usize {
+        self.dim
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
@@ -400,7 +343,7 @@ impl Embedder for FakeHashEmbedder {
     }
 
     fn fingerprint(&self) -> String {
-        fingerprint_for("fake-hash-embedder", self.profile())
+        fingerprint_for("fake-hash-embedder", self.dim)
     }
 }
 
@@ -429,35 +372,25 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_with_label_and_dim() {
-        let p16 = ModelProfile {
-            dimension: 16,
-            ..VOYAGE_PROFILE
-        };
-        let p32 = ModelProfile {
-            dimension: 32,
-            ..VOYAGE_PROFILE
-        };
-        assert_ne!(fingerprint_for("a", p16), fingerprint_for("b", p16));
-        assert_ne!(fingerprint_for("a", p16), fingerprint_for("a", p32));
+        assert_ne!(fingerprint_for("a", 16), fingerprint_for("b", 16));
+        assert_ne!(fingerprint_for("a", 16), fingerprint_for("a", 32));
     }
 
     #[test]
-    fn granite_profile_matches_serving_contract() {
-        assert_eq!(GRANITE_R2_PROFILE.dimension, 384);
-        assert_eq!(GRANITE_R2_PROFILE.pooling, "cls");
-        assert!(GRANITE_R2_PROFILE.query_prefix.ends_with("Query: "));
-        assert!(GRANITE_R2_PROFILE.passage_prefix.ends_with('\n'));
+    fn accelerator_selects_full_muninn_by_default() {
+        assert_eq!(selected_embed_repo_id(None, true), MUNINN_MODEL_ID);
     }
 
     #[test]
-    fn dw10_profile_matches_serving_contract() {
-        assert_eq!(DW10_PROFILE.dimension, 512);
-        assert_eq!(DW10_PROFILE.pooling, "mean-mrl");
-        assert_eq!(DW10_PROFILE.query_prefix, VOYAGE_PROFILE.query_prefix);
-        assert_eq!(DW10_PROFILE.passage_prefix, VOYAGE_PROFILE.passage_prefix);
-        assert_ne!(
-            fingerprint_for("checkpoint", DW10_PROFILE),
-            fingerprint_for("checkpoint", VOYAGE_PROFILE)
+    fn cpu_selects_small_muninn_by_default() {
+        assert_eq!(selected_embed_repo_id(None, false), MUNINN_SMALL_MODEL_ID);
+    }
+
+    #[test]
+    fn explicit_model_id_wins_without_a_profile() {
+        assert_eq!(
+            selected_embed_repo_id(Some("owner/model".to_string()), true),
+            "owner/model"
         );
     }
 

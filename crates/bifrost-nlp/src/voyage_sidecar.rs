@@ -1,14 +1,14 @@
 //! PyTorch SDPA embedding sidecar client.
 //!
 //! Each [`SingleSidecar`] owns one child process (`scripts/voyage_sidecar.py`) pinned to
-//! one GPU; the child runs voyage-4-nano under PyTorch with fused (memory-efficient)
+//! one GPU; the child runs the selected Muninn model under PyTorch with fused
 //! SDPA attention. N sidecars are wrapped in the existing [`ScheduledEmbedder`] so a
 //! batch fans across every GPU.
 //!
 //! Wire protocol (little-endian), one frame each way:
 //!   request : u32 len + JSON {"kind":"passage"|"query","texts":[...]}
 //!   response: u32 len + [u32 n][u32 dim][f64 queue_s][f64 service_s] + n*dim f32
-//! The child emits one ready frame (`{"ready":true,"dim":512}`) after model load.
+//! The child emits one ready frame with its model ID and dimension after model load.
 
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
@@ -17,11 +17,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-#[cfg(all(test, unix))]
-use super::engine::VOYAGE_PROFILE;
 use super::engine::{
-    EMBED_ENDPOINT_ENV, Embedder, EmbeddingTiming, ModelProfile, ScheduledEmbedder, embed_repo_id,
-    fingerprint_for, selected_model_profile,
+    EMBED_ENDPOINT_ENV, EMBED_MODEL_ID_ENV, Embedder, EmbeddingTiming, ScheduledEmbedder,
+    embed_repo_id, fingerprint_for,
 };
 
 const SCRIPT_ENV: &str = "BIFROST_SIDECAR_SCRIPT";
@@ -123,7 +121,7 @@ pub struct SingleSidecar {
     connection: Mutex<SidecarConnection>,
     label: String,
     model_fingerprint: String,
-    profile: ModelProfile,
+    dimension: usize,
 }
 
 impl SingleSidecar {
@@ -140,13 +138,13 @@ impl SingleSidecar {
         connection.write_frame(&body)?;
         let resp = connection.read_frame()?;
         drop(connection);
-        decode_matrix(&resp, texts.len(), self.profile.dimension)
+        decode_matrix(&resp, texts.len(), self.dimension)
     }
 }
 
 impl Embedder for SingleSidecar {
-    fn profile(&self) -> ModelProfile {
-        self.profile
+    fn dim(&self) -> usize {
+        self.dimension
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
@@ -168,11 +166,9 @@ impl Embedder for SingleSidecar {
     }
 
     fn fingerprint(&self) -> String {
-        // bf16 sidecar vectors differ slightly from the fp32 reference, so use a
-        // distinct contract id — switching backends rebuilds the cache.
         fingerprint_for(
-            &format!("{}:{}:sidecar-bf16", self.label, self.model_fingerprint),
-            self.profile,
+            &format!("{}:{}:sidecar", self.label, self.model_fingerprint),
+            self.dimension,
         )
     }
 }
@@ -298,18 +294,13 @@ fn kill_sidecar_pid(pid: u32) {
 
 /// Spawn one sidecar pinned to `device` (a CUDA_VISIBLE_DEVICES value) and wait for its
 /// ready frame.
-fn spawn_sidecar(
-    device: &str,
-    label: String,
-    profile: ModelProfile,
-) -> Result<SingleSidecar, String> {
-    spawn_sidecar_with_timeout(device, label, profile, script_path(), ready_timeout(), None)
+fn spawn_sidecar(device: &str, model_id: &str) -> Result<SingleSidecar, String> {
+    spawn_sidecar_with_timeout(device, model_id, script_path(), ready_timeout(), None)
 }
 
 fn spawn_sidecar_with_timeout(
     device: &str,
-    label: String,
-    profile: ModelProfile,
+    model_id: &str,
     script: PathBuf,
     timeout: Duration,
     uv_cache_dir: Option<&Path>,
@@ -320,7 +311,7 @@ fn spawn_sidecar_with_timeout(
         cmd.env("UV_CACHE_DIR", cache_dir);
     }
     cmd.env("CUDA_VISIBLE_DEVICES", device);
-    cmd.env(super::engine::EMBED_PROFILE_ENV, profile.name);
+    cmd.env(EMBED_MODEL_ID_ENV, model_id);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -353,13 +344,13 @@ fn spawn_sidecar_with_timeout(
                 if info.get("ready").and_then(|v| v.as_bool()) != Some(true) {
                     return Err(format!("sidecar did not report ready: {info}"));
                 }
-                let model_fingerprint = validate_ready(&info, profile)?;
-                Ok((proc, model_fingerprint))
+                let contract = validate_ready(&info)?;
+                Ok((proc, contract))
             });
             tx.send(result).ok();
         })
         .map_err(|err| format!("spawn sidecar ready thread: {err}"))?;
-    let (proc, model_fingerprint) = match rx.recv_timeout(timeout) {
+    let (proc, contract) = match rx.recv_timeout(timeout) {
         Ok(result) => {
             handle
                 .join()
@@ -384,36 +375,48 @@ fn spawn_sidecar_with_timeout(
     };
     Ok(SingleSidecar {
         connection: Mutex::new(SidecarConnection::Process(proc)),
-        label,
-        model_fingerprint,
-        profile,
+        label: contract.model_id,
+        model_fingerprint: contract.model_fingerprint,
+        dimension: contract.dimension,
     })
 }
 
-fn validate_ready(info: &serde_json::Value, profile: ModelProfile) -> Result<String, String> {
+struct SidecarContract {
+    model_id: String,
+    model_fingerprint: String,
+    dimension: usize,
+}
+
+fn validate_ready(info: &serde_json::Value) -> Result<SidecarContract, String> {
     if info.get("ready").and_then(|v| v.as_bool()) != Some(true) {
         return Err(format!("sidecar did not report ready: {info}"));
     }
-    let dim = info.get("dim").and_then(|v| v.as_u64());
-    let reported_profile = info.get("profile").and_then(|v| v.as_str());
-    if dim != Some(profile.dimension as u64) || reported_profile != Some(profile.name) {
-        return Err(format!(
-            "sidecar contract mismatch: reported profile={reported_profile:?} dim={dim:?}, expected profile={} dim={}",
-            profile.name, profile.dimension
-        ));
-    }
-    info.get("model_fingerprint")
+    let dimension = info
+        .get("dim")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "sidecar ready frame omitted a valid dimension".to_string())?;
+    let model_id = info
+        .get("model_id")
         .and_then(|value| value.as_str())
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| "sidecar ready frame omitted model_fingerprint".to_string())
+        .ok_or_else(|| "sidecar ready frame omitted model_id".to_string())?;
+    let model_fingerprint = info
+        .get("model_fingerprint")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "sidecar ready frame omitted model_fingerprint".to_string())?;
+    Ok(SidecarContract {
+        model_id,
+        model_fingerprint,
+        dimension,
+    })
 }
 
-fn connect_sidecar(
-    endpoint: &str,
-    label: String,
-    profile: ModelProfile,
-) -> Result<SingleSidecar, String> {
+fn connect_sidecar(endpoint: &str) -> Result<SingleSidecar, String> {
     let address = endpoint
         .strip_prefix("tcp://")
         .ok_or_else(|| format!("{EMBED_ENDPOINT_ENV} must use tcp://host:port"))?;
@@ -426,30 +429,29 @@ fn connect_sidecar(
     let ready = connection.read_frame()?;
     let info: serde_json::Value =
         serde_json::from_slice(&ready).map_err(|err| format!("sidecar ready frame: {err}"))?;
-    let model_fingerprint = validate_ready(&info, profile)?;
+    let contract = validate_ready(&info)?;
     Ok(SingleSidecar {
         connection: Mutex::new(connection),
-        label,
-        model_fingerprint,
-        profile,
+        label: contract.model_id,
+        model_fingerprint: contract.model_fingerprint,
+        dimension: contract.dimension,
     })
 }
 
 /// Spawn one sidecar per device and fan a batch across them via `ScheduledEmbedder`.
 pub fn load_sidecar_embedder() -> Result<Arc<dyn Embedder>, String> {
-    let profile = selected_model_profile()?;
-    let label = embed_repo_id();
     if let Ok(endpoint) = std::env::var(EMBED_ENDPOINT_ENV) {
-        let worker = connect_sidecar(&endpoint, label, profile)?;
+        let worker = connect_sidecar(&endpoint)?;
         worker
             .embed_passages(&["warmup"])
             .map_err(|err| format!("sidecar warmup failed at '{endpoint}': {err}"))?;
         return Ok(Arc::new(worker));
     }
+    let model_id = embed_repo_id();
     let devices = sidecar_devices();
     let mut workers: Vec<Arc<dyn Embedder>> = Vec::with_capacity(devices.len());
     for device in &devices {
-        let worker = spawn_sidecar(device, label.clone(), profile)?;
+        let worker = spawn_sidecar(device, &model_id)?;
         worker
             .embed_passages(&["warmup"])
             .map_err(|err| format!("sidecar warmup failed on device '{device}': {err}"))?;
@@ -498,6 +500,22 @@ mod tests {
     }
 
     #[test]
+    fn ready_contract_uses_sidecar_model_and_dimension() {
+        let info = serde_json::json!({
+            "ready": true,
+            "dim": 384,
+            "model_id": "brokkai/Muninn-small",
+            "model_fingerprint": "small-contract",
+        });
+
+        let contract = validate_ready(&info).unwrap();
+
+        assert_eq!(contract.dimension, 384);
+        assert_eq!(contract.model_id, "brokkai/Muninn-small");
+        assert_eq!(contract.model_fingerprint, "small-contract");
+    }
+
+    #[test]
     fn spawn_sidecar_times_out_and_reaps_child() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("sleep_sidecar.py");
@@ -508,8 +526,7 @@ mod tests {
 
         let result = spawn_sidecar_with_timeout(
             "",
-            "test-sidecar".to_string(),
-            VOYAGE_PROFILE,
+            "test-sidecar",
             script,
             Duration::from_secs(1),
             Some(&uv_cache_dir),

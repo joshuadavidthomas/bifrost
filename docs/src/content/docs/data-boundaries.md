@@ -64,7 +64,7 @@ so the MCP tool list is negotiated again.
 
 ## Optional Semantic Model
 
-Semantic search is off by default and requires the `nlp` feature. When enabled without `BIFROST_EMBED_MODEL_DIR`, Bifrost resolves `BIFROST_EMBED_MODEL_ID` (by default `voyageai/voyage-4-nano`) through the Hugging Face cache, downloading missing configuration, tokenizer, and weight files. Set `BIFROST_EMBED_MODEL_DIR` to an approved local model directory for an offline or pre-audited setup.
+Semantic search is off by default and requires the `nlp` feature. `BIFROST_EMBED_MODEL_ID` selects an explicit Hugging Face model. Otherwise, Bifrost selects `brokkai/Muninn` with an accelerator and `brokkai/Muninn-small` without one. The Hugging Face cache downloads missing configuration, tokenizer, metadata, and weight files. Set `BIFROST_EMBED_MODEL_DIR` to an approved local model directory for an offline or pre-audited setup.
 
 The PyTorch sidecar receives code chunks for local embedding inference. It is a child process, not a hosted embedding API. Accelerator and device environment variables affect local execution, not the MCP/model-host boundary.
 
