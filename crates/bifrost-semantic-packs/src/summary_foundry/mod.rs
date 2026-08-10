@@ -24,6 +24,7 @@ pub mod joern;
 pub mod join;
 pub mod sanitizer;
 pub mod store;
+pub mod taint_policy;
 
 use std::collections::BTreeMap;
 use std::fmt;

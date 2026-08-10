@@ -30,11 +30,17 @@ use brokk_bifrost_analysis::analyzer::{
 };
 use brokk_bifrost_policy::{
     PolicyAnalysisType, PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
-    PolicyRunCompletion, PolicySourceIdentity, evaluate_policy_inputs_with_analyzer,
+    PolicyIncompleteReason, PolicyRunCompletion, PolicySourceIdentity,
+    evaluate_policy_inputs_with_analyzer,
 };
+use brokk_bifrost_semantic_packs::summary_foundry::codeql::translate_codeql_taint_endpoints;
 use brokk_bifrost_semantic_packs::summary_foundry::demand::{
     BlockerObservation, CompletionBucket, DemandSweepReport, RepoOutcome, RepoRunOutcome,
     SliceMeta, SliceRepo, blockers_from_report, summarize,
+};
+use brokk_bifrost_semantic_packs::summary_foundry::ir::FoundryTaintEndpoint;
+use brokk_bifrost_semantic_packs::summary_foundry::taint_policy::{
+    PolicyShape, build_require_model_java_taint_policy, import_detectable_packages,
 };
 
 /// The evaluation date the sweep pins. The taint policy carries no temporal
@@ -159,13 +165,125 @@ pub fn run_sweep(config: &SweepConfig) -> Result<DemandSweepReport, SweepError> 
     let mut outcomes = Vec::with_capacity(repos.len());
     for repo in &repos {
         let root = config.corpus_root.join(&repo.name);
-        outcomes.push(run_repo(&repo.name, repo.java_files, &root, config));
+        outcomes.push(run_repo(
+            &repo.name,
+            repo.java_files,
+            &root,
+            REQUIRE_MODEL_TAINT_POLICY,
+            config,
+        ));
     }
     let slice = SliceMeta {
         selection_rule,
         repos,
     };
     Ok(summarize(slice, &outcomes))
+}
+
+/// A realistic-sweep run: the deterministic report plus the policy it ran.
+///
+/// The policy is returned so the driver can write it beside the report, which
+/// makes the run reproducible and the selectors auditable.
+#[derive(Debug, Clone)]
+pub struct RealisticSweep {
+    pub report: DemandSweepReport,
+    pub policy: String,
+    pub policy_shape: PolicyShape,
+    pub endpoint_count: usize,
+    pub import_packages: Vec<String>,
+}
+
+/// Load and translate every CodeQL Models-as-Data file under `dir` into taint
+/// endpoints. A `.model.yml` file that will not parse stops the load, because a
+/// silently-skipped corpus file would understate the endpoint set.
+pub fn load_codeql_endpoints(dir: &Path) -> Result<Vec<FoundryTaintEndpoint>, SweepError> {
+    let mut files = Vec::new();
+    let mut names = fs::read_dir(dir)
+        .map_err(|error| SweepError::Io {
+            path: dir.to_path_buf(),
+            error,
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".model.yml"))
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    for path in names {
+        let bytes = fs::read(&path).map_err(|error| SweepError::Io {
+            path: path.clone(),
+            error,
+        })?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a .model.yml path has a file name")
+            .to_owned();
+        files.push((name, bytes));
+    }
+    let translation = translate_codeql_taint_endpoints(&files).map_err(|error| SweepError::Io {
+        path: dir.to_path_buf(),
+        error: io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
+    })?;
+    Ok(translation.endpoints)
+}
+
+/// Run the realistic demand sweep: build a `require-model` Java taint policy from
+/// the endpoints, select the slice by whether a repo imports the endpoint
+/// libraries, run the policy over each selected repo, and aggregate.
+///
+/// This is the milestone-4.6 counterpart of [`run_sweep`]. It shares every piece
+/// of the run machinery -- the per-repo runner, the outcome bucketing, the
+/// deterministic aggregation -- and differs only in the two inputs milestone 4.5
+/// could not supply: a policy whose selectors match real Java, and a slice
+/// chosen for using the APIs that policy names.
+pub fn run_realistic_sweep(
+    config: &SweepConfig,
+    endpoints: &[FoundryTaintEndpoint],
+) -> Result<RealisticSweep, SweepError> {
+    let (policy, policy_shape) = build_require_model_java_taint_policy(endpoints);
+    let import_packages = import_detectable_packages(endpoints);
+    let repos = select_java_slice_importing(config, &import_packages)?;
+    let selection_rule = format!(
+        "The first {} corpus directories, in sorted-name order, that carry a \
+         root-level Maven or Gradle build file (pom.xml, build.gradle, or \
+         build.gradle.kts), hold between one and {} .java files, and import at \
+         least one endpoint library ({}). The import scan is a slice-selection \
+         heuristic over `import` declarations; the taint analysis itself is fully \
+         structural. `java.lang` endpoints (Runtime, ProcessBuilder, System) are \
+         imported implicitly and so cannot gate selection, but they still fire in \
+         a selected repo that uses them. A repo's git HEAD is recorded when the \
+         clone is a git checkout.",
+        config.max_repos,
+        config.max_java_files,
+        import_packages.join(", "),
+    );
+    let mut outcomes = Vec::with_capacity(repos.len());
+    for repo in &repos {
+        let root = config.corpus_root.join(&repo.name);
+        outcomes.push(run_repo(
+            &repo.name,
+            repo.java_files,
+            &root,
+            &policy,
+            config,
+        ));
+    }
+    let slice = SliceMeta {
+        selection_rule,
+        repos,
+    };
+    let report = summarize(slice, &outcomes);
+    Ok(RealisticSweep {
+        report,
+        policy,
+        policy_shape,
+        endpoint_count: endpoints.len(),
+        import_packages,
+    })
 }
 
 /// Run the `require-model` taint policy over one repo and bucket the outcome.
@@ -177,17 +295,19 @@ pub fn run_repo(
     name: &str,
     java_files: usize,
     root: &Path,
+    policy: &str,
     config: &SweepConfig,
 ) -> RepoRunOutcome {
     let cancellation = CancellationToken::new().with_timeout(config.per_repo_timeout);
-    let outcome = run_repo_inner(root, &cancellation);
+    let outcome = run_repo_inner(root, policy, &cancellation);
     let outcome = match outcome {
-        Ok((completion, blockers)) => {
+        Ok((completion, blockers, inconclusive_reasons)) => {
             return RepoRunOutcome {
                 repo: name.to_owned(),
                 java_files,
                 outcome: completion,
                 blockers,
+                inconclusive_reasons,
             };
         }
         Err(error) => error,
@@ -204,15 +324,32 @@ pub fn run_repo(
         java_files,
         outcome,
         blockers: Vec::new(),
+        inconclusive_reasons: Vec::new(),
     }
 }
 
-/// The inner run, returning either the concluded outcome plus blockers or a
-/// non-ran outcome bucket.
+/// The typed reasons an inconclusive completion gave, as the policy layer's own
+/// snake_case labels. `PolicyIncompleteReason` is a unit-variant serde enum, so
+/// serializing each yields its stable label; the reasons are already sorted and
+/// deduplicated by the policy layer.
+fn incomplete_reason_labels(reasons: &[PolicyIncompleteReason]) -> Vec<String> {
+    reasons
+        .iter()
+        .filter_map(|reason| {
+            serde_json::to_value(reason)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+        })
+        .collect()
+}
+
+/// The inner run, returning either the concluded outcome plus blockers and any
+/// inconclusive reasons, or a non-ran outcome bucket.
 fn run_repo_inner(
     root: &Path,
+    policy: &str,
     cancellation: &CancellationToken,
-) -> Result<(RepoOutcome, Vec<BlockerObservation>), RepoOutcome> {
+) -> Result<(RepoOutcome, Vec<BlockerObservation>, Vec<String>), RepoOutcome> {
     let project =
         FilesystemProject::new(root).map_err(|error| RepoOutcome::WorkspaceBuildFailed {
             detail: error.to_string(),
@@ -227,7 +364,7 @@ fn run_repo_inner(
 
     let inputs = [PolicyEvaluationInput::embedded(
         PolicySourceIdentity::new("bifrost:summary-foundry/demand-sweep-policy"),
-        REQUIRE_MODEL_TAINT_POLICY,
+        policy,
     )];
     let (year, month, day) = SWEEP_EVALUATION_DATE;
     let options = PolicyEvaluationOptions::new(
@@ -276,14 +413,22 @@ fn run_repo_inner(
 
     // Blockers are attributed only to an inconclusive verdict; a clean run has
     // none to attribute. They come from every retained per-root analysis.
-    let blockers = if matches!(completion, CompletionBucket::Inconclusive) {
+    // The run-level abstention reasons are captured alongside, because a real
+    // require-model run over these workspaces abstains at a coarse run-level
+    // reason (for example `capability_incomplete`) and retains no per-root
+    // analysis, so the reasons are the only structured account of the verdict.
+    let (blockers, inconclusive_reasons) = if matches!(completion, CompletionBucket::Inconclusive) {
         let mut blockers = Vec::new();
         for analysis in batch.taint_analysis_results() {
             blockers.extend(blockers_from_report(analysis.report()));
         }
-        blockers
+        let reasons = match run.completion() {
+            PolicyRunCompletion::Inconclusive { reasons } => incomplete_reason_labels(reasons),
+            _ => Vec::new(),
+        };
+        (blockers, reasons)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     Ok((
         RepoOutcome::Ran {
@@ -291,6 +436,7 @@ fn run_repo_inner(
             findings,
         },
         blockers,
+        inconclusive_reasons,
     ))
 }
 
@@ -376,6 +522,175 @@ pub fn select_java_slice(config: &SweepConfig) -> Result<Vec<SliceRepo>, SweepEr
     Ok(selected)
 }
 
+/// Select the fixed Java slice by whether a repo uses the endpoint libraries.
+///
+/// This is the milestone-4.6 selection rule and the lesson of milestone 4.5: a
+/// slice chosen only by "has a build file" matched none of the sourced or sunk
+/// APIs, so the policy could never fire. Here a repo is selected only if it also
+/// imports at least one of `packages` -- the import-detectable endpoint libraries
+/// (`java.sql`, `javax.servlet.http`, ...). The scan is bounded: only build-file
+/// projects in the sorted-name prefix are walked, each repo's `.java` files are
+/// read only until a matching import is found, and the walk stops at `max_repos`.
+///
+/// If, after selecting for import-use, coverage is still thin, that is a
+/// reportable finding, not a reason to relax the rule.
+pub fn select_java_slice_importing(
+    config: &SweepConfig,
+    packages: &[String],
+) -> Result<Vec<SliceRepo>, SweepError> {
+    let prefixes = packages
+        .iter()
+        .map(|package| format!("{package}."))
+        .collect::<Vec<_>>();
+    let mut names = fs::read_dir(&config.corpus_root)
+        .map_err(|error| SweepError::Io {
+            path: config.corpus_root.clone(),
+            error,
+        })?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+
+    let mut selected = Vec::new();
+    for name in names {
+        if selected.len() >= config.max_repos {
+            break;
+        }
+        let root = config.corpus_root.join(&name);
+        if !JAVA_BUILD_FILES
+            .iter()
+            .any(|build_file| root.join(build_file).exists())
+        {
+            continue;
+        }
+        let scan = scan_repo_java(&root, config.max_java_files, &prefixes);
+        if scan.java_files == 0 || scan.java_files > config.max_java_files || !scan.imports_endpoint
+        {
+            continue;
+        }
+        let commit = git_head(&root);
+        selected.push(SliceRepo {
+            name,
+            java_files: scan.java_files,
+            commit,
+        });
+    }
+    Ok(selected)
+}
+
+/// The result of one repo's slice-selection scan: its `.java` count and whether
+/// any of its `.java` files imports one of the endpoint libraries.
+struct RepoJavaScan {
+    java_files: usize,
+    imports_endpoint: bool,
+}
+
+/// Walk `root` once, counting `.java` files and detecting an endpoint-library
+/// import. The count stops growing past `cap` (the caller rejects an over-cap
+/// repo anyway); the import flag latches on the first match and is not re-checked.
+fn scan_repo_java(root: &Path, cap: usize, import_prefixes: &[String]) -> RepoJavaScan {
+    const SKIP: &[&str] = &[
+        ".git",
+        "node_modules",
+        "target",
+        "build",
+        ".gradle",
+        "vendor",
+    ];
+    let mut stack = vec![root.to_path_buf()];
+    let mut java_files = 0usize;
+    let mut imports_endpoint = false;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                let name = entry.file_name();
+                if SKIP.iter().any(|skip| name == *skip) {
+                    continue;
+                }
+                stack.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "java")
+            {
+                java_files += 1;
+                if !imports_endpoint && file_imports_any(&path, import_prefixes) {
+                    imports_endpoint = true;
+                }
+                if java_files > cap {
+                    // The caller rejects an over-cap repo regardless of imports,
+                    // so there is no reason to keep walking a giant tree.
+                    return RepoJavaScan {
+                        java_files,
+                        imports_endpoint,
+                    };
+                }
+            }
+        }
+    }
+    RepoJavaScan {
+        java_files,
+        imports_endpoint,
+    }
+}
+
+/// Whether a `.java` file has an `import` declaration for one of the endpoint
+/// libraries. This reads `import` lines only, a well-defined lexical construct
+/// at the top of a Java file, purely to pre-filter the slice; it makes no claim
+/// about the file's semantics. Import declarations precede type declarations, so
+/// the scan stops at the first type declaration.
+fn file_imports_any(path: &Path, import_prefixes: &[String]) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix("static ").unwrap_or(rest);
+            if import_prefixes
+                .iter()
+                .any(|prefix| rest.starts_with(prefix.as_str()))
+            {
+                return true;
+            }
+        } else if is_type_declaration_start(trimmed) {
+            // Imports are all above the first type declaration; nothing below it
+            // can be an import, so stop reading this file.
+            break;
+        }
+    }
+    false
+}
+
+/// A cheap check that a trimmed line begins a top-level type declaration, used
+/// only to stop the import scan early. It never gates taint analysis.
+fn is_type_declaration_start(trimmed: &str) -> bool {
+    const STARTS: &[&str] = &[
+        "public class ",
+        "public final class ",
+        "public abstract class ",
+        "class ",
+        "final class ",
+        "abstract class ",
+        "public interface ",
+        "interface ",
+        "public enum ",
+        "enum ",
+        "public record ",
+        "record ",
+    ];
+    STARTS.iter().any(|start| trimmed.starts_with(start))
+}
+
 /// Count `.java` files under `root` with an explicit stack, stopping once the
 /// count exceeds `cap` (the caller rejects a repo over the cap anyway, so there
 /// is no reason to keep walking a giant tree). Common vendor and VCS directories
@@ -453,6 +768,22 @@ pub fn write_report(report: &DemandSweepReport, path: &Path) -> Result<(), Sweep
     let mut rendered = serde_json::to_string_pretty(report).expect("the report is serializable");
     rendered.push('\n');
     fs::write(path, rendered.as_bytes()).map_err(|error| SweepError::Io {
+        path: path.to_path_buf(),
+        error,
+    })
+}
+
+/// Write the built policy to `path`, creating parents. The policy is what makes
+/// the realistic sweep reproducible and its selectors auditable, so it is
+/// committed beside the report.
+pub fn write_policy(policy: &str, path: &Path) -> Result<(), SweepError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| SweepError::Io {
+            path: parent.to_path_buf(),
+            error,
+        })?;
+    }
+    fs::write(path, policy.as_bytes()).map_err(|error| SweepError::Io {
         path: path.to_path_buf(),
         error,
     })

@@ -515,6 +515,106 @@ impl FoundryEntry {
     }
 }
 
+/// Whether an endpoint originates taint (a source) or consumes it (a sink).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FoundryEndpointRole {
+    /// A method whose named access path becomes tainted (Models-as-Data
+    /// `sourceModel`). The access path is the row's `output` column.
+    Source,
+    /// A method whose named access path is sensitive (Models-as-Data
+    /// `sinkModel`). The access path is the row's `input` column.
+    Sink,
+}
+
+impl FoundryEndpointRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Sink => "sink",
+        }
+    }
+}
+
+/// The root port a taint endpoint names: what becomes tainted (a source) or what
+/// is sensitive (a sink).
+///
+/// A Models-as-Data access path can qualify the port with selectors
+/// (`.Element`, `.Field[..]`); those are kept on the endpoint as a rendered
+/// qualifier, and this is the root the qualifier hangs from. The root is what a
+/// policy source binding or sink operand can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "port", rename_all = "snake_case")]
+pub enum FoundryEndpointPort {
+    /// `ReturnValue`: the call's return. Legal for a source (the return is
+    /// tainted); never for a sink (a sink consumes an input, not a return).
+    ReturnValue,
+    /// `Argument[this]`: the receiver.
+    Receiver,
+    /// `Argument[N]`: the zero-based parameter.
+    Parameter { ordinal: u32 },
+}
+
+impl FoundryEndpointPort {
+    /// Render for a report and for a stable endpoint id.
+    pub fn render(self) -> String {
+        match self {
+            Self::ReturnValue => "return_value".to_owned(),
+            Self::Receiver => "receiver".to_owned(),
+            Self::Parameter { ordinal } => format!("parameter[{ordinal}]"),
+        }
+    }
+}
+
+/// One Java taint endpoint translated from a Models-as-Data `sourceModel` or
+/// `sinkModel` row.
+///
+/// A source names a method and the access path that becomes tainted (its
+/// `output`); a sink names a method and the access path that is sensitive (its
+/// `input`). Both are parsed structurally: the signature through
+/// [`super::codeql`]'s signature parser, the access path through its access-path
+/// parser, exactly as the summary-transfer translation reads them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct FoundryTaintEndpoint {
+    pub role: FoundryEndpointRole,
+    pub target: FoundryTarget,
+    /// The declaring package as the corpus spells it (`javax.servlet.http`).
+    /// Slice selection derives the endpoint libraries from this column.
+    pub package: String,
+    /// The declaring type's simple name (`HttpServletRequest`).
+    pub type_name: String,
+    /// Whether the corpus applies the model to overrides in subtypes. A policy
+    /// selector that matches by callee name already spans subtypes, so this is
+    /// recorded rather than acted on.
+    pub subtypes: bool,
+    /// The root port(s) the row names, one per selected argument. A range
+    /// (`Argument[0..1]`) or a set (`Argument[this,0]`) expands to one port each,
+    /// mirroring the summary translator's expansion.
+    pub ports: Vec<FoundryEndpointPort>,
+    /// The rendered access-path qualifier when the row qualified the port
+    /// (`Argument[0].Element` records `.Element`), else absent. The endpoint is
+    /// still usable through its root port; the qualifier records that the row
+    /// said more than the root port carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
+    /// The Models-as-Data `kind` column: the taint label the row assigns
+    /// (`remote`, `command-injection`, `sql-injection`, `environment`, ...).
+    pub kind: String,
+    pub provenance: String,
+    pub evidence: FoundryEvidence,
+}
+
+impl FoundryTaintEndpoint {
+    /// The declaring type's fully-qualified name (`javax.servlet.http.Cookie`).
+    pub fn declaring_type_fqn(&self) -> String {
+        if self.package.is_empty() {
+            self.type_name.clone()
+        } else {
+            format!("{}.{}", self.package, self.type_name)
+        }
+    }
+}
+
 /// A stable, validator-legal summary id for one corpus target.
 ///
 /// Authored ids accept lowercase ASCII alphanumerics, `-`, `_`, and `.` only,

@@ -294,6 +294,15 @@ pub struct RepoRunOutcome {
     /// this verdict.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<BlockerObservation>,
+    /// The typed reasons an `Inconclusive` run gave for abstaining, as the policy
+    /// layer's own snake_case labels (`capability_incomplete`,
+    /// `partial_discovery`, ...). Empty for a clean conclusion. This is the
+    /// coarse, run-level abstention cause; it is recorded because a real
+    /// require-model run over these workspaces abstains here rather than at a
+    /// per-callee value-flow boundary, so the reason is the only structured
+    /// account of why the verdict is not clean.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inconclusive_reasons: Vec<String>,
 }
 
 impl RepoRunOutcome {
@@ -403,6 +412,12 @@ pub struct DemandSweepReport {
     pub outcomes: OutcomeTallies,
     pub verdict_split: VerdictBucketSplit,
     pub blocker_bucket_totals: BlockerBucketTotals,
+    /// How many `Inconclusive` verdicts each abstention reason appeared in, keyed
+    /// by the policy layer's snake_case reason label, sorted. When the ranked
+    /// blocker list is empty but verdicts are inconclusive, this is where the
+    /// abstention cause is visible: a run-level reason such as
+    /// `capability_incomplete`, which no procedure summary closes.
+    pub inconclusive_reason_verdicts: BTreeMap<String, usize>,
     /// Blockers ranked by how many verdicts each blocked, descending, then by a
     /// stable key so the order is total.
     pub ranked_blockers: Vec<RankedBlocker>,
@@ -453,10 +468,19 @@ pub fn summarize(slice: SliceMeta, outcomes: &[RepoRunOutcome]) -> DemandSweepRe
     let mut blocked_verdicts = 0usize;
     let mut verdicts_all_summary_closable = 0usize;
     let mut verdicts_with_engine_blocker = 0usize;
+    // How many inconclusive verdicts carried each abstention reason. A reason
+    // seen twice in one run counts once for that verdict.
+    let mut inconclusive_reason_verdicts: BTreeMap<String, usize> = BTreeMap::new();
 
     for outcome in outcomes {
         if !outcome.is_inconclusive() {
             continue;
+        }
+        let mut reasons = outcome.inconclusive_reasons.clone();
+        reasons.sort();
+        reasons.dedup();
+        for reason in reasons {
+            *inconclusive_reason_verdicts.entry(reason).or_default() += 1;
         }
         let blockers = outcome.distinct_blockers();
         if blockers.is_empty() {
@@ -527,6 +551,7 @@ pub fn summarize(slice: SliceMeta, outcomes: &[RepoRunOutcome]) -> DemandSweepRe
             ),
         },
         blocker_bucket_totals,
+        inconclusive_reason_verdicts,
         ranked_blockers,
         repo_outcomes: outcomes.to_vec(),
         slice,
@@ -565,6 +590,20 @@ mod tests {
                 findings: 0,
             },
             blockers,
+            inconclusive_reasons: Vec::new(),
+        }
+    }
+
+    fn inconclusive_with_reasons(repo: &str, reasons: &[&str]) -> RepoRunOutcome {
+        RepoRunOutcome {
+            repo: repo.to_owned(),
+            java_files: 1,
+            outcome: RepoOutcome::Ran {
+                completion: CompletionBucket::Inconclusive,
+                findings: 0,
+            },
+            blockers: Vec::new(),
+            inconclusive_reasons: reasons.iter().map(|reason| (*reason).to_owned()).collect(),
         }
     }
 
@@ -577,6 +616,7 @@ mod tests {
                 findings: 0,
             },
             blockers: Vec::new(),
+            inconclusive_reasons: Vec::new(),
         }
     }
 
@@ -746,6 +786,7 @@ mod tests {
                     detail: "boom".to_owned(),
                 },
                 blockers: Vec::new(),
+                inconclusive_reasons: Vec::new(),
             },
         ];
         let report = summarize(slice(&["a", "b", "c", "d"]), &outcomes);
@@ -775,6 +816,33 @@ mod tests {
         assert_eq!(report.ranked_blockers.len(), 1);
         assert_eq!(report.ranked_blockers[0].blocked_verdicts, 1);
         assert_eq!(report.verdict_split.blocked_verdicts, 1);
+    }
+
+    #[test]
+    fn inconclusive_reasons_tally_across_verdicts_even_with_no_blockers() {
+        // The realistic-sweep shape: inconclusive verdicts that carry a run-level
+        // abstention reason but no per-callee blocker. The reason tally is where
+        // the abstention cause stays visible.
+        let outcomes = vec![
+            inconclusive_with_reasons("a", &["capability_incomplete"]),
+            inconclusive_with_reasons("b", &["capability_incomplete", "partial_discovery"]),
+            concluded("c", CompletionBucket::Complete),
+        ];
+        let report = summarize(slice(&["a", "b", "c"]), &outcomes);
+
+        assert!(report.ranked_blockers.is_empty());
+        assert_eq!(report.verdict_split.blocked_verdicts, 0);
+        assert_eq!(
+            report
+                .inconclusive_reason_verdicts
+                .get("capability_incomplete"),
+            Some(&2)
+        );
+        assert_eq!(
+            report.inconclusive_reason_verdicts.get("partial_discovery"),
+            Some(&1)
+        );
+        assert_eq!(report.outcomes.inconclusive, 2);
     }
 
     #[test]
