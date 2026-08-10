@@ -113,53 +113,17 @@ static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(
         .expect("create baseline schema");
     schema_object_definitions(&conn).expect("read baseline schema definitions")
 });
-#[cfg(test)]
+/// The schema every migration in [`CACHE_MIGRATION_SQL`] produces in order.
+///
+/// This is what a store must look like to be this build's, whether it was
+/// created here or carried forward from an older one
+/// ([`verify_upgraded_store`]).
 static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
     let conn = Connection::open_in_memory().expect("open current schema connection");
-    conn.execute_batch(CURRENT_BASELINE_SQL)
-        .expect("create baseline schema");
-    conn.execute_batch(PATH_SYMBOL_UNITS_SQL)
-        .expect("apply path symbol migration");
-    conn.execute_batch(FORWARD_FACTS_SQL)
-        .expect("apply forward facts migration");
-    conn.execute_batch(ANALYZER_GENERATIONS_SQL)
-        .expect("apply analyzer generations migration");
-    conn.execute_batch(ANALYZER_BLOB_CASCADE_COSTS_SQL)
-        .expect("apply analyzer blob cascade costs migration");
-    conn.execute_batch(ANALYZER_BLOB_PAYLOAD_COSTS_SQL)
-        .expect("apply analyzer blob payload costs migration");
-    conn.execute_batch(STRUCTURAL_FACTS_SNAPSHOTS_SQL)
-        .expect("apply structural facts snapshots migration");
-    conn.execute_batch(CPP_TEMPLATE_METADATA_SQL)
-        .expect("apply C++ template metadata migration");
-    conn.execute_batch(SCALA_EXPORTS_SQL)
-        .expect("apply Scala exports migration");
-    conn.execute_batch(IDENTIFIER_LOOKUP_MEMBERSHIP_SQL)
-        .expect("apply identifier lookup membership migration");
-    conn.execute_batch(CODE_UNIT_TEST_REGION_SQL)
-        .expect("apply code unit test region migration");
-    conn.execute_batch(FQ_SEGMENTS_SQL)
-        .expect("apply fq segments migration");
-    conn.execute_batch(SEMANTIC_MODEL_ACTIVE_SET_SQL)
-        .expect("apply semantic model active set migration");
-    conn.execute_batch(SEMANTIC_FILE_DOCUMENTS_SQL)
-        .expect("apply semantic file documents migration");
-    conn.execute_batch(MATERIALIZATION_RECORDS_SQL)
-        .expect("apply materialization records migration");
-    conn.execute_batch(OPTIONAL_FACT_MANIFEST_SQL)
-        .expect("apply optional fact manifest migration");
-    conn.execute_batch(RUST_USAGE_FACTS_SQL)
-        .expect("apply Rust usage facts migration");
-    conn.execute_batch(RUST_MODULE_ROUTES_SQL)
-        .expect("apply Rust module routes migration");
-    conn.execute_batch(IMPORT_BINDINGS_SQL)
-        .expect("apply import bindings migration");
-    conn.execute_batch(RUST_INCLUDE_EDGES_SQL)
-        .expect("apply Rust include edges migration");
-    conn.execute_batch(RUST_IMPORT_CFG_AND_EXTERN_CRATE_SQL)
-        .expect("apply Rust import cfg and extern-crate migration");
-    conn.execute_batch(DROP_BM25_LEXICAL_COLUMNS_SQL)
-        .expect("apply BM25 lexical column drop migration");
+    for (index, sql) in CACHE_MIGRATION_SQL.iter().enumerate() {
+        conn.execute_batch(sql)
+            .unwrap_or_else(|err| panic!("apply cache migration {}: {err}", index + 1));
+    }
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -414,7 +378,13 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
         )
     })?;
     let startup_cleanup = disused_version_stores_on_startup(&db_path);
-    import_newest_older_store(&db_path)?;
+    // An older store is optional input. When it cannot be carried forward the
+    // operator needs to know -- a cold start on an indexed corpus is hours of
+    // re-embedding -- but a neighbouring file this build cannot read must not
+    // be what stops the workspace from opening at all.
+    if let Err(error) = import_newest_older_store(&db_path) {
+        eprintln!("Bifrost cache upgrade skipped, starting a fresh store: {error}");
+    }
     let mut conn = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -647,10 +617,17 @@ fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
 ///
 /// Version-keyed naming means an upgrade lands on a file that does not exist,
 /// which would otherwise mean a cold start for a corpus that is already
-/// extracted. Copy the newest store this build can migrate forward instead and
-/// let [`migrate`] carry the copy the rest of the way. The source is only ever
-/// read: an older checkout keeps opening it, and the existence of a newer file
-/// says nothing about whether the older one is still live (issue #1589).
+/// extracted -- for a semantically indexed corpus, hours of GPU embedding for
+/// vectors that are already on disk and still valid. Copy the newest store this
+/// build can migrate forward instead, carry the copy the rest of the way with
+/// the ordinary migration machinery, and publish it only once it has arrived.
+///
+/// The source is only ever read. An older checkout keeps opening it, the
+/// existence of a newer file says nothing about whether the older one is still
+/// live (issue #1589), and the version sweeper reclaims it once it has gone
+/// [`VERSION_STORE_GRACE_SECS`] unused. Renaming instead of copying would save
+/// a transient doubling of one store's bytes and cost exactly the guarantee
+/// #1589 was filed to establish.
 ///
 /// The copy goes through SQLite's backup API rather than the filesystem
 /// because a live source holds committed pages in its `-wal` sidecar; copying
@@ -659,6 +636,9 @@ fn import_newest_older_store(db_path: &Path) -> Result<()> {
     if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
         return Ok(());
     }
+    // A store this build owns already exists. It wins unconditionally: a
+    // downgrade-then-upgrade session must never let an older store overwrite
+    // the newer data written since.
     if db_path.exists() {
         return Ok(());
     }
@@ -668,39 +648,215 @@ fn import_newest_older_store(db_path: &Path) -> Result<()> {
     let Some(source) = newest_importable_store(cache_dir)? else {
         return Ok(());
     };
-    let source_conn = Connection::open_with_flags(
-        &source,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(|err| {
-        format!(
-            "cache DB import SQLite error reading {}: {err}",
-            source.display()
-        )
-    })?;
-    let staged = tempfile::Builder::new()
-        .prefix(".bifrost-cache-import")
-        .tempfile_in(cache_dir)
-        .map_err(|err| format!("failed to stage cache DB import: {err}"))?;
-    source_conn
-        .backup(rusqlite::DatabaseName::Main, staged.path(), None)
-        .map_err(|err| {
-            format!(
-                "cache DB import SQLite error copying {}: {err}",
-                source.display()
-            )
-        })?;
-    match staged.persist_noclobber(db_path) {
-        Ok(_) => Ok(()),
-        // Another process published its own import first. It drew from the same
-        // candidate set, so ours has nothing to add.
+    let upgraded = stage_upgraded_store(cache_dir, &source)?;
+    match upgraded.persist_noclobber(db_path) {
+        Ok(()) => {
+            eprintln!(
+                "Bifrost cache upgraded {} to schema version {} as {}",
+                source.display(),
+                CURRENT_MIGRATION_VERSION,
+                db_path.display()
+            );
+            Ok(())
+        }
+        // Another process published its own upgrade first. It drew from the
+        // same candidate set, so ours has nothing to add.
         Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(err) => Err(format!(
-            "failed to atomically publish imported cache DB {}: {}",
+            "failed to atomically publish upgraded cache DB {}: {}",
             db_path.display(),
             err.error
         )),
     }
+}
+
+/// Copy `source` aside, migrate the copy to this build's schema, and prove the
+/// result before anyone can see it.
+///
+/// Publishing first and migrating afterwards is what made a failed upgrade
+/// unrecoverable: the half-migrated copy already carried this build's file
+/// name, so every later open found the file present, skipped the upgrade, and
+/// failed the same migration again. Nothing here is visible under that name
+/// until the migration has run, the schema matches this build's exactly, and
+/// `quick_check` passes; a failure drops the staged path and leaves the source
+/// untouched.
+fn stage_upgraded_store(cache_dir: &Path, source: &Path) -> Result<tempfile::TempPath> {
+    let staged = tempfile::Builder::new()
+        .prefix(".bifrost-cache-import")
+        .tempfile_in(cache_dir)
+        .map_err(|err| format!("failed to stage cache DB upgrade: {err}"))?
+        // Release the handle. SQLite owns the path from here; the guard only
+        // keeps the deletion-on-drop that makes a failed upgrade leave nothing.
+        .into_temp_path();
+    {
+        let source_conn = Connection::open_with_flags(
+            source,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|err| {
+            format!(
+                "cache DB upgrade SQLite error reading {}: {err}",
+                source.display()
+            )
+        })?;
+        source_conn
+            .backup(rusqlite::DatabaseName::Main, &staged, None)
+            .map_err(|err| {
+                format!(
+                    "cache DB upgrade SQLite error copying {}: {err}",
+                    source.display()
+                )
+            })?;
+    }
+    let mut conn = Connection::open_with_flags(
+        &staged,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
+    install_busy_timeout(&conn)?;
+    adopt_store_schema_version(&mut conn, source)?;
+    migrate(&mut conn)?;
+    verify_upgraded_store(&conn, source)?;
+    drop(conn);
+    Ok(staged)
+}
+
+/// The upgraded copy must be indistinguishable from a store this build wrote.
+///
+/// A migration that merely does not raise is not proof. Version numbers are
+/// per-lineage counters (see [`RECOGNIZED_FOREIGN_STORES`]), so a store can
+/// declare a version whose migrations happen to apply without producing this
+/// build's schema. Compare the whole schema, then let SQLite check the pages.
+fn verify_upgraded_store(conn: &Connection, source: &Path) -> Result<()> {
+    let version = cache_migration_version(conn)?;
+    if version != CURRENT_MIGRATION_VERSION {
+        return Err(format!(
+            "cache DB upgrade of {} reached schema version {version}, not {CURRENT_MIGRATION_VERSION}",
+            source.display()
+        ));
+    }
+    let objects = schema_object_definitions(conn)?;
+    if objects != *CURRENT_SCHEMA_OBJECTS {
+        let migrated: HashSet<&str> = objects.iter().map(|(_, name, _)| name.as_str()).collect();
+        let expected: HashSet<&str> = CURRENT_SCHEMA_OBJECTS
+            .iter()
+            .map(|(_, name, _)| name.as_str())
+            .collect();
+        return Err(format!(
+            "cache DB upgrade of {} did not reproduce this build's schema; \
+             objects only in the upgrade: {:?}; objects only in this build: {:?}",
+            source.display(),
+            migrated.difference(&expected).collect::<Vec<_>>(),
+            expected.difference(&migrated).collect::<Vec<_>>(),
+        ));
+    }
+    if !quick_check_is_ok(conn)? {
+        return Err(format!(
+            "cache DB upgrade of {} failed quick_check",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+/// A schema this build recognizes but cannot name with its own version number.
+///
+/// A cache store's `user_version` is a count of the migrations its build had,
+/// not an identity for the schema they produced. Two branches that both add
+/// migrations mint the same numbers for different schemas, and merging them
+/// renumbers one side. That is not hypothetical: `bifrost-nlp-ft` shipped
+/// `import-bindings` as its migration 18, then merged master, which inserted
+/// `0016-optional-fact-manifest` beneath three migrations the branch had
+/// already shipped and pushed `import-bindings` to 19. Stores written by that
+/// branch -- among them the CodeScaleBench r26 evaluation caches, 5.5 million
+/// embedded chunks -- declare version 18 while holding this build's version 19
+/// schema minus migration 16. Running this build's 19 over one of them fails on
+/// `DROP TABLE import_details`, a table that store never had.
+///
+/// Recognition is by a discriminating predicate rather than a stored schema
+/// snapshot: the snapshot would be a second copy of the schema to keep true,
+/// and the squash of 0001..0018 into one baseline removed the ability to
+/// synthesize the shape from the chain in any case.
+struct RecognizedForeignStore {
+    /// What the store's `user_version` claims.
+    declared_version: i64,
+    /// True for exactly this lineage's stores at [`Self::declared_version`].
+    recognize: fn(&Connection) -> Result<bool>,
+    /// Brings the store to [`Self::equivalent_version`] of this build's chain.
+    bridge_sql: &'static str,
+    /// The version of this build's chain the bridged store then holds.
+    equivalent_version: i64,
+    /// Named in the log line so an operator can tell which rule fired.
+    lineage: &'static str,
+}
+
+/// The bridge is `0016-optional-fact-manifest.sql` with the one column that
+/// migration 19 had already dropped removed from its `blob_meta` rebuild. It
+/// cannot be shared with migration 16 itself, which still runs before 19 for
+/// every store in this build's own lineage.
+const OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL: &str =
+    include_str!("../migrations/cache/bridges/0016-optional-fact-manifest-after-19.sql");
+
+const RECOGNIZED_FOREIGN_STORES: [RecognizedForeignStore; 1] = [RecognizedForeignStore {
+    declared_version: 18,
+    recognize: is_nlp_ft_import_bindings_store,
+    bridge_sql: OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL,
+    equivalent_version: 19,
+    lineage: "bifrost-nlp-ft import-bindings-at-18",
+}];
+
+/// The `bifrost-nlp-ft` version 18 store: migration 19's `import_statements`
+/// is present, and migration 16's manifest table is not.
+///
+/// Both halves are needed. The first alone also matches this build's version 19
+/// and later; the second alone also matches this build's version 15 and
+/// earlier. Together they describe a schema no version of this build's own
+/// chain ever produced.
+fn is_nlp_ft_import_bindings_store(conn: &Connection) -> Result<bool> {
+    Ok(column_exists(conn, "import_statements", "is_wildcard")?
+        && !table_exists(conn, "blob_optional_fact_manifest")?)
+}
+
+/// Give the staged copy a version number that means what this build's
+/// migrations expect it to mean.
+///
+/// The ordinary case needs nothing: a store from this build's own lineage
+/// declares a version this build's chain also produced, so its pending
+/// migrations are exactly the ones after it. Only a recognized foreign lineage
+/// is rewritten, and only onto the version of this chain whose schema it then
+/// holds. An unrecognized shape is left alone deliberately: the migrations run
+/// against it, and [`verify_upgraded_store`] rejects the result if they did not
+/// produce this build's schema.
+fn adopt_store_schema_version(conn: &mut Connection, source: &Path) -> Result<()> {
+    let declared_version = cache_migration_version(conn)?;
+    for foreign in &RECOGNIZED_FOREIGN_STORES {
+        if declared_version != foreign.declared_version || !(foreign.recognize)(conn)? {
+            continue;
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
+        tx.execute_batch(foreign.bridge_sql).map_err(|err| {
+            format!(
+                "cache DB upgrade error bridging {} from the {} lineage: {err}",
+                source.display(),
+                foreign.lineage
+            )
+        })?;
+        tx.pragma_update(None, "user_version", foreign.equivalent_version)
+            .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
+        tx.commit()
+            .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
+        eprintln!(
+            "Bifrost cache upgrade: {} declares schema version {declared_version} from the {} \
+             lineage, which is this build's version {}; bridged and continuing",
+            source.display(),
+            foreign.lineage,
+            foreign.equivalent_version,
+        );
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// The newest store in `cache_dir` this build can migrate forward.
@@ -1381,7 +1537,6 @@ fn recreate_schema(tx: &Transaction<'_>) -> Result<()> {
         .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-#[cfg(test)]
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -1391,7 +1546,6 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-#[cfg(test)]
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(
@@ -3437,5 +3591,378 @@ mod tests {
 
         let _conn = open_unified_connection(&db_path).unwrap();
         assert!(!temp.path().join(".gitignore").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Carrying an older store forward (issue #1589's upgrade path).
+    //
+    // The expensive thing in a warm cache is the semantic index: a large
+    // corpus is hours of GPU embedding. These tests use semantic rows as the
+    // payload because they are the rows whose loss actually costs something.
+    // -----------------------------------------------------------------------
+
+    /// Zero, one, and many: enough rows to prove a copy rather than a shape.
+    const SEEDED_CHUNKS: [(&str, &str, i64); 3] = [
+        ("a.py", "alpha", 0),
+        ("a.py", "beta", 1),
+        ("nested/b.py", "gamma", 0),
+    ];
+
+    /// A 40-character lowercase-hex OID and a 32-byte vector key, derived from
+    /// `name` so the fixtures stay readable and the CHECK constraints hold.
+    fn seeded_oid(name: &str) -> String {
+        let mut oid: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
+        oid.truncate(40);
+        while oid.len() < 40 {
+            oid.push('0');
+        }
+        oid
+    }
+
+    fn seeded_vector_hash(name: &str) -> Vec<u8> {
+        let mut key = name.as_bytes().to_vec();
+        key.resize(32, 0);
+        key
+    }
+
+    /// Create a store at `path` holding exactly `migrations`, then stamp
+    /// `user_version`.
+    ///
+    /// The stamp is a parameter because a store's version number is a count of
+    /// its own build's migrations, which is not always the count applied here:
+    /// that mismatch is the whole subject of
+    /// [`nlp_ft_lineage_v18_store_is_bridged_and_carried_forward`].
+    fn create_store_at(path: &Path, migrations: &[&str], user_version: i64) {
+        let mut conn = Connection::open(path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, migrations).unwrap();
+        conn.pragma_update(None, "user_version", user_version)
+            .unwrap();
+        seed_semantic_rows(&conn);
+    }
+
+    fn seed_semantic_rows(conn: &Connection) {
+        // Before migration 22 the chunk row also carried the BM25 tokens, and
+        // the column is NOT NULL. Seeding a pre-22 store means writing it; the
+        // upgrade then drops it, which is exactly what must not disturb the
+        // rest of the row.
+        let with_fts = column_exists(conn, "semantic_file_chunks", "fts_tokens").unwrap();
+        for (rel_path, symbol, chunk_ord) in SEEDED_CHUNKS {
+            let blob_oid = seeded_oid(rel_path);
+            let vector_hash = seeded_vector_hash(symbol);
+            conn.execute(
+                "INSERT OR IGNORE INTO semantic_files(blob_oid, rel_path, language)
+                 VALUES (?1, ?2, 'python')",
+                rusqlite::params![blob_oid, rel_path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO semantic_vectors(vector_hash, dim, vector)
+                 VALUES (?1, 4, ?2)",
+                rusqlite::params![vector_hash, symbol.as_bytes()],
+            )
+            .unwrap();
+            if with_fts {
+                conn.execute(
+                    "INSERT INTO semantic_file_chunks(
+                         blob_oid, rel_path, chunk_ord, symbol, start_line, end_line,
+                         vector_hash, fts_tokens)
+                     VALUES (?1, ?2, ?3, ?4, 1, 9, ?5, ?6)",
+                    rusqlite::params![blob_oid, rel_path, chunk_ord, symbol, vector_hash, symbol],
+                )
+                .unwrap();
+            } else {
+                conn.execute(
+                    "INSERT INTO semantic_file_chunks(
+                         blob_oid, rel_path, chunk_ord, symbol, start_line, end_line, vector_hash)
+                     VALUES (?1, ?2, ?3, ?4, 1, 9, ?5)",
+                    rusqlite::params![blob_oid, rel_path, chunk_ord, symbol, vector_hash],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Every seeded chunk with the vector bytes it points at, in a stable
+    /// order. Equality of this against the pre-upgrade value is the claim that
+    /// no embedding has to be recomputed.
+    fn semantic_rows(conn: &Connection) -> Vec<(String, String, i64, String, Vec<u8>)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT chunks.rel_path, chunks.symbol, chunks.chunk_ord,
+                        files.language, vectors.vector
+                 FROM semantic_file_chunks AS chunks
+                 JOIN semantic_files AS files
+                   ON files.blob_oid = chunks.blob_oid AND files.rel_path = chunks.rel_path
+                 JOIN semantic_vectors AS vectors
+                   ON vectors.vector_hash = chunks.vector_hash
+                 ORDER BY chunks.rel_path, chunks.chunk_ord",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn read_semantic_rows(path: &Path) -> Vec<(String, String, i64, String, Vec<u8>)> {
+        semantic_rows(&Connection::open(path).unwrap())
+    }
+
+    fn store_path(cache_dir: &Path, version: i64) -> PathBuf {
+        cache_dir.join(cache_db_file_name_for_version(version))
+    }
+
+    fn current_store_path(cache_dir: &Path) -> PathBuf {
+        cache_dir.join(cache_db_file_name())
+    }
+
+    fn staged_leftovers(cache_dir: &Path) -> Vec<String> {
+        std::fs::read_dir(cache_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".bifrost-cache-import"))
+            .collect()
+    }
+
+    /// The migrations a `bifrost-nlp-ft` build had at its version 18: this
+    /// build's chain without migration 16, which master inserted below three
+    /// migrations that branch had already shipped.
+    fn nlp_ft_v18_migrations() -> Vec<&'static str> {
+        CACHE_MIGRATION_SQL
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 15 && *index < 19)
+            .map(|(_, sql)| *sql)
+            .collect()
+    }
+
+    /// The ordinary upgrade: a store from this build's own lineage, one
+    /// version back, is carried forward with its rows and its source kept.
+    #[test]
+    fn an_older_store_is_carried_forward_with_its_semantic_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let previous = CURRENT_MIGRATION_VERSION - 1;
+        let older = store_path(cache_dir, previous);
+        create_store_at(&older, &CACHE_MIGRATION_SQL[..previous as usize], previous);
+        let expected = read_semantic_rows(&older);
+        let older_before = std::fs::read(&older).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            semantic_rows(&conn),
+            expected,
+            "every embedded chunk must survive the upgrade unchanged"
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
+        assert_eq!(
+            std::fs::read(&older).unwrap(),
+            older_before,
+            "the source stays readable for the checkouts still on it (issue #1589)"
+        );
+        assert!(staged_leftovers(cache_dir).is_empty());
+    }
+
+    /// A `bifrost-nlp-ft` store declares version 18 while holding this build's
+    /// version 19 schema minus migration 16. Its pending migrations are
+    /// therefore not "19 onwards", and running 19 over it fails on `DROP TABLE
+    /// import_details`.
+    ///
+    /// Fail-before: without [`RECOGNIZED_FOREIGN_STORES`] this test fails with
+    /// that error, the upgrade is abandoned, and the assertions below see an
+    /// empty store beside an ignored 248 MB one.
+    #[test]
+    fn nlp_ft_lineage_v18_store_is_bridged_and_carried_forward() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let foreign = store_path(cache_dir, 18);
+        create_store_at(&foreign, &nlp_ft_v18_migrations(), 18);
+        let expected = read_semantic_rows(&foreign);
+        assert_eq!(expected.len(), SEEDED_CHUNKS.len());
+        let foreign_before = std::fs::read(&foreign).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            semantic_rows(&conn),
+            expected,
+            "the vectors this upgrade exists to save must arrive byte for byte"
+        );
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS,
+            "a bridged store must be indistinguishable from one this build wrote"
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
+        assert_eq!(std::fs::read(&foreign).unwrap(), foreign_before);
+    }
+
+    /// The recognizer has to be exact: both halves of the predicate matter, so
+    /// this build's own version 18 store must not be mistaken for the foreign
+    /// one and bridged.
+    #[test]
+    fn this_builds_own_v18_store_is_not_mistaken_for_the_foreign_lineage() {
+        let conn = {
+            let mut conn = Connection::open_in_memory().unwrap();
+            configure_connection(&mut conn).unwrap();
+            migrate_with_sql(&mut conn, &CACHE_MIGRATION_SQL[..18]).unwrap();
+            conn
+        };
+
+        assert!(
+            !is_nlp_ft_import_bindings_store(&conn).unwrap(),
+            "this build's version 18 has migration 16's manifest table"
+        );
+
+        let mut foreign = Connection::open_in_memory().unwrap();
+        configure_connection(&mut foreign).unwrap();
+        migrate_with_sql(&mut foreign, &nlp_ft_v18_migrations()).unwrap();
+        assert!(is_nlp_ft_import_bindings_store(&foreign).unwrap());
+    }
+
+    /// A store this build already owns wins over any older one. A session that
+    /// downgraded and came back must not lose the rows written in between.
+    #[test]
+    fn an_existing_current_store_wins_and_the_older_one_is_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let older = store_path(cache_dir, CURRENT_MIGRATION_VERSION - 1);
+        create_store_at(
+            &older,
+            &CACHE_MIGRATION_SQL[..(CURRENT_MIGRATION_VERSION - 1) as usize],
+            CURRENT_MIGRATION_VERSION - 1,
+        );
+        let older_before = std::fs::read(&older).unwrap();
+        let current = current_store_path(cache_dir);
+        {
+            let mut conn = Connection::open(&current).unwrap();
+            configure_connection(&mut conn).unwrap();
+            migrate(&mut conn).unwrap();
+            conn.execute(
+                "INSERT INTO semantic_vectors(vector_hash, dim, vector) VALUES (?1, 4, X'01')",
+                [seeded_vector_hash("written after the downgrade")],
+            )
+            .unwrap();
+        }
+
+        let conn = open_unified_connection(&current).unwrap();
+
+        let vectors: i64 = conn
+            .query_row("SELECT count(*) FROM semantic_vectors", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            vectors, 1,
+            "the older store must not overwrite the current one"
+        );
+        assert_eq!(std::fs::read(&older).unwrap(), older_before);
+    }
+
+    /// A source that cannot be carried forward must cost the workspace a cold
+    /// start and nothing else: the open still succeeds, the source is intact,
+    /// and no unusable file is left under this build's name for the next
+    /// process to trip over.
+    #[test]
+    fn an_unusable_older_store_leaves_the_source_intact_and_still_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let poisoned = store_path(cache_dir, CURRENT_MIGRATION_VERSION - 1);
+        {
+            let mut conn = Connection::open(&poisoned).unwrap();
+            configure_connection(&mut conn).unwrap();
+            migrate_with_sql(
+                &mut conn,
+                &CACHE_MIGRATION_SQL[..(CURRENT_MIGRATION_VERSION - 1) as usize],
+            )
+            .unwrap();
+            // The column the last migration is about to drop is already gone,
+            // so that migration cannot run and no bridge claims this shape.
+            conn.execute_batch("ALTER TABLE semantic_file_chunks DROP COLUMN fts_tokens;")
+                .unwrap();
+        }
+        let poisoned_before = std::fs::read(&poisoned).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        let vectors: i64 = conn
+            .query_row("SELECT count(*) FROM semantic_vectors", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(vectors, 0, "a failed upgrade starts cold, it does not lie");
+        assert_eq!(
+            std::fs::read(&poisoned).unwrap(),
+            poisoned_before,
+            "a failed upgrade must not touch the source"
+        );
+        assert!(
+            staged_leftovers(cache_dir).is_empty(),
+            "the staged copy must be dropped, not left for the next open to adopt"
+        );
+    }
+
+    /// Concurrent openers race for one upgrade. Publication is
+    /// `persist_noclobber`, so the loser discards its own copy and opens the
+    /// winner's; every thread must come back with the carried rows.
+    #[test]
+    fn concurrent_openers_publish_one_upgrade_and_all_serve_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+        let previous = CURRENT_MIGRATION_VERSION - 1;
+        let older = store_path(&cache_dir, previous);
+        create_store_at(&older, &CACHE_MIGRATION_SQL[..previous as usize], previous);
+        let expected = read_semantic_rows(&older);
+        let older_before = std::fs::read(&older).unwrap();
+
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let cache_dir = cache_dir.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let conn = open_unified_connection(&current_store_path(&cache_dir)).unwrap();
+                    (
+                        cache_migration_version(&conn).unwrap(),
+                        semantic_rows(&conn),
+                    )
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (version, rows) = handle.join().unwrap();
+            assert_eq!(version, CURRENT_MIGRATION_VERSION);
+            assert_eq!(rows, expected, "every racing opener must serve the upgrade");
+        }
+        assert!(
+            quick_check_is_ok(&Connection::open(current_store_path(&cache_dir)).unwrap()).unwrap()
+        );
+        assert_eq!(std::fs::read(&older).unwrap(), older_before);
+        assert!(staged_leftovers(&cache_dir).is_empty());
     }
 }
