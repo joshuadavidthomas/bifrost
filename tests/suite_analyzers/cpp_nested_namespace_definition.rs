@@ -6,7 +6,9 @@
 //! spelling, and a reference to `a::b::f` must resolve identically under both.
 
 use crate::common::{BuiltInlineTestProject, InlineTestProject, call_tool};
-use brokk_bifrost::{CodeUnit, CodeUnitIndex, CppAnalyzer, Language};
+use brokk_bifrost::{
+    CodeUnit, CodeUnitIndex, CppAnalyzer, Language, searchtools::disable_time_budget_for_test,
+};
 use std::collections::BTreeSet;
 
 const NESTED: &str = "namespace a::b {\nvoid f() {}\n}\n";
@@ -49,6 +51,10 @@ fn nested_namespace_definition_declares_the_same_units_as_the_expanded_form() {
 
 #[test]
 fn a_reference_resolves_identically_under_both_namespace_spellings() {
+    // This test compares namespace spellings. It does not test the interactive
+    // wall-clock limit. Keep the other scan limits active under suite load.
+    let _time_budget_guard = disable_time_budget_for_test();
+
     // The resolution verdict for `a::b.f` plus every file carrying a proven
     // hit. An unresolvable symbol reports `not_found` and no hits at all.
     let resolve = |declaration: &str| -> (String, Vec<String>) {
