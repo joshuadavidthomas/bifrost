@@ -288,7 +288,8 @@ that bootstrap.
 `brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
 `brokk-bifrost-js-ts`, `brokk-bifrost-jvm`, `brokk-bifrost-php`,
 `brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` are new
-packages that still await that bootstrap publication. Trusted publishing cannot create a new crate, so
+packages that still await that bootstrap publication. `brokk-bifrost-rql` also
+awaits its bootstrap publication. Trusted publishing cannot create a new crate, so
 each one's first version must be uploaded with a scoped crates.io API token
 from a clean, reviewed commit. Then set the crate owners and configure the
 trusted publisher per the checklist above, and verify that configuration
