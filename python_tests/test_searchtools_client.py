@@ -2477,12 +2477,6 @@ namespace Demo
                         "score": 0.87,
                     },
                 ],
-                "bm25_ranked": [
-                    {
-                        "fqfn": "Bar.secondary",
-                        "score": 0.1254,
-                    },
-                ],
                 "coedit_ranked": [{"path": "src/Baz.java", "score": 0.42}],
                 "notes": ["index warmed from cache"],
             }
@@ -2491,7 +2485,6 @@ namespace Demo
         self.assertEqual(1, result.count)
         self.assertEqual("Foo.primary", result.vector_ranked[0].fqfn)
         self.assertEqual(0.87, result.vector_ranked[0].score)
-        self.assertEqual("Bar.secondary", result.bm25_ranked[0].fqfn)
         self.assertEqual("src/Baz.java", result.coedit_ranked[0].path)
         self.assertEqual(["index warmed from cache"], result.notes)
 
@@ -2499,7 +2492,6 @@ namespace Demo
         self.assertIn("note: index warmed from cache", text)
         self.assertIn("=== vector ===", text)
         self.assertIn("Foo.primary (score 0.870)", text)
-        self.assertIn("=== bm25 ===", text)
         self.assertIn("Bar.secondary (score 0.125)", text)
         self.assertIn("=== co-edit ===", text)
         self.assertIn("src/Baz.java (score 0.420)", text)
@@ -2507,7 +2499,7 @@ namespace Demo
     def test_semantic_search_status_from_dict(self) -> None:
         status = SemanticSearchStatus.from_dict(
             {
-                "indexed_chunks": 12,
+                "indexed_files": 12,
                 "pending_batches": 1,
                 "phase": "ready",
                 "materialized_files": 4,
@@ -2515,7 +2507,7 @@ namespace Demo
             }
         )
 
-        self.assertEqual(12, status.indexed_chunks)
+        self.assertEqual(12, status.indexed_files)
         self.assertEqual(1, status.pending_batches)
         self.assertEqual("ready", status.phase)
         self.assertEqual(4, status.materialized_files)

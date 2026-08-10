@@ -93,12 +93,12 @@ fn main() -> Result<(), String> {
                 peak_rss.fetch_max(rss, Ordering::Relaxed);
                 let elapsed = start.elapsed().as_secs_f64();
                 eprintln!(
-                    "[profile] {elapsed:.0}s phase={} materialized_files={}/{} indexed_chunks={} \
+                    "[profile] {elapsed:.0}s phase={} materialized_files={}/{} indexed_files={} \
                      pending={} rss_mib={:.0} db_mib={:.0}",
                     status.phase,
                     status.materialized_files,
                     status.materialize_total_files,
-                    status.indexed_chunks,
+                    status.indexed_files,
                     status.pending_batches,
                     rss as f64 / 1024.0,
                     db_size_mib(&root),
@@ -117,11 +117,11 @@ fn main() -> Result<(), String> {
     let status = indexer.status(&snapshot);
     let total = start.elapsed().as_secs_f64();
     eprintln!(
-        "[profile] DONE {total:.1}s phase={} indexed_chunks={} ({:.0} chunks/s) \
+        "[profile] DONE {total:.1}s phase={} indexed_files={} ({:.0} files/s) \
          peak_rss_mib={:.0} db_mib={:.1}",
         status.phase,
-        status.indexed_chunks,
-        status.indexed_chunks as f64 / total.max(1e-3),
+        status.indexed_files,
+        status.indexed_files as f64 / total.max(1e-3),
         peak_rss.load(Ordering::Relaxed) as f64 / 1024.0,
         db_size_mib(&root),
     );

@@ -2,6 +2,13 @@
 
 pub mod benchmark;
 pub mod mcp_property_fuzzer;
+// OWASP BenchmarkJava taint bakeoff scorer. Like `summary_foundry_demand`, it
+// runs the require-model taint policy through the production evaluator and so
+// needs both the semantic-model machinery from brokk-bifrost-analysis and the
+// evaluator from brokk-bifrost-policy; this package is the only one that sees
+// both. It stays ungated so its hermetic scoring-core unit tests run under a
+// plain `cargo test`.
+pub mod owasp_benchmark;
 #[cfg(feature = "python")]
 mod python_module;
 // Differential validation tooling for the reference/usage analyzers. It lives

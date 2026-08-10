@@ -2,8 +2,8 @@
 //!
 //! A materialized file is identified by both its git blob OID and its
 //! workspace-relative path because the path is part of every embedding document.
-//! Raw source is tokenized for BM25, while the canonical headered document is
-//! retained only through the embedding call.
+//! The canonical headered document is retained only through the embedding call;
+//! only the chunk's span, symbol, and vector key are persisted.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -12,7 +12,6 @@ use rayon::prelude::*;
 
 use brokk_bifrost_analysis::analyzer::{IAnalyzer, ProjectFile};
 
-use super::bm25::fts_text;
 use super::chunker::extract_file_chunks;
 use super::engine::Embedder;
 use super::keys::{Key, document_key};
@@ -66,7 +65,6 @@ struct PendingChunk {
     symbol: String,
     start_line: Option<i64>,
     end_line: Option<i64>,
-    fts_tokens: String,
     vector_hash: Key,
 }
 
@@ -174,7 +172,6 @@ fn extract_file(analyzer: &dyn IAnalyzer, target: &FileTarget) -> ExtractedFile 
     for chunk in extracted.chunks {
         let document = chunk.embedding_document(&extracted.file_path);
         let vector_hash = document_key(&document);
-        let fts_tokens = fts_text(&chunk.source_text);
         if seen.insert(vector_hash) {
             documents.push((vector_hash, document));
         }
@@ -183,12 +180,11 @@ fn extract_file(analyzer: &dyn IAnalyzer, target: &FileTarget) -> ExtractedFile 
             symbol: chunk.symbol,
             start_line: chunk.start_line,
             end_line: chunk.end_line,
-            fts_tokens,
             vector_hash,
         });
     }
     metrics::trace(format_args!(
-        "fts/hash done {}",
+        "hash done {}",
         target.file.rel_path().display()
     ));
 
@@ -299,7 +295,6 @@ pub fn write_group(store: &SemanticStore, embedded: EmbeddedGroup) -> Result<(),
                     symbol: &chunk.symbol,
                     start_line: chunk.start_line,
                     end_line: chunk.end_line,
-                    fts_tokens: &chunk.fts_tokens,
                     vector_hash: chunk.vector_hash,
                 })
                 .collect()
@@ -465,31 +460,6 @@ mod tests {
         assert!(extracted.documents[0].1.starts_with("left/Same.java/"));
         assert!(extracted.documents[1].1.starts_with("right/Same.java/"));
         assert_ne!(extracted.documents[0].0, extracted.documents[1].0);
-    }
-
-    #[test]
-    fn path_and_class_prefixes_do_not_enter_bm25_tokens() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let file = ProjectFile::new(root.clone(), "onlyheader/Widget.java");
-        file.write("class Widget { void execute() {} }\n").unwrap();
-        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
-        let extracted = extract_group_serial(
-            &analyzer,
-            &[FileTarget {
-                file,
-                oid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                language: Some("java".to_string()),
-            }],
-        );
-
-        assert!(extracted.documents[0].1.contains("onlyheader/Widget.java"));
-        let tokens = &extracted.pending_files[0].chunks[0].fts_tokens;
-        assert!(
-            !tokens.contains("onlyheader"),
-            "raw-source tokens: {tokens}"
-        );
-        assert!(tokens.contains("execute"), "raw-source tokens: {tokens}");
     }
 
     #[test]

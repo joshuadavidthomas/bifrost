@@ -3,7 +3,7 @@ title: Semantic Search
 description: Enable and operate Bifrost semantic code search.
 ---
 
-`semantic_search` searches code by meaning and returns its constituent rankings directly. The vector and BM25 legs are function-oriented, using function-level chunks with enclosing class or file summary context. The co-edit leg is file-oriented. It searches code, not prose or markdown.
+`semantic_search` searches code by meaning and returns its constituent rankings directly. The dense vector leg is function-oriented, using function-level chunks with enclosing class or file context. The co-edit leg is file-oriented. It searches code, not prose or markdown.
 
 Semantic search is opt-in. Build Bifrost with the `nlp` feature:
 
@@ -22,7 +22,7 @@ This example is intentionally scoped to symbol navigation plus semantic search a
 
 ## Index
 
-The semantic index shares `.bifrost/cache/bifrost_cache.v<N>.db` with the analyzer cache, where `<N>` is the cache schema version the running build reads. Every entry point places that path at the primary repository root and therefore shares it across linked worktrees, including MCP sessions bound through client roots. An explicit `BIFROST_CACHE_DIR` continues to place the database directly at `$BIFROST_CACHE_DIR/bifrost_cache.v<N>.db`. Vectors and BM25 rows are keyed by content hash, so switching branches re-points rows instead of re-embedding unchanged content.
+The semantic index shares `.bifrost/cache/bifrost_cache.v<N>.db` with the analyzer cache, where `<N>` is the cache schema version the running build reads. Every entry point places that path at the primary repository root and therefore shares it across linked worktrees, including MCP sessions bound through client roots. An explicit `BIFROST_CACHE_DIR` continues to place the database directly at `$BIFROST_CACHE_DIR/bifrost_cache.v<N>.db`. Vectors and chunk rows are keyed by content hash, so switching branches re-points rows instead of re-embedding unchanged content.
 
 Once enabled, a background build starts when the workspace is activated. `semantic_search` waits until the index is ready, and the file watcher keeps it updated incrementally.
 

@@ -196,7 +196,7 @@ fn exported_local_property_binding(
     target: &CodeUnit,
     language: Language,
 ) -> Option<ExportedLocalPropertyBinding> {
-    if language != Language::JavaScript || !target.is_field() {
+    if language != Language::JavaScript || (!target.is_field() && !target.is_function()) {
         return None;
     }
     let target_member = member_name(target)?;

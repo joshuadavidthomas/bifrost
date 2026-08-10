@@ -92,13 +92,23 @@ fn javascript_destructured_owner_keeps_the_nested_property_identity() {
   request.response.headers = {};
 }
 "#;
-    let consumer = r#"export function encode(request, other) {
+    let consumer = r#"const addHeaderPart = (response) => {
+  response.headers.set("cache-control", "private");
+};
+
+const addDecoyPart = (response) => {
+  response.headers.set("x-decoy-helper", "true");
+};
+
+export function encode(request, other) {
   const { response } = request;
   const { response: responseAlias } = request;
   const { response: unrelated } = other;
   response.headers.set("content-encoding", "gzip");
   responseAlias.headers.set("vary", "accept-encoding");
   unrelated.headers.set("x-decoy", "true");
+  addHeaderPart(response);
+  addDecoyPart(unrelated);
 }
 "#;
     let project = InlineTestProject::with_language(Language::JavaScript)
@@ -130,10 +140,65 @@ fn javascript_destructured_owner_keeps_the_nested_property_identity() {
     assert_eq!(
         BTreeSet::from([
             occurrence_range(consumer, "headers", 0),
-            occurrence_range(consumer, "headers", 1),
+            occurrence_range(consumer, "headers", 2),
+            occurrence_range(consumer, "headers", 3),
         ]),
         consumer_ranges,
         "destructuring the target owner must preserve its property identity without claiming the wrong root: {hits:#?}"
+    );
+}
+
+#[test]
+fn javascript_imported_object_method_keeps_identity_after_reassignment() {
+    let definitions = r#"export const CILogger = {
+  logTest: (_entry) => {},
+};
+
+export const DecoyLogger = {
+  logTest: (_entry) => {},
+};
+
+if (process.env.CI) {
+  CILogger.logTest = (entry) => consume(entry);
+}
+"#;
+    let consumer = r#"import { CILogger, DecoyLogger } from "./definitions.js";
+
+export function report(entry) {
+  CILogger.logTest(entry);
+  DecoyLogger.logTest(entry);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("definitions.js", definitions)
+        .file("consumer.js", consumer)
+        .build();
+    let definitions_file = project.file("definitions.js");
+    let consumer_file = project.file("consumer.js");
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let targets: Vec<_> = analyzer
+        .global_usage_definition_index()
+        .fqn_for_test("CILogger.logTest")
+        .into_iter()
+        .filter(|unit| unit.source() == &definitions_file)
+        .collect();
+    assert_eq!(targets.len(), 1, "exported logger method: {targets:#?}");
+
+    let hits = authoritative_hits_across(
+        &analyzer,
+        &targets[0],
+        [definitions_file, consumer_file.clone()],
+    );
+    let consumer_ranges: BTreeSet<_> = hits
+        .iter()
+        .filter(|hit| hit.file == consumer_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([occurrence_range(consumer, "logTest", 0)]),
+        consumer_ranges,
+        "the imported exported object must preserve its exact method identity without claiming the decoy: {hits:#?}"
     );
 }
 
