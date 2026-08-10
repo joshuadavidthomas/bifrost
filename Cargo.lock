@@ -255,7 +255,6 @@ dependencies = [
  "quick-xml",
  "rayon",
  "regex",
- "regex-syntax",
  "rubund",
  "rusqlite",
  "rustc-hash",
