@@ -40,9 +40,9 @@ use crate::common::InlineTestProject;
 use brokk_bifrost::analyzer::CodeUnitIndex;
 use brokk_bifrost::searchtools::{
     SYMBOL_TOOL_MAX_RESOLUTION_CANDIDATES, SummariesParams, SymbolLookupParams, TooBroadMatch,
-    get_summaries, get_symbol_sources,
+    get_summaries, get_symbol_sources, get_symbol_sources_with_source_budget,
 };
-use brokk_bifrost::{CppAnalyzer, Language};
+use brokk_bifrost::{CancellationToken, CppAnalyzer, Language};
 
 /// One header holding `count` classes, each in its own namespace, each
 /// declaring the same member identifier.
@@ -314,4 +314,88 @@ fn issue_1908_reconciliation_still_skips_a_same_named_member_of_an_unrelated_own
          all {} candidates",
         2 * DIVERGENT_COUNT
     );
+}
+
+/// Fix D: how many checks the token allows before it reports a timeout.
+///
+/// Enough that the request reaches reconciliation and evaluates some
+/// candidates, few enough that it cannot finish all `2 * DIVERGENT_COUNT` of
+/// them. The exact number is not load-bearing -- the assertions are "fewer
+/// than all of them" and "the later call is still whole".
+const CHECKS_BEFORE_TIMEOUT: usize = 12;
+
+#[test]
+fn issue_1908_a_cancelled_request_stops_the_reconcile_scan_and_publishes_nothing() {
+    let (_project, analyzer) = divergent_namesakes(DIVERGENT_COUNT, &one_owner_terminal);
+    let names = divergent_canonical_names(&one_owner_terminal);
+    analyzer.get_all_declarations();
+    analyzer.reset_reconcile_counts_for_test();
+
+    let stopping = CancellationToken::timeout_after_checks_for_test(CHECKS_BEFORE_TIMEOUT);
+    let stopped = get_symbol_sources_with_source_budget(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec![names[0].clone()],
+        },
+        usize::MAX,
+        Some(&stopping),
+    )
+    .expect("the source byte budget is unbounded here");
+    // Not a fixture assertion. This token only reports a timeout once something
+    // has asked it, so it is the direct pin that the request polls its deadline
+    // at all -- before fix D nothing on this path ever did, which is why
+    // request 179 in the incident emitted spans until the container died.
+    assert!(
+        stopping.is_cancelled(),
+        "the request must poll its own deadline: {stopped:#?}"
+    );
+
+    let stopped_evaluations = analyzer.reconcile_candidate_evaluation_count_for_test();
+    assert!(
+        stopped_evaluations < 2 * DIVERGENT_COUNT,
+        "a cancelled request must stop the candidate scan short of the whole \
+         candidate set: evaluated {stopped_evaluations} of {}",
+        2 * DIVERGENT_COUNT
+    );
+
+    // Nothing partial may have been published. Every canonical name must still
+    // resolve to both its declaration and its out-of-line definition, which is
+    // only true if the stopped build was discarded and rebuilt whole.
+    for (index, name) in names.iter().enumerate() {
+        assert_eq!(
+            vec![
+                (name.clone(), format!("c{index}.cpp")),
+                (name.clone(), format!("h{index}.h")),
+            ],
+            resolved_sources(&analyzer, name),
+            "a later call must get the full answer, not the truncated memo"
+        );
+    }
+}
+
+#[test]
+fn issue_1908_an_uncancelled_request_still_answers_the_same_name_in_full() {
+    // The control for the test above: same fixture, same call, no deadline.
+    let (_project, analyzer) = divergent_namesakes(DIVERGENT_COUNT, &one_owner_terminal);
+    let names = divergent_canonical_names(&one_owner_terminal);
+
+    let result = get_symbol_sources_with_source_budget(
+        &analyzer,
+        SymbolLookupParams {
+            symbols: vec![names[0].clone()],
+        },
+        usize::MAX,
+        None,
+    )
+    .expect("the source byte budget is unbounded here");
+
+    // One block, not two: the tool prefers the definition over the declaration
+    // it unified with, so a reconciled name answers with its `.cpp` body. That
+    // block exists at all only because reconciliation ran and was published.
+    let paths: Vec<_> = result
+        .sources
+        .iter()
+        .map(|block| block.path.clone())
+        .collect();
+    assert_eq!(vec!["c0.cpp".to_string()], paths, "{result:#?}");
 }

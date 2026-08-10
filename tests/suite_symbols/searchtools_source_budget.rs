@@ -27,6 +27,7 @@ fn symbol_source_budget_stops_before_cloning_an_oversized_fragment() {
             symbols: vec![target],
         },
         1024,
+        None,
     )
     .expect_err("oversized source must stop at the source response budget");
 

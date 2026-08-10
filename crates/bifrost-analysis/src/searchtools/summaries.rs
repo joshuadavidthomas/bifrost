@@ -589,8 +589,7 @@ fn summarize_symbol_targets_with_cancellation(
                 }
             }
         }
-        // #1908 fix D replaces this with the request's cancellation token.
-        let keep_going = || true;
+        let keep_going = || !cancellation.is_some_and(crate::CancellationToken::is_cancelled);
         let resolution =
             resolve_selectable_definitions_bounded(analyzer, &target, |analyzer, lookup| {
                 resolve_codeunit_fuzzy_bounded(
@@ -675,8 +674,13 @@ pub fn get_summaries_with_cancellation(
     let _scope = profiling::scope("searchtools::get_summaries");
     // Same request boundary as `get_symbol_sources`: routing builds a resolver
     // per target through `resolve_file_patterns`, so without a shared listing
-    // an N-target request walked the workspace O(N) times (#1334).
-    let _analyzer_query = AnalyzerQueryScope::new(analyzer);
+    // an N-target request walked the workspace O(N) times (#1334). It also
+    // carries the caller's deadline down to reads whose signatures do not take
+    // one, which is what `get_summaries[g]` needed in #1908.
+    let _analyzer_query = match cancellation {
+        Some(cancellation) => AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+        None => AnalyzerQueryScope::new(analyzer),
+    };
     let targets = route_summary_targets_with_cancellation(
         analyzer,
         &params.targets,

@@ -364,7 +364,7 @@ pub fn get_symbol_sources(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
 ) -> SymbolSourcesResult {
-    get_symbol_sources_with_budget(analyzer, params, &SourceByteBudget::unbounded())
+    get_symbol_sources_with_budget(analyzer, params, &SourceByteBudget::unbounded(), None)
         .expect("an unbounded source lookup must not exceed its budget")
 }
 
@@ -372,8 +372,14 @@ pub fn get_symbol_sources_with_source_budget(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
     max_source_bytes: usize,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> Result<SymbolSourcesResult, SymbolSourcesBudgetExceeded> {
-    get_symbol_sources_with_budget(analyzer, params, &SourceByteBudget::new(max_source_bytes))
+    get_symbol_sources_with_budget(
+        analyzer,
+        params,
+        &SourceByteBudget::new(max_source_bytes),
+        cancellation,
+    )
 }
 
 /// Two independent bounds apply here. `source_budget` caps the total bytes of
@@ -388,6 +394,7 @@ fn get_symbol_sources_with_budget(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
     source_budget: &SourceByteBudget,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> Result<SymbolSourcesResult, SymbolSourcesBudgetExceeded> {
     let max_files_per_target = GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET;
     // One tool call is one read-only analyzer request. The scope is what lets
@@ -397,7 +404,14 @@ fn get_symbol_sources_with_budget(
     // fan-out reuse hydrated file states the way every other batched tool
     // already does. Nested scopes opened by callees do not clear the cache
     // while this outer scope is active.
-    let _analyzer_query = AnalyzerQueryScope::new(analyzer);
+    // With the caller's deadline, when it set one. The scope is how the token
+    // reaches reads whose signatures do not carry one: on C++ the per-symbol
+    // `definitions` read runs identity reconciliation, which is where #1908
+    // spent 270 s with nothing polling it.
+    let _analyzer_query = match cancellation {
+        Some(cancellation) => AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+        None => AnalyzerQueryScope::new(analyzer),
+    };
 
     let selected_symbols: Vec<_> = params
         .symbols
@@ -412,8 +426,7 @@ fn get_symbol_sources_with_budget(
             if source_budget.is_exceeded() {
                 return (index, SourceLookupOutcome::BudgetExceeded);
             }
-            // #1908 fix D replaces this with the request's cancellation token.
-            let keep_going = || true;
+            let keep_going = || !cancellation.is_some_and(crate::CancellationToken::is_cancelled);
             if symbol.starts_with("bifrost-model://")
                 && let Some(outcome) =
                     semantic_model_source_outcome(analyzer, &symbol, source_budget)
