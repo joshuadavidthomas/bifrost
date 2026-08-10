@@ -222,3 +222,115 @@ export function shadow(ElementInteractivity) {
         "the imported singleton must keep its exact export without claiming decoy or shadowed receivers: {hits:#?}"
     );
 }
+
+#[test]
+fn javascript_script_global_function_inverse_matches_only_classic_script_consumers() {
+    let declaration = r#"function canRequestBody(tabId) {
+  return tabId > 0;
+}
+
+"#;
+    let consumer = r#"function respond(tabId) {
+  return canRequestBody(tabId);
+}
+"#;
+    let module_consumer = r#"export function respond(tabId) {
+  return canRequestBody(tabId);
+}
+"#;
+    let shadow_consumer = r#"function respond(canRequestBody, tabId) {
+  return canRequestBody(tabId);
+}
+"#;
+    let module_declaration = r#"export function canRequestBody(tabId) {
+  return tabId < 0;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("declaration.js", declaration)
+        .file("consumer.js", consumer)
+        .file("module-consumer.js", module_consumer)
+        .file("shadow-consumer.js", shadow_consumer)
+        .file("module-declaration.js", module_declaration)
+        .build();
+    let declaration_file = project.file("declaration.js");
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let targets: Vec<_> = analyzer
+        .global_usage_definition_index()
+        .fqn_for_test("canRequestBody")
+        .into_iter()
+        .filter(|unit| unit.source() == &declaration_file && unit.is_function())
+        .collect();
+    assert_eq!(
+        targets.len(),
+        1,
+        "exact script-global function: {targets:#?}"
+    );
+
+    let query =
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&targets[0]));
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query
+    else {
+        panic!("expected JavaScript usage success, got {query:#?}");
+    };
+    let hits = hits_by_overload
+        .get(&targets[0])
+        .cloned()
+        .unwrap_or_default();
+    let ranges_by_file: BTreeSet<_> = hits
+        .iter()
+        .map(|hit| {
+            (
+                hit.file.rel_path().to_path_buf(),
+                hit.start_offset,
+                hit.end_offset,
+            )
+        })
+        .collect();
+
+    let (start, end) = occurrence_range(consumer, "canRequestBody", 0);
+    assert_eq!(
+        BTreeSet::from([(
+            project.file("consumer.js").rel_path().to_path_buf(),
+            start,
+            end,
+        )]),
+        ranges_by_file,
+        "only an unshadowed classic-script call can use the script-global declaration: {hits:#?}"
+    );
+}
+
+#[test]
+fn javascript_script_global_function_inverse_rejects_competing_global_declarations() {
+    let first = "function sharedGlobal() { return 1; }\n";
+    let second = "function sharedGlobal() { return 2; }\n";
+    let consumer = "function read() { return sharedGlobal(); }\n";
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("first.js", first)
+        .file("second.js", second)
+        .file("consumer.js", consumer)
+        .build();
+    let first_file = project.file("first.js");
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let target = analyzer
+        .global_usage_definition_index()
+        .fqn_for_test("sharedGlobal")
+        .into_iter()
+        .find(|unit| unit.source() == &first_file && unit.is_function())
+        .expect("first script-global function");
+
+    let query = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query
+    else {
+        panic!("expected JavaScript usage success, got {query:#?}");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    assert!(
+        hits.is_empty(),
+        "a bare call with two distinct script-global declarations must not select one target: {hits:#?}"
+    );
+}
