@@ -125,7 +125,7 @@ pub fn scan_js_ts_target_usages(
             language,
             exported_local_property
                 .as_ref()
-                .map(|binding| binding.receiver_root.as_str()),
+                .map(|binding| (binding.receiver_root.as_str(), &binding.exported_names)),
             scan_scope.cancellation(),
         )
     } else {
@@ -147,7 +147,7 @@ pub fn scan_js_ts_target_usages(
             language,
             exported_local_property
                 .as_ref()
-                .map(|binding| binding.receiver_root.as_str()),
+                .map(|binding| (binding.receiver_root.as_str(), &binding.exported_names)),
             scan_scope.cancellation(),
         )
     };

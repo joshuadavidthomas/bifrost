@@ -38,6 +38,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 const TARGET_BINDING: &str = "__target__";
 const TARGET_VALUE_BINDING: &str = "__target_value__";
+const TARGET_IMPORTED_VALUE_BINDING: &str = "__target_imported_value__";
 const TARGET_OBJECT_BINDING: &str = "__target_object__";
 
 #[allow(clippy::too_many_arguments)]
@@ -49,9 +50,10 @@ pub fn scan_files_for_seeds(
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
     language: Language,
-    exported_local_property_root: Option<&str>,
+    exported_local_property: Option<(&str, &BTreeSet<String>)>,
     cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
+    let exported_local_property_root = exported_local_property.map(|(root, _)| root);
     // `host` is the JS/TS analyzer for `language`, resolved by the caller's one
     // downcast; `analyzer` is the dispatching analyzer, which in a mixed workspace
     // spans every language and is what the declaration and range reads must go to.
@@ -151,16 +153,24 @@ pub fn scan_files_for_seeds(
         let target_self_file = *file == target.source();
         let mut binding_engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
         for edge in &edges {
-            if edge_binds_bare_identifier(edge) {
-                binding_engine.seed_symbol(edge.local_name.clone(), TARGET_BINDING);
+            if !edge_binds_bare_identifier(edge) {
+                continue;
             }
-        }
-        if exported_local_property_root.is_some() {
-            for edge in &edges {
-                if edge_binds_bare_identifier(edge) {
-                    binding_engine.seed_symbol(edge.local_name.clone(), TARGET_OBJECT_BINDING);
+            let binding = if let Some((_, exported_names)) = exported_local_property {
+                let imports_exported_object = match &edge.kind {
+                    ImportEdgeKind::Named(imported_name) => exported_names.contains(imported_name),
+                    ImportEdgeKind::Default => exported_names.contains("default"),
+                    ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_) => false,
+                };
+                if imports_exported_object {
+                    TARGET_OBJECT_BINDING
+                } else {
+                    TARGET_IMPORTED_VALUE_BINDING
                 }
-            }
+            } else {
+                TARGET_BINDING
+            };
+            binding_engine.seed_symbol(edge.local_name.clone(), binding);
         }
         if target_self_file {
             binding_engine.seed_symbol(target_short.clone(), TARGET_BINDING);
@@ -747,7 +757,9 @@ impl ScanCtx<'_> {
         }
         let local_resolution = self.binding_engine.resolve_symbol(ident);
         if local_resolution.as_precise().is_some_and(|targets| {
-            targets.contains(TARGET_BINDING) || targets.contains(TARGET_VALUE_BINDING)
+            targets.contains(TARGET_BINDING)
+                || targets.contains(TARGET_VALUE_BINDING)
+                || targets.contains(TARGET_IMPORTED_VALUE_BINDING)
         }) {
             return true;
         }
@@ -789,6 +801,13 @@ impl ScanCtx<'_> {
             .resolve_symbol(ident)
             .as_precise()
             .is_some_and(|targets| targets.contains(TARGET_VALUE_BINDING))
+    }
+
+    fn binds_imported_target_value(&self, ident: &str) -> bool {
+        self.binding_engine
+            .resolve_symbol(ident)
+            .as_precise()
+            .is_some_and(|targets| targets.contains(TARGET_IMPORTED_VALUE_BINDING))
     }
 
     fn binds_target_object(&self, ident: &str) -> bool {
@@ -1583,11 +1602,16 @@ fn collect_pattern_identifiers_into(
 }
 
 fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.target_member.is_some() && ctx.browser_global_object.is_none() {
-        return;
-    }
     let text = slice(node, ctx.source);
     if text.is_empty() {
+        return;
+    }
+    // Most member targets require a receiver. A named import is different: its
+    // exact import edge binds the exported member value to a bare local name.
+    if ctx.target_member.is_some()
+        && ctx.browser_global_object.is_none()
+        && !ctx.binds_imported_target_value(text)
+    {
         return;
     }
     if ctx.browser_global_object.is_some() && ctx.lexically_bound_at(text, node.start_byte()) {
@@ -2545,12 +2569,104 @@ fn register_module_exports_assignment(right: Node<'_>, source: &str, index: &mut
     }
 
     if let Some(local_name) = local_export_name(right, source) {
+        if let Some(object) = program_object_binding(right, source, &local_name) {
+            register_module_exports_bound_object(object, source, &local_name, index);
+        }
         index.exports_by_name.insert(
             "default".to_string(),
             ExportEntry::Default {
                 local_name: Some(local_name),
             },
         );
+    }
+}
+
+/// Resolve `module.exports = local` to the one program-scope object literal
+/// that binds `local`. A CommonJS consumer can destructure the object's named
+/// properties even though the assignment exports the object through a local
+/// binding instead of an inline literal.
+fn program_object_binding<'tree>(
+    reference: Node<'tree>,
+    source: &str,
+    local_name: &str,
+) -> Option<Node<'tree>> {
+    if simple_identifier_text_for_source(reference, source) != Some(local_name) {
+        return None;
+    }
+    let mut root = reference;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    if root.kind() != "program" {
+        return None;
+    }
+
+    let mut object = None;
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if !matches!(
+            statement.kind(),
+            "lexical_declaration" | "variable_declaration"
+        ) {
+            continue;
+        }
+        let mut declaration_cursor = statement.walk();
+        for declarator in statement.named_children(&mut declaration_cursor) {
+            if declarator.kind() != "variable_declarator"
+                || declarator
+                    .child_by_field_name("name")
+                    .and_then(|name| simple_identifier_text_for_source(name, source))
+                    != Some(local_name)
+            {
+                continue;
+            }
+            let value = declarator.child_by_field_name("value")?;
+            if value.kind() != "object" || object.replace(value).is_some() {
+                return None;
+            }
+        }
+    }
+    object
+}
+
+fn register_module_exports_bound_object(
+    object: Node<'_>,
+    source: &str,
+    object_name: &str,
+    index: &mut ExportIndex,
+) {
+    let mut cursor = object.walk();
+    for child in object.named_children(&mut cursor) {
+        match child.kind() {
+            "shorthand_property_identifier" | "shorthand_property_identifier_pattern" => {
+                let name = slice(child, source).trim();
+                if !name.is_empty() {
+                    index.exports_by_name.insert(
+                        name.to_string(),
+                        ExportEntry::Local {
+                            local_name: name.to_string(),
+                        },
+                    );
+                }
+            }
+            "pair" => {
+                let Some(key) = child.child_by_field_name("key") else {
+                    continue;
+                };
+                let Some(value) = child.child_by_field_name("value") else {
+                    continue;
+                };
+                let Some(exported_name) = property_name_text(key, source) else {
+                    continue;
+                };
+                let local_name = local_export_name(value, source)
+                    .unwrap_or_else(|| format!("{object_name}.{exported_name}"));
+                index
+                    .exports_by_name
+                    .insert(exported_name, ExportEntry::Local { local_name });
+            }
+            _ => {}
+        }
     }
 }
 
