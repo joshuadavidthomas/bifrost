@@ -28,8 +28,8 @@ the new crate in the dependency graph.
 - [x] (2026-08-10) Reconnect analysis execution and compatibility re-exports.
 - [x] (2026-08-10) Update workspace call sites and direct crate dependencies.
 - [x] (2026-08-10) Add the dependency graph rule and release inventory entry.
-- [ ] Run all required featureless validation commands.
-- [ ] Commit the skeleton, move, and graph/inventory changes in logical commits.
+- [x] (2026-08-10) Run all required featureless validation commands.
+- [x] (2026-08-10) Commit the skeleton, move, and graph/inventory changes in logical commits.
 
 ## Surprises & Discoveries
 
@@ -87,9 +87,20 @@ the new crate in the dependency graph.
 The pure query modules, shared S-expression parser, and bounded query-input
 reference values now live in `brokk-bifrost-rql`. Analysis keeps execution,
 registration sets, and the reference-edge row matcher. The new crate has only
-the core workspace dependency. Focused RQL tests, the workspace check, and the
-featureless workspace check pass. Full validation and the logical commits
-remain.
+the core workspace dependency.
+
+Validation passed on 2026-08-10:
+
+- `cargo fmt`
+- `node scripts/check-workspace-dependencies.mjs`
+- `cargo build --workspace`
+- `cargo nextest run --workspace --no-fail-fast` (9,961 passed, 42 skipped)
+- `cargo clippy --workspace --all-targets -- -D warnings`
+
+The work is in three logical commits. The RQL and policy schema versions and
+the RQL editor grammar remain unchanged. Crates.io bootstrap and trusted
+publisher configuration remain release-owner work before the next version
+release.
 
 ## Context and Orientation
 
