@@ -14,7 +14,7 @@
 //! hierarchy draws the same line.
 
 use brokk_bifrost_core::analyzer::capabilities::{
-    DirectDescendantIndex, build_direct_descendant_index_from_candidates,
+    DescendantIndexScope, DirectDescendantIndex, build_direct_descendant_index_from_candidates,
 };
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -70,15 +70,21 @@ pub fn kotlin_resolve_direct_ancestors(
 /// `candidates` are the persisted class rows; `hydrate` fills one batch of them
 /// with the imports and raw supertypes the resolution needs, answering `false`
 /// when the batch could not be hydrated.
+///
+/// `scope` drops out-of-slice declarations before they are hydrated at all, and
+/// bounds the pass: `None` means it stopped short and must not be published
+/// (issue #1748).
 pub fn build_kotlin_direct_descendant_index<Fact>(
     mut candidates: Vec<Fact>,
     mut hydrate: impl FnMut(&mut [Fact]) -> bool,
     source: &dyn KotlinSource,
     realm: Option<&JvmSourceRealm<'_>>,
-) -> DirectDescendantIndex
+    scope: &DescendantIndexScope<'_>,
+) -> Option<DirectDescendantIndex>
 where
     Fact: KotlinHierarchyFact,
 {
+    candidates.retain(|facts| scope.admits(facts.declaration()));
     candidates.sort_by(|left, right| left.declaration().cmp(right.declaration()));
 
     // Hydration is batched because each candidate needs two facts that are not
@@ -87,6 +93,9 @@ where
     // round-trip per class.
     let mut ancestors_by_owner: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
     for batch_start in (0..candidates.len()).step_by(HIERARCHY_FACT_BATCH_SIZE) {
+        if scope.cancellation().is_cancelled() {
+            return None;
+        }
         let batch_end = (batch_start + HIERARCHY_FACT_BATCH_SIZE).min(candidates.len());
         let mut batch = candidates[batch_start..batch_end].to_vec();
         if !hydrate(&mut batch) {
@@ -112,11 +121,14 @@ where
             .map(|facts| facts.declaration().clone())
             .collect(),
         |candidate| {
-            ancestors_by_owner
-                .get(candidate)
-                .cloned()
-                .unwrap_or_default()
+            Some(
+                ancestors_by_owner
+                    .get(candidate)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
         },
+        &scope.keep_going(),
     )
 }
 

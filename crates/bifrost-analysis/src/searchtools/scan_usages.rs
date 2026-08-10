@@ -572,6 +572,16 @@ pub(super) fn scoped_usage_finder<'a>(
 ) -> UsageFinder<'a> {
     let mut finder = UsageFinder::new();
     if let Some(test_files) = test_files {
+        // The same verdict twice, on purpose. The retain below is the
+        // correctness backstop over every candidate the walk produced; this
+        // one reaches *into* the walk, so the type-hierarchy index it triggers
+        // is never built over classes this request has already excluded
+        // (#1748). Only the test verdict crosses -- see
+        // `UsageFinder::with_test_file_exclusion` for why the path filter
+        // cannot.
+        let excluded = Arc::clone(test_files);
+        finder = finder.with_test_file_exclusion(move |file| excluded.excludes(file));
+
         let test_files = Arc::clone(test_files);
         let path_filter = path_filter.map(Arc::clone);
         // The candidate files reaching this filter are the only files the scan

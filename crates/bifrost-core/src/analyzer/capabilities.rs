@@ -1,6 +1,7 @@
 use crate::analyzer::code_unit_index::CodeUnitIndex;
 use crate::analyzer::model::{CodeUnit, ImportInfo, ProjectFile};
-use crate::analyzer::pool_memo::PoolSafeMemo;
+use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo};
+use crate::cancellation::CancellationToken;
 use crate::compact_graph::{CompactRows, CompactRowsBuilder};
 use crate::hash::{HashMap, HashSet};
 use std::any::Any;
@@ -281,6 +282,89 @@ pub trait TypeAliasProvider: CapabilityProvider + Send + Sync {
 
 pub trait TestDetectionProvider: CapabilityProvider {}
 
+/// Which slice of the workspace a descendant index covers.
+///
+/// This is the memo key, and two values is the whole range: the excluded set is
+/// a pure function of the analyzer and the file, so every request that asks to
+/// leave test files out describes the same index.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum DescendantIndexVariant {
+    /// Every class-like declaration the analyzer indexes.
+    WholeWorkspace,
+    /// The declarations whose source file the caller's predicate rejected are
+    /// left out. In practice that is a `scan_usages` request with
+    /// `include_tests: false`, whose test files the answer would discard anyway.
+    ProductionOnly,
+}
+
+/// The request state a whole-workspace descendant-index build needs: the
+/// deadline it polls, and the slice of the workspace it covers.
+///
+/// The two travel together because one loop consumes both -- the per-class loop
+/// in [`build_direct_descendant_index_from_candidates`] and, for C++, the
+/// per-file include-closure walk beneath it -- and because the slice is the
+/// memo key that the deadline's complete-or-nothing rule is applied to.
+///
+/// The exclusion predicate is supplied by the caller rather than named here.
+/// Test classification needs an analyzer (`file_is_test_only` reads a language
+/// module index), which this crate must not know about; the closure crossing is
+/// the same one the Rust usage walks already use for their `keep_going`
+/// predicate. **The predicate must be a pure function of the analyzer and the
+/// file.** That is the condition that makes [`DescendantIndexVariant`] a
+/// complete key: two requests that both exclude test files must describe the
+/// same index, or one would be served the other's.
+#[derive(Clone, Copy)]
+pub struct DescendantIndexScope<'a> {
+    cancellation: &'a CancellationToken,
+    excluded_source: Option<&'a dyn Fn(&ProjectFile) -> bool>,
+}
+
+impl<'a> DescendantIndexScope<'a> {
+    /// Every class in the workspace, stopping when `cancellation` says to.
+    pub fn whole_workspace(cancellation: &'a CancellationToken) -> Self {
+        Self {
+            cancellation,
+            excluded_source: None,
+        }
+    }
+
+    /// Every class whose source file `excluded` rejects is left out of the
+    /// index entirely -- it is never handed to `get_direct_ancestors`, so the
+    /// per-file resolution work behind that call is never charged.
+    pub fn excluding_sources(
+        cancellation: &'a CancellationToken,
+        excluded: &'a dyn Fn(&ProjectFile) -> bool,
+    ) -> Self {
+        Self {
+            cancellation,
+            excluded_source: Some(excluded),
+        }
+    }
+
+    pub fn cancellation(&self) -> &'a CancellationToken {
+        self.cancellation
+    }
+
+    pub fn variant(&self) -> DescendantIndexVariant {
+        match self.excluded_source {
+            Some(_) => DescendantIndexVariant::ProductionOnly,
+            None => DescendantIndexVariant::WholeWorkspace,
+        }
+    }
+
+    /// The poll predicate for a builder that would rather take a plain
+    /// `Fn() -> bool` than a token.
+    pub fn keep_going(&self) -> impl Fn() -> bool + use<'_> {
+        || !self.cancellation.is_cancelled()
+    }
+
+    /// Whether `declaration` belongs in this index.
+    pub fn admits(&self, declaration: &CodeUnit) -> bool {
+        self.excluded_source
+            .is_none_or(|excluded| !excluded(declaration.source()))
+    }
+}
+
 pub trait TypeHierarchyProvider: CapabilityProvider + Send + Sync {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit>;
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit>;
@@ -296,6 +380,62 @@ pub trait TypeHierarchyProvider: CapabilityProvider + Send + Sync {
     fn get_descendants(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
         traverse_hierarchy(code_unit, |next| {
             self.get_direct_descendants(next).into_iter().collect()
+        })
+    }
+
+    /// [`Self::get_direct_ancestors`] under a caller's deadline.
+    ///
+    /// `None` means the resolution stopped short; it is never an empty answer,
+    /// which stays the honest way to say "no resolvable base types". The
+    /// default checks the deadline once and delegates, which is right for a
+    /// provider whose ancestor resolution is a lookup. C++ overrides it because
+    /// resolving one class's bases means walking that file's whole transitive
+    /// `#include` closure.
+    fn get_direct_ancestors_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Option<Vec<CodeUnit>> {
+        (!scope.cancellation().is_cancelled()).then(|| self.get_direct_ancestors(code_unit))
+    }
+
+    /// [`Self::get_direct_descendants`] under a caller's deadline and workspace
+    /// slice.
+    ///
+    /// `None` means the answer is not available because the build stopped
+    /// short. It is never a partial answer, and a stopped build publishes
+    /// nothing: a truncated index memoized as complete would be served to every
+    /// later caller as the truth (the rule
+    /// `cancelled_cold_candidate_discovery_does_not_publish_partial_index`
+    /// pins for the Rust walk caches).
+    ///
+    /// The default checks the deadline once and delegates, which is the correct
+    /// behaviour for a provider whose descendant answer is bounded by
+    /// construction. Every provider that inverts the ancestor relation over the
+    /// whole workspace overrides this; a provider that also honours
+    /// [`DescendantIndexScope::admits`] builds one index per
+    /// [`DescendantIndexVariant`]. Ignoring `admits` is sound -- the index is
+    /// then a superset and the caller's own file filter still applies -- so
+    /// only the providers where the prune pays for itself implement it.
+    fn get_direct_descendants_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
+        (!scope.cancellation().is_cancelled()).then(|| self.get_direct_descendants(code_unit))
+    }
+
+    /// [`Self::get_descendants`] under a caller's deadline and workspace slice,
+    /// polling once per node of the walk. `None` carries the same meaning as in
+    /// [`Self::get_direct_descendants_within`].
+    fn get_descendants_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Option<Vec<CodeUnit>> {
+        traverse_hierarchy_while(code_unit, scope.cancellation(), |next| {
+            self.get_direct_descendants_within(next, scope)
+                .map(|descendants| descendants.into_iter().collect())
         })
     }
 
@@ -387,7 +527,42 @@ impl DirectDescendantIndex {
     }
 }
 
-pub fn build_direct_descendant_index<A, P>(analyzer: &A, provider: &P) -> DirectDescendantIndex
+/// Answer a descendant query from a variant-keyed index cell, building the
+/// variant the caller asked for if it is missing.
+///
+/// Every analyzer that memoizes a whole-workspace descendant index repeats this
+/// same dance: pick the cell for the scope's variant, build while the deadline
+/// holds, publish nothing if it does not, project the ancestor's row. It lives
+/// here so the complete-or-nothing rule is stated once instead of copied into
+/// each language module.
+pub fn descendants_from_variant_index(
+    index: &KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>,
+    scope: &DescendantIndexScope<'_>,
+    code_unit: &CodeUnit,
+    build: impl Fn() -> Option<DirectDescendantIndex>,
+) -> Option<HashSet<CodeUnit>> {
+    Some(
+        index
+            .cell(&scope.variant())
+            // The builders are serial, so the same closure serves both memo
+            // arms; the memo's value here is the non-blocking claim protocol.
+            .get_or_build_while(&scope.keep_going(), &build, &build)?
+            .descendants(code_unit),
+    )
+}
+
+/// Invert the ancestor relation over every class the analyzer indexes.
+///
+/// `scope` decides two things. Its predicate drops declarations before they are
+/// ever handed to `get_direct_ancestors`, which is where the per-declaration
+/// resolution cost is charged (for C++ that is a whole transitive `#include`
+/// closure per declaring file). Its token bounds the loop: `None` means the
+/// build stopped short and must not be published.
+pub fn build_direct_descendant_index<A, P>(
+    analyzer: &A,
+    provider: &P,
+    scope: &DescendantIndexScope<'_>,
+) -> Option<DirectDescendantIndex>
 where
     A: CodeUnitIndex,
     P: TypeHierarchyProvider + ?Sized,
@@ -395,18 +570,29 @@ where
     build_direct_descendant_index_from_candidates(
         analyzer
             .all_declarations()
-            .filter(|candidate| candidate.is_class())
+            .filter(|candidate| candidate.is_class() && scope.admits(candidate))
             .collect(),
-        |candidate| provider.get_direct_ancestors(candidate),
+        |candidate| provider.get_direct_ancestors_within(candidate, scope),
+        &scope.keep_going(),
     )
 }
 
+/// The edge-building half of [`build_direct_descendant_index`], for providers
+/// that assemble their candidate list some other way.
+///
+/// `keep_going` is polled once per candidate. That granularity is the natural
+/// checkpoint: one candidate is one `direct_ancestors` call, which is the unit
+/// of work whose tens of thousands of repetitions made this loop unbounded in
+/// the first place (issue #1748). `direct_ancestors` answers `None` when its
+/// own work stopped short, which stops this loop too -- a candidate whose bases
+/// were half-resolved must not contribute a half-populated edge set.
 pub fn build_direct_descendant_index_from_candidates<F>(
     mut candidates: Vec<CodeUnit>,
     mut direct_ancestors: F,
-) -> DirectDescendantIndex
+    keep_going: &dyn Fn() -> bool,
+) -> Option<DirectDescendantIndex>
 where
-    F: FnMut(&CodeUnit) -> Vec<CodeUnit>,
+    F: FnMut(&CodeUnit) -> Option<Vec<CodeUnit>>,
 {
     candidates.sort();
     candidates.dedup();
@@ -430,8 +616,11 @@ where
         .collect();
     let mut edges = Vec::new();
     for candidate in candidates {
+        if !keep_going() {
+            return None;
+        }
         let descendant = index_by_node[&candidate];
-        for ancestor in direct_ancestors(&candidate) {
+        for ancestor in direct_ancestors(&candidate)? {
             let ancestor = types_by_fq_name
                 .get(&ancestor.fq_name())
                 .and_then(|same_name| {
@@ -451,7 +640,54 @@ where
             edges.push((ancestor, descendant));
         }
     }
-    DirectDescendantIndex::from_indexed_nodes(nodes, index_by_node, edges)
+    Some(DirectDescendantIndex::from_indexed_nodes(
+        nodes,
+        index_by_node,
+        edges,
+    ))
+}
+
+/// [`traverse_hierarchy`] under a deadline: polls once per node popped and
+/// propagates a stopped step as `None` rather than returning the nodes it had
+/// already collected. A partial subtype set read as complete would let a caller
+/// conclude that a class has no further subclasses.
+fn traverse_hierarchy_while<F>(
+    root: &CodeUnit,
+    cancellation: &CancellationToken,
+    mut next: F,
+) -> Option<Vec<CodeUnit>>
+where
+    F: FnMut(&CodeUnit) -> Option<Vec<CodeUnit>>,
+{
+    let direct = next(root)?;
+    if direct.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    let mut queue = VecDeque::new();
+
+    for item in direct {
+        if seen.insert(item.fq_name()) {
+            queue.push_back(item.clone());
+            result.push(item);
+        }
+    }
+
+    while let Some(current) = queue.pop_front() {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        for item in next(&current)? {
+            if seen.insert(item.fq_name()) {
+                queue.push_back(item.clone());
+                result.push(item);
+            }
+        }
+    }
+
+    Some(result)
 }
 
 fn traverse_hierarchy<F>(root: &CodeUnit, mut next: F) -> Vec<CodeUnit>

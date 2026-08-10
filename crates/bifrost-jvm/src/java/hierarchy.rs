@@ -8,7 +8,7 @@
 //! handed across without the store's key material crossing with it.
 
 use brokk_bifrost_core::analyzer::CodeUnitIndex;
-use brokk_bifrost_core::analyzer::capabilities::DirectDescendantIndex;
+use brokk_bifrost_core::analyzer::capabilities::{DescendantIndexScope, DirectDescendantIndex};
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ImportInfo, Language, Range};
 use brokk_bifrost_core::hash::HashMap;
@@ -67,14 +67,20 @@ pub fn java_direct_ancestors(source: &dyn JavaSource, code_unit: &CodeUnit) -> V
 /// `hydrate` fills the supertype and import facts of one batch in place and
 /// reports whether it could; a batch it cannot fill contributes no edges, as
 /// before the move.
+///
+/// `scope` drops out-of-slice declarations before they are hydrated at all, and
+/// bounds the hydration pass: `None` means the build stopped short and must not
+/// be published (issue #1748).
 pub fn build_java_direct_descendant_index<F, H>(
     mut candidates: Vec<F>,
     hydrate: H,
-) -> DirectDescendantIndex
+    scope: &DescendantIndexScope<'_>,
+) -> Option<DirectDescendantIndex>
 where
     F: JavaHierarchyFact,
     H: Fn(&mut Vec<F>) -> bool,
 {
+    candidates.retain(|facts| scope.admits(facts.declaration()));
     candidates.sort_by(|left, right| {
         left.declaration()
             .source()
@@ -114,6 +120,9 @@ where
 
     let mut edges = Vec::new();
     for batch_start in (0..candidates.len()).step_by(HIERARCHY_FACT_BATCH_SIZE) {
+        if scope.cancellation().is_cancelled() {
+            return None;
+        }
         let batch_end = (batch_start + HIERARCHY_FACT_BATCH_SIZE).min(candidates.len());
         let mut batch = candidates[batch_start..batch_end].to_vec();
         if !hydrate(&mut batch) {
@@ -152,7 +161,11 @@ where
         .into_iter()
         .map(|facts| facts.declaration().clone())
         .collect();
-    DirectDescendantIndex::from_indexed_nodes(nodes, index_by_node, edges)
+    Some(DirectDescendantIndex::from_indexed_nodes(
+        nodes,
+        index_by_node,
+        edges,
+    ))
 }
 
 fn java_definition_sort_key(

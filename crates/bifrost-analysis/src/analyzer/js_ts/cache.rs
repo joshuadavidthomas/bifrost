@@ -1,5 +1,8 @@
 use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
-use crate::analyzer::{CodeUnit, DirectDescendantIndex, PoolSafeMemo, ProjectFile};
+use crate::analyzer::{
+    CodeUnit, DescendantIndexVariant, DirectDescendantIndex, KeyedPoolSafeMemo, PoolSafeMemo,
+    ProjectFile,
+};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
 use std::mem::size_of;
@@ -38,7 +41,12 @@ pub(crate) struct JsTsMemoCaches {
     /// and its rayon fan-out -- a blocking `get_or_init` held across that is
     /// the #1416 self-deadlock shape its two sibling cells below already
     /// migrated away from.
-    pub(crate) direct_descendant_index: PoolSafeMemo<DirectDescendantIndex>,
+    /// Keyed by [`DescendantIndexVariant`]: a request that excluded test files
+    /// gets an index that was never built over them (issue #1748). Two cells at
+    /// most, because the exclusion verdict is a pure function of the analyzer
+    /// and the file.
+    pub(crate) direct_descendant_index:
+        KeyedPoolSafeMemo<DescendantIndexVariant, DirectDescendantIndex>,
     /// Reverse import edges (importer files by imported file), built once per bucket.
     pub(crate) reverse_import_index: PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     /// JS/TS usage-resolution maps, built once per bucket and reused across queries.
@@ -53,7 +61,7 @@ impl JsTsMemoCaches {
             referencing_files: build_weighted_cache(budget_bytes / 6, weight_project_file_set),
             relevant_imports: build_weighted_cache(budget_bytes / 6, weight_string_set),
             direct_ancestors: build_weighted_cache(budget_bytes / 8, weight_code_unit_vec_by_unit),
-            direct_descendant_index: PoolSafeMemo::new(),
+            direct_descendant_index: KeyedPoolSafeMemo::new(),
             reverse_import_index: PoolSafeMemo::new(),
             jsts_usage_index: PoolSafeMemo::new(),
         }

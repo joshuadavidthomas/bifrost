@@ -398,6 +398,14 @@ impl TypeHierarchyProvider for TypescriptAnalyzer {
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
         providers::get_direct_descendants(self, code_unit)
     }
+
+    fn get_direct_descendants_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &crate::analyzer::DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
+        providers::get_direct_descendants_within(self, code_unit, scope)
+    }
 }
 
 use crate::analyzer::CodeUnitIndex;

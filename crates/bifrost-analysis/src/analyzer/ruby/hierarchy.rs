@@ -2,7 +2,10 @@
 //! [`brokk_bifrost_ruby::hierarchy`].
 
 use super::*;
-use crate::analyzer::build_direct_descendant_index;
+use crate::analyzer::{
+    DescendantIndexScope, build_direct_descendant_index, descendants_from_variant_index,
+};
+use crate::cancellation::CancellationToken;
 use brokk_bifrost_ruby::hierarchy::{
     build_ruby_types_by_identifier, ruby_direct_ancestors, ruby_supports_type_hierarchy,
 };
@@ -32,13 +35,20 @@ impl TypeHierarchyProvider for RubyAnalyzer {
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> HashSet<CodeUnit> {
-        // The builder itself is serial, so the same closure serves both memo
-        // arms; the memo's value here is the non-blocking claim protocol.
-        self.direct_descendant_index
-            .get_or_build(
-                || build_direct_descendant_index(self, self),
-                || build_direct_descendant_index(self, self),
-            )
-            .descendants(code_unit)
+        let uncancelled = CancellationToken::default();
+        self.get_direct_descendants_within(
+            code_unit,
+            &DescendantIndexScope::whole_workspace(&uncancelled),
+        )
+        .expect("a descendant index that cannot stop always completes")
+    }
+    fn get_direct_descendants_within(
+        &self,
+        code_unit: &CodeUnit,
+        scope: &DescendantIndexScope<'_>,
+    ) -> Option<HashSet<CodeUnit>> {
+        descendants_from_variant_index(&self.direct_descendant_index, scope, code_unit, || {
+            build_direct_descendant_index(self, self, scope)
+        })
     }
 }
