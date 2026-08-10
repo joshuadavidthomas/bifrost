@@ -1,7 +1,6 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
-use crate::analyzer::tree_walk::subtree_contains;
 use crate::analyzer::usages::js_ts_graph::{
     browser_global_property_shape, unbound_browser_global_property,
 };
@@ -13,7 +12,7 @@ use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
 use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, MAX_STATIC_IMPORT_BINDINGS_PER_NAME,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key,
-    js_program_is_external_module, slice,
+    js_program_is_external_module, pattern_binder_identifiers, slice,
 };
 /// The receiver-owner / type-text cluster this route drives now lives beside the
 /// rest of the JS/TS language logic, so the usage graph can call it without
@@ -1677,14 +1676,9 @@ fn jsts_nearest_lexical_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope
 }
 
 fn jsts_pattern_contains_name(node: Node<'_>, source: &str, name: &str) -> bool {
-    subtree_contains(node, |node| {
-        matches!(
-            node.kind(),
-            "identifier" | "shorthand_property_identifier_pattern"
-        ) && source
-            .get(node.start_byte()..node.end_byte())
-            .is_some_and(|text| text.trim() == name)
-    })
+    pattern_binder_identifiers(node)
+        .into_iter()
+        .any(|binder| slice(binder, source) == name)
 }
 
 fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {

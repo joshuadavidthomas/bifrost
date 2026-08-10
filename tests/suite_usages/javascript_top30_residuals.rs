@@ -463,3 +463,61 @@ function shadow(WantedError) {
         "the named CommonJS import must preserve the bound object's exported property identity; hits={hits:#?}"
     );
 }
+
+#[test]
+fn javascript_destructured_parameter_default_calls_outer_function() {
+    let source = r#"const defaultCount = ({ compact }) => (compact ? 5 : 10);
+
+function render(options = {}) {
+  const { compact, count = defaultCount({ compact }) } = options;
+  return count;
+}
+
+function shadow(defaultCount, options = {}) {
+  const { count = defaultCount() } = options;
+  return count;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("card.js", source)
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let response = get_definitions_by_location(
+        &analyzer,
+        GetDefinitionParams {
+            references: vec![
+                definition_query(
+                    "card.js",
+                    source,
+                    "  const { compact, count = defaultCount({ compact }) } = options;",
+                    "defaultCount",
+                ),
+                definition_query(
+                    "card.js",
+                    source,
+                    "  const { count = defaultCount() } = options;",
+                    "defaultCount",
+                ),
+            ],
+        },
+    );
+
+    assert_eq!(response.results[0].status, "resolved", "{response:#?}");
+    assert_eq!(response.results[0].definitions.len(), 1, "{response:#?}");
+    assert_eq!(
+        response.results[0].definitions[0].fqn.as_deref(),
+        Some("defaultCount"),
+        "a default initializer is an expression, not part of the destructuring binding: {response:#?}"
+    );
+    assert_eq!(response.results[1].status, "resolved", "{response:#?}");
+    assert_eq!(response.results[1].definitions.len(), 1, "{response:#?}");
+    assert_eq!(
+        response.results[1].definitions[0].fqn, None,
+        "an actual parameter binding must resolve locally instead of claiming the outer function: {response:#?}"
+    );
+    assert_eq!(
+        response.results[1].definitions[0].kind.as_str(),
+        "parameter",
+        "the near miss must retain its structured local-binding identity: {response:#?}"
+    );
+}
