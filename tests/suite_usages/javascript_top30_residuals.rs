@@ -155,3 +155,70 @@ class OtherToolbar {
         "the class-field alias must retain the local property identity without claiming the decoy: {hits:#?}"
     );
 }
+
+#[test]
+fn javascript_imported_jsdoc_cast_singleton_member_keeps_export_identity() {
+    let constants = r#"export const ElementInteractivity = /** @type {const} */ ({
+  Interactive: "interactive",
+  NonInteractive: "non-interactive",
+});
+
+export const DecoyInteractivity = {
+  NonInteractive: "decoy",
+};
+"#;
+    let consumer = r#"import {
+  DecoyInteractivity,
+  ElementInteractivity,
+} from "./constants.js";
+
+export function classify() {
+  return ElementInteractivity.NonInteractive;
+}
+
+export function decoy() {
+  return DecoyInteractivity.NonInteractive;
+}
+
+export function shadow(ElementInteractivity) {
+  return ElementInteractivity.NonInteractive;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("constants.js", constants)
+        .file("consumer.js", consumer)
+        .build();
+    let constants_file = project.file("constants.js");
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let targets: Vec<_> = analyzer
+        .global_usage_definition_index()
+        .fqn_for_test("ElementInteractivity.NonInteractive")
+        .into_iter()
+        .filter(|unit| unit.source() == &constants_file)
+        .collect();
+    assert_eq!(targets.len(), 1, "exact singleton member: {targets:#?}");
+
+    let query =
+        UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&targets[0]));
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = query
+    else {
+        panic!("expected JavaScript usage success, got {query:#?}");
+    };
+    let hits = hits_by_overload
+        .get(&targets[0])
+        .cloned()
+        .unwrap_or_default();
+    let ranges: BTreeSet<_> = hits
+        .iter()
+        .filter(|hit| hit.file.rel_path().ends_with("consumer.js"))
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([occurrence_range(consumer, "NonInteractive", 0)]),
+        ranges,
+        "the imported singleton must keep its exact export without claiming decoy or shadowed receivers: {hits:#?}"
+    );
+}

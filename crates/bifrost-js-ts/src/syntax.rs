@@ -367,7 +367,16 @@ fn direct_object_pair_receiver<'tree>(
         return None;
     }
     let object = pair.parent().filter(|parent| parent.kind() == "object")?;
-    let bound = object.parent()?;
+    let mut value = object;
+    while let Some(parent) = value.parent()
+        && parent.kind() == "parenthesized_expression"
+        && parent
+            .named_child(0)
+            .is_some_and(|child| child.id() == value.id())
+    {
+        value = parent;
+    }
+    let bound = value.parent()?;
     // The literal is the whole value of a binding, so its keys are properties of
     // whatever that binding names: `const x = { key: ... }` mints `x.key`, and
     // `x.y = { key: ... }` mints `x.y.key`. A chained receiver is kept whole --
@@ -375,11 +384,11 @@ fn direct_object_pair_receiver<'tree>(
     let receiver = match bound.kind() {
         "variable_declarator" => bound
             .child_by_field_name("value")
-            .filter(|value| value.id() == object.id())
+            .filter(|bound_value| bound_value.id() == value.id())
             .and_then(|_| bound.child_by_field_name("name")),
         "assignment_expression" => bound
             .child_by_field_name("right")
-            .filter(|right| right.id() == object.id())
+            .filter(|right| right.id() == value.id())
             .and_then(|_| bound.child_by_field_name("left")),
         _ => None,
     }?;
