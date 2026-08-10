@@ -1,6 +1,6 @@
 //! Real-model smoke test for semantic_search.
 //!
-//! Ignored by default: it downloads the granite embedding model from HuggingFace
+//! Ignored by default: it downloads the selected Muninn model from Hugging Face
 //! (or honors BIFROST_EMBED_MODEL_DIR) and runs real ONNX inference. Run with:
 //!
 //! ```bash

@@ -37,8 +37,10 @@ use serde::Serialize;
 
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     CatalogCoordinate, CatalogOptions, CompiledSemanticModelPack, CompilerOptions,
-    SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelRuntimeLimits,
-    SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat, compile_source,
+    SemanticModelActivationControl, SemanticModelActivationEvidence,
+    SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
+    SemanticModelPackSelector, SemanticModelRuntimeLimits, SemanticPackCatalog, SessionPackSource,
+    SessionPackSourceKind, SourceFormat, compile_source,
 };
 use brokk_bifrost_analysis::{
     AnalyzerConfig, CancellationToken, FilesystemProject, JvmDependencyDiscoveryMode,
@@ -600,11 +602,21 @@ pub fn build_policy(category: InjectionCategory) -> String {
     for (index, sink) in category_sinks(category).into_iter().enumerate() {
         let callee = sink.callee;
         let argument = sink.argument;
+        // The dangerous operand is positional argument `argument`, so the call
+        // must carry at least `argument + 1` positional arguments to be this
+        // sink at all. Constraining the selector by minimum arity is a
+        // structural correctness bound, not TPR tuning: it excludes the
+        // arity-overloaded no-operand calls (a no-argument
+        // `PreparedStatement.execute()` collides with `Statement.execute(String)`
+        // by name) that otherwise abort endpoint binding for the whole compile
+        // (#1935 cause 1). A real sink call always has the operand, so the bound
+        // never drops a true positive.
+        let min_arity = argument + 1;
         sinks.push_str(&format!(
             "          (sink :id snk-{index} :display-name {callee:?}\n\
              \x20           :categories [data.sensitive]\n\
              \x20           :selector (rql :schema-version 1\n\
-             \x20             (language java (call :callee (name {callee:?}))))\n\
+             \x20             (language java (call :callee (name {callee:?}) (arity :min {min_arity}))))\n\
              \x20           :dangerous-operand (argument :index {argument}) :accepts [attacker-controlled])\n"
         ));
     }
@@ -699,9 +711,12 @@ pub fn promote_staged_sanitizer_pack(
 // Live runner
 // ===========================================================================
 
-/// One sanitizer pack to activate: its on-disk JSON and the activation evidence
-/// that lets the analyzer bind it.
-struct SanitizerPack {
+/// One pack to activate: its on-disk JSON and the activation evidence that lets
+/// the analyzer bind it. The set spans sanitizer packs, external declaration
+/// packs (servlet/JDBC/java.lang framework decls), and the golden JDK
+/// procedure-summary pack -- every pack the require-model run needs to close a
+/// boundary the Benchmark routes flows through.
+struct LoadedPack {
     pack_id: String,
     compiled: CompiledSemanticModelPack,
     evidence: SemanticModelActivationEvidence,
@@ -723,8 +738,11 @@ pub struct RunConfig {
     /// The directory of resolved dependency jars (Maven `target/dependency`),
     /// fed to the analyzer so Benchmark types resolve. Empty to skip.
     pub dependency_jars: Vec<PathBuf>,
-    /// The sanitizer packs to activate: (pack_id, json_path, evidence).
-    pub sanitizer_packs: Vec<SanitizerPackSpec>,
+    /// The packs to activate. Each is registered as a session pack, given
+    /// matching activation evidence, and enabled with an explicit `Enable`
+    /// control (every shipped pack declares `safety.review_required`, so an
+    /// enable control is what lets it resolve as active).
+    pub packs: Vec<PackSpec>,
     /// Wall-clock budget for the whole taint run.
     pub timeout: Duration,
     /// Optional cap on the number of cases scored, for a smoke run. `None`
@@ -732,9 +750,9 @@ pub struct RunConfig {
     pub case_limit: Option<usize>,
 }
 
-/// A sanitizer pack to load: its id, its JSON on disk, and the coordinate
-/// evidence to activate it with.
-pub struct SanitizerPackSpec {
+/// A pack to load: its id, its JSON on disk, and the coordinate evidence to
+/// activate it with.
+pub struct PackSpec {
     pub pack_id: String,
     pub json_path: PathBuf,
     pub ecosystem: String,
@@ -776,13 +794,11 @@ pub struct CategoryRunStatus {
     pub sample_diagnostics: Vec<String>,
 }
 
-fn load_sanitizer_pack(spec: &SanitizerPackSpec) -> Result<SanitizerPack, String> {
+fn load_pack(spec: &PackSpec) -> Result<LoadedPack, String> {
     let source = fs::read(&spec.json_path)
         .map_err(|error| format!("read {}: {error}", spec.json_path.display()))?;
     let compiled = compile_source(SourceFormat::Json, &source, &CompilerOptions::default())
-        .map_err(|diagnostics| {
-            format!("compile sanitizer pack {}: {diagnostics:#?}", spec.pack_id)
-        })?;
+        .map_err(|diagnostics| format!("compile pack {}: {diagnostics:#?}", spec.pack_id))?;
     let evidence = SemanticModelActivationEvidence {
         language: "java".to_owned(),
         ecosystem: spec.ecosystem.clone(),
@@ -793,7 +809,7 @@ fn load_sanitizer_pack(spec: &SanitizerPackSpec) -> Result<SanitizerPack, String
         configuration: None,
         artifact_sha256: spec.artifact_sha256.clone(),
     };
-    Ok(SanitizerPack {
+    Ok(LoadedPack {
         pack_id: spec.pack_id.clone(),
         compiled,
         evidence,
@@ -843,10 +859,11 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
         .map_err(|error| format!("open pack catalog: {error}"))?;
     let mut evidence = Vec::new();
+    let mut controls = Vec::new();
     let mut activated_pack_ids = Vec::new();
     let mut skipped_packs = Vec::new();
-    for spec in &config.sanitizer_packs {
-        let pack = match load_sanitizer_pack(spec) {
+    for spec in &config.packs {
+        let pack = match load_pack(spec) {
             Ok(pack) => pack,
             Err(error) if !spec.mandatory => {
                 skipped_packs.push((spec.pack_id.clone(), error));
@@ -867,6 +884,20 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
             skipped_packs.push((spec.pack_id.clone(), error.to_string()));
             continue;
         }
+        // Every shipped pack declares `safety.review_required`, so activation
+        // needs an explicit compatible `Enable` control keyed by pack id --
+        // matching evidence alone leaves it in `ReviewRequired` (inactive). We
+        // both supply the evidence and enable the pack, so the run resolves the
+        // full set active.
+        controls.push(SemanticModelActivationControl {
+            scope: SemanticModelControlScope::Workspace,
+            action: SemanticModelControlAction::Enable,
+            selector: SemanticModelPackSelector {
+                pack_id: pack.pack_id.clone(),
+                version: None,
+                manifest_digest: None,
+            },
+        });
         evidence.push(pack.evidence);
         activated_pack_ids.push(pack.pack_id);
     }
@@ -874,7 +905,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
             .map_err(|error| format!("parse bifrost version: {error}"))?,
         evidence,
-        controls: Vec::new(),
+        controls,
         limits: SemanticModelRuntimeLimits::default(),
     };
 
@@ -1210,10 +1241,20 @@ mod tests {
         assert!(policy.contains("getParameter"));
         assert!(policy.contains("executeQuery"));
         assert!(policy.contains("bifrost.owasp-benchmark.sqli.require-model"));
+        // Every sink selector constrains minimum arity so a no-operand
+        // arity-overloaded call (e.g. `PreparedStatement.execute()`) does not
+        // collide by name and abort binding (#1935 cause 1). An operand at
+        // argument index 0 requires at least one positional argument.
+        assert!(policy.contains("(call :callee (name \"executeQuery\") (arity :min 1))"));
         // A pathtraver policy names the file sinks, not the sql ones.
         let pathtraver = build_policy(InjectionCategory::Pathtraver);
         assert!(pathtraver.contains("FileInputStream"));
         assert!(!pathtraver.contains("executeQuery"));
+        // The ldapi filter operand sits at argument index 1, so its sink
+        // requires at least two positional arguments.
+        let ldapi = build_policy(InjectionCategory::Ldapi);
+        assert!(ldapi.contains("(call :callee (name \"search\") (arity :min 1))"));
+        assert!(ldapi.contains("(call :callee (name \"search\") (arity :min 2))"));
     }
 
     #[test]

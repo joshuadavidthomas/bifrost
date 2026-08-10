@@ -6,7 +6,7 @@ pub(crate) fn nlp_tool_descriptors(git_repo: bool) -> Vec<Value> {
     use serde_json::json;
 
     // Semantic search is git-only (the cache is keyed by blob OID) and needs a
-    // CUDA/Metal accelerator for voyage-4-nano; on a non-git root or a CPU-only
+    // CUDA/Metal accelerator for Muninn; on a non-git root or a CPU-only
     // host the tool is omitted entirely (the latter unless --force-semantic-cpu).
     if !git_repo
         || !crate::searchtools_service::semantic_indexing_enabled()

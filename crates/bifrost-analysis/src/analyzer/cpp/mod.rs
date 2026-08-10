@@ -52,12 +52,15 @@ use brokk_bifrost_cpp::clones::cpp_clone_parser;
 use brokk_bifrost_cpp::compile_context::{CppCompileContext, CppCompileContexts};
 use brokk_bifrost_cpp::graph::CppWorkspaceSource;
 use brokk_bifrost_cpp::graph_support::CppSource;
-use brokk_bifrost_cpp::identity::{CppReconciledDefinitionIndex, cpp_reconciled_definitions};
+use brokk_bifrost_cpp::identity::{
+    CppReconcileCandidates, CppReconcileGroupKey, CppReconciledDefinitionIndex,
+    cpp_reconcile_candidates, cpp_reconcile_group, cpp_reconcile_group_key,
+};
 use brokk_bifrost_cpp::imports::IncludeTargetIndex;
 use brokk_bifrost_cpp::test_detection::detect_cpp_test_assertion_smells;
 use cache::{
     weight_code_unit_set_by_file, weight_code_unit_vec_by_file, weight_include_reachability,
-    weight_project_file_set,
+    weight_project_file_set, weight_reconcile_candidates, weight_reconciled_groups,
 };
 use clones::build_clone_candidate_data;
 
@@ -81,13 +84,23 @@ pub struct CppAnalyzer {
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     visible_type_units_by_file: Cache<ProjectFile, Arc<Vec<CodeUnit>>>,
     unconditional_include_reachability: Cache<(ProjectFile, ProjectFile, bool), bool>,
+    /// Every callable declaration sharing one member identifier, bucketed by
+    /// owner terminal. The identifier-index store read and the bucketing pass
+    /// that produce it are what #1908 stopped repeating per queried fq name.
+    reconcile_candidates_by_identifier: Cache<String, Arc<CppReconcileCandidates>>,
     /// #1134 resolution-time identity-reconciliation overlay. Maps the canonical
     /// `fq_name` a header declaration carries to the provisional out-of-line
     /// member definition `CodeUnit`s whose per-file identity extraction could not
     /// reconcile with it (the file-scope-under-using-directive shape and the
     /// template-specialization twin), keyed on the include-visible class table.
-    /// Memoized per queried name; see `reconciled_definitions`.
-    reconciled_definitions_by_fq: Cache<String, Arc<CppReconciledDefinitionIndex>>,
+    ///
+    /// Keyed by [`CppReconcileGroupKey`] -- the member identifier and the owner
+    /// terminal -- not by the queried fq name. Reconciliation is a function of
+    /// exactly that pair, so the old per-fq key never hit for a bare identifier
+    /// whose namesakes have distinct owners: 1,277 distinct keys, 1,277
+    /// identical rebuilds (#1908). See `reconciled_definitions`.
+    reconciled_definitions_by_group:
+        Cache<CppReconcileGroupKey, Arc<HashMap<String, Arc<CppReconciledDefinitionIndex>>>>,
     include_target_index: Arc<OnceLock<IncludeTargetIndex>>,
     reverse_include_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     /// `PoolSafeMemo`, not `OnceLock`: this whole-workspace build is reached
@@ -113,6 +126,14 @@ pub struct CppAnalyzer {
     visible_type_units_build_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-support"))]
     cpp_class_strength_parse_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Identifier-index scans issued for reconciliation. One per member
+    /// identifier after #1908; one per queried fq name before it.
+    #[cfg(any(test, feature = "test-support"))]
+    reconcile_candidate_scan_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Candidates one reconcile group examined. The unit the #1908 trace
+    /// counted 11.0M of.
+    #[cfg(any(test, feature = "test-support"))]
+    reconcile_candidate_evaluation_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
@@ -167,7 +188,14 @@ impl CppAnalyzer {
                 memo_budget / 8,
                 weight_include_reachability,
             ),
-            reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
+            reconcile_candidates_by_identifier: build_weighted_cache(
+                memo_budget / 8,
+                weight_reconcile_candidates,
+            ),
+            reconciled_definitions_by_group: build_weighted_cache(
+                memo_budget / 8,
+                weight_reconciled_groups,
+            ),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
@@ -184,20 +212,71 @@ impl CppAnalyzer {
             cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             visible_type_units_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            reconcile_candidate_evaluation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     /// The re-keyed reconciled definitions (if any) that belong under the
-    /// canonical `fq_name` a header declaration carries, memoized per queried
-    /// name. The decision is
-    /// [`brokk_bifrost_cpp::identity::cpp_reconciled_definitions`]; this cell is
-    /// the only thing that stayed, because `IAnalyzer::update` rebuilds it
-    /// wholesale with the rest of the analyzer.
+    /// canonical `fq_name` a header declaration carries.
+    ///
+    /// Two memos, both on the analyzer so `IAnalyzer::update` rebuilds them
+    /// wholesale with the rest of it. The identifier cell holds the candidate
+    /// set one store read produced; the group cell holds every re-keyed
+    /// definition that (identifier, owner terminal) pair yields, indexed by the
+    /// canonical fq name it belongs under. This query is then a map lookup.
+    ///
+    /// Both use `optionally_get_with_by_ref`, not `get_with_by_ref`: a build
+    /// that stopped on the request's deadline returns `None` and publishes
+    /// nothing, because a truncated candidate set or a truncated group is
+    /// indistinguishable from an identifier with fewer namesakes, and every
+    /// later reader would silently lose definitions. That is moka's form of the
+    /// complete-or-nothing contract `PoolSafeMemo::get_or_build_while` carries
+    /// (#1748), and `visible_type_units_while` already applies it one layer
+    /// down.
     fn reconciled_definitions(&self, fq_name: &str) -> Arc<CppReconciledDefinitionIndex> {
-        self.reconciled_definitions_by_fq
-            .get_with_by_ref(fq_name, || {
-                Arc::new(cpp_reconciled_definitions(self, fq_name))
+        static EMPTY: OnceLock<Arc<CppReconciledDefinitionIndex>> = OnceLock::new();
+        let empty = || Arc::clone(EMPTY.get_or_init(Arc::default));
+        let Some(key) = cpp_reconcile_group_key(fq_name) else {
+            return empty();
+        };
+        // The request's deadline, if its opener set one. `IAnalyzer::definitions`
+        // takes no token -- it is nominally a plain lookup -- and on C++ it is
+        // the read that ran for 270 s in #1908 with nothing polling it.
+        let cancellation = self.inner.active_query_cancellation();
+        let keep_going = || {
+            !cancellation
+                .as_ref()
+                .is_some_and(crate::CancellationToken::is_cancelled)
+        };
+        let Some(candidates) = self
+            .reconcile_candidates_by_identifier
+            .optionally_get_with_by_ref(key.member_identifier.as_str(), || {
+                #[cfg(any(test, feature = "test-support"))]
+                self.reconcile_candidate_scan_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                cpp_reconcile_candidates(self, &key.member_identifier, &keep_going).map(Arc::new)
             })
+        else {
+            return empty();
+        };
+        let on_candidate = || {
+            #[cfg(any(test, feature = "test-support"))]
+            self.reconcile_candidate_evaluation_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        let Some(groups) = self
+            .reconciled_definitions_by_group
+            .optionally_get_with_by_ref(&key, || {
+                cpp_reconcile_group(self, &key, &candidates, &keep_going, &on_candidate)
+                    .map(Arc::new)
+            })
+        else {
+            return empty();
+        };
+        groups.get(fq_name).map_or_else(empty, Arc::clone)
     }
 
     fn with_updated_inner(&self, inner: TreeSitterAnalyzer<CppAdapter>) -> Self {
@@ -221,7 +300,14 @@ impl CppAnalyzer {
                 self.memo_budget / 8,
                 weight_include_reachability,
             ),
-            reconciled_definitions_by_fq: moka::sync::Cache::builder().max_capacity(2048).build(),
+            reconcile_candidates_by_identifier: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_reconcile_candidates,
+            ),
+            reconciled_definitions_by_group: build_weighted_cache(
+                self.memo_budget / 8,
+                weight_reconciled_groups,
+            ),
             include_target_index: Arc::new(OnceLock::new()),
             reverse_include_index: Arc::new(PoolSafeMemo::new()),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
@@ -238,6 +324,10 @@ impl CppAnalyzer {
             cpp_class_strength_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             visible_type_units_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            reconcile_candidate_evaluation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -460,6 +550,32 @@ impl CppAnalyzer {
     #[cfg(any(test, feature = "test-support"))]
     pub fn visible_type_units_build_count_for_test(&self) -> usize {
         self.visible_type_units_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// #1908: reset both reconcile counters together. They are two halves of
+    /// one measurement -- scans and the candidates those scans fed -- and a
+    /// test that reset one and read the other would report a ratio it never
+    /// measured.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_reconcile_counts_for_test(&self) {
+        self.reconcile_candidate_scan_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.reconcile_candidate_evaluation_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Identifier-index scans issued for reconciliation.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reconcile_candidate_scan_count_for_test(&self) -> usize {
+        self.reconcile_candidate_scan_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Candidates reconcile groups examined.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reconcile_candidate_evaluation_count_for_test(&self) -> usize {
+        self.reconcile_candidate_evaluation_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 

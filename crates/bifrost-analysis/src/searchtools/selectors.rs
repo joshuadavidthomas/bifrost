@@ -606,6 +606,22 @@ pub(super) fn exact_codeunit_resolution(
     analyzer: &dyn IAnalyzer,
     input: &str,
 ) -> CodeUnitResolution {
+    exact_codeunit_resolution_bounded(analyzer, input, FuzzyResolveBudget::unbounded())
+        .expect("an unbounded exact-then-bare resolution has no stop condition")
+}
+
+/// [`exact_codeunit_resolution`] under the caller's fan-out and cancellation
+/// budget.
+///
+/// The bare-name leg is the one that needs it. It is the only leg that reaches
+/// the workspace-wide fuzzy resolver, and until #1908 it reached it
+/// `unbounded()`: `get_symbol_sources` was the last tool whose bare-identifier
+/// route had neither a fan-out gate nor a deadline poll.
+pub(super) fn exact_codeunit_resolution_bounded(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    budget: FuzzyResolveBudget<'_>,
+) -> Result<CodeUnitResolution, FuzzyResolveStop> {
     // A bare terminal name must see same-named members so a lone top-level
     // namesake cannot silently win over a hidden member (#1057). The member-aware
     // fuzzy resolver unions the exact top-level hit with identifier-indexed
@@ -613,14 +629,14 @@ pub(super) fn exact_codeunit_resolution(
     // keep the exact-first path so canonical `/`- or `::`-bearing symbols (Go
     // import paths, `fmt::formatter`) are never misrouted as file patterns.
     if is_bare_symbol_query(analyzer, input) {
-        return resolve_codeunit_fuzzy(analyzer, input);
+        return resolve_codeunit_fuzzy_bounded(analyzer, input, budget);
     }
     let units = resolve_codeunit_exact(analyzer, input);
-    if units.is_empty() {
+    Ok(if units.is_empty() {
         CodeUnitResolution::NotFound
     } else {
         CodeUnitResolution::Resolved(units)
-    }
+    })
 }
 
 pub(super) fn exact_then_fuzzy_codeunit_resolution(
@@ -663,6 +679,22 @@ pub(super) fn resolve_selectable_definitions(
     input: &str,
     resolve: impl Fn(&dyn IAnalyzer, &str) -> CodeUnitResolution,
 ) -> SelectableDefinitionResolution {
+    resolve_selectable_definitions_bounded(analyzer, input, |analyzer, lookup| {
+        Ok(resolve(analyzer, lookup))
+    })
+    .expect("an unbounded selectable resolution has no stop condition")
+}
+
+/// [`resolve_selectable_definitions`] with a resolver that can report the
+/// caller's own limits instead of an answer. Both of this function's calls into
+/// `resolve` propagate the stop: the second one is the not-found diagnostics
+/// probe, which re-resolves the same selector globally and would otherwise pay
+/// the whole fan-out the first call declined.
+pub(super) fn resolve_selectable_definitions_bounded(
+    analyzer: &dyn IAnalyzer,
+    input: &str,
+    resolve: impl Fn(&dyn IAnalyzer, &str) -> Result<CodeUnitResolution, FuzzyResolveStop>,
+) -> Result<SelectableDefinitionResolution, FuzzyResolveStop> {
     let selector = split_workspace_definition_selector(analyzer, input);
     let (mut anchor, mut lookup) = match selector {
         DefinitionSelector::Name(name) => (None, name),
@@ -670,7 +702,7 @@ pub(super) fn resolve_selectable_definitions(
     };
     let mut resolution = match &anchor {
         Some(anchor) => anchor_scoped_codeunit_resolution(analyzer, anchor, lookup),
-        None => resolve(analyzer, lookup),
+        None => resolve(analyzer, lookup)?,
     };
     if matches!(resolution, CodeUnitResolution::NotFound)
         && anchor.is_none()
@@ -686,13 +718,13 @@ pub(super) fn resolve_selectable_definitions(
                 lookup = path_lookup;
             }
             PathQualifiedSelector::AmbiguousPath(item) => {
-                return SelectableDefinitionResolution::NotFound(not_found_input(
+                return Ok(SelectableDefinitionResolution::NotFound(not_found_input(
                     input,
                     Some(format!(
                         "path is ambiguous; retry with one of: {}",
                         item.matches.join(", ")
                     )),
-                ));
+                )));
             }
         }
     }
@@ -701,29 +733,30 @@ pub(super) fn resolve_selectable_definitions(
         CodeUnitResolution::Ambiguous(matches) => matches,
         CodeUnitResolution::NotFound => {
             let Some(anchor) = &anchor else {
-                return SelectableDefinitionResolution::NotFound(symbol_not_found_input(input));
+                return Ok(SelectableDefinitionResolution::NotFound(
+                    symbol_not_found_input(input),
+                ));
             };
             // Nothing resolved in the anchor file. Resolve globally once
             // for diagnostics: candidates elsewhere mean the symbol exists
             // but not here (the anchor recovery note's case); nothing
             // anywhere is a genuine not-found.
-            let global_candidates = match resolve(analyzer, lookup) {
+            let global_candidates = match resolve(analyzer, lookup)? {
                 CodeUnitResolution::Resolved(units) | CodeUnitResolution::Ambiguous(units) => units,
                 CodeUnitResolution::NotFound => Vec::new(),
             };
             if global_candidates.is_empty() {
-                return SelectableDefinitionResolution::NotFound(symbol_not_found_input(input));
+                return Ok(SelectableDefinitionResolution::NotFound(
+                    symbol_not_found_input(input),
+                ));
             }
             let candidate_names = if looks_like_extensionless_path_anchor(anchor) {
                 code_unit_match_names(analyzer, &global_candidates)
             } else {
                 Vec::new()
             };
-            return SelectableDefinitionResolution::NotFound(symbol_source_anchor_not_found_input(
-                input,
-                anchor,
-                lookup,
-                &candidate_names,
+            return Ok(SelectableDefinitionResolution::NotFound(
+                symbol_source_anchor_not_found_input(input, anchor, lookup, &candidate_names),
             ));
         }
     };
@@ -739,7 +772,7 @@ pub(super) fn resolve_selectable_definitions(
     };
 
     let groups = distinct_definitions(analyzer, code_units);
-    match groups.as_slice() {
+    Ok(match groups.as_slice() {
         [] => SelectableDefinitionResolution::NotFound(symbol_not_found_input(input)),
         [(_, _)] => SelectableDefinitionResolution::Resolved(
             groups.into_iter().flat_map(|(_, units)| units).collect(),
@@ -748,7 +781,7 @@ pub(super) fn resolve_selectable_definitions(
             let matches: Vec<String> = groups.into_iter().map(|(selector, _)| selector).collect();
             SelectableDefinitionResolution::Ambiguous(capped_ambiguous_symbol(input, matches))
         }
-    }
+    })
 }
 
 pub(super) fn ambiguous_symbol_selector_note(matches: &[String]) -> Option<String> {

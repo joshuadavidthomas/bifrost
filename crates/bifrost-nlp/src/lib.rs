@@ -29,7 +29,7 @@ pub mod voyage_sidecar;
 #[cfg(feature = "tokenizers")]
 pub use tokenizers;
 
-/// Whether `semantic_search` should be offered. The voyage-4-nano embedder (PyTorch
+/// Whether `semantic_search` should be offered. The Muninn embedder (PyTorch
 /// sidecar) is fast on a CUDA or Metal accelerator; on CPU-only hosts the tool is hidden
 /// unless the operator opts in with `--force-semantic-cpu` (`BIFROST_FORCE_SEMANTIC_CPU=1`).
 pub fn semantic_search_available() -> bool {

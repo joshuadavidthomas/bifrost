@@ -155,7 +155,7 @@ zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
 [features]
 default = []
-# Semantic search: voyageai/voyage-4-nano embeddings via the PyTorch SDPA sidecar.
+# Semantic search: brokkai/Muninn embeddings via the PyTorch SDPA sidecar.
 # Opt in with `--features nlp`. Acceleration (CUDA/Metal) is selected inside the sidecar
 # at runtime — no compile-time backend features needed.
 # Enabling this pulls in the brokk-bifrost-nlp crate. It deliberately does NOT

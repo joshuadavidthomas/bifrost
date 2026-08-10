@@ -69,9 +69,10 @@ how to obtain the MPL-covered source. See the [MPL 2.0 executable-distribution
 requirements](https://www.mozilla.org/en-US/MPL/2.0/#distribution-of-executable-form).
 
 At runtime, semantic search separately downloads
-[`voyageai/voyage-4-nano`](https://huggingface.co/voyageai/voyage-4-nano), whose
-official model repository declares `Apache-2.0`, and uses Python packages such
-as PyTorch, Transformers, and NumPy installed by `uv`. Those downloads are not
+[`brokkai/Muninn`](https://huggingface.co/brokkai/Muninn) or
+[`brokkai/Muninn-small`](https://huggingface.co/brokkai/Muninn-small). Both
+official model repositories declare `Apache-2.0`. The sidecar uses Python packages
+such as PyTorch, Transformers, and NumPy installed by `uv`. Those downloads are not
 embedded in today's Bifrost release archives or wheels. If you redistribute or
 bundle them, review and ship their own license and notice material too. Apache
 2.0 redistribution requires a copy of the license and preservation of any

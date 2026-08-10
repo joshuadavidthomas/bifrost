@@ -30,7 +30,7 @@ Once enabled, a background build starts when the workspace is activated. `semant
 
 ## Model and Runtime
 
-Embeddings use `voyageai/voyage-4-nano`, downloaded from the Hugging Face hub on first use, and run in a PyTorch SDPA sidecar launched with:
+Embeddings use `brokkai/Muninn` when CUDA or Apple Metal is available. Bifrost truncates Muninn output to 512 dimensions. Without an accelerator, Bifrost uses the native 384-dimensional `brokkai/Muninn-small` model. The selected model downloads from the Hugging Face hub on first use and runs in a PyTorch SDPA sidecar launched with:
 
 ```bash
 uv run scripts/voyage_sidecar.py
@@ -43,11 +43,13 @@ Rust keeps the indexing pipeline and token counting in-process. The sidecar owns
 | Variable | Description |
 | --- | --- |
 | `BIFROST_SEMANTIC_INDEX=auto` | Enables background indexing. The default is off. |
-| `BIFROST_EMBED_MODEL_DIR` | Local directory containing `config.json`, `tokenizer.json`, and `model.safetensors`; takes precedence over the hub. |
-| `BIFROST_EMBED_MODEL_ID` | Alternate Hugging Face repository id. |
+| `BIFROST_EMBED_MODEL_DIR` | Local Sentence Transformers model directory; takes precedence over the hub. |
+| `BIFROST_EMBED_MODEL_ID` | Explicit Hugging Face repository ID; takes precedence over automatic Muninn selection. |
 | `BIFROST_ACCELERATOR=auto|cpu|cuda|metal` | Controls whether `semantic_search` is advertised and started based on the available accelerator. The default is `auto`; `cpu` hides the tool unless force-enabled with `--force-semantic-cpu`. |
 | `BIFROST_SIDECAR_DEVICES=<uuid|index,...>` | CUDA devices the Rust scheduler should use. Bifrost launches one sidecar worker per listed device and sets that child's `CUDA_VISIBLE_DEVICES`. |
 
 If `BIFROST_SIDECAR_DEVICES` is unset, Bifrost honors an existing `CUDA_VISIBLE_DEVICES` list. If that is also unset, it uses every GPU reported by `nvidia-smi`. If no CUDA GPU is visible, it launches one unpinned sidecar, which may use Metal or CPU.
+
+A local model directory must contain the model, tokenizer, `config_sentence_transformers.json`, and `1_Pooling/config.json`. Bifrost reads dimensions, prompts, and pooling from this metadata. Bidirectional Qwen Muninn models use 512-dimensional Matryoshka truncation.
 
 `BIFROST_ACCELERATOR` is a Bifrost tool-availability gate, not a CUDA device binding.

@@ -328,9 +328,14 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
         })?;
         let uncancelled = CancellationToken::default();
         let cancellation = context.cancellation.unwrap_or(&uncancelled);
-        let compiled = TypestatePolicyCompiler::new(workspace, budget.query_limits(), cancellation)
-            .compile(policy, spec)
-            .map_err(|failure| compile_failure(*failure))?;
+        let compiled = TypestatePolicyCompiler::new(
+            workspace,
+            budget.query_limits(),
+            budget.max_selector_results(),
+            cancellation,
+        )
+        .compile(policy, spec)
+        .map_err(|failure| compile_failure(*failure))?;
         let hashes =
             TypestateCompilationHashes::new(compiled.protocol.hash(), compiled.bindings.hash());
         self.prepared.replace(Some(compiled));
@@ -1280,6 +1285,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
     pub(crate) fn new(
         workspace: &'a WorkspaceAnalyzer,
         query_limits: CodeQueryExecutionLimits,
+        max_selector_results: usize,
         cancellation: &'a CancellationToken,
     ) -> Self {
         Self {
@@ -1287,6 +1293,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 workspace,
                 "typestate",
                 query_limits,
+                max_selector_results,
                 cancellation,
             ),
             syntax_trees: HashMap::new(),
