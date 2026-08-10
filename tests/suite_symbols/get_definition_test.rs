@@ -34088,6 +34088,51 @@ fn python_from_import_of_submodule_resolves_head_to_the_module() {
 }
 
 #[test]
+fn python_from_import_of_same_named_module_file_resolves_head_to_child_module() {
+    let source =
+        "from utils import utils\n\n\ndef update():\n    return utils.soft_variables_update()\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("utils/__init__.py", "")
+        .file(
+            "utils/utils.py",
+            "def soft_variables_update():\n    return None\n",
+        )
+        .file("agents/ddpg_agent.py", source)
+        .build();
+    let at = source
+        .find("utils.soft_variables_update")
+        .expect("module head");
+    let value = lookup(
+        project.root(),
+        &location_reference("agents/ddpg_agent.py", source, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "utils.utils",
+        "the imported name binds the child module file, not its package: {value}"
+    );
+}
+
+#[test]
+fn python_from_import_of_same_named_member_without_child_module_resolves_member() {
+    let source = "from utils import utils\n\n\ndef update():\n    return utils()\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("utils/__init__.py", "def utils():\n    return None\n")
+        .file("agents/ddpg_agent.py", source)
+        .build();
+    let at = source.rfind("utils()").expect("imported function call");
+    let value = lookup(
+        project.root(),
+        &location_reference("agents/ddpg_agent.py", source, at),
+    );
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["fqn"], "utils.utils", "{value}");
+    assert_eq!(result["definitions"][0]["kind"], "function", "{value}");
+}
+
+#[test]
 fn python_from_import_of_submodule_resolves_member_through_the_module() {
     let project = python_submodule_self_named_member_project();
     let source = PYTHON_SUBMODULE_SELF_NAMED_MEMBER_USER;

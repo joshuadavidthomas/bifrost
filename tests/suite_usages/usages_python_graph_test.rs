@@ -574,6 +574,45 @@ fn imported_alias_annotations_resolve_module_field_target() {
 }
 
 #[test]
+fn imported_class_annotation_survives_same_fqn_module_collision() {
+    let source = "from lfx.schema.dotdict import dotdict\n\n\nclass Tool:\n    def update(self, value: dotdict) -> dotdict:\n        return value\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file("src/lfx/__init__.py", "")
+        .file("src/lfx/schema/__init__.py", "")
+        .file(
+            "src/lfx/schema/dotdict.py",
+            "class dotdict(dict):\n    pass\n",
+        )
+        .file("src/lfx/tool.py", source)
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = analyzer
+        .declarations(&project.file("src/lfx/schema/dotdict.py"))
+        .into_iter()
+        .find(|unit| unit.is_class() && unit.identifier() == "dotdict")
+        .expect("dotdict class declaration");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve the imported class annotations");
+    let mut actual: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit.file == project.file("src/lfx/tool.py"))
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(
+        actual,
+        vec![
+            nth_occurrence_range(source, "dotdict", 2),
+            nth_occurrence_range(source, "dotdict", 3),
+        ],
+        "{hits:#?}"
+    );
+}
+
+#[test]
 fn paramspec_annotations_resolve_module_field_target() {
     let source = "from typing import Callable\nfrom service import P\n\ndef wrap(func: Callable[P, int]) -> Callable[P, int]:\n    return func\n";
     let project = InlineTestProject::with_language(Language::Python)
@@ -643,6 +682,53 @@ fn imported_owner_nested_annotation_chain_resolves_class_target() {
         source,
         &[("Inner", 0), ("Inner", 1), ("Inner", 2)],
     );
+}
+
+#[test]
+fn imported_outer_class_qualifier_in_nested_annotation_is_a_usage() {
+    let source = "from service import BaseFileComponent\nfrom decoy import Other\n\ndef process(files: list[BaseFileComponent.BaseFile]) -> list[BaseFileComponent.BaseFile]:\n    decoy: Other.BaseFile\n    return files\n";
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "class BaseFileComponent:\n    class BaseFile:\n        pass\n",
+        )
+        .file(
+            "decoy.py",
+            "class Other:\n    class BaseFile:\n        pass\n",
+        )
+        .file("consumer.py", source)
+        .build();
+
+    assert_python_usage_hits(
+        &project,
+        "service.BaseFileComponent",
+        "consumer.py",
+        source,
+        &[("BaseFileComponent", 1), ("BaseFileComponent", 2)],
+    );
+}
+
+#[test]
+fn shadowed_outer_class_qualifier_does_not_match_imported_target() {
+    let project = InlineTestProject::with_language(Language::Python)
+        .file(
+            "service.py",
+            "class BaseFileComponent:\n    class BaseFile:\n        pass\n",
+        )
+        .file(
+            "consumer.py",
+            "from service import BaseFileComponent\n\nclass BaseFileComponent:\n    class BaseFile:\n        pass\n\ndef process(value: BaseFileComponent.BaseFile):\n    return value\n",
+        )
+        .build();
+    let analyzer = PythonAnalyzer::from_project(project.project().clone());
+    let target = definition(&analyzer, "service.BaseFileComponent");
+    let candidates = analyzer.get_analyzed_files().into_iter().collect();
+
+    let hits = PythonExportUsageGraphStrategy::new()
+        .find_usages(&analyzer, std::slice::from_ref(&target), &candidates, 1000)
+        .into_either()
+        .expect("graph should resolve a shadowed outer-class annotation");
+    assert!(hits.is_empty(), "{hits:#?}");
 }
 
 #[test]

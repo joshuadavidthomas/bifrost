@@ -7,9 +7,9 @@ use crate::graph::hits::{
     record_hit, record_import_hit, record_self_receiver_hit, record_unproven_hit,
 };
 use crate::graph::resolver::{
-    annotation_reference_candidates, member_name, normalized_receiver_type,
-    receiver_annotation_matches_target, resolve_constructor_types, resolve_receiver_type,
-    target_owner_code_unit, top_level_identifier,
+    annotation_class_qualifier_site, annotation_reference_candidates, member_name,
+    normalized_receiver_type, receiver_annotation_matches_target, resolve_constructor_types,
+    resolve_receiver_type, target_owner_code_unit, top_level_identifier,
 };
 use crate::graph_support::{PythonSource, PythonUsageSource};
 use crate::imports::{PythonImportBinding, parse_python_import_bindings, resolve_fqn_candidates};
@@ -760,6 +760,12 @@ fn handle_annotation_reference_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) 
         } else {
             node
         };
+        record_hit(site, ctx);
+    }
+
+    if let Some(site) = annotation_class_qualifier_site(
+        ctx.graph, ctx.python, ctx.file, ctx.source, node, ctx.target,
+    ) {
         record_hit(site, ctx);
     }
 

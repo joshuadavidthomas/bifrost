@@ -512,7 +512,6 @@ dependencies = [
  "git2",
  "glob",
  "moka",
- "rayon",
  "regex",
  "semver",
  "tempfile",
