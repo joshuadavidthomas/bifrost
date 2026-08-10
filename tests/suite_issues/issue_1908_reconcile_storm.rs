@@ -37,6 +37,7 @@
 //! reconcile is never published to the memo.
 
 use crate::common::InlineTestProject;
+use brokk_bifrost::analyzer::CodeUnitIndex;
 use brokk_bifrost::searchtools::{
     SYMBOL_TOOL_MAX_RESOLUTION_CANDIDATES, SummariesParams, SymbolLookupParams, TooBroadMatch,
     get_summaries, get_symbol_sources,
@@ -146,5 +147,171 @@ fn issue_1908_an_under_cap_bare_identifier_is_still_answered_in_full() {
         under,
         result.ambiguous[0].matches.len(),
         "every candidate must still be offered: {result:#?}"
+    );
+}
+
+/// Fix B's fixture: `count` classes that each declare `shared`, each in its own
+/// namespace and its own header, plus one `.cpp` per class holding the
+/// out-of-line definition under a `using namespace`.
+///
+/// The `using namespace` is what makes reconciliation do real work: extraction
+/// records the definition's provisional identity as `Outer$Inner.shared` with
+/// no namespace, and only the include-visible class table can re-key it onto
+/// `ns.Outer$Inner.shared`. That is the #1121/#1134 shape the whole reconcile
+/// path exists for, so each class contributes one genuine re-keying and the
+/// candidate set for the identifier is `2 * count` declarations over `count`
+/// distinct canonical names -- the storm's K x N shape in miniature.
+///
+/// `inner_name` decides whether those `count` owners share one terminal
+/// segment. Both arrangements occur in real code and they exercise different
+/// halves of the memo key.
+fn divergent_namesakes(
+    count: usize,
+    inner_name: &dyn Fn(usize) -> String,
+) -> (crate::common::BuiltInlineTestProject, CppAnalyzer) {
+    let mut builder = InlineTestProject::with_language(Language::Cpp);
+    for index in 0..count {
+        let inner = inner_name(index);
+        builder = builder.file(
+            format!("h{index}.h"),
+            format!(
+                "namespace ns{index} {{\nclass Outer{index} {{\n public:\n  class {inner} {{ public: int shared() const; }};\n}};\n}}\n"
+            ),
+        );
+        builder = builder.file(
+            format!("c{index}.cpp"),
+            format!(
+                "#include \"h{index}.h\"\nusing namespace ns{index};\nint Outer{index}::{inner}::shared() const {{ return {index}; }}\n"
+            ),
+        );
+    }
+    let project = builder.build();
+    let analyzer = CppAnalyzer::from_project(project.project().clone());
+    (project, analyzer)
+}
+
+/// Every owner nests its member under the same terminal segment, so all
+/// `count` canonical names fall in one reconcile group.
+fn one_owner_terminal(_index: usize) -> String {
+    "Inner".to_string()
+}
+
+/// Every owner has its own terminal segment, so #1566's pre-filter can narrow
+/// a query to that owner's own two declarations.
+fn distinct_owner_terminals(index: usize) -> String {
+    format!("Inner{index}")
+}
+
+const DIVERGENT_COUNT: usize = 12;
+
+/// Every canonical name in the fixture, in fixture order.
+fn divergent_canonical_names(inner_name: &dyn Fn(usize) -> String) -> Vec<String> {
+    (0..DIVERGENT_COUNT)
+        .map(|index| format!("ns{index}.Outer{index}${}.shared", inner_name(index)))
+        .collect()
+}
+
+fn resolved_sources(analyzer: &CppAnalyzer, fq_name: &str) -> Vec<(String, String)> {
+    let mut sources: Vec<_> = analyzer
+        .definitions(fq_name)
+        .map(|unit| {
+            (
+                unit.fq_name(),
+                unit.source().rel_path().to_string_lossy().to_string(),
+            )
+        })
+        .collect();
+    sources.sort();
+    sources
+}
+
+#[test]
+fn issue_1908_resolving_every_namesake_costs_one_candidate_scan_not_one_per_key() {
+    let (_project, analyzer) = divergent_namesakes(DIVERGENT_COUNT, &one_owner_terminal);
+    let names = divergent_canonical_names(&one_owner_terminal);
+    // Warm the store-backed declaration reads so the counters measure
+    // reconciliation only.
+    analyzer.get_all_declarations();
+    analyzer.reset_reconcile_counts_for_test();
+
+    for name in &names {
+        let definitions: Vec<_> = analyzer.definitions(name).collect();
+        assert!(
+            definitions.iter().any(|unit| unit
+                .source()
+                .rel_path()
+                .to_string_lossy()
+                .ends_with(".cpp")),
+            "the out-of-line definition must reconcile onto {name}: {definitions:?}"
+        );
+    }
+
+    assert_eq!(
+        1,
+        analyzer.reconcile_candidate_scan_count_for_test(),
+        "K queries sharing one member identifier share one identifier-index scan"
+    );
+    // These K names share both halves of the memo key, so they share one group
+    // build over the whole 2K-declaration candidate set. Before #1908 each of
+    // the K queries rescanned that set on its own: K x N.
+    assert_eq!(
+        2 * DIVERGENT_COUNT,
+        analyzer.reconcile_candidate_evaluation_count_for_test(),
+        "candidate evaluations must be the candidate set, not K times it"
+    );
+}
+
+#[test]
+fn issue_1908_regrouping_reconciliation_answers_exactly_what_per_fq_reconciliation_did() {
+    for inner_name in [
+        &one_owner_terminal as &dyn Fn(usize) -> String,
+        &distinct_owner_terminals,
+    ] {
+        let (_project, analyzer) = divergent_namesakes(DIVERGENT_COUNT, inner_name);
+
+        for (index, name) in divergent_canonical_names(inner_name)
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                vec![
+                    (name.clone(), format!("c{index}.cpp")),
+                    (name.clone(), format!("h{index}.h")),
+                ],
+                resolved_sources(&analyzer, &name),
+                "the header declaration and its out-of-line definition must both \
+                 answer {name}, and nothing else may"
+            );
+        }
+    }
+}
+
+#[test]
+fn issue_1908_reconciliation_still_skips_a_same_named_member_of_an_unrelated_owner() {
+    // The reason the memo key keeps the owner terminal instead of being a plain
+    // per-identifier map: dropping it would reconcile every same-named
+    // candidate in the workspace on the first query for the identifier, which
+    // is the cost #1566 removed (chromium paid ~75 s per member query that
+    // way). `reconcile_skips_same_named_members_of_unrelated_classes_1566`
+    // guards the class-table half in-crate; this guards the
+    // candidate-evaluation half.
+    let (_project, analyzer) = divergent_namesakes(DIVERGENT_COUNT, &distinct_owner_terminals);
+    analyzer.get_all_declarations();
+    analyzer.reset_reconcile_counts_for_test();
+
+    let name = format!("ns0.Outer0${}.shared", distinct_owner_terminals(0));
+    assert_eq!(
+        vec![
+            (name.clone(), "c0.cpp".to_string()),
+            (name.clone(), "h0.h".to_string()),
+        ],
+        resolved_sources(&analyzer, &name)
+    );
+    assert_eq!(
+        2,
+        analyzer.reconcile_candidate_evaluation_count_for_test(),
+        "only the queried owner's own two declarations may be evaluated, not \
+         all {} candidates",
+        2 * DIVERGENT_COUNT
     );
 }
