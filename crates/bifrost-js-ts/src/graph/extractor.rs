@@ -363,6 +363,16 @@ struct LocalPropertyDefinition {
     receiver_members: Vec<String>,
     scope: JsTsLexicalBindingScope,
     property_range: Range,
+    aliases: Vec<LocalPropertyReceiverAlias>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalPropertyReceiverAlias {
+    receiver_root: String,
+    receiver_members: Vec<String>,
+    binding_scope: Option<JsTsLexicalBindingScope>,
+    enclosing_class_range: Option<(usize, usize)>,
+    enclosing_function_range: Option<(usize, usize)>,
 }
 
 /// A receiver chain (`WLT`, or `WLT.Inner`) whose root the declaring file binds
@@ -448,7 +458,7 @@ fn collect_local_property_definitions(
             }
             let scope = lexical_bindings
                 .binding_scope_at(receiver_root, fact.receiver.root.start_byte())?;
-            let definition = LocalPropertyDefinition {
+            let mut definition = LocalPropertyDefinition {
                 receiver_root: receiver_root.to_string(),
                 receiver_members: fact
                     .receiver
@@ -458,10 +468,158 @@ fn collect_local_property_definitions(
                     .collect(),
                 scope,
                 property_range: fact.property_range,
+                aliases: Vec::new(),
             };
+            definition.aliases = chained_assignment_aliases_for_local_property(
+                root,
+                source,
+                lexical_bindings,
+                &definition,
+            );
             Some(definition)
         })
         .collect()
+}
+
+fn chained_assignment_aliases_for_local_property(
+    root: Node<'_>,
+    source: &str,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    definition: &LocalPropertyDefinition,
+) -> Vec<LocalPropertyReceiverAlias> {
+    let mut latest_declarator = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= definition.property_range.start_byte {
+            continue;
+        }
+        if node.kind() == "variable_declarator"
+            && let Some(name) = node.child_by_field_name("name")
+            && name.kind() == "identifier"
+            && slice(name, source) == definition.receiver_root
+            && lexical_bindings.binding_scope_at(&definition.receiver_root, name.start_byte())
+                == Some(definition.scope)
+            && latest_declarator
+                .is_none_or(|latest: Node<'_>| latest.start_byte() < node.start_byte())
+        {
+            latest_declarator = Some(node);
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+
+    let Some(mut expression) = latest_declarator.and_then(|node| node.child_by_field_name("value"))
+    else {
+        return Vec::new();
+    };
+    let mut aliases = Vec::new();
+    loop {
+        expression = unwrap_parenthesized_expression(expression);
+        if expression.kind() != "assignment_expression" {
+            break;
+        }
+        let (Some(left), Some(right)) = (
+            expression.child_by_field_name("left"),
+            expression.child_by_field_name("right"),
+        ) else {
+            break;
+        };
+        if let Some(alias) = local_property_receiver_alias(left, source, lexical_bindings) {
+            aliases.push(alias);
+        }
+        expression = right;
+    }
+    aliases
+}
+
+fn unwrap_parenthesized_expression(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" {
+        let Some(child) = node.named_child(0) else {
+            break;
+        };
+        node = child;
+    }
+    node
+}
+
+fn local_property_receiver_alias(
+    node: Node<'_>,
+    source: &str,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+) -> Option<LocalPropertyReceiverAlias> {
+    let mut current = node;
+    let mut members = Vec::new();
+    while current.kind() == "member_expression" {
+        let property = current.child_by_field_name("property")?;
+        if !matches!(
+            property.kind(),
+            "property_identifier" | "private_property_identifier"
+        ) {
+            return None;
+        }
+        let member = slice(property, source);
+        if member.is_empty() {
+            return None;
+        }
+        members.push(member.to_string());
+        current = current.child_by_field_name("object")?;
+    }
+    members.reverse();
+
+    let receiver_root = slice(current, source);
+    if receiver_root.is_empty() {
+        return None;
+    }
+    match current.kind() {
+        "identifier" => Some(LocalPropertyReceiverAlias {
+            receiver_root: receiver_root.to_string(),
+            receiver_members: members,
+            binding_scope: lexical_bindings.binding_scope_at(receiver_root, current.start_byte()),
+            enclosing_class_range: None,
+            enclosing_function_range: enclosing_function_range(current),
+        })
+        .filter(|alias| alias.binding_scope.is_some()),
+        "this" => {
+            enclosing_class_range(current).map(|enclosing_class_range| LocalPropertyReceiverAlias {
+                receiver_root: receiver_root.to_string(),
+                receiver_members: members,
+                binding_scope: None,
+                enclosing_class_range: Some(enclosing_class_range),
+                enclosing_function_range: enclosing_function_range(current),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn enclosing_class_range(mut node: Node<'_>) -> Option<(usize, usize)> {
+    loop {
+        if matches!(node.kind(), "class" | "class_declaration") {
+            return Some((node.start_byte(), node.end_byte()));
+        }
+        node = node.parent()?;
+    }
+}
+
+fn enclosing_function_range(mut node: Node<'_>) -> Option<(usize, usize)> {
+    loop {
+        if matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "generator_function_declaration"
+                | "method_definition"
+        ) {
+            return Some((node.start_byte(), node.end_byte()));
+        }
+        node = node.parent()?;
+    }
 }
 
 fn local_property_read_matches(
@@ -471,24 +629,22 @@ fn local_property_read_matches(
     lexical_bindings: &JsTsLexicalBindingIndex,
     definitions: &[LocalPropertyDefinition],
 ) -> bool {
-    let Some(receiver) = static_member_receiver(object, source) else {
-        return false;
-    };
-    let receiver_root = slice(receiver.root, source);
-    let Some(scope) = lexical_bindings.binding_scope_at(receiver_root, receiver.root.start_byte())
-    else {
+    let Some(receiver) = local_property_receiver_alias(object, source, lexical_bindings) else {
         return false;
     };
     definitions.iter().any(|definition| {
-        definition.receiver_root == receiver_root
-            && definition.receiver_members.len() == receiver.members.len()
-            && definition
-                .receiver_members
-                .iter()
-                .zip(&receiver.members)
-                .all(|(expected, actual)| expected == slice(*actual, source))
-            && definition.scope == scope
-            && definition.property_range.end_byte <= property.start_byte()
+        let direct = definition.receiver_root == receiver.receiver_root
+            && definition.receiver_members == receiver.receiver_members
+            && receiver.binding_scope == Some(definition.scope);
+        let alias = definition.aliases.iter().any(|alias| {
+            alias.receiver_root == receiver.receiver_root
+                && alias.receiver_members == receiver.receiver_members
+                && alias.binding_scope == receiver.binding_scope
+                && alias.enclosing_class_range == receiver.enclosing_class_range
+                && (alias.enclosing_function_range != receiver.enclosing_function_range
+                    || definition.property_range.end_byte <= property.start_byte())
+        });
+        direct && definition.property_range.end_byte <= property.start_byte() || alias
     })
 }
 

@@ -1,6 +1,6 @@
 use crate::common::InlineTestProject;
 use brokk_bifrost::usages::{ExplicitCandidateProvider, FuzzyResult, UsageFinder};
-use brokk_bifrost::{CodeUnit, CodeUnitIndex, JavascriptAnalyzer, Language};
+use brokk_bifrost::{CodeUnit, CodeUnitIndex, IAnalyzer, JavascriptAnalyzer, Language};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -96,5 +96,62 @@ class Decoy {
         ]),
         ranges,
         "same-class static private-field reads and writes must resolve without claiming the decoy: {hits:#?}"
+    );
+}
+
+#[test]
+fn javascript_chained_assignment_keeps_property_provenance_through_a_private_field() {
+    let source = r#"class Toolbar {
+  #button;
+  #otherButton;
+
+  update() {
+    this.#button.disabled = false;
+    this.#otherButton.disabled = false;
+  }
+
+  build() {
+    const button = (this.#button = document.createElement("button"));
+    button.disabled = true;
+    const otherButton = (this.#otherButton = document.createElement("button"));
+    otherButton.disabled = true;
+  }
+}
+
+class OtherToolbar {
+  #button;
+
+  update() {
+    this.#button.disabled = false;
+  }
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("toolbar.js", source)
+        .build();
+    let file = project.file("toolbar.js");
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let targets: Vec<_> = analyzer
+        .global_usage_definition_index()
+        .fqn_for_test("button.disabled")
+        .into_iter()
+        .filter(|unit| unit.source() == &file)
+        .collect();
+    assert_eq!(
+        targets.len(),
+        1,
+        "modeled local property target: {targets:#?}"
+    );
+
+    let hits = authoritative_hits(&analyzer, &targets[0]);
+    let ranges: BTreeSet<_> = hits
+        .iter()
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([occurrence_range(source, "disabled", 0)]),
+        ranges,
+        "the class-field alias must retain the local property identity without claiming the decoy: {hits:#?}"
     );
 }
