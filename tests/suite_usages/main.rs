@@ -11,6 +11,7 @@ mod common;
 
 mod cpp_member_dispatch_trace;
 mod csharp_bounded_receiver_hardening;
+mod csharp_ranks21_30_regression;
 mod go_rust_bounded_receiver_acceptance;
 mod issue_1416_scan_name_gate;
 mod issue_1450_cross_request_prepared_syntax;

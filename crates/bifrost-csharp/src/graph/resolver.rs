@@ -3,9 +3,10 @@ use crate::graph::CSharpGraphSource;
 use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
 use crate::syntax::{
-    CSharpMemberName, csharp_callable_arity, csharp_conditional_member_access, csharp_member_name,
-    csharp_method_generic_arity, csharp_normalize_full_name, csharp_signature_return_type,
-    csharp_source_identifier, csharp_type_node_identity, csharp_type_reference_root,
+    CSharpMemberName, CSharpRelationalGenericCall, csharp_callable_arity,
+    csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
+    csharp_normalize_full_name, csharp_signature_return_type, csharp_source_identifier,
+    csharp_type_leftmost_identifier, csharp_type_node_identity, csharp_type_reference_root,
     csharp_using_directive_is_global, csharp_using_directive_is_static,
     csharp_using_directive_namespace, csharp_using_directive_target,
 };
@@ -2911,6 +2912,38 @@ pub(super) fn usage_unqualified_value_member_shadows_type(
     nearest_member_candidates_for_owner(graph, csharp, &enclosing, name, None)
         .iter()
         .any(CodeUnit::is_field)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn usage_relational_generic_call_has_type_argument(
+    call: CSharpRelationalGenericCall<'_>,
+    graph: &CSharpGraphSource<'_>,
+    csharp: &dyn CSharpSource,
+    file: &ProjectFile,
+    class_ranges: &ClassRangeIndex,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+) -> bool {
+    let Some(leftmost) = csharp_type_leftmost_identifier(call.type_argument) else {
+        return false;
+    };
+    let name = node_text(leftmost, source);
+    if member_name_is_locally_bound(name, bindings)
+        || unqualified_member_has_structured_shadow(leftmost, source)
+        || usage_unqualified_value_member_shadows_type(leftmost, name, graph, csharp, file, source)
+    {
+        return false;
+    }
+    let reference = reference_type_text(call.type_argument, source);
+    resolve_type_fq_name_at(
+        csharp,
+        file,
+        class_ranges,
+        &reference,
+        call.type_argument,
+        source,
+    )
+    .is_some()
 }
 
 /// Whether an unqualified `member_name` is bound by a local (parameter or local

@@ -770,6 +770,21 @@ pub struct CSharpConditionalMemberAccess<'tree> {
     pub name: Node<'tree>,
 }
 
+/// A one-type-argument, one-value-argument generic member call that
+/// tree-sitter-c-sharp parsed as relational expressions. In a boolean chain,
+/// `receiver.Call<T>(argument) && next` can become `(receiver.Call < T) >
+/// ((argument) && next)`: the call argument occupies the `type` field of the
+/// recovery `cast_expression`. The structure and operator fields distinguish
+/// this grammar ambiguity without parsing source text.
+#[derive(Clone, Copy)]
+pub struct CSharpRelationalGenericCall<'tree> {
+    pub member_access: Node<'tree>,
+    pub type_argument: Node<'tree>,
+    pub argument: Node<'tree>,
+    pub explicit_generic_arity: usize,
+    pub call_arity: usize,
+}
+
 pub fn csharp_conditional_member_access(
     node: Node<'_>,
 ) -> Option<CSharpConditionalMemberAccess<'_>> {
@@ -813,6 +828,88 @@ pub fn csharp_member_name(node: Node<'_>) -> Option<CSharpMemberName<'_>> {
         }
         _ => None,
     }
+}
+
+pub fn csharp_relational_generic_call(
+    member_access: Node<'_>,
+) -> Option<CSharpRelationalGenericCall<'_>> {
+    if member_access.kind() != "member_access_expression" {
+        return None;
+    }
+    let mut current = member_access;
+    let less_than = loop {
+        let parent = current.parent()?;
+        if parent.kind() == "binary_expression"
+            && parent
+                .child_by_field_name("operator")
+                .is_some_and(|operator| operator.kind() == "<")
+            && parent.child_by_field_name("left").is_some_and(|left| {
+                left.start_byte() <= member_access.start_byte()
+                    && left.end_byte() == member_access.end_byte()
+            })
+        {
+            break parent;
+        }
+        current = parent;
+    };
+    let type_argument = less_than.child_by_field_name("right")?;
+    let greater_than = less_than.parent()?;
+    if greater_than.kind() != "binary_expression"
+        || greater_than.child_by_field_name("left") != Some(less_than)
+        || greater_than
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != ">")
+    {
+        return None;
+    }
+    let argument_container = greater_than.child_by_field_name("right")?;
+    let argument = match argument_container.kind() {
+        "cast_expression" => argument_container.child_by_field_name("type")?,
+        "parenthesized_expression" if argument_container.named_child_count() == 1 => {
+            argument_container.named_child(0)?
+        }
+        _ => return None,
+    };
+    Some(CSharpRelationalGenericCall {
+        member_access,
+        type_argument,
+        argument,
+        explicit_generic_arity: 1,
+        call_arity: 1,
+    })
+}
+
+pub fn csharp_relational_generic_call_for_argument(
+    argument: Node<'_>,
+) -> Option<CSharpRelationalGenericCall<'_>> {
+    let argument_container = argument.parent()?;
+    let greater_than = match argument_container.kind() {
+        "cast_expression" if argument_container.child_by_field_name("type") == Some(argument) => {
+            argument_container.parent()?
+        }
+        "parenthesized_expression"
+            if argument_container.named_child_count() == 1
+                && argument_container.named_child(0) == Some(argument) =>
+        {
+            argument_container.parent()?
+        }
+        _ => return None,
+    };
+    let less_than = greater_than.child_by_field_name("left")?;
+    let mut member_access = less_than.child_by_field_name("left")?;
+    while member_access.kind() != "member_access_expression" {
+        let end = member_access.end_byte();
+        let mut cursor = member_access.walk();
+        let mut ending_children = member_access
+            .named_children(&mut cursor)
+            .filter(|child| child.end_byte() == end);
+        member_access = ending_children.next()?;
+        if ending_children.next().is_some() {
+            return None;
+        }
+    }
+    let call = csharp_relational_generic_call(member_access)?;
+    (call.argument == argument).then_some(call)
 }
 
 pub fn csharp_unqualified_invocation_for_name(
