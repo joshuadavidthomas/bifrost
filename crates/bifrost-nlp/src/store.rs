@@ -47,15 +47,14 @@ pub struct SemanticStore {
     db_path: PathBuf,
 }
 
-/// Persisted metadata for one function. Source and embedding documents are not
-/// stored; only raw-source BM25 tokens and the direct vector key survive.
+/// Persisted metadata for one function. Neither the source nor the embedding
+/// document is stored; only the span and the direct vector key survive.
 #[derive(Debug, Clone)]
 pub struct FileChunkIn<'a> {
     pub chunk_ord: i64,
     pub symbol: &'a str,
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
-    pub fts_tokens: &'a str,
     pub vector_hash: [u8; 32],
 }
 
@@ -78,39 +77,27 @@ impl SemanticStore {
         &self,
         fingerprint: &str,
         chunker_version: &str,
-        bm25_tokenizer_version: &str,
     ) -> Result<bool> {
         let mut conn = self.conn.lock().expect("semantic store mutex poisoned");
         let read_contracts = |conn: &Connection| {
             conn.query_row(
-                "SELECT embed_fingerprint, chunker_version, bm25_tokenizer_version
-                 FROM cache_state WHERE id = 1",
+                "SELECT embed_fingerprint, chunker_version FROM cache_state WHERE id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
         };
-        let (stored_fp, stored_chunker, stored_bm25): (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = read_contracts(&conn)?;
+        let (stored_fp, stored_chunker): (Option<String>, Option<String>) = read_contracts(&conn)?;
         let matches = stored_fp.as_deref() == Some(fingerprint)
-            && stored_chunker.as_deref() == Some(chunker_version)
-            && stored_bm25.as_deref() == Some(bm25_tokenizer_version);
+            && stored_chunker.as_deref() == Some(chunker_version);
         if matches {
             return Ok(false);
         }
 
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (stored_fp, stored_chunker, stored_bm25): (
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = read_contracts(&tx)?;
-        let first_run = stored_fp.is_none() && stored_chunker.is_none() && stored_bm25.is_none();
+        let (stored_fp, stored_chunker): (Option<String>, Option<String>) = read_contracts(&tx)?;
+        let first_run = stored_fp.is_none() && stored_chunker.is_none();
         let matches = stored_fp.as_deref() == Some(fingerprint)
-            && stored_chunker.as_deref() == Some(chunker_version)
-            && stored_bm25.as_deref() == Some(bm25_tokenizer_version);
+            && stored_chunker.as_deref() == Some(chunker_version);
         let wiped = if first_run || matches {
             false
         } else {
@@ -121,10 +108,9 @@ impl SemanticStore {
         tx.execute(
             "UPDATE cache_state
              SET embed_fingerprint = ?1,
-                 chunker_version = ?2,
-                 bm25_tokenizer_version = ?3
+                 chunker_version = ?2
              WHERE id = 1",
-            params![fingerprint, chunker_version, bm25_tokenizer_version],
+            params![fingerprint, chunker_version],
         )?;
         tx.commit()?;
         Ok(wiped)
@@ -239,9 +225,8 @@ impl SemanticStore {
             )?;
             let mut insert_chunk = tx.prepare(
                 "INSERT INTO semantic_file_chunks(
-                     blob_oid, rel_path, chunk_ord, symbol, start_line, end_line,
-                     fts_tokens, vector_hash
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     blob_oid, rel_path, chunk_ord, symbol, start_line, end_line, vector_hash
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for (oid, rel_path, language, chunks) in files {
                 upsert_file.execute(params![oid, rel_path, language])?;
@@ -254,7 +239,6 @@ impl SemanticStore {
                         chunk.symbol,
                         chunk.start_line,
                         chunk.end_line,
-                        chunk.fts_tokens,
                         chunk.vector_hash.as_slice(),
                     ])?;
                 }
@@ -327,7 +311,6 @@ mod tests {
             symbol,
             start_line: Some(1),
             end_line: Some(2),
-            fts_tokens: "raw source tokens",
             vector_hash,
         }
     }
@@ -435,14 +418,14 @@ mod tests {
     #[test]
     fn compatibility_change_wipes_only_semantic_data() {
         let (_temp, store) = open_temp();
-        assert!(!store.ensure_index_compatible("fp1", "ck1", "bm1").unwrap());
+        assert!(!store.ensure_index_compatible("fp1", "ck1").unwrap());
         let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         store.upsert_vectors(&[([1; 32], vec![1.0])]).unwrap();
         store
             .put_files(&[(oid, "a.rs", Some("rust"), &[chunk("a", [1; 32])])])
             .unwrap();
 
-        assert!(store.ensure_index_compatible("fp2", "ck1", "bm1").unwrap());
+        assert!(store.ensure_index_compatible("fp2", "ck1").unwrap());
         let semantic_files: i64 = store
             .conn
             .lock()
@@ -462,7 +445,7 @@ mod tests {
         let database = temp.path().join("cache.db");
         let writer = SemanticStore::open(&database).unwrap();
         let reader = SemanticStore::open(&database).unwrap();
-        writer.ensure_index_compatible("fp", "ck", "bm").unwrap();
+        writer.ensure_index_compatible("fp", "ck").unwrap();
 
         reader
             .conn
@@ -475,7 +458,7 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
 
-        assert!(!reader.ensure_index_compatible("fp", "ck", "bm").unwrap());
+        assert!(!reader.ensure_index_compatible("fp", "ck").unwrap());
         writer_transaction.rollback().unwrap();
     }
 

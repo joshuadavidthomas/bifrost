@@ -4949,11 +4949,11 @@ class RankedFile:
 
 @dataclass(frozen=True)
 class SemanticSearchResult:
-    """The three independent retrieval signals over function chunks. Reranking/fusing
-    them is the caller's job."""
+    """The independent retrieval signals over function chunks: a dense ranking of
+    symbols and a git co-edit ranking of files. Reranking/fusing them is the
+    caller's job."""
 
     vector_ranked: list[RankedSymbol]
-    bm25_ranked: list[RankedSymbol]
     coedit_ranked: list[RankedFile]
     notes: list[str]
     render_line_numbers: bool = True
@@ -4965,7 +4965,6 @@ class SemanticSearchResult:
     ) -> SemanticSearchResult:
         return cls(
             vector_ranked=[RankedSymbol.from_dict(item) for item in data.get("vector_ranked", [])],
-            bm25_ranked=[RankedSymbol.from_dict(item) for item in data.get("bm25_ranked", [])],
             coedit_ranked=[RankedFile.from_dict(item) for item in data.get("coedit_ranked", [])],
             notes=list(data.get("notes", [])),
             render_line_numbers=render_line_numbers,
@@ -4983,9 +4982,6 @@ class SemanticSearchResult:
         if self.vector_ranked:
             lines.append("=== vector ===")
             lines.extend(f"{r.fqfn} (score {r.score:.3f})" for r in self.vector_ranked)
-        if self.bm25_ranked:
-            lines.append("=== bm25 ===")
-            lines.extend(f"{r.fqfn} (score {r.score:.3f})" for r in self.bm25_ranked)
         if self.coedit_ranked:
             lines.append("=== co-edit ===")
             lines.extend(f"{r.path} (score {r.score:.3f})" for r in self.coedit_ranked)
@@ -4994,7 +4990,7 @@ class SemanticSearchResult:
 
 @dataclass(frozen=True)
 class SemanticSearchStatus:
-    indexed_chunks: int
+    indexed_files: int
     pending_batches: int
     phase: str
     materialized_files: int
@@ -5003,7 +4999,7 @@ class SemanticSearchStatus:
     @classmethod
     def from_dict(cls, data: dict) -> SemanticSearchStatus:
         return cls(
-            indexed_chunks=int(data["indexed_chunks"]),
+            indexed_files=int(data["indexed_files"]),
             pending_batches=int(data["pending_batches"]),
             phase=str(data["phase"]),
             materialized_files=int(data["materialized_files"]),

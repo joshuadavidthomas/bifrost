@@ -1,80 +1,49 @@
 //! The semantic_search query pipeline.
 //!
-//! Returns three independent retrieval signals over function chunks, leaving any
-//! reranking to the caller: an exhaustive vector scan (cosine per fqfn), a
-//! grounded-strings BM25 ranking (per fqfn), and git co-edit relevance (per file)
-//! seeded from the union of the top vector + BM25 files. Symbol scores are
-//! normalized within each leg after top-k selection so callers can fuse vector
-//! and BM25 results without raw cosine/BM25 scale mismatch. Vector results use
-//! the direct file/class-prefixed function documents, while BM25 remains based
-//! on raw function source. Constants come from the prototype's dev sweeps (see
-//! `nlp/mod.rs`).
+//! Retrieval is dense only. A query is embedded once, scored against the stored
+//! quantized vectors, and the best candidates are resolved to live function
+//! occurrences one at a time (see `super::retrieval`). Two independent signals
+//! come back -- ranked symbols from the dense arm and ranked files from git
+//! co-edit history -- and reranking stays with the caller. Symbol scores are
+//! min-max normalized within the returned window so a caller does not have to
+//! know the raw cosine scale.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use brokk_bifrost_analysis::analyzer::{IAnalyzer, WorkspaceAnalyzer};
-use brokk_bifrost_analysis::path_utils::rel_path_string;
+use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
 use brokk_bifrost_analysis::searchtools::{
     MostRelevantFilesParams, most_relevant_files_history_only,
 };
 use brokk_bifrost_analysis::searchtools_render::{RenderOptions, RenderText};
 
-use super::active_index::ActiveIndex;
-use super::bm25::{RepoEntityUniverse, build_match_query, grounded_prompt_text, tokenize};
 use super::indexer::{DEFAULT_READY_TIMEOUT, READY_TIMEOUT_MESSAGE, SemanticIndexer};
 use super::{COEDIT_HALF_LIFE, RRF_K};
 
-/// Rows decoded per scan batch.
-const SCAN_BATCH: usize = 8192;
 const MAX_K: usize = 100;
-/// Once an active index exists, keep interactive queries responsive while a
-/// newer snapshot is building by falling back to that active index promptly.
+/// Depth of the dense arm relative to the requested `k`. The CodeScaleBench
+/// arm sweep (`.agents/plans/bifrost-localizer-cim-eval.md`, "Results") ran
+/// vector/BM25/co-edit budgets of b/b/b, 3b/0/0, and 2b/0/b at a constant
+/// nominal pool of 3b. The 2b dense plus b co-edit arm scored best (54.9%
+/// resolve) and the lexical arm worst of the three (53.8%), so the winning
+/// depths are now the only behavior and the total pool is unchanged.
+const VECTOR_LEG_DEPTH: usize = 2;
+/// Candidate vectors scored per returned symbol. The candidate stream comes
+/// straight from the persistent store and may include chunks of blobs this
+/// worktree no longer has, so the walk over-retrieves and skips. A warmed exact
+/// checkout has a near-zero dead fraction; the factor only has to cover a cache
+/// that has drifted between garbage collections, plus the several chunk vectors
+/// a single symbol can legitimately own.
+const CANDIDATE_OVER_RETRIEVE: usize = 8;
+/// Once a live set exists, keep interactive queries responsive while a newer
+/// snapshot is building by falling back to that live set promptly.
 const SEMANTIC_SEARCH_STALE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Floor for min-max normalized retrieval scores. Co-edit seed weights must be
-/// positive for `most_relevant_files`, and callers fusing symbol legs should not
-/// see a selected result collapse to zero.
+/// positive for `most_relevant_files`, and callers should not see a selected
+/// result collapse to zero.
 const MIN_NORMALIZED_SCORE: f64 = 0.01;
-const SEARCH_PROFILE_ENV: &str = "BIFROST_SEMANTIC_SEARCH_PROFILE";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SearchProfile {
-    AllSignals,
-    SemanticOnly,
-    SemanticCoeditTwoToOne,
-}
-
-impl SearchProfile {
-    fn selected() -> Result<Self, String> {
-        match std::env::var(SEARCH_PROFILE_ENV).ok().as_deref() {
-            None | Some("") | Some("all-signals") => Ok(Self::AllSignals),
-            Some("semantic-only") => Ok(Self::SemanticOnly),
-            Some("semantic-coedit-2-1") => Ok(Self::SemanticCoeditTwoToOne),
-            Some(value) => Err(format!(
-                "unknown {SEARCH_PROFILE_ENV} value '{value}'; expected all-signals, semantic-only, or semantic-coedit-2-1"
-            )),
-        }
-    }
-
-    fn leg_limits(self, base: usize) -> (usize, usize, usize) {
-        match self {
-            Self::AllSignals => (base, base, base),
-            Self::SemanticOnly => (3 * base, 0, 0),
-            Self::SemanticCoeditTwoToOne => (2 * base, 0, base),
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::AllSignals => "all-signals",
-            Self::SemanticOnly => "semantic-only",
-            Self::SemanticCoeditTwoToOne => "semantic-coedit-2-1",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SemanticSearchParams {
@@ -87,7 +56,7 @@ fn default_k() -> usize {
     10
 }
 
-/// A function chunk ranked by one retrieval leg, keyed by fully-qualified name.
+/// A function chunk ranked by the dense arm, keyed by fully-qualified name.
 /// `score` is min-max normalized within this leg's returned top-k window.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RankedSymbol {
@@ -102,14 +71,12 @@ pub struct RankedFile {
     pub score: f32,
 }
 
-/// The constituent retrieval signals for a query. Each leg is independent and
-/// capped at `k`; fusing/reranking them is the caller's job.
+/// The constituent retrieval signals for a query. Each leg is independent;
+/// fusing/reranking them is the caller's job.
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticSearchResult {
     pub vector_ranked: Vec<RankedSymbol>,
-    pub bm25_ranked: Vec<RankedSymbol>,
     pub coedit_ranked: Vec<RankedFile>,
-    pub retrieval_profile: &'static str,
     pub requested_leg_counts: RetrievalLegCounts,
     pub timings: SemanticSearchTimings,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -119,7 +86,6 @@ pub struct SemanticSearchResult {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct RetrievalLegCounts {
     pub vector: usize,
-    pub bm25: usize,
     pub coedit: usize,
 }
 
@@ -134,16 +100,13 @@ pub struct SemanticSearchTimings {
 impl SemanticSearchResult {
     fn empty(
         notes: Vec<String>,
-        profile: SearchProfile,
         requested_leg_counts: RetrievalLegCounts,
         wait_ready_ms: f64,
         started: Instant,
     ) -> Self {
         Self {
             vector_ranked: Vec::new(),
-            bm25_ranked: Vec::new(),
             coedit_ranked: Vec::new(),
-            retrieval_profile: profile.name(),
             requested_leg_counts,
             timings: SemanticSearchTimings {
                 wait_ready_ms,
@@ -172,34 +135,23 @@ impl RenderText for SemanticSearchResult {
             );
         }
 
-        let symbol_section = |title: &str, rows: &[RankedSymbol]| -> Option<String> {
-            if rows.is_empty() {
-                return None;
-            }
-            let mut block = format!("=== {title} ===");
-            for row in rows {
+        let mut any_results = false;
+        if !self.vector_ranked.is_empty() {
+            any_results = true;
+            let mut block = "=== vector ===".to_string();
+            for row in &self.vector_ranked {
                 block.push_str(&format!("\n{} (score {:.3})", row.fqfn, row.score));
             }
-            Some(block)
-        };
-        let file_section = |title: &str, rows: &[RankedFile]| -> Option<String> {
-            if rows.is_empty() {
-                return None;
-            }
-            let mut block = format!("=== {title} ===");
-            for row in rows {
+            blocks.push(block);
+        }
+        if !self.coedit_ranked.is_empty() {
+            any_results = true;
+            let mut block = "=== co-edit ===".to_string();
+            for row in &self.coedit_ranked {
                 block.push_str(&format!("\n{} (score {:.3})", row.path, row.score));
             }
-            Some(block)
-        };
-
-        let sections = [
-            symbol_section("vector", &self.vector_ranked),
-            symbol_section("bm25", &self.bm25_ranked),
-            file_section("co-edit", &self.coedit_ranked),
-        ];
-        let any_results = sections.iter().any(Option::is_some);
-        blocks.extend(sections.into_iter().flatten());
+            blocks.push(block);
+        }
 
         if !any_results {
             blocks.push("No semantically similar code found.".to_string());
@@ -219,20 +171,18 @@ pub fn semantic_search(
         return Err("query must not be empty".to_string());
     }
     let k = params.k.clamp(1, MAX_K);
-    let profile = SearchProfile::selected()?;
-    let (vector_limit, bm25_limit, coedit_limit) = profile.leg_limits(k);
+    let vector_limit = VECTOR_LEG_DEPTH * k;
     let requested_leg_counts = RetrievalLegCounts {
         vector: vector_limit,
-        bm25: bm25_limit,
-        coedit: coedit_limit,
+        coedit: k,
     };
 
-    let has_active_index = indexer
-        .active_index()
+    let has_live_set = indexer
+        .live_set()
         .read()
-        .map_err(|_| "semantic active index lock poisoned".to_string())?
+        .map_err(|_| "semantic live set lock poisoned".to_string())?
         .is_some();
-    let ready_timeout = if has_active_index {
+    let ready_timeout = if has_live_set {
         SEMANTIC_SEARCH_STALE_TIMEOUT
     } else {
         DEFAULT_READY_TIMEOUT
@@ -256,7 +206,6 @@ pub fn semantic_search(
             notes.push("embedding model is not loaded yet".to_string());
             return Ok(SemanticSearchResult::empty(
                 notes,
-                profile,
                 requested_leg_counts,
                 wait_ready_ms,
                 started,
@@ -264,98 +213,74 @@ pub fn semantic_search(
         }
         return Err("embedding model unavailable".to_string());
     };
-    let active_lock = indexer.active_index();
-    let active_guard = active_lock
+    let live_lock = indexer.live_set();
+    let live_guard = live_lock
         .read()
-        .map_err(|_| "semantic active index lock poisoned".to_string())?;
-    let Some(active) = active_guard.as_ref() else {
+        .map_err(|_| "semantic live set lock poisoned".to_string())?;
+    let Some(live) = live_guard.as_ref() else {
         if timed_out {
-            notes.push("semantic active index is not built yet".to_string());
+            notes.push("semantic live set is not built yet".to_string());
             return Ok(SemanticSearchResult::empty(
                 notes,
-                profile,
                 requested_leg_counts,
                 wait_ready_ms,
                 started,
             ));
         }
-        return Err("semantic active index unavailable".to_string());
+        return Err("semantic live set unavailable".to_string());
     };
-    let analyzer = workspace.analyzer();
 
-    // 1. Exhaustive vector scan over the active set. SQLite streams batches;
-    //    cosine is scored in parallel; each direct
-    //    document vector is then resolved to its function occurrences.
+    // 1. Dense arm. Score every stored vector against the query, keep a bounded
+    //    candidate pool, then resolve candidates in descending score to live
+    //    function occurrences. Candidates whose chunks all belong to blobs this
+    //    worktree no longer has resolve to nothing and are simply skipped.
     let (query_vector, embedding_timing) = embedder.embed_query_timed(query)?;
     let scorer = super::quant::query_scorer(&query_vector);
-    let mut hash_scores: Vec<([u8; 32], f32)> = Vec::new();
-    active.scan_vectors(SCAN_BATCH, &mut |batch| {
-        let scored: Vec<([u8; 32], f32)> = batch
-            .par_iter()
-            .filter_map(|row| {
-                scorer
-                    .score(&row.code)
-                    .ok()
-                    .map(|score| (row.vector_hash, score))
-            })
-            .collect();
-        hash_scores.extend(scored);
-    })?;
+    let pool = CANDIDATE_OVER_RETRIEVE * vector_limit;
+    let candidates = live.top_candidates(&scorer, pool)?;
     let mut vector_by_symbol: HashMap<String, f32> = HashMap::new();
     let mut symbol_file: HashMap<String, String> = HashMap::new();
-    for (hash, score) in &hash_scores {
-        for hit in active.resolve(hash) {
-            symbol_file
-                .entry(hit.fqfn.to_string())
-                .or_insert_with(|| hit.path.to_string());
+    let mut leg_filled = false;
+    for (hash, score) in &candidates {
+        // Candidates arrive in descending score and a symbol scores as its best
+        // chunk, so the leg is complete as soon as it is full.
+        if vector_by_symbol.len() >= vector_limit {
+            leg_filled = true;
+            break;
+        }
+        for hit in live.resolve_live(hash)? {
+            symbol_file.entry(hit.fqfn.clone()).or_insert(hit.path);
             vector_by_symbol
-                .entry(hit.fqfn.to_string())
+                .entry(hit.fqfn)
                 .and_modify(|best| *best = best.max(*score))
                 .or_insert(*score);
         }
     }
+    // A short candidate list just means the store holds fewer vectors than the
+    // pool. A full list that still did not fill the leg means dead blobs (or
+    // one symbol owning many vectors) consumed the whole over-retrieve budget.
+    if !leg_filled && candidates.len() == pool {
+        notes.push(format!(
+            "dense candidate pool of {pool} was consumed before {vector_limit} live symbols were found"
+        ));
+    }
     let mut vector_ranked = top_ranked_symbols(&vector_by_symbol, vector_limit);
     normalize_ranked_symbol_scores(&mut vector_ranked);
 
-    // 2. Grounded-strings BM25 over the in-memory active corpus.
-    let bm25_scores = if bm25_limit == 0 {
-        Vec::new()
-    } else {
-        bm25_symbol_candidates(analyzer, active, query, bm25_limit).unwrap_or_else(|err| {
-            notes.push(format!("bm25 retrieval skipped: {err}"));
-            Vec::new()
-        })
-    };
-    let mut bm25_ranked: Vec<RankedSymbol> = bm25_scores
-        .iter()
-        .map(|(fqfn, score)| RankedSymbol {
-            fqfn: fqfn.clone(),
-            score: *score as f32,
-        })
-        .collect();
-    normalize_ranked_symbol_scores(&mut bm25_ranked);
-
-    // 3. Co-edit relevance, seeded by the union of the top vector + BM25 files.
-    //    Seeds carry their own-leg normalized weight (summed when a file is in both
-    //    legs), which sidesteps the cosine-vs-BM25 scale mismatch.
+    // 2. Co-edit relevance, seeded by the top dense files. Seeds carry their
+    //    normalized dense weight so `most_relevant_files` sees positive weights.
     let vector_files = aggregate_symbols_to_files(
         vector_by_symbol
             .iter()
             .map(|(sym, score)| (sym.as_str(), *score)),
         &symbol_file,
     );
-    let bm25_files = aggregate_symbols_to_files(
-        bm25_scores
-            .iter()
-            .map(|(sym, score)| (sym.as_str(), *score as f32)),
-        &symbol_file,
-    );
-    let (seed_paths, seed_weights) = build_seeds(&vector_files, &bm25_files, k);
-    let coedit_ranked = if coedit_limit == 0 || seed_paths.is_empty() {
+    let (seed_paths, seed_weights) = build_seeds(&vector_files, k);
+    let coedit_ranked = if seed_paths.is_empty() {
         Vec::new()
     } else {
         match most_relevant_files_history_only(
-            analyzer,
+            workspace.analyzer(),
             MostRelevantFilesParams {
                 seed_file_paths: seed_paths,
                 seed_weights: Some(seed_weights),
@@ -365,7 +290,7 @@ pub fn semantic_search(
                 // graph is unrelated to this retrieval signal and can expand
                 // for minutes in large Java workspaces.
                 ranking_mode: Default::default(),
-                limit: coedit_limit,
+                limit: k,
             },
         ) {
             Ok(result) => result
@@ -386,9 +311,7 @@ pub fn semantic_search(
 
     Ok(SemanticSearchResult {
         vector_ranked,
-        bm25_ranked,
         coedit_ranked,
-        retrieval_profile: profile.name(),
         requested_leg_counts,
         timings: SemanticSearchTimings {
             wait_ready_ms,
@@ -461,21 +384,10 @@ fn aggregate_symbols_to_files<'a>(
     files
 }
 
-/// Co-edit seed set: the union of the top-`m` files from each leg, each weighted by
-/// its own-leg min-max normalized score (floored so weights stay positive). A file
-/// present in both legs accumulates both weights.
-fn build_seeds(
-    vector_files: &HashMap<String, f32>,
-    bm25_files: &HashMap<String, f32>,
-    m: usize,
-) -> (Vec<String>, Vec<f64>) {
-    let mut weights: HashMap<String, f64> = HashMap::new();
-    for leg in [vector_files, bm25_files] {
-        for (path, weight) in normalized_top(leg, m) {
-            *weights.entry(path).or_insert(0.0) += weight;
-        }
-    }
-    let mut seeds: Vec<(String, f64)> = weights.into_iter().collect();
+/// Co-edit seed set: the top-`m` dense files, each weighted by its min-max
+/// normalized score (floored so weights stay positive).
+fn build_seeds(vector_files: &HashMap<String, f32>, m: usize) -> (Vec<String>, Vec<f64>) {
+    let mut seeds = normalized_top(vector_files, m);
     seeds.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -516,35 +428,6 @@ fn normalized_top(files: &HashMap<String, f32>, m: usize) -> Vec<(String, f64)> 
         .collect()
 }
 
-/// Grounded-strings BM25: reduce the query to repo-grounded words + quoted spans,
-/// then MATCH the FTS index, returning per-fqfn scores.
-fn bm25_symbol_candidates(
-    analyzer: &dyn IAnalyzer,
-    active: &ActiveIndex,
-    query: &str,
-    limit: usize,
-) -> Result<Vec<(String, f64)>, String> {
-    let paths: Vec<String> = analyzer
-        .analyzed_files()
-        .into_iter()
-        .map(|file| rel_path_string(&file))
-        .collect();
-    let symbols: Vec<String> = analyzer
-        .all_declarations()
-        .map(|unit| unit.fq_name())
-        .collect();
-    let universe = RepoEntityUniverse::new(
-        paths.iter().map(String::as_str),
-        symbols.iter().map(String::as_str),
-    );
-    let grounded = grounded_prompt_text(query, &universe);
-    let tokens = tokenize(&grounded);
-    let Some(match_query) = build_match_query(&tokens) else {
-        return Ok(Vec::new());
-    };
-    active.bm25_symbol_scores(&match_query, limit)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,17 +457,13 @@ mod tests {
     }
 
     #[test]
-    fn build_seeds_unions_legs_and_adds_shared_weight() {
-        let vector = files(&[("shared", 0.9), ("v_only", 0.4)]);
-        let bm25 = files(&[("shared", 8.0), ("b_only", 2.0)]);
-        let (paths, weights) = build_seeds(&vector, &bm25, 5);
-        // Union of both legs, deduplicated.
-        assert_eq!(paths.len(), 3);
-        // `shared` tops both legs (weight 1.0 each), so its summed weight (~2.0)
-        // sorts it first ahead of the leg-only files.
-        assert_eq!(paths[0], "shared");
-        assert!((weights[0] - 2.0).abs() < 1e-9);
+    fn build_seeds_ranks_the_dense_files_by_weight() {
+        let vector = files(&[("top.rs", 0.9), ("middle.rs", 0.5), ("low.rs", 0.1)]);
+        let (paths, weights) = build_seeds(&vector, 5);
+        assert_eq!(paths, vec!["top.rs", "middle.rs", "low.rs"]);
+        assert!((weights[0] - 1.0).abs() < 1e-9);
         assert!(weights.iter().all(|w| *w > 0.0));
+        assert!(weights.windows(2).all(|pair| pair[0] >= pair[1]));
     }
 
     #[test]
@@ -600,21 +479,21 @@ mod tests {
     fn normalize_ranked_symbol_scores_maps_leg_to_common_scale() {
         let mut ranked = vec![
             RankedSymbol {
-                fqfn: "bm25.top".to_string(),
+                fqfn: "dense.top".to_string(),
                 score: 30.0,
             },
             RankedSymbol {
-                fqfn: "bm25.middle".to_string(),
+                fqfn: "dense.middle".to_string(),
                 score: 10.0,
             },
             RankedSymbol {
-                fqfn: "bm25.bottom".to_string(),
+                fqfn: "dense.bottom".to_string(),
                 score: 5.0,
             },
         ];
         normalize_ranked_symbol_scores(&mut ranked);
 
-        assert_eq!(ranked[0].fqfn, "bm25.top");
+        assert_eq!(ranked[0].fqfn, "dense.top");
         assert!((ranked[0].score - 1.0).abs() < 1e-6);
         assert!((ranked[2].score as f64 - MIN_NORMALIZED_SCORE).abs() < 1e-6);
         assert!(ranked.windows(2).all(|pair| pair[0].score >= pair[1].score));
@@ -657,33 +536,21 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_profiles_hold_nominal_pool_size_constant() {
-        assert_eq!(SearchProfile::AllSignals.leg_limits(40), (40, 40, 40));
-        assert_eq!(SearchProfile::SemanticOnly.leg_limits(40), (120, 0, 0));
-        assert_eq!(
-            SearchProfile::SemanticCoeditTwoToOne.leg_limits(40),
-            (80, 0, 40)
-        );
-    }
-
-    #[test]
-    fn empty_result_serializes_profile_budgets_and_timings() {
+    fn empty_result_serializes_leg_budgets_and_timings() {
         let result = SemanticSearchResult::empty(
             vec!["building".to_string()],
-            SearchProfile::SemanticOnly,
             RetrievalLegCounts {
                 vector: 120,
-                bm25: 0,
-                coedit: 0,
+                coedit: 40,
             },
             12.5,
             Instant::now(),
         );
 
         let value = serde_json::to_value(result).unwrap();
-        assert_eq!(value["retrieval_profile"], "semantic-only");
         assert_eq!(value["requested_leg_counts"]["vector"], 120);
-        assert_eq!(value["requested_leg_counts"]["bm25"], 0);
+        assert_eq!(value["requested_leg_counts"]["coedit"], 40);
+        assert!(value.get("bm25_ranked").is_none());
         assert_eq!(value["timings"]["wait_ready_ms"], 12.5);
         assert_eq!(value["timings"]["embedding_queue_ms"], 0.0);
         assert!(value["timings"]["total_ms"].as_f64().unwrap() >= 0.0);
