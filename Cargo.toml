@@ -12,6 +12,7 @@ members = [
     "crates/bifrost-nlp",
     "crates/bifrost-php",
     "crates/bifrost-policy",
+    "crates/bifrost-rql",
     "crates/bifrost-python",
     "crates/bifrost-ruby",
     "crates/bifrost-runtime",
