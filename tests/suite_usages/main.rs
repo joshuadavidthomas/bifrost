@@ -23,6 +23,7 @@ mod issue_1854_scala_enclosing_def_shadow;
 mod issue_1855_scala_site_java_declaration;
 mod issue_1924_typescript_imported_returns;
 mod issue_1925_typescript_later_lexical_binding;
+mod javascript_top30_residuals;
 mod kotlin_member_dispatch_trace;
 mod random_alias_recovery_test;
 mod receiver_language_acceptance_matrix;

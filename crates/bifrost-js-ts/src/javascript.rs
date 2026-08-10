@@ -501,7 +501,7 @@ fn visit_js_field(
     top_level: &CodeUnit,
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
 ) {
-    let Some(name_node) = node.child_by_field_name("name") else {
+    let Some(name_node) = node.child_by_field_name("property") else {
         return;
     };
     let name = node_text(name_node, source).trim_matches('"').trim();
