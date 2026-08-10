@@ -59,7 +59,7 @@ struct FindingSummary {
 fn a_shipped_sanitize_effect_neutralizes_its_label_and_leaves_others_flowing() {
     // With the sanitizer: only the label the summary does not remove reaches a
     // sink. The `sql` flow is neutralized on the modeled transfer.
-    let sanitized = run_case(true);
+    let sanitized = run_case(true, "sql", "safe");
     assert_eq!(
         sanitized,
         vec![FindingSummary {
@@ -70,7 +70,7 @@ fn a_shipped_sanitize_effect_neutralizes_its_label_and_leaves_others_flowing() {
 
     // Without the sanitizer, the same transfer carries both labels through, so
     // both sinks fire. The difference is exactly the sanitized `sql` flow.
-    let unsanitized = run_case(false);
+    let unsanitized = run_case(false, "sql", "safe");
     assert_eq!(
         unsanitized,
         vec![
@@ -85,14 +85,87 @@ fn a_shipped_sanitize_effect_neutralizes_its_label_and_leaves_others_flowing() {
     );
 }
 
-fn run_case(include_sanitize: bool) -> Vec<FindingSummary> {
+/// The M4 sanitizer fixture (#1871) gates a held candidate into adversarial
+/// probes over each context's breakout metacharacter. This proves that a k3
+/// entry's `neutralizes: [context]` maps directly onto a shipped `Sanitize`
+/// effect's `removes: [label]`: the gate decides which label the pack removes
+/// and which one must still flow, and the taint run confirms both. The
+/// mechanism proof is label-based on a synthetic bodyless target; proving a
+/// real escaper body encodes the metacharacter stays M4's separate real-body
+/// seam (a tracked follow-up), not this test.
+#[cfg(feature = "release-tooling")]
+#[test]
+fn a_gated_k3_entry_maps_neutralizes_onto_removes_and_neutralizes_end_to_end() {
+    use brokk_bifrost::semantic_packs::summary_foundry::sanitizer::{
+        InjectionContext, SanitizerCompleteness, SanitizerEntry, SanitizerExpectation,
+        SanitizerPort, SanitizerTarget, gate_sanitizer,
+    };
+
+    // A held-shape entry: the escaper neutralizes `sql` and explicitly does not
+    // neutralize `html`.
+    let entry = SanitizerEntry {
+        target: SanitizerTarget {
+            path: "app.java".to_owned(),
+            symbol: "escape(String)".to_owned(),
+            has_receiver: true,
+            parameter_count: 1,
+        },
+        artifact: None,
+        sanitized_input: SanitizerPort::Parameter { ordinal: 0 },
+        output: serde_json::json!({ "kind": "normal_return" }),
+        neutralizes: vec![InjectionContext::Sql],
+        does_not_neutralize: vec![InjectionContext::Html],
+        completeness: SanitizerCompleteness::Complete,
+        rationale: None,
+        confidence: None,
+        citations: None,
+    };
+
+    // The gate turns the claim into adversarial probes over real breakout
+    // metacharacters: the neutralized context must encode `'`, the surviving one
+    // leaves `<` live. This is the adversarial-by-construction check.
+    let suite = gate_sanitizer(&entry).expect("a sql-neutralizing entry gates");
+    let neutralized = suite
+        .probes
+        .iter()
+        .find(|probe| probe.expectation == SanitizerExpectation::Neutralized)
+        .expect("one neutralized probe");
+    let survives = suite
+        .probes
+        .iter()
+        .find(|probe| probe.expectation == SanitizerExpectation::Survives)
+        .expect("one survives probe");
+    assert_eq!(neutralized.context, InjectionContext::Sql);
+    assert_eq!(neutralized.metacharacter, "'");
+    assert_eq!(survives.context, InjectionContext::Html);
+    assert_eq!(survives.metacharacter, "<");
+
+    // Map `neutralizes -> removes` and `does_not_neutralize -> survives`, then
+    // prove the shipped pack removes exactly the neutralized label.
+    let removed_label = neutralized.context.as_str();
+    let surviving_label = survives.context.as_str();
+    let findings = run_case(true, removed_label, surviving_label);
+    assert_eq!(
+        findings,
+        vec![FindingSummary {
+            reached_labels: vec![surviving_label.to_owned()],
+        }],
+        "the neutralized context's label is removed while the does-not-neutralize label still flows"
+    );
+}
+
+fn run_case(
+    include_sanitize: bool,
+    removed_label: &str,
+    surviving_label: &str,
+) -> Vec<FindingSummary> {
     let project = InlineTestProject::with_language(Language::Java)
         .file("app.java", FIXTURE_SOURCE)
         .build();
     let workspace = project.workspace_analyzer(AnalyzerConfig::default());
 
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
-    let pack = escape_pack(include_sanitize);
+    let pack = escape_pack(include_sanitize, removed_label);
     catalog
         .register_session_pack(
             &pack,
@@ -104,7 +177,7 @@ fn run_case(include_sanitize: bool) -> Vec<FindingSummary> {
         .expect("register the sanitizer procedure-summary pack");
     let request = semantic_model_request();
 
-    let policy_source = policy_source();
+    let policy_source = policy_source(removed_label, surviving_label);
     let inputs = [PolicyEvaluationInput::embedded(
         PolicySourceIdentity::new("test:sanitizer-summary-pack.rqlp"),
         &policy_source,
@@ -139,8 +212,11 @@ fn run_case(include_sanitize: bool) -> Vec<FindingSummary> {
     findings
 }
 
-fn policy_source() -> String {
-    r#"(policy
+fn policy_source(removed_label: &str, surviving_label: &str) -> String {
+    // `sqlSource`/`sqlSink` carry the label the summary removes; the source and
+    // sink names are fixed by the workspace, the labels are the variable.
+    format!(
+        r#"(policy
       :schema-version 1
       :id "test.sanitizer-summary-pack"
       :name "Shipped sanitizer neutralizes its label"
@@ -151,36 +227,36 @@ fn policy_source() -> String {
         :mode may
         :call-modeling (call-modeling :unmodeled require-model)
         :sources (endpoint-set :entries [
-          (source :id sql-source :display-name "sql source" :categories [input.user]
+          (source :id removed-source :display-name "removed source" :categories [input.user]
             :selector (rql :schema-version 1
               (language java (call :callee (name "sqlSource"))))
-            :bind return-value :labels [sql])
-          (source :id safe-source :display-name "safe source" :categories [input.user]
+            :bind return-value :labels [{removed_label}])
+          (source :id surviving-source :display-name "surviving source" :categories [input.user]
             :selector (rql :schema-version 1
               (language java (call :callee (name "safeSource"))))
-            :bind return-value :labels [safe])])
+            :bind return-value :labels [{surviving_label}])])
         :sinks (endpoint-set :entries [
-          (sink :id sql-sink :display-name "sql sink" :categories [data.sensitive]
+          (sink :id removed-sink :display-name "removed sink" :categories [data.sensitive]
             :selector (rql :schema-version 1
               (language java (call :callee (name "sqlSink"))))
-            :dangerous-operand (argument :index 0) :accepts [sql])
-          (sink :id safe-sink :display-name "safe sink" :categories [data.sensitive]
+            :dangerous-operand (argument :index 0) :accepts [{removed_label}])
+          (sink :id surviving-sink :display-name "surviving sink" :categories [data.sensitive]
             :selector (rql :schema-version 1
               (language java (call :callee (name "safeSink"))))
-            :dangerous-operand (argument :index 0) :accepts [safe])]))
+            :dangerous-operand (argument :index 0) :accepts [{surviving_label}])]))
       :classification (classification
         :fallback (classification-id :taxonomy "Test" :id "SANITIZER-SUMMARY")))"#
-        .to_owned()
+    )
 }
 
-fn escape_pack(include_sanitize: bool) -> CompiledSemanticModelPack {
+fn escape_pack(include_sanitize: bool, removed_label: &str) -> CompiledSemanticModelPack {
     let mut effects = Vec::new();
     if include_sanitize {
         effects.push(serde_json::json!({
             "kind": "sanitize",
             "input": { "kind": "parameter", "ordinal": 0 },
             "output": { "kind": "normal_return" },
-            "removes": ["sql"]
+            "removes": [removed_label]
         }));
     }
     let source = serde_json::to_vec(&serde_json::json!({
