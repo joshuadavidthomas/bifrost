@@ -530,6 +530,7 @@ fn summarize_symbol_targets_with_cancellation(
     let mut summaries = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
+    let mut too_broad = Vec::new();
 
     for target in targets {
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
@@ -588,7 +589,29 @@ fn summarize_symbol_targets_with_cancellation(
                 }
             }
         }
-        match resolve_selectable_definitions(analyzer, &target, resolve_codeunit_fuzzy) {
+        // #1908 fix D replaces this with the request's cancellation token.
+        let keep_going = || true;
+        let resolution =
+            resolve_selectable_definitions_bounded(analyzer, &target, |analyzer, lookup| {
+                resolve_codeunit_fuzzy_bounded(
+                    analyzer,
+                    lookup,
+                    FuzzyResolveBudget::new(&keep_going, SYMBOL_TOOL_MAX_RESOLUTION_CANDIDATES),
+                )
+            });
+        let resolution = match resolution {
+            Ok(resolution) => resolution,
+            // The selector names more declarations than this tool will
+            // summarize. Reported by its count, with no candidate list: the
+            // list is the work the cap skipped (#1908).
+            Err(FuzzyResolveStop::TooManyCandidates { total, limit }) => {
+                too_broad.push(too_broad_resolution_candidates(&target, total, limit));
+                continue;
+            }
+            // Same handling as the cancellation check at the top of this loop.
+            Err(FuzzyResolveStop::Cancelled) => break,
+        };
+        match resolution {
             SelectableDefinitionResolution::Resolved(code_units) => {
                 extend_symbol_summaries(
                     analyzer,
@@ -618,7 +641,7 @@ fn summarize_symbol_targets_with_cancellation(
         not_found,
         ambiguous,
         ambiguous_paths: Vec::new(),
-        too_broad: Vec::new(),
+        too_broad,
     }
 }
 
@@ -938,6 +961,9 @@ fn summarize_routed_targets_with_cancellation(
     file_output.summaries.extend(symbol_output.summaries);
     file_output.listings = summary_targets.listings.clone();
     file_output.too_broad = summary_targets.too_broad.clone();
+    // Routing reports file fan-out; symbol summarization reports resolution
+    // fan-out (#1908). One target can only produce one of them.
+    file_output.too_broad.extend(symbol_output.too_broad);
     file_output.not_found.extend(symbol_output.not_found);
     file_output.ambiguous.extend(symbol_output.ambiguous);
     file_output

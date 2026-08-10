@@ -6,8 +6,8 @@ use crate::searchtools::{
     ScanUsagesInput, ScanUsagesResult, ScanUsagesStatus, SearchSymbolHit, SearchSymbolsFile,
     SearchSymbolsResult, SkimFile, SkimFilesResult, SourceBlock, SummaryBlock, SummaryElement,
     SummaryResult, SymbolAncestors, SymbolAncestorsResult, SymbolLocation, SymbolLocationsResult,
-    SymbolSourcesResult, TooBroadScope, TooManySymbolMatches, UsageFileGroup, UsageGraphResult,
-    UsageLocation, scan_usages_target_label,
+    SymbolSourcesResult, TooBroadMatch, TooBroadScope, TooManySymbolMatches, UsageFileGroup,
+    UsageGraphResult, UsageLocation, scan_usages_target_label,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -888,21 +888,38 @@ fn render_ambiguous_paths(paths: &[AmbiguousPathInput]) -> String {
 }
 
 fn render_too_broad_scope(scope: &TooBroadScope) -> String {
-    // A scope is only reported once it matched more files than the cap, so it
-    // always carries at least one sample path.
-    assert!(
-        !scope.sample.is_empty(),
-        "too-broad scope without a sample: {scope:?}"
-    );
-    [
-        format!(
-            "Too broad: target {} matched {} files, over the {} file limit for one target, so it was skipped.",
-            scope.target, scope.matched, scope.cap
-        ),
-        format!("Sample of the match: {}", scope.sample.join(", ")),
-        "Narrow the target to a subdirectory, list the specific files you want, or call list_symbols for an outline of the whole match.".to_string(),
-    ]
-    .join("\n")
+    match scope.matched_kind {
+        TooBroadMatch::Files => {
+            // A file scope is only reported once it matched more files than
+            // the cap, so it always carries at least one sample path.
+            assert!(
+                !scope.sample.is_empty(),
+                "too-broad file scope without a sample: {scope:?}"
+            );
+            [
+                format!(
+                    "Too broad: target {} matched {} files, over the {} file limit for one target, so it was skipped.",
+                    scope.target, scope.matched, scope.cap
+                ),
+                format!("Sample of the match: {}", scope.sample.join(", ")),
+                "Narrow the target to a subdirectory, list the specific files you want, or call list_symbols for an outline of the whole match.".to_string(),
+            ]
+            .join("\n")
+        }
+        // No sample by construction: the candidate list is the work the cap
+        // skipped (#1908). Same wording as `scan_usages`, which applies the
+        // same cap to the same resolution phase.
+        TooBroadMatch::Declarations => {
+            assert!(
+                scope.sample.is_empty(),
+                "a skipped resolution fan-out cannot carry a sample: {scope:?}"
+            );
+            format!(
+                "Too broad: target {} matched {} declarations, over the {}-declaration resolution limit for one selector, so no candidate list was produced.\nQualify the symbol (add its owner or module), or pick one declaration with `path#symbol`, and re-call.",
+                scope.target, scope.matched, scope.cap
+            )
+        }
+    }
 }
 
 fn render_skim_file(file: &SkimFile) -> String {
