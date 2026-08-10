@@ -1,0 +1,147 @@
+[
+  {
+    "target": {
+      "path": "java.base/java/lang/Integer.java",
+      "symbol": "java.lang.Integer.intValue()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the int value the receiver wraps, so the receiver reaches normal_return. There is no parameter and the receiver is not mutated. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Integer.intValue(); JDK java.lang.Integer source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/Integer.java",
+      "symbol": "java.lang.Integer.toString(int)",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the decimal representation of the argument, so the argument's value reaches normal_return. The int is the only input and there are no other outputs. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Integer.toString(int); JDK java.lang.Integer source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/Integer.java",
+      "symbol": "java.lang.Integer.valueOf(int)",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is an Integer wrapping the argument (a cached instance for small values, a new one otherwise), so the argument's value reaches normal_return in both cases. The int is the only input and there are no other outputs. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Integer.valueOf(int); JDK java.lang.Integer source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Optional.java",
+      "symbol": "java.util.Optional.get()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the value the Optional holds, so the receiver reaches normal_return. When the Optional is empty the method throws NoSuchElementException, which carries no value derived from the receiver. There is no parameter and the receiver is not mutated.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Optional.get(); JDK java.util.Optional source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Optional.java",
+      "symbol": "java.util.Optional.of(java.lang.Object)",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a new Optional holding the argument as its value, so the argument reaches normal_return. A null argument throws NullPointerException, which carries no flow. The argument is the only input and there are no other outputs.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Optional.of; JDK java.util.Optional source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Optional.java",
+      "symbol": "java.util.Optional.ofNullable(java.lang.Object)",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "A non-null argument becomes the value of the returned Optional, so it reaches normal_return; a null argument yields Optional.empty(), which carries no flow. The argument is the only input and there are no other outputs. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Optional.ofNullable; JDK java.util.Optional source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Optional.java",
+      "symbol": "java.util.Optional.orElse(java.lang.Object)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "When the receiver holds a value the result is that value (receiver to normal_return); when it is empty the result is the argument (parameter 0 to normal_return). Neither input reaches the receiver because the Optional is not mutated. These two transfers cover every input-to-output pair.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Optional.orElse; JDK java.util.Optional source. No CodeQL or Joern model consulted."
+  }
+]
