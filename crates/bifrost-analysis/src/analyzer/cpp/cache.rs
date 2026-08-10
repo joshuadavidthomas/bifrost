@@ -65,6 +65,9 @@ fn weight_code_unit(unit: &CodeUnit) -> usize {
 /// bucketed by owner terminal, so a hot identifier on a whale repo is thousands
 /// of units. Weighed by content like its siblings rather than counted, so the
 /// cell cannot hold an unbounded amount of the workspace.
+// `&String`, not `&str`: moka's weigher is `Fn(&K, &V)` and the cell is keyed
+// by `String`.
+#[allow(clippy::ptr_arg)]
 pub(super) fn weight_reconcile_candidates(
     key: &String,
     value: &Arc<CppReconcileCandidates>,
