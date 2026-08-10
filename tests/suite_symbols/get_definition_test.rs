@@ -34254,7 +34254,8 @@ fn python_block_nested_reexport_after_a_declaration_resolves_to_the_later_bindin
 
 // Issue #1782: JavaScript hoists a `var` binder to its enclosing function, so a
 // use before the declaration, or after a block that declares it, still names
-// the same binder. `let`/`const` keep block scoping and their TDZ.
+// the same binder. `let`/`const` keep block scoping. A read in their TDZ is a
+// runtime error, but definition lookup still resolves the lexical identity.
 fn javascript_var_scoping_definition(source: &str, reference: &str) -> serde_json::Value {
     let project = InlineTestProject::with_language(Language::JavaScript)
         .file("mod.js", source)
@@ -34357,12 +34358,14 @@ fn javascript_function_declaration_hoists_above_its_use_in_the_same_function() {
 }
 
 #[test]
-fn javascript_lexical_binder_used_before_its_declaration_reports_no_definition() {
+fn javascript_lexical_binder_used_before_its_declaration_resolves_its_identity() {
     let value = javascript_var_scoping_definition(
         JAVASCRIPT_LEXICAL_USE_BEFORE_DECLARATION,
         "toBigNumber(val",
     );
-    assert_eq!(value["results"][0]["status"], "no_definition", "{value}");
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(result["definitions"][0]["start_line"], 5, "{value}");
 }
 
 #[test]

@@ -367,7 +367,16 @@ fn direct_object_pair_receiver<'tree>(
         return None;
     }
     let object = pair.parent().filter(|parent| parent.kind() == "object")?;
-    let bound = object.parent()?;
+    let mut value = object;
+    while let Some(parent) = value.parent()
+        && parent.kind() == "parenthesized_expression"
+        && parent
+            .named_child(0)
+            .is_some_and(|child| child.id() == value.id())
+    {
+        value = parent;
+    }
+    let bound = value.parent()?;
     // The literal is the whole value of a binding, so its keys are properties of
     // whatever that binding names: `const x = { key: ... }` mints `x.key`, and
     // `x.y = { key: ... }` mints `x.y.key`. A chained receiver is kept whole --
@@ -375,11 +384,11 @@ fn direct_object_pair_receiver<'tree>(
     let receiver = match bound.kind() {
         "variable_declarator" => bound
             .child_by_field_name("value")
-            .filter(|value| value.id() == object.id())
+            .filter(|bound_value| bound_value.id() == value.id())
             .and_then(|_| bound.child_by_field_name("name")),
         "assignment_expression" => bound
             .child_by_field_name("right")
-            .filter(|right| right.id() == object.id())
+            .filter(|right| right.id() == value.id())
             .and_then(|_| bound.child_by_field_name("left")),
         _ => None,
     }?;
@@ -465,13 +474,26 @@ fn node_scope(node: Node<'_>) -> JsTsLexicalBindingScope {
 }
 
 fn variable_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
-    let is_var = node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "variable_declaration");
-    if is_var {
-        return enclosing_var_binding_scope(node);
+    js_ts_variable_declarator_binding_scope(node).map(node_scope)
+}
+
+/// The lexical scope that owns a JavaScript or TypeScript variable declarator.
+///
+/// `var` attaches to its nearest function or program. `let` and `const` attach
+/// to their nearest block-like scope. The declaration order does not change
+/// that identity: a lexical binding exists for its complete scope, including
+/// its temporal-dead-zone portion before initialization.
+pub fn js_ts_variable_declarator_binding_scope<'tree>(
+    declarator: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if declarator.kind() != "variable_declarator" {
+        return None;
     }
-    let mut current = node.parent();
+    let declaration = declarator.parent()?;
+    if declaration.kind() == "variable_declaration" {
+        return var_binding_scope_node(declaration);
+    }
+    let mut current = Some(declaration);
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
@@ -482,7 +504,7 @@ fn variable_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
                 | "switch_body"
                 | "catch_clause"
         ) {
-            return Some(node_scope(parent));
+            return Some(parent);
         }
         current = parent.parent();
     }
@@ -502,7 +524,7 @@ pub fn js_ts_var_declarator_binding_scope<'tree>(declarator: Node<'tree>) -> Opt
     if declaration.kind() != "variable_declaration" {
         return None;
     }
-    var_binding_scope_node(declaration)
+    js_ts_variable_declarator_binding_scope(declarator)
 }
 
 fn var_binding_scope_node(node: Node<'_>) -> Option<Node<'_>> {

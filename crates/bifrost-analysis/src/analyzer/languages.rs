@@ -33,6 +33,18 @@ use crate::hash::{HashMap, HashSet};
 use std::any::Any;
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalDeclarationVisibility {
+    Lexical,
+    Hoisted,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalDeclarationBindingScope<'tree> {
+    pub scope: tree_sitter::Node<'tree>,
+    pub visibility: LocalDeclarationVisibility,
+}
+
 pub(crate) trait LanguageSupport: Send + Sync {
     /// The `Language` variant this support serves. Must equal the registry match key.
     fn language(&self) -> Language;
@@ -215,6 +227,26 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// `init_declarator` inside a recovered exported class body, where the parse shape of a
     /// member declaration is indistinguishable from a local one.
     fn skips_local_declaration(&self, _node: tree_sitter::Node<'_>, _source: &str) -> bool {
+        false
+    }
+
+    /// The syntax scope that owns a local declaration whose binding rules differ from
+    /// ordinary source-order visibility. `None` keeps the framework's default rule that
+    /// a local declaration is visible only after its declaration. JavaScript and
+    /// TypeScript return their structured variable-binding scope and state whether the
+    /// binding is lexical or hoisted.
+    fn local_declaration_binding_scope<'tree>(
+        &self,
+        _node: tree_sitter::Node<'tree>,
+    ) -> Option<LocalDeclarationBindingScope<'tree>> {
+        None
+    }
+
+    /// Whether the lexical resolver must traverse syntax after the focused byte to find
+    /// declarations that bind earlier source positions. A declaration found there is
+    /// still accepted only when [`Self::local_declaration_binding_scope`] proves that the
+    /// current syntax scope owns it.
+    fn scans_local_declarations_after_focus(&self) -> bool {
         false
     }
 

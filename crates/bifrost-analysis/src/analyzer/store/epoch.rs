@@ -403,11 +403,13 @@ mod query_content_tests {
 // moved from this crate's `resources/treesitter/javascript/` into
 // `brokk-bifrost-js-ts`, so the salted content now comes from a different
 // crate's `include_str!`.
+// Salt bumped again (#1926): JavaScript `field_definition` uses the structured
+// `property` field. Reading it now indexes public and private class fields.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08"
 );
 // TS salt bumped again (#1167): `is_simple_ts_initializer` now includes
 // `regex` (a regex-initialized binding renders its initializer inline in the

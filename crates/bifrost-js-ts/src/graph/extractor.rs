@@ -4,7 +4,7 @@ use crate::graph::hits::{
 };
 use crate::graph::receiver_analysis::JsTsReceiverFactProvider;
 use crate::graph::resolver::{
-    JsTsUsageIndex, browser_global_property_shape, is_static_member, member_name,
+    JsTsUsageIndex, browser_global_property_shape, is_static_member, member_name, target_language,
     unbound_browser_global_property,
 };
 use crate::imports::require_call_module_specifier;
@@ -25,7 +25,7 @@ use brokk_bifrost_core::analyzer::usages::local_inference::{
 };
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ExportIndex, UsageHit};
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
-    ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
+    ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
 };
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile, Range};
 use brokk_bifrost_core::cancellation::CancellationToken;
@@ -95,6 +95,8 @@ pub fn scan_files_for_seeds(
     let target_short = target_seed_identifier(target, target_owner.as_ref());
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
+    let script_global_bare_target =
+        target_member.is_none() && unique_script_global_binding(analyzer, target, &target_short);
 
     let files_vec: Vec<&ProjectFile> = files.iter().collect();
 
@@ -165,13 +167,15 @@ pub fn scan_files_for_seeds(
         }
 
         let root = tree_ref.root_node();
+        let file_is_script = !js_program_is_external_module(root, source_str);
         // The global-property model needs this file's bindings too: a reading file
         // that binds the receiver root reads its own object, exactly as it does in
         // the declaring file.
         let lexical_bindings = (((browser_global_object.is_some() || direct_local_property)
             && target_self_file)
-            || !global_property_receivers.is_empty())
-        .then(|| JsTsLexicalBindingIndex::build(root, source_str));
+            || !global_property_receivers.is_empty()
+            || script_global_bare_target)
+            .then(|| JsTsLexicalBindingIndex::build(root, source_str));
         // Both remaining same-file models read the declaring file's byte ranges, so
         // they stay confined to it however the bindings above were built.
         let browser_global_object = lexical_bindings
@@ -226,6 +230,8 @@ pub fn scan_files_for_seeds(
             lookup_only_local_property,
             local_property_definitions,
             global_property_receivers: &global_property_receivers,
+            script_global_bare_target,
+            file_is_script,
             edges: &edges,
             seeds,
             target_self_file,
@@ -234,6 +240,7 @@ pub fn scan_files_for_seeds(
             target_owner_source: target_owner_source.as_ref(),
             imports,
             receiver_facts,
+            language,
             lexical_bindings,
             scope_stack: vec![HashMap::default()],
             lexical_shadow_scopes: Vec::new(),
@@ -305,6 +312,49 @@ fn function_target_has_non_program_local_receiver(
         })
 }
 
+fn unique_script_global_binding(
+    analyzer: &dyn CodeUnitIndex,
+    target: &CodeUnit,
+    name: &str,
+) -> bool {
+    let target_fqn = target.fq_name();
+    let mut candidates = analyzer
+        .definitions(&target_fqn)
+        .filter(|candidate| code_unit_is_script_global_binding(analyzer, candidate, name));
+    candidates.next().as_ref() == Some(target) && candidates.next().is_none()
+}
+
+fn code_unit_is_script_global_binding(
+    analyzer: &dyn CodeUnitIndex,
+    candidate: &CodeUnit,
+    name: &str,
+) -> bool {
+    let language = target_language(candidate);
+    let Ok(source) = candidate.source().read_to_string() else {
+        return false;
+    };
+    let Some(parser_language) = js_ts_tree_sitter_language_for_file(candidate.source(), language)
+    else {
+        return false;
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&parser_language).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if js_program_is_external_module(root, source.as_str()) {
+        return false;
+    }
+    let bindings = JsTsLexicalBindingIndex::build(root, source.as_str());
+    analyzer
+        .ranges(candidate)
+        .iter()
+        .any(|range| bindings.is_program_binding_at(name, range.start_byte, root))
+}
+
 pub struct ScanCtx<'a> {
     pub file: &'a ProjectFile,
     pub source: &'a str,
@@ -327,6 +377,10 @@ pub struct ScanCtx<'a> {
     /// Receiver chains the declaring file binds at program scope in a browser
     /// script, so any other script reading the same chain reads this target.
     global_property_receivers: &'a [GlobalPropertyReceiver],
+    /// A unique program-scope declaration in a classic script. Other classic
+    /// scripts share this bare binding; modules and lexical shadows do not.
+    script_global_bare_target: bool,
+    file_is_script: bool,
     /// Import edges from this file that resolve to the target's seed set.
     edges: &'a [ImportEdge],
     /// Exported names that resolve to the target, including local and re-export aliases.
@@ -339,6 +393,7 @@ pub struct ScanCtx<'a> {
     target_owner_source: Option<&'a ProjectFile>,
     imports: JsTsImportBinder,
     receiver_facts: JsTsReceiverFactProvider<'a, 'a>,
+    language: Language,
     lexical_bindings: Option<JsTsLexicalBindingIndex>,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     lexical_shadow_scopes: Vec<HashSet<String>>,
@@ -361,6 +416,16 @@ struct LocalPropertyDefinition {
     receiver_members: Vec<String>,
     scope: JsTsLexicalBindingScope,
     property_range: Range,
+    aliases: Vec<LocalPropertyReceiverAlias>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalPropertyReceiverAlias {
+    receiver_root: String,
+    receiver_members: Vec<String>,
+    binding_scope: Option<JsTsLexicalBindingScope>,
+    enclosing_class_range: Option<(usize, usize)>,
+    enclosing_function_range: Option<(usize, usize)>,
 }
 
 /// A receiver chain (`WLT`, or `WLT.Inner`) whose root the declaring file binds
@@ -446,7 +511,7 @@ fn collect_local_property_definitions(
             }
             let scope = lexical_bindings
                 .binding_scope_at(receiver_root, fact.receiver.root.start_byte())?;
-            let definition = LocalPropertyDefinition {
+            let mut definition = LocalPropertyDefinition {
                 receiver_root: receiver_root.to_string(),
                 receiver_members: fact
                     .receiver
@@ -456,10 +521,158 @@ fn collect_local_property_definitions(
                     .collect(),
                 scope,
                 property_range: fact.property_range,
+                aliases: Vec::new(),
             };
+            definition.aliases = chained_assignment_aliases_for_local_property(
+                root,
+                source,
+                lexical_bindings,
+                &definition,
+            );
             Some(definition)
         })
         .collect()
+}
+
+fn chained_assignment_aliases_for_local_property(
+    root: Node<'_>,
+    source: &str,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    definition: &LocalPropertyDefinition,
+) -> Vec<LocalPropertyReceiverAlias> {
+    let mut latest_declarator = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= definition.property_range.start_byte {
+            continue;
+        }
+        if node.kind() == "variable_declarator"
+            && let Some(name) = node.child_by_field_name("name")
+            && name.kind() == "identifier"
+            && slice(name, source) == definition.receiver_root
+            && lexical_bindings.binding_scope_at(&definition.receiver_root, name.start_byte())
+                == Some(definition.scope)
+            && latest_declarator
+                .is_none_or(|latest: Node<'_>| latest.start_byte() < node.start_byte())
+        {
+            latest_declarator = Some(node);
+        }
+
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+
+    let Some(mut expression) = latest_declarator.and_then(|node| node.child_by_field_name("value"))
+    else {
+        return Vec::new();
+    };
+    let mut aliases = Vec::new();
+    loop {
+        expression = unwrap_parenthesized_expression(expression);
+        if expression.kind() != "assignment_expression" {
+            break;
+        }
+        let (Some(left), Some(right)) = (
+            expression.child_by_field_name("left"),
+            expression.child_by_field_name("right"),
+        ) else {
+            break;
+        };
+        if let Some(alias) = local_property_receiver_alias(left, source, lexical_bindings) {
+            aliases.push(alias);
+        }
+        expression = right;
+    }
+    aliases
+}
+
+fn unwrap_parenthesized_expression(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "parenthesized_expression" {
+        let Some(child) = node.named_child(0) else {
+            break;
+        };
+        node = child;
+    }
+    node
+}
+
+fn local_property_receiver_alias(
+    node: Node<'_>,
+    source: &str,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+) -> Option<LocalPropertyReceiverAlias> {
+    let mut current = node;
+    let mut members = Vec::new();
+    while current.kind() == "member_expression" {
+        let property = current.child_by_field_name("property")?;
+        if !matches!(
+            property.kind(),
+            "property_identifier" | "private_property_identifier"
+        ) {
+            return None;
+        }
+        let member = slice(property, source);
+        if member.is_empty() {
+            return None;
+        }
+        members.push(member.to_string());
+        current = current.child_by_field_name("object")?;
+    }
+    members.reverse();
+
+    let receiver_root = slice(current, source);
+    if receiver_root.is_empty() {
+        return None;
+    }
+    match current.kind() {
+        "identifier" => Some(LocalPropertyReceiverAlias {
+            receiver_root: receiver_root.to_string(),
+            receiver_members: members,
+            binding_scope: lexical_bindings.binding_scope_at(receiver_root, current.start_byte()),
+            enclosing_class_range: None,
+            enclosing_function_range: enclosing_function_range(current),
+        })
+        .filter(|alias| alias.binding_scope.is_some()),
+        "this" => {
+            enclosing_class_range(current).map(|enclosing_class_range| LocalPropertyReceiverAlias {
+                receiver_root: receiver_root.to_string(),
+                receiver_members: members,
+                binding_scope: None,
+                enclosing_class_range: Some(enclosing_class_range),
+                enclosing_function_range: enclosing_function_range(current),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn enclosing_class_range(mut node: Node<'_>) -> Option<(usize, usize)> {
+    loop {
+        if matches!(node.kind(), "class" | "class_declaration") {
+            return Some((node.start_byte(), node.end_byte()));
+        }
+        node = node.parent()?;
+    }
+}
+
+fn enclosing_function_range(mut node: Node<'_>) -> Option<(usize, usize)> {
+    loop {
+        if matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "generator_function_declaration"
+                | "method_definition"
+        ) {
+            return Some((node.start_byte(), node.end_byte()));
+        }
+        node = node.parent()?;
+    }
 }
 
 fn local_property_read_matches(
@@ -469,24 +682,22 @@ fn local_property_read_matches(
     lexical_bindings: &JsTsLexicalBindingIndex,
     definitions: &[LocalPropertyDefinition],
 ) -> bool {
-    let Some(receiver) = static_member_receiver(object, source) else {
-        return false;
-    };
-    let receiver_root = slice(receiver.root, source);
-    let Some(scope) = lexical_bindings.binding_scope_at(receiver_root, receiver.root.start_byte())
-    else {
+    let Some(receiver) = local_property_receiver_alias(object, source, lexical_bindings) else {
         return false;
     };
     definitions.iter().any(|definition| {
-        definition.receiver_root == receiver_root
-            && definition.receiver_members.len() == receiver.members.len()
-            && definition
-                .receiver_members
-                .iter()
-                .zip(&receiver.members)
-                .all(|(expected, actual)| expected == slice(*actual, source))
-            && definition.scope == scope
-            && definition.property_range.end_byte <= property.start_byte()
+        let direct = definition.receiver_root == receiver.receiver_root
+            && definition.receiver_members == receiver.receiver_members
+            && receiver.binding_scope == Some(definition.scope);
+        let alias = definition.aliases.iter().any(|alias| {
+            alias.receiver_root == receiver.receiver_root
+                && alias.receiver_members == receiver.receiver_members
+                && alias.binding_scope == receiver.binding_scope
+                && alias.enclosing_class_range == receiver.enclosing_class_range
+                && (alias.enclosing_function_range != receiver.enclosing_function_range
+                    || definition.property_range.end_byte <= property.start_byte())
+        });
+        direct && definition.property_range.end_byte <= property.start_byte() || alias
     })
 }
 
@@ -548,6 +759,9 @@ impl ScanCtx<'_> {
             .iter()
             .any(|edge| edge.local_name == ident && edge_binds_bare_identifier(edge))
         {
+            return true;
+        }
+        if self.script_global_bare_target && self.file_is_script && ident == self.target_short {
             return true;
         }
         // In the target's own file, the bare class/function name is itself a reference
@@ -1864,6 +2078,9 @@ fn member_object_match_status(
     }) {
         return match binding {
             LocalBinding::TargetReceiver => ReceiverMatchStatus::Proven,
+            LocalBinding::KnownUnrelated if ctx.language == Language::TypeScript => {
+                receiver_fact_match_status(node, ctx)
+            }
             LocalBinding::KnownUnrelated => ReceiverMatchStatus::NoMatch,
             LocalBinding::Other
                 if simple_identifier_text(node, ctx.source)
@@ -1892,10 +2109,10 @@ fn receiver_fact_match_status(node: Node<'_>, ctx: &ScanCtx<'_>) -> ReceiverMatc
         .resolve_receiver_node(node, ReceiverAnalysisBudget::default())
     {
         ReceiverAnalysisOutcome::Precise(values) => {
-            if values.iter().any(|value| {
-                let resolved = value.owner();
-                resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
-            }) {
+            if values
+                .iter()
+                .any(|value| receiver_value_matches_owner(value, owner))
+            {
                 ReceiverMatchStatus::Proven
             } else if node.kind() == "call_expression" {
                 ReceiverMatchStatus::Unproven
@@ -1904,10 +2121,10 @@ fn receiver_fact_match_status(node: Node<'_>, ctx: &ScanCtx<'_>) -> ReceiverMatc
             }
         }
         ReceiverAnalysisOutcome::Ambiguous(values) => {
-            if values.iter().any(|value| {
-                let resolved = value.owner();
-                resolved.source() == owner.source() && resolved.fq_name() == owner.fq_name()
-            }) {
+            if values
+                .iter()
+                .any(|value| receiver_value_matches_owner(value, owner))
+            {
                 ReceiverMatchStatus::Unproven
             } else {
                 ReceiverMatchStatus::NoMatch
@@ -1916,6 +2133,27 @@ fn receiver_fact_match_status(node: Node<'_>, ctx: &ScanCtx<'_>) -> ReceiverMatc
         ReceiverAnalysisOutcome::Unknown
         | ReceiverAnalysisOutcome::Unsupported { .. }
         | ReceiverAnalysisOutcome::ExceededBudget { .. } => ReceiverMatchStatus::Unproven,
+    }
+}
+
+fn receiver_value_matches_owner(mut value: &ReceiverValue, owner: &CodeUnit) -> bool {
+    loop {
+        match value {
+            ReceiverValue::FactoryReturn {
+                factory,
+                value: returned,
+            } => {
+                if factory.source() == owner.source() && factory.fq_name() == owner.fq_name() {
+                    return true;
+                }
+                value = returned;
+            }
+            _ => {
+                let resolved = value.owner();
+                return resolved.source() == owner.source()
+                    && resolved.fq_name() == owner.fq_name();
+            }
+        }
     }
 }
 

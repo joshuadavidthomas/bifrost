@@ -33,7 +33,8 @@ use crate::analyzer::common::language_for_target;
 use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
-    LanguageEdgeWeights, LanguageSupport, ReceiverFactsFactory, analyzable_file_count,
+    LanguageEdgeWeights, LanguageSupport, LocalDeclarationBindingScope, LocalDeclarationVisibility,
+    ReceiverFactsFactory, analyzable_file_count,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::GraphUsageAnalyzer;
@@ -51,7 +52,23 @@ use crate::analyzer::{
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
 use brokk_bifrost_js_ts::model::module_code_unit;
+use brokk_bifrost_js_ts::syntax::js_ts_variable_declarator_binding_scope;
 use std::sync::LazyLock;
+
+fn js_ts_local_declaration_binding_scope<'tree>(
+    node: tree_sitter::Node<'tree>,
+) -> Option<LocalDeclarationBindingScope<'tree>> {
+    let scope = js_ts_variable_declarator_binding_scope(node)?;
+    let visibility = if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "variable_declaration")
+    {
+        LocalDeclarationVisibility::Hoisted
+    } else {
+        LocalDeclarationVisibility::Lexical
+    };
+    Some(LocalDeclarationBindingScope { scope, visibility })
+}
 
 static JS_TS_COGNITIVE_CONFIG: LazyLock<cognitive_complexity::Config> =
     LazyLock::new(|| cognitive_complexity::Config {
@@ -172,6 +189,17 @@ impl LanguageSupport for JavascriptSupport {
         Some(&JsTsReceiverFacts)
     }
 
+    fn local_declaration_binding_scope<'tree>(
+        &self,
+        node: tree_sitter::Node<'tree>,
+    ) -> Option<LocalDeclarationBindingScope<'tree>> {
+        js_ts_local_declaration_binding_scope(node)
+    }
+
+    fn scans_local_declarations_after_focus(&self) -> bool {
+        true
+    }
+
     fn parser_language(&self, _flavor: ParserFlavor) -> tree_sitter::Language {
         tree_sitter_javascript::LANGUAGE.into()
     }
@@ -200,6 +228,17 @@ impl LanguageSupport for TypescriptSupport {
 
     fn source_identifier<'s>(&self, identifier: &'s str) -> &'s str {
         identifier.strip_suffix("$static").unwrap_or(identifier)
+    }
+
+    fn local_declaration_binding_scope<'tree>(
+        &self,
+        node: tree_sitter::Node<'tree>,
+    ) -> Option<LocalDeclarationBindingScope<'tree>> {
+        js_ts_local_declaration_binding_scope(node)
+    }
+
+    fn scans_local_declarations_after_focus(&self) -> bool {
+        true
     }
 
     fn declaration_ranges_limited(
