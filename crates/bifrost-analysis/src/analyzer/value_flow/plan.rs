@@ -1768,6 +1768,7 @@ impl ValueFlowPlan {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit_modeled_transfers<'a>(
         &'a self,
         call: &CallSiteHandle,

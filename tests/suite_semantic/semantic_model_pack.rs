@@ -480,7 +480,10 @@ fn invalid_procedure_summary_targets_ports_locations_and_completeness_fail_close
         output: AuthoredSummaryOutput::NormalReturn {},
         removes: vec!["sql".to_owned()],
     });
-    cases.push((sanitize_without_transfer, "summary.sanitize_without_transfer"));
+    cases.push((
+        sanitize_without_transfer,
+        "summary.sanitize_without_transfer",
+    ));
 
     for (authored, expected_code) in cases {
         let diagnostics = compile_pack(&authored, &CompilerOptions::default()).unwrap_err();
