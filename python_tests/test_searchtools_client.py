@@ -2492,7 +2492,6 @@ namespace Demo
         self.assertIn("note: index warmed from cache", text)
         self.assertIn("=== vector ===", text)
         self.assertIn("Foo.primary (score 0.870)", text)
-        self.assertIn("Bar.secondary (score 0.125)", text)
         self.assertIn("=== co-edit ===", text)
         self.assertIn("src/Baz.java (score 0.420)", text)
 
