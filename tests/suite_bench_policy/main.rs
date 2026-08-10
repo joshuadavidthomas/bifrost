@@ -41,6 +41,11 @@ mod policy_source;
 mod policy_suppression_evaluation;
 mod policy_suppression_loading;
 mod sanitizer_summary_pack;
+// Stage 4 of the procedure-summary foundry (#1871, #1923): the shipped k3
+// sanitizer packs. The converter that produces them is generation-time tooling
+// behind `release-tooling`, so this acceptance runs with that feature enabled.
+#[cfg(feature = "release-tooling")]
+mod sanitizer_pack_shipping;
 mod scan_usages_same_owner_policy;
 // Milestone 3 of the procedure-summary foundry (#1871). The fixture engine and
 // its runner are generation-time tooling behind `release-tooling`, so this

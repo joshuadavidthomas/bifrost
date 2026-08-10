@@ -23,6 +23,7 @@ pub mod ir;
 pub mod joern;
 pub mod join;
 pub mod sanitizer;
+pub mod sanitizer_pack;
 pub mod store;
 pub mod taint_policy;
 
