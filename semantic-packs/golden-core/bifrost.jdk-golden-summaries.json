@@ -1247,6 +1247,30 @@
             "effects": []
           },
           {
+            "id": "java.net.urldecoder.decode-java.lang.string-java.lang.string",
+            "target": {
+              "path": "java.base/java/net/URLDecoder.java",
+              "symbol": "java.net.URLDecoder.decode(java.lang.String,java.lang.String)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "normal_return"
+                }
+              }
+            ],
+            "effects": []
+          },
+          {
             "id": "java.util.arrays.aslist-java.lang.object",
             "target": {
               "path": "java.base/java/util/Arrays.java",
