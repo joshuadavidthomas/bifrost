@@ -17,7 +17,7 @@ fn main() -> Result<(), String> {
     use std::time::Instant;
 
     use brokk_bifrost::{
-        AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer, nlp::bm25::fts_text,
+        AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
         nlp::chunker::extract_file_chunks,
     };
 
@@ -68,22 +68,6 @@ fn main() -> Result<(), String> {
                 file.rel_path().display(),
                 chunks.chunks.len()
             );
-        }
-        // Mirror raw-source BM25 tokenization performed after extraction.
-        for c in &chunks.chunks {
-            let ft = Instant::now();
-            let _ = fts_text(&c.source_text);
-            let fms = ft.elapsed().as_millis();
-            if fms >= warn_ms {
-                let mut h = stderr.lock();
-                let _ = writeln!(
-                    h,
-                    "[probe] SLOW-FTS {fms}ms body bytes={} in {}",
-                    c.source_text.len(),
-                    file.rel_path().display()
-                );
-                let _ = h.flush();
-            }
         }
     }
     eprintln!("[probe] done — no file hung");

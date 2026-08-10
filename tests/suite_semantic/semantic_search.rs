@@ -1,6 +1,6 @@
 //! End-to-end semantic_search pipeline test with deterministic fake engines:
-//! index build -> vector scan -> grounded bm25 -> co-edit relevance, returned as
-//! three independent ranked lists.
+//! hydration -> bounded dense candidate scan -> per-hit liveness resolution ->
+//! co-edit relevance, returned as two independent ranked lists.
 
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -12,9 +12,7 @@ use brokk_bifrost::nlp::query::{SemanticSearchParams, SemanticSearchResult, sema
 use brokk_bifrost::{AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer};
 
 fn all_legs_empty(result: &SemanticSearchResult) -> bool {
-    result.vector_ranked.is_empty()
-        && result.bm25_ranked.is_empty()
-        && result.coedit_ranked.is_empty()
+    result.vector_ranked.is_empty() && result.coedit_ranked.is_empty()
 }
 
 fn assert_normalized_symbol_scores(scores: impl IntoIterator<Item = f32>) {
@@ -166,7 +164,7 @@ impl EngineProvider for PanickingEngineProvider {
 }
 
 #[test]
-fn semantic_search_returns_constituent_rankings() {
+fn semantic_search_returns_every_live_function_in_the_dense_leg() {
     let dir = tempfile::tempdir().unwrap();
     write_java(
         dir.path(),
@@ -192,40 +190,32 @@ fn semantic_search_returns_constituent_rankings() {
         &snapshot,
         &indexer,
         SemanticSearchParams {
-            // "loadConfig" grounds against the repo symbol universe, so the bm25
-            // leg surfaces the loadConfig function chunk by fqfn.
             query: "where does loadConfig read the configuration".to_string(),
             k: 2,
         },
     )
     .expect("semantic_search succeeds");
 
-    // The vector leg ranks the directly embedded function documents.
+    // Both functions are live and the leg is deeper than the corpus, so the
+    // candidate walk must resolve both of them by fully-qualified name.
+    let ranked: Vec<&str> = result
+        .vector_ranked
+        .iter()
+        .map(|row| row.fqfn.as_str())
+        .collect();
     assert!(
-        !result.vector_ranked.is_empty(),
-        "vector leg returns function symbols"
+        ranked.iter().any(|fqfn| fqfn.contains("loadConfig")),
+        "dense leg surfaces loadConfig: {ranked:?}"
     );
-    // The grounded bm25 leg keys on fully-qualified names, so the loadConfig
-    // function is recovered by symbol.
     assert!(
-        result
-            .bm25_ranked
-            .iter()
-            .any(|row| row.fqfn.contains("loadConfig")),
-        "bm25 leg surfaces the loadConfig symbol: {:?}",
-        result.bm25_ranked
+        ranked.iter().any(|fqfn| fqfn.contains("fetchUrl")),
+        "dense leg surfaces fetchUrl: {ranked:?}"
     );
     assert_normalized_symbol_scores(result.vector_ranked.iter().map(|row| row.score));
-    assert_normalized_symbol_scores(result.bm25_ranked.iter().map(|row| row.score));
     assert_eq!(
         result.vector_ranked.first().map(|row| row.score),
         Some(1.0),
         "top vector result should normalize to 1.0"
-    );
-    assert_eq!(
-        result.bm25_ranked.first().map(|row| row.score),
-        Some(1.0),
-        "top bm25 result should normalize to 1.0"
     );
     indexer.close();
 }
@@ -282,7 +272,7 @@ fn semantic_search_handles_initial_build_race() {
 }
 
 #[test]
-fn semantic_search_waits_for_initial_active_index() {
+fn semantic_search_waits_for_the_initial_live_set() {
     let dir = tempfile::tempdir().unwrap();
     write_java(
         dir.path(),
@@ -331,7 +321,7 @@ fn semantic_search_waits_for_initial_active_index() {
     query.join().unwrap();
     assert!(
         !result.vector_ranked.is_empty(),
-        "the first query uses the newly ready active index"
+        "the first query uses the newly hydrated live set"
     );
 
     indexer.close();
@@ -417,7 +407,7 @@ fn semantic_index_status_counts_indexed_and_waiting_files() {
 
     indexer.wait_ready(Duration::from_secs(30)).unwrap();
     let status = indexer.status(&snapshot);
-    assert_eq!(status.indexed_chunks, 1, "only greet() is indexed");
+    assert_eq!(status.indexed_files, 1, "only Greeter.java is live");
     assert_eq!(status.pending_batches, 0);
     assert_eq!(status.phase, "ready");
     assert!(
@@ -591,25 +581,25 @@ fn mixed_language_workspace_materializes_chunks_for_both_languages() {
         "both language files materialize; neither is dropped as foreign"
     );
 
-    // The grounded bm25 leg keys on fully-qualified names, so each language's
-    // distinctive symbol proves that language produced its own chunks.
+    // Each language's distinctive symbol must be retrievable, which proves that
+    // language produced its own chunks and that they resolve as live.
+    let result = semantic_search(
+        &snapshot,
+        &indexer,
+        SemanticSearchParams {
+            query: "where are configuration and manifests handled".to_string(),
+            k: 4,
+        },
+    )
+    .expect("semantic_search succeeds");
     for symbol in ["loadConfig", "parseManifest"] {
-        let result = semantic_search(
-            &snapshot,
-            &indexer,
-            SemanticSearchParams {
-                query: format!("where is {symbol} defined"),
-                k: 4,
-            },
-        )
-        .expect("semantic_search succeeds");
         assert!(
             result
-                .bm25_ranked
+                .vector_ranked
                 .iter()
                 .any(|row| row.fqfn.contains(symbol)),
-            "bm25 leg surfaces {symbol}: {:?}",
-            result.bm25_ranked
+            "dense leg surfaces {symbol}: {:?}",
+            result.vector_ranked
         );
     }
     indexer.close();
@@ -642,6 +632,112 @@ fn semantic_search_caps_requested_k() {
         },
     )
     .expect("oversized k is clamped before internal candidate math");
+    assert_eq!(result.vector_ranked.len(), 1);
+    indexer.close();
+}
+
+/// Issue #1929: the cache keeps the chunks of every blob it has ever seen, so
+/// after an edit the old function is still stored under the old blob OID.
+/// Retrieval no longer projects the cache through the worktree up front; it
+/// checks liveness per hit instead. The stale symbol must therefore never come
+/// back, and the symbol that replaced it must.
+#[test]
+fn an_edited_file_retrieves_the_new_symbol_and_never_the_cached_old_one() {
+    use std::collections::BTreeSet;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_java(
+        dir.path(),
+        "Greeter.java",
+        "public class Greeter {\n  public String greetTheStaleWay(String name) { return name; }\n}\n",
+    );
+    init_git(dir.path());
+    let snapshot = snapshot_for(dir.path());
+    let embedder = Arc::new(FakeHashEmbedder::new(16));
+    let indexer = SemanticIndexer::start_with_provider(
+        dir.path().to_path_buf(),
+        snapshot.clone(),
+        FakeEngineProvider { embedder },
+    );
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
+
+    let file = snapshot
+        .analyzer()
+        .analyzed_files()
+        .into_iter()
+        .next()
+        .expect("one analyzed file");
+    let changed: BTreeSet<_> = [file].into_iter().collect();
+    write_java(
+        dir.path(),
+        "Greeter.java",
+        "public class Greeter {\n  public String greetTheLiveWay(String name) { return name; }\n}\n",
+    );
+    run_git(dir.path(), &["commit", "-aqm", "rename the greeting"]);
+    let edited = Arc::new(snapshot.update(&changed));
+    indexer.request_update(edited.clone(), changed);
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
+
+    let result = semantic_search(
+        &edited,
+        &indexer,
+        SemanticSearchParams {
+            query: "greet a user by name".to_string(),
+            k: 5,
+        },
+    )
+    .expect("query after the edit");
+
+    let ranked: Vec<&str> = result
+        .vector_ranked
+        .iter()
+        .map(|row| row.fqfn.as_str())
+        .collect();
+    assert!(
+        ranked.iter().any(|fqfn| fqfn.contains("greetTheLiveWay")),
+        "the live symbol must be retrievable: {ranked:?}"
+    );
+    assert!(
+        !ranked.iter().any(|fqfn| fqfn.contains("greetTheStaleWay")),
+        "the previous blob's chunk is still cached but must not be returned: {ranked:?}"
+    );
+    indexer.close();
+}
+
+/// The readiness contract the anvil hook polls: once `phase` is "ready" with no
+/// pending batches, the very next query is answerable without a further wait.
+#[test]
+fn ready_status_means_the_first_query_is_answerable() {
+    let dir = tempfile::tempdir().unwrap();
+    write_java(
+        dir.path(),
+        "Greeter.java",
+        "public class Greeter {\n  public String greet(String name) { return name; }\n}\n",
+    );
+    init_git(dir.path());
+    let snapshot = snapshot_for(dir.path());
+    let embedder = Arc::new(FakeHashEmbedder::new(16));
+    let indexer = SemanticIndexer::start_with_provider(
+        dir.path().to_path_buf(),
+        snapshot.clone(),
+        FakeEngineProvider { embedder },
+    );
+    indexer.wait_ready(Duration::from_secs(30)).unwrap();
+
+    let status = indexer.status(&snapshot);
+    assert_eq!(status.phase, "ready");
+    assert_eq!(status.pending_batches, 0);
+
+    let result = semantic_search(
+        &snapshot,
+        &indexer,
+        SemanticSearchParams {
+            query: "greet a user by name".to_string(),
+            k: 1,
+        },
+    )
+    .expect("a ready index answers immediately");
+    assert!(result.notes.is_empty(), "notes: {:?}", result.notes);
     assert_eq!(result.vector_ranked.len(), 1);
     indexer.close();
 }

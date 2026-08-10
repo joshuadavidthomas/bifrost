@@ -22,3 +22,9 @@ Migration `0014-semantic-file-documents.sql` replaces the summary/component
 semantic schema with path-aware file materializations and direct document
 vectors. It discards only rebuildable semantic-index rows; analyzer and
 semantic-pack state remain intact.
+
+Migration `0022-drop-bm25-lexical-columns.sql` removes the two columns that
+only served the deleted lexical (BM25) retrieval arm:
+`semantic_file_chunks.fts_tokens` and `cache_state.bm25_tokenizer_version`.
+Retrieval is dense only, so nothing reads them. Chunk and vector rows keep
+their identities, so no cache is invalidated by this migration.

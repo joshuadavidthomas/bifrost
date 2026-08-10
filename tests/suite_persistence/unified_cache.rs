@@ -11,7 +11,6 @@ fn chunk(ord: i64, vector_hash: [u8; 32]) -> FileChunkIn<'static> {
         symbol: "pkg.Symbol",
         start_line: Some(ord),
         end_line: Some(ord + 1),
-        fts_tokens: "pkg symbol",
         vector_hash,
     }
 }
@@ -79,9 +78,7 @@ fn family_scoped_invalidation_keeps_other_family_rows() {
     let java_oid = Oid::hash_object(ObjectType::Blob, b"java").unwrap();
     let python_oid = Oid::hash_object(ObjectType::Blob, b"python").unwrap();
 
-    semantic
-        .ensure_index_compatible("fp1", "chunker1", "bm251")
-        .unwrap();
+    semantic.ensure_index_compatible("fp1", "chunker1").unwrap();
     put_semantic(&semantic, semantic_oid, [5; 32]);
     let java_generation = analyzer
         .ensure_language_epoch_value("java", "epoch-a")
@@ -96,11 +93,7 @@ fn family_scoped_invalidation_keeps_other_family_rows() {
         .register_blobs(&[python_oid], "python", python_generation)
         .unwrap();
 
-    assert!(
-        semantic
-            .ensure_index_compatible("fp2", "chunker1", "bm251")
-            .unwrap()
-    );
+    assert!(semantic.ensure_index_compatible("fp2", "chunker1").unwrap());
     assert!(!has_semantic(&semantic, semantic_oid));
     assert!(analyzer.contains_blob(java_oid, "java").unwrap());
     assert!(analyzer.contains_blob(python_oid, "python").unwrap());

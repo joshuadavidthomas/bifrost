@@ -202,7 +202,7 @@ is the canonical reference:
 ## Semantic search
 
 `semantic_search(...)` searches code by meaning rather than name and returns the
-three retrieval legs directly: function-oriented vector and BM25 rankings over
+two retrieval legs directly: a function-oriented dense vector ranking over
 function-level chunks, plus a file-oriented co-edit ranking. It searches code,
 not prose.
 

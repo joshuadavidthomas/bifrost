@@ -2,9 +2,10 @@
 //!
 //! One worker thread per active workspace. It opens the per-repo content-addressed
 //! cache, resolves the working tree to git blob OIDs, materializes any path/OID
-//! pairs the cache has never seen, then builds the in-memory active index
-//! (`vector_hash -> fqfn/file`) + BM25. Branch switches and worktree creation
-//! reuse files whose path and content are unchanged.
+//! pairs the cache has never seen, then hands that `rel_path -> blob_oid` map to
+//! the query path as a `LiveSet`. Nothing else is projected: retrieval reads the
+//! persistent tables directly and checks liveness per hit. Branch switches and
+//! worktree creation reuse files whose path and content are unchanged.
 //!
 //! `semantic_search` blocks on `wait_ready` until the initial build (and any
 //! queued deltas) have been applied.
@@ -23,7 +24,7 @@ use serde::Serialize;
 use brokk_bifrost_analysis::analyzer::{IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_analysis::path_utils::rel_path_string;
 
-use super::active_index::ActiveIndex;
+use super::CHUNKER_VERSION;
 use super::engine::{Embedder, FakeHashEmbedder, load_production_embedder};
 use super::gitcache;
 use super::materialize::{
@@ -31,8 +32,8 @@ use super::materialize::{
     write_group,
 };
 use super::metrics;
+use super::retrieval::LiveSet;
 use super::store::{SemanticStore, semantic_db_path};
-use super::{BM25_TOKENIZER_VERSION, CHUNKER_VERSION};
 
 /// Files materialized per embedding round so documents batch well.
 const FILE_GROUP: usize = 64;
@@ -102,15 +103,15 @@ enum IndexerMsg {
 
 pub struct SemanticIndexer {
     shared: Arc<Shared>,
-    active: Arc<RwLock<Option<ActiveIndex>>>,
+    live: Arc<RwLock<Option<LiveSet>>>,
     tx: Sender<IndexerMsg>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SemanticIndexStatus {
-    /// Active function occurrences resolvable for this worktree.
-    pub indexed_chunks: usize,
+    /// Analyzed files whose current content this worktree can retrieve.
+    pub indexed_files: usize,
     pub pending_batches: u64,
     pub phase: String,
     pub materialized_files: u64,
@@ -153,11 +154,11 @@ impl SemanticIndexer {
             store: OnceLock::new(),
             embedder: OnceLock::new(),
         });
-        let active: Arc<RwLock<Option<ActiveIndex>>> = Arc::new(RwLock::new(None));
+        let live: Arc<RwLock<Option<LiveSet>>> = Arc::new(RwLock::new(None));
         let (tx, rx) = mpsc::channel();
         tx.send(IndexerMsg::FullBuild(snapshot)).ok();
         let worker_shared = shared.clone();
-        let worker_active = active.clone();
+        let worker_live = live.clone();
         let join = std::thread::Builder::new()
             .name("bifrost-semantic-indexer".to_string())
             .spawn(move || {
@@ -165,7 +166,7 @@ impl SemanticIndexer {
                 let result = catch_unwind(AssertUnwindSafe(move || {
                     worker_loop(
                         worker_shared,
-                        worker_active,
+                        worker_live,
                         workspace_root,
                         db_path,
                         provider,
@@ -185,7 +186,7 @@ impl SemanticIndexer {
             .expect("spawn semantic indexer thread");
         Arc::new(Self {
             shared,
-            active,
+            live,
             tx,
             join: Mutex::new(Some(join)),
         })
@@ -272,9 +273,10 @@ impl SemanticIndexer {
         self.shared.embedder.get().cloned()
     }
 
-    /// The in-memory active index used by the query path; `None` until built.
-    pub fn active_index(&self) -> Arc<RwLock<Option<ActiveIndex>>> {
-        self.active.clone()
+    /// This worktree's live content identity, used by the query path to reject
+    /// cached chunks of blobs the tree no longer has; `None` until hydrated.
+    pub fn live_set(&self) -> Arc<RwLock<Option<LiveSet>>> {
+        self.live.clone()
     }
 
     pub fn status(&self, _snapshot: &WorkspaceAnalyzer) -> SemanticIndexStatus {
@@ -291,14 +293,14 @@ impl SemanticIndexer {
             Phase::Closed => "closed",
         }
         .to_string();
-        let indexed_chunks = self
-            .active
+        let indexed_files = self
+            .live
             .read()
             .ok()
-            .and_then(|guard| guard.as_ref().map(|idx| idx.occurrence_count()))
+            .and_then(|guard| guard.as_ref().map(LiveSet::live_file_count))
             .unwrap_or(0);
         SemanticIndexStatus {
-            indexed_chunks,
+            indexed_files,
             pending_batches: self.shared.pending.load(Ordering::SeqCst),
             phase: phase_label,
             materialized_files: self.shared.files_done.load(Ordering::SeqCst),
@@ -388,7 +390,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 fn worker_loop(
     shared: Arc<Shared>,
-    active: Arc<RwLock<Option<ActiveIndex>>>,
+    live: Arc<RwLock<Option<LiveSet>>>,
     workspace_root: PathBuf,
     db_path: PathBuf,
     provider: impl EngineProvider,
@@ -418,11 +420,7 @@ fn worker_loop(
     if check_cancelled(&shared).is_err() {
         return;
     }
-    if let Err(err) = store.ensure_index_compatible(
-        &embedder.fingerprint(),
-        CHUNKER_VERSION,
-        BM25_TOKENIZER_VERSION,
-    ) {
+    if let Err(err) = store.ensure_index_compatible(&embedder.fingerprint(), CHUNKER_VERSION) {
         return fail(&shared, format!("index invalidation check failed: {err}"));
     }
     shared.store.set(store.clone()).ok();
@@ -441,14 +439,9 @@ fn worker_loop(
                 done.send(run_gc(&store, &repo)).ok();
                 continue;
             }
-            IndexerMsg::FullBuild(snapshot) => full_build(
-                &shared,
-                &store,
-                embedder.as_ref(),
-                &repo,
-                &snapshot,
-                &active,
-            ),
+            IndexerMsg::FullBuild(snapshot) => {
+                full_build(&shared, &store, embedder.as_ref(), &repo, &snapshot, &live)
+            }
             IndexerMsg::Update(snapshot, changed) => update_files(
                 &shared,
                 &store,
@@ -456,7 +449,7 @@ fn worker_loop(
                 &repo,
                 &snapshot,
                 &changed,
-                &active,
+                &live,
             ),
         };
         match result {
@@ -493,7 +486,7 @@ fn full_build(
     embedder: &dyn Embedder,
     repo: &git2::Repository,
     snapshot: &WorkspaceAnalyzer,
-    active: &RwLock<Option<ActiveIndex>>,
+    live: &RwLock<Option<LiveSet>>,
 ) -> BuildResult {
     check_cancelled(shared)?;
     let analyzer = snapshot.analyzer();
@@ -505,8 +498,11 @@ fn full_build(
     eprintln!("bifrost semantic index: {}", metrics::report());
 
     check_cancelled(shared)?;
-    let index = ActiveIndex::build(store, &path_to_oid).map_err(BuildError::Failed)?;
-    *active.write().expect("active index lock poisoned") = Some(index);
+    // Hydration ends here: the identity map plus an open reader. Retrieval
+    // resolves cached chunks against this map lazily, one matched vector at a
+    // time, so there is no corpus-wide projection to build.
+    let hydrated = LiveSet::open(store, path_to_oid).map_err(BuildError::Failed)?;
+    *live.write().expect("live set lock poisoned") = Some(hydrated);
 
     // GC is deliberately NOT run here: it must not block the index from becoming Ready
     // (the worker runs it after readiness — see worker_loop).
@@ -520,7 +516,7 @@ fn update_files(
     repo: &git2::Repository,
     snapshot: &WorkspaceAnalyzer,
     changed: &BTreeSet<ProjectFile>,
-    active: &RwLock<Option<ActiveIndex>>,
+    live: &RwLock<Option<LiveSet>>,
 ) -> BuildResult {
     check_cancelled(shared)?;
     let analyzer = snapshot.analyzer();
@@ -548,10 +544,8 @@ fn update_files(
     )?;
 
     check_cancelled(shared)?;
-    if let Some(index) = active.write().expect("active index lock poisoned").as_mut() {
-        index
-            .apply_changes(&path_to_oid, &removed)
-            .map_err(BuildError::Failed)?;
+    if let Some(hydrated) = live.write().expect("live set lock poisoned").as_mut() {
+        hydrated.apply_changes(&path_to_oid, &removed);
     }
     Ok(())
 }
