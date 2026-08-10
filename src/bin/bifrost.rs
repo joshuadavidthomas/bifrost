@@ -11,6 +11,7 @@ mod code_query_repl;
 use brokk_bifrost::ToolOutput;
 use brokk_bifrost::lsp::run_lsp_stdio_server;
 use brokk_bifrost::mcp_common::McpRenderOptions;
+use brokk_bifrost::mcp_install::install_mcp_hosts;
 use brokk_bifrost::mcp_registry::{
     resolve_server_spec, resolve_server_spec_for_render_options, searchtools_toolset_order,
 };
@@ -156,6 +157,7 @@ fn run_inner(
     let mut root =
         env::current_dir().map_err(|err| format!("Failed to get current directory: {err}"))?;
     let mut root_explicit = false;
+    let mut install = false;
     let mut named_workspaces = Vec::new();
     let mut mcp_mode: Option<String> = None;
     let mut run_lsp = false;
@@ -194,6 +196,12 @@ fn run_inner(
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--install" => {
+                if install {
+                    return Err("--install may only be provided once".to_string());
+                }
+                install = true;
+            }
             "--root" => {
                 let value = args
                     .next()
@@ -470,9 +478,10 @@ fn run_inner(
             || no_line_numbers_seen
             || force_semantic_cpu_seen
             || diff_snapshot_object_dir.is_some()
+            || install
         {
             return Err(
-                "policy options cannot be combined with --query-file, --tool, --args, --sources, --mcp, --lsp, or --repl, --no-line-numbers, --force-semantic-cpu, or --diff-snapshot-object-dir"
+                "policy options cannot be combined with --install, --query-file, --tool, --args, --sources, --mcp, --lsp, or --repl, --no-line-numbers, --force-semantic-cpu, or --diff-snapshot-object-dir"
                     .to_string(),
             );
         }
@@ -558,6 +567,26 @@ fn run_inner(
             &policy_inputs,
         );
         return Ok(CliRunResult::PolicyStatus(status));
+    }
+
+    if install {
+        if root_explicit
+            || !named_workspaces.is_empty()
+            || mcp_mode.is_some()
+            || run_lsp
+            || run_repl
+            || tool_name.is_some()
+            || tool_args_seen
+            || !tool_sources.is_empty()
+            || diff_snapshot_object_dir.is_some()
+            || query_file.is_some()
+            || no_line_numbers_seen
+            || force_semantic_cpu_seen
+        {
+            return Err("--install cannot be combined with other options".to_string());
+        }
+        install_mcp_hosts()?;
+        return Ok(CliRunResult::Complete);
     }
 
     if let Some(query_file) = query_file {
@@ -1104,11 +1133,15 @@ USAGE:
     bifrost --repl             Run the interactive code-query REPL
     bifrost --tool NAME        Run a single tool once, print JSON result, and exit
     bifrost --query-file PATH  Run a .rql or .json code query once, print JSON result, and exit
+    bifrost --install          Register brokk with installed coding hosts and exit
     bifrost --policy-file PATH Evaluate workspace or built-in static-analysis policies and exit
     bifrost --list-policies    Print the built-in policy-pack manifest and exit
     bifrost --version | --help [TOOL]
 
 OPTIONS:
+    --install              Register a user-scoped brokk MCP server with Codex, Claude Code,
+                           OpenCode, Kimi Code, Hermes, and Oh My Pi. This option does not
+                           install host applications, skills, instructions, or Pi extensions.
     --root DIR             Project root to analyze (default: current directory)
     --workspace NAME=PATH  Named project root for MCP mode; repeat as needed.
                            Cannot be combined with --root. Requires --mcp.

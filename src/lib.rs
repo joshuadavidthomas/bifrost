@@ -1,6 +1,7 @@
 //! Stable CLI and Python facade for the Bifrost workspace packages.
 
 pub mod benchmark;
+pub mod mcp_install;
 pub mod mcp_property_fuzzer;
 // OWASP BenchmarkJava taint bakeoff scorer. Like `summary_foundry_demand`, it
 // runs the require-model taint policy through the production evaluator and so

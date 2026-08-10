@@ -218,10 +218,11 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `rust_analyzer_find_references`
 - `rust_analyzer_goto_definition`
 
-### `suite_mcp_cli` (12 modules)
+### `suite_mcp_cli` (13 modules)
 
 - `bifrost_benchmark_cli`
 - `bifrost_benchmark_run`
+- `bifrost_install_cli`
 - `bifrost_lsp_server`
 - `bifrost_mcp_property_fuzzer_cli`
 - `bifrost_mcp_server`

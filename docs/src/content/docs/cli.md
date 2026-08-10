@@ -318,3 +318,11 @@ cargo build --bin most_relevant_files
 
 Pass `--exclude-tests` to omit files classified as tests or test support from
 the ranking without allowing them to consume the result limit.
+
+## Register Coding Hosts
+
+Run `bifrost --install` to register a user-level MCP server named `brokk` with
+installed Codex, Claude Code, OpenCode, Kimi Code, Hermes, and Oh My Pi clients.
+The action registers the current executable with `--mcp core|nlp`. It
+does not install skills, instruction files, host applications, or the original
+Pi extension. See [Install Bifrost](/install/#connect-coding-hosts) for details.

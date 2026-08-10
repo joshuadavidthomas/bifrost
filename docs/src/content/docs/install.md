@@ -59,6 +59,28 @@ Bifrost during installation. Upgrade it with `npm update -g
 The CLI package is `@brokkai/bifrost`. The separate
 `@brokk/bifrost-agent` package contains the Pi extension and host MCP integration.
 
+## Connect Coding Hosts
+
+After Bifrost and one or more coding hosts are installed, register a user-level
+MCP server named `brokk`:
+
+```bash
+bifrost --install
+```
+
+The command registers the current Bifrost executable with installed Codex,
+Claude Code, OpenCode, Kimi Code, Hermes, and Oh My Pi clients. It starts
+Bifrost with the `core|nlp` toolsets. The server starts without a fixed
+project and uses the workspace root that the client supplies for each session.
+
+The command skips clients that are not installed. It does not install client
+applications, skills, instruction files, or extensions. Run it again after the
+Bifrost executable moves to a different path.
+
+Oh My Pi receives a native user MCP entry. Original Pi uses the separate
+`@brokk/bifrost-agent` extension described on the [Pi page](/pi/). The command
+does not install or change that extension.
+
 ## Homebrew
 
 Install from the [BrokkAi Homebrew tap](https://github.com/BrokkAi/homebrew-tap)

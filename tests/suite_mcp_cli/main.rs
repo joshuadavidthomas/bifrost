@@ -11,6 +11,7 @@ mod common;
 
 mod bifrost_benchmark_cli;
 mod bifrost_benchmark_run;
+mod bifrost_install_cli;
 mod bifrost_mcp_property_fuzzer_cli;
 mod bifrost_reference_differential_cli;
 mod bifrost_tool_cli;
