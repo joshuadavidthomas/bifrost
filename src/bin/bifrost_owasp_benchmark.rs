@@ -48,9 +48,10 @@ mod imp {
         CatalogCoordinate, CompilerOptions, SourceFormat, compile_source,
     };
     use brokk_bifrost::owasp_benchmark::{
-        InjectionCategory, RunConfig, RunResult, SanitizerPackSpec, build_policy, policy_id,
+        InjectionCategory, PackSpec, RunConfig, RunResult, build_policy, policy_id,
         promote_staged_sanitizer_pack, run as run_bakeoff,
     };
+    use semver::Version;
     use serde::Serialize;
     use sha2::{Digest, Sha256};
 
@@ -130,68 +131,109 @@ mod imp {
         Ok(())
     }
 
-    /// A sanitizer pack the run activates, described so both the loader and the
-    /// artifact can name it.
+    /// A pack the run activates, described so both the loader and the artifact
+    /// can name it. `file` is resolved under `--packs-dir` (the `semantic-packs`
+    /// root), so it carries the pack family subdirectory.
     struct PackDescriptor {
         pack_id: &'static str,
         file: &'static str,
         ecosystem: &'static str,
         package: Option<&'static str>,
+        /// An exact package version to advertise in the activation evidence, for
+        /// a pack whose shard pins one (the servlet declarations pin `=4.0.1`).
+        package_version: Option<&'static str>,
         mandatory: bool,
         /// True when this pack carries a byte-level `artifact_sha256` pin fed
         /// from the resolved jar digest.
         pinned_to_esapi_digest: bool,
     }
 
-    /// The packs the bakeoff activates. `bifrost.java-sanitizers` and the pinned
-    /// `bifrost.esapi-sanitizers` are mandatory (the task rests on them); the
-    /// other library packs are best-effort extras.
+    /// The packs the bakeoff activates. The mandatory set is the four-blocker
+    /// punch-list content (#1935): the two sanitizer packs (so ESAPI-sanitized
+    /// fake cases clear), the JDK and servlet framework-declaration packs (so
+    /// servlet/JDBC/java.lang types resolve as external declarations), and the
+    /// golden JDK procedure-summary pack (so require-model can pass taint through
+    /// the JDK transforms the Benchmark routes every flow through). The remaining
+    /// staged library sanitizer packs are best-effort extras.
     const PACKS: &[PackDescriptor] = &[
         PackDescriptor {
             pack_id: "bifrost.java-sanitizers",
-            file: "bifrost.java-sanitizers.json",
+            file: "sanitizers/bifrost.java-sanitizers.json",
             ecosystem: "jdk",
             package: None,
+            package_version: None,
             mandatory: true,
             pinned_to_esapi_digest: false,
         },
         PackDescriptor {
             pack_id: "bifrost.esapi-sanitizers",
-            file: "bifrost.esapi-sanitizers.json",
+            file: "sanitizers/bifrost.esapi-sanitizers.json",
             ecosystem: "maven",
             package: Some("org.owasp.esapi:esapi"),
+            package_version: None,
             mandatory: true,
             pinned_to_esapi_digest: true,
         },
         PackDescriptor {
+            pack_id: "bifrost.jdk-framework-decls",
+            file: "framework-decls/bifrost.jdk-framework-decls.json",
+            ecosystem: "jdk",
+            package: None,
+            package_version: None,
+            mandatory: true,
+            pinned_to_esapi_digest: false,
+        },
+        PackDescriptor {
+            pack_id: "bifrost.javax.servlet-api-framework-decls",
+            file: "framework-decls/staged/bifrost.javax.servlet-api-framework-decls.json",
+            ecosystem: "maven",
+            package: Some("javax.servlet:javax.servlet-api"),
+            package_version: Some("4.0.1"),
+            mandatory: true,
+            pinned_to_esapi_digest: false,
+        },
+        PackDescriptor {
+            pack_id: "bifrost.jdk-golden-summaries",
+            file: "golden-core/bifrost.jdk-golden-summaries.json",
+            ecosystem: "jdk",
+            package: None,
+            package_version: None,
+            mandatory: true,
+            pinned_to_esapi_digest: false,
+        },
+        PackDescriptor {
             pack_id: "bifrost.encoder-sanitizers",
-            file: "staged/bifrost.encoder-sanitizers.json",
+            file: "sanitizers/staged/bifrost.encoder-sanitizers.json",
             ecosystem: "maven",
             package: Some("org.owasp.encoder:encoder"),
+            package_version: None,
             mandatory: false,
             pinned_to_esapi_digest: false,
         },
         PackDescriptor {
             pack_id: "bifrost.commons-text-sanitizers",
-            file: "staged/bifrost.commons-text-sanitizers.json",
+            file: "sanitizers/staged/bifrost.commons-text-sanitizers.json",
             ecosystem: "maven",
             package: Some("org.apache.commons:commons-text"),
+            package_version: None,
             mandatory: false,
             pinned_to_esapi_digest: false,
         },
         PackDescriptor {
             pack_id: "bifrost.guava-sanitizers",
-            file: "staged/bifrost.guava-sanitizers.json",
+            file: "sanitizers/staged/bifrost.guava-sanitizers.json",
             ecosystem: "maven",
             package: Some("com.google.guava:guava"),
+            package_version: None,
             mandatory: false,
             pinned_to_esapi_digest: false,
         },
         PackDescriptor {
             pack_id: "bifrost.spring-web-sanitizers",
-            file: "staged/bifrost.spring-web-sanitizers.json",
+            file: "sanitizers/staged/bifrost.spring-web-sanitizers.json",
             ecosystem: "maven",
             package: Some("org.springframework:spring-web"),
+            package_version: None,
             mandatory: false,
             pinned_to_esapi_digest: false,
         },
@@ -241,15 +283,104 @@ mod imp {
         scoreboard: brokk_bifrost::owasp_benchmark::Scoreboard,
     }
 
-    /// A plain-language verdict a reader gets before the tables.
+    /// A plain-language verdict a reader gets before the tables. Every field is
+    /// computed from the run, so the summary is honest for any outcome -- a real
+    /// score, a partial one, or a still-near-zero abstention.
     #[derive(Serialize)]
     struct ResultSummary {
-        verdict: &'static str,
+        verdict: String,
         headline_number: String,
         false_greens: u32,
         findings: usize,
-        why_abstained: Vec<&'static str>,
-        directs_next_work: Vec<&'static str>,
+        real_true_positives: u32,
+        honest_vs_naive: String,
+        /// Per category, the residual abstention count and a sample binding
+        /// diagnostic, for every category that did not fully decide. Empty when
+        /// every case reached a verdict.
+        remaining_abstention: Vec<String>,
+    }
+
+    /// Compute the plain-language result summary from the run outcome.
+    fn result_summary(result: &RunResult) -> ResultSummary {
+        let overall = &result.scoreboard.overall;
+        let fmt_youden = |value: Option<f64>| {
+            value.map_or_else(|| "undefined".to_owned(), |v| format!("{v:.4}"))
+        };
+        let verdict = if overall.real_flagged > 0 || overall.fake_flagged > 0 {
+            format!(
+                "productive: {} of {} real taint cases flagged as vulnerable (true positives), \
+                 {} of {} fake cases flagged (false positives), {} false greens. \
+                 {} real and {} fake cases still abstained (no reliable verdict).",
+                overall.real_flagged,
+                overall.real,
+                overall.fake_flagged,
+                overall.fake,
+                overall.false_greens,
+                overall.real_abstained,
+                overall.fake_abstained,
+            )
+        } else {
+            format!(
+                "still abstains: no case reached a flag over the taint subset. {} real and {} \
+                 fake cases abstained; {} cleared. The stack activated but a boundary upstream \
+                 of a finding still fails closed (see remaining_abstention and category_runs).",
+                overall.real_abstained,
+                overall.fake_abstained,
+                overall.real_cleared + overall.fake_cleared,
+            )
+        };
+        let honest_vs_naive = format!(
+            "naive Youden J = {} folds every abstention into the negatives; honest Youden J = {} \
+             scores only the {} cases that reached a reliable verdict and holds out the {} that \
+             abstained. The gap is the cost of honest abstention.",
+            fmt_youden(overall.naive_metrics.youden),
+            fmt_youden(overall.honest_metrics.youden),
+            overall.honest.tp
+                + overall.honest.fp
+                + overall.honest.false_negative
+                + overall.honest.tn,
+            overall.real_abstained + overall.fake_abstained,
+        );
+        let mut remaining_abstention = Vec::new();
+        for score in &result.scoreboard.per_category {
+            let abstained = score.real_abstained + score.fake_abstained;
+            if abstained == 0 {
+                continue;
+            }
+            let sample = result
+                .category_runs
+                .iter()
+                .find(|run| run.category == score.category)
+                .and_then(|run| run.sample_diagnostics.first())
+                .map_or_else(|| "no binding diagnostic recorded".to_owned(), Clone::clone);
+            remaining_abstention.push(format!(
+                "{}: {} of {} cases abstained ({} real, {} fake); e.g. {}",
+                score.category,
+                abstained,
+                score.total,
+                score.real_abstained,
+                score.fake_abstained,
+                sample,
+            ));
+        }
+        ResultSummary {
+            verdict,
+            headline_number: format!(
+                "naive Youden J = {}; honest Youden J = {} over {} taint cases. {} findings, {} \
+                 false positives, {} false greens.",
+                fmt_youden(overall.naive_metrics.youden),
+                fmt_youden(overall.honest_metrics.youden),
+                overall.total,
+                result.findings_total,
+                overall.fake_flagged,
+                overall.false_greens,
+            ),
+            false_greens: overall.false_greens,
+            findings: result.findings_total,
+            real_true_positives: overall.real_flagged,
+            honest_vs_naive,
+            remaining_abstention,
+        }
     }
 
     #[derive(Serialize)]
@@ -365,28 +496,38 @@ mod imp {
                 .unwrap_or(3600),
         );
 
-        let sanitizer_packs: Vec<SanitizerPackSpec> = PACKS
+        let packs: Vec<PackSpec> = PACKS
             .iter()
-            .map(|descriptor| SanitizerPackSpec {
-                pack_id: descriptor.pack_id.to_owned(),
-                json_path: packs_dir.join(descriptor.file),
-                ecosystem: descriptor.ecosystem.to_owned(),
-                package: descriptor.package.map(|name| CatalogCoordinate {
-                    name: name.to_owned(),
-                    version: None,
-                }),
-                artifact_sha256: descriptor
-                    .pinned_to_esapi_digest
-                    .then(|| esapi_digest.clone())
-                    .flatten(),
-                mandatory: descriptor.mandatory,
+            .map(|descriptor| {
+                let version = descriptor
+                    .package_version
+                    .map(|raw| {
+                        Version::parse(raw).map_err(|error| {
+                            format!("pack {} version: {error}", descriptor.pack_id)
+                        })
+                    })
+                    .transpose()?;
+                Ok(PackSpec {
+                    pack_id: descriptor.pack_id.to_owned(),
+                    json_path: packs_dir.join(descriptor.file),
+                    ecosystem: descriptor.ecosystem.to_owned(),
+                    package: descriptor.package.map(|name| CatalogCoordinate {
+                        name: name.to_owned(),
+                        version: version.clone(),
+                    }),
+                    artifact_sha256: descriptor
+                        .pinned_to_esapi_digest
+                        .then(|| esapi_digest.clone())
+                        .flatten(),
+                    mandatory: descriptor.mandatory,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
 
         let config = RunConfig {
             benchmark_root: benchmark_root.clone(),
             dependency_jars,
-            sanitizer_packs,
+            packs,
             timeout,
             case_limit,
         };
@@ -425,7 +566,7 @@ mod imp {
             .collect();
         let overall = &result.scoreboard.overall;
         Artifact {
-            schema: "bifrost.owasp-benchmark-java.v1",
+            schema: "bifrost.owasp-benchmark-java.v2",
             benchmark: BenchmarkMeta {
                 repo: "https://github.com/OWASP-Benchmark/BenchmarkJava",
                 commit: benchmark_commit,
@@ -477,56 +618,7 @@ mod imp {
                 dependency_jars: config.dependency_jars.len(),
                 case_limit: config.case_limit,
             },
-            result: ResultSummary {
-                verdict: "abstained (capability_incomplete) across the taint subset: the shipped \
-                          require-model taint policy produced no source-to-sink verdicts on the \
-                          OWASP Benchmark under name-based endpoint selection.",
-                headline_number: format!(
-                    "naive Youden J = {}; honest Youden J = {} (no case was decided). \
-                     0 findings, 0 false positives, 0 false greens over {} taint cases.",
-                    overall
-                        .naive_metrics
-                        .youden
-                        .map_or_else(|| "undefined".to_owned(), |v| format!("{v:.3}")),
-                    overall
-                        .honest_metrics
-                        .youden
-                        .map_or_else(|| "undefined".to_owned(), |v| format!("{v:.3}")),
-                    overall.total,
-                ),
-                false_greens: overall.false_greens,
-                findings: result.findings_total,
-                why_abstained: vec![
-                    "Endpoint binding requires every selected source and sink to bind into a \
-                     shared, completely-discovered call region; workspace-wide name selectors \
-                     match sources in files that hold no matching sink, so coverage fails and the \
-                     whole policy compile abstains (capability_incomplete).",
-                    "At corpus scale the source selector also exceeds the RQL 100-result limit \
-                     before binding (result_limit_reached), truncating the match set to a partial \
-                     discovery.",
-                    "Binding hard-fails when a matched sink call lacks the selected argument index \
-                     -- arity-overloaded names like Statement.execute / PreparedStatement.execute() \
-                     -- and there is no RQL predicate to constrain a call's arity.",
-                    "Where binding does succeed (observed per-file for pathtraver/xss), the flow \
-                     still crosses an unmodeled JDK transform (URLDecoder.decode, java.util.List \
-                     add/get, Enumeration.nextElement, StringBuilder) on essentially every \
-                     Benchmark case, so require-model propagation reaches PartialDiscovery and \
-                     abstains rather than fabricating a pass-through.",
-                ],
-                directs_next_work: vec![
-                    "Make endpoint binding arity-tolerant: skip a matched call that lacks the \
-                     selected operand instead of aborting the whole policy compile.",
-                    "Bind endpoints per completely-discovered region (or add a file/region scope to \
-                     selectors) so workspace-wide selection does not require global co-occurrence.",
-                    "Ship taint-preserving procedure summaries for the common JDK string/codec/ \
-                     collection transforms (URLDecoder.decode, StringBuilder, List/Map, \
-                     Enumeration) so require-model can close the boundaries the Benchmark routes \
-                     every flow through -- the same summaries-vs-engine question this run feeds.",
-                    "Mount external declaration packs (servlet, java.sql, ESAPI) so sanitizer \
-                     summaries can bind by exact symbol, letting ESAPI-sanitized fake cases clear \
-                     rather than abstain.",
-                ],
-            },
+            result: result_summary(result),
             scoring_methodology: vec![
                 "Each Benchmark case belongs to exactly one category, so each category is scored \
                  over only its own labeled cases.",

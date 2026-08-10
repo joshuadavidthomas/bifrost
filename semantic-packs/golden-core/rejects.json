@@ -1,7 +1,7 @@
 {
   "format": "bifrost_golden_pack_audit/v1",
-  "candidates_total": 54,
-  "shipped_summaries": 54,
+  "candidates_total": 55,
+  "shipped_summaries": 55,
   "rejected": 0,
   "rejects": [],
   "packs": [
@@ -11,7 +11,7 @@
       "pinned": true,
       "ecosystem": "jdk",
       "completeness": "complete",
-      "shipped_summaries": 54
+      "shipped_summaries": 55
     }
   ]
 }
