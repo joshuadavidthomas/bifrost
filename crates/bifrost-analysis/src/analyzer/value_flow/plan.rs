@@ -4,7 +4,8 @@ use crate::analyzer::dataflow::{
     CuratedCallModel, CuratedCallModelFingerprint, ExternalSemanticSummarySet,
     ExternalSummarySetFingerprint, MAX_SUMMARY_BOUNDARY_BINDINGS, SemanticInputStatus,
     SemanticProcedureSummary, SummaryBoundary, SummaryBoundaryKind, SummaryDataflowResult,
-    SummaryEvidence, SummaryExitKind, SummaryPort, SummaryTransfer, UnmodeledCallBehavior,
+    SummaryEffect, SummaryEffectKey, SummaryEvidence, SummaryExitKind, SummaryPort,
+    SummaryTransfer, UnmodeledCallBehavior,
 };
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AccessPathRoot, CallArgumentEndpoint, CallBinding,
@@ -278,6 +279,28 @@ fn summary_evidence_is_proven_complete(evidence: &SummaryEvidence) -> bool {
         .any(|alternative| alternative.quality().is_proven() && alternative.quality().is_complete())
 }
 
+/// The labels a sanitize effect removes on the `input`-to-`output` transfer, or
+/// an empty slice when no sanitize effect names that exact port pair (#1923).
+/// A summary declares at most one sanitize per port pair, so the first match
+/// is the answer.
+fn sanitize_removed_labels<'a>(
+    effects: &'a [SummaryEffect],
+    input: &SummaryPort,
+    output: &SummaryPort,
+) -> &'a [Box<str>] {
+    effects
+        .iter()
+        .find_map(|effect| match effect.key() {
+            SummaryEffectKey::Sanitize {
+                input: sanitize_input,
+                output: sanitize_output,
+                removed,
+            } if sanitize_input == input && sanitize_output == output => Some(removed.as_ref()),
+            _ => None,
+        })
+        .unwrap_or(&[])
+}
+
 /// How strong a dispatch boundary's proof must be for it to count as fully
 /// modeled.
 ///
@@ -323,9 +346,13 @@ pub(crate) struct BoundaryTransferApplication {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BoundBoundaryTransfer {
+pub(crate) struct BoundBoundaryTransfer<'a> {
     pub target: ValueFlowCarrierId,
     pub proven_complete: bool,
+    /// Stable labels a matching sanitize effect removes on this modeled
+    /// transfer (#1923). It is empty for a plain flow-through. The taint client
+    /// resolves these labels against its run universe and composes a kill.
+    pub removed_labels: &'a [Box<str>],
 }
 
 /// One curated transfer model after its selector has been bound to a live
@@ -1690,13 +1717,13 @@ impl ValueFlowPlan {
         self.carrier_id(&ValueFlowCarrier::Value(value))
     }
 
-    pub(crate) fn visit_boundary_transfers(
-        &self,
+    pub(crate) fn visit_boundary_transfers<'a>(
+        &'a self,
         call: &CallSiteHandle,
         boundary: Option<&DispatchBoundaryKind>,
         kind: IcfgEdgeKind,
         input: ValueFlowCarrierId,
-        mut visitor: impl FnMut(BoundBoundaryTransfer) -> bool,
+        mut visitor: impl FnMut(BoundBoundaryTransfer<'a>) -> bool,
     ) -> BoundaryTransferApplication {
         if let Some(summary) =
             boundary.and_then(|boundary| self.external_summary_for_boundary(boundary))
@@ -1706,6 +1733,7 @@ impl ValueFlowPlan {
                 kind,
                 input,
                 summary.transfers(),
+                summary.effects(),
                 summary.completeness().is_complete(),
                 visitor,
             );
@@ -1716,6 +1744,7 @@ impl ValueFlowPlan {
                 kind,
                 input,
                 model.transfers(),
+                &[],
                 true,
                 visitor,
             );
@@ -1727,6 +1756,7 @@ impl ValueFlowPlan {
                 visitor(BoundBoundaryTransfer {
                     target,
                     proven_complete: false,
+                    removed_labels: &[],
                 })
             });
         }
@@ -1738,14 +1768,15 @@ impl ValueFlowPlan {
         }
     }
 
-    fn visit_modeled_transfers(
-        &self,
+    fn visit_modeled_transfers<'a>(
+        &'a self,
         call: &CallSiteHandle,
         kind: IcfgEdgeKind,
         input: ValueFlowCarrierId,
-        transfers: &[SummaryTransfer],
+        transfers: &'a [SummaryTransfer],
+        effects: &'a [SummaryEffect],
         mut complete: bool,
-        mut visitor: impl FnMut(BoundBoundaryTransfer) -> bool,
+        mut visitor: impl FnMut(BoundBoundaryTransfer<'a>) -> bool,
     ) -> BoundaryTransferApplication {
         let exit = match kind {
             IcfgEdgeKind::CallToNormalContinuation => SummaryExitKind::Normal,
@@ -1774,6 +1805,11 @@ impl ValueFlowPlan {
                 && !visitor(BoundBoundaryTransfer {
                     target,
                     proven_complete: summary_evidence_is_proven_complete(transfer.evidence()),
+                    removed_labels: sanitize_removed_labels(
+                        effects,
+                        transfer.input(),
+                        transfer.exit().port(),
+                    ),
                 })
             {
                 break;
