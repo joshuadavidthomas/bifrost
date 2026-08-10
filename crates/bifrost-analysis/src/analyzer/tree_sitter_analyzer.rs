@@ -5453,6 +5453,16 @@ where
     }
 
     fn analyzed_live_files(&self) -> Vec<ProjectFile> {
+        // Spanned because this is where #1738's missing time was: the worst
+        // `searchtools::route_summary_targets` span in the incident trace was
+        // 123.5 s with zero children, and all of it was this whole-workspace
+        // scan run once per language delegate per request.
+        let _scope = profiling::scope_with(|| {
+            format!(
+                "analyzer::analyzed_live_files[{:?}]",
+                self.adapter.language()
+            )
+        });
         self.analyzed_file_listing_count
             .fetch_add(1, Ordering::Relaxed);
         // Capture the two request handles together. `analyzed_live_files` is
@@ -5548,15 +5558,26 @@ where
             .iter()
             .map(|(_, oid, storage_key)| (*oid, storage_key.clone()))
             .collect::<Vec<_>>();
-        let present = self
-            .store_query_or_record(
+        let present = {
+            // The key set is the language's whole candidate list, so this one
+            // query is workspace-scale; the span carries the count so a trace
+            // shows what it was asked about (#1738).
+            let _scope = profiling::scope_with(|| {
+                format!(
+                    "store::parsed_blob_keys_at_generations[{:?},{} keys]",
+                    self.adapter.language(),
+                    keys.len()
+                )
+            });
+            self.store_query_or_record(
                 self.store_context.store.parsed_blob_keys_at_generations(
                     &keys,
                     self.store_context.generations.as_ref(),
                 ),
                 "checking analyzed live files",
             )
-            .unwrap_or_default();
+            .unwrap_or_default()
+        };
         for (project_file, oid, storage_key) in persisted_candidates {
             if present.contains(&(oid, storage_key)) {
                 files.push(project_file);
@@ -9426,6 +9447,76 @@ where
                     )
                     .unwrap_or(false)
         }
+    }
+
+    /// [`is_analyzed`] for a whole candidate set, spending one store query
+    /// instead of one per candidate.
+    ///
+    /// Each candidate is filtered by the same ownership and live-identity rules
+    /// `is_analyzed` applies, and the survivors that are not already answered by
+    /// a retained dirty state are confirmed in a single
+    /// `parsed_blob_keys_at_generations` call -- the same query
+    /// [`Self::analyzed_live_files`] makes, over the candidates instead of over
+    /// the whole workspace. That is the point: a glob target that matched three
+    /// files must cost three files' worth of work, not a workspace scan per
+    /// language (#1738).
+    ///
+    /// [`is_analyzed`]: CodeUnitIndex::is_analyzed
+    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let _scope = profiling::scope_with(|| {
+            format!(
+                "analyzer::retain_analyzed[{:?},{} candidates]",
+                self.adapter.language(),
+                candidates.len()
+            )
+        });
+        let snapshot = self.live_snapshot();
+        let mut analyzed = Vec::new();
+        // Candidates whose membership only the store can settle. Collected
+        // first so they cost one query between them, not one each.
+        let mut persisted_candidates = Vec::new();
+        for candidate in candidates {
+            if !self.adapter_owns_file(candidate, &snapshot) {
+                continue;
+            }
+            let Some(oid) = self.resolve_live_oid_for_file(candidate) else {
+                continue;
+            };
+            let storage_key = self.adapter.storage_language_key_for_file(candidate);
+            let key = Self::transient_cache_key(oid, candidate);
+            if self.retry_dirty_file_state(&key, &storage_key).is_some() {
+                analyzed.push(candidate.clone());
+                continue;
+            }
+            persisted_candidates.push((candidate, oid, storage_key));
+        }
+        if persisted_candidates.is_empty() {
+            analyzed.sort();
+            return analyzed;
+        }
+        let keys = persisted_candidates
+            .iter()
+            .map(|(_, oid, storage_key)| (*oid, storage_key.clone()))
+            .collect::<Vec<_>>();
+        let present = self
+            .store_query_or_record(
+                self.store_context.store.parsed_blob_keys_at_generations(
+                    &keys,
+                    self.store_context.generations.as_ref(),
+                ),
+                "checking whether matched files are analyzed",
+            )
+            .unwrap_or_default();
+        for (candidate, oid, storage_key) in persisted_candidates {
+            if present.contains(&(oid, storage_key)) {
+                analyzed.push(candidate.clone());
+            }
+        }
+        analyzed.sort();
+        analyzed
     }
 
     fn languages(&self) -> BTreeSet<Language> {

@@ -306,6 +306,10 @@ impl CodeUnitIndex for RubyAnalyzer {
         self.inner.analyzed_files()
     }
 
+    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
+        self.inner.retain_analyzed(candidates)
+    }
+
     fn indexed_source(&self, file: &ProjectFile) -> Option<String> {
         self.inner.indexed_source(file)
     }

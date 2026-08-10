@@ -60,7 +60,17 @@ impl Project for CountingProject {
 
 struct CountingAnalyzer {
     project: CountingProject,
+    /// Workspace files this analyzer has NOT analyzed. They stay in the
+    /// project listing, which is what a real workspace looks like: the listing
+    /// is every git-visible file, the analyzed set is the subset the store
+    /// holds parsed declarations for.
+    unanalyzed: BTreeSet<ProjectFile>,
     analyzed_files_calls: AtomicUsize,
+    /// Files offered to `retain_analyzed`, summed over calls. This is the
+    /// complexity signal for #1738: a glob request must offer only the files
+    /// its pattern matched, never the workspace.
+    retain_analyzed_candidates: AtomicUsize,
+    retain_analyzed_calls: AtomicUsize,
     search_definitions_calls: AtomicUsize,
     /// Declarations `search_definitions` reports, which the default
     /// `IAnalyzer::search_symbol_candidates` turns into search candidates.
@@ -76,10 +86,23 @@ impl CountingAnalyzer {
             .collect();
         Self {
             project: CountingProject::new(root, files),
+            unanalyzed: BTreeSet::new(),
             analyzed_files_calls: AtomicUsize::new(0),
+            retain_analyzed_candidates: AtomicUsize::new(0),
+            retain_analyzed_calls: AtomicUsize::new(0),
             search_definitions_calls: AtomicUsize::new(0),
             search_definition_results: BTreeSet::new(),
         }
+    }
+
+    /// Add workspace files the listing shows but the analyzer never indexed.
+    fn with_unanalyzed(mut self, rel_paths: &[&str]) -> Self {
+        for rel_path in rel_paths {
+            let file = ProjectFile::new(self.project.root.clone(), *rel_path);
+            self.project.files.insert(file.clone());
+            self.unanalyzed.insert(file);
+        }
+        self
     }
 
     fn with_search_definitions(mut self, code_units: impl IntoIterator<Item = CodeUnit>) -> Self {
@@ -89,6 +112,14 @@ impl CountingAnalyzer {
 
     fn analyzed_files_calls(&self) -> usize {
         self.analyzed_files_calls.load(Ordering::Relaxed)
+    }
+
+    fn retain_analyzed_candidates(&self) -> usize {
+        self.retain_analyzed_candidates.load(Ordering::Relaxed)
+    }
+
+    fn retain_analyzed_calls(&self) -> usize {
+        self.retain_analyzed_calls.load(Ordering::Relaxed)
     }
 
     fn search_definitions_calls(&self) -> usize {
@@ -118,7 +149,29 @@ impl CodeUnitIndex for CountingAnalyzer {
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
         self.analyzed_files_calls.fetch_add(1, Ordering::Relaxed);
-        self.project.files.iter().cloned().collect()
+        self.project
+            .files
+            .iter()
+            .filter(|file| !self.unanalyzed.contains(*file))
+            .cloned()
+            .collect()
+    }
+
+    /// Answers from the same set `analyzed_files` reports, but counts the
+    /// candidates it was offered instead of reporting the whole workspace.
+    /// A real persisted analyzer settles these with one store query; the fake
+    /// only has to charge for the size of the question.
+    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
+        self.retain_analyzed_calls.fetch_add(1, Ordering::Relaxed);
+        self.retain_analyzed_candidates
+            .fetch_add(candidates.len(), Ordering::Relaxed);
+        let mut retained: Vec<_> = candidates
+            .iter()
+            .filter(|file| self.project.files.contains(*file) && !self.unanalyzed.contains(*file))
+            .cloned()
+            .collect();
+        retained.sort();
+        retained
     }
 
     fn languages(&self) -> BTreeSet<Language> {
@@ -190,7 +243,10 @@ impl IAnalyzer for CountingAnalyzer {
     fn update(&self, _changed_files: &BTreeSet<ProjectFile>) -> Self {
         Self {
             project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
+            unanalyzed: self.unanalyzed.clone(),
             analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
+            retain_analyzed_candidates: AtomicUsize::new(self.retain_analyzed_candidates()),
+            retain_analyzed_calls: AtomicUsize::new(self.retain_analyzed_calls()),
             search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
             search_definition_results: self.search_definition_results.clone(),
         }
@@ -199,7 +255,10 @@ impl IAnalyzer for CountingAnalyzer {
     fn update_all(&self) -> Self {
         Self {
             project: CountingProject::new(self.project.root.clone(), self.project.files.clone()),
+            unanalyzed: self.unanalyzed.clone(),
             analyzed_files_calls: AtomicUsize::new(self.analyzed_files_calls()),
+            retain_analyzed_candidates: AtomicUsize::new(self.retain_analyzed_candidates()),
+            retain_analyzed_calls: AtomicUsize::new(self.retain_analyzed_calls()),
             search_definitions_calls: AtomicUsize::new(self.search_definitions_calls()),
             search_definition_results: self.search_definition_results.clone(),
         }
@@ -419,7 +478,7 @@ fn issue_1431_source_block_end_line_counts_cr_only_terminators() {
 fn literal_file_pattern_uses_project_lookup_without_scanning_analyzed_files() {
     let root = std::env::current_dir().unwrap();
     let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java"]);
-    let files = resolve_file_patterns(&analyzer, &["nested/B.java".to_string()]);
+    let files = resolve_file_patterns(&analyzer, &["nested/B.java".to_string()], None);
 
     assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
     assert!(files.ambiguous_paths.is_empty());
@@ -524,15 +583,54 @@ fn missing_extensionless_directory_paths_skip_package_and_fuzzy_resolution() {
     );
 }
 
+/// A glob resolves against the workspace listing and validates only what it
+/// matched. It must never enumerate the analyzed set, which on a large
+/// workspace is a live-filesystem scan plus a whole-workspace store query per
+/// language, per request (#1738).
 #[test]
-fn glob_file_pattern_scans_analyzed_files() {
+fn glob_file_pattern_validates_only_matched_files() {
     let root = std::env::current_dir().unwrap();
-    let analyzer = CountingAnalyzer::new(root, &["A.java", "nested/B.java", "notes.txt"]);
-    let files = resolve_file_patterns(&analyzer, &["nested/*.java".to_string()]);
+    let mut workspace: Vec<_> = (0..200)
+        .map(|index| format!("wide/W{index:03}.java"))
+        .collect();
+    workspace.push("nested/B.java".to_string());
+    workspace.push("notes.txt".to_string());
+    let rel_path_refs: Vec<_> = workspace.iter().map(String::as_str).collect();
+    let analyzer = CountingAnalyzer::new(root, &rel_path_refs);
+
+    let files = resolve_file_patterns(&analyzer, &["nested/*.java".to_string()], None);
 
     assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
     assert!(files.ambiguous_paths.is_empty());
-    assert_eq!(1, analyzer.analyzed_files_calls());
+    assert_eq!(
+        0,
+        analyzer.analyzed_files_calls(),
+        "a glob must not enumerate the analyzed universe"
+    );
+    assert_eq!(
+        1,
+        analyzer.retain_analyzed_candidates(),
+        "only the matched file may be validated, not the 202-file workspace"
+    );
+}
+
+/// The listing is a superset of the analyzed set, so validation is what keeps a
+/// listed-but-unindexed file out of a glob result. Without it a `.java` file the
+/// store never parsed would come back as a summary built from a raw excerpt.
+#[test]
+fn glob_target_excludes_listed_but_unanalyzed_file() {
+    let root = std::env::current_dir().unwrap();
+    let analyzer =
+        CountingAnalyzer::new(root, &["nested/B.java"]).with_unanalyzed(&["nested/Ghost.java"]);
+
+    let files = resolve_file_patterns(&analyzer, &["nested/*.java".to_string()], None);
+
+    assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
+    assert_eq!(
+        2,
+        analyzer.retain_analyzed_candidates(),
+        "both listed files are candidates; validation is what rejects one"
+    );
 }
 
 #[test]
@@ -546,18 +644,62 @@ fn file_pattern_resolution_deduplicates_literal_and_glob_matches() {
             "nested/*.java".to_string(),
             "nested/B.java".to_string(),
         ],
+        None,
     );
 
     assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
     assert!(files.ambiguous_paths.is_empty());
-    assert_eq!(1, analyzer.analyzed_files_calls());
+    assert_eq!(0, analyzer.analyzed_files_calls());
+}
+
+/// The fan-out cap decides on the match count alone. A target the tool is going
+/// to skip must not first be validated file by file: that is what made a 1.3 KB
+/// `too_broad` reply cost 248 s on the Firefox tree (#1738).
+#[test]
+fn too_broad_glob_reports_before_validating_any_file() {
+    let root = std::env::current_dir().unwrap();
+    let workspace: Vec<_> = (0..25)
+        .map(|index| format!("src/File{index:02}.java"))
+        .collect();
+    let rel_path_refs: Vec<_> = workspace.iter().map(String::as_str).collect();
+    let analyzer = CountingAnalyzer::new(root, &rel_path_refs);
+
+    let targets = route_summary_targets(&analyzer, &["src/*.java".to_string()]);
+
+    assert_eq!(1, targets.too_broad.len(), "{targets:#?}");
+    let too_broad = &targets.too_broad[0];
+    assert_eq!("src/*.java", too_broad.target);
+    assert_eq!(25, too_broad.matched);
+    assert_eq!(super::GET_SUMMARIES_MAX_FILES_PER_TARGET, too_broad.cap);
+    assert_eq!(
+        vec![
+            "src/File00.java",
+            "src/File01.java",
+            "src/File02.java",
+            "src/File03.java",
+            "src/File04.java",
+            "src/File05.java",
+            "src/File06.java",
+            "src/File07.java",
+            "src/File08.java",
+            "src/File09.java",
+        ],
+        too_broad.sample
+    );
+    assert!(targets.file_targets.is_empty(), "{targets:#?}");
+    assert_eq!(
+        0,
+        analyzer.retain_analyzed_calls(),
+        "a rejected target must cost the match count and nothing else"
+    );
+    assert_eq!(0, analyzer.analyzed_files_calls());
 }
 
 #[test]
 fn bare_filename_repairs_uniquely_without_scanning_analyzed_files() {
     let root = std::env::current_dir().unwrap();
     let analyzer = CountingAnalyzer::new(root, &["nested/B.java", "other/C.java"]);
-    let files = resolve_file_patterns(&analyzer, &["B.java".to_string()]);
+    let files = resolve_file_patterns(&analyzer, &["B.java".to_string()], None);
 
     assert_eq!(vec!["nested/B.java"], rel_paths(&files.files));
     assert!(files.ambiguous_paths.is_empty());
@@ -568,7 +710,7 @@ fn bare_filename_repairs_uniquely_without_scanning_analyzed_files() {
 fn bare_filename_reports_ambiguity_without_guessing() {
     let root = std::env::current_dir().unwrap();
     let analyzer = CountingAnalyzer::new(root, &["src/B.java", "nested/B.java"]);
-    let files = resolve_file_patterns(&analyzer, &["B.java".to_string()]);
+    let files = resolve_file_patterns(&analyzer, &["B.java".to_string()], None);
 
     assert!(files.files.is_empty());
     assert_eq!(1, files.ambiguous_paths.len());

@@ -43,6 +43,34 @@ pub trait CodeUnitIndex: Send + Sync {
             .any(|candidate| candidate == file)
     }
 
+    /// The subset of `candidates` this analyzer has indexed, in path order.
+    ///
+    /// The membership rule is exactly [`CodeUnitIndex::is_analyzed`]'s, but a
+    /// caller holding a whole match set must not pay one store round trip per
+    /// file: persisted analyzers override this to check ownership and liveness
+    /// per candidate and then confirm the survivors in a single store query.
+    ///
+    /// This exists so that resolving a directory or glob target costs work
+    /// proportional to what the target matched instead of to the workspace.
+    /// Before it, the glob leg of `resolve_file_patterns` enumerated
+    /// `analyzed_files` -- a whole-workspace filesystem scan plus a
+    /// whole-workspace store query, once per language, once per request -- to
+    /// answer a pattern that matched three files (issue #1738).
+    ///
+    /// The default materializes the analyzed set once, which is what every
+    /// caller effectively did before and is still right for an analyzer with
+    /// no store behind it.
+    fn retain_analyzed(&self, candidates: &[ProjectFile]) -> Vec<ProjectFile> {
+        let analyzed = self.get_analyzed_files();
+        let mut retained: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| analyzed.contains(*candidate))
+            .cloned()
+            .collect();
+        retained.sort();
+        retained
+    }
+
     fn is_empty(&self) -> bool {
         self.all_declarations().next().is_none()
     }

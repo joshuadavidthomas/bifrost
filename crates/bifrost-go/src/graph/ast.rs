@@ -218,8 +218,9 @@ pub fn is_definition_identifier(node: Node<'_>, _source: &str) -> bool {
         return true;
     }
     if keyed_element_for_key(node).is_some() {
-        return composite_literal_owner_type_for_key(node)
-            .is_none_or(|type_node| type_node.kind() != "map_type");
+        return composite_literal_owner_type_for_key(node).is_none_or(|type_node| {
+            !matches!(type_node.kind(), "map_type" | "array_type" | "slice_type")
+        });
     }
     if parent.kind() == "field_declaration"
         && parent.child_by_field_name("type").is_some_and(|ty| {
