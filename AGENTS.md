@@ -430,6 +430,21 @@ The analyzer cache is a SQLite database. The schema and its views are the interf
 
 The optional `nlp` Cargo feature has `default = []`. It adds `semantic_search`.
 
+## Index readiness design (owner decision, do not re-litigate)
+
+Index open and hydration are asynchronous. This is the intended design:
+
+- A tool call that needs the index blocks until the index is ready.
+- A client that wants to wait before it calls tools uses the readiness function.
+- Do not add eager or synchronous hydration at server start to hide this.
+- Do not treat "first call waited for readiness" as a defect by itself. The
+  defect is when hydration itself is slower than it must be. Profile that
+  and file it separately.
+
+Harnesses and clients choose one of the two patterns above explicitly. A
+harness that measures tool latency must either call the readiness function
+first or report readiness wait separately from tool execution time.
+
 The PyTorch SDPA sidecar provides voyage-4-nano embeddings. The sidecar selects CUDA or Metal at run time. There are no compile-time backend features.
 
 Tests must not download models. Tests must not start indexer threads.
