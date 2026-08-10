@@ -61,6 +61,82 @@ fn authoritative_hits(
     }
 }
 
+fn authoritative_hits_across(
+    analyzer: &JavascriptAnalyzer,
+    target: &CodeUnit,
+    candidates: impl IntoIterator<Item = brokk_bifrost::ProjectFile>,
+) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
+    let candidates: brokk_bifrost::hash::HashSet<_> = candidates.into_iter().collect();
+    let max_files = candidates.len();
+    let provider = ExplicitCandidateProvider::new(Arc::new(candidates));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            analyzer,
+            std::slice::from_ref(target),
+            Some(&provider),
+            max_files,
+            100,
+        );
+    match query.result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload.get(target).cloned().unwrap_or_default(),
+        other => panic!("expected authoritative JavaScript usage success, got {other:#?}"),
+    }
+}
+
+#[test]
+fn javascript_destructured_owner_keeps_the_nested_property_identity() {
+    let definitions = r#"export function normalize(request) {
+  request.response.headers = {};
+}
+"#;
+    let consumer = r#"export function encode(request, other) {
+  const { response } = request;
+  const { response: responseAlias } = request;
+  const { response: unrelated } = other;
+  response.headers.set("content-encoding", "gzip");
+  responseAlias.headers.set("vary", "accept-encoding");
+  unrelated.headers.set("x-decoy", "true");
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("definitions.js", definitions)
+        .file("consumer.js", consumer)
+        .build();
+    let definitions_file = project.file("definitions.js");
+    let consumer_file = project.file("consumer.js");
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let targets: Vec<_> = analyzer
+        .global_usage_definition_index()
+        .fqn_for_test("request.response.headers")
+        .into_iter()
+        .filter(|unit| unit.source() == &definitions_file)
+        .collect();
+    assert_eq!(targets.len(), 1, "nested property target: {targets:#?}");
+
+    let hits = authoritative_hits_across(
+        &analyzer,
+        &targets[0],
+        [definitions_file, consumer_file.clone()],
+    );
+    let consumer_ranges: BTreeSet<_> = hits
+        .iter()
+        .filter(|hit| hit.file == consumer_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([
+            occurrence_range(consumer, "headers", 0),
+            occurrence_range(consumer, "headers", 1),
+        ]),
+        consumer_ranges,
+        "destructuring the target owner must preserve its property identity without claiming the wrong root: {hits:#?}"
+    );
+}
+
 #[test]
 fn javascript_static_private_field_usages_keep_the_exact_class_owner() {
     let source = r#"class CurrentPointers {

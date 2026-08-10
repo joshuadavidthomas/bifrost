@@ -94,6 +94,10 @@ pub fn scan_files_for_seeds(
     } else {
         Vec::new()
     };
+    let target_property_receivers = target_member
+        .as_deref()
+        .map(|member| collect_target_property_receivers(analyzer, target, member, language))
+        .unwrap_or_default();
     let target_short = target_seed_identifier(target, target_owner.as_ref());
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
@@ -240,6 +244,7 @@ pub fn scan_files_for_seeds(
             lookup_only_local_property,
             local_property_definitions,
             global_property_receivers: &global_property_receivers,
+            target_property_receivers: &target_property_receivers,
             script_global_bare_target,
             file_is_script,
             edges: &edges,
@@ -387,6 +392,10 @@ pub struct ScanCtx<'a> {
     /// Receiver chains the declaring file binds at program scope in a browser
     /// script, so any other script reading the same chain reads this target.
     global_property_receivers: &'a [GlobalPropertyReceiver],
+    /// Structured receiver chains from the target declaration. These chains let
+    /// destructuring preserve a nested property owner such as
+    /// `const { response } = request; response.headers`.
+    target_property_receivers: &'a [GlobalPropertyReceiver],
     /// A unique program-scope declaration in a classic script. Other classic
     /// scripts share this bare binding; modules and lexical shadows do not.
     script_global_bare_target: bool,
@@ -445,6 +454,49 @@ struct LocalPropertyReceiverAlias {
 struct GlobalPropertyReceiver {
     root: String,
     members: Vec<String>,
+}
+
+fn collect_target_property_receivers(
+    analyzer: &dyn CodeUnitIndex,
+    target: &CodeUnit,
+    target_member: &str,
+    language: Language,
+) -> Vec<GlobalPropertyReceiver> {
+    let Ok(source) = target.source().read_to_string() else {
+        return Vec::new();
+    };
+    let Some(parser_language) = js_ts_tree_sitter_language_for_file(target.source(), language)
+    else {
+        return Vec::new();
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&parser_language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return Vec::new();
+    };
+    let mut receivers = direct_property_definitions(
+        tree.root_node(),
+        source.as_str(),
+        &analyzer.ranges(target),
+        target_member,
+    )
+    .into_iter()
+    .map(|definition| GlobalPropertyReceiver {
+        root: slice(definition.receiver.root, source.as_str()).to_string(),
+        members: definition
+            .receiver
+            .members
+            .iter()
+            .map(|member| slice(*member, source.as_str()).to_string())
+            .collect(),
+    })
+    .collect::<Vec<_>>();
+    receivers
+        .sort_by(|left, right| (&left.root, &left.members).cmp(&(&right.root, &right.members)));
+    receivers.dedup();
+    receivers
 }
 
 /// The receiver chains through which another script can read `target_member`
@@ -1229,11 +1281,13 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
         register_declarator_pattern_shadows(name_node, ctx);
-        if name_node.kind() == "object_pattern"
-            && (expression_carries_target_object(value_node, ctx)
-                || expression_resolves_to_target_owner(value_node, ctx))
-        {
-            seed_target_destructuring_bindings(name_node, ctx);
+        if name_node.kind() == "object_pattern" {
+            if expression_carries_target_object(value_node, ctx)
+                || expression_resolves_to_target_owner(value_node, ctx)
+            {
+                seed_target_destructuring_bindings(name_node, ctx);
+            }
+            seed_target_owner_destructuring_binding(name_node, value_node, ctx);
         }
         return;
     }
@@ -1330,6 +1384,85 @@ fn seed_target_destructuring_bindings(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) 
             record_hit(key_node, ctx);
             ctx.binding_engine
                 .seed_symbol(local.to_string(), TARGET_VALUE_BINDING);
+        }
+    }
+}
+
+fn seed_target_owner_destructuring_binding(
+    pattern: Node<'_>,
+    value: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+) {
+    let Some(value_receiver) = static_member_receiver(value, ctx.source) else {
+        return;
+    };
+    let value_root = slice(value_receiver.root, ctx.source);
+    for target_receiver in ctx.target_property_receivers {
+        if value_root != target_receiver.root
+            || value_receiver.members.len() > target_receiver.members.len()
+            || !value_receiver
+                .members
+                .iter()
+                .zip(&target_receiver.members)
+                .all(|(actual, expected)| slice(*actual, ctx.source) == expected)
+        {
+            continue;
+        }
+        seed_target_owner_pattern_path(
+            pattern,
+            &target_receiver.members[value_receiver.members.len()..],
+            ctx,
+        );
+    }
+}
+
+fn seed_target_owner_pattern_path(pattern: Node<'_>, owner_path: &[String], ctx: &mut ScanCtx<'_>) {
+    let Some((next_member, remaining)) = owner_path.split_first() else {
+        seed_target_destructuring_bindings(pattern, ctx);
+        return;
+    };
+    let mut cursor = pattern.walk();
+    for property in pattern.named_children(&mut cursor) {
+        let (key_node, value_node) = match property.kind() {
+            "shorthand_property_identifier_pattern" => (property, property),
+            "pair_pattern" => {
+                let (Some(key), Some(value)) = (
+                    property.child_by_field_name("key"),
+                    property.child_by_field_name("value"),
+                ) else {
+                    continue;
+                };
+                (key, value)
+            }
+            "object_assignment_pattern" => {
+                let Some(left) = property.child_by_field_name("left") else {
+                    continue;
+                };
+                (left, left)
+            }
+            _ => continue,
+        };
+        if slice(key_node, ctx.source) != next_member {
+            continue;
+        }
+        if remaining.is_empty() {
+            if let Some(local) = direct_pattern_binding(value_node) {
+                let local = slice(local, ctx.source);
+                if !local.is_empty() {
+                    ctx.binding_engine
+                        .seed_symbol(local.to_string(), TARGET_OBJECT_BINDING);
+                }
+            }
+            continue;
+        }
+        let nested = match value_node.kind() {
+            "assignment_pattern" | "object_assignment_pattern" => {
+                value_node.child_by_field_name("left")
+            }
+            _ => Some(value_node),
+        };
+        if let Some(nested) = nested.filter(|node| node.kind() == "object_pattern") {
+            seed_target_owner_pattern_path(nested, remaining, ctx);
         }
     }
 }
@@ -1776,6 +1909,9 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         if ctx.lookup_only_local_property {
+            if expression_carries_target_object(object, ctx) {
+                record_hit(property, ctx);
+            }
             return;
         }
     }
