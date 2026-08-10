@@ -218,16 +218,14 @@ only from test-gated code.
 Written 2026-08-09, at completion of both fixes.
 
 What was achieved. A `scan_usages_by_reference` request that runs out of its
-`max_duration_secs` now ends with a structured `time_budget` verdict and whatever sites it
-proved, instead of running until something else kills the call. Measured on the
-llvm-project clone that produced the incident: the request the issue records as a 1,200 s
-transport error now returns in 44.6 s of process wall -- of which roughly 22 s is workspace
-binding outside the scan's budget entirely -- carrying `incomplete_reason: time_budget`.
-Every whole-workspace descendant-index build in the tree except Rust's and Go's now polls a
-deadline, and every one of them publishes nothing when it stops. An `include_tests: false`
-request no longer inverts the ancestor relation over classes it has already excluded: on the
-test fixture that is exactly the 20 test headers, and on the incident workspace it is 52.3%
-of the include-closure builds.
+`max_duration_secs` now ends when its budget does. Measured before and after on the
+llvm-project clone that produced the incident, same host, same warm cache, same arguments:
+433.9 s wall / 412.6 s CPU before, 44.6 s wall / 34.0 s CPU after, for the *identical*
+`time_budget` answer. Every whole-workspace descendant-index build in the tree except Rust's
+and Go's now polls a deadline, and every one of them publishes nothing when it stops. An
+`include_tests: false` request no longer inverts the ancestor relation over classes it has
+already excluded: on the test fixture that is exactly the 20 test headers, and on the
+incident workspace it is 52.3% of the include-closure builds.
 
 What was not achieved, and should not be read into this change. The llvm query is still too
 expensive to *finish* inside 30 s -- the honest reading of a `time_budget` verdict is that
@@ -494,11 +492,12 @@ Check `df -h` before the clippy run: an all-features build can use tens of GiB.
 
 ### Milestone 7 -- measurement
 
-If `/mnt/T9/repo-clones` still holds the llvm-project clone from the campaign, run one
-`scan_usages_by_reference` with `symbols=["llvm.EVT.isSimple"]`, `include_tests=false`,
-`max_duration_secs=30` against it under `/usr/bin/time -v` and record wall and CPU time. The
-claim to validate is only that the call terminates near 30 seconds instead of near 1,200. If
-the clone is absent, record that, and rely on the test counters for the behavioural pin.
+Run one `scan_usages_by_reference` with `symbols=["llvm.EVT.isSimple"]`,
+`include_tests=false`, `max_duration_secs=30` against the llvm-project clone under
+`/usr/bin/time -v`, and the same call from a release build of the base commit, and compare.
+The claim to validate is only that the call now terminates near its budget. Done; see
+`Artifacts and Notes` for the two rows and the caveat about how much of the wall clock is
+workspace binding rather than scan.
 
 ## Concrete Steps
 
@@ -673,23 +672,29 @@ llvm entry, so the workspace was indexed fresh into a throwaway cache root
       --tool scan_usages_by_reference \
       --args '{"symbols":["llvm.EVT.isSimple"],"include_tests":false,"max_duration_secs":30}'
 
-    max_duration_secs   wall      user CPU   verdict
-    5                   27.5 s    19.6 s     failure / time_budget
-    30                  44.6 s    34.0 s     failure / time_budget
-    30 (first run)      47.3 s    37.2 s     failure / time_budget
+    build                     max_duration_secs   wall       user CPU   verdict
+    f68bc2b8 (before)         30                  433.9 s    412.6 s    failure / time_budget
+    this branch (after)       30                   44.6 s     34.0 s    failure / time_budget
+    this branch (after)        5                   27.5 s     19.6 s    failure / time_budget
+    this branch, first run    30                   47.3 s     37.2 s    failure / time_budget
 
-The number that matters is that the call *ends*. It ends with the structured verdict the
-machinery always had and could never reach -- `incomplete_reason: time_budget`, with the
-message telling the caller to narrow `paths` -- instead of running past twenty minutes and
-dying on the MCP host's own request budget with a transport error and no data.
+The before row is a release build of `f68bc2b8` from `git archive`, run against the same
+warm cache with the same arguments on the same host. **Both rows produce the identical
+answer** -- `incomplete_reason: time_budget`, zero hits, zero files. The only thing that
+changed is how long the call takes to say it: 433.9 s versus 44.6 s of wall, 412.6 s versus
+34.0 s of CPU. That is the whole claim of Fix A, measured rather than argued. The pre-fix
+call reports `time_budget` too, because the token *is* timed out by then -- it simply could
+not act on that until the hierarchy build finally returned, 14x past the deadline it was
+carrying the entire time.
 
-Read the wall clock honestly. It is process wall, not scan wall: roughly 22 s of it is
-outside the scan's budget entirely (process start, workspace binding over a 100k-file tree,
-cache open, semantic-pack activation, rendering). The budget governs the difference: raising
-it from 5 s to 30 s, a 25 s increase, moved the wall from 27.5 s to 44.6 s. The scan phase
-tracks its budget; the constant is everything around it, which is a different issue.
+Read the wall figures honestly. They are process wall, not scan wall. About 22 s of each is
+outside the scan's budget entirely: process start, workspace binding over a 100k-file tree,
+cache open, semantic-pack activation, rendering. The 5 s and 30 s rows isolate it -- a 25 s
+budget increase moves the wall by 17.1 s, so the scan phase is bounded by its budget and the
+rest is a constant. Subtracting that constant, the pre-fix scan phase ran about 412 s against
+a 30 s budget.
 
 The `time_budget` verdict also says plainly what this change does *not* do: the query is
 still too expensive to finish inside 30 s on llvm-project. Enforcing the deadline turns a
-1,200 s failure into a 30 s partial answer. Making the answer complete is the deferred work
-below.
+seven-minute wait for a partial answer into a forty-second one. Making the answer complete is
+the deferred work below.
