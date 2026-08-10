@@ -249,24 +249,31 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.pos += 1;
         let mut escaped = false;
-        while let Some(byte) = self.peek() {
+        let terminated = loop {
+            let Some(byte) = self.peek() else {
+                break false;
+            };
             self.pos += 1;
             if escaped {
                 escaped = false;
             } else if byte == b'\\' {
                 escaped = true;
             } else if byte == b'"' {
-                let value = serde_json::from_str::<String>(&self.source[start..self.pos]).map_err(
-                    |error| ParseError {
+                break true;
+            }
+        };
+        if terminated {
+            let value =
+                serde_json::from_str::<String>(&self.source[start..self.pos]).map_err(|error| {
+                    ParseError {
                         range: start..self.pos,
                         message: format!("invalid string: {error}"),
-                    },
-                )?;
-                return Ok(Expr {
-                    kind: ExprKind::String(value),
-                    range: start..self.pos,
-                });
-            }
+                    }
+                })?;
+            return Ok(Expr {
+                kind: ExprKind::String(value),
+                range: start..self.pos,
+            });
         }
         self.mark_incomplete(
             start..self.source.len(),

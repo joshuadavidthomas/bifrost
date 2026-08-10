@@ -170,6 +170,7 @@ test("promotion evidence covers validation before every external publisher", () 
     "publish-crate-python",
     "publish-crate-ruby",
     "publish-crate-rust",
+    "publish-crate-rql",
     "publish-crate-analysis",
     "publish-wheels",
     "publish-agent-plugin",
@@ -225,6 +226,10 @@ test("promotion evidence covers validation before every external publisher", () 
       /^    needs: \[release-context, promotion-evidence, publish-crate-core\]$/mu,
     );
   }
+  assert.match(
+    jobBlock(release, "publish-crate-rql"),
+    /^    needs: \[release-context, promotion-evidence, publish-crate-core\]$/mu,
+  );
   // Derived from the roster above rather than spelled out, so a newly landed
   // language crate cannot be added to the parallel band while analysis quietly
   // stops waiting for it. The literal form drifted once already: the C++
@@ -234,6 +239,7 @@ test("promotion evidence covers validation before every external publisher", () 
     "promotion-evidence",
     "publish-crate-core",
     ...languageCrates.map((language) => `publish-crate-${language}`),
+    "publish-crate-rql",
   ].join(", ");
   assert.match(
     jobBlock(release, "publish-crate-analysis"),

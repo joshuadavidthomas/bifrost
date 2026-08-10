@@ -1,4 +1,7 @@
 use crate::common::InlineTestProject;
+use brokk_bifrost::searchtools::{
+    DefinitionReferenceQuery, GetDefinitionParams, get_definitions_by_location,
+};
 use brokk_bifrost::usages::{ExplicitCandidateProvider, FuzzyResult, UsageFinder};
 use brokk_bifrost::{CodeUnit, CodeUnitIndex, IAnalyzer, JavascriptAnalyzer, Language};
 use std::collections::BTreeSet;
@@ -11,6 +14,28 @@ fn occurrence_range(source: &str, text: &str, occurrence: usize) -> (usize, usiz
         .map(|(start, _)| start)
         .unwrap_or_else(|| panic!("missing occurrence {occurrence} of {text:?}"));
     (start, start + text.len())
+}
+
+fn definition_query(
+    path: &str,
+    source: &str,
+    line_text: &str,
+    name: &str,
+) -> DefinitionReferenceQuery {
+    let line = source
+        .lines()
+        .position(|line| line == line_text)
+        .unwrap_or_else(|| panic!("missing fixture line {line_text:?}"));
+    DefinitionReferenceQuery {
+        path: path.to_string(),
+        line: Some(line + 1),
+        column: Some(
+            line_text
+                .find(name)
+                .unwrap_or_else(|| panic!("missing {name:?} in {line_text:?}"))
+                + 1,
+        ),
+    }
 }
 
 fn authoritative_hits(
@@ -34,6 +59,147 @@ fn authoritative_hits(
         } => hits_by_overload.get(target).cloned().unwrap_or_default(),
         other => panic!("expected authoritative JavaScript usage success, got {other:#?}"),
     }
+}
+
+fn authoritative_hits_across(
+    analyzer: &JavascriptAnalyzer,
+    target: &CodeUnit,
+    candidates: impl IntoIterator<Item = brokk_bifrost::ProjectFile>,
+) -> BTreeSet<brokk_bifrost::usages::UsageHit> {
+    let candidates: brokk_bifrost::hash::HashSet<_> = candidates.into_iter().collect();
+    let max_files = candidates.len();
+    let provider = ExplicitCandidateProvider::new(Arc::new(candidates));
+    let query = UsageFinder::new()
+        .with_authoritative_scope(true)
+        .query_with_provider(
+            analyzer,
+            std::slice::from_ref(target),
+            Some(&provider),
+            max_files,
+            100,
+        );
+    match query.result {
+        FuzzyResult::Success {
+            hits_by_overload, ..
+        } => hits_by_overload.get(target).cloned().unwrap_or_default(),
+        other => panic!("expected authoritative JavaScript usage success, got {other:#?}"),
+    }
+}
+
+#[test]
+fn javascript_destructured_owner_keeps_the_nested_property_identity() {
+    let definitions = r#"export function normalize(request) {
+  request.response.headers = {};
+}
+"#;
+    let consumer = r#"const addHeaderPart = (response) => {
+  response.headers.set("cache-control", "private");
+};
+
+const addDecoyPart = (response) => {
+  response.headers.set("x-decoy-helper", "true");
+};
+
+export function encode(request, other) {
+  const { response } = request;
+  const { response: responseAlias } = request;
+  const { response: unrelated } = other;
+  response.headers.set("content-encoding", "gzip");
+  responseAlias.headers.set("vary", "accept-encoding");
+  unrelated.headers.set("x-decoy", "true");
+  addHeaderPart(response);
+  addDecoyPart(unrelated);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("definitions.js", definitions)
+        .file("consumer.js", consumer)
+        .build();
+    let definitions_file = project.file("definitions.js");
+    let consumer_file = project.file("consumer.js");
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let targets: Vec<_> = analyzer
+        .global_usage_definition_index()
+        .fqn_for_test("request.response.headers")
+        .into_iter()
+        .filter(|unit| unit.source() == &definitions_file)
+        .collect();
+    assert_eq!(targets.len(), 1, "nested property target: {targets:#?}");
+
+    let hits = authoritative_hits_across(
+        &analyzer,
+        &targets[0],
+        [definitions_file, consumer_file.clone()],
+    );
+    let consumer_ranges: BTreeSet<_> = hits
+        .iter()
+        .filter(|hit| hit.file == consumer_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([
+            occurrence_range(consumer, "headers", 0),
+            occurrence_range(consumer, "headers", 2),
+            occurrence_range(consumer, "headers", 3),
+        ]),
+        consumer_ranges,
+        "destructuring the target owner must preserve its property identity without claiming the wrong root: {hits:#?}"
+    );
+}
+
+#[test]
+fn javascript_imported_object_method_keeps_identity_after_reassignment() {
+    let definitions = r#"export const CILogger = {
+  logTest: (_entry) => {},
+};
+
+export const DecoyLogger = {
+  logTest: (_entry) => {},
+};
+
+if (process.env.CI) {
+  CILogger.logTest = (entry) => consume(entry);
+}
+"#;
+    let consumer = r#"import { CILogger, DecoyLogger } from "./definitions.js";
+
+export function report(entry) {
+  CILogger.logTest(entry);
+  DecoyLogger.logTest(entry);
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("definitions.js", definitions)
+        .file("consumer.js", consumer)
+        .build();
+    let definitions_file = project.file("definitions.js");
+    let consumer_file = project.file("consumer.js");
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let targets: Vec<_> = analyzer
+        .global_usage_definition_index()
+        .fqn_for_test("CILogger.logTest")
+        .into_iter()
+        .filter(|unit| unit.source() == &definitions_file)
+        .collect();
+    assert_eq!(targets.len(), 1, "exported logger method: {targets:#?}");
+
+    let hits = authoritative_hits_across(
+        &analyzer,
+        &targets[0],
+        [definitions_file, consumer_file.clone()],
+    );
+    let consumer_ranges: BTreeSet<_> = hits
+        .iter()
+        .filter(|hit| hit.file == consumer_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+
+    assert_eq!(
+        BTreeSet::from([occurrence_range(consumer, "logTest", 0)]),
+        consumer_ranges,
+        "the imported exported object must preserve its exact method identity without claiming the decoy: {hits:#?}"
+    );
 }
 
 #[test]
@@ -153,6 +319,46 @@ class OtherToolbar {
         BTreeSet::from([occurrence_range(source, "disabled", 0)]),
         ranges,
         "the class-field alias must retain the local property identity without claiming the decoy: {hits:#?}"
+    );
+}
+
+#[test]
+fn javascript_private_field_focus_stops_before_a_later_property() {
+    let source = r#"class Renderer {
+  #out = [];
+
+  clear() {
+    const child = new Renderer();
+    child.#out.length = 0;
+  }
+}
+
+class Decoy {
+  #out = [];
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("renderer.js", source)
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let response = get_definitions_by_location(
+        &analyzer,
+        GetDefinitionParams {
+            references: vec![definition_query(
+                "renderer.js",
+                source,
+                "    child.#out.length = 0;",
+                "#out",
+            )],
+        },
+    );
+
+    assert_eq!(response.results[0].status, "resolved", "{response:#?}");
+    assert_eq!(response.results[0].definitions.len(), 1, "{response:#?}");
+    assert_eq!(
+        response.results[0].definitions[0].fqn.as_deref(),
+        Some("Renderer.#out"),
+        "the selected private segment must not resolve as the later `length` property: {response:#?}"
     );
 }
 
@@ -332,5 +538,167 @@ fn javascript_script_global_function_inverse_rejects_competing_global_declaratio
     assert!(
         hits.is_empty(),
         "a bare call with two distinct script-global declarations must not select one target: {hits:#?}"
+    );
+}
+
+#[test]
+fn javascript_commonjs_destructuring_uses_the_exact_exported_binding() {
+    let preferences = r#"class PreferencesStore {
+  getPreferences() { return { wrong: true }; }
+}
+const getPreferences = () => ({ right: true });
+module.exports = { getPreferences };
+"#;
+    let errors = r#"const createError = () => function GeneratedError() {};
+const codes = {
+  WantedError: createError(),
+};
+const decoy = {
+  WantedError: createError(),
+};
+module.exports = codes;
+"#;
+    let opaque = r#"const hidden = { HiddenError: () => null };
+module.exports = () => hidden;
+"#;
+    let consumer = r#"const { getPreferences, getPreferences: renamed } = require('./preferences');
+const { WantedError } = require('./errors');
+const { HiddenError } = require('./opaque');
+getPreferences();
+renamed();
+WantedError();
+HiddenError();
+function shadow(WantedError) {
+  WantedError();
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("preferences.js", preferences)
+        .file("errors.js", errors)
+        .file("opaque.js", opaque)
+        .file("consumer.js", consumer)
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let response = get_definitions_by_location(
+        &analyzer,
+        GetDefinitionParams {
+            references: vec![
+                definition_query(
+                    "consumer.js",
+                    consumer,
+                    "getPreferences();",
+                    "getPreferences",
+                ),
+                definition_query("consumer.js", consumer, "renamed();", "renamed"),
+                definition_query("consumer.js", consumer, "WantedError();", "WantedError"),
+                definition_query("consumer.js", consumer, "HiddenError();", "HiddenError"),
+            ],
+        },
+    );
+
+    for result in &response.results[..2] {
+        assert_eq!(result.status, "resolved", "{response:#?}");
+        assert_eq!(result.definitions.len(), 1, "{response:#?}");
+        assert_eq!(
+            result.definitions[0].fqn.as_deref(),
+            Some("getPreferences"),
+            "the CommonJS shorthand export must select the top-level function, not the same-named class method: {response:#?}"
+        );
+    }
+    assert_eq!(response.results[2].status, "resolved", "{response:#?}");
+    assert_eq!(response.results[2].definitions.len(), 1, "{response:#?}");
+    assert_eq!(
+        response.results[2].definitions[0].fqn.as_deref(),
+        Some("codes.WantedError"),
+        "module.exports assigned through a local object must project that object's exact named surface: {response:#?}"
+    );
+    assert_eq!(
+        response.results[3].status, "no_definition",
+        "a non-object CommonJS export must not expose properties of a captured local object: {response:#?}"
+    );
+
+    let errors_file = project.file("errors.js");
+    let target = analyzer
+        .global_usage_definition_index()
+        .fqn_for_test("codes.WantedError")
+        .into_iter()
+        .find(|unit| unit.source() == &errors_file)
+        .expect("codes.WantedError definition");
+    let result = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target));
+    let FuzzyResult::Success {
+        hits_by_overload, ..
+    } = result
+    else {
+        panic!("expected CommonJS inverse usage success, got {result:#?}");
+    };
+    let hits = hits_by_overload.get(&target).cloned().unwrap_or_default();
+    let consumer_file = project.file("consumer.js");
+    let consumer_ranges: BTreeSet<_> = hits
+        .iter()
+        .filter(|hit| hit.file == consumer_file)
+        .map(|hit| (hit.start_offset, hit.end_offset))
+        .collect();
+    assert_eq!(
+        consumer_ranges,
+        BTreeSet::from([occurrence_range(consumer, "WantedError", 1)]),
+        "the named CommonJS import must preserve the bound object's exported property identity; hits={hits:#?}"
+    );
+}
+
+#[test]
+fn javascript_destructured_parameter_default_calls_outer_function() {
+    let source = r#"const defaultCount = ({ compact }) => (compact ? 5 : 10);
+
+function render(options = {}) {
+  const { compact, count = defaultCount({ compact }) } = options;
+  return count;
+}
+
+function shadow(defaultCount, options = {}) {
+  const { count = defaultCount() } = options;
+  return count;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("card.js", source)
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let response = get_definitions_by_location(
+        &analyzer,
+        GetDefinitionParams {
+            references: vec![
+                definition_query(
+                    "card.js",
+                    source,
+                    "  const { compact, count = defaultCount({ compact }) } = options;",
+                    "defaultCount",
+                ),
+                definition_query(
+                    "card.js",
+                    source,
+                    "  const { count = defaultCount() } = options;",
+                    "defaultCount",
+                ),
+            ],
+        },
+    );
+
+    assert_eq!(response.results[0].status, "resolved", "{response:#?}");
+    assert_eq!(response.results[0].definitions.len(), 1, "{response:#?}");
+    assert_eq!(
+        response.results[0].definitions[0].fqn.as_deref(),
+        Some("defaultCount"),
+        "a default initializer is an expression, not part of the destructuring binding: {response:#?}"
+    );
+    assert_eq!(response.results[1].status, "resolved", "{response:#?}");
+    assert_eq!(response.results[1].definitions.len(), 1, "{response:#?}");
+    assert_eq!(
+        response.results[1].definitions[0].fqn, None,
+        "an actual parameter binding must resolve locally instead of claiming the outer function: {response:#?}"
+    );
+    assert_eq!(
+        response.results[1].definitions[0].kind.as_str(),
+        "parameter",
+        "the near miss must retain its structured local-binding identity: {response:#?}"
     );
 }

@@ -19,17 +19,19 @@ use super::schema::{
     rql_schema_version_registry, usage_kind_from_label, usage_proof_from_label,
     usage_surface_from_label,
 };
-use crate::analyzer::Language;
-use crate::analyzer::structural::edges::{OwnerRelation, SiteClass};
-use crate::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
-use crate::analyzer::structural::materialization::{
+use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
+use brokk_bifrost_core::analyzer::structural::kinds::{ALL_KINDS, NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
 };
-use crate::analyzer::structural::occurrences::{Namespace, OccurrenceClass, OccurrenceRole};
-use crate::analyzer::structural::resolution::{
+use brokk_bifrost_core::analyzer::structural::occurrences::{
+    Namespace, OccurrenceClass, OccurrenceRole,
+};
+use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingKind, BoundaryStatus, HoistingClass, PrecedenceTier, RejectionReason,
 };
-use crate::schema_version::SchemaVersionRegistry;
+use brokk_bifrost_core::schema_version::SchemaVersionRegistry;
 use regex::Regex;
 use serde_json::{Map, Value};
 use std::num::NonZeroUsize;
@@ -1057,7 +1059,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                         QueryError::new(&protocol_ref_path, "expected a protocol reference string")
                     })?
                     .parse()
-                    .map_err(|error: super::super::analysis_context::ProtocolRefError| {
+                    .map_err(|error: crate::refs::ProtocolRefError| {
                         QueryError::new(protocol_ref_path, error.to_string())
                     })?;
                 QueryStep::Typestate(TypestateTraversal { protocol_ref })
@@ -1075,11 +1077,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                         )
                     })?
                     .parse()
-                    .map_err(
-                        |error: super::super::analysis_context::ValueFlowPlanRefError| {
-                            QueryError::new(plan_ref_path, error.to_string())
-                        },
-                    )?;
+                    .map_err(|error: crate::refs::ValueFlowPlanRefError| {
+                        QueryError::new(plan_ref_path, error.to_string())
+                    })?;
                 QueryStep::ValueFlow(ValueFlowTraversal { plan_ref })
             }
             super::schema::QueryStepOp::Taint => {
@@ -1092,11 +1092,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                         QueryError::new(&taint_ref_path, "expected a taint result reference string")
                     })?
                     .parse()
-                    .map_err(
-                        |error: super::super::analysis_context::TaintResultRefError| {
-                            QueryError::new(taint_ref_path, error.to_string())
-                        },
-                    )?;
+                    .map_err(|error: crate::refs::TaintResultRefError| {
+                        QueryError::new(taint_ref_path, error.to_string())
+                    })?;
                 QueryStep::Taint(TaintTraversal { taint_ref })
             }
             super::schema::QueryStepOp::Witness => QueryStep::Witness(WitnessTraversal::default()),
@@ -1442,7 +1440,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                         "proven_subset is currently supported only for callers",
                     ));
                 }
-                if proof != Some(crate::analyzer::usages::UsageProof::Proven) {
+                if proof != Some(brokk_bifrost_core::analyzer::usages::model::UsageProof::Proven) {
                     return Err(QueryError::new(
                         child_path(&entry_path, "completeness"),
                         "proven_subset requires proof to be proven",
@@ -1549,7 +1547,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
 fn decode_optional_proof(
     value: Option<&Value>,
     path: &str,
-) -> Result<Option<crate::analyzer::usages::UsageProof>, QueryError> {
+) -> Result<Option<brokk_bifrost_core::analyzer::usages::model::UsageProof>, QueryError> {
     value
         .map(|value| {
             let path = child_path(path, "proof");

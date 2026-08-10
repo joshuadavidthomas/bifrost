@@ -26,7 +26,6 @@ use crate::analyzer::semantic::{
 use crate::analyzer::structural::analysis_context::{
     QueryAnalysisContext, QueryAnalysisContextError, ValueFlowPlanRef,
 };
-use crate::analyzer::structural::query::WitnessTraversal;
 use crate::analyzer::value_flow::{
     ValueFlowCarrierKey, ValueFlowMayStatus, ValueFlowMeeting, ValueFlowObservationPhase,
     ValueFlowPlan, ValueFlowPortKey, ValueFlowScopedRootKind, ValueFlowSelectorKey,
@@ -35,6 +34,7 @@ use crate::analyzer::value_flow::{
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
+use brokk_bifrost_rql::WitnessTraversal;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ValueFlowCacheKey {

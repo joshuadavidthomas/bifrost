@@ -38,6 +38,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 const TARGET_BINDING: &str = "__target__";
 const TARGET_VALUE_BINDING: &str = "__target_value__";
+const TARGET_IMPORTED_VALUE_BINDING: &str = "__target_imported_value__";
 const TARGET_OBJECT_BINDING: &str = "__target_object__";
 
 #[allow(clippy::too_many_arguments)]
@@ -49,9 +50,10 @@ pub fn scan_files_for_seeds(
     target: &CodeUnit,
     seeds: &BTreeSet<(ProjectFile, String)>,
     language: Language,
-    exported_local_property_root: Option<&str>,
+    exported_local_property: Option<(&str, &BTreeSet<String>)>,
     cancellation: Option<&CancellationToken>,
 ) -> BTreeSet<UsageHit> {
+    let exported_local_property_root = exported_local_property.map(|(root, _)| root);
     // `host` is the JS/TS analyzer for `language`, resolved by the caller's one
     // downcast; `analyzer` is the dispatching analyzer, which in a mixed workspace
     // spans every language and is what the declaration and range reads must go to.
@@ -92,6 +94,10 @@ pub fn scan_files_for_seeds(
     } else {
         Vec::new()
     };
+    let target_property_receivers = target_member
+        .as_deref()
+        .map(|member| collect_target_property_receivers(analyzer, target, member, language))
+        .unwrap_or_default();
     let target_short = target_seed_identifier(target, target_owner.as_ref());
     let reference_needle = target_member.as_deref().unwrap_or(&target_short);
     let target_owner_source = target_owner.as_ref().map(|owner| owner.source().clone());
@@ -151,16 +157,24 @@ pub fn scan_files_for_seeds(
         let target_self_file = *file == target.source();
         let mut binding_engine = LocalInferenceEngine::new(LocalInferenceConfig::default());
         for edge in &edges {
-            if edge_binds_bare_identifier(edge) {
-                binding_engine.seed_symbol(edge.local_name.clone(), TARGET_BINDING);
+            if !edge_binds_bare_identifier(edge) {
+                continue;
             }
-        }
-        if exported_local_property_root.is_some() {
-            for edge in &edges {
-                if edge_binds_bare_identifier(edge) {
-                    binding_engine.seed_symbol(edge.local_name.clone(), TARGET_OBJECT_BINDING);
+            let binding = if let Some((_, exported_names)) = exported_local_property {
+                let imports_exported_object = match &edge.kind {
+                    ImportEdgeKind::Named(imported_name) => exported_names.contains(imported_name),
+                    ImportEdgeKind::Default => exported_names.contains("default"),
+                    ImportEdgeKind::Namespace | ImportEdgeKind::CommonJsRequire(_) => false,
+                };
+                if imports_exported_object {
+                    TARGET_OBJECT_BINDING
+                } else {
+                    TARGET_IMPORTED_VALUE_BINDING
                 }
-            }
+            } else {
+                TARGET_BINDING
+            };
+            binding_engine.seed_symbol(edge.local_name.clone(), binding);
         }
         if target_self_file {
             binding_engine.seed_symbol(target_short.clone(), TARGET_BINDING);
@@ -174,6 +188,7 @@ pub fn scan_files_for_seeds(
         let lexical_bindings = (((browser_global_object.is_some() || direct_local_property)
             && target_self_file)
             || !global_property_receivers.is_empty()
+            || !target_property_receivers.is_empty()
             || script_global_bare_target)
             .then(|| JsTsLexicalBindingIndex::build(root, source_str));
         // Both remaining same-file models read the declaring file's byte ranges, so
@@ -217,6 +232,9 @@ pub fn scan_files_for_seeds(
             root,
             imports.clone(),
         );
+        let initial_binding_engine = binding_engine.clone();
+        let initial_type_binding_engine =
+            LocalInferenceEngine::new(LocalInferenceConfig::default());
         let mut scan_ctx = ScanCtx {
             file,
             source: source_str,
@@ -230,6 +248,7 @@ pub fn scan_files_for_seeds(
             lookup_only_local_property,
             local_property_definitions,
             global_property_receivers: &global_property_receivers,
+            target_property_receivers: &target_property_receivers,
             script_global_bare_target,
             file_is_script,
             edges: &edges,
@@ -245,12 +264,23 @@ pub fn scan_files_for_seeds(
             scope_stack: vec![HashMap::default()],
             lexical_shadow_scopes: Vec::new(),
             binding_engine,
-            type_binding_engine: LocalInferenceEngine::new(LocalInferenceConfig::default()),
+            type_binding_engine: initial_type_binding_engine.clone(),
+            target_object_parameters: HashMap::default(),
             hits: &mut local_hits,
             unproven_hits: &mut local_unproven_hits,
         };
 
-        scan_node(tree_ref.root_node(), &mut scan_ctx);
+        loop {
+            let parameter_count = scan_ctx.target_object_parameter_count();
+            scan_node(tree_ref.root_node(), &mut scan_ctx);
+            if scan_ctx.target_object_parameter_count() == parameter_count {
+                break;
+            }
+            scan_ctx.reset_for_additional_pass(
+                initial_binding_engine.clone(),
+                initial_type_binding_engine.clone(),
+            );
+        }
 
         if !local_hits.is_empty() {
             let mut sink = collected
@@ -377,6 +407,10 @@ pub struct ScanCtx<'a> {
     /// Receiver chains the declaring file binds at program scope in a browser
     /// script, so any other script reading the same chain reads this target.
     global_property_receivers: &'a [GlobalPropertyReceiver],
+    /// Structured receiver chains from the target declaration. These chains let
+    /// destructuring preserve a nested property owner such as
+    /// `const { response } = request; response.headers`.
+    target_property_receivers: &'a [GlobalPropertyReceiver],
     /// A unique program-scope declaration in a classic script. Other classic
     /// scripts share this bare binding; modules and lexical shadows do not.
     script_global_bare_target: bool,
@@ -399,6 +433,7 @@ pub struct ScanCtx<'a> {
     lexical_shadow_scopes: Vec<HashSet<String>>,
     binding_engine: LocalInferenceEngine<&'static str>,
     type_binding_engine: LocalInferenceEngine<()>,
+    target_object_parameters: HashMap<CodeUnit, HashSet<usize>>,
     pub hits: &'a mut BTreeSet<UsageHit>,
     pub unproven_hits: &'a mut BTreeSet<UsageHit>,
 }
@@ -435,6 +470,49 @@ struct LocalPropertyReceiverAlias {
 struct GlobalPropertyReceiver {
     root: String,
     members: Vec<String>,
+}
+
+fn collect_target_property_receivers(
+    analyzer: &dyn CodeUnitIndex,
+    target: &CodeUnit,
+    target_member: &str,
+    language: Language,
+) -> Vec<GlobalPropertyReceiver> {
+    let Ok(source) = target.source().read_to_string() else {
+        return Vec::new();
+    };
+    let Some(parser_language) = js_ts_tree_sitter_language_for_file(target.source(), language)
+    else {
+        return Vec::new();
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&parser_language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(source.as_str(), None) else {
+        return Vec::new();
+    };
+    let mut receivers = direct_property_definitions(
+        tree.root_node(),
+        source.as_str(),
+        &analyzer.ranges(target),
+        target_member,
+    )
+    .into_iter()
+    .map(|definition| GlobalPropertyReceiver {
+        root: slice(definition.receiver.root, source.as_str()).to_string(),
+        members: definition
+            .receiver
+            .members
+            .iter()
+            .map(|member| slice(*member, source.as_str()).to_string())
+            .collect(),
+    })
+    .collect::<Vec<_>>();
+    receivers
+        .sort_by(|left, right| (&left.root, &left.members).cmp(&(&right.root, &right.members)));
+    receivers.dedup();
+    receivers
 }
 
 /// The receiver chains through which another script can read `target_member`
@@ -732,6 +810,25 @@ fn global_property_read_matches(object: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
 }
 
 impl ScanCtx<'_> {
+    fn target_object_parameter_count(&self) -> usize {
+        self.target_object_parameters
+            .values()
+            .map(HashSet::len)
+            .sum()
+    }
+
+    fn reset_for_additional_pass(
+        &mut self,
+        binding_engine: LocalInferenceEngine<&'static str>,
+        type_binding_engine: LocalInferenceEngine<()>,
+    ) {
+        self.scope_stack.clear();
+        self.scope_stack.push(HashMap::default());
+        self.lexical_shadow_scopes.clear();
+        self.binding_engine = binding_engine;
+        self.type_binding_engine = type_binding_engine;
+    }
+
     /// Whether `name` has a lexical binding covering `byte` in this file. A
     /// bound name is the file's own, which disproves every global-identity
     /// read of the same spelling.
@@ -747,7 +844,9 @@ impl ScanCtx<'_> {
         }
         let local_resolution = self.binding_engine.resolve_symbol(ident);
         if local_resolution.as_precise().is_some_and(|targets| {
-            targets.contains(TARGET_BINDING) || targets.contains(TARGET_VALUE_BINDING)
+            targets.contains(TARGET_BINDING)
+                || targets.contains(TARGET_VALUE_BINDING)
+                || targets.contains(TARGET_IMPORTED_VALUE_BINDING)
         }) {
             return true;
         }
@@ -789,6 +888,13 @@ impl ScanCtx<'_> {
             .resolve_symbol(ident)
             .as_precise()
             .is_some_and(|targets| targets.contains(TARGET_VALUE_BINDING))
+    }
+
+    fn binds_imported_target_value(&self, ident: &str) -> bool {
+        self.binding_engine
+            .resolve_symbol(ident)
+            .as_precise()
+            .is_some_and(|targets| targets.contains(TARGET_IMPORTED_VALUE_BINDING))
     }
 
     fn binds_target_object(&self, ident: &str) -> bool {
@@ -864,6 +970,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.binding_engine.enter_scope();
         ctx.type_binding_engine.enter_scope();
         register_function_parameters(node, ctx);
+        seed_target_object_function_parameters(node, ctx);
         register_named_function_expression_shadow(node, ctx);
         ctx.scope_stack.push(HashMap::default());
         register_scope_parameters(node, ctx);
@@ -920,6 +1027,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             handle_identifier_candidate(node, ctx);
         }
         "member_expression" => handle_member_expression(node, ctx),
+        "call_expression" => register_target_object_call_arguments(node, ctx),
         "object" => handle_contextual_object_literal(node, ctx),
         "jsx_opening_element" | "jsx_self_closing_element" => handle_jsx_element(node, ctx),
         _ => {}
@@ -1210,11 +1318,13 @@ fn register_local_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
     if matches!(name_node.kind(), "object_pattern" | "array_pattern") {
         register_declarator_pattern_shadows(name_node, ctx);
-        if name_node.kind() == "object_pattern"
-            && (expression_carries_target_object(value_node, ctx)
-                || expression_resolves_to_target_owner(value_node, ctx))
-        {
-            seed_target_destructuring_bindings(name_node, ctx);
+        if name_node.kind() == "object_pattern" {
+            if expression_carries_target_object(value_node, ctx)
+                || expression_resolves_to_target_owner(value_node, ctx)
+            {
+                seed_target_destructuring_bindings(name_node, ctx);
+            }
+            seed_target_owner_destructuring_binding(name_node, value_node, ctx);
         }
         return;
     }
@@ -1311,6 +1421,85 @@ fn seed_target_destructuring_bindings(pattern: Node<'_>, ctx: &mut ScanCtx<'_>) 
             record_hit(key_node, ctx);
             ctx.binding_engine
                 .seed_symbol(local.to_string(), TARGET_VALUE_BINDING);
+        }
+    }
+}
+
+fn seed_target_owner_destructuring_binding(
+    pattern: Node<'_>,
+    value: Node<'_>,
+    ctx: &mut ScanCtx<'_>,
+) {
+    let Some(value_receiver) = static_member_receiver(value, ctx.source) else {
+        return;
+    };
+    let value_root = slice(value_receiver.root, ctx.source);
+    for target_receiver in ctx.target_property_receivers {
+        if value_root != target_receiver.root
+            || value_receiver.members.len() > target_receiver.members.len()
+            || !value_receiver
+                .members
+                .iter()
+                .zip(&target_receiver.members)
+                .all(|(actual, expected)| slice(*actual, ctx.source) == expected)
+        {
+            continue;
+        }
+        seed_target_owner_pattern_path(
+            pattern,
+            &target_receiver.members[value_receiver.members.len()..],
+            ctx,
+        );
+    }
+}
+
+fn seed_target_owner_pattern_path(pattern: Node<'_>, owner_path: &[String], ctx: &mut ScanCtx<'_>) {
+    let Some((next_member, remaining)) = owner_path.split_first() else {
+        seed_target_destructuring_bindings(pattern, ctx);
+        return;
+    };
+    let mut cursor = pattern.walk();
+    for property in pattern.named_children(&mut cursor) {
+        let (key_node, value_node) = match property.kind() {
+            "shorthand_property_identifier_pattern" => (property, property),
+            "pair_pattern" => {
+                let (Some(key), Some(value)) = (
+                    property.child_by_field_name("key"),
+                    property.child_by_field_name("value"),
+                ) else {
+                    continue;
+                };
+                (key, value)
+            }
+            "object_assignment_pattern" => {
+                let Some(left) = property.child_by_field_name("left") else {
+                    continue;
+                };
+                (left, left)
+            }
+            _ => continue,
+        };
+        if slice(key_node, ctx.source) != next_member {
+            continue;
+        }
+        if remaining.is_empty() {
+            if let Some(local) = direct_pattern_binding(value_node) {
+                let local = slice(local, ctx.source);
+                if !local.is_empty() {
+                    ctx.binding_engine
+                        .seed_symbol(local.to_string(), TARGET_OBJECT_BINDING);
+                }
+            }
+            continue;
+        }
+        let nested = match value_node.kind() {
+            "assignment_pattern" | "object_assignment_pattern" => {
+                value_node.child_by_field_name("left")
+            }
+            _ => Some(value_node),
+        };
+        if let Some(nested) = nested.filter(|node| node.kind() == "object_pattern") {
+            seed_target_owner_pattern_path(nested, remaining, ctx);
         }
     }
 }
@@ -1430,6 +1619,146 @@ fn register_function_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     register_pattern_bindings(parameters, ctx);
+}
+
+fn register_target_object_call_arguments(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.target_property_receivers.is_empty() {
+        return;
+    }
+    let Some(callee) = node.child_by_field_name("function") else {
+        return;
+    };
+    let Some(target) = local_function_target_for_reference(callee, ctx) else {
+        return;
+    };
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = arguments.walk();
+    for (index, argument) in arguments.named_children(&mut cursor).enumerate() {
+        if expression_carries_target_object(argument, ctx) {
+            ctx.target_object_parameters
+                .entry(target.clone())
+                .or_default()
+                .insert(index);
+        }
+    }
+}
+
+fn seed_target_object_function_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if ctx.target_object_parameters.is_empty() {
+        return;
+    }
+    let Some(target) = local_function_target_for_declaration(node, ctx) else {
+        return;
+    };
+    let Some(indices) = ctx.target_object_parameters.get(&target) else {
+        return;
+    };
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for (index, parameter) in parameters.named_children(&mut cursor).enumerate() {
+        if !indices.contains(&index) {
+            continue;
+        }
+        if let Some(binding) = direct_function_parameter_binding(parameter) {
+            let name = slice(binding, ctx.source);
+            if !name.is_empty() {
+                ctx.binding_engine
+                    .seed_symbol(name.to_string(), TARGET_OBJECT_BINDING);
+            }
+        }
+    }
+}
+
+fn direct_function_parameter_binding(node: Node<'_>) -> Option<Node<'_>> {
+    let pattern = match node.kind() {
+        "required_parameter" | "optional_parameter" => node
+            .child_by_field_name("pattern")
+            .or_else(|| node.child_by_field_name("name"))?,
+        _ => node,
+    };
+    direct_pattern_binding(pattern)
+}
+
+fn local_function_target_for_reference(reference: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
+    let name = simple_identifier_text(reference, ctx.source)?;
+    let scope = ctx
+        .lexical_bindings
+        .as_ref()?
+        .binding_scope_at(name, reference.start_byte())?;
+    let mut candidates = ctx
+        .host
+        .usage_definitions()
+        .file_identifier(ctx.file, name)
+        .into_iter()
+        .filter(|candidate| candidate.source() == ctx.file && candidate.is_function())
+        .filter(|candidate| {
+            ctx.analyzer.ranges(candidate).iter().any(|range| {
+                ctx.lexical_bindings
+                    .as_ref()
+                    .and_then(|bindings| bindings.binding_scope_at(name, range.start_byte))
+                    == Some(scope)
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn local_function_target_for_declaration(
+    function: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<CodeUnit> {
+    let name = local_function_binding_name(function, ctx.source)?;
+    let function_range = Range {
+        start_byte: function.start_byte(),
+        end_byte: function.end_byte(),
+        start_line: 0,
+        end_line: 0,
+    };
+    let mut candidates = ctx
+        .host
+        .usage_definitions()
+        .file_identifier(ctx.file, name)
+        .into_iter()
+        .filter(|candidate| candidate.source() == ctx.file && candidate.is_function())
+        .filter(|candidate| {
+            ctx.analyzer
+                .ranges(candidate)
+                .iter()
+                .any(|range| range_within(&function_range, range))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn local_function_binding_name<'a>(function: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if matches!(
+        function.kind(),
+        "function_declaration" | "generator_function_declaration"
+    ) {
+        return function
+            .child_by_field_name("name")
+            .and_then(|name| simple_identifier_text(name, source));
+    }
+    let declarator = function
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")?;
+    if declarator
+        .child_by_field_name("value")
+        .is_none_or(|value| value.id() != function.id())
+    {
+        return None;
+    }
+    declarator
+        .child_by_field_name("name")
+        .and_then(|name| simple_identifier_text(name, source))
 }
 
 fn register_scope_parameters(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -1583,11 +1912,16 @@ fn collect_pattern_identifiers_into(
 }
 
 fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
-    if ctx.target_member.is_some() && ctx.browser_global_object.is_none() {
-        return;
-    }
     let text = slice(node, ctx.source);
     if text.is_empty() {
+        return;
+    }
+    // Most member targets require a receiver. A named import is different: its
+    // exact import edge binds the exported member value to a bare local name.
+    if ctx.target_member.is_some()
+        && ctx.browser_global_object.is_none()
+        && !ctx.binds_imported_target_value(text)
+    {
         return;
     }
     if ctx.browser_global_object.is_some() && ctx.lexically_bound_at(text, node.start_byte()) {
@@ -1752,6 +2086,9 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         if ctx.lookup_only_local_property {
+            if expression_carries_target_object(object, ctx) {
+                record_hit(property, ctx);
+            }
             return;
         }
     }
@@ -2545,12 +2882,104 @@ fn register_module_exports_assignment(right: Node<'_>, source: &str, index: &mut
     }
 
     if let Some(local_name) = local_export_name(right, source) {
+        if let Some(object) = program_object_binding(right, source, &local_name) {
+            register_module_exports_bound_object(object, source, &local_name, index);
+        }
         index.exports_by_name.insert(
             "default".to_string(),
             ExportEntry::Default {
                 local_name: Some(local_name),
             },
         );
+    }
+}
+
+/// Resolve `module.exports = local` to the one program-scope object literal
+/// that binds `local`. A CommonJS consumer can destructure the object's named
+/// properties even though the assignment exports the object through a local
+/// binding instead of an inline literal.
+fn program_object_binding<'tree>(
+    reference: Node<'tree>,
+    source: &str,
+    local_name: &str,
+) -> Option<Node<'tree>> {
+    if simple_identifier_text_for_source(reference, source) != Some(local_name) {
+        return None;
+    }
+    let mut root = reference;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    if root.kind() != "program" {
+        return None;
+    }
+
+    let mut object = None;
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if !matches!(
+            statement.kind(),
+            "lexical_declaration" | "variable_declaration"
+        ) {
+            continue;
+        }
+        let mut declaration_cursor = statement.walk();
+        for declarator in statement.named_children(&mut declaration_cursor) {
+            if declarator.kind() != "variable_declarator"
+                || declarator
+                    .child_by_field_name("name")
+                    .and_then(|name| simple_identifier_text_for_source(name, source))
+                    != Some(local_name)
+            {
+                continue;
+            }
+            let value = declarator.child_by_field_name("value")?;
+            if value.kind() != "object" || object.replace(value).is_some() {
+                return None;
+            }
+        }
+    }
+    object
+}
+
+fn register_module_exports_bound_object(
+    object: Node<'_>,
+    source: &str,
+    object_name: &str,
+    index: &mut ExportIndex,
+) {
+    let mut cursor = object.walk();
+    for child in object.named_children(&mut cursor) {
+        match child.kind() {
+            "shorthand_property_identifier" | "shorthand_property_identifier_pattern" => {
+                let name = slice(child, source).trim();
+                if !name.is_empty() {
+                    index.exports_by_name.insert(
+                        name.to_string(),
+                        ExportEntry::Local {
+                            local_name: name.to_string(),
+                        },
+                    );
+                }
+            }
+            "pair" => {
+                let Some(key) = child.child_by_field_name("key") else {
+                    continue;
+                };
+                let Some(value) = child.child_by_field_name("value") else {
+                    continue;
+                };
+                let Some(exported_name) = property_name_text(key, source) else {
+                    continue;
+                };
+                let local_name = local_export_name(value, source)
+                    .unwrap_or_else(|| format!("{object_name}.{exported_name}"));
+                index
+                    .exports_by_name
+                    .insert(exported_name, ExportEntry::Local { local_name });
+            }
+            _ => {}
+        }
     }
 }
 

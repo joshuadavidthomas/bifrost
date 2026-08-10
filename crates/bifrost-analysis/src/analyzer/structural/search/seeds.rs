@@ -624,8 +624,8 @@ pub(super) fn execute_environment_seed(
 }
 
 pub(super) enum MaterializationSeedKind<'a> {
-    GenerationSites(&'a super::super::query::GenerationSiteFilter),
-    Exports(&'a super::super::query::ExportFilter),
+    GenerationSites(&'a brokk_bifrost_rql::GenerationSiteFilter),
+    Exports(&'a brokk_bifrost_rql::ExportFilter),
 }
 
 /// Scan the workspace for generation-site or export rows (#1476).

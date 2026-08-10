@@ -13,7 +13,6 @@
 //! empty answer is never silently a complete one.
 
 use super::super::edges::EdgeAxis;
-use super::super::query::schema::{reference_kind_label, usage_proof_label};
 use super::super::reference_edges::{
     EdgeCompleteness, EdgeDerivationResult, EdgeIncompleteReason, ReferenceEdgeRow,
     forward_edges_for_file, inverse_edges_for_declaration,
@@ -27,6 +26,7 @@ use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_rql::schema::{reference_kind_label, usage_proof_label};
 use std::sync::Arc;
 
 /// Domain separator for a reference-edge row's stable id.

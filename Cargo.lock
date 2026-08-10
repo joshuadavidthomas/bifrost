@@ -186,6 +186,7 @@ dependencies = [
  "brokk-bifrost-mcp",
  "brokk-bifrost-nlp",
  "brokk-bifrost-policy",
+ "brokk-bifrost-rql",
  "brokk-bifrost-runtime",
  "brokk-bifrost-semantic-packs",
  "chrono",
@@ -237,6 +238,7 @@ dependencies = [
  "brokk-bifrost-jvm",
  "brokk-bifrost-php",
  "brokk-bifrost-python",
+ "brokk-bifrost-rql",
  "brokk-bifrost-ruby",
  "brokk-bifrost-rust",
  "cap-fs-ext",
@@ -248,13 +250,11 @@ dependencies = [
  "goblin",
  "growable-bloom-filter",
  "jclassfile",
- "json-spanned-value",
  "libc",
  "moka",
  "quick-xml",
  "rayon",
  "regex",
- "regex-syntax",
  "rubund",
  "rusqlite",
  "rustc-hash",
@@ -266,7 +266,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "spdx",
- "strsim",
  "tar",
  "tempfile",
  "toml",
@@ -382,6 +381,7 @@ version = "0.8.24"
 dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-policy",
+ "brokk-bifrost-rql",
  "brokk-bifrost-runtime",
  "crossbeam-channel",
  "glob",
@@ -405,6 +405,7 @@ dependencies = [
  "brokk-bifrost-analysis",
  "brokk-bifrost-nlp",
  "brokk-bifrost-policy",
+ "brokk-bifrost-rql",
  "brokk-bifrost-runtime",
  "git2",
  "glob",
@@ -459,6 +460,7 @@ name = "brokk-bifrost-policy"
 version = "0.8.24"
 dependencies = [
  "brokk-bifrost-analysis",
+ "brokk-bifrost-rql",
  "cap-std",
  "chrono",
  "cvss",
@@ -481,6 +483,20 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "tree-sitter-python",
+]
+
+[[package]]
+name = "brokk-bifrost-rql"
+version = "0.8.24"
+dependencies = [
+ "brokk-bifrost-core",
+ "glob",
+ "json-spanned-value",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "strsim",
 ]
 
 [[package]]

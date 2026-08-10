@@ -1649,7 +1649,7 @@ fn edge_field_mismatches(left: &ReferenceEdgeRow, right: &ReferenceEdgeRow) -> V
 
 fn edge_kind_label(row: &ReferenceEdgeRow) -> &'static str {
     row.reference_kind.map_or("unclassified", |kind| {
-        brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(kind)
+        brokk_bifrost_rql::schema::reference_kind_label(kind)
     })
 }
 
@@ -2003,10 +2003,7 @@ fn edge_class_verdict(
             // requirement nor trip a prohibition.
             None => EdgeClassVerdict::Undecidable,
             Some(kind) => check(kind, require, forbid, |value| {
-                brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(
-                    value,
-                )
-                .to_string()
+                brokk_bifrost_rql::schema::reference_kind_label(value).to_string()
             }),
         },
     }

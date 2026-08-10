@@ -1,16 +1,20 @@
-use super::super::analysis_context::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
-use super::super::edges::{OwnerRelation, SiteClass};
-use super::super::kinds::{NormalizedKind, Role};
-use super::super::materialization::{
+use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
+use crate::refs::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
+use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
+use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role};
+use brokk_bifrost_core::analyzer::structural::materialization::{
     DeclarationOrigin, ExportForm, GenerationInputClass, GenerationKind,
 };
-use super::super::occurrences::{ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole};
-use super::super::resolution::{
+use brokk_bifrost_core::analyzer::structural::occurrences::{
+    ALL_OCCURRENCE_ROLES, Namespace, OccurrenceClass, OccurrenceRole,
+};
+use brokk_bifrost_core::analyzer::structural::resolution::{
     BindingKind, BoundaryStatus, CandidateOutcome, HoistingClass, PrecedenceTier, RejectionReason,
 };
-use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
-use crate::analyzer::Language;
-use crate::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof};
+use brokk_bifrost_core::analyzer::usages::model::{
+    ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof,
+};
 use regex::Regex;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -160,21 +164,6 @@ impl EdgeFilter {
             && self.usage_kinds.is_empty()
             && self.relations.is_empty()
             && self.site_classes.is_empty()
-    }
-
-    pub fn matches(
-        &self,
-        row: &crate::analyzer::structural::reference_edges::ReferenceEdgeRow,
-    ) -> bool {
-        (self.reference_kinds.is_empty()
-            || row
-                .reference_kind
-                .is_some_and(|kind| self.reference_kinds.contains(&kind)))
-            && self.proof.is_none_or(|proof| row.proof == proof)
-            && self.surface.is_none_or(|surface| row.included_in(surface))
-            && (self.usage_kinds.is_empty() || self.usage_kinds.contains(&row.usage_kind))
-            && (self.relations.is_empty() || self.relations.contains(&row.owner_relation))
-            && (self.site_classes.is_empty() || self.site_classes.contains(&row.site_class))
     }
 }
 
@@ -357,8 +346,7 @@ impl BindingFilter {
 /// Constrained-value filter over resolution-candidate rows.
 ///
 /// `unattributed_tier` is a filter value of its own rather than an absent
-/// filter: [`crate::analyzer::usages::get_definition::TraceCandidate::tier`] is
-/// an `Option`, so "the seam could not name a tier" is a real answer an author
+/// filter: the row tier is an `Option`, so "the seam could not name a tier" is a real answer an author
 /// must be able to select, and it must never be confused with any named tier.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CandidateFilter {
@@ -1541,7 +1529,7 @@ impl StringPredicate {
     /// every other regex, in which case callers must treat the predicate as
     /// opaque (no pruning, no posting lookup). Alternatives are non-empty,
     /// sorted, and deduplicated.
-    pub(crate) fn exact_alternatives(&self) -> Option<Vec<String>> {
+    pub fn exact_alternatives(&self) -> Option<Vec<String>> {
         let mut alternatives = match self {
             StringPredicate::Exact(expected) => vec![expected.clone()],
             StringPredicate::Regex(regex) => regex_literal_alternatives(regex.as_str())?,
@@ -1672,7 +1660,7 @@ impl Pattern {
             || !self.kwargs.is_empty()
     }
 
-    pub(crate) fn single_role_pattern(&self, role: Role) -> Option<&Pattern> {
+    pub fn single_role_pattern(&self, role: Role) -> Option<&Pattern> {
         match role {
             Role::Callee => self.callee.as_deref(),
             Role::Receiver => self.receiver.as_deref(),
@@ -1685,7 +1673,7 @@ impl Pattern {
         }
     }
 
-    pub(crate) fn list_role_patterns(&self, role: Role) -> &[Pattern] {
+    pub fn list_role_patterns(&self, role: Role) -> &[Pattern] {
         match role {
             Role::Arg => &self.args,
             Role::Decorator => &self.decorators,
@@ -1700,7 +1688,7 @@ impl Pattern {
         }
     }
 
-    pub(crate) fn has_role_constraints(&self) -> bool {
+    pub fn has_role_constraints(&self) -> bool {
         self.constrains_roles()
     }
 }

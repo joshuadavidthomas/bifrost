@@ -806,9 +806,7 @@ impl EdgeParityAssert {
         match self.surface {
             Some(surface) => format!(
                 "{direction} on the {} surface",
-                brokk_bifrost_analysis::analyzer::structural::query::schema::usage_surface_label(
-                    surface
-                )
+                brokk_bifrost_rql::schema::usage_surface_label(surface)
             ),
             None => direction.to_string(),
         }
@@ -836,9 +834,7 @@ impl EdgeClassAssert {
         match self.surface {
             Some(surface) => format!(
                 "{base} on the {} surface",
-                brokk_bifrost_analysis::analyzer::structural::query::schema::usage_surface_label(
-                    surface
-                )
+                brokk_bifrost_rql::schema::usage_surface_label(surface)
             ),
             None => base,
         }
@@ -906,10 +902,10 @@ impl EdgeClassConstraint {
             ),
             Self::Kind { require, forbid } => (
                 joined(require, |value| {
-                    brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(*value)
+                    brokk_bifrost_rql::schema::reference_kind_label(*value)
                 }),
                 joined(forbid, |value| {
-                    brokk_bifrost_analysis::analyzer::structural::query::schema::reference_kind_label(*value)
+                    brokk_bifrost_rql::schema::reference_kind_label(*value)
                 }),
             ),
         };

@@ -12,7 +12,7 @@
 
 use super::facts::{FileFacts, RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
-use super::query::{CodeQuerySeed, Pattern};
+use brokk_bifrost_rql::{CodeQuerySeed, Pattern};
 
 #[derive(Debug)]
 pub(crate) struct CaptureBinding {

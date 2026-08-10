@@ -23,7 +23,6 @@ use crate::analyzer::semantic::{
 use crate::analyzer::structural::analysis_context::{
     ProtocolRef, QueryAnalysisContext, QueryAnalysisContextError,
 };
-use crate::analyzer::structural::query::WitnessTraversal;
 use crate::analyzer::typestate::{
     CompiledProtocol, ProductionSummaryLifecycleCounters, ProductionTypestateExecutionContext,
     ProtocolStateId, TypestateBindingPlan, TypestateFinding, TypestateFindingCertainty,
@@ -34,6 +33,7 @@ use crate::analyzer::typestate::{
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
+use brokk_bifrost_rql::WitnessTraversal;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TypestateCacheKey {

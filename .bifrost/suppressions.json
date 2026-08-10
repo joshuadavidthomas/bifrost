@@ -1859,6 +1859,72 @@
       "accepted_by": "jbellis",
       "accepted_at": "2026-08-09",
       "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "b70d3ca6e98fb348587114de3145c84ee0b95adb4e1845eaf84d283c6783b602",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration reads a different .model.yml file selected by the current path. The read depends on that path and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-10",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "8aa9bf4aa531e42d842331ddefeeba568ed2ab1538c78495f71f0191d71da8d1",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each procedure summary has a different location list. Sorting each list once gives canonical output and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-10",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "266aa8677f456ca3da453b1084ae1e6ffa3f6345f00c53ab39140045dcede744",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each procedure summary has a different transfer list. Sorting each list once gives canonical output and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-10",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "308972232467bc10dc0388b87c2b26b875f02dae1623d0d2701794865bc3ff82",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each inconclusive outcome has a different reason list. Sorting each list once gives deterministic counting and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-10",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "0a8a852ba6a85f934a129817394ae8ae9ce04648fc1f98df4dc63f88f5217d30",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration reads a different sanitizer candidate file selected by the current path. The read depends on that path and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-10",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "0e2e50e3f90d5709eee56bc470003a8a3e2f05646f8bd1b3d0b07357c4085f54",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration parses the bytes from a different sanitizer candidate file. The parse depends on that file and cannot be hoisted.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "jbellis",
+      "accepted_at": "2026-08-10",
+      "expires_at": null
     }
   ]
 }
