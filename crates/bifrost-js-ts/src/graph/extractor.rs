@@ -234,6 +234,7 @@ pub fn scan_files_for_seeds(
             target_owner_source: target_owner_source.as_ref(),
             imports,
             receiver_facts,
+            language,
             lexical_bindings,
             scope_stack: vec![HashMap::default()],
             lexical_shadow_scopes: Vec::new(),
@@ -339,6 +340,7 @@ pub struct ScanCtx<'a> {
     target_owner_source: Option<&'a ProjectFile>,
     imports: JsTsImportBinder,
     receiver_facts: JsTsReceiverFactProvider<'a, 'a>,
+    language: Language,
     lexical_bindings: Option<JsTsLexicalBindingIndex>,
     scope_stack: Vec<HashMap<String, LocalBinding>>,
     lexical_shadow_scopes: Vec<HashSet<String>>,
@@ -1864,6 +1866,9 @@ fn member_object_match_status(
     }) {
         return match binding {
             LocalBinding::TargetReceiver => ReceiverMatchStatus::Proven,
+            LocalBinding::KnownUnrelated if ctx.language == Language::TypeScript => {
+                receiver_fact_match_status(node, ctx)
+            }
             LocalBinding::KnownUnrelated => ReceiverMatchStatus::NoMatch,
             LocalBinding::Other
                 if simple_identifier_text(node, ctx.source)

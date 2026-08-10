@@ -430,6 +430,9 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             "object" if self.language == Language::JavaScript => {
                 self.resolve_object_expression(expression, budget)
             }
+            "object" if self.language == Language::TypeScript => {
+                self.resolve_typescript_object_spreads(expression, depth + 1, budget, tracker)
+            }
             "this" => self.resolve_this_expression(expression, budget),
             "call_expression" => self.summarize_call_node(
                 expression,
@@ -541,6 +544,30 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             .map(ReceiverValue::ModuleOrExportObject)
             .collect::<Vec<_>>();
         ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget)
+    }
+
+    fn resolve_typescript_object_spreads(
+        &self,
+        expression: Node<'tree>,
+        depth: usize,
+        budget: ReceiverAnalysisBudget,
+        tracker: &mut ReceiverAnalysisBudgetTracker,
+    ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        let mut outcomes = Vec::new();
+        let mut cursor = expression.walk();
+        for child in expression.named_children(&mut cursor) {
+            if child.kind() != "spread_element" {
+                continue;
+            }
+            if let Some(value) = child.named_child(0) {
+                outcomes.push(self.resolve_expression(value, depth + 1, budget, tracker));
+            }
+        }
+        if outcomes.is_empty() {
+            ReceiverAnalysisOutcome::Unknown
+        } else {
+            ReceiverAnalysisOutcome::merge_branch_outcomes(outcomes, budget)
+        }
     }
 
     fn resolve_identifier_binding(
@@ -877,9 +904,6 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         budget: ReceiverAnalysisBudget,
         tracker: &mut ReceiverAnalysisBudgetTracker,
     ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
-        if self.language != Language::JavaScript {
-            return None;
-        }
         let functions = resolve_js_ts_direct_import_candidates(
             self.host,
             self.support,
@@ -1036,6 +1060,14 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             return ReceiverAnalysisOutcome::ExceededBudget {
                 limit: "receiver_recursion",
             };
+        }
+        if self.language == Language::TypeScript
+            && let Some(type_node) = function.child_by_field_name("return_type")
+        {
+            let values = self.type_annotation_receiver_values(type_node, budget);
+            if !values.is_empty() {
+                return ReceiverAnalysisOutcome::single_precise_or_ambiguous(values, budget);
+            }
         }
         let mut outcomes = Vec::new();
         let mut stack = vec![function];
