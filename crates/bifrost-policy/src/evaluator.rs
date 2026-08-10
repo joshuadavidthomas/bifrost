@@ -31,10 +31,6 @@ use brokk_bifrost_analysis::analyzer::structural::materialization_rows::{
 };
 use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceClass as InternalOccurrenceClass;
 use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceRole;
-use brokk_bifrost_analysis::analyzer::structural::query::{
-    CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, GenerationSiteSeed, OccurrenceSeed,
-    QueryStep, ReachingBindingOptions, SCHEMA_VERSION, ScopeSeed,
-};
 use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
     EdgeDerivationResult, ReferenceEdgeRow, forward_edges_for_file, inverse_edges_for_declaration,
 };
@@ -66,6 +62,10 @@ use brokk_bifrost_analysis::analyzer::structural::{
 };
 use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
 use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
+use brokk_bifrost_rql::{
+    CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, GenerationSiteSeed, OccurrenceSeed,
+    QueryStep, ReachingBindingOptions, SCHEMA_VERSION, ScopeSeed,
+};
 use std::sync::Arc;
 
 use super::budget::PolicyBudget;

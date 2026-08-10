@@ -18,7 +18,6 @@ use super::super::materialization_rows::{
     DeclarationStateRow, ExportRow, GenerationSiteRow, MaterializationCompleteness,
     MaterializationFileResult, MaterializationIncompleteReason, materialization_for_file,
 };
-use super::super::query::{ExportFilter, GenerationSiteFilter};
 use super::results::{
     CodeQueryDeclarationState, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact, CodeQueryExport, CodeQueryGeneratedDeclaration,
@@ -27,6 +26,7 @@ use super::results::{
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::{IAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_rql::{ExportFilter, GenerationSiteFilter};
 use std::sync::Arc;
 
 /// Domain separator for a generation-site row's stable id.

@@ -1,8 +1,3 @@
-use crate::analyzer::structural::query::schema::{
-    ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, ALL_USAGE_KINDS,
-    QueryField, QueryStepField, environment_filter_labels, occurrence_filter_labels,
-    reference_kind_label, supported_query_schema_versions,
-};
 use crate::analyzer::structural::{
     ALL_KINDS, ALL_OWNER_RELATIONS, ALL_SITE_CLASSES, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH,
     MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS,
@@ -10,6 +5,11 @@ use crate::analyzer::structural::{
     MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, SCHEMA_VERSION,
 };
 use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
+use brokk_bifrost_rql::schema::{
+    ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, ALL_USAGE_KINDS,
+    QueryField, QueryStepField, environment_filter_labels, occurrence_filter_labels,
+    reference_kind_label, supported_query_schema_versions,
+};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 

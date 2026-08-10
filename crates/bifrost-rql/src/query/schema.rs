@@ -6,16 +6,18 @@
 //! a value shape is therefore a macro error, and every handler must match the
 //! generated enum exhaustively.
 
-use super::super::materialization::ALL_DECLARATION_ORIGINS;
-use crate::analyzer::structural::occurrences::{
+use brokk_bifrost_core::analyzer::structural::materialization::ALL_DECLARATION_ORIGINS;
+use brokk_bifrost_core::analyzer::structural::occurrences::{
     ALL_NAMESPACES, ALL_OCCURRENCE_CLASSES, ALL_OCCURRENCE_ROLES,
 };
-use crate::analyzer::structural::resolution::{
+use brokk_bifrost_core::analyzer::structural::resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_HOISTING_CLASSES, ALL_PRECEDENCE_TIERS,
     ALL_REJECTION_REASONS,
 };
-use crate::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof};
-use crate::schema_version::{
+use brokk_bifrost_core::analyzer::usages::model::{
+    ReferenceKind, UsageHitKind, UsageHitSurface, UsageProof,
+};
+use brokk_bifrost_core::schema_version::{
     SchemaVersionDescriptor, SchemaVersionRegistry, SchemaVersionResolution,
     UnsupportedSchemaVersion,
 };
@@ -180,13 +182,9 @@ impl ValueShape {
         match self {
             Self::ParameterName => Some((1, MAX_KWARG_NAME_LENGTH)),
             Self::CaptureName => Some((1, MAX_CAPTURE_LENGTH)),
-            Self::ProtocolRef => Some((3, crate::analyzer::structural::MAX_PROTOCOL_REF_BYTES)),
-            Self::ValueFlowPlanRef => {
-                Some((3, crate::analyzer::structural::MAX_PROTOCOL_REF_BYTES))
-            }
-            Self::TaintResultRef => {
-                Some((3, crate::analyzer::structural::MAX_TAINT_RESULT_REF_BYTES))
-            }
+            Self::ProtocolRef => Some((3, crate::refs::MAX_PROTOCOL_REF_BYTES)),
+            Self::ValueFlowPlanRef => Some((3, crate::refs::MAX_VALUE_FLOW_PLAN_REF_BYTES)),
+            Self::TaintResultRef => Some((3, crate::refs::MAX_TAINT_RESULT_REF_BYTES)),
             _ => None,
         }
     }
@@ -1906,7 +1904,7 @@ json_fields! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
+    use brokk_bifrost_core::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
     use std::collections::HashSet;
 
     #[test]

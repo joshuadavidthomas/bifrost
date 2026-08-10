@@ -90,7 +90,7 @@ fn malformed_json_range_is_byte_correct_after_utf8() {
 
 #[test]
 fn json_schema_validation_uses_the_compatibility_registry() {
-    use crate::schema_version::{SchemaVersionDescriptor, SchemaVersionRegistry};
+    use brokk_bifrost_core::schema_version::{SchemaVersionDescriptor, SchemaVersionRegistry};
 
     let registry = SchemaVersionRegistry::new(&[
         SchemaVersionDescriptor::new(2, None, true),
@@ -343,7 +343,7 @@ fn typed_pipeline_help_and_json_diagnostics_use_shared_schema() {
     assert!(file_of_help.description.contains("reference sites"));
     assert!(file_of_help.description.contains("receiver analyses"));
     assert!(
-        crate::analyzer::structural::query::schema::QueryStepOp::FileOf
+        crate::schema::QueryStepOp::FileOf
             .signature()
             .contains("reference_site")
     );

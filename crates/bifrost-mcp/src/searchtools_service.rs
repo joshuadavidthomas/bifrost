@@ -2213,14 +2213,13 @@ impl SearchToolsService {
         )
         .map_err(|error| Self::query_file_read_error(query_file, error))?;
         let value = match extension {
-            Some("rql") => crate::analyzer::structural::query::sexp::sexp_to_json(
-                contents.source(),
-            )
-            .map_err(|error| {
-                SearchToolsServiceError::invalid_params(format!(
-                    "failed to parse RQL query file `{query_file}`: {error}"
-                ))
-            }),
+            Some("rql") => {
+                brokk_bifrost_rql::query::sexp::sexp_to_json(contents.source()).map_err(|error| {
+                    SearchToolsServiceError::invalid_params(format!(
+                        "failed to parse RQL query file `{query_file}`: {error}"
+                    ))
+                })
+            }
             Some("json") => serde_json::from_str::<Value>(contents.source()).map_err(|error| {
                 SearchToolsServiceError::invalid_params(format!(
                     "failed to parse JSON query file `{query_file}`: {error}"

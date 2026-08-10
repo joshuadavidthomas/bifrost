@@ -7,7 +7,7 @@
 use std::fmt;
 use std::ops::Range;
 
-use brokk_bifrost_analysis::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
+use brokk_bifrost_rql::sexp::{Expr, ExprKind, SexpParseLimits, parse_sexp_with_limits};
 
 use super::schema::{PolicyRecord, RecordLayout, lookup_field, records_from_label};
 use super::source::{

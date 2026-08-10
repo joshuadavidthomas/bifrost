@@ -7,12 +7,12 @@ use super::schema::{
     generation_site_field_for_rql_label, occurrence_option_for_rql_label,
     resolve_rql_schema_version,
 };
-use crate::analyzer::Language;
-use crate::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
-use crate::schema_version::SchemaVersionResolution;
 #[cfg(test)]
 use crate::sexp::MAX_SEXP_DEPTH;
 use crate::sexp::{Expr, ExprKind, ParseError, ParsedSexp, parse_sexp};
+use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::kinds::{NormalizedKind, Role, RoleValueShape};
+use brokk_bifrost_core::schema_version::SchemaVersionResolution;
 use serde_json::{Map, Number, Value, json};
 use std::fmt;
 use std::ops::Range;
@@ -1935,7 +1935,7 @@ mod tests {
 
     #[test]
     fn nested_set_semantic_error_retains_canonical_path_and_absolute_leaf_range() {
-        let invalid_name = "x".repeat(super::super::MAX_STRING_PREDICATE_LENGTH + 1);
+        let invalid_name = "x".repeat(crate::MAX_STRING_PREDICATE_LENGTH + 1);
         let source = format!(
             r#"(policy :selector (union (call) (intersect (call) (call :name "{invalid_name}"))))"#
         );

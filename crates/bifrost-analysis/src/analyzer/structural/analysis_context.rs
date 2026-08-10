@@ -4,15 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroU64;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
 use crate::analyzer::WorkspaceAnalyzer;
-use crate::analyzer::identifier::define_identifier;
 use crate::analyzer::semantic::{
     LengthDelimitedDigest, ProcedureHandle, SemanticArtifact, SemanticArtifactKey,
 };
@@ -24,14 +19,21 @@ use crate::analyzer::typestate::{
 use crate::analyzer::value_flow::ValueFlowPlan;
 use crate::cancellation::CancellationToken;
 
+pub use brokk_bifrost_rql::refs::{
+    MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
+    MAX_TAINT_RESULT_NAME_BYTES, MAX_TAINT_RESULT_NAMESPACE_BYTES, MAX_TAINT_RESULT_REF_BYTES,
+    MAX_VALUE_FLOW_PLAN_NAME_BYTES, MAX_VALUE_FLOW_PLAN_NAMESPACE_BYTES,
+    MAX_VALUE_FLOW_PLAN_REF_BYTES, ProtocolNameError, ProtocolNamespaceError, ProtocolRef,
+    ProtocolRefError, TaintResultNameError, TaintResultNamespaceError, TaintResultRef,
+    TaintResultRefError, ValueFlowPlanNameError, ValueFlowPlanNamespaceError, ValueFlowPlanRef,
+    ValueFlowPlanRefError,
+};
+
 pub const MAX_PROTOCOL_REFS: usize = 256;
 pub const MAX_PROTOCOL_REGISTRATIONS: usize = 128;
 pub const MAX_RETAINED_PROTOCOL_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_RETAINED_BINDING_PLAN_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
-pub const MAX_PROTOCOL_REF_BYTES: usize = 192;
-pub const MAX_PROTOCOL_NAMESPACE_BYTES: usize = 63;
-pub const MAX_PROTOCOL_NAME_BYTES: usize = 128;
 pub const MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_QUERY_REGISTRATION_VALIDATION_ARTIFACTS: usize = 256;
 pub const MAX_QUERY_REGISTRATION_VALIDATION_SOURCE_BYTES: usize = 16 * 1024 * 1024;
@@ -39,260 +41,12 @@ pub const MAX_VALUE_FLOW_PLAN_REFS: usize = 256;
 pub const MAX_VALUE_FLOW_PLAN_REGISTRATIONS: usize = 128;
 pub const MAX_RETAINED_VALUE_FLOW_PLAN_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_VALUE_FLOW_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
-pub const MAX_VALUE_FLOW_PLAN_REF_BYTES: usize = 192;
-pub const MAX_VALUE_FLOW_PLAN_NAMESPACE_BYTES: usize = 63;
-pub const MAX_VALUE_FLOW_PLAN_NAME_BYTES: usize = 128;
 pub const MAX_TAINT_RESULT_REFS: usize = 256;
 pub const MAX_TAINT_RESULT_REGISTRATIONS: usize = 128;
 pub const MAX_TAINT_RESULTS_PER_REGISTRATION: usize = 256;
 pub const MAX_RETAINED_TAINT_PLAN_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_TAINT_REPORT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_RETAINED_TAINT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
-pub const MAX_TAINT_RESULT_REF_BYTES: usize = 192;
-pub const MAX_TAINT_RESULT_NAMESPACE_BYTES: usize = 63;
-pub const MAX_TAINT_RESULT_NAME_BYTES: usize = 128;
-
-pub type ProtocolNamespaceError = crate::analyzer::identifier::IdentifierError;
-pub type ProtocolNameError = crate::analyzer::identifier::IdentifierError;
-pub type ValueFlowPlanNamespaceError = crate::analyzer::identifier::IdentifierError;
-pub type ValueFlowPlanNameError = crate::analyzer::identifier::IdentifierError;
-pub type TaintResultNamespaceError = crate::analyzer::identifier::IdentifierError;
-pub type TaintResultNameError = crate::analyzer::identifier::IdentifierError;
-
-define_identifier! {
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    struct ProtocolNamespace {
-        max_bytes: MAX_PROTOCOL_NAMESPACE_BYTES,
-        allow_dot: true,
-        error: ProtocolNamespaceError,
-    }
-}
-
-define_identifier! {
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    struct TaintResultNamespace {
-        max_bytes: MAX_TAINT_RESULT_NAMESPACE_BYTES,
-        allow_dot: true,
-        error: TaintResultNamespaceError,
-    }
-}
-
-define_identifier! {
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    struct TaintResultName {
-        max_bytes: MAX_TAINT_RESULT_NAME_BYTES,
-        allow_dot: true,
-        error: TaintResultNameError,
-    }
-}
-
-define_identifier! {
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    struct ValueFlowPlanNamespace {
-        max_bytes: MAX_VALUE_FLOW_PLAN_NAMESPACE_BYTES,
-        allow_dot: true,
-        error: ValueFlowPlanNamespaceError,
-    }
-}
-
-define_identifier! {
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    struct ValueFlowPlanName {
-        max_bytes: MAX_VALUE_FLOW_PLAN_NAME_BYTES,
-        allow_dot: true,
-        error: ValueFlowPlanNameError,
-    }
-}
-
-define_identifier! {
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    struct ProtocolName {
-        max_bytes: MAX_PROTOCOL_NAME_BYTES,
-        allow_dot: true,
-        error: ProtocolNameError,
-    }
-}
-
-macro_rules! define_bounded_registration_ref {
-    (
-        $(#[$meta:meta])*
-        $ref_type:ident,
-        $error_type:ident,
-        $namespace_type:ident,
-        $namespace_error:ty,
-        $name_type:ident,
-        $name_error:ty,
-        $max_ref_bytes:expr,
-        $label:literal,
-        $expecting:literal
-    ) => {
-        $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $ref_type {
-            namespace: $namespace_type,
-            name: $name_type,
-        }
-
-        impl $ref_type {
-            pub fn new(
-                namespace: impl AsRef<str>,
-                name: impl AsRef<str>,
-            ) -> Result<Self, $error_type> {
-                let namespace = $namespace_type::new(namespace).map_err($error_type::Namespace)?;
-                let name = $name_type::new(name).map_err($error_type::Name)?;
-                let total = namespace
-                    .as_str()
-                    .len()
-                    .checked_add(1)
-                    .and_then(|length| length.checked_add(name.as_str().len()))
-                    .ok_or($error_type::TooLong {
-                        max_bytes: $max_ref_bytes,
-                    })?;
-                if total > $max_ref_bytes {
-                    return Err($error_type::TooLong {
-                        max_bytes: $max_ref_bytes,
-                    });
-                }
-                Ok(Self { namespace, name })
-            }
-
-            pub fn namespace(&self) -> &str {
-                self.namespace.as_str()
-            }
-
-            pub fn name(&self) -> &str {
-                self.name.as_str()
-            }
-        }
-
-        impl fmt::Display for $ref_type {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(formatter, "{}:{}", self.namespace, self.name)
-            }
-        }
-
-        impl FromStr for $ref_type {
-            type Err = $error_type;
-
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                if value.len() > $max_ref_bytes {
-                    return Err($error_type::TooLong {
-                        max_bytes: $max_ref_bytes,
-                    });
-                }
-                let (namespace, name) = value
-                    .split_once(':')
-                    .ok_or($error_type::MissingSeparator)?;
-                Self::new(namespace, name)
-            }
-        }
-
-        impl Serialize for $ref_type {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: Serializer,
-            {
-                serializer.collect_str(self)
-            }
-        }
-
-        impl<'de> Deserialize<'de> for $ref_type {
-            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                struct RefVisitor;
-
-                impl Visitor<'_> for RefVisitor {
-                    type Value = $ref_type;
-
-                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                        formatter.write_str($expecting)
-                    }
-
-                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-                    where
-                        E: de::Error,
-                    {
-                        $ref_type::from_str(value).map_err(E::custom)
-                    }
-                }
-
-                deserializer.deserialize_str(RefVisitor)
-            }
-        }
-
-        #[derive(Debug, Clone, PartialEq, Eq)]
-        pub enum $error_type {
-            MissingSeparator,
-            TooLong { max_bytes: usize },
-            Namespace($namespace_error),
-            Name($name_error),
-        }
-
-        impl fmt::Display for $error_type {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                match self {
-                    Self::MissingSeparator => write!(
-                        formatter,
-                        "{} reference must use namespace:name form",
-                        $label
-                    ),
-                    Self::TooLong { max_bytes } => write!(
-                        formatter,
-                        "{} reference must be at most {max_bytes} bytes",
-                        $label
-                    ),
-                    Self::Namespace(error) => {
-                        write!(formatter, "invalid {} namespace: {error}", $label)
-                    }
-                    Self::Name(error) => write!(formatter, "invalid {} name: {error}", $label),
-                }
-            }
-        }
-
-        impl std::error::Error for $error_type {}
-    };
-}
-
-define_bounded_registration_ref! {
-    /// A bounded host-defined alias for one pre-resolved protocol registration.
-    ProtocolRef,
-    ProtocolRefError,
-    ProtocolNamespace,
-    ProtocolNamespaceError,
-    ProtocolName,
-    ProtocolNameError,
-    MAX_PROTOCOL_REF_BYTES,
-    "protocol",
-    "a bounded protocol reference in namespace:name form"
-}
-
-define_bounded_registration_ref! {
-    /// A bounded host-defined alias for retained production taint results.
-    TaintResultRef,
-    TaintResultRefError,
-    TaintResultNamespace,
-    TaintResultNamespaceError,
-    TaintResultName,
-    TaintResultNameError,
-    MAX_TAINT_RESULT_REF_BYTES,
-    "taint result",
-    "a bounded taint result reference in namespace:name form"
-}
-
-define_bounded_registration_ref! {
-    /// A bounded host-defined alias for one immutable value-flow plan.
-    ValueFlowPlanRef,
-    ValueFlowPlanRefError,
-    ValueFlowPlanNamespace,
-    ValueFlowPlanNamespaceError,
-    ValueFlowPlanName,
-    ValueFlowPlanNameError,
-    MAX_VALUE_FLOW_PLAN_REF_BYTES,
-    "value-flow plan",
-    "a bounded value-flow plan reference in namespace:name form"
-}
 
 /// One immutable host registration. Semantic handles never cross the wire.
 #[derive(Debug)]

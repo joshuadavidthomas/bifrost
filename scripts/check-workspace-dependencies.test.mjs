@@ -15,6 +15,7 @@ const names = [
   "brokk-bifrost-python",
   "brokk-bifrost-ruby",
   "brokk-bifrost-rust",
+  "brokk-bifrost-rql",
   "brokk-bifrost-analysis",
   "brokk-bifrost-nlp",
   "brokk-bifrost-policy",
@@ -41,6 +42,7 @@ function metadata(overrides = {}) {
     "brokk-bifrost-python": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-ruby": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-rust": [dependency("brokk-bifrost-core")],
+    "brokk-bifrost-rql": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-analysis": [
       dependency("brokk-bifrost-core"),
       dependency("brokk-bifrost-cpp"),
@@ -52,9 +54,13 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-python"),
       dependency("brokk-bifrost-ruby"),
       dependency("brokk-bifrost-rust"),
+      dependency("brokk-bifrost-rql"),
     ],
     "brokk-bifrost-nlp": [dependency("brokk-bifrost-analysis")],
-    "brokk-bifrost-policy": [dependency("brokk-bifrost-analysis")],
+    "brokk-bifrost-policy": [
+      dependency("brokk-bifrost-analysis"),
+      dependency("brokk-bifrost-rql"),
+    ],
     "brokk-bifrost-runtime": [
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-policy"),
@@ -63,11 +69,13 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-policy"),
       dependency("brokk-bifrost-runtime"),
+      dependency("brokk-bifrost-rql"),
     ],
     "brokk-bifrost-lsp": [
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-policy"),
       dependency("brokk-bifrost-runtime"),
+      dependency("brokk-bifrost-rql"),
     ],
     "brokk-bifrost-semantic-packs": [dependency("brokk-bifrost-analysis")],
     ...overrides.dependencies,
@@ -123,6 +131,7 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
             dependency("brokk-bifrost-python"),
             dependency("brokk-bifrost-ruby"),
             dependency("brokk-bifrost-rust"),
+            dependency("brokk-bifrost-rql"),
             dependency("brokk-bifrost-semantic-packs"),
           ],
         },
@@ -144,6 +153,32 @@ test("rejects a core dependency back on analysis", () => {
       }),
     ),
     ["brokk-bifrost-core must not depend on workspace package brokk-bifrost-analysis"],
+  );
+});
+
+test("accepts an RQL dependency on core but rejects analysis", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-rql": [dependency("brokk-bifrost-core")],
+        },
+      }),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-rql": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-analysis"),
+          ],
+        },
+      }),
+    ),
+    ["brokk-bifrost-rql must not depend on workspace package brokk-bifrost-analysis"],
   );
 });
 

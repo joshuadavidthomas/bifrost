@@ -35,13 +35,6 @@ use super::provider::{
     StructuralFactsCacheOutcome, StructuralFactsLimitedOutcome, StructuralSearchProvider,
     StructuralSourceLimitedOutcome,
 };
-use super::query::schema::{reference_kind_label, usage_proof_label};
-use super::query::{
-    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
-    CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, HierarchyTraversal, PathFilter, Pattern, QueryError, QueryStep,
-    ReferenceTraversalFilter, SetOperator,
-};
 use crate::analyzer::reference_candidates::{
     ReferenceCandidateRanges, reference_candidate_ranges, reference_candidate_ranges_cancellable,
 };
@@ -76,6 +69,13 @@ use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use crate::path_utils::rel_path_string;
 use crate::text_utils::{compute_line_starts, line_column_for_offset};
+use brokk_bifrost_rql::schema::{reference_kind_label, usage_proof_label};
+use brokk_bifrost_rql::{
+    CallInputSelector, CallSiteTraversalFilter, CallTraversalFilter, CodeQuery,
+    CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
+    CodeQuerySeed, HierarchyTraversal, PathFilter, Pattern, QueryError, QueryStep,
+    ReferenceTraversalFilter, SetOperator,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -160,11 +160,11 @@ use expansions::{
 use super::lexical_environment::ReachingBindingOutcome;
 use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
 use super::occurrences::{OccurrenceClass, OccurrenceRole};
-use super::query::{
-    BindingFilter, CandidateFilter, EdgeFilter, OccurrenceFilter, OccurrenceSeed, ScopeFilter,
-};
 use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
 use crate::analyzer::usages::get_definition::TraceCandidateRef;
+use brokk_bifrost_rql::{
+    BindingFilter, CandidateFilter, EdgeFilter, OccurrenceFilter, OccurrenceSeed, ScopeFilter,
+};
 pub use results::ALL_DETAILED_CODE_QUERY_DOMAINS;
 pub use results::CodeQueryBinding;
 pub use results::CodeQueryCallArgument;

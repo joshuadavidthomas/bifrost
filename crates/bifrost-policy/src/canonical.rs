@@ -917,11 +917,7 @@ fn edge_parity_assert_to_json(assertion: &EdgeParityAssert) -> Value {
         &mut object,
         "surface",
         match assertion.surface {
-            Some(surface) => json!(
-                brokk_bifrost_analysis::analyzer::structural::query::schema::usage_surface_label(
-                    surface
-                )
-            ),
+            Some(surface) => json!(brokk_bifrost_rql::schema::usage_surface_label(surface)),
             None => Value::Null,
         },
     );
@@ -929,9 +925,7 @@ fn edge_parity_assert_to_json(assertion: &EdgeParityAssert) -> Value {
 }
 
 fn edge_class_assert_to_json(assertion: &EdgeClassAssert) -> Value {
-    use brokk_bifrost_analysis::analyzer::structural::query::schema::{
-        reference_kind_label, usage_surface_label,
-    };
+    use brokk_bifrost_rql::schema::{reference_kind_label, usage_surface_label};
     let mut object = serde_json::Map::new();
     insert(&mut object, "kind", json!("edge_class"));
     insert(&mut object, "id", json!(assertion.id.as_str()));

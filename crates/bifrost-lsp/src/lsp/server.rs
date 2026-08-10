@@ -42,9 +42,6 @@ use lsp_types::{
 
 use crate::NavigationOperation;
 use crate::analyzer::semantic::WorkspaceRelativePath;
-use crate::analyzer::structural::query::{
-    QuerySourceEdit, query_source_help_at, validate_query_source,
-};
 use crate::analyzer::structural::{
     CodeQuery, CodeQueryExecutionLimits, CodeQueryResponse, CodeQueryResultItem,
     CodeQueryResultValue,
@@ -87,6 +84,7 @@ use crate::policy::{
 };
 use crate::text_utils::compute_line_starts;
 use crate::util::throttled_log::ThrottledLog;
+use brokk_bifrost_rql::{QuerySourceEdit, query_source_help_at, validate_query_source};
 use semver::Version;
 
 /// Run the LSP server over stdio. `fallback_root` is used when the client does

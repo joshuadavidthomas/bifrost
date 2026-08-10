@@ -33,7 +33,6 @@ use super::profile::QueryExecutionProfile;
 use crate::analyzer::benchmark_provenance::{
     command_output_in, git_tree_fingerprint as framed_git_tree_fingerprint,
 };
-use crate::analyzer::structural::query::{CodeQuery, MAX_LIMIT};
 use crate::analyzer::structural::search::{
     CodeQueryCompletion, CodeQueryExecutionLimits, CodeQueryExecutionWork, DetailedCodeQueryResult,
     UnionExecutionStrategy, execute_code_query_with_union_strategy,
@@ -42,6 +41,7 @@ use crate::{
     AnalyzerConfig, FileSetProject, IAnalyzer, Language, Project, ProjectFile, TestProject,
     WorkspaceAnalyzer, analyzer::AnalyzerQueryScope,
 };
+use brokk_bifrost_rql::{CodeQuery, MAX_LIMIT};
 
 const RESULT_PREFIX: &str = "BIFROST_CODE_QUERY_EXECUTION_BENCHMARK=";
 const SMALL_FILES_ENV: &str = "BIFROST_CODE_QUERY_BENCH_SMALL_FILES";
