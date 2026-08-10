@@ -49,6 +49,7 @@ exceptions = [
     { crate = "brokk-bifrost-python", allow = ["LGPL-3.0-or-later"] },
     { crate = "brokk-bifrost-ruby", allow = ["LGPL-3.0-or-later"] },
     { crate = "brokk-bifrost-rust", allow = ["LGPL-3.0-or-later"] },
+    { crate = "brokk-bifrost-rql", allow = ["LGPL-3.0-or-later"] },
     { crate = "brokk-bifrost-nlp", allow = ["LGPL-3.0-or-later"] },
     { crate = "brokk-bifrost-policy", allow = ["LGPL-3.0-or-later"] },
     { crate = "brokk-bifrost-semantic-packs", allow = ["LGPL-3.0-or-later"] },
