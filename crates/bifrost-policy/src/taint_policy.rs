@@ -259,6 +259,7 @@ impl ProductionTaintPolicyEvaluator {
                     workspace,
                     active.clone(),
                     budget.query_limits(),
+                    budget.max_selector_results(),
                     cancellation,
                 )
                 .compile(policy, spec),
@@ -417,6 +418,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         workspace: &'a WorkspaceAnalyzer,
         active_semantic_models: Option<Arc<ResolvedActiveSemanticModels>>,
         query_limits: CodeQueryExecutionLimits,
+        max_selector_results: usize,
         cancellation: &'a CancellationToken,
     ) -> Self {
         Self {
@@ -424,6 +426,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 workspace,
                 "taint",
                 query_limits,
+                max_selector_results,
                 cancellation,
             ),
             active_semantic_models,
@@ -562,6 +565,19 @@ impl<'a> TaintPolicyCompiler<'a> {
         for root in roots {
             discoveries.push(self.discover_value_flow(&root)?);
         }
+        // Keep only regions that contain both a selected source and a selected
+        // sink: those are the regions where a flow can exist, and each becomes
+        // one independent analysis plan below. Binding proceeds per region on
+        // purpose (#1935). Workspace-wide name selection spans many files, so
+        // requiring every selected source AND sink to land in one shared region
+        // aborted the whole compile by construction and abstained with zero
+        // findings. A source in one region and a sink in another simply cannot
+        // flow, so an endpoint with no co-located partner contributes no
+        // finding; it must not suppress a fully-discovered region's verdicts.
+        // Within-region incompleteness still degrades honestly: a region whose
+        // discovery is partial carries that status into its value-flow plan and
+        // reports `Inconclusive`, and require-model still fails closed on a
+        // genuinely unmodeled call inside a region.
         discoveries.retain(|discovery| {
             all_sources
                 .iter()
@@ -570,22 +586,6 @@ impl<'a> TaintPolicyCompiler<'a> {
                     .iter()
                     .any(|endpoint| discovery.procedures.contains(endpoint.point.procedure()))
         });
-        let covered_sources = all_sources.iter().all(|endpoint| {
-            discoveries
-                .iter()
-                .any(|discovery| discovery.procedures.contains(endpoint.point.procedure()))
-        });
-        let covered_sinks = all_sinks.iter().all(|endpoint| {
-            discoveries
-                .iter()
-                .any(|discovery| discovery.procedures.contains(endpoint.point.procedure()))
-        });
-        if !covered_sources || !covered_sinks {
-            return Err(TaintPolicyCompileError::SemanticUnavailable(
-                "selected taint endpoints do not share a completely discovered call region"
-                    .to_owned(),
-            ));
-        }
         let covered = discoveries
             .iter()
             .map(|discovery| discovery.procedures.clone())
