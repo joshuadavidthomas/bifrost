@@ -15,6 +15,7 @@
 
 pub mod adjudicate;
 pub mod codeql;
+pub mod demand;
 pub mod derive;
 pub mod driver;
 pub mod fixture;
