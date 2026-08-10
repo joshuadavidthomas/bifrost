@@ -7,7 +7,9 @@
 //! their working bytes, even when Git reports them as clean.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use git2::{
@@ -48,12 +50,19 @@ pub fn working_tree_oids(
         })
         .collect::<Result<_>>()?;
     let mut transforms = ContentTransformProbe::new(repo, &index, workdir);
+    // Only a clean tracked path can serve an index OID, so only such a path
+    // needs an attribute verdict. Ask about all of them at once.
+    let clean_tracked: Vec<&str> = rel_paths
+        .iter()
+        .filter(|rel| !dirty.contains(*rel) && index_oids.contains_key(*rel))
+        .map(String::as_str)
+        .collect();
+    let transformed = transforms.resolve(&clean_tracked)?;
     let mut out = HashMap::with_capacity(rel_paths.len());
     let mut hashed = 0usize;
     for rel in rel_paths {
-        let use_worktree = dirty.contains(rel)
-            || !index_oids.contains_key(rel)
-            || transforms.applies_to(Path::new(rel))?;
+        let use_worktree =
+            dirty.contains(rel) || !index_oids.contains_key(rel) || transformed.contains(rel);
         let oid = if use_worktree {
             hashed += 1;
             hash_working_file(workdir, rel)?
@@ -65,9 +74,10 @@ pub fn working_tree_oids(
         out.insert(rel.clone(), oid.to_string());
     }
     eprintln!(
-        "bifrost semantic identities: files={}; index={}; hashed={hashed}; attr_lookups={}; time={:?}",
+        "bifrost semantic identities: files={}; index={}; hashed={hashed}; attr_paths={}; attr_lookups={}; time={:?}",
         rel_paths.len(),
         rel_paths.len() - hashed,
+        transforms.asked,
         transforms.lookups,
         started.elapsed()
     );
@@ -87,12 +97,18 @@ pub fn working_tree_oids_targeted(
     index.read(true).map_err(|err| err.to_string())?;
     let dirty = dirty_worktree_paths(repo, &index, Some(rel_paths))?;
     let mut transforms = ContentTransformProbe::new(repo, &index, workdir);
+    let clean_tracked: Vec<&str> = rel_paths
+        .iter()
+        .filter(|rel| !dirty.contains(*rel) && index.get_path(Path::new(rel.as_str()), 0).is_some())
+        .map(String::as_str)
+        .collect();
+    let transformed = transforms.resolve(&clean_tracked)?;
     let mut out = HashMap::with_capacity(rel_paths.len());
     let mut hashed = 0usize;
     for rel in rel_paths {
         let path = Path::new(rel);
         let entry = index.get_path(path, 0);
-        let use_worktree = dirty.contains(rel) || entry.is_none() || transforms.applies_to(path)?;
+        let use_worktree = dirty.contains(rel) || entry.is_none() || transformed.contains(rel);
         let oid = if use_worktree {
             hashed += 1;
             hash_working_file(workdir, rel)?
@@ -104,9 +120,10 @@ pub fn working_tree_oids_targeted(
         out.insert(rel.clone(), oid.to_string());
     }
     eprintln!(
-        "bifrost semantic watcher identities: files={}; index={}; hashed={hashed}; attr_lookups={}; time={:?}",
+        "bifrost semantic watcher identities: files={}; index={}; hashed={hashed}; attr_paths={}; attr_lookups={}; time={:?}",
         rel_paths.len(),
         rel_paths.len() - hashed,
+        transforms.asked,
         transforms.lookups,
         started.elapsed()
     );
@@ -154,20 +171,37 @@ fn dirty_worktree_paths(
     Ok(dirty)
 }
 
+/// The attributes that let Git show worktree bytes which differ from the index
+/// blob. A path carries a content transform when any of them is set to anything
+/// other than unspecified or unset.
+const CONTENT_TRANSFORM_ATTRIBUTES: [&str; 3] = ["filter", "ident", "working-tree-encoding"];
+
 /// Answers whether Git can show worktree bytes that differ from the index blob
 /// for a path, which is true when `filter`, `ident` or `working-tree-encoding`
 /// is set on it.
 ///
-/// libgit2 answers per path and re-reads every attribute source on each call,
-/// so a whole-worktree walk pays three lookups for each file: 512,667 of them
-/// on Firefox (issue #1904). Git reads those attributes from a fixed set of
-/// sources: the system attributes file, `core.attributesFile` or its XDG
-/// default, `$GIT_DIR/info/attributes`, and a `.gitattributes` file in each
-/// directory from the worktree root down to the path, taken from the worktree
-/// or, when it is absent there, from the index. No source above a path means no
-/// rule and no macro can match it, so the lookups are skipped. libgit2 stays
-/// the authority for every path that does have a source above it; this type
-/// only decides whether to ask, and it never reads a rule itself.
+/// The probe answers a whole walk at once, in two stages.
+///
+/// First it drops the paths that no rule can reach. Git reads these attributes
+/// from a fixed set of sources: the system attributes file, `core.attributesFile`
+/// or its XDG default, `$GIT_DIR/info/attributes`, and a `.gitattributes` file in
+/// each directory from the worktree root down to the path, taken from the
+/// worktree or, when it is absent there, from the index. No source above a path
+/// means no rule and no macro can match it, so nothing is asked about it and no
+/// subprocess runs for a repository that has no attribute file at all.
+///
+/// The paths that survive go to one `git check-attr --stdin -z` process. libgit2
+/// has no attribute session here, so it re-reads every attribute source on each
+/// of the up-to-three lookups it does per path: it answers Firefox's 1,205,412
+/// questions in 55.3 s of CPU where this batch answers the same 401,804 paths in
+/// 4.4 s (issue #1904). The CLI is the same escape `gitblob` already takes for
+/// `git rev-list` and `git worktree list`. It reads the same sources in the same
+/// order -- its default check-in direction is file-then-index, which is what
+/// `AttrCheckFlags::FILE_THEN_INDEX` asks libgit2 for -- and it expands macros,
+/// so the verdicts agree.
+///
+/// When the CLI is absent or fails for any reason, libgit2 answers the same
+/// paths per path. Correctness never depends on the subprocess.
 ///
 /// The cached verdicts describe files on disk and in the index, so an instance
 /// is valid for one identity walk.
@@ -175,13 +209,19 @@ struct ContentTransformProbe<'a> {
     repo: &'a Repository,
     index: &'a Index,
     workdir: &'a Path,
-    /// A source outside the directory chain exists, so every path needs libgit2.
+    /// Program asked for the batched verdicts. Production always uses `git` from
+    /// `PATH`; the fallback test points this at a name that cannot spawn.
+    git_program: &'a str,
+    /// A source outside the directory chain exists, so every path needs a verdict.
     repository_wide_rules: bool,
     /// `.gitattributes` presence for each directory already inspected, keyed by
     /// its worktree-relative path.
     directories: HashMap<PathBuf, bool>,
-    /// Attribute lookups handed to libgit2. Reported in the walk's timing line
-    /// and asserted by the tests that pin the skipped case.
+    /// Paths that reached an attribute answerer, whichever one answered.
+    asked: usize,
+    /// Attribute lookups handed to libgit2, which is three per answered path.
+    /// Zero whenever the batch answered. Reported in the walk's timing line and
+    /// asserted by the tests that pin the skipped and batched cases.
     lookups: usize,
 }
 
@@ -191,17 +231,46 @@ impl<'a> ContentTransformProbe<'a> {
             repo,
             index,
             workdir,
+            git_program: "git",
             repository_wide_rules: has_repository_wide_attribute_rules(repo),
             directories: HashMap::new(),
+            asked: 0,
             lookups: 0,
         }
     }
 
-    fn applies_to(&mut self, path: &Path) -> Result<bool> {
-        if !self.has_rules_above(path) {
-            return Ok(false);
+    /// The subset of `paths` whose worktree bytes Git can transform.
+    fn resolve(&mut self, paths: &[&str]) -> Result<HashSet<String>> {
+        let candidates: Vec<&str> = paths
+            .iter()
+            .copied()
+            .filter(|path| self.has_rules_above(Path::new(path)))
+            .collect();
+        self.asked += candidates.len();
+        if candidates.is_empty() {
+            return Ok(HashSet::new());
         }
-        for name in ["filter", "ident", "working-tree-encoding"] {
+        match batched_transform_verdicts(self.git_program, self.workdir, &candidates) {
+            Ok(transformed) => Ok(transformed),
+            Err(error) => {
+                eprintln!(
+                    "bifrost semantic identities: batched git check-attr unavailable ({error}); \
+                     asking libgit2 about {} paths",
+                    candidates.len()
+                );
+                let mut transformed = HashSet::new();
+                for path in candidates {
+                    if self.libgit2_verdict(Path::new(path))? {
+                        transformed.insert(path.to_string());
+                    }
+                }
+                Ok(transformed)
+            }
+        }
+    }
+
+    fn libgit2_verdict(&mut self, path: &Path) -> Result<bool> {
+        for name in CONTENT_TRANSFORM_ATTRIBUTES {
             self.lookups += 1;
             let value = self
                 .repo
@@ -245,6 +314,92 @@ impl<'a> ContentTransformProbe<'a> {
         self.directories.insert(directory.to_path_buf(), present);
         present
     }
+}
+
+/// Ask one `git check-attr` process about every candidate path and return the
+/// paths that carry a content transform.
+///
+/// `-z` makes both directions NUL-delimited, so a path that holds a quote, a
+/// space or a newline needs no escaping and comes back byte for byte. Git
+/// answers three `<path> NUL <attribute> NUL <value> NUL` records per path, in
+/// the order it was asked, where the value is `unspecified`, `unset`, `set` or
+/// the attribute's string value.
+///
+/// Any failure is returned to the caller, which falls back to libgit2.
+fn batched_transform_verdicts(
+    git_program: &str,
+    workdir: &Path,
+    paths: &[&str],
+) -> Result<HashSet<String>> {
+    let mut child = Command::new(git_program)
+        .current_dir(workdir)
+        .args(["check-attr", "--stdin", "-z"])
+        .args(CONTENT_TRANSFORM_ATTRIBUTES)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("git check-attr failed to spawn: {err}"))?;
+    let stdin = child.stdin.take().expect("git check-attr stdin is piped");
+    let mut stdout = child.stdout.take().expect("git check-attr stdout is piped");
+
+    // Git answers while it reads, so writing every path before reading fills the
+    // output pipe and deadlocks. Write from a scoped thread and read here. The
+    // identity walk owns its thread, so nothing in a worker pool waits on this.
+    let (read, written) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| -> std::io::Result<()> {
+            let mut stdin = BufWriter::new(stdin);
+            for path in paths {
+                stdin.write_all(path.as_bytes())?;
+                stdin.write_all(b"\0")?;
+            }
+            stdin.flush()
+        });
+        let mut output = Vec::new();
+        let read = stdout.read_to_end(&mut output).map(|_| output);
+        let written = writer
+            .join()
+            .expect("git check-attr writer thread panicked");
+        (read, written)
+    });
+    let output = read.map_err(|err| format!("reading git check-attr output: {err}"))?;
+    written.map_err(|err| format!("writing paths to git check-attr: {err}"))?;
+    let status = child
+        .wait()
+        .map_err(|err| format!("git check-attr wait failed: {err}"))?;
+    if !status.success() {
+        return Err(format!("git check-attr exited with {status}"));
+    }
+
+    let mut fields: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
+    // The final record ends with the delimiter, so the split leaves a tail.
+    if fields.last().is_some_and(|last| last.is_empty()) {
+        fields.pop();
+    }
+    // One record per attribute per path, three fields in each record.
+    let expected = paths.len() * CONTENT_TRANSFORM_ATTRIBUTES.len() * 3;
+    if fields.len() != expected {
+        return Err(format!(
+            "git check-attr answered {} fields for {} paths, expected {expected}",
+            fields.len(),
+            paths.len()
+        ));
+    }
+
+    let mut unanswered: HashSet<&str> = paths.iter().copied().collect();
+    let mut transformed = HashSet::new();
+    for record in fields.chunks_exact(3) {
+        let path = std::str::from_utf8(record[0])
+            .map_err(|err| format!("non-UTF-8 path in git check-attr output: {err}"))?;
+        unanswered.remove(path);
+        if !matches!(record[2], b"unspecified" | b"unset") {
+            transformed.insert(path.to_string());
+        }
+    }
+    if !unanswered.is_empty() {
+        return Err(format!("git check-attr did not answer for {unanswered:?}"));
+    }
+    Ok(transformed)
 }
 
 /// Whether an attribute file that can carry a rule or a macro for any path in
@@ -414,17 +569,18 @@ mod tests {
     }
 
     #[test]
-    fn a_repository_without_attribute_files_asks_libgit2_nothing() {
+    fn a_repository_without_attribute_files_asks_nothing() {
         let (_temp, repo) = init_repo();
         let index = repo.index().unwrap();
         let mut transforms = ContentTransformProbe::new(&repo, &index, repo.workdir().unwrap());
 
-        assert!(!transforms.applies_to(Path::new("tracked.rs")).unwrap());
+        assert!(transforms.resolve(&["tracked.rs"]).unwrap().is_empty());
+        assert_eq!(transforms.asked, 0);
         assert_eq!(transforms.lookups, 0);
     }
 
     #[test]
-    fn only_paths_under_a_gitattributes_file_reach_libgit2() {
+    fn only_paths_under_a_gitattributes_file_are_asked_about() {
         let (temp, repo) = init_repo();
         std::fs::create_dir(temp.path().join("sub")).unwrap();
         std::fs::write(temp.path().join("sub/.gitattributes"), "*.rs filter=fake\n").unwrap();
@@ -432,15 +588,22 @@ mod tests {
         let index = repo.index().unwrap();
         let mut transforms = ContentTransformProbe::new(&repo, &index, repo.workdir().unwrap());
 
-        assert!(transforms.applies_to(Path::new("sub/nested.rs")).unwrap());
-        let under_rules = transforms.lookups;
-        assert!(under_rules > 0);
-        assert!(!transforms.applies_to(Path::new("tracked.rs")).unwrap());
-        assert_eq!(transforms.lookups, under_rules);
+        let transformed = transforms
+            .resolve(&["sub/nested.rs", "tracked.rs"])
+            .unwrap();
+        assert_eq!(
+            transformed,
+            HashSet::from(["sub/nested.rs".to_string()]),
+            "only the path under the rule is transformed"
+        );
+        assert_eq!(
+            transforms.asked, 1,
+            "the path with no rule above it is dropped"
+        );
     }
 
     #[test]
-    fn a_gitattributes_file_only_in_the_index_still_reaches_libgit2() {
+    fn a_gitattributes_file_only_in_the_index_is_still_a_source() {
         let (temp, repo) = init_repo();
         std::fs::write(temp.path().join(".gitattributes"), "*.rs ident\n").unwrap();
         run_git(temp.path(), ["add", ".gitattributes"]);
@@ -449,8 +612,104 @@ mod tests {
         index.read(true).unwrap();
         let mut transforms = ContentTransformProbe::new(&repo, &index, repo.workdir().unwrap());
 
-        assert!(transforms.applies_to(Path::new("tracked.rs")).unwrap());
-        assert!(transforms.lookups > 0);
+        assert_eq!(
+            transforms.resolve(&["tracked.rs"]).unwrap(),
+            HashSet::from(["tracked.rs".to_string()])
+        );
+        assert_eq!(transforms.asked, 1);
+    }
+
+    /// A repository whose root `.gitattributes` sets attributes that no content
+    /// transform uses -- the shape of llvm, gcc and firefox. Every path has a
+    /// source above it, so the directory-chain short-circuit cannot help and the
+    /// batch has to answer all of them without a single libgit2 lookup.
+    #[test]
+    fn a_root_gitattributes_file_is_answered_in_one_batch() {
+        let (temp, repo) = init_repo();
+        std::fs::write(
+            temp.path().join(".gitattributes"),
+            "* -text\n*.ident ident\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("keeps.ident"), "$Id$\n").unwrap();
+        run_git(temp.path(), ["add", ".gitattributes", "keeps.ident"]);
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let mut transforms = ContentTransformProbe::new(&repo, &index, repo.workdir().unwrap());
+
+        let transformed = transforms
+            .resolve(&["tracked.rs", "keeps.ident", ".gitattributes"])
+            .unwrap();
+        assert_eq!(
+            transformed,
+            HashSet::from(["keeps.ident".to_string()]),
+            "-text is not a content transform; ident is"
+        );
+        assert_eq!(
+            transforms.asked, 3,
+            "the root file puts a rule above every path"
+        );
+        assert_eq!(
+            transforms.lookups, 0,
+            "the batch answered, so libgit2 was never asked"
+        );
+    }
+
+    #[test]
+    fn libgit2_answers_the_same_paths_when_the_git_cli_cannot_run() {
+        let (temp, repo) = init_repo();
+        std::fs::write(
+            temp.path().join(".gitattributes"),
+            "* -text\n*.ident ident\n",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("keeps.ident"), "$Id$\n").unwrap();
+        run_git(temp.path(), ["add", ".gitattributes", "keeps.ident"]);
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let paths = ["tracked.rs", "keeps.ident", ".gitattributes"];
+
+        let mut batched = ContentTransformProbe::new(&repo, &index, repo.workdir().unwrap());
+        let mut fallback = ContentTransformProbe::new(&repo, &index, repo.workdir().unwrap());
+        fallback.git_program = "bifrost-no-such-git-binary";
+
+        assert_eq!(
+            fallback.resolve(&paths).unwrap(),
+            batched.resolve(&paths).unwrap()
+        );
+        assert_eq!(
+            batched.lookups, 0,
+            "the batch answers without a libgit2 lookup"
+        );
+        // Three lookups each for `tracked.rs` and `.gitattributes`, and two for
+        // `keeps.ident`, where the second attribute is the set one.
+        assert_eq!(fallback.lookups, 8);
+    }
+
+    /// `-z` delimits with NUL, so a path that needs quoting in Git's default
+    /// output comes back byte for byte.
+    #[test]
+    fn a_path_that_needs_escaping_survives_the_batch() {
+        let (temp, repo) = init_repo();
+        // Windows rejects a quote in a filename; a space exercises the same
+        // quoting in Git's non-`-z` output.
+        let awkward = if cfg!(windows) {
+            "od d.ident"
+        } else {
+            "od\" d.ident"
+        };
+        std::fs::write(temp.path().join(".gitattributes"), "*.ident ident\n").unwrap();
+        std::fs::write(temp.path().join(awkward), "$Id$\n").unwrap();
+        run_git(temp.path(), ["add", "-A"]);
+        let mut index = repo.index().unwrap();
+        index.read(true).unwrap();
+        let mut transforms = ContentTransformProbe::new(&repo, &index, repo.workdir().unwrap());
+
+        assert_eq!(
+            transforms.resolve(&[awkward, "tracked.rs"]).unwrap(),
+            HashSet::from([awkward.to_string()])
+        );
+        assert_eq!(transforms.lookups, 0);
     }
 
     #[test]
