@@ -1,0 +1,22 @@
+[
+  {
+    "target": {
+      "path": "java.base/java/net/URLDecoder.java",
+      "symbol": "java.net.URLDecoder.decode(java.lang.String,java.lang.String)",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The method returns a new String that is the application/x-www-form-urlencoded decoding of the encoded string (parameter 0): '+' becomes a space and each %xx triple becomes the byte it names, and the remaining characters are copied verbatim, so parameter 0 reaches normal_return. The charset name (parameter 1) only selects how the decoded bytes map to characters; its own characters are never incorporated into the result, so it has no transfer. The only exceptional exit is an UnsupportedEncodingException when the charset name is not recognized, which carries no value derived from either input. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of java.net.URLDecoder.decode(String, String); JDK java.net.URLDecoder source. No CodeQL or Joern model consulted."
+  }
+]
