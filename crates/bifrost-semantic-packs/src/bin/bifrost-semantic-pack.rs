@@ -18,6 +18,9 @@ use brokk_bifrost_semantic_packs::release_bundle::{
     BundleInput, ReleaseBundleRejects, generate_release_bundle, install_release_bundle,
     verify_release_bundle,
 };
+use brokk_bifrost_semantic_packs::summary_foundry::sanitizer_pack::{
+    convert_sanitizer_candidates, write_sanitizer_packs,
+};
 use brokk_bifrost_semantic_packs::summary_foundry::{
     FoundryPins, FoundryRunInputs, run_foundry_join,
 };
@@ -78,6 +81,7 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
         "verify" => verify_command(arguments, format),
         "install" => install_command(arguments, format),
         "summary-corpus-join" => summary_corpus_join_command(arguments, format),
+        "sanitizer-pack" => sanitizer_pack_command(arguments, format),
         _ => Err(failure(2, usage(), format)),
     }
 }
@@ -486,6 +490,54 @@ fn summary_corpus_join_command(
     Ok(u8::from(!joined.round_trip_is_clean()))
 }
 
+/// Convert the audited k3 sanitizer candidates into `procedure_summaries` packs,
+/// gate every entry through the adversarial mechanism gate, and write the pack
+/// sources plus the audit report. The conversion is deterministic, so re-running
+/// over unchanged candidates rewrites identical bytes.
+fn sanitizer_pack_command(
+    arguments: Vec<OsString>,
+    format: OutputFormat,
+) -> Result<u8, CommandFailure> {
+    require_human_release_output(format)?;
+    let [candidates_dir, output_root] = arguments.as_slice() else {
+        return Err(failure(2, usage(), format));
+    };
+    let conversion = convert_sanitizer_candidates(Path::new(candidates_dir))
+        .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+    let written = write_sanitizer_packs(&conversion, Path::new(output_root))
+        .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+
+    let audit = &conversion.audit;
+    println!(
+        "gated {} candidates: {} shipped summaries, {} gate-rejected, {} overloads folded, {} adversarial probes",
+        audit.candidates_total,
+        audit.shipped_summaries,
+        audit.gate_rejected,
+        audit.folded_overloads,
+        audit.adversarial_probes,
+    );
+    for pack in &audit.packs {
+        println!(
+            "  {} [{}] {} summaries, {} probes, artifact={}",
+            pack.pack_id,
+            if pack.pinned { "pinned" } else { "staged" },
+            pack.shipped_summaries,
+            pack.adversarial_probes,
+            pack.artifact,
+        );
+    }
+    for reject in &audit.gate_rejects {
+        println!(
+            "  reject {} {}: {}",
+            reject.reason, reject.target_symbol, reject.message
+        );
+    }
+    for path in &written {
+        println!("wrote {}", path.display());
+    }
+    Ok(0)
+}
+
 fn require_human_release_output(format: OutputFormat) -> Result<(), CommandFailure> {
     if format == OutputFormat::Json {
         Err(failure(
@@ -749,5 +801,5 @@ impl ActivationControlInput {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]"
+    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT"
 }
