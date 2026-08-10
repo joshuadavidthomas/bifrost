@@ -1,0 +1,457 @@
+[
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.<init>(byte[])",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The constructor decodes the bytes of the argument with the default charset and stores the resulting characters in the new String, so parameter 0 reaches the constructed object, spelled here as normal_return. The byte array is the only input and it is read only as data. There is no other input-to-output pair, so the single listed transfer is the whole behavior.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String(byte[]); JDK java.lang.String constructor source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.<init>(byte[],java.nio.charset.Charset)",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The constructor decodes the byte array (parameter 0) with the given charset and stores the characters in the new String, so parameter 0 reaches normal_return. The charset (parameter 1) only selects the decoding algorithm; its own value is never incorporated into the constructed object, so it has no transfer. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String(byte[], Charset); JDK java.lang.String and StringCoding source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.concat(java.lang.String)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the receiver's characters followed by the argument's characters, and when the argument is empty the receiver itself is returned, so both inputs reach normal_return. A String is immutable, so neither input flows to the receiver. The only exceptional exit is a NullPointerException on a null argument, which carries no value derived from either input.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.concat; JDK java.lang.String.concat source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.format(java.lang.String,java.lang.Object[])",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 1 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The literal text of the format string (parameter 0) is copied into the result around the format specifiers, and each argument in the varargs array (parameter 1) contributes its string representation, so both parameters reach normal_return. The method delegates to the java.util.Formatter machinery, including custom Formattable implementations, whose full behavior I do not trace, so completeness stays partial.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.format and java.util.Formatter. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.format(java.util.Locale,java.lang.String,java.lang.Object[])",
+      "has_receiver": false,
+      "parameter_count": 3
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 1 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 2 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The format string (parameter 1) contributes its literal text and the arguments (parameter 2) contribute their string representations, so both reach normal_return. The locale (parameter 0) selects formatting rules such as grouping and digit shape; the locale object itself is not incorporated into the result, so it has no transfer. Completeness is partial because the method runs the java.util.Formatter machinery, which I do not fully trace.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.format(Locale, String, Object...) and java.util.Formatter. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.getBytes()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The returned byte array is the receiver's characters encoded with the default charset, so the receiver reaches normal_return. There is no parameter and the receiver is not mutated. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.getBytes(); JDK java.lang.String and StringCoding source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.getBytes(java.nio.charset.Charset)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The returned byte array is the receiver's characters encoded with the given charset, so the receiver reaches normal_return. The charset parameter only selects the encoding algorithm; its own value is not incorporated into the output, so it has no transfer. The receiver is not mutated and no other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.getBytes(Charset); JDK java.lang.String and StringCoding source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.join(java.lang.CharSequence,java.lang.CharSequence[])",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 1 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The delimiter (parameter 0) is inserted between the elements, and the characters of each element in the varargs array (parameter 1) are copied into the result, so both parameters reach normal_return. Element characters are read through the CharSequence interface, which for a non-String implementation runs a virtual toString I do not trace, so completeness stays partial.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.join; JDK java.lang.String.join and java.util.StringJoiner source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.join(java.lang.CharSequence,java.lang.Iterable)",
+      "has_receiver": false,
+      "parameter_count": 2
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 1 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The delimiter (parameter 0) is inserted between the elements, and the characters of each element the Iterable (parameter 1) yields are copied into the result, so both parameters reach normal_return. The method calls the virtual iterator() on the Iterable and reads element characters through the CharSequence interface, machinery I do not fully trace, so completeness stays partial.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.join; JDK java.lang.String.join and java.util.StringJoiner source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.replace(char,char)",
+      "has_receiver": true,
+      "parameter_count": 2
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 1 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the receiver with every occurrence of the old char replaced by the new char, so the receiver's other characters and the new char (parameter 1) reach normal_return. The old char (parameter 0) is only compared against; its value never appears in the result, so it has no transfer. When no occurrence exists the receiver itself is returned, which is still covered by the receiver transfer.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.replace(char, char); JDK java.lang.String.replace source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.replace(java.lang.CharSequence,java.lang.CharSequence)",
+      "has_receiver": true,
+      "parameter_count": 2
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 1 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the receiver with each literal occurrence of the target sequence substituted by the replacement sequence, so the receiver's unmatched regions and the replacement (parameter 1) both reach normal_return. The target (parameter 0) is only matched against; its characters never appear in the result, so it has no transfer. This overload performs a literal indexOf-based replacement, not a regex, so the listed transfers are the whole behavior.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.replace(CharSequence, CharSequence); JDK java.lang.String.replace source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.substring(int)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a new String holding the receiver's characters from the begin index to the end, so the receiver reaches normal_return. The begin index (parameter 0) only selects where the copy starts; its value is never incorporated into the result, so it has no transfer. The receiver is not mutated and no other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.substring(int); JDK java.lang.String source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.substring(int,int)",
+      "has_receiver": true,
+      "parameter_count": 2
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a new String holding the receiver's characters between the two indices, so the receiver reaches normal_return. Both index parameters only select the copy bounds; their values are never incorporated into the result, so neither has a transfer. The receiver is not mutated and no other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.substring(int, int); JDK java.lang.String source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.toLowerCase()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the receiver's characters case-mapped with the default locale, so the receiver reaches normal_return. There is no parameter and the receiver is not mutated. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.toLowerCase(); JDK java.lang.String source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.toLowerCase(java.util.Locale)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the receiver's characters case-mapped under the given locale, so the receiver reaches normal_return. The locale parameter only selects the case-mapping rules (for example the Turkish dotted-i rule); the locale object itself is not incorporated into the result, so it has no transfer. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.toLowerCase(Locale); JDK java.lang.String source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.toUpperCase()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the receiver's characters case-mapped with the default locale, so the receiver reaches normal_return. There is no parameter and the receiver is not mutated. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.toUpperCase(); JDK java.lang.String source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.toUpperCase(java.util.Locale)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the receiver's characters case-mapped under the given locale, so the receiver reaches normal_return. The locale parameter only selects the case-mapping rules; the locale object itself is not incorporated into the result, so it has no transfer. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.toUpperCase(Locale); JDK java.lang.String source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.trim()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the receiver with leading and trailing characters up to U+0020 removed, so the remaining receiver characters reach normal_return (and the receiver itself is returned when nothing is trimmed). There is no parameter and the receiver is not mutated. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.trim(); JDK java.lang.String source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.valueOf(char[])",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a new String holding exactly the argument array's characters, so parameter 0 reaches normal_return. The array is the only input and it is read only as data. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.valueOf(char[]); JDK java.lang.String source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.valueOf(int)",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the decimal representation of the argument, so the argument's value reaches normal_return. The int is the only input and there are no other outputs. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.valueOf(int); JDK java.lang.String and Integer.toString source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/String.java",
+      "symbol": "java.lang.String.valueOf(java.lang.Object)",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "A non-null argument contributes its toString() result to the return value, and a null argument yields the literal \"null\" with no flow, so parameter 0 reaches normal_return when non-null. The method calls the argument's virtual toString, which is arbitrary code I do not trace, so completeness stays partial.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of String.valueOf(Object); JDK java.lang.String source. No CodeQL or Joern model consulted."
+  }
+]

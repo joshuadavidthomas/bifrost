@@ -1595,6 +1595,40 @@ fn regex_literal_alternatives(pattern: &str) -> Option<Vec<String>> {
     Some(alternatives)
 }
 
+/// Upper bound on either `:min`/`:max` bound of an arity constraint. Parameter
+/// lists are small; the JVM itself caps a method at 255 parameters, so a bound
+/// this generous rejects only nonsense while fitting every real callable.
+pub const MAX_ARITY: u32 = 1024;
+
+/// Constraint on the number of positional arguments a matched call passes (its
+/// `args` count). Both bounds are inclusive; an absent bound is open on that
+/// side. A constraint always fixes at least one bound -- an all-open constraint
+/// would filter nothing -- and `min <= max` whenever both are present. Both
+/// invariants are enforced at the decode boundary, so a constructed
+/// `ArityConstraint` is always satisfiable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArityConstraint {
+    pub min: Option<u32>,
+    pub max: Option<u32>,
+}
+
+impl ArityConstraint {
+    /// Match exactly `count` positional arguments.
+    pub fn exact(count: u32) -> Self {
+        Self {
+            min: Some(count),
+            max: Some(count),
+        }
+    }
+
+    /// Whether `arity` positional arguments satisfy the constraint.
+    pub fn matches(&self, arity: usize) -> bool {
+        let arity = arity as u64;
+        self.min.is_none_or(|min| arity >= u64::from(min))
+            && self.max.is_none_or(|max| arity <= u64::from(max))
+    }
+}
+
 /// One node pattern. All fields optional; the *root* `match` pattern must
 /// constrain at least one of kind/name/text (a wildcard root would match
 /// every node in the workspace), while nested patterns may be capture-only
@@ -1615,6 +1649,10 @@ pub struct Pattern {
     pub not_kinds: Vec<NormalizedKind>,
     pub name: Option<StringPredicate>,
     pub text: Option<StringPredicate>,
+    /// Constraint on the matched call's positional argument count. `None`
+    /// leaves arity unconstrained. Meaningful on `call` facts, whose `args`
+    /// role edges carry the count; a fact without argument edges has arity 0.
+    pub arity: Option<ArityConstraint>,
     pub capture: Option<String>,
     pub has: Option<Box<Pattern>>,
     /// Verifier-only: never used for candidate pruning.
@@ -1644,6 +1682,7 @@ impl Pattern {
             && self.not_kinds.is_empty()
             && self.name.is_none()
             && self.text.is_none()
+            && self.arity.is_none()
             && self.capture.is_none()
             && self.has.is_none()
             && self.not_has.is_none()

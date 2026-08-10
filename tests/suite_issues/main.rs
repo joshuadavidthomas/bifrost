@@ -58,5 +58,6 @@ mod issue_1853_scala_function_valued_result_application;
 mod issue_1856_scala_wildcard_companion_and_for_binder;
 mod issue_1857_scala_scope_boundaries;
 mod issue_1866_php_global_namespace_fallback;
+mod issue_1908_reconcile_storm;
 mod issue_693_profile;
 mod issue_csharp_verbatim_identifiers;

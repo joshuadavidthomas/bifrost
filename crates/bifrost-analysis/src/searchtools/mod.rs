@@ -266,6 +266,22 @@ const SCAN_USAGES_AMBIGUOUS_DETAILS_LIMIT: usize = 3;
 /// two orders of magnitude below the measured explosion.
 pub const SCAN_USAGES_MAX_RESOLUTION_CANDIDATES: usize = 200;
 
+/// Declarations one `get_symbol_sources` or `get_summaries` symbol selector may
+/// name before the tool skips the expansion and answers with the count.
+///
+/// Same value and same policy as [`SCAN_USAGES_MAX_RESOLUTION_CANDIDATES`],
+/// because it bounds the same phase: `resolution_from_matches` charges one
+/// `definitions` store read per matched declaration. On C++ each of those reads
+/// also runs identity reconciliation over every workspace declaration sharing
+/// the terminal identifier, so the phase is quadratic in the same-terminal
+/// declaration count. In the #1908 incident a bare `g` on llvm+clang named
+/// 1,277 declarations over 2,898 same-terminal candidates: 3.70M candidate
+/// evaluations and 1,277 repetitions of one 57 ms store read, 270 s for one
+/// request, to build a candidate list nobody can act on.
+///
+/// These two tools were the last unbudgeted callers of the fuzzy resolver.
+pub const SYMBOL_TOOL_MAX_RESOLUTION_CANDIDATES: usize = 200;
+
 const SCAN_USAGES_PATH_SELECTOR_MATCH_LIMIT: usize = 5;
 
 const SCAN_USAGES_SCOPE_PATH_LIMIT: usize = 5;
@@ -297,6 +313,23 @@ pub const GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET: usize = 10;
 /// workload. Record the measured count here and retune once one exists.
 pub const SEARCH_SYMBOLS_MAX_RANKED_CANDIDATES: usize = 10_000;
 
+/// What a too-broad target matched more of than the tool will process.
+///
+/// The two overflows are reported through one shape but are not the same
+/// request error, and the remedy differs: a file fan-out is narrowed by naming
+/// a subdirectory, a resolution fan-out by qualifying the symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TooBroadMatch {
+    /// A path or glob target expanded to more workspace files than the
+    /// per-target file cap.
+    Files,
+    /// A symbol selector named more declarations than the resolution cap
+    /// (#1908). There is no sample: producing one means expanding every
+    /// matched declaration, which is exactly the work the cap exists to skip.
+    Declarations,
+}
+
 /// A single request target that matched more of the workspace than the
 /// tool will process. The work was skipped, not truncated: `sample`
 /// holds the first `FILE_PATTERN_FANOUT_SAMPLE` matched paths so the
@@ -306,7 +339,24 @@ pub struct TooBroadScope {
     pub target: String,
     pub matched: usize,
     pub cap: usize,
+    pub matched_kind: TooBroadMatch,
     pub sample: Vec<String>,
+}
+
+/// The #1908 resolution fan-out reply: the selector's true declaration count
+/// and the cap it passed, with no candidate list.
+pub(super) fn too_broad_resolution_candidates(
+    target: &str,
+    matched: usize,
+    cap: usize,
+) -> TooBroadScope {
+    TooBroadScope {
+        target: target.to_string(),
+        matched,
+        cap,
+        matched_kind: TooBroadMatch::Declarations,
+        sample: Vec::new(),
+    }
 }
 
 /// `matched` is already ordered (it comes out of a `BTreeSet<ProjectFile>`), so
@@ -323,6 +373,7 @@ fn too_broad_scope(target: &str, matched: &[ProjectFile], cap: usize) -> TooBroa
         target: target.to_string(),
         matched: matched.len(),
         cap,
+        matched_kind: TooBroadMatch::Files,
         sample,
     }
 }
@@ -417,6 +468,7 @@ impl GlobFanout {
             target: target.to_string(),
             matched: self.matched,
             cap,
+            matched_kind: TooBroadMatch::Files,
             sample: self.sample,
         }
     }

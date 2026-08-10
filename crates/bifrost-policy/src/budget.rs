@@ -15,6 +15,20 @@ const MAX_SCANNED_SOURCE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_FACT_NODES: usize = 2_000_000;
 const MAX_PIPELINE_ROWS: usize = 50_000;
 
+// Policy endpoint SELECTION must bind every matching source or sink site, not
+// an interactive pagination sample.  The RQL result limit governing one
+// selector query is the query's own `limit` field, which the catalog validates
+// to the shared `DEFAULT_LIMIT` of 100 -- an interactive default.  At corpus
+// scale a workspace-wide source or sink selector matches far more than 100
+// sites, so the query truncates and reports `ResultLimitReached` before binding
+// completes, which fails the require-model taint compile closed (#1935).  The
+// selection result cap is therefore the pipeline-row ceiling rather than 100: a
+// selection pipeline cannot emit more rows than `MAX_PIPELINE_ROWS` permits, so
+// this bound never truncates before the pipeline budget -- the real
+// corpus-scale limit -- does.  A selector that genuinely exceeds the pipeline
+// budget still degrades honestly through the query's own incompleteness signal.
+const MAX_SELECTOR_RESULTS: usize = MAX_PIPELINE_ROWS;
+
 // The three scan lanes are the only lanes whose default is a floor rather than
 // a cap.  A whole-workspace policy subject scan costs Theta(workspace facts),
 // so `PolicyBudget::scaled_for_workspace` raises them with the audited
@@ -64,6 +78,7 @@ fn saturating_usize(value: u64) -> usize {
 #[derive(Debug, Clone, Copy)]
 pub struct PolicyBudget {
     query: CodeQueryExecutionLimits,
+    max_selector_results: usize,
     max_findings: usize,
     max_diagnostics: usize,
     max_related_locations_per_finding: usize,
@@ -95,6 +110,7 @@ impl Default for PolicyBudget {
                 value_flow: Default::default(),
                 taint: Default::default(),
             },
+            max_selector_results: MAX_SELECTOR_RESULTS,
             max_findings: MAX_FINDINGS,
             max_diagnostics: MAX_DIAGNOSTICS,
             max_related_locations_per_finding: MAX_RELATED_LOCATIONS_PER_FINDING,
@@ -124,6 +140,15 @@ impl PolicyBudget {
 
     pub const fn query_limits(&self) -> CodeQueryExecutionLimits {
         self.query
+    }
+
+    /// Maximum matching sites one policy source or sink selector may bind.
+    ///
+    /// This overrides the selector query's interactive `DEFAULT_LIMIT` so a
+    /// corpus-scale endpoint selection binds every site instead of truncating
+    /// at the pagination default (#1935).
+    pub const fn max_selector_results(&self) -> usize {
+        self.max_selector_results
     }
 
     /// Raise the three scan lanes to fit one whole-workspace subject scan.
@@ -276,6 +301,7 @@ pub enum PolicyBudgetField {
     ScannedSourceBytes,
     FactNodes,
     PipelineRows,
+    SelectorResults,
     SemanticMaterializedFiles,
     SemanticSourceBytes,
     SemanticRowsPerDimension,
@@ -310,6 +336,7 @@ impl PolicyBudgetField {
             Self::ScannedSourceBytes => "scanned_source_bytes",
             Self::FactNodes => "fact_nodes",
             Self::PipelineRows => "pipeline_rows",
+            Self::SelectorResults => "selector_results",
             Self::SemanticMaterializedFiles => "semantic_materialized_files",
             Self::SemanticSourceBytes => "semantic_source_bytes",
             Self::SemanticRowsPerDimension => "semantic_rows_per_dimension",
@@ -474,6 +501,12 @@ impl PolicyBudgetBuilder {
         Ok(self)
     }
 
+    policy_budget_setter!(
+        with_max_selector_results,
+        max_selector_results,
+        SelectorResults,
+        MAX_SELECTOR_RESULTS
+    );
     policy_budget_setter!(with_max_findings, max_findings, Findings, MAX_FINDINGS);
     policy_budget_setter!(
         with_max_diagnostics,
@@ -641,6 +674,7 @@ mod tests {
         assert_eq!(query.max_scanned_source_bytes, 128 * 1024 * 1024);
         assert_eq!(query.max_fact_nodes, 2_000_000);
         assert_eq!(query.max_pipeline_rows, 50_000);
+        assert_eq!(budget.max_selector_results(), 50_000);
         assert_eq!(
             query.semantic.max_materialized_files,
             MAX_SEMANTIC_MATERIALIZED_FILES
@@ -691,6 +725,8 @@ mod tests {
                 taint: Default::default(),
             })
             .unwrap()
+            .with_max_selector_results(0)
+            .unwrap()
             .with_max_findings(0)
             .unwrap()
             .with_max_diagnostics(0)
@@ -725,6 +761,7 @@ mod tests {
             .unwrap()
             .build()
             .unwrap();
+        assert_eq!(budget.max_selector_results(), 0);
         assert_eq!(budget.max_findings(), 0);
         assert_eq!(budget.max_retained_report_bytes(), 0);
     }
@@ -867,6 +904,11 @@ mod tests {
             );
         }
 
+        assert!(
+            PolicyBudget::builder()
+                .with_max_selector_results(MAX_SELECTOR_RESULTS + 1)
+                .is_err()
+        );
         assert!(
             PolicyBudget::builder()
                 .with_max_findings(MAX_FINDINGS + 1)

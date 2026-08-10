@@ -32,6 +32,12 @@ mod dependency_pack_lifecycle;
 mod dependency_pack_version_selection;
 mod dependency_semantic_pack;
 mod external_artifact_pack;
+// Framework declaration packs for the OWASP Benchmark type-resolution
+// prerequisite (#1935). The converter that produces them is generation-time
+// tooling behind `release-tooling`, so this acceptance runs with that feature
+// enabled and is absent from a featureless build.
+#[cfg(feature = "release-tooling")]
+mod framework_declaration_pack;
 mod generated_behavior_models;
 mod go_semantic_diagnostics;
 mod icfg_contract;

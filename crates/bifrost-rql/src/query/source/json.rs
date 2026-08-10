@@ -306,6 +306,7 @@ fn validate_json_pattern(value: &spanned::Value, path: &str, analysis: &mut Anal
                 PatternField::Text => {
                     validate_string_predicate(child, &child_path, false, analysis)
                 }
+                PatternField::Arity => validate_json_arity(child, &child_path, analysis),
                 PatternField::Capture => validate_json_capture(child, analysis),
                 PatternField::Has | PatternField::NotHas => {
                     validate_json_pattern(child, &child_path, analysis);
@@ -782,6 +783,82 @@ fn validate_json_path_filter(value: &spanned::Value, path: &str, analysis: &mut 
             );
         }
     }
+}
+
+fn validate_json_arity(value: &spanned::Value, path: &str, analysis: &mut Analysis) {
+    // Exact form: a non-negative integer count.
+    if value.as_number().is_some() {
+        validate_json_arity_bound(value, analysis);
+        return;
+    }
+    let Some(object) = value.as_object() else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "arity must be a non-negative integer or a { \"min\", \"max\" } range object",
+        );
+        return;
+    };
+    let mut min = None;
+    let mut max = None;
+    let mut seen = HashSet::new();
+    for (key, child) in object {
+        analysis.path(join_path(path, key.get_ref()), child.range());
+        let name = key.get_ref().as_str();
+        if name != "min" && name != "max" {
+            analysis.error(
+                key.range(),
+                "unknown-property",
+                format!("unknown arity filter property '{key}'; arity accepts only min and max"),
+            );
+            continue;
+        }
+        record_json_duplicate(name, key.range(), &mut seen, analysis);
+        let bound = validate_json_arity_bound(child, analysis);
+        if name == "min" {
+            min = bound;
+        } else {
+            max = bound;
+        }
+    }
+    if min.is_none() && max.is_none() {
+        analysis.error(
+            value.range(),
+            "invalid-query",
+            "arity range must set at least one of \"min\" or \"max\"",
+        );
+    }
+    if let (Some(min), Some(max)) = (min, max)
+        && min > max
+    {
+        analysis.error(
+            value.range(),
+            "invalid-query",
+            format!("arity \"min\" {min} must not exceed \"max\" {max}"),
+        );
+    }
+}
+
+/// Validate one arity bound literal, returning its value when it is a valid
+/// non-negative count within [`MAX_ARITY`].
+fn validate_json_arity_bound(value: &spanned::Value, analysis: &mut Analysis) -> Option<u64> {
+    let Some(count) = value.as_number().and_then(serde_json::Number::as_u64) else {
+        analysis.error(
+            value.range(),
+            "wrong-value-shape",
+            "arity bound must be a non-negative integer",
+        );
+        return None;
+    };
+    if count > u64::from(MAX_ARITY) {
+        analysis.error(
+            value.range(),
+            "invalid-query",
+            format!("arity bound must be at most {MAX_ARITY}"),
+        );
+        return None;
+    }
+    Some(count)
 }
 
 fn validate_json_environment_filter(

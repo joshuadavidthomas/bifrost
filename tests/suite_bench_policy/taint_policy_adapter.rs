@@ -3270,3 +3270,310 @@ fn production_taint_policies_share_a_batch_and_all_renderers_keep_the_same_evide
         assert!(rendered.contains("untrusted"));
     }
 }
+
+/// The same call name resolves to both a no-argument and a one-argument call
+/// site. `{sink_arity}` is either empty or ` :arity 1`; the arity form drops the
+/// no-arg site so the operand at index 0 always exists.
+fn arity_overloaded_sink_policy(id: &str, sink_arity: &str) -> String {
+    format!(
+        r#"(policy
+          :schema-version 1
+          :id "{id}"
+          :name "Arity-disambiguated sink"
+          :message "attacker data reached an arity-overloaded sink"
+          :severity warning
+          :analysis (analysis
+            :type taint
+            :mode may
+            :call-modeling (call-modeling :unmodeled optimistic)
+            :sources (endpoint-set :entries [
+              (source :id first :display-name "first source" :categories [input.user]
+                :selector (rql :schema-version 1
+                  (language python (call :callee (name "source_one"))))
+                :bind return-value :labels [untrusted])])
+            :sinks (endpoint-set :entries [
+              (sink :id store :display-name "sink" :categories [data.sensitive]
+                :selector (rql :schema-version 1
+                  (language python (call :callee (name "sink_one"){sink_arity})))
+                :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+          :classification (classification
+            :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+    )
+}
+
+/// The Benchmark headline, reduced: a sink name shared by a no-arg overload
+/// aborts the operand binding, and an arity predicate on the sink selector
+/// restores it. Drives the production policy registry exactly as the other
+/// adapter tests do.
+#[test]
+fn arity_predicate_binds_a_sink_whose_name_is_arity_overloaded() {
+    const OVERLOADED_SINK_SOURCE: &str = r#"
+def source_one():
+    return "one"
+
+def sink_one(value):
+    pass
+
+def run():
+    first = source_one()
+    sink_one()
+    sink_one(first)
+"#;
+
+    // Without an arity predicate the sink selector also matches the no-arg
+    // sink_one(), which has no argument at the dangerous-operand index, so the
+    // sink cannot bind and the tainted flow is never reported.
+    let without = evaluate_one(
+        OVERLOADED_SINK_SOURCE,
+        &arity_overloaded_sink_policy("test.arity-overloaded-abort", ""),
+    );
+    assert!(
+        without.taint_findings().is_empty(),
+        "the no-arg overload must prevent a finding without an arity predicate; findings={:#?}",
+        without.taint_findings()
+    );
+
+    // Constraining the sink to arity 1 drops the no-arg overload, so the
+    // operand binds and the source->sink flow is found.
+    let with = evaluate_one(
+        OVERLOADED_SINK_SOURCE,
+        &arity_overloaded_sink_policy("test.arity-overloaded-bound", " :arity 1"),
+    );
+    let [finding] = with.taint_findings() else {
+        panic!(
+            "the arity-constrained sink must bind and find the flow; findings={:#?}; report={:#?}",
+            with.taint_findings(),
+            with.report()
+        );
+    };
+    assert!(!finding.witnesses.is_empty());
+}
+
+/// OWASP Benchmark blocker 2 (#1935): a policy source or sink selector that
+/// matches more sites than the interactive RQL result limit (100) must bind
+/// every site rather than truncate. Before the fix the selector query ran at
+/// the shared DEFAULT_LIMIT of 100, so a corpus-scale selection truncated,
+/// reported ResultLimitReached, and aborted the compile with zero findings.
+/// Drives the production policy registry exactly as the other adapter tests do.
+#[test]
+fn selector_binds_more_sites_than_the_interactive_result_limit() {
+    // Above the interactive DEFAULT_LIMIT of 100. Before the fix the source and
+    // sink selector queries each truncated at 100 rows and reported
+    // ResultLimitReached, aborting the compile. The site count stays modest
+    // enough for the shared semantic discovery budget, an unrelated limit that
+    // governs value-flow exploration rather than selection (#1935).
+    const SITE_COUNT: usize = 101;
+    // Each `tainted` occurrence is both a matched-value source and the operand of
+    // its own sink, so selection binds every occurrence and each yields its own
+    // finding with a one-step witness. This isolates the selection result limit
+    // from the request-wide finding and witness budgets (unrelated limits tuned
+    // near 100 findings) and keeps discovery cheap with an external sink.
+    let mut source = String::from("\ndef run():\n    tainted = \"x\"\n");
+    for _ in 0..SITE_COUNT {
+        source.push_str("    sink_one(tainted)\n");
+    }
+    let outcome = evaluate_one(
+        &source,
+        &single_policy(
+            "test.selector-scale",
+            "(language python (name \"tainted\"))",
+            "matched-value",
+        ),
+    );
+    assert_eq!(
+        outcome.report().runs().len(),
+        1,
+        "{:?}",
+        outcome.report().diagnostics()
+    );
+    let run = &outcome.report().runs()[0];
+    // Selection must not truncate at the interactive result limit: every one of
+    // the sink sites binds, so every one of the flows is found.
+    assert!(
+        run.diagnostics()
+            .iter()
+            .all(|diagnostic| !diagnostic.message().contains("did not execute completely")),
+        "selection above the interactive limit must not truncate: {:?}",
+        run.diagnostics()
+    );
+    assert_eq!(
+        outcome.taint_findings().len(),
+        SITE_COUNT,
+        "every selected sink site must bind: completion={:?} diagnostics={:?}",
+        run.completion(),
+        run.diagnostics()
+    );
+}
+
+/// OWASP Benchmark blocker 3 (#1935): a require-model taint policy whose source
+/// and sink selectors span several call regions must bind per region. Before
+/// the fix the compiler required every selected source AND sink to land in one
+/// shared, completely discovered region, so a selected source with no
+/// co-located sink aborted the whole compile and the run abstained with zero
+/// findings. `source_one`/`sink_one` are in-workspace so their flow is fully
+/// modeled under require-model; `unknown_transform` is undefined, so it is the
+/// genuinely unmodeled call the honesty invariant hinges on.
+const PY_MULTI_REGION_BOUND_ORPHAN: &str = r#"
+def source_one():
+    return "one"
+
+def sink_one(value):
+    pass
+
+def keep(value):
+    pass
+
+def bound():
+    sink_one(source_one())
+
+def orphan():
+    keep(source_one())
+"#;
+
+const PY_MULTI_REGION_WITH_UNMODELED: &str = r#"
+def source_one():
+    return "one"
+
+def sink_one(value):
+    pass
+
+def keep(value):
+    pass
+
+def bound():
+    sink_one(source_one())
+
+def orphan():
+    keep(source_one())
+
+def unmodeled():
+    sink_one(unknown_transform(source_one()))
+"#;
+
+/// Line of the `sink_one(source_one())` bound-region sink in the fixtures above.
+const BOUND_SINK_LINE: u64 = 12;
+
+fn region_policy(id: &str, unmodeled: &str) -> String {
+    format!(
+        r#"(policy
+          :schema-version 1
+          :id "{id}"
+          :name "Multi-region taint"
+          :message "untrusted data reached a sink"
+          :severity warning
+          :analysis (analysis
+            :type taint
+            :mode may
+            :call-modeling (call-modeling :unmodeled {unmodeled})
+            :sources (endpoint-set :entries [
+              (source :id first :display-name "first source" :categories [input.user]
+                :selector (rql :schema-version 1
+                  (language python (call :callee (name "source_one"))))
+                :bind return-value :labels [untrusted])])
+            :sinks (endpoint-set :entries [
+              (sink :id first-store :display-name "first sink" :categories [data.sensitive]
+                :selector (rql :schema-version 1
+                  (language python (call :callee (name "sink_one"))))
+                :dangerous-operand (argument :index 0) :accepts [untrusted])]))
+          :classification (classification
+            :fallback (classification-id :taxonomy "Test" :id "BROAD-TAINT")))"#
+    )
+}
+
+#[test]
+fn require_model_binds_each_region_and_an_orphan_source_no_longer_aborts_the_compile() {
+    // The bound region (bound -> sink_one) yields its finding even though a
+    // second region holds a selected source (orphan) with no co-located sink.
+    // Before the fix the uncovered orphan source made the require-model compile
+    // demand one shared region for every endpoint, so it aborted and the run
+    // abstained with zero findings.
+    let outcome = evaluate_one(
+        PY_MULTI_REGION_BOUND_ORPHAN,
+        &region_policy("test.multi-region-bound", "require-model"),
+    );
+    assert_eq!(
+        outcome.report().runs().len(),
+        1,
+        "{:?}",
+        outcome.report().diagnostics()
+    );
+    let run = &outcome.report().runs()[0];
+    assert_eq!(
+        run.findings().len(),
+        1,
+        "the bound region must produce its verdict: completion={:?} diagnostics={:?} public={:?}",
+        run.completion(),
+        run.diagnostics(),
+        outcome.taint_findings()
+    );
+    assert_eq!(outcome.taint_findings().len(), 1);
+    let projected =
+        serde_json::to_value(outcome.taint_findings()).expect("stable public taint serialization");
+    assert_eq!(
+        projected[0]["sink"]["range"]["start_line"].as_u64(),
+        Some(BOUND_SINK_LINE),
+        "the finding must be the bound region's flow: {projected}"
+    );
+}
+
+#[test]
+fn require_model_keeps_a_provable_region_while_an_unmodeled_region_stays_inconclusive() {
+    // The unmodeled region carries a real potential flow: paranoid modeling
+    // (which propagates taint through unmodeled calls) reports both co-located
+    // regions, the bound flow and the unmodeled flow. The orphan source with no
+    // co-located sink contributes none.
+    let paranoid = evaluate_one(
+        PY_MULTI_REGION_WITH_UNMODELED,
+        &region_policy("test.multi-region-paranoid", "paranoid"),
+    );
+    assert_eq!(
+        paranoid.taint_findings().len(),
+        2,
+        "paranoid modeling reports both co-located regions: {:?}",
+        paranoid.report().diagnostics()
+    );
+
+    // require-model must fail closed on that same genuinely unmodeled transform:
+    // that region yields no finding and its incompleteness leaves the run
+    // Inconclusive. Crucially, that does not suppress the fully modeled bound
+    // region, which still reports its verdict. Honesty is preserved: the
+    // unmodeled flow is neither found nor cleared.
+    let outcome = evaluate_one(
+        PY_MULTI_REGION_WITH_UNMODELED,
+        &region_policy("test.multi-region-honest", "require-model"),
+    );
+    assert_eq!(
+        outcome.report().runs().len(),
+        1,
+        "{:?}",
+        outcome.report().diagnostics()
+    );
+    let run = &outcome.report().runs()[0];
+    assert_eq!(
+        run.findings().len(),
+        1,
+        "the bound region must survive the unmodeled region: completion={:?} diagnostics={:?} public={:?}",
+        run.completion(),
+        run.diagnostics(),
+        outcome.taint_findings()
+    );
+    assert_eq!(outcome.taint_findings().len(), 1);
+    // The only finding is the bound region (line 12), not the unmodeled region
+    // (line 18): require-model refused the unmodeled flow.
+    let projected =
+        serde_json::to_value(outcome.taint_findings()).expect("stable public taint serialization");
+    assert_eq!(
+        projected[0]["sink"]["range"]["start_line"].as_u64(),
+        Some(BOUND_SINK_LINE),
+        "the only finding must be the bound region's flow: {projected}"
+    );
+    assert!(
+        matches!(
+            run.completion(),
+            PolicyRunCompletion::Inconclusive { reasons }
+                if reasons.contains(&PolicyIncompleteReason::PartialDiscovery)
+        ),
+        "the unmodeled region must leave the run Inconclusive: {:?}",
+        run.completion()
+    );
+}

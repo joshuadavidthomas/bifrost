@@ -1,0 +1,257 @@
+[
+  {
+    "target": {
+      "path": "java.base/java/lang/StringBuffer.java",
+      "symbol": "java.lang.StringBuffer.<init>(java.lang.String)",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The new StringBuffer's internal buffer is initialized with the argument's characters, so parameter 0 reaches the constructed object, spelled here as normal_return. The argument is the only input and it is read only as data. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringBuffer(String); JDK java.lang.StringBuffer and AbstractStringBuilder source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/StringBuffer.java",
+      "symbol": "java.lang.StringBuffer.append(java.lang.String)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The argument's characters are appended to the receiver's buffer (parameter 0 to receiver), the buffer's prior content remains (receiver to receiver), and the method returns `this`, so the return value aliases the receiver and carries both the prior content and the appended argument (both inputs to normal_return). A null argument appends the literal \"null\" and carries no flow. These four transfers cover every input-to-output pair; synchronization does not change the value flow.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringBuffer.append(String); JDK java.lang.StringBuffer and AbstractStringBuilder source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/StringBuffer.java",
+      "symbol": "java.lang.StringBuffer.toString()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a new String holding the current content of the receiver's buffer, so the receiver reaches normal_return. There is no parameter and the receiver is not mutated. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringBuffer.toString(); JDK java.lang.StringBuffer source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/StringBuilder.java",
+      "symbol": "java.lang.StringBuilder.<init>(java.lang.String)",
+      "has_receiver": false,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The new StringBuilder's internal buffer is initialized with the argument's characters, so parameter 0 reaches the constructed object, spelled here as normal_return. The argument is the only input and it is read only as data. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringBuilder(String); JDK java.lang.StringBuilder and AbstractStringBuilder source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/StringBuilder.java",
+      "symbol": "java.lang.StringBuilder.append(char[])",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The argument array's characters are appended to the receiver's buffer (parameter 0 to receiver), the buffer's prior content remains (receiver to receiver), and the method returns `this`, so the return value aliases the receiver and carries both the prior content and the appended characters (both inputs to normal_return). These four transfers cover every input-to-output pair.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringBuilder.append(char[]); JDK java.lang.StringBuilder and AbstractStringBuilder source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/StringBuilder.java",
+      "symbol": "java.lang.StringBuilder.append(java.lang.Object)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The argument's String.valueOf result is appended to the receiver's buffer and the method returns `this`, so both inputs reach the receiver (post-state) and the aliased return value. The argument's characters come from its virtual toString, which is arbitrary code I do not trace, so completeness stays partial.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringBuilder.append(Object); JDK java.lang.StringBuilder and String.valueOf source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/StringBuilder.java",
+      "symbol": "java.lang.StringBuilder.append(java.lang.String)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The argument's characters are appended to the receiver's buffer (parameter 0 to receiver), the buffer's prior content remains (receiver to receiver), and the method returns `this`, so the return value aliases the receiver and carries both the prior content and the appended argument (both inputs to normal_return). A null argument appends the literal \"null\" and carries no flow. These four transfers cover every input-to-output pair.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringBuilder.append(String); JDK java.lang.StringBuilder and AbstractStringBuilder source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/StringBuilder.java",
+      "symbol": "java.lang.StringBuilder.insert(int,java.lang.String)",
+      "has_receiver": true,
+      "parameter_count": 2
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 1 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 1 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The argument's characters are inserted into the receiver's buffer (parameter 1 to receiver), the buffer's prior content remains around the insertion point (receiver to receiver), and the method returns `this`, so the return value aliases the receiver and carries both (both inputs to normal_return). The offset (parameter 0) only selects the insertion point; its value is never incorporated into the buffer, so it has no transfer.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringBuilder.insert(int, String); JDK java.lang.StringBuilder and AbstractStringBuilder source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/lang/StringBuilder.java",
+      "symbol": "java.lang.StringBuilder.toString()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a new String holding the current content of the receiver's buffer, so the receiver reaches normal_return. There is no parameter and the receiver is not mutated. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringBuilder.toString(); JDK java.lang.StringBuilder source. No CodeQL or Joern model consulted."
+  }
+]

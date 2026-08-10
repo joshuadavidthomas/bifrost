@@ -1112,7 +1112,8 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::Capture
         | RqlForm::Has
         | RqlForm::NotHas
-        | RqlForm::NotKind => unreachable!("predicate filtered above"),
+        | RqlForm::NotKind
+        | RqlForm::Arity => unreachable!("predicate filtered above"),
     }
 }
 
@@ -1465,6 +1466,9 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
             expect_len(expr, items, 2, "not-kind")?;
             insert_unique(&mut object, "not_kind", kind_value(&items[1])?).at(expr)?;
         }
+        RqlForm::Arity => {
+            insert_unique(&mut object, "arity", arity_value(expr, &items[1..])?).at(expr)?;
+        }
         RqlForm::Where
         | RqlForm::Language
         | RqlForm::Limit
@@ -1603,6 +1607,9 @@ fn insert_keyword(
             RqlProperty::NotKind => {
                 insert_unique(object, "not_kind", kind_value(value)?).at(key_expr)
             }
+            RqlProperty::Arity => {
+                insert_unique(object, "arity", arity_property_value(value)?).at(key_expr)
+            }
             RqlProperty::Has => insert_unique(object, "has", pattern_to_json(value)?).at(key_expr),
             RqlProperty::NotHas => {
                 insert_unique(object, "not_has", pattern_to_json(value)?).at(key_expr)
@@ -1737,6 +1744,60 @@ fn string_arg(expr: &Expr) -> LowerResult<String> {
             format!("expected string, got {}", describe_expr(expr)),
         )
     })
+}
+
+/// Lower the tail of an `(arity ...)` predicate to its JSON value: a single
+/// non-negative integer (exact count), or `:min`/`:max` keyword bounds
+/// (inclusive range). Bound ranges and `min <= max` are enforced by the
+/// decoder; this only shapes the JSON.
+fn arity_value(expr: &Expr, tail: &[Expr]) -> LowerResult<Value> {
+    if let [only] = tail
+        && let Some(count) = only.as_number()
+    {
+        return Ok(Value::Number(count.into()));
+    }
+    if tail.is_empty() || !tail.len().is_multiple_of(2) {
+        return Err(lower_error(
+            expr,
+            "(arity ...) expects a count or :min/:max integer pairs",
+        ));
+    }
+    let mut object = Map::new();
+    for pair in tail.chunks_exact(2) {
+        let key = pair[0]
+            .as_symbol()
+            .ok_or_else(|| lower_error(&pair[0], "(arity ...) bound names must be :min or :max"))?;
+        let field = match key {
+            ":min" => "min",
+            ":max" => "max",
+            _ => {
+                return Err(lower_error(
+                    &pair[0],
+                    "(arity ...) accepts only :min and :max",
+                ));
+            }
+        };
+        let ExprKind::Number(count) = pair[1].kind else {
+            return Err(lower_error(
+                &pair[1],
+                format!("{key} takes a non-negative integer"),
+            ));
+        };
+        insert_unique(&mut object, field, Value::Number(count.into())).at(&pair[0])?;
+    }
+    Ok(Value::Object(object))
+}
+
+/// Lower an inline `:arity` property value: a single non-negative integer
+/// (exact count). Ranges use the `(arity :min .. :max ..)` predicate form.
+fn arity_property_value(expr: &Expr) -> LowerResult<Value> {
+    match expr.as_number() {
+        Some(count) => Ok(Value::Number(count.into())),
+        None => Err(lower_error(
+            expr,
+            ":arity takes a non-negative integer; use (arity :min .. :max ..) for a range",
+        )),
+    }
 }
 
 fn symbol_or_string(expr: &Expr) -> LowerResult<String> {

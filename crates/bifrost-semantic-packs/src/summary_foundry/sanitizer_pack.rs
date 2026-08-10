@@ -615,7 +615,10 @@ fn summary_input(port: &SanitizerPort) -> AuthoredSummaryInput {
 /// Derive a stable, valid summary id from the target symbol. The id charset is
 /// lowercase ASCII alphanumerics plus `.`, `-`, and `_`; every other character
 /// collapses to a single `-`, and leading or trailing separators are trimmed.
-fn summary_id(symbol: &str) -> String {
+///
+/// Shared with the golden-core and framework-declaration converters, which slug
+/// a summary id or a pack coordinate the same way.
+pub(crate) fn summary_id(symbol: &str) -> String {
     let mut id = String::with_capacity(symbol.len());
     let mut last_dash = false;
     for character in symbol.chars() {

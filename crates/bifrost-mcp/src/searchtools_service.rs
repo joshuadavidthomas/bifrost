@@ -3300,6 +3300,7 @@ impl SearchToolsService {
             initial_snapshot.analyzer(),
             params.clone(),
             GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES,
+            cancellation,
         )
         .map_err(Self::symbol_sources_budget_error)?;
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -3350,6 +3351,7 @@ impl SearchToolsService {
                     final_snapshot.analyzer(),
                     params,
                     GET_SYMBOL_SOURCES_RESPONSE_BUDGET_BYTES,
+                    cancellation,
                 )
                 .map_err(Self::symbol_sources_budget_error)?;
                 let output = Self::symbol_sources_output(result, render_options);

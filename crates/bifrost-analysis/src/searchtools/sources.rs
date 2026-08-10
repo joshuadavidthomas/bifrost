@@ -105,6 +105,29 @@ pub(super) enum SourceLookupOutcome {
     AmbiguousPath(AmbiguousPathInput),
     TooBroad(TooBroadScope),
     BudgetExceeded,
+    /// Resolution stopped on the request's cancellation, so this target has no
+    /// verdict at all. It contributes nothing to the reply: the request
+    /// boundary that set the token is the one that reports the cancellation,
+    /// exactly as `get_summaries` reports it by breaking out of its target
+    /// loop.
+    Cancelled,
+}
+
+/// The fan-out and cancellation budget one `get_symbol_sources` symbol
+/// argument resolves under (#1908).
+fn resolution_budget(keep_going: &dyn Fn() -> bool) -> FuzzyResolveBudget<'_> {
+    FuzzyResolveBudget::new(keep_going, SYMBOL_TOOL_MAX_RESOLUTION_CANDIDATES)
+}
+
+/// What this tool answers with when resolution reported the caller's own limits
+/// instead of a resolution.
+fn stopped_source_outcome(symbol: &str, stop: FuzzyResolveStop) -> SourceLookupOutcome {
+    match stop {
+        FuzzyResolveStop::Cancelled => SourceLookupOutcome::Cancelled,
+        FuzzyResolveStop::TooManyCandidates { total, limit } => {
+            SourceLookupOutcome::TooBroad(too_broad_resolution_candidates(symbol, total, limit))
+        }
+    }
 }
 
 fn source_blocks_for_resolved_units_with_budget(
@@ -341,7 +364,7 @@ pub fn get_symbol_sources(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
 ) -> SymbolSourcesResult {
-    get_symbol_sources_with_budget(analyzer, params, &SourceByteBudget::unbounded())
+    get_symbol_sources_with_budget(analyzer, params, &SourceByteBudget::unbounded(), None)
         .expect("an unbounded source lookup must not exceed its budget")
 }
 
@@ -349,8 +372,14 @@ pub fn get_symbol_sources_with_source_budget(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
     max_source_bytes: usize,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> Result<SymbolSourcesResult, SymbolSourcesBudgetExceeded> {
-    get_symbol_sources_with_budget(analyzer, params, &SourceByteBudget::new(max_source_bytes))
+    get_symbol_sources_with_budget(
+        analyzer,
+        params,
+        &SourceByteBudget::new(max_source_bytes),
+        cancellation,
+    )
 }
 
 /// Two independent bounds apply here. `source_budget` caps the total bytes of
@@ -365,6 +394,7 @@ fn get_symbol_sources_with_budget(
     analyzer: &dyn IAnalyzer,
     params: SymbolLookupParams,
     source_budget: &SourceByteBudget,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> Result<SymbolSourcesResult, SymbolSourcesBudgetExceeded> {
     let max_files_per_target = GET_SYMBOL_SOURCES_MAX_FILES_PER_TARGET;
     // One tool call is one read-only analyzer request. The scope is what lets
@@ -374,7 +404,14 @@ fn get_symbol_sources_with_budget(
     // fan-out reuse hydrated file states the way every other batched tool
     // already does. Nested scopes opened by callees do not clear the cache
     // while this outer scope is active.
-    let _analyzer_query = AnalyzerQueryScope::new(analyzer);
+    // With the caller's deadline, when it set one. The scope is how the token
+    // reaches reads whose signatures do not carry one: on C++ the per-symbol
+    // `definitions` read runs identity reconciliation, which is where #1908
+    // spent 270 s with nothing polling it.
+    let _analyzer_query = match cancellation {
+        Some(cancellation) => AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+        None => AnalyzerQueryScope::new(analyzer),
+    };
 
     let selected_symbols: Vec<_> = params
         .symbols
@@ -389,6 +426,7 @@ fn get_symbol_sources_with_budget(
             if source_budget.is_exceeded() {
                 return (index, SourceLookupOutcome::BudgetExceeded);
             }
+            let keep_going = || !cancellation.is_some_and(crate::CancellationToken::is_cancelled);
             if symbol.starts_with("bifrost-model://")
                 && let Some(outcome) =
                     semantic_model_source_outcome(analyzer, &symbol, source_budget)
@@ -405,7 +443,19 @@ fn get_symbol_sources_with_budget(
             // `fmt::formatter` are never stolen by path-selector parsing.
             let exact_scope =
                 crate::profiling::scope(format!("get_symbol_sources.exact[{symbol}]"));
-            match resolve_selectable_definitions(analyzer, &symbol, exact_codeunit_resolution) {
+            let exact =
+                resolve_selectable_definitions_bounded(analyzer, &symbol, |analyzer, lookup| {
+                    exact_codeunit_resolution_bounded(
+                        analyzer,
+                        lookup,
+                        resolution_budget(&keep_going),
+                    )
+                });
+            let exact = match exact {
+                Ok(resolution) => resolution,
+                Err(stop) => return (index, stopped_source_outcome(&symbol, stop)),
+            };
+            match exact {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = if file_anchored {
                         source_blocks_for_resolved_units_with_budget(
@@ -457,32 +507,16 @@ fn get_symbol_sources_with_budget(
                 crate::profiling::scope(format!("get_symbol_sources.path_qualified[{symbol}]"));
             match split_path_qualified_definition_selector(analyzer, &symbol) {
                 Some(PathQualifiedSelector::Resolved { anchor, lookup }) => {
-                    return match resolve_file_anchored_symbol_sources(
-                        analyzer,
-                        &symbol,
-                        anchor,
-                        lookup,
-                        source_budget,
-                    ) {
-                        SourceLookupOutcome::Found(blocks) => {
-                            (index, SourceLookupOutcome::Found(blocks))
-                        }
-                        SourceLookupOutcome::NotFound(item) => {
-                            (index, SourceLookupOutcome::NotFound(item))
-                        }
-                        SourceLookupOutcome::Ambiguous(item) => {
-                            (index, SourceLookupOutcome::Ambiguous(item))
-                        }
-                        SourceLookupOutcome::AmbiguousPath(item) => {
-                            (index, SourceLookupOutcome::AmbiguousPath(item))
-                        }
-                        SourceLookupOutcome::BudgetExceeded => {
-                            (index, SourceLookupOutcome::BudgetExceeded)
-                        }
-                        SourceLookupOutcome::TooBroad(item) => {
-                            (index, SourceLookupOutcome::TooBroad(item))
-                        }
-                    };
+                    return (
+                        index,
+                        resolve_file_anchored_symbol_sources(
+                            analyzer,
+                            &symbol,
+                            anchor,
+                            lookup,
+                            source_budget,
+                        ),
+                    );
                 }
                 Some(PathQualifiedSelector::AmbiguousPath(item)) => {
                     return (index, SourceLookupOutcome::AmbiguousPath(item));
@@ -605,7 +639,15 @@ fn get_symbol_sources_with_budget(
 
             let _fuzzy_scope =
                 crate::profiling::scope(format!("get_symbol_sources.fuzzy[{symbol}]"));
-            match resolve_selectable_definitions(analyzer, &symbol, resolve_codeunit_fuzzy) {
+            let fuzzy =
+                resolve_selectable_definitions_bounded(analyzer, &symbol, |analyzer, lookup| {
+                    resolve_codeunit_fuzzy_bounded(analyzer, lookup, resolution_budget(&keep_going))
+                });
+            let fuzzy = match fuzzy {
+                Ok(resolution) => resolution,
+                Err(stop) => return (index, stopped_source_outcome(&symbol, stop)),
+            };
+            match fuzzy {
                 SelectableDefinitionResolution::Resolved(code_units) => {
                     let sources = match preferred_source_blocks_for_resolved_units_with_budget(
                         analyzer,
@@ -666,6 +708,7 @@ fn get_symbol_sources_with_budget(
             SourceLookupOutcome::Ambiguous(item) => ambiguous.push(item),
             SourceLookupOutcome::AmbiguousPath(item) => ambiguous_paths.push(item),
             SourceLookupOutcome::TooBroad(item) => too_broad.push(item),
+            SourceLookupOutcome::Cancelled => {}
             SourceLookupOutcome::BudgetExceeded => {
                 return Err(SymbolSourcesBudgetExceeded {
                     max_source_bytes: source_budget.max_source_bytes,
