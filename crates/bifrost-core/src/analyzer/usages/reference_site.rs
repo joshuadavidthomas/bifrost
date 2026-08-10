@@ -500,7 +500,8 @@ fn member_access_chain(
 fn is_ident_byte(byte: u8, language: Language) -> bool {
     byte == b'_'
         || (language == Language::Ruby && byte == b'@')
-        || (matches!(language, Language::JavaScript | Language::TypeScript) && byte == b'$')
+        || (matches!(language, Language::JavaScript | Language::TypeScript)
+            && matches!(byte, b'$' | b'#'))
         || byte.is_ascii_alphanumeric()
 }
 

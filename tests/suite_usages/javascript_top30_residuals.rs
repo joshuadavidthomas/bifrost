@@ -182,6 +182,46 @@ class OtherToolbar {
 }
 
 #[test]
+fn javascript_private_field_focus_stops_before_a_later_property() {
+    let source = r#"class Renderer {
+  #out = [];
+
+  clear() {
+    const child = new Renderer();
+    child.#out.length = 0;
+  }
+}
+
+class Decoy {
+  #out = [];
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("renderer.js", source)
+        .build();
+    let analyzer = JavascriptAnalyzer::from_project(project.project().clone());
+    let response = get_definitions_by_location(
+        &analyzer,
+        GetDefinitionParams {
+            references: vec![definition_query(
+                "renderer.js",
+                source,
+                "    child.#out.length = 0;",
+                "#out",
+            )],
+        },
+    );
+
+    assert_eq!(response.results[0].status, "resolved", "{response:#?}");
+    assert_eq!(response.results[0].definitions.len(), 1, "{response:#?}");
+    assert_eq!(
+        response.results[0].definitions[0].fqn.as_deref(),
+        Some("Renderer.#out"),
+        "the selected private segment must not resolve as the later `length` property: {response:#?}"
+    );
+}
+
+#[test]
 fn javascript_imported_jsdoc_cast_singleton_member_keeps_export_identity() {
     let constants = r#"export const ElementInteractivity = /** @type {const} */ ({
   Interactive: "interactive",
