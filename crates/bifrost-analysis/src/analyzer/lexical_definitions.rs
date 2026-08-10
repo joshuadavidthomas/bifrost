@@ -5,7 +5,9 @@
 //! symbol graph.  Resolving them from the current syntax tree keeps overlays
 //! authoritative and avoids adding short-lived lexical facts to the store.
 
-use brokk_bifrost_js_ts::syntax::js_ts_var_declarator_binding_scope;
+use brokk_bifrost_js_ts::syntax::{
+    js_ts_var_declarator_binding_scope, js_ts_variable_declarator_binding_scope,
+};
 use tree_sitter::Node;
 
 use super::languages::language_support;
@@ -602,6 +604,7 @@ fn scope_matching_local(
     focus_start: usize,
     identifier: &str,
 ) -> Option<LexicalDefinition> {
+    let js_ts = matches!(language, Language::JavaScript | Language::TypeScript);
     let mut nearest_before: Option<(Node<'_>, Node<'_>)> = None;
     let mut first_any: Option<(Node<'_>, Node<'_>)> = None;
     let mut hoisted: Option<(Node<'_>, Node<'_>)> = None;
@@ -616,16 +619,26 @@ fn scope_matching_local(
         {
             hoisted = Some((name, node));
         }
-        if node.start_byte() > focus_start {
-            continue;
-        }
         if is_parameter_owner(language, node.kind())
             || is_nested_scope(language, node.kind())
             || is_parameter_declaration(language, node.kind())
         {
             continue;
         }
+        let starts_after_focus = node.start_byte() > focus_start;
+        if starts_after_focus && !js_ts {
+            continue;
+        }
         if is_local_declaration(language, node.kind()) {
+            if js_ts && node.kind() == "variable_declarator" {
+                if js_ts_variable_declarator_binding_scope(node)
+                    .is_none_or(|binding_scope| binding_scope.id() != scope.id())
+                {
+                    continue;
+                }
+            } else if starts_after_focus {
+                continue;
+            }
             if language == Language::Rust && node.end_byte() > focus_start {
                 continue;
             }

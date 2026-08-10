@@ -465,13 +465,26 @@ fn node_scope(node: Node<'_>) -> JsTsLexicalBindingScope {
 }
 
 fn variable_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
-    let is_var = node
-        .parent()
-        .is_some_and(|parent| parent.kind() == "variable_declaration");
-    if is_var {
-        return enclosing_var_binding_scope(node);
+    js_ts_variable_declarator_binding_scope(node).map(node_scope)
+}
+
+/// The lexical scope that owns a JavaScript or TypeScript variable declarator.
+///
+/// `var` attaches to its nearest function or program. `let` and `const` attach
+/// to their nearest block-like scope. The declaration order does not change
+/// that identity: a lexical binding exists for its complete scope, including
+/// its temporal-dead-zone portion before initialization.
+pub fn js_ts_variable_declarator_binding_scope<'tree>(
+    declarator: Node<'tree>,
+) -> Option<Node<'tree>> {
+    if declarator.kind() != "variable_declarator" {
+        return None;
     }
-    let mut current = node.parent();
+    let declaration = declarator.parent()?;
+    if declaration.kind() == "variable_declaration" {
+        return var_binding_scope_node(declaration);
+    }
+    let mut current = Some(declaration);
     while let Some(parent) = current {
         if matches!(
             parent.kind(),
@@ -482,7 +495,7 @@ fn variable_binding_scope(node: Node<'_>) -> Option<JsTsLexicalBindingScope> {
                 | "switch_body"
                 | "catch_clause"
         ) {
-            return Some(node_scope(parent));
+            return Some(parent);
         }
         current = parent.parent();
     }
@@ -502,7 +515,7 @@ pub fn js_ts_var_declarator_binding_scope<'tree>(declarator: Node<'tree>) -> Opt
     if declaration.kind() != "variable_declaration" {
         return None;
     }
-    var_binding_scope_node(declaration)
+    js_ts_variable_declarator_binding_scope(declarator)
 }
 
 fn var_binding_scope_node(node: Node<'_>) -> Option<Node<'_>> {
