@@ -6243,7 +6243,7 @@ int consume() {
 }
 
 #[test]
-fn scan_usages_cpp_macro_failure_is_actionable_and_hides_strategy_details() {
+fn scan_usages_cpp_macro_succeeds_and_wrong_anchor_is_actionable() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("defs.h", "#define TEST_DECLARE(name) int name\n")
         .file(
@@ -6269,25 +6269,12 @@ void run() {
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
-    let failure = only_result(&value);
+    let found = only_result(&value);
 
-    assert_eq!("failure", failure["status"], "payload: {value}");
-    assert_eq!(
-        "unsupported_target_shape", failure["reason_kind"],
-        "payload: {value}"
-    );
-    let message = failure["message"].as_str().expect("failure message");
-    assert!(message.contains("C/C++ macro"), "payload: {value}");
-    assert!(message.contains("query_code"), "payload: {value}");
-    assert!(
-        message.contains("syntactic invocation candidates"),
-        "payload: {value}"
-    );
-    assert!(
-        !message.contains("CppUsageGraphStrategy"),
-        "payload: {value}"
-    );
-    assert!(failure.get("strategy").is_none(), "payload: {value}");
+    assert_eq!("found", found["status"], "payload: {value}");
+    assert_eq!("defs.h", found["definition_path"], "payload: {value}");
+    assert_eq!(1, found["total_hits"], "payload: {value}");
+    assert_eq!("uses.cpp", found["files"][0]["path"], "payload: {value}");
 
     let anchored_payload = service
         .call_tool_json(
