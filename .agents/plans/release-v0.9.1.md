@@ -12,8 +12,10 @@ Bifrost v0.9.1 replaces the unpublished v0.9.0 release candidate. It includes th
 - [x] (2026-08-11 09:20Z) Create and push `dave/v0.9.1-rc` from master commit `528655957`.
 - [x] (2026-08-11 09:22Z) Set version 0.9.1 and synchronize release metadata.
 - [x] (2026-08-11 09:24Z) Validate release metadata and all 118 agent plugin tests.
-- [ ] Commit the version projection and copy it to `master`.
-- [ ] Run the full release gate and the pinned semantic pack build on the frozen RC.
+- [x] (2026-08-11 09:30Z) Commit the version projection and copy it to `master`.
+- [x] (2026-08-11 09:44Z) Confirm that all 19 publishable crates exist in the public Cargo registry.
+- [x] (2026-08-11 09:45Z) Run the pinned semantic pack build on the frozen RC.
+- [x] (2026-08-11 09:57Z) Run the full release gate on the frozen RC.
 - [ ] Tag the validated RC commit as `v0.9.1` and push the tag.
 - [ ] Monitor publication and confirm all public version 0.9.1 artifacts.
 
@@ -37,7 +39,7 @@ Bifrost v0.9.1 replaces the unpublished v0.9.0 release candidate. It includes th
 
 ## Outcomes & Retrospective
 
-The RC snapshot and version projection exist. Publication remains pending until all local gates pass and the tag workflow succeeds.
+The RC snapshot, version projection, public crate audit, pinned pack build, and full local gate are complete. Publication remains pending until the tag workflow succeeds.
 
 ## Context and Orientation
 
@@ -81,9 +83,17 @@ Current evidence:
     old failed release run: https://github.com/BrokkAi/bifrost/actions/runs/31470463663
     release version check: passed at 0.9.1
     agent plugin tests: 118 passed; 0 failed
+    public Cargo registry: all 19 release crates exist at 0.8.24
+    pinned JVM semantic pack build: passed
+    cargo nextest: 10002 passed; 0 failed
+    workspace doctests: passed
+    all-feature workspace clippy: passed
+    full pre-push gate: passed in 727 seconds
 
 ## Interfaces and Dependencies
 
 Do not add a crate or dependency. Use the existing version projection script, semantic pack build script, pre-push gate, and release workflow. Keep the v0.9.0 tag unchanged.
 
 Revision note: Created this plan for the v0.9.1 recovery release after confirming that every v0.9.0 RC fix was present on master.
+
+Revision note: Recorded the synchronized version projection, public crate audit, pinned pack result, and complete local release gate.
