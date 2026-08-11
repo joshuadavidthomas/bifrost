@@ -2839,6 +2839,144 @@ fn production_taint_discovers_an_unselected_common_caller_for_sibling_callees() 
     );
 }
 
+/// Builds a Python project where `entry_count` entry procedures all call the
+/// same relay chain to the sink (#1936).
+///
+/// The flow is `source_one() -> entry_i -> relay_a -> relay_b -> sink_one`. The
+/// taint compile roots every procedure of the materialized artifact, so the
+/// shared relay chain and the sink are a callee subgraph that every entry root
+/// and every relay root reaches. This is the topology that made per-root
+/// re-materialization re-charge the shared semantic budget.
+fn shared_relay_source(chain_length: usize, entry_count: usize) -> String {
+    assert!(chain_length >= 1);
+    let mut source = String::from(
+        r#"
+def source_one():
+    return "one"
+
+def sink_one(value):
+    pass
+
+def relay_0(value):
+    sink_one(value)
+"#,
+    );
+    // A linear relay chain relay_{n-1} -> ... -> relay_0 -> sink_one. Every entry
+    // enters the chain at relay_{n-1}, so the whole chain and the sink are a
+    // callee subgraph that every entry root and every relay root reaches. Because
+    // every relay is also a root, per-root discovery re-walks the suffix of the
+    // chain from each relay, which grows the total charge with the square of the
+    // chain length. The per-compile cache charges each relay one time, so its
+    // total charge grows only linearly with the chain length.
+    for index in 1..chain_length {
+        let previous = index - 1;
+        source.push_str(&format!(
+            "\ndef relay_{index}(value):\n    relay_{previous}(value)\n"
+        ));
+    }
+    let head = chain_length - 1;
+    for index in 0..entry_count {
+        source.push_str(&format!(
+            "\ndef entry_{index}():\n    relay_{head}(source_one())\n"
+        ));
+    }
+    source
+}
+
+/// Reads the taint compile's semantic program-point charge from the one run.
+///
+/// Discovery charges this budget through the value-flow oracle. A per-compile
+/// cache hit skips the oracle call, so this metric counts each shared procedure
+/// one time for each compile, not one time for each root.
+fn taint_semantic_program_points(outcome: &brokk_bifrost::policy::PolicyBatchOutcome) -> u64 {
+    let [run] = outcome.report().runs() else {
+        panic!(
+            "expected one policy run, got {}",
+            outcome.report().runs().len()
+        );
+    };
+    run.work()
+        .metrics()
+        .iter()
+        .find(|metric| metric.name() == "taint.semantic_program_points")
+        .map(|metric| metric.value())
+        .expect("taint compile must report semantic_program_points")
+}
+
+#[test]
+fn production_taint_shared_relay_reached_by_many_roots_still_finds_the_flow() {
+    let policy = single_policy(
+        "test.shared-relay-taint",
+        "(language python (call :callee (name \"source_one\")))",
+        "return-value",
+    );
+    // Two entry procedures reach the same relay chain, so the shared chain is a
+    // callee subgraph of both entry roots. The per-compile materialization cache
+    // must return the same regions a fresh per-root discovery would, so the
+    // source_one -> sink_one flow must still be found.
+    let outcome = evaluate_one(&shared_relay_source(12, 2), &policy);
+    assert_eq!(
+        outcome.report().runs().len(),
+        1,
+        "{:?}",
+        outcome.report().diagnostics()
+    );
+    assert!(
+        !outcome.taint_findings().is_empty(),
+        "the shared source->sink flow must still be found; report={:#?}",
+        outcome.report()
+    );
+    for finding in outcome.taint_findings() {
+        assert!(
+            finding.sink.path.ends_with("app.py"),
+            "the sink must stay in the inline project: {finding:#?}"
+        );
+        assert!(
+            finding
+                .reached_labels
+                .iter()
+                .any(|label| label == "untrusted"),
+            "the untrusted label must reach the sink through the shared relay chain: {finding:#?}"
+        );
+    }
+}
+
+#[test]
+fn production_taint_caches_shared_relay_materialization_across_roots() {
+    let policy = single_policy(
+        "test.shared-relay-materialization-taint",
+        "(language python (call :callee (name \"source_one\")))",
+        "return-value",
+    );
+    let short = evaluate_one(&shared_relay_source(4, 1), &policy);
+    let long = evaluate_one(&shared_relay_source(8, 1), &policy);
+    assert!(
+        !short.taint_findings().is_empty(),
+        "short-chain flow must be found; report={:#?}",
+        short.report()
+    );
+    assert!(
+        !long.taint_findings().is_empty(),
+        "long-chain flow must be found; report={:#?}",
+        long.report()
+    );
+    let short_points = taint_semantic_program_points(&short);
+    let long_points = taint_semantic_program_points(&long);
+    // Every relay is a root, so per-root discovery re-walks the chain suffix from
+    // each relay. Before #1936 that made the total charge grow with the square of
+    // the chain length, so doubling the chain length roughly quadrupled the charge
+    // (measured ~4x). The per-compile cache charges each relay one time, so the
+    // total charge grows far more slowly and doubling the chain only about doubles
+    // it (measured ~2.3x). A three-times bound separates the cached result from
+    // the old quadratic one with margin on each side. The bound is deterministic,
+    // because the analysis charges no random work.
+    assert!(
+        long_points < 3 * short_points,
+        "the shared relay chain must be charged once, not once per root: \
+         chain_4={short_points}, chain_8={long_points}"
+    );
+}
+
 #[test]
 fn production_taint_matched_value_uses_the_direct_source_observation() {
     let policy = single_policy(
