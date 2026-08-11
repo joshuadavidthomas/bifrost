@@ -364,7 +364,11 @@ impl StructuralSpec for JavaStructuralSpec {
     }
 
     fn generator_construct(&self, node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
-        (node.kind() == "method_reference").then_some("java_method_reference")
+        match node.kind() {
+            "method_reference" => Some("java_method_reference"),
+            "object_creation_expression" => Some("java_object_creation"),
+            _ => None,
+        }
     }
 
     fn supports_role(&self, role: Role) -> bool {

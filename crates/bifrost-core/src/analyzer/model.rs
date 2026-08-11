@@ -466,6 +466,8 @@ pub struct SignatureMetadata {
     #[serde(default)]
     field_is_final: bool,
     #[serde(default)]
+    field_has_initializer: bool,
+    #[serde(default)]
     cpp_field_linkage: Option<CppFieldLinkage>,
     /// Whether this class-like declaration is a Kotlin `companion object`.
     ///
@@ -1702,6 +1704,7 @@ impl SignatureMetadata {
             extension_receiver_is_unconstrained_type_parameter: false,
             field_is_static: false,
             field_is_final: false,
+            field_has_initializer: false,
             cpp_field_linkage: None,
             companion_object: false,
             callable_is_static: false,
@@ -1834,6 +1837,11 @@ impl SignatureMetadata {
         self
     }
 
+    pub fn with_field_initializer(mut self, has_initializer: bool) -> Self {
+        self.field_has_initializer = has_initializer;
+        self
+    }
+
     pub fn with_cpp_field_linkage(mut self, linkage: CppFieldLinkage) -> Self {
         self.cpp_field_linkage = Some(linkage);
         self
@@ -1938,6 +1946,10 @@ impl SignatureMetadata {
 
     pub fn field_is_final(&self) -> bool {
         self.field_is_final
+    }
+
+    pub fn field_has_initializer(&self) -> bool {
+        self.field_has_initializer
     }
 
     pub const fn cpp_field_linkage(&self) -> Option<CppFieldLinkage> {
