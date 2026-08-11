@@ -9,8 +9,6 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use rusqlite::ffi::ErrorCode;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
-#[cfg(test)]
-use rusqlite_migration::{M, Migrations};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -24,7 +22,10 @@ pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 /// The store file and the SQLite sidecars that belong to it.
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
 
-const BASELINE_MIGRATION_VERSION: i64 = 1;
+/// The version the baseline script creates. Versions below it are gone: the
+/// migrations that produced them were folded into the baseline, so a store
+/// older than this cannot be carried forward and is refused.
+const BASELINE_MIGRATION_VERSION: i64 = 18;
 const CURRENT_MIGRATION_VERSION: i64 = 22;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
@@ -32,40 +33,7 @@ pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
 pub const OPTIONAL_FACT_KIND_SCALA_EXPORT: i64 = 4;
 pub const OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD: i64 = 5;
 const BASELINE_CACHE_STATE_VERSIONS: (i64, i64, i64) = (1, 1, 10);
-const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0001-current-baseline.sql");
-const PATH_SYMBOL_UNITS_SQL: &str = include_str!("../migrations/cache/0002-path-symbol-units.sql");
-const FORWARD_FACTS_SQL: &str = include_str!("../migrations/cache/0003-forward-facts.sql");
-const ANALYZER_GENERATIONS_SQL: &str =
-    include_str!("../migrations/cache/0004-analyzer-generations.sql");
-const ANALYZER_BLOB_CASCADE_COSTS_SQL: &str =
-    include_str!("../migrations/cache/0005-analyzer-blob-cascade-costs.sql");
-const ANALYZER_BLOB_PAYLOAD_COSTS_SQL: &str =
-    include_str!("../migrations/cache/0006-analyzer-blob-payload-costs.sql");
-const STRUCTURAL_FACTS_SNAPSHOTS_SQL: &str =
-    include_str!("../migrations/cache/0007-structural-facts-snapshots.sql");
-const CPP_TEMPLATE_METADATA_SQL: &str =
-    include_str!("../migrations/cache/0008-cpp-template-metadata.sql");
-const SCALA_EXPORTS_SQL: &str = include_str!("../migrations/cache/0009-scala-exports.sql");
-const IDENTIFIER_LOOKUP_MEMBERSHIP_SQL: &str =
-    include_str!("../migrations/cache/0010-identifier-lookup-membership.sql");
-const CODE_UNIT_TEST_REGION_SQL: &str =
-    include_str!("../migrations/cache/0011-code-unit-test-region.sql");
-const FQ_SEGMENTS_SQL: &str = include_str!("../migrations/cache/0012-fq-segments.sql");
-const SEMANTIC_MODEL_ACTIVE_SET_SQL: &str =
-    include_str!("../migrations/cache/0013-semantic-model-active-set.sql");
-const SEMANTIC_FILE_DOCUMENTS_SQL: &str =
-    include_str!("../migrations/cache/0014-semantic-file-documents.sql");
-const MATERIALIZATION_RECORDS_SQL: &str =
-    include_str!("../migrations/cache/0015-materialization-records.sql");
-const OPTIONAL_FACT_MANIFEST_SQL: &str =
-    include_str!("../migrations/cache/0016-optional-fact-manifest.sql");
-// Migrations 0017 and 0018 create the per-file Rust usage-fact tables the
-// usage-v2 arc writes. Phase 1 of `.agents/plans/port-optimization-arc-to-upstream.md`
-// creates them empty: the Rust reader is upstream's whole-workspace index for
-// now, and Phase 2 adds the writer without needing another schema version.
-const RUST_USAGE_FACTS_SQL: &str = include_str!("../migrations/cache/0017-rust-usage-facts.sql");
-const RUST_MODULE_ROUTES_SQL: &str =
-    include_str!("../migrations/cache/0018-rust-module-routes.sql");
+const CURRENT_BASELINE_SQL: &str = include_str!("../migrations/cache/0018-current-baseline.sql");
 const IMPORT_BINDINGS_SQL: &str = include_str!("../migrations/cache/0019-import-bindings.sql");
 const RUST_INCLUDE_EDGES_SQL: &str =
     include_str!("../migrations/cache/0020-rust-include-edges.sql");
@@ -73,93 +41,80 @@ const RUST_IMPORT_CFG_AND_EXTERN_CRATE_SQL: &str =
     include_str!("../migrations/cache/0021-rust-import-cfg-and-extern-crate.sql");
 const DROP_BM25_LEXICAL_COLUMNS_SQL: &str =
     include_str!("../migrations/cache/0022-drop-bm25-lexical-columns.sql");
-const CACHE_MIGRATION_SQL: [&str; CURRENT_MIGRATION_VERSION as usize] = [
-    CURRENT_BASELINE_SQL,
-    PATH_SYMBOL_UNITS_SQL,
-    FORWARD_FACTS_SQL,
-    ANALYZER_GENERATIONS_SQL,
-    ANALYZER_BLOB_CASCADE_COSTS_SQL,
-    ANALYZER_BLOB_PAYLOAD_COSTS_SQL,
-    STRUCTURAL_FACTS_SNAPSHOTS_SQL,
-    CPP_TEMPLATE_METADATA_SQL,
-    SCALA_EXPORTS_SQL,
-    IDENTIFIER_LOOKUP_MEMBERSHIP_SQL,
-    CODE_UNIT_TEST_REGION_SQL,
-    FQ_SEGMENTS_SQL,
-    SEMANTIC_MODEL_ACTIVE_SET_SQL,
-    SEMANTIC_FILE_DOCUMENTS_SQL,
-    MATERIALIZATION_RECORDS_SQL,
-    OPTIONAL_FACT_MANIFEST_SQL,
-    RUST_USAGE_FACTS_SQL,
-    RUST_MODULE_ROUTES_SQL,
-    IMPORT_BINDINGS_SQL,
-    RUST_INCLUDE_EDGES_SQL,
-    RUST_IMPORT_CFG_AND_EXTERN_CRATE_SQL,
-    DROP_BM25_LEXICAL_COLUMNS_SQL,
+/// One migration and the schema version a store holds once it has run.
+///
+/// The version is carried explicitly rather than inferred from the entry's
+/// position. Position and version stopped agreeing when migrations 1..18 were
+/// folded into one baseline script: the list has five entries and the newest
+/// version is 22. Inferring the version from an index is what let a merge
+/// renumber a shipped schema silently once already (see
+/// [`RECOGNIZED_FOREIGN_STORES`]), so the number a store will carry is now
+/// written down beside the SQL that gives it that schema.
+#[derive(Clone, Copy)]
+struct CacheMigration {
+    version: i64,
+    sql: &'static str,
+}
+
+const CACHE_MIGRATIONS: [CacheMigration; 5] = [
+    CacheMigration {
+        version: 18,
+        sql: CURRENT_BASELINE_SQL,
+    },
+    CacheMigration {
+        version: 19,
+        sql: IMPORT_BINDINGS_SQL,
+    },
+    CacheMigration {
+        version: 20,
+        sql: RUST_INCLUDE_EDGES_SQL,
+    },
+    CacheMigration {
+        version: 21,
+        sql: RUST_IMPORT_CFG_AND_EXTERN_CRATE_SQL,
+    },
+    CacheMigration {
+        version: 22,
+        sql: DROP_BM25_LEXICAL_COLUMNS_SQL,
+    },
 ];
-// The store file is named for the schema version that wrote it, and that
-// version is the migration count. Tie the two at compile time so a migration
-// added without touching `CURRENT_MIGRATION_VERSION` cannot ship a file name
-// that lies about its schema.
-const _: () = assert!(CACHE_MIGRATION_SQL.len() == CURRENT_MIGRATION_VERSION as usize);
+
+// The store file is named for the schema version that wrote it, so the list
+// above and the two version constants must agree or a build ships a file name
+// that lies about its schema. The invariant is no longer "one entry per
+// version" -- the baseline stands for eighteen of them -- so assert what is
+// actually true: the first entry produces the baseline version, the last
+// produces the current one, and the versions strictly increase in between.
+const _: () = assert!(CACHE_MIGRATIONS[0].version == BASELINE_MIGRATION_VERSION);
+const _: () =
+    assert!(CACHE_MIGRATIONS[CACHE_MIGRATIONS.len() - 1].version == CURRENT_MIGRATION_VERSION);
+const _: () = {
+    let mut index = 1;
+    while index < CACHE_MIGRATIONS.len() {
+        assert!(CACHE_MIGRATIONS[index - 1].version < CACHE_MIGRATIONS[index].version);
+        index += 1;
+    }
+};
+
 static CACHE_DB_FILE_NAME: Lazy<String> =
     Lazy::new(|| cache_db_file_name_for_version(CURRENT_MIGRATION_VERSION));
-#[cfg(test)]
-static CACHE_MIGRATIONS: Lazy<Migrations<'static>> =
-    Lazy::new(|| Migrations::new(CACHE_MIGRATION_SQL.into_iter().map(M::up).collect()));
 static BASELINE_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
     let conn = Connection::open_in_memory().expect("open baseline schema connection");
     conn.execute_batch(CURRENT_BASELINE_SQL)
         .expect("create baseline schema");
     schema_object_definitions(&conn).expect("read baseline schema definitions")
 });
-#[cfg(test)]
+/// The schema every migration in [`CACHE_MIGRATIONS`] produces in order.
+///
+/// This is what a store must look like to be this build's, whether it was
+/// created here or carried forward from an older one
+/// ([`verify_upgraded_store`]).
 static CURRENT_SCHEMA_OBJECTS: Lazy<Vec<(String, String, String)>> = Lazy::new(|| {
     let conn = Connection::open_in_memory().expect("open current schema connection");
-    conn.execute_batch(CURRENT_BASELINE_SQL)
-        .expect("create baseline schema");
-    conn.execute_batch(PATH_SYMBOL_UNITS_SQL)
-        .expect("apply path symbol migration");
-    conn.execute_batch(FORWARD_FACTS_SQL)
-        .expect("apply forward facts migration");
-    conn.execute_batch(ANALYZER_GENERATIONS_SQL)
-        .expect("apply analyzer generations migration");
-    conn.execute_batch(ANALYZER_BLOB_CASCADE_COSTS_SQL)
-        .expect("apply analyzer blob cascade costs migration");
-    conn.execute_batch(ANALYZER_BLOB_PAYLOAD_COSTS_SQL)
-        .expect("apply analyzer blob payload costs migration");
-    conn.execute_batch(STRUCTURAL_FACTS_SNAPSHOTS_SQL)
-        .expect("apply structural facts snapshots migration");
-    conn.execute_batch(CPP_TEMPLATE_METADATA_SQL)
-        .expect("apply C++ template metadata migration");
-    conn.execute_batch(SCALA_EXPORTS_SQL)
-        .expect("apply Scala exports migration");
-    conn.execute_batch(IDENTIFIER_LOOKUP_MEMBERSHIP_SQL)
-        .expect("apply identifier lookup membership migration");
-    conn.execute_batch(CODE_UNIT_TEST_REGION_SQL)
-        .expect("apply code unit test region migration");
-    conn.execute_batch(FQ_SEGMENTS_SQL)
-        .expect("apply fq segments migration");
-    conn.execute_batch(SEMANTIC_MODEL_ACTIVE_SET_SQL)
-        .expect("apply semantic model active set migration");
-    conn.execute_batch(SEMANTIC_FILE_DOCUMENTS_SQL)
-        .expect("apply semantic file documents migration");
-    conn.execute_batch(MATERIALIZATION_RECORDS_SQL)
-        .expect("apply materialization records migration");
-    conn.execute_batch(OPTIONAL_FACT_MANIFEST_SQL)
-        .expect("apply optional fact manifest migration");
-    conn.execute_batch(RUST_USAGE_FACTS_SQL)
-        .expect("apply Rust usage facts migration");
-    conn.execute_batch(RUST_MODULE_ROUTES_SQL)
-        .expect("apply Rust module routes migration");
-    conn.execute_batch(IMPORT_BINDINGS_SQL)
-        .expect("apply import bindings migration");
-    conn.execute_batch(RUST_INCLUDE_EDGES_SQL)
-        .expect("apply Rust include edges migration");
-    conn.execute_batch(RUST_IMPORT_CFG_AND_EXTERN_CRATE_SQL)
-        .expect("apply Rust import cfg and extern-crate migration");
-    conn.execute_batch(DROP_BM25_LEXICAL_COLUMNS_SQL)
-        .expect("apply BM25 lexical column drop migration");
+    for migration in &CACHE_MIGRATIONS {
+        conn.execute_batch(migration.sql)
+            .unwrap_or_else(|err| panic!("apply cache migration {}: {err}", migration.version));
+    }
     schema_object_definitions(&conn).expect("read current schema definitions")
 });
 pub const SQLITE_MIN_VERSION: (u32, u32, u32) = (3, 43, 0);
@@ -414,7 +369,13 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
         )
     })?;
     let startup_cleanup = disused_version_stores_on_startup(&db_path);
-    import_newest_older_store(&db_path)?;
+    // An older store is optional input. When it cannot be carried forward the
+    // operator needs to know -- a cold start on an indexed corpus is hours of
+    // re-embedding -- but a neighbouring file this build cannot read must not
+    // be what stops the workspace from opening at all.
+    if let Err(error) = import_newest_older_store(&db_path) {
+        eprintln!("Bifrost cache upgrade skipped, starting a fresh store: {error}");
+    }
     let mut conn = Connection::open_with_flags(
         &db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -647,10 +608,17 @@ fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
 ///
 /// Version-keyed naming means an upgrade lands on a file that does not exist,
 /// which would otherwise mean a cold start for a corpus that is already
-/// extracted. Copy the newest store this build can migrate forward instead and
-/// let [`migrate`] carry the copy the rest of the way. The source is only ever
-/// read: an older checkout keeps opening it, and the existence of a newer file
-/// says nothing about whether the older one is still live (issue #1589).
+/// extracted -- for a semantically indexed corpus, hours of GPU embedding for
+/// vectors that are already on disk and still valid. Copy the newest store this
+/// build can migrate forward instead, carry the copy the rest of the way with
+/// the ordinary migration machinery, and publish it only once it has arrived.
+///
+/// The source is only ever read. An older checkout keeps opening it, the
+/// existence of a newer file says nothing about whether the older one is still
+/// live (issue #1589), and the version sweeper reclaims it once it has gone
+/// [`VERSION_STORE_GRACE_SECS`] unused. Renaming instead of copying would save
+/// a transient doubling of one store's bytes and cost exactly the guarantee
+/// #1589 was filed to establish.
 ///
 /// The copy goes through SQLite's backup API rather than the filesystem
 /// because a live source holds committed pages in its `-wal` sidecar; copying
@@ -659,6 +627,9 @@ fn import_newest_older_store(db_path: &Path) -> Result<()> {
     if db_path.file_name() != Some(std::ffi::OsStr::new(cache_db_file_name())) {
         return Ok(());
     }
+    // A store this build owns already exists. It wins unconditionally: a
+    // downgrade-then-upgrade session must never let an older store overwrite
+    // the newer data written since.
     if db_path.exists() {
         return Ok(());
     }
@@ -668,39 +639,238 @@ fn import_newest_older_store(db_path: &Path) -> Result<()> {
     let Some(source) = newest_importable_store(cache_dir)? else {
         return Ok(());
     };
-    let source_conn = Connection::open_with_flags(
-        &source,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(|err| {
-        format!(
-            "cache DB import SQLite error reading {}: {err}",
-            source.display()
-        )
-    })?;
-    let staged = tempfile::Builder::new()
-        .prefix(".bifrost-cache-import")
-        .tempfile_in(cache_dir)
-        .map_err(|err| format!("failed to stage cache DB import: {err}"))?;
-    source_conn
-        .backup(rusqlite::DatabaseName::Main, staged.path(), None)
-        .map_err(|err| {
-            format!(
-                "cache DB import SQLite error copying {}: {err}",
-                source.display()
-            )
-        })?;
-    match staged.persist_noclobber(db_path) {
-        Ok(_) => Ok(()),
-        // Another process published its own import first. It drew from the same
-        // candidate set, so ours has nothing to add.
+    let upgraded = stage_upgraded_store(cache_dir, &source)?;
+    match upgraded.persist_noclobber(db_path) {
+        Ok(()) => {
+            eprintln!(
+                "Bifrost cache upgraded {} to schema version {} as {}",
+                source.display(),
+                CURRENT_MIGRATION_VERSION,
+                db_path.display()
+            );
+            Ok(())
+        }
+        // Another process published its own upgrade first. It drew from the
+        // same candidate set, so ours has nothing to add.
         Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(err) => Err(format!(
-            "failed to atomically publish imported cache DB {}: {}",
+            "failed to atomically publish upgraded cache DB {}: {}",
             db_path.display(),
             err.error
         )),
     }
+}
+
+/// Copy `source` aside, migrate the copy to this build's schema, and prove the
+/// result before anyone can see it.
+///
+/// Publishing first and migrating afterwards is what made a failed upgrade
+/// unrecoverable: the half-migrated copy already carried this build's file
+/// name, so every later open found the file present, skipped the upgrade, and
+/// failed the same migration again. Nothing here is visible under that name
+/// until the migration has run, the schema matches this build's exactly, and
+/// `quick_check` passes; a failure drops the staged path and leaves the source
+/// untouched.
+fn stage_upgraded_store(cache_dir: &Path, source: &Path) -> Result<tempfile::TempPath> {
+    let staged = tempfile::Builder::new()
+        .prefix(".bifrost-cache-import")
+        .tempfile_in(cache_dir)
+        .map_err(|err| format!("failed to stage cache DB upgrade: {err}"))?
+        // Release the handle. SQLite owns the path from here; the guard only
+        // keeps the deletion-on-drop that makes a failed upgrade leave nothing.
+        .into_temp_path();
+    {
+        let source_conn = Connection::open_with_flags(
+            source,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|err| {
+            format!(
+                "cache DB upgrade SQLite error reading {}: {err}",
+                source.display()
+            )
+        })?;
+        source_conn
+            .backup(rusqlite::DatabaseName::Main, &staged, None)
+            .map_err(|err| {
+                format!(
+                    "cache DB upgrade SQLite error copying {}: {err}",
+                    source.display()
+                )
+            })?;
+    }
+    let mut conn = Connection::open_with_flags(
+        &staged,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
+    install_busy_timeout(&conn)?;
+    refuse_store_below_baseline(&conn, source)?;
+    adopt_store_schema_version(&mut conn, source)?;
+    migrate(&mut conn)?;
+    verify_upgraded_store(&conn, source)?;
+    drop(conn);
+    Ok(staged)
+}
+
+/// The upgraded copy must be indistinguishable from a store this build wrote.
+///
+/// A migration that merely does not raise is not proof. Version numbers are
+/// per-lineage counters (see [`RECOGNIZED_FOREIGN_STORES`]), so a store can
+/// declare a version whose migrations happen to apply without producing this
+/// build's schema. Compare the whole schema, then let SQLite check the pages.
+fn verify_upgraded_store(conn: &Connection, source: &Path) -> Result<()> {
+    let version = cache_migration_version(conn)?;
+    if version != CURRENT_MIGRATION_VERSION {
+        return Err(format!(
+            "cache DB upgrade of {} reached schema version {version}, not {CURRENT_MIGRATION_VERSION}",
+            source.display()
+        ));
+    }
+    let objects = schema_object_definitions(conn)?;
+    if objects != *CURRENT_SCHEMA_OBJECTS {
+        let migrated: HashSet<&str> = objects.iter().map(|(_, name, _)| name.as_str()).collect();
+        let expected: HashSet<&str> = CURRENT_SCHEMA_OBJECTS
+            .iter()
+            .map(|(_, name, _)| name.as_str())
+            .collect();
+        return Err(format!(
+            "cache DB upgrade of {} did not reproduce this build's schema; \
+             objects only in the upgrade: {:?}; objects only in this build: {:?}",
+            source.display(),
+            migrated.difference(&expected).collect::<Vec<_>>(),
+            expected.difference(&migrated).collect::<Vec<_>>(),
+        ));
+    }
+    if !quick_check_is_ok(conn)? {
+        return Err(format!(
+            "cache DB upgrade of {} failed quick_check",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+/// A store older than the baseline cannot be carried forward.
+///
+/// The migrations that produced those versions were folded into the baseline
+/// script, which creates a schema rather than upgrading one into place. Left
+/// to run, [`migrate`] would find the store's schema unrecognizable, rebuild
+/// it empty, and publish that as the upgrade -- a cold start wearing the
+/// carried-forward store's name. Say so and decline instead. `migrate` keeps
+/// its own behaviour for a store already under this build's name, where
+/// rebuilding a damaged file is the only way to open the workspace at all.
+fn refuse_store_below_baseline(conn: &Connection, source: &Path) -> Result<()> {
+    let version = cache_migration_version(conn)?;
+    if version > 0 && version < BASELINE_MIGRATION_VERSION {
+        return Err(format!(
+            "cache DB {} is at schema version {version}, which predates this build's baseline \
+             {BASELINE_MIGRATION_VERSION}; the migrations that produced it are no longer shipped, \
+             so it cannot be carried forward",
+            source.display(),
+        ));
+    }
+    Ok(())
+}
+
+/// A schema this build recognizes but cannot name with its own version number.
+///
+/// A cache store's `user_version` is a count of the migrations its build had,
+/// not an identity for the schema they produced. Two branches that both add
+/// migrations mint the same numbers for different schemas, and merging them
+/// renumbers one side. That is not hypothetical: `bifrost-nlp-ft` shipped
+/// `import-bindings` as its migration 18, then merged master, which inserted
+/// `0016-optional-fact-manifest` beneath three migrations the branch had
+/// already shipped and pushed `import-bindings` to 19. Stores written by that
+/// branch -- among them the CodeScaleBench r26 evaluation caches, 5.5 million
+/// embedded chunks -- declare version 18 while holding this build's version 19
+/// schema minus migration 16. Running this build's 19 over one of them fails on
+/// `DROP TABLE import_details`, a table that store never had.
+///
+/// Recognition is by a discriminating predicate rather than a stored schema
+/// snapshot: the snapshot would be a second copy of the schema to keep true,
+/// and the squash of 0001..0018 into one baseline removed the ability to
+/// synthesize the shape from the chain in any case.
+struct RecognizedForeignStore {
+    /// What the store's `user_version` claims.
+    declared_version: i64,
+    /// True for exactly this lineage's stores at [`Self::declared_version`].
+    recognize: fn(&Connection) -> Result<bool>,
+    /// Brings the store to [`Self::equivalent_version`] of this build's chain.
+    bridge_sql: &'static str,
+    /// The version of this build's chain the bridged store then holds.
+    equivalent_version: i64,
+    /// Named in the log line so an operator can tell which rule fired.
+    lineage: &'static str,
+}
+
+/// The bridge is `0016-optional-fact-manifest.sql` with the one column that
+/// migration 19 had already dropped removed from its `blob_meta` rebuild. It
+/// cannot be shared with migration 16 itself, which still runs before 19 for
+/// every store in this build's own lineage.
+const OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL: &str =
+    include_str!("../migrations/cache/bridges/0016-optional-fact-manifest-after-19.sql");
+
+const RECOGNIZED_FOREIGN_STORES: [RecognizedForeignStore; 1] = [RecognizedForeignStore {
+    declared_version: 18,
+    recognize: is_nlp_ft_import_bindings_store,
+    bridge_sql: OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL,
+    equivalent_version: 19,
+    lineage: "bifrost-nlp-ft import-bindings-at-18",
+}];
+
+/// The `bifrost-nlp-ft` version 18 store: migration 19's `import_statements`
+/// is present, and migration 16's manifest table is not.
+///
+/// Both halves are needed. The first alone also matches this build's version 19
+/// and later; the second alone also matches this build's version 15 and
+/// earlier. Together they describe a schema no version of this build's own
+/// chain ever produced.
+fn is_nlp_ft_import_bindings_store(conn: &Connection) -> Result<bool> {
+    Ok(column_exists(conn, "import_statements", "is_wildcard")?
+        && !table_exists(conn, "blob_optional_fact_manifest")?)
+}
+
+/// Give the staged copy a version number that means what this build's
+/// migrations expect it to mean.
+///
+/// The ordinary case needs nothing: a store from this build's own lineage
+/// declares a version this build's chain also produced, so its pending
+/// migrations are exactly the ones after it. Only a recognized foreign lineage
+/// is rewritten, and only onto the version of this chain whose schema it then
+/// holds. An unrecognized shape is left alone deliberately: the migrations run
+/// against it, and [`verify_upgraded_store`] rejects the result if they did not
+/// produce this build's schema.
+fn adopt_store_schema_version(conn: &mut Connection, source: &Path) -> Result<()> {
+    let declared_version = cache_migration_version(conn)?;
+    for foreign in &RECOGNIZED_FOREIGN_STORES {
+        if declared_version != foreign.declared_version || !(foreign.recognize)(conn)? {
+            continue;
+        }
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
+        tx.execute_batch(foreign.bridge_sql).map_err(|err| {
+            format!(
+                "cache DB upgrade error bridging {} from the {} lineage: {err}",
+                source.display(),
+                foreign.lineage
+            )
+        })?;
+        tx.pragma_update(None, "user_version", foreign.equivalent_version)
+            .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
+        tx.commit()
+            .map_err(|err| format!("cache DB upgrade SQLite error: {err}"))?;
+        eprintln!(
+            "Bifrost cache upgrade: {} declares schema version {declared_version} from the {} \
+             lineage, which is this build's version {}; bridged and continuing",
+            source.display(),
+            foreign.lineage,
+            foreign.equivalent_version,
+        );
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// The newest store in `cache_dir` this build can migrate forward.
@@ -1212,10 +1382,10 @@ fn reject_symlink(path: &Path, label: &str) -> Result<()> {
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
     assert_sqlite_version(conn)?;
-    migrate_with_sql(conn, &CACHE_MIGRATION_SQL)
+    migrate_with_sql(conn, &CACHE_MIGRATIONS)
 }
 
-fn migrate_with_sql(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
+fn migrate_with_sql(conn: &mut Connection, migrations: &[CacheMigration]) -> Result<()> {
     let user_version = cache_migration_version(conn)?;
     if current_schema_fast_path(migrations, user_version) {
         return Ok(());
@@ -1259,7 +1429,7 @@ enum BaselinePreparation {
 
 fn migrate_with_sql_locked(
     conn: &mut Connection,
-    migrations: &[&str],
+    migrations: &[CacheMigration],
     rebuild_invalid_schema: bool,
 ) -> Result<LockedMigrationOutcome> {
     let tx = conn
@@ -1271,18 +1441,21 @@ fn migrate_with_sql_locked(
             "cache DB migration user_version must not be negative: {user_version}"
         ));
     }
-    if user_version as usize > migrations.len() {
+    let newest_version = migrations
+        .last()
+        .expect("the migration list is never empty")
+        .version;
+    if user_version > newest_version {
         // Version skew no longer reaches here: a build opens only the store
         // named for its own schema, and imports from an older one instead of
         // migrating it (issue #1589). A file whose name claims this schema and
         // whose user_version claims a later one is corrupt, so say what to do
         // with it rather than leaving the workspace unopenable.
         return Err(format!(
-            "cache DB migration error: DatabaseTooFarAhead: user_version {user_version} exceeds {} in {}. \
+            "cache DB migration error: DatabaseTooFarAhead: user_version {user_version} exceeds {newest_version} in {}. \
              Each schema version has its own store file, so this file's contents contradict its name; \
              moving it aside is safe and this build will import the newest compatible older store or \
              start a fresh one.",
-            migrations.len(),
             tx.path().unwrap_or("<in-memory>"),
         ));
     }
@@ -1300,9 +1473,12 @@ fn migrate_with_sql_locked(
         }
     };
     let mut migration_applied = false;
-    for (index, sql) in migrations.iter().enumerate().skip(user_version as usize) {
-        let version = index + 1;
-        tx.execute_batch(sql)
+    for migration in migrations
+        .iter()
+        .filter(|migration| migration.version > user_version)
+    {
+        let version = migration.version;
+        tx.execute_batch(migration.sql)
             .map_err(|err| format!("cache DB migration error applying version {version}: {err}"))?;
         tx.pragma_update(None, "user_version", version)
             .map_err(|err| format!("cache DB migration error setting version {version}: {err}"))?;
@@ -1381,7 +1557,6 @@ fn recreate_schema(tx: &Transaction<'_>) -> Result<()> {
         .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-#[cfg(test)]
 fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -1391,7 +1566,6 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     .map_err(|err| format!("cache DB SQLite error: {err}"))
 }
 
-#[cfg(test)]
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     conn.query_row(
         "SELECT EXISTS(
@@ -1514,8 +1688,18 @@ fn current_schema_is_valid(conn: &Connection) -> Result<bool> {
     Ok(matches!(versions, Ok(versions) if versions == BASELINE_CACHE_STATE_VERSIONS))
 }
 
-fn current_schema_fast_path(migrations: &[&str], user_version: i64) -> bool {
-    migrations == CACHE_MIGRATION_SQL.as_slice() && user_version == CURRENT_MIGRATION_VERSION
+/// Nothing is pending, so skip taking the write lock.
+///
+/// Identity of the list is deliberately not part of this test. A `const` is
+/// inlined at each use, so two mentions of `CACHE_MIGRATIONS` need not share an
+/// address, and a pointer comparison would quietly never hold -- costing every
+/// open a write lock it does not need. What matters is the question actually
+/// being asked: is the store already at the newest version these migrations
+/// produce.
+fn current_schema_fast_path(migrations: &[CacheMigration], user_version: i64) -> bool {
+    migrations
+        .last()
+        .is_some_and(|migration| migration.version == user_version)
 }
 
 fn quick_check_is_ok(conn: &Connection) -> Result<bool> {
@@ -1580,8 +1764,6 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use rusqlite_migration::{M, Migrations};
-
     use super::*;
 
     fn open_in_memory_cache() -> Connection {
@@ -1598,10 +1780,15 @@ mod tests {
         conn
     }
 
-    fn future_migration_sql(sql: &'static str) -> Vec<&'static str> {
-        CACHE_MIGRATION_SQL
+    /// This build's migrations plus one more, standing for the next schema
+    /// version a future build will add.
+    fn future_migration_sql(sql: &'static str) -> Vec<CacheMigration> {
+        CACHE_MIGRATIONS
             .into_iter()
-            .chain(std::iter::once(sql))
+            .chain(std::iter::once(CacheMigration {
+                version: CURRENT_MIGRATION_VERSION + 1,
+                sql,
+            }))
             .collect()
     }
 
@@ -1682,11 +1869,6 @@ mod tests {
                 && error.contains("elevated filesystem permissions"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn baseline_migration_validates() {
-        CACHE_MIGRATIONS.validate().unwrap();
     }
 
     #[test]
@@ -1968,288 +2150,6 @@ mod tests {
     }
 
     #[test]
-    fn current_pre_migration_cache_rebuilds_semantic_rows_and_invalidates_analyzer_rows() {
-        let mut conn = create_current_baseline_without_migration();
-        conn.execute(
-            "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
-            ["1111111111111111111111111111111111111111"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
-            ["2222222222222222222222222222222222222222"],
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        let semantic_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM semantic_files", [], |row| row.get(0))
-            .unwrap();
-        let analyzer_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        assert_eq!(semantic_count, 0);
-        assert_eq!(analyzer_count, 0);
-    }
-
-    #[test]
-    fn analyzer_migrations_preserve_populated_v3_rows_with_lazy_payload_costs() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        Migrations::new(vec![
-            M::up(CURRENT_BASELINE_SQL),
-            M::up(PATH_SYMBOL_UNITS_SQL),
-            M::up(FORWARD_FACTS_SQL),
-        ])
-        .to_latest(&mut conn)
-        .unwrap();
-        let semantic_oid = "1111111111111111111111111111111111111111";
-        let analyzer_oid = "2222222222222222222222222222222222222222";
-        conn.execute(
-            "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
-            [semantic_oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
-            [analyzer_oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO type_identifiers(blob_oid, lang, type_identifier)
-             VALUES(?1, 'rust', 'PersistedType')",
-            [analyzer_oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blob_meta(
-               blob_oid, lang, contains_tests, content_package, stored_unit_count,
-               range_count, signature_count, signature_metadata_count, supertype_count,
-               child_count, import_statement_count, import_count, type_identifier_count,
-               ruby_dispatch_count, scala_trait_count, is_complete
-             ) VALUES(?1, 'rust', 0, '', 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1)",
-            [analyzer_oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO path_symbol_units(
-               lang, rel_path, blob_oid, kind, package_name, short_name,
-               exact_fqn, normalized_fqn
-             ) VALUES('rust', 'src/lib.rs', ?1, 0, 'src', 'lib', 'src.lib', 'src.lib')",
-            [analyzer_oid],
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        assert_eq!(
-            conn.query_row("SELECT generation FROM blobs", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM blob_payload_costs", [], |row| row
-                .get::<_, i64>(0),)
-                .unwrap(),
-            0,
-            "the migration must preserve populated analyzer rows for lazy fallback"
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('blobs')
-                 WHERE name IN ('cascade_logical_rows', 'cascade_payload_bytes')",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            2,
-            "the published v5 columns must remain present after additive v6 migration"
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM blob_meta", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM type_identifiers", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            conn.query_row("SELECT generation FROM path_symbol_units", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM semantic_files", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-            0
-        );
-        assert!(current_schema_is_valid(&conn).unwrap());
-    }
-
-    #[test]
-    fn populated_v5_cache_migrates_additively_to_v7() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        Migrations::new(vec![
-            M::up(CURRENT_BASELINE_SQL),
-            M::up(PATH_SYMBOL_UNITS_SQL),
-            M::up(FORWARD_FACTS_SQL),
-            M::up(ANALYZER_GENERATIONS_SQL),
-            M::up(ANALYZER_BLOB_CASCADE_COSTS_SQL),
-        ])
-        .to_latest(&mut conn)
-        .unwrap();
-        let analyzer_oid = "2222222222222222222222222222222222222222";
-        conn.execute(
-            "INSERT INTO blobs(
-               blob_oid, lang, generation, cascade_logical_rows, cascade_payload_bytes
-             ) VALUES(?1, 'rust', 7, 3, 11)",
-            [analyzer_oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blob_meta(
-               blob_oid, lang, contains_tests, content_package, stored_unit_count,
-               range_count, signature_count, signature_metadata_count, supertype_count,
-               child_count, import_statement_count, import_count, type_identifier_count,
-               ruby_dispatch_count, scala_trait_count, is_complete
-             ) VALUES(?1, 'rust', 0, 'unicode_é', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)",
-            [analyzer_oid],
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT generation, cascade_logical_rows, cascade_payload_bytes FROM blobs",
-                [],
-                |row| Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?
-                )),
-            )
-            .unwrap(),
-            (7, 3, 11),
-            "later additive migrations must not reinterpret already-applied v5 state"
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM blob_payload_costs", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-            0,
-            "existing parsed blobs intentionally retain the v6 legacy-fallback state"
-        );
-        assert_eq!(
-            conn.query_row("SELECT content_package FROM blob_meta", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .unwrap(),
-            "unicode_é"
-        );
-        assert!(current_schema_is_valid(&conn).unwrap());
-    }
-
-    #[test]
-    fn populated_v10_cache_migrates_additively_to_code_unit_test_region() {
-        // A code_units row written before migration 0011 must survive the
-        // additive `in_test_region` column, which defaults to 0 (untainted).
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        Migrations::new(vec![
-            M::up(CURRENT_BASELINE_SQL),
-            M::up(PATH_SYMBOL_UNITS_SQL),
-            M::up(FORWARD_FACTS_SQL),
-            M::up(ANALYZER_GENERATIONS_SQL),
-            M::up(ANALYZER_BLOB_CASCADE_COSTS_SQL),
-            M::up(ANALYZER_BLOB_PAYLOAD_COSTS_SQL),
-            M::up(STRUCTURAL_FACTS_SNAPSHOTS_SQL),
-            M::up(CPP_TEMPLATE_METADATA_SQL),
-            M::up(SCALA_EXPORTS_SQL),
-            M::up(IDENTIFIER_LOOKUP_MEMBERSHIP_SQL),
-        ])
-        .to_latest(&mut conn)
-        .unwrap();
-        let oid = "3333333333333333333333333333333333333333";
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'rust', 11)",
-            [oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO code_units(
-               blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
-               synthetic, is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup
-             ) VALUES(?1, 'rust', 0, 1, 'make_widget', 'make_widget', '', 0, 0, 0, 1, 0)",
-            [oid],
-        )
-        .unwrap();
-
-        // The column does not exist before migration 0011.
-        let before: bool = conn
-            .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM pragma_table_info('code_units')
-                   WHERE name = 'in_test_region'
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!before, "in_test_region should not exist before 0011");
-
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT short_name, in_test_region FROM code_units",
-                [],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .unwrap(),
-            ("make_widget".to_string(), 0),
-            "pre-existing units default to untainted after the additive column"
-        );
-        assert!(current_schema_is_valid(&conn).unwrap());
-    }
-
-    #[test]
     fn incomplete_pre_migration_cache_is_rebuilt() {
         let mut conn = Connection::open_in_memory().unwrap();
         configure_connection(&mut conn).unwrap();
@@ -2343,406 +2243,15 @@ mod tests {
     #[test]
     fn incomplete_current_cache_is_rebuilt() {
         let mut conn = create_current_baseline_without_migration();
-        conn.execute_batch(
-            "DROP TABLE semantic_vectors;
-             PRAGMA user_version = 1;",
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        assert!(current_schema_is_valid(&conn).unwrap());
-    }
-
-    #[test]
-    fn fq_segments_migration_upgrades_pre_column_database() {
-        // Build a database at the schema version that predates the fq_segments
-        // column (everything through 0011), insert a code_units row the old way
-        // (no fq_segments), then run the full migration and prove the ALTER
-        // lands cleanly and the pre-existing row survives with a NULL segments
-        // blob (which the load path decodes to an empty FqName; the epoch salt
-        // bump forces such rows to re-extract and repopulate real segments).
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        let pre_column = &CACHE_MIGRATION_SQL[..11];
-        migrate_with_sql(&mut conn, pre_column).unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 11);
-        assert!(!column_exists(&conn, "code_units", "fq_segments").unwrap());
-
-        let oid = "2222222222222222222222222222222222222222";
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
-            [oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO code_units(
-               blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
-               signature, synthetic, is_type_alias, top_level_ordinal,
-               in_declarations, in_definition_lookup
-             ) VALUES(?1, 'rust', 1, 2, 'Widget', 'Widget', '', NULL, 0, 0, 0, 1, 0)",
-            [oid],
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        assert!(column_exists(&conn, "code_units", "fq_segments").unwrap());
-        assert!(current_schema_is_valid(&conn).unwrap());
-        let (short_name, fq_segments): (String, Option<Vec<u8>>) = conn
-            .query_row(
-                "SELECT short_name, fq_segments FROM code_units WHERE blob_oid = ?1",
-                [oid],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        conn.execute_batch("DROP TABLE semantic_vectors;").unwrap();
+        conn.pragma_update(None, "user_version", BASELINE_MIGRATION_VERSION)
             .unwrap();
-        assert_eq!(short_name, "Widget");
-        assert_eq!(fq_segments, None);
-    }
-
-    #[test]
-    fn semantic_pack_active_set_migration_preserves_analyzer_rows() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        let before_active_sets = &CACHE_MIGRATION_SQL[..12];
-        migrate_with_sql(&mut conn, before_active_sets).unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 12);
-        let oid = "3333333333333333333333333333333333333333";
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
-            [oid],
-        )
-        .unwrap();
 
         migrate(&mut conn).unwrap();
 
         assert_eq!(
             cache_migration_version(&conn).unwrap(),
             CURRENT_MIGRATION_VERSION
-        );
-        assert!(table_exists(&conn, "semantic_pack_active_state").unwrap());
-        assert!(table_exists(&conn, "semantic_pack_active_members").unwrap());
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1",
-                [oid],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn semantic_file_document_migration_rebuilds_only_semantic_index_rows() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        let before_file_documents = &CACHE_MIGRATION_SQL[..13];
-        migrate_with_sql(&mut conn, before_file_documents).unwrap();
-        let semantic_oid = "1111111111111111111111111111111111111111";
-        let analyzer_oid = "2222222222222222222222222222222222222222";
-        conn.execute(
-            "INSERT INTO semantic_blobs(blob_oid, language) VALUES(?1, 'rust')",
-            [semantic_oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO blobs(blob_oid, lang) VALUES(?1, 'rust')",
-            [analyzer_oid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO semantic_pack_active_state(singleton, active_set_digest, updated_at)
-             VALUES(1, ?1, 1)",
-            ["a".repeat(64)],
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM semantic_files", [], |row| row
-                .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM semantic_pack_active_state",
-                [],
-                |row| { row.get::<_, i64>(0) }
-            )
-            .unwrap(),
-            1
-        );
-        assert!(current_schema_is_valid(&conn).unwrap());
-    }
-
-    #[test]
-    fn optional_fact_manifest_migration_preserves_populated_v15_rows() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        configure_connection(&mut conn).unwrap();
-        let version_15 = &CACHE_MIGRATION_SQL[..15];
-        migrate_with_sql(&mut conn, version_15).unwrap();
-        assert_eq!(cache_migration_version(&conn).unwrap(), 15);
-
-        conn.execute_batch(
-            "INSERT INTO blobs(blob_oid, lang) VALUES
-               ('1111111111111111111111111111111111111111', 'cpp'),
-               ('2222222222222222222222222222222222222222', 'ruby'),
-               ('3333333333333333333333333333333333333333', 'scala'),
-               ('4444444444444444444444444444444444444444', 'rust');
-
-             INSERT INTO code_units(
-               blob_oid, lang, unit_key, kind, short_name, identifier,
-               content_qualifier, synthetic, is_type_alias, top_level_ordinal,
-               in_declarations, in_definition_lookup
-             ) VALUES
-               ('1111111111111111111111111111111111111111', 'cpp', 1, 0,
-                'TemplateOne', 'TemplateOne', '', 0, 0, 0, 1, 0),
-               ('1111111111111111111111111111111111111111', 'cpp', 2, 0,
-                'TemplateTwo', 'TemplateTwo', '', 0, 0, 1, 1, 0),
-               ('2222222222222222222222222222222222222222', 'ruby', 1, 2,
-                'dispatch', 'dispatch', '', 0, 0, 0, 1, 0),
-               ('3333333333333333333333333333333333333333', 'scala', 1, 0,
-                'ExportOwner', 'ExportOwner', '', 0, 0, 0, 1, 0);
-
-             INSERT INTO blob_meta(
-               blob_oid, lang, contains_tests, content_package,
-               stored_unit_count, range_count, signature_count,
-               signature_metadata_count, supertype_count, child_count,
-               import_statement_count, import_count, type_identifier_count,
-               ruby_dispatch_count, scala_trait_count, is_complete,
-               cpp_template_metadata_count
-             ) VALUES
-               ('1111111111111111111111111111111111111111', 'cpp', 0, 'cpp.pkg',
-                2, 11, 12, 13, 14, 15, 16, 17, 18, 0, 0, 1, 3),
-               ('2222222222222222222222222222222222222222', 'ruby', 0, 'ruby.pkg',
-                1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0),
-               ('3333333333333333333333333333333333333333', 'scala', 0, 'scala.pkg',
-                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0),
-               ('4444444444444444444444444444444444444444', 'rust', 0, 'rust.pkg',
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0);
-
-             INSERT INTO unit_cpp_template_metadata(blob_oid, lang, unit_key, metadata) VALUES
-               ('1111111111111111111111111111111111111111', 'cpp', 1, X'01'),
-               ('1111111111111111111111111111111111111111', 'cpp', 2, X'02');
-             INSERT INTO ruby_method_dispatch_modes(blob_oid, lang, unit_key, mode) VALUES
-               ('2222222222222222222222222222222222222222', 'ruby', 1, 2);
-             INSERT INTO scala_traits(blob_oid, lang, unit_key) VALUES
-               ('3333333333333333333333333333333333333333', 'scala', 1);
-             INSERT INTO scala_exports(blob_oid, lang, owner_key, ordinal, info) VALUES
-               ('3333333333333333333333333333333333333333', 'scala', 1, 0, X'03'),
-               ('3333333333333333333333333333333333333333', 'scala', 1, 1, X'04');
-             INSERT INTO materialization_records(blob_oid, lang, ordinal, unit_key, payload) VALUES
-               ('4444444444444444444444444444444444444444', 'rust', 0, NULL, X'05'),
-               ('4444444444444444444444444444444444444444', 'rust', 1, NULL, X'06');
-
-             INSERT INTO blob_payload_costs(blob_oid, lang, payload_bytes) VALUES
-               ('1111111111111111111111111111111111111111', 'cpp', 73);
-             INSERT INTO structural_facts_snapshots(
-               blob_oid, lang, snapshot_version, payload
-             ) VALUES
-               ('1111111111111111111111111111111111111111', 'cpp', 4, X'0708');",
-        )
-        .unwrap();
-
-        migrate(&mut conn).unwrap();
-
-        assert_eq!(
-            cache_migration_version(&conn).unwrap(),
-            CURRENT_MIGRATION_VERSION
-        );
-        let manifest_rows = conn
-            .prepare(
-                "SELECT fact_kind, lang, row_count
-                 FROM blob_optional_fact_manifest
-                 ORDER BY fact_kind",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(
-            manifest_rows,
-            vec![
-                (
-                    OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA,
-                    "cpp".to_string(),
-                    3
-                ),
-                (
-                    OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE,
-                    "ruby".to_string(),
-                    1,
-                ),
-                (OPTIONAL_FACT_KIND_SCALA_TRAIT, "scala".to_string(), 1),
-                (OPTIONAL_FACT_KIND_SCALA_EXPORT, "scala".to_string(), 2),
-                (
-                    OPTIONAL_FACT_KIND_MATERIALIZATION_RECORD,
-                    "rust".to_string(),
-                    2,
-                ),
-            ]
-        );
-        assert!(
-            conn.execute(
-                "INSERT INTO blob_optional_fact_manifest(
-                   blob_oid, lang, fact_kind, row_count
-                 ) VALUES(
-                   '1111111111111111111111111111111111111111', 'cpp', 5, 0
-                 )",
-                [],
-            )
-            .is_err(),
-            "the sparse manifest must not store zero counts"
-        );
-        assert_eq!(
-            conn.query_row(
-                // `import_count` goes with them, dropped by migration 0019:
-                // there is one import table now, so counting it twice would
-                // check one fact twice.
-                "SELECT COUNT(*) FROM pragma_table_info('blob_meta')
-                 WHERE name IN (
-                   'cpp_template_metadata_count',
-                   'ruby_dispatch_count',
-                   'scala_trait_count',
-                   'import_count'
-                 )",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM blob_meta", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-            4
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT GROUP_CONCAT(content_package, ',')
-                 FROM (SELECT content_package FROM blob_meta ORDER BY lang)",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-            "cpp.pkg,ruby.pkg,rust.pkg,scala.pkg"
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT stored_unit_count, range_count, signature_count,
-                        signature_metadata_count, supertype_count, child_count,
-                        import_statement_count, type_identifier_count
-                 FROM blob_meta
-                 WHERE blob_oid = '1111111111111111111111111111111111111111'
-                   AND lang = 'cpp'",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
-                    ))
-                },
-            )
-            .unwrap(),
-            (2, 11, 12, 13, 14, 15, 16, 18)
-        );
-        assert_eq!(
-            conn.query_row("SELECT payload_bytes FROM blob_payload_costs", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-            73
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT snapshot_version, hex(payload) FROM structural_facts_snapshots",
-                [],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-            )
-            .unwrap(),
-            (4, "0708".to_string())
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT
-                   (SELECT COUNT(*) FROM unit_cpp_template_metadata) +
-                   (SELECT COUNT(*) FROM ruby_method_dispatch_modes) +
-                   (SELECT COUNT(*) FROM scala_traits) +
-                   (SELECT COUNT(*) FROM scala_exports) +
-                   (SELECT COUNT(*) FROM materialization_records)",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            8
-        );
-        conn.execute(
-            "INSERT INTO blob_optional_fact_manifest(
-               blob_oid, lang, fact_kind, row_count
-             ) VALUES(
-               '4444444444444444444444444444444444444444', 'rust', 99, 1
-             )",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "DELETE FROM blob_meta
-             WHERE blob_oid = '4444444444444444444444444444444444444444'
-               AND lang = 'rust'",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM blob_optional_fact_manifest WHERE lang = 'rust'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-            0,
-            "manifest rows must follow their parsed metadata lifetime"
-        );
-        assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-            0
         );
         assert!(current_schema_is_valid(&conn).unwrap());
     }
@@ -2811,7 +2320,10 @@ mod tests {
         );
         assert_eq!(cache_migration_version(&conn).unwrap(), 0);
         assert!(table_exists(&conn, "legacy_cache").unwrap());
-        assert!(!table_exists(&conn, "blob_payload_costs").unwrap());
+        assert!(
+            !table_exists(&conn, "rust_include_edges").unwrap(),
+            "a table a rolled-back migration created must be gone with it"
+        );
         assert_eq!(
             conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
@@ -3437,5 +2949,427 @@ mod tests {
 
         let _conn = open_unified_connection(&db_path).unwrap();
         assert!(!temp.path().join(".gitignore").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Carrying an older store forward (issue #1589's upgrade path).
+    //
+    // The expensive thing in a warm cache is the semantic index: a large
+    // corpus is hours of GPU embedding. These tests use semantic rows as the
+    // payload because they are the rows whose loss actually costs something.
+    // -----------------------------------------------------------------------
+
+    /// Zero, one, and many: enough rows to prove a copy rather than a shape.
+    const SEEDED_CHUNKS: [(&str, &str, i64); 3] = [
+        ("a.py", "alpha", 0),
+        ("a.py", "beta", 1),
+        ("nested/b.py", "gamma", 0),
+    ];
+
+    /// A 40-character lowercase-hex OID and a 32-byte vector key, derived from
+    /// `name` so the fixtures stay readable and the CHECK constraints hold.
+    fn seeded_oid(name: &str) -> String {
+        let mut oid: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
+        oid.truncate(40);
+        while oid.len() < 40 {
+            oid.push('0');
+        }
+        oid
+    }
+
+    fn seeded_vector_hash(name: &str) -> Vec<u8> {
+        let mut key = name.as_bytes().to_vec();
+        key.resize(32, 0);
+        key
+    }
+
+    /// Create a store at `path` holding exactly `migrations`, then stamp
+    /// `user_version`.
+    ///
+    /// The stamp is a parameter because a store's version number is a count of
+    /// its own build's migrations, which is not always the count applied here:
+    /// that mismatch is the whole subject of
+    /// [`nlp_ft_lineage_v18_store_is_bridged_and_carried_forward`].
+    fn create_store_at(path: &Path, migrations: &[CacheMigration], user_version: i64) {
+        let mut conn = Connection::open(path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, migrations).unwrap();
+        conn.pragma_update(None, "user_version", user_version)
+            .unwrap();
+        seed_semantic_rows(&conn);
+    }
+
+    fn seed_semantic_rows(conn: &Connection) {
+        // Before migration 22 the chunk row also carried the BM25 tokens, and
+        // the column is NOT NULL. Seeding a pre-22 store means writing it; the
+        // upgrade then drops it, which is exactly what must not disturb the
+        // rest of the row.
+        let with_fts = column_exists(conn, "semantic_file_chunks", "fts_tokens").unwrap();
+        for (rel_path, symbol, chunk_ord) in SEEDED_CHUNKS {
+            let blob_oid = seeded_oid(rel_path);
+            let vector_hash = seeded_vector_hash(symbol);
+            conn.execute(
+                "INSERT OR IGNORE INTO semantic_files(blob_oid, rel_path, language)
+                 VALUES (?1, ?2, 'python')",
+                rusqlite::params![blob_oid, rel_path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO semantic_vectors(vector_hash, dim, vector)
+                 VALUES (?1, 4, ?2)",
+                rusqlite::params![vector_hash, symbol.as_bytes()],
+            )
+            .unwrap();
+            if with_fts {
+                conn.execute(
+                    "INSERT INTO semantic_file_chunks(
+                         blob_oid, rel_path, chunk_ord, symbol, start_line, end_line,
+                         vector_hash, fts_tokens)
+                     VALUES (?1, ?2, ?3, ?4, 1, 9, ?5, ?6)",
+                    rusqlite::params![blob_oid, rel_path, chunk_ord, symbol, vector_hash, symbol],
+                )
+                .unwrap();
+            } else {
+                conn.execute(
+                    "INSERT INTO semantic_file_chunks(
+                         blob_oid, rel_path, chunk_ord, symbol, start_line, end_line, vector_hash)
+                     VALUES (?1, ?2, ?3, ?4, 1, 9, ?5)",
+                    rusqlite::params![blob_oid, rel_path, chunk_ord, symbol, vector_hash],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Every seeded chunk with the vector bytes it points at, in a stable
+    /// order. Equality of this against the pre-upgrade value is the claim that
+    /// no embedding has to be recomputed.
+    fn semantic_rows(conn: &Connection) -> Vec<(String, String, i64, String, Vec<u8>)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT chunks.rel_path, chunks.symbol, chunks.chunk_ord,
+                        files.language, vectors.vector
+                 FROM semantic_file_chunks AS chunks
+                 JOIN semantic_files AS files
+                   ON files.blob_oid = chunks.blob_oid AND files.rel_path = chunks.rel_path
+                 JOIN semantic_vectors AS vectors
+                   ON vectors.vector_hash = chunks.vector_hash
+                 ORDER BY chunks.rel_path, chunks.chunk_ord",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn read_semantic_rows(path: &Path) -> Vec<(String, String, i64, String, Vec<u8>)> {
+        semantic_rows(&Connection::open(path).unwrap())
+    }
+
+    fn store_path(cache_dir: &Path, version: i64) -> PathBuf {
+        cache_dir.join(cache_db_file_name_for_version(version))
+    }
+
+    fn current_store_path(cache_dir: &Path) -> PathBuf {
+        cache_dir.join(cache_db_file_name())
+    }
+
+    fn staged_leftovers(cache_dir: &Path) -> Vec<String> {
+        std::fs::read_dir(cache_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".bifrost-cache-import"))
+            .collect()
+    }
+
+    /// The migrations that bring a store to `version`.
+    fn migrations_through(version: i64) -> Vec<CacheMigration> {
+        CACHE_MIGRATIONS
+            .into_iter()
+            .filter(|migration| migration.version <= version)
+            .collect()
+    }
+
+    /// Undo what migration 16 did, so a fixture can stand where the
+    /// `bifrost-nlp-ft` branch stood when it shipped its version 18.
+    ///
+    /// Migration 16 is inside the baseline now, so it can no longer be left
+    /// out of a chain. Putting back the three counts it moved and dropping the
+    /// table it added reaches the same place. The columns carry no CHECK
+    /// because nothing reads them before the bridge rebuilds the table.
+    const UNDO_OPTIONAL_FACT_MANIFEST_SQL: &str = "\
+        ALTER TABLE blob_meta ADD COLUMN ruby_dispatch_count INTEGER NOT NULL DEFAULT 0;\
+        ALTER TABLE blob_meta ADD COLUMN scala_trait_count INTEGER NOT NULL DEFAULT 0;\
+        ALTER TABLE blob_meta ADD COLUMN cpp_template_metadata_count INTEGER NOT NULL DEFAULT 0;\
+        DROP TABLE blob_optional_fact_manifest;";
+
+    /// A store shaped the way `bifrost-nlp-ft` wrote one at its version 18:
+    /// migration 19 applied, migration 16 not, and the number 18 on the front.
+    fn create_nlp_ft_v18_store(path: &Path) {
+        let mut conn = Connection::open(path).unwrap();
+        configure_connection(&mut conn).unwrap();
+        migrate_with_sql(&mut conn, &migrations_through(18)).unwrap();
+        conn.execute_batch(UNDO_OPTIONAL_FACT_MANIFEST_SQL).unwrap();
+        conn.execute_batch(IMPORT_BINDINGS_SQL).unwrap();
+        conn.pragma_update(None, "user_version", 18).unwrap();
+        seed_semantic_rows(&conn);
+    }
+
+    /// The ordinary upgrade: a store from this build's own lineage, one
+    /// version back, is carried forward with its rows and its source kept.
+    #[test]
+    fn an_older_store_is_carried_forward_with_its_semantic_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let previous = CURRENT_MIGRATION_VERSION - 1;
+        let older = store_path(cache_dir, previous);
+        create_store_at(&older, &migrations_through(previous), previous);
+        let expected = read_semantic_rows(&older);
+        let older_before = std::fs::read(&older).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            semantic_rows(&conn),
+            expected,
+            "every embedded chunk must survive the upgrade unchanged"
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
+        assert_eq!(
+            std::fs::read(&older).unwrap(),
+            older_before,
+            "the source stays readable for the checkouts still on it (issue #1589)"
+        );
+        assert!(staged_leftovers(cache_dir).is_empty());
+    }
+
+    /// A `bifrost-nlp-ft` store declares version 18 while holding this build's
+    /// version 19 schema minus migration 16. Its pending migrations are
+    /// therefore not "19 onwards", and running 19 over it fails on `DROP TABLE
+    /// import_details`.
+    ///
+    /// Fail-before: without [`RECOGNIZED_FOREIGN_STORES`] this test fails with
+    /// that error, the upgrade is abandoned, and the assertions below see an
+    /// empty store beside an ignored 248 MB one.
+    #[test]
+    fn nlp_ft_lineage_v18_store_is_bridged_and_carried_forward() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let foreign = store_path(cache_dir, 18);
+        create_nlp_ft_v18_store(&foreign);
+        let expected = read_semantic_rows(&foreign);
+        assert_eq!(expected.len(), SEEDED_CHUNKS.len());
+        let foreign_before = std::fs::read(&foreign).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            semantic_rows(&conn),
+            expected,
+            "the vectors this upgrade exists to save must arrive byte for byte"
+        );
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS,
+            "a bridged store must be indistinguishable from one this build wrote"
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
+        assert_eq!(std::fs::read(&foreign).unwrap(), foreign_before);
+    }
+
+    /// The recognizer has to be exact: both halves of the predicate matter, so
+    /// this build's own version 18 store must not be mistaken for the foreign
+    /// one and bridged.
+    #[test]
+    fn this_builds_own_v18_store_is_not_mistaken_for_the_foreign_lineage() {
+        let conn = {
+            let mut conn = Connection::open_in_memory().unwrap();
+            configure_connection(&mut conn).unwrap();
+            migrate_with_sql(&mut conn, &migrations_through(18)).unwrap();
+            conn
+        };
+
+        assert!(
+            !is_nlp_ft_import_bindings_store(&conn).unwrap(),
+            "this build's version 18 has migration 16's manifest table"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let foreign_path = temp.path().join("foreign.db");
+        create_nlp_ft_v18_store(&foreign_path);
+        let foreign = Connection::open(&foreign_path).unwrap();
+        assert!(is_nlp_ft_import_bindings_store(&foreign).unwrap());
+    }
+
+    /// A store this build already owns wins over any older one. A session that
+    /// downgraded and came back must not lose the rows written in between.
+    #[test]
+    fn an_existing_current_store_wins_and_the_older_one_is_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let older = store_path(cache_dir, CURRENT_MIGRATION_VERSION - 1);
+        create_store_at(
+            &older,
+            &migrations_through(CURRENT_MIGRATION_VERSION - 1),
+            CURRENT_MIGRATION_VERSION - 1,
+        );
+        let older_before = std::fs::read(&older).unwrap();
+        let current = current_store_path(cache_dir);
+        {
+            let mut conn = Connection::open(&current).unwrap();
+            configure_connection(&mut conn).unwrap();
+            migrate(&mut conn).unwrap();
+            conn.execute(
+                "INSERT INTO semantic_vectors(vector_hash, dim, vector) VALUES (?1, 4, X'01')",
+                [seeded_vector_hash("written after the downgrade")],
+            )
+            .unwrap();
+        }
+
+        let conn = open_unified_connection(&current).unwrap();
+
+        let vectors: i64 = conn
+            .query_row("SELECT count(*) FROM semantic_vectors", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            vectors, 1,
+            "the older store must not overwrite the current one"
+        );
+        assert_eq!(std::fs::read(&older).unwrap(), older_before);
+    }
+
+    /// A source that cannot be carried forward must cost the workspace a cold
+    /// start and nothing else: the open still succeeds, the source is intact,
+    /// and no unusable file is left under this build's name for the next
+    /// process to trip over.
+    #[test]
+    fn an_unusable_older_store_leaves_the_source_intact_and_still_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let poisoned = store_path(cache_dir, CURRENT_MIGRATION_VERSION - 1);
+        {
+            let mut conn = Connection::open(&poisoned).unwrap();
+            configure_connection(&mut conn).unwrap();
+            migrate_with_sql(
+                &mut conn,
+                &migrations_through(CURRENT_MIGRATION_VERSION - 1),
+            )
+            .unwrap();
+            // The column the last migration is about to drop is already gone,
+            // so that migration cannot run and no bridge claims this shape.
+            conn.execute_batch("ALTER TABLE semantic_file_chunks DROP COLUMN fts_tokens;")
+                .unwrap();
+        }
+        let poisoned_before = std::fs::read(&poisoned).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        let vectors: i64 = conn
+            .query_row("SELECT count(*) FROM semantic_vectors", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(vectors, 0, "a failed upgrade starts cold, it does not lie");
+        assert_eq!(
+            std::fs::read(&poisoned).unwrap(),
+            poisoned_before,
+            "a failed upgrade must not touch the source"
+        );
+        assert!(
+            staged_leftovers(cache_dir).is_empty(),
+            "the staged copy must be dropped, not left for the next open to adopt"
+        );
+    }
+
+    /// A store older than the baseline is declined, not silently rebuilt into
+    /// an empty store wearing this build's name.
+    #[test]
+    fn a_store_below_the_baseline_is_declined_and_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let ancient = store_path(cache_dir, BASELINE_MIGRATION_VERSION - 1);
+        create_store_at(&ancient, &CACHE_MIGRATIONS, CURRENT_MIGRATION_VERSION);
+        {
+            let conn = Connection::open(&ancient).unwrap();
+            conn.pragma_update(None, "user_version", BASELINE_MIGRATION_VERSION - 1)
+                .unwrap();
+        }
+        let ancient_before = std::fs::read(&ancient).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        let vectors: i64 = conn
+            .query_row("SELECT count(*) FROM semantic_vectors", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(vectors, 0, "nothing below the baseline may be carried");
+        assert_eq!(std::fs::read(&ancient).unwrap(), ancient_before);
+        assert!(staged_leftovers(cache_dir).is_empty());
+    }
+
+    /// Concurrent openers race for one upgrade. Publication is
+    /// `persist_noclobber`, so the loser discards its own copy and opens the
+    /// winner's; every thread must come back with the carried rows.
+    #[test]
+    fn concurrent_openers_publish_one_upgrade_and_all_serve_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().to_path_buf();
+        let previous = CURRENT_MIGRATION_VERSION - 1;
+        let older = store_path(&cache_dir, previous);
+        create_store_at(&older, &migrations_through(previous), previous);
+        let expected = read_semantic_rows(&older);
+        let older_before = std::fs::read(&older).unwrap();
+
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let cache_dir = cache_dir.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let conn = open_unified_connection(&current_store_path(&cache_dir)).unwrap();
+                    (
+                        cache_migration_version(&conn).unwrap(),
+                        semantic_rows(&conn),
+                    )
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (version, rows) = handle.join().unwrap();
+            assert_eq!(version, CURRENT_MIGRATION_VERSION);
+            assert_eq!(rows, expected, "every racing opener must serve the upgrade");
+        }
+        assert!(
+            quick_check_is_ok(&Connection::open(current_store_path(&cache_dir)).unwrap()).unwrap()
+        );
+        assert_eq!(std::fs::read(&older).unwrap(), older_before);
+        assert!(staged_leftovers(&cache_dir).is_empty());
     }
 }

@@ -1,3 +1,15 @@
+-- Bridge, not a migration. It never runs for a store in this build's own
+-- lineage; `RECOGNIZED_FOREIGN_STORES` in `src/cache_db.rs` applies it to one
+-- recognized foreign shape and nothing else. See that constant for why a
+-- foreign shape exists at all.
+--
+-- This is `0016-optional-fact-manifest.sql` with a single edit: the
+-- `import_count` column is gone from the `blob_meta` rebuild, because the
+-- stores this bridge repairs have already applied `0019-import-bindings.sql`,
+-- which dropped it. Migration 16 itself cannot be changed to match -- it still
+-- runs before 19 for every store in this build's lineage, where the column is
+-- present -- so the two files differ by exactly that column and nothing else.
+--
 -- Keep counts for optional analyzer facts only when a blob has those facts.
 -- Fact-kind values are stable persistence identifiers:
 --   1 = C++ template metadata
@@ -19,7 +31,6 @@ CREATE TABLE blob_meta_new(
   supertype_count            INTEGER NOT NULL CHECK(supertype_count >= 0),
   child_count                INTEGER NOT NULL CHECK(child_count >= 0),
   import_statement_count     INTEGER NOT NULL CHECK(import_statement_count >= 0),
-  import_count               INTEGER NOT NULL CHECK(import_count >= 0),
   type_identifier_count      INTEGER NOT NULL CHECK(type_identifier_count >= 0),
   is_complete                INTEGER NOT NULL CHECK(is_complete IN (0, 1)),
   PRIMARY KEY(blob_oid, lang),
@@ -30,13 +41,13 @@ CREATE TABLE blob_meta_new(
 INSERT INTO blob_meta_new(
   blob_oid, lang, contains_tests, content_package, stored_unit_count,
   range_count, signature_count, signature_metadata_count, supertype_count,
-  child_count, import_statement_count, import_count, type_identifier_count,
+  child_count, import_statement_count, type_identifier_count,
   is_complete
 )
 SELECT
   blob_oid, lang, contains_tests, content_package, stored_unit_count,
   range_count, signature_count, signature_metadata_count, supertype_count,
-  child_count, import_statement_count, import_count, type_identifier_count,
+  child_count, import_statement_count, type_identifier_count,
   is_complete
 FROM blob_meta;
 

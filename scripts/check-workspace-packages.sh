@@ -119,8 +119,11 @@ for package in "${packages[@]}"; do
 done
 
 require_archive_file brokk-bifrost-core src/lib.rs
-# The unified cache DB's migrations moved down with cache_db.rs.
-require_archive_file brokk-bifrost-core migrations/cache/0001-current-baseline.sql
+# The unified cache DB's migrations moved down with cache_db.rs. The baseline
+# is named for the schema version it creates, which is 18: migrations 1..18
+# were folded into it.
+require_archive_file brokk-bifrost-core migrations/cache/0018-current-baseline.sql
+require_archive_file brokk-bifrost-core migrations/cache/bridges/0016-optional-fact-manifest-after-19.sql
 # The C++, C#, Go, Java, PHP, Python, Ruby, Rust and Scala tree-sitter query
 # assets moved down with their language crates; the epoch salt hashes them from
 # there, so a missing file is a silent epoch change. Kotlin's `highlights.scm`
