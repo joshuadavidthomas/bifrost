@@ -364,13 +364,12 @@ name = "brokk-bifrost-jvm"
 version = "0.9.1"
 dependencies = [
  "brokk-bifrost-core",
- "cc",
+ "brokk-tree-sitter-kotlin",
  "regex",
  "serde",
  "serde_json",
  "tree-sitter",
  "tree-sitter-java",
- "tree-sitter-language",
  "tree-sitter-scala",
 ]
 
@@ -548,6 +547,16 @@ dependencies = [
  "tar",
  "tempfile",
  "zip",
+]
+
+[[package]]
+name = "brokk-tree-sitter-kotlin"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "026d0000e970e184e93236c12c2ce899828b3aae6a97f4741858ae4b498611bd"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
 ]
 
 [[package]]

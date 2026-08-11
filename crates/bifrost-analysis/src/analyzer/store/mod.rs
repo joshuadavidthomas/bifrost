@@ -11280,7 +11280,7 @@ mod tests {
     fn scala_empty_lambda_parser_epoch_invalidates_prior_parsed_blobs() {
         // This is the Scala epoch immediately before issue #1068's parser-table
         // change. The change does not add an ABI, node-kind, or field name, so
-        // the manual vendored-parser salt must invalidate old parsed blobs.
+        // the manual parser-release salt must invalidate old parsed blobs.
         const PRE_EMPTY_LAMBDA_EPOCH: &str =
             "68da221d12ed704b76c78dfe72b57f6eca7064aaa95ca39af8bcdcca1c2d1a29";
 

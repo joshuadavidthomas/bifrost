@@ -554,9 +554,9 @@ lang_epoch!(
     "treesitter/ruby/",
     "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07;ruby-query-assets-in-brokk-bifrost-ruby-2026-08"
 );
-// The live grammar fingerprint does not include parser tables. Keep the
-// vendored Kotlin revision in the salt so conflict-resolution-only grammar
-// changes cannot reuse analysis produced by an older parser.
+// The live grammar fingerprint does not include parser tables. Keep the exact
+// Kotlin crate release in the salt so parser-only grammar changes cannot reuse
+// analysis produced by an older parser.
 // Salt bumped (#1345): Kotlin callables now publish their written return type
 // and, for an extension, the receiver type they extend; Kotlin properties now
 // carry `SignatureMetadata` at all. Persisted rows written before this change
@@ -568,8 +568,8 @@ lang_epoch!(
 // own name without re-parsing the declaring file. A companion indexed before
 // this change carries no metadata at all, and a warm workspace would read every
 // companion as an ordinary nested object — losing every `Base.of()` edge.
-// Salt bumped (#1548 stage 3 fleet): Kotlin's `highlights.scm` and the vendored
-// grammar moved from this crate into `brokk-bifrost-jvm`. Unlike Java's and
+// Salt bumped (#1548 stage 3 fleet): Kotlin's `highlights.scm` and grammar
+// binding moved from this crate into `brokk-bifrost-jvm`. Unlike Java's and
 // Scala's, this bump is not forced by the mechanism -- `treesitter/kotlin/`
 // selects no entry in the salted asset set, because Kotlin is
 // declaration-walk-only and neither of its `.scm` files has ever been in
@@ -578,7 +578,7 @@ lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
+    "brokk-tree-sitter-kotlin-0.4.0-2026-08;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
 );
 
 #[cfg(test)]

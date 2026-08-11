@@ -1971,7 +1971,7 @@ object App {
 
 /// Kotlin's normalized shapes (issue #1240).
 ///
-/// Every fixture body is deliberately multi-line: the vendored fwcd grammar
+/// Every fixture body is deliberately multi-line: the Kotlin grammar
 /// synthesizes an `_automatic_semicolon` between statements and reports a
 /// MISSING node when several statements share one line, so a compact
 /// `fun run() { audit() }` would exercise error recovery rather than the
