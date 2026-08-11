@@ -68,6 +68,13 @@ export const RELEASED_CARGO_MANIFESTS = [
   "crates/bifrost-semantic-packs/Cargo.toml",
 ];
 
+export const RELEASE_BUNDLE_SPECS = [
+  "semantic-packs/jvm/temurin-jdk-21.0.8+9.json",
+  "semantic-packs/jvm/kotlin-stdlib-2.2.20.json",
+  "semantic-packs/jvm/scala-library-2.13.16.json",
+  "semantic-packs/python/typeshed-stdlib-2026.8.8.json",
+];
+
 export function syncBifrostDependencyVersions(contents, version) {
   return contents.replace(
     /^(\s*brokk-bifrost-[a-z-]+\s*=\s*\{[^\n]*\bversion\s*=\s*")=[^"]+("[^\n]*\}\s*(?:#.*)?)$/gmu,
@@ -175,6 +182,16 @@ function collectProjectionUpdates(repoRoot, version) {
         syncBifrostDependencyVersions(contents, version),
       ),
     ),
+    ...RELEASE_BUNDLE_SPECS.map((relativePath) =>
+      updateJson(repoRoot, relativePath, (json) => {
+        json.compatibility ??= {};
+        json.compatibility.bifrost = syncCompatibilityRequirement(
+          json.compatibility.bifrost,
+          version,
+          relativePath,
+        );
+      }),
+    ),
     updateJson(repoRoot, "plugins/bifrost-agent/.codex-plugin/plugin.json", (json) => {
       json.version = version;
     }),
@@ -242,6 +259,24 @@ function collectProjectionUpdates(repoRoot, version) {
   ].filter(Boolean);
 
   return { updates, canCopyReleaseChecksums };
+}
+
+function syncCompatibilityRequirement(requirement, version, sourceName) {
+  if (typeof requirement !== "string") {
+    throw new Error(`${sourceName} does not declare compatibility.bifrost.`);
+  }
+  const versionMatch = /^(\d+)\.(\d+)\.(\d+)$/u.exec(version);
+  if (!versionMatch) {
+    throw new Error(`Cargo version is not semantic: ${version}`);
+  }
+  const major = Number(versionMatch[1]);
+  const minor = Number(versionMatch[2]);
+  const upper = major === 0 ? `0.${minor + 1}.0` : `${major + 1}.0.0`;
+  const upperPattern = /,\s*<\d+\.\d+\.\d+$/u;
+  if (!upperPattern.test(requirement)) {
+    throw new Error(`${sourceName} compatibility.bifrost has no exclusive upper bound.`);
+  }
+  return requirement.replace(upperPattern, `, <${upper}`);
 }
 
 function readTomlSection(contents, section, sourceName) {

@@ -6,7 +6,10 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { RELEASED_CARGO_MANIFESTS } from "../../../scripts/release-version.mjs";
+import {
+  RELEASE_BUNDLE_SPECS,
+  RELEASED_CARGO_MANIFESTS,
+} from "../../../scripts/release-version.mjs";
 
 const execFileAsync = promisify(execFile);
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -83,6 +86,20 @@ test("release version update synchronizes RQL internal dependencies", async () =
   }
 });
 
+test("release version update includes the current version in release bundle compatibility", async () => {
+  const root = await createFixture("1.2.4", "1.2.3", "\n");
+  try {
+    await execFileAsync(process.execPath, [releaseVersionScript, "sync"], { cwd: root });
+
+    for (const relativePath of RELEASE_BUNDLE_SPECS) {
+      const spec = JSON.parse(await readFile(path.join(root, relativePath), "utf8"));
+      assert.equal(spec.compatibility.bifrost, ">=0.8.0, <2.0.0");
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("GitHub outputs are emitted only after successful release validation", async () => {
   const root = await createFixture("1.2.3", "1.2.3", "\n");
   const outputPath = path.join(root, "github-output.txt");
@@ -122,6 +139,18 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
       root,
       relativePath,
       `[package]${lineEnding}name = "fixture"${lineEnding}version.workspace = true${lineEnding}`,
+    );
+  }
+  for (const relativePath of RELEASE_BUNDLE_SPECS) {
+    const spec = JSON.stringify(
+      { compatibility: { bifrost: ">=0.8.0, <2.0.0" } },
+      null,
+      2,
+    ).replaceAll("\n", lineEnding);
+    await writeFixtureFile(
+      root,
+      relativePath,
+      `${spec}${lineEnding}`,
     );
   }
   await writeFixtureFile(

@@ -17,7 +17,7 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 - [x] (2026-08-11 07:08Z) Set the workspace version to 0.9.0 and synchronize release metadata.
 - [x] (2026-08-11 07:10Z) Copy the version projection and both RC fixes to `master`.
 - [x] (2026-08-11 07:45Z) Run the release validation gates on the frozen RC.
-- [ ] Tag the validated RC commit as `v0.9.0` and push the tag.
+- [x] (2026-08-11 07:48Z) Tag RC commit `b9ac4c806` as `v0.9.0` and push the tag.
 - [ ] Monitor the Release and follow-on publication workflows. Stop on a failed gate.
 - [ ] Confirm the GitHub Release and public package versions.
 
@@ -50,6 +50,15 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 - Observation: Direct RC branch pushes do not start the repository CI workflows.
   Evidence: `ci.yml` and `policy-sarif.yml` accept direct pushes only on `master`. The RC therefore used the local pre-push gate, while master received the identical tree.
 
+- Observation: The first tagged Release run failed before promotion because every pinned JVM pack excluded Bifrost 0.9.0.
+  Evidence: Run 31470463663 reported `representative lookup did not resolve any records: Type { name: "java.lang.Object" }`. The JDK spec declared `>=0.8.18, <0.9.0`.
+
+- Observation: The release version script did not project compatibility ranges into pinned release-bundle specifications.
+  Evidence: The script synchronized code and plugin versions but did not inspect the three JVM specifications or the Python specification. It now updates their exclusive upper bound and has a behavior test.
+
+- Observation: Promotion did not start after the JVM failure.
+  Evidence: Every crate, wheel, agent plugin, Pi package, and editor publication job in run 31470463663 was skipped.
+
 ## Decision Log
 
 - Decision: Repair `master` before selecting the RC commit.
@@ -66,7 +75,7 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 
 ## Outcomes & Retrospective
 
-The first milestone corrected two Linux-only test fixture defects and accepted six reviewed policy findings. The RQL crate is bootstrapped. No release tag exists.
+The stabilization work corrected two Linux fixture defects, one macOS cache-path defect, and the release projections. The first immutable v0.9.0 tag failed before promotion because its pinned packs excluded 0.9.0. No artifact was published from that run.
 
 ## Context and Orientation
 
@@ -129,6 +138,10 @@ Current evidence:
     cargo nextest run --workspace: 9989 passed; 0 failed
     cargo test --workspace --doc: passed
     cargo clippy --workspace --all-targets --all-features -- -D warnings: passed
+    exact pinned JVM bundle script after compatibility fix: passed
+    semantic-pack release-tooling tests: 116 passed; 0 failed
+    framework pack shipping tests: 6 passed; 0 failed
+    golden and sanitizer pack shipping tests: 10 passed; 0 failed
 
 ## Interfaces and Dependencies
 

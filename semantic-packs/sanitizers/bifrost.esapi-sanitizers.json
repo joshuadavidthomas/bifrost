@@ -1,6 +1,6 @@
 {
   "compatibility": {
-    "bifrost": ">=0.8.0, <0.9.0",
+    "bifrost": ">=0.8.0, <0.10.0",
     "toolchains": []
   },
   "completeness": "complete",
@@ -10,7 +10,7 @@
   "pack_id": "bifrost.esapi-sanitizers",
   "producer": {
     "name": "bifrost-sanitizer-foundry",
-    "version": "0.8.24"
+    "version": "0.9.0"
   },
   "provenance": {
     "revision": "k3-sanitizers",
