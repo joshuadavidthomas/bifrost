@@ -234,10 +234,11 @@ async function main() {
       "tree-sitter-scala parser",
       "compiled into Bifrost on every release target",
     ),
-    await vendoredLegalFile(
-      "crates/bifrost-jvm/vendor/tree-sitter-kotlin/LICENSE",
-      "Bifrost-pinned tree-sitter-kotlin parser",
-      "https://github.com/fwcd/tree-sitter-kotlin/tree/c8ac3d2627240160b999a2c100de3babbdb8f419",
+    await legalFile(
+      metadata,
+      "brokk-tree-sitter-kotlin",
+      "LICENSE",
+      "brokk-tree-sitter-kotlin parser",
       "compiled into Bifrost on every release target",
     ),
   ];
