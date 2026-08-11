@@ -15,8 +15,8 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 - [x] (2026-08-11 06:10Z) Correct the remaining Hermes fixture race found by the full Linux CI job.
 - [x] (2026-08-11 07:00Z) Create and push `dave/v0.9.0-rc` from master commit `35868e505`.
 - [x] (2026-08-11 07:08Z) Set the workspace version to 0.9.0 and synchronize release metadata.
-- [ ] Copy the version projection to `master`, as required by the release process.
-- [ ] Run the release validation gates and confirm remote RC checks are green.
+- [x] (2026-08-11 07:10Z) Copy the version projection and both RC fixes to `master`.
+- [x] (2026-08-11 07:45Z) Run the release validation gates on the frozen RC.
 - [ ] Tag the validated RC commit as `v0.9.0` and push the tag.
 - [ ] Monitor the Release and follow-on publication workflows. Stop on a failed gate.
 - [ ] Confirm the GitHub Release and public package versions.
@@ -46,6 +46,9 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 
 - Observation: The active-session read-only cache opener failed for macOS temporary paths.
   Evidence: SQLite `SQLITE_OPEN_NOFOLLOW` refused `/var/folders/...`, while the other read-only opener already canonicalized the parent to `/private/var/folders/...`.
+
+- Observation: Direct RC branch pushes do not start the repository CI workflows.
+  Evidence: `ci.yml` and `policy-sarif.yml` accept direct pushes only on `master`. The RC therefore used the local pre-push gate, while master received the identical tree.
 
 ## Decision Log
 
@@ -122,6 +125,10 @@ Current evidence:
     release metadata checks: passed at 0.9.0
     agent plugin tests: 116 passed; 0 failed
     cargo check --workspace --locked: passed
+    cache database tests: 49 passed; 0 failed
+    cargo nextest run --workspace: 9989 passed; 0 failed
+    cargo test --workspace --doc: passed
+    cargo clippy --workspace --all-targets --all-features -- -D warnings: passed
 
 ## Interfaces and Dependencies
 
