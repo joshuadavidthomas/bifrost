@@ -195,6 +195,21 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_eq!("2025-11-25", initialize["result"]["protocolVersion"]);
     assert_eq!(initialize["result"]["capabilities"]["tools"], json!({}));
     assert_eq!(initialize["result"]["capabilities"]["resources"], json!({}));
+    let instructions = initialize["result"]["instructions"]
+        .as_str()
+        .expect("server instructions");
+    assert!(
+        instructions.starts_with("Semantic source-code analysis and repository navigation."),
+        "{initialize}"
+    );
+    assert!(instructions.contains("Symbol tools"), "{initialize}");
+    assert!(instructions.contains("CodeQuery and RQL"), "{initialize}");
+    assert!(instructions.contains("repository policies"), "{initialize}");
+    assert!(
+        !instructions.contains("Semantic search finds"),
+        "semantic search is disabled for this process: {initialize}"
+    );
+    assert!(instructions.chars().count() <= 2_000, "{initialize}");
 
     write_line(
         &mut stdin,

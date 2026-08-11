@@ -77,7 +77,9 @@ The command skips clients that are not installed. It does not install client
 applications, skills, instruction files, or extensions. Run it again after the
 Bifrost executable moves to a different path.
 
-Oh My Pi receives a native user MCP entry. Original Pi uses the separate
+Oh My Pi receives a native user MCP entry. It reads Bifrost's standard MCP instructions and adds them to its model prompt.
+
+Original Pi uses the separate
 `@brokk/bifrost-agent` extension described on the [Pi page](/pi/). The command
 does not install or change that extension.
 

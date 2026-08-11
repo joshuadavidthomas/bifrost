@@ -16,10 +16,11 @@ use crate::analyzer_pool::{
 use crate::mcp_common::{
     AGENTS_GUIDANCE_MIME_TYPE, AGENTS_GUIDANCE_TEXT, AGENTS_GUIDANCE_URI,
     BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, CODEX_MCP_CLIENT_NAME,
-    CODEX_SANDBOX_STATE_META_CAPABILITY, MCP_FILE_WATCHER_ENV, McpRenderOptions, McpServerSpec,
-    UNBOUND_WORKSPACE_MESSAGE, attach_run_policy_correlation, client_root_to_path,
-    file_uri_to_path, file_watching_enabled, fit_get_summaries_output_to_budget,
-    mcp_analyzer_request_budget, mcp_request_deadline, request_correlation_id, serial_tool_request,
+    CODEX_SANDBOX_STATE_META_CAPABILITY, MCP_DISCOVERY_TEXT_MAX_CHARS, MCP_FILE_WATCHER_ENV,
+    McpRenderOptions, McpServerSpec, UNBOUND_WORKSPACE_MESSAGE, attach_run_policy_correlation,
+    client_root_to_path, file_uri_to_path, file_watching_enabled,
+    fit_get_summaries_output_to_budget, mcp_analyzer_request_budget, mcp_request_deadline,
+    request_correlation_id, serial_tool_request,
 };
 use crate::ordered_transport::{
     OutboundResponseTimings, ResponseTimingTransport, RootsOrderedTransport, RootsRevocations,
@@ -239,16 +240,18 @@ impl NamedWorkspaceRouter {
             .collect()
     }
 
-    fn instructions(&self, base: &str) -> String {
+    fn instructions(&self, base: &str) -> Result<String, String> {
         let mut instructions = String::from(base);
-        instructions.push_str("\n\nNamed workspaces:\n");
-        for entry in &self.entries {
-            instructions.push_str(&format!("- {}: {}\n", entry.name, entry.root.display()));
-        }
         instructions.push_str(
-            "Select the workspace that contains the target code for each workspace tool call.",
+            "\n\nNamed workspace mode is active. Set the workspace argument to the workspace that contains the target code.",
         );
-        instructions
+        let instruction_chars = instructions.chars().count();
+        if instruction_chars > MCP_DISCOVERY_TEXT_MAX_CHARS {
+            return Err(format!(
+                "named-workspace MCP server instructions contain {instruction_chars} characters; maximum is {MCP_DISCOVERY_TEXT_MAX_CHARS}"
+            ));
+        }
+        Ok(instructions)
     }
 }
 
@@ -631,9 +634,9 @@ impl BifrostMcpHandler {
         Ok(Self {
             service,
             instructions: named_workspaces.as_ref().map_or_else(
-                || spec.instructions.to_string(),
-                |router| router.instructions(spec.instructions),
-            ),
+                || Ok(spec.instructions.clone()),
+                |router| router.instructions(&spec.instructions),
+            )?,
             named_workspaces,
             build_identity: build_identity.to_string(),
             tools,
@@ -2009,6 +2012,22 @@ mod named_workspace_tests {
             .map(|descriptor| descriptor["name"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["refresh"]);
+    }
+
+    #[test]
+    fn named_mode_adds_bounded_routing_without_exposing_paths() {
+        let instructions = schema_router()
+            .instructions("Semantic source-code analysis.")
+            .expect("named workspace instructions");
+        assert!(instructions.contains("Set the workspace argument"));
+        assert!(!instructions.contains("/api"));
+        assert!(!instructions.contains("/ui"));
+        assert!(instructions.chars().count() <= MCP_DISCOVERY_TEXT_MAX_CHARS);
+
+        let error = schema_router()
+            .instructions(&"x".repeat(MCP_DISCOVERY_TEXT_MAX_CHARS))
+            .expect_err("named workspace guidance must keep the final instruction bounded");
+        assert!(error.contains("named-workspace MCP server instructions"));
     }
 
     #[test]

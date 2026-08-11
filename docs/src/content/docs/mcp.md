@@ -11,6 +11,20 @@ bifrost --root /path/to/project --mcp "symbol|extended"
 
 Use `--mcp core` only for a navigation-focused setup that should not expose `query_code`. The chosen toolset controls whether an agent can query code.
 
+## Tool Discovery Metadata
+
+Bifrost uses only standard MCP metadata for tool discovery. It does not provide a separate tool-search method.
+
+The initialize result contains routing instructions for the tools selected at startup. The first 512 characters contain the general routing guidance.
+
+Each tool has a specific name, description, and input schema. Server instructions and tool descriptions contain no more than 2,000 characters.
+
+The tool catalog stays fixed for the process lifetime. Therefore, Bifrost does not advertise `tools.listChanged` or send tool-list change notifications.
+
+Hosts can use this metadata in different ways. Codex and Claude Code use it for deferred discovery.
+
+Oh My Pi adds server instructions to its model prompt. The native Bifrost Pi extension forwards the same instructions itself.
+
 Root and nested `.bifrostignore` files exclude matching tracked or untracked
 files from code intelligence without hiding them from text-level tools
 (`find_files_containing`, `search_file_contents`, `get_file_contents`).

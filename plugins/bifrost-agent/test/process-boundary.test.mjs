@@ -23,6 +23,7 @@ test("SDK process boundary initializes, discovers, calls, cancels, and cleans up
 
   try {
     await client.connect();
+    assert.equal(client.getInstructions(), "Use fake Bifrost for semantic code lookup.");
     const tools = await client.listTools();
     assert.deepEqual(tools.map((tool) => tool.name), ["fake_lookup", "slow_lookup"]);
     assert.deepEqual(tools[0].inputSchema.required, ["symbol"]);

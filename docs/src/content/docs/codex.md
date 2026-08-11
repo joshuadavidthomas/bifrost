@@ -71,6 +71,10 @@ tool-search query:
 Bifrost search_symbols query_code
 ```
 
+Codex uses Bifrost's MCP server instructions as the deferred namespace description. The instructions contain complete routing guidance in their first 512 characters.
+
+Tool names and descriptions then help Codex select an individual schema. The exact query above remains a deterministic discovery smoke test.
+
 The discovered `mcp__bifrost` surface should include both `search_symbols` and
 `query_code`. Do not treat a guessed JavaScript call such as
 `tools.mcp__bifrost__search_symbols(...)` as discovery; a missing generated

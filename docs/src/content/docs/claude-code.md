@@ -65,6 +65,10 @@ The two integrations serve different agent workflows:
 
 Claude Code starts separate LSP and MCP child processes. Both resolve the same pinned Bifrost binary, while each protocol owns its own workspace state and lifecycle.
 
+Claude Code defers MCP tool schemas until it needs them. It initially uses Bifrost's tool names and server instructions for discovery.
+
+Bifrost keeps each instruction and tool description below Claude Code's 2,000-character limit. Bifrost does not force any tool to load for every task.
+
 ## Local Plugin Testing
 
 From the repository root, build Bifrost and start Claude Code with this package directory:

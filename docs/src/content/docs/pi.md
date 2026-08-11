@@ -56,6 +56,10 @@ The extension scopes its Bifrost child to Pi's explicit session workspace. It
 does not analyze the installed package directory and does not expose Bifrost's
 workspace-switching tools, because Pi owns the session workspace.
 
+The extension also reads Bifrost's standard MCP server instructions. It adds them to Pi's model prompt before the namespace and workspace note.
+
+This gives Pi the same routing guidance as generic MCP hosts. The extension sanitizes the text and limits it to 2,000 characters.
+
 ## Validate The Setup
 
 Start a fresh Pi session in the repository you want to analyze, then ask it to
