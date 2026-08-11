@@ -203,6 +203,28 @@ impl CodeQueryResult {
         CodeQueryCompletion::Complete
     }
 
+    /// Cap per-row flow completion by the run's own completion (#1952).
+    ///
+    /// An interrupted or budget-limited query may be missing rows, so no
+    /// retained flow row may present itself as a complete clean negative.
+    /// The row's analysis-level detail stays in `semantic_status`.
+    pub(crate) fn cap_flow_completion_by_run(&mut self) {
+        let cap = match self.completion() {
+            CodeQueryCompletion::Complete | CodeQueryCompletion::ProvenSubset { .. } => return,
+            CodeQueryCompletion::Cancelled => CodeQueryFlowCompletion::Cancelled,
+            CodeQueryCompletion::Incomplete { .. } | CodeQueryCompletion::Invalid { .. } => {
+                CodeQueryFlowCompletion::Incomplete
+            }
+        };
+        for item in &mut self.results {
+            if let CodeQueryResultValue::FlowEndpoint { value } = &mut item.value
+                && value.completion == CodeQueryFlowCompletion::Complete
+            {
+                value.completion = cap;
+            }
+        }
+    }
+
     fn diagnostic_codes_with_impact(
         &self,
         impact: CodeQueryDiagnosticImpact,

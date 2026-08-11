@@ -15,9 +15,10 @@ use brokk_bifrost::analyzer::dataflow::{
 };
 use brokk_bifrost::analyzer::semantic::{
     CallBoundary, CallToReturnModel, CallTransfer, ControlContinuation, ControlEdgeKind,
-    IcfgEdgeKind, IcfgExitProfile, IcfgProvider, MatchedReturnProjection, ProcedureHandle,
-    ProcedureIcfgEdge, ProgramPointHandle, ProgramPointId, ProofStatus, ReturnTransferKind,
-    SemanticBudget, SemanticCallSite, SemanticEffect, SemanticProviderError, SemanticRequest,
+    EvidenceCompleteness, IcfgEdgeKind, IcfgExitProfile, IcfgProvider, MatchedReturnProjection,
+    ProcedureHandle, ProcedureIcfgEdge, ProgramPointHandle, ProgramPointId, ProofStatus,
+    ReturnTransferKind, SemanticBudget, SemanticCallSite, SemanticEffect, SemanticProviderError,
+    SemanticRequest,
 };
 
 pub type ReferenceStateKey<Fact> = (
@@ -286,6 +287,50 @@ where
                             &semantic_call,
                             boundary,
                         )?;
+                    }
+                    // Mirror the production kernel (#1952): a problem that
+                    // opts in receives the caller's own continuation edges
+                    // for resolved calls so caller-side facts can survive.
+                    if problem.resolved_call_to_return() && !transfers.transfers.is_empty() {
+                        for (kind, continuation) in [
+                            (
+                                IcfgEdgeKind::CallToNormalContinuation,
+                                semantic_call.normal_continuation,
+                            ),
+                            (
+                                IcfgEdgeKind::CallToExceptionalContinuation,
+                                semantic_call.exceptional_continuation,
+                            ),
+                        ] {
+                            let ControlContinuation::Target(target_id) = continuation else {
+                                continue;
+                            };
+                            let target = point
+                                .procedure()
+                                .point_handle(target_id)
+                                .expect("call continuation target remains valid");
+                            let edge = ProcedureIcfgEdge {
+                                source: point.clone(),
+                                target,
+                                kind,
+                                origin: point.procedure().call_site_handle(semantic_call.id),
+                                proof: ProofStatus::Proven,
+                                completeness: EvidenceCompleteness::Complete,
+                                boundary: None,
+                            };
+                            for transition in transition_outputs(problem, &edge, path.fact) {
+                                changed |= publish_jump(
+                                    &mut jumps,
+                                    Path {
+                                        entry: path.entry.clone(),
+                                        point: target_id,
+                                        fact: transition.fact,
+                                    },
+                                    compose(problem, jump, &transition.function),
+                                    problem,
+                                );
+                            }
+                        }
                     }
                 }
                 changed |= propagate_local_edges(

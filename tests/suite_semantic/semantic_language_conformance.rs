@@ -353,8 +353,12 @@ fn assert_direct_call_project_conformance(
             && (gap.subject == SemanticGapSubject::Point
                 || gap.subject == SemanticGapSubject::CallSite(direct_call.id))
     });
-    let has_unresolved_dynamic_dispatch =
-        has_dynamic_dispatch_gap && !expectations.closed_dispatch_refinement;
+    // A receiverless free-function call's blanket dispatch gap is discharged
+    // by the resolver-proven target set since #1952; receiver dispatch keeps
+    // its boundary unless the language declares closed refinement.
+    let has_unresolved_dynamic_dispatch = has_dynamic_dispatch_gap
+        && !expectations.closed_dispatch_refinement
+        && direct_call.receiver.is_some();
     let call_boundary_count = if expectations.unproven_link_unit {
         2
     } else {
@@ -6865,7 +6869,9 @@ def make_deferred():
             root(),
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    // The deferred invocations stay typed dispatch boundaries below; the
+    // snapshot status itself closes since #1952.
+    graph.assert_outcome(IcfgOutcomeKind::Complete);
     graph.assert_boundary(
         "async_invoke",
         ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchDeferred(
@@ -6873,23 +6879,11 @@ def make_deferred():
         ))
         .originating_call("async_call"),
     );
-    graph.assert_boundary(
-        "async_invoke",
-        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
-            .originating_call("async_call"),
-    );
     graph.assert_successors(
         "async_invoke",
         &[
             icfg_edge("async_normal", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("async_call"),
-            icfg_edge("async_normal", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("async_call"),
-            icfg_edge(
-                "async_exceptional",
-                IcfgEdgeKind::CallToExceptionalContinuation,
-            )
-            .originating_call("async_call"),
             icfg_edge(
                 "async_exceptional",
                 IcfgEdgeKind::CallToExceptionalContinuation,
@@ -6902,8 +6896,6 @@ def make_deferred():
         &[
             icfg_edge("async_invoke", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("async_call"),
-            icfg_edge("async_invoke", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("async_call"),
         ],
     );
     graph.assert_boundary(
@@ -6913,23 +6905,11 @@ def make_deferred():
         ))
         .originating_call("generator_call"),
     );
-    graph.assert_boundary(
-        "generator_invoke",
-        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
-            .originating_call("generator_call"),
-    );
     graph.assert_successors(
         "generator_invoke",
         &[
             icfg_edge("generator_normal", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("generator_call"),
-            icfg_edge("generator_normal", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("generator_call"),
-            icfg_edge(
-                "generator_exceptional",
-                IcfgEdgeKind::CallToExceptionalContinuation,
-            )
-            .originating_call("generator_call"),
             icfg_edge(
                 "generator_exceptional",
                 IcfgEdgeKind::CallToExceptionalContinuation,
@@ -6940,8 +6920,6 @@ def make_deferred():
     graph.assert_predecessors(
         "generator_normal",
         &[
-            icfg_edge("generator_invoke", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("generator_call"),
             icfg_edge("generator_invoke", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("generator_call"),
         ],

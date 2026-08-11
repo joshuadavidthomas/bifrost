@@ -272,6 +272,47 @@ fn completeness_heap_bytes(completeness: &EvidenceCompleteness) -> usize {
     }
 }
 
+/// Classify a snapshot's residual openness (#1952). `None` when a relevant
+/// gap or a needed-but-unavailable capability keeps the snapshot honestly
+/// open. `Some(residual)` when every relevant gap is either an implicit
+/// abort gap discharged because no abort path runs user code, or a
+/// call-target refinement gap; `residual` lists the refinement calls that do
+/// not carry a complete binding in this plan (empty when the plan's own
+/// bindings answer them all).
+fn classify_snapshot_openness(
+    snapshot: &ValueFlowSnapshot,
+    binding_complete: &HashMap<CallSiteHandle, bool>,
+) -> Option<Vec<CallSiteHandle>> {
+    let procedure = snapshot.procedure();
+    if crate::analyzer::semantic::workspace_oracle::value_flow_capabilities_are_open(procedure) {
+        return None;
+    }
+    let abort_user_code = crate::analyzer::semantic::workspace_oracle::abort_paths_run_user_code(
+        procedure.semantics(),
+    );
+    let mut residual = Vec::new();
+    for gap in procedure.semantics().gaps() {
+        if !crate::analyzer::semantic::workspace_oracle::gap_impacts_value_flow(gap) {
+            continue;
+        }
+        if crate::analyzer::semantic::workspace_oracle::implicit_abort_gap_is_discharged(
+            gap,
+            abort_user_code,
+        ) {
+            continue;
+        }
+        let call = crate::analyzer::semantic::workspace_oracle::call_target_refinement_call(
+            procedure.semantics(),
+            gap,
+        )
+        .and_then(|call| procedure.call_site_handle(call))?;
+        if !binding_complete.get(&call).copied().unwrap_or(false) && !residual.contains(&call) {
+            residual.push(call);
+        }
+    }
+    Some(residual)
+}
+
 fn summary_evidence_is_proven_complete(evidence: &SummaryEvidence) -> bool {
     evidence
         .alternatives()
@@ -403,6 +444,85 @@ impl ValueFlowCuratedCallModel {
     }
 }
 
+/// The first discovery input, in the plan's deterministic input order
+/// (sorted snapshots, then sorted bindings, then sources, then sinks), that
+/// prevented `discovery_complete` (#1952).
+///
+/// The cause keeps the typed `SemanticInputStatus`, so a downstream client can
+/// distinguish a missing capability from an unproven or budget-limited input
+/// instead of collapsing every incomplete run into one generic reason.
+/// How one snapshot input participates in discovery completeness (#1952).
+///
+/// `Refinable` records a snapshot left `Unknown` only by call-target
+/// refinement gaps whose calls have no complete binding in this plan. Such a
+/// snapshot does not make discovery complete by itself, but an execution
+/// result that fully models exactly those calls (a complete external summary
+/// or curated model closing their boundaries) answers the same gaps, so
+/// `execution_result_complete` treats it as closed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SnapshotDiscovery {
+    Complete,
+    Refinable { calls: Box<[CallSiteHandle]> },
+    Incomplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ValueFlowIncompleteCause {
+    Snapshot {
+        procedure: ProcedureHandle,
+        status: SemanticInputStatus,
+    },
+    SnapshotCoverage {
+        procedure: ProcedureHandle,
+    },
+    CallBinding {
+        call: CallSiteHandle,
+        callee: ProcedureHandle,
+        status: SemanticInputStatus,
+    },
+    CallBindingCoverage {
+        call: CallSiteHandle,
+        callee: ProcedureHandle,
+    },
+    SourceEvidence {
+        point: ProgramPointHandle,
+    },
+    SinkEvidence {
+        point: ProgramPointHandle,
+    },
+}
+
+impl ValueFlowIncompleteCause {
+    pub const fn status(&self) -> Option<SemanticInputStatus> {
+        match self {
+            Self::Snapshot { status, .. } | Self::CallBinding { status, .. } => Some(*status),
+            Self::SnapshotCoverage { .. }
+            | Self::CallBindingCoverage { .. }
+            | Self::SourceEvidence { .. }
+            | Self::SinkEvidence { .. } => None,
+        }
+    }
+
+    pub fn procedure(&self) -> &ProcedureHandle {
+        match self {
+            Self::Snapshot { procedure, .. } | Self::SnapshotCoverage { procedure } => procedure,
+            Self::CallBinding { callee, .. } | Self::CallBindingCoverage { callee, .. } => callee,
+            Self::SourceEvidence { point } | Self::SinkEvidence { point } => point.procedure(),
+        }
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Snapshot { .. } => "procedure value-flow snapshot",
+            Self::SnapshotCoverage { .. } => "procedure value-flow coverage",
+            Self::CallBinding { .. } => "call binding",
+            Self::CallBindingCoverage { .. } => "call binding coverage",
+            Self::SourceEvidence { .. } => "source evidence",
+            Self::SinkEvidence { .. } => "sink evidence",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct BoundValueFlowSource {
     pub id: ValueFlowSourceId,
@@ -437,6 +557,9 @@ pub struct ValueFlowPlan {
     snapshot_procedures: Box<[ProcedureHandle]>,
     binding_pairs: Box<[(CallSiteHandle, ProcedureHandle)]>,
     discovery_status: SemanticInputStatus,
+    first_incomplete_cause: Option<ValueFlowIncompleteCause>,
+    snapshot_discoveries: Box<[SnapshotDiscovery]>,
+    non_snapshot_discovery_complete: bool,
     ambiguous_dispatch: bool,
     discovery_complete: bool,
     structural_discovery_complete: bool,
@@ -462,6 +585,9 @@ impl PartialEq for ValueFlowPlan {
             && self.snapshot_procedures == other.snapshot_procedures
             && self.binding_pairs == other.binding_pairs
             && self.discovery_status == other.discovery_status
+            && self.first_incomplete_cause == other.first_incomplete_cause
+            && self.snapshot_discoveries == other.snapshot_discoveries
+            && self.non_snapshot_discovery_complete == other.non_snapshot_discovery_complete
             && self.ambiguous_dispatch == other.ambiguous_dispatch
             && self.discovery_complete == other.discovery_complete
             && self.structural_discovery_complete == other.structural_discovery_complete
@@ -490,6 +616,9 @@ impl Hash for ValueFlowPlan {
         self.snapshot_procedures.hash(state);
         self.binding_pairs.hash(state);
         self.discovery_status.hash(state);
+        self.first_incomplete_cause.hash(state);
+        self.snapshot_discoveries.hash(state);
+        self.non_snapshot_discovery_complete.hash(state);
         self.ambiguous_dispatch.hash(state);
         self.discovery_complete.hash(state);
         self.structural_discovery_complete.hash(state);
@@ -597,6 +726,7 @@ impl ValueFlowPlan {
         });
         let mut discovery_complete = true;
         let mut structural_discovery_complete = true;
+        let mut first_incomplete_cause: Option<ValueFlowIncompleteCause> = None;
         let mut carrier_candidates = Vec::new();
         let mut relation_count = 0usize;
         let snapshot_procedures = snapshots
@@ -607,11 +737,62 @@ impl ValueFlowPlan {
             .iter()
             .map(|input| (input.value().call().clone(), input.value().callee().clone()))
             .collect::<Vec<_>>();
+        let mut non_snapshot_discovery_complete = true;
+        let mut binding_complete = HashMap::<CallSiteHandle, bool>::default();
+        for input in &bindings {
+            let complete = input.status().is_complete()
+                && input.value().coverage() == CandidateCoverage::Exhaustive
+                && !input.value().context().was_truncated();
+            binding_complete
+                .entry(input.value().call().clone())
+                .and_modify(|value| *value &= complete)
+                .or_insert(complete);
+        }
+        let mut snapshot_discoveries = Vec::with_capacity(snapshots.len());
         for input in &snapshots {
             validate_mount(input.value().procedure(), mount)?;
-            discovery_status = discovery_status.merge(input.status());
-            discovery_complete &= input.status().is_complete()
-                && input.value().coverage() == CandidateCoverage::Exhaustive;
+            // A snapshot left Unknown only by call-target refinement gaps is
+            // answered by this plan's own complete resolutions and bindings of
+            // exactly those calls (#1952): the refinement the gaps demand has
+            // been performed, so the input does not open discovery. Residual
+            // refinement calls without a complete binding stay open here and
+            // may still be closed by a fully modeled execution boundary.
+            let discovery = if input.status().is_complete()
+                && input.value().coverage() == CandidateCoverage::Exhaustive
+            {
+                SnapshotDiscovery::Complete
+            } else if matches!(input.status(), SemanticInputStatus::Unknown)
+                && input.value().coverage() == CandidateCoverage::Open
+            {
+                match classify_snapshot_openness(input.value(), &binding_complete) {
+                    Some(residual) if residual.is_empty() => SnapshotDiscovery::Complete,
+                    Some(residual) => SnapshotDiscovery::Refinable {
+                        calls: residual.into_boxed_slice(),
+                    },
+                    None => SnapshotDiscovery::Incomplete,
+                }
+            } else {
+                SnapshotDiscovery::Incomplete
+            };
+            let refined = discovery == SnapshotDiscovery::Complete && !input.status().is_complete();
+            let complete = discovery == SnapshotDiscovery::Complete;
+            if !refined {
+                discovery_status = discovery_status.merge(input.status());
+            }
+            if first_incomplete_cause.is_none() && !complete {
+                if !input.status().is_complete() {
+                    first_incomplete_cause = Some(ValueFlowIncompleteCause::Snapshot {
+                        procedure: input.value().procedure().clone(),
+                        status: input.status(),
+                    });
+                } else {
+                    first_incomplete_cause = Some(ValueFlowIncompleteCause::SnapshotCoverage {
+                        procedure: input.value().procedure().clone(),
+                    });
+                }
+            }
+            snapshot_discoveries.push(discovery);
+            discovery_complete &= complete;
             relation_count = relation_count.saturating_add(input.value().relations().len());
             for relation in input.value().relations() {
                 carrier_candidates.push(ValueFlowCarrier::from(&relation.source));
@@ -622,9 +803,27 @@ impl ValueFlowPlan {
             validate_mount(input.value().call().procedure(), mount)?;
             validate_mount(input.value().callee(), mount)?;
             discovery_status = discovery_status.merge(input.status());
-            discovery_complete &= input.status().is_complete()
+            if first_incomplete_cause.is_none() {
+                if !input.status().is_complete() {
+                    first_incomplete_cause = Some(ValueFlowIncompleteCause::CallBinding {
+                        call: input.value().call().clone(),
+                        callee: input.value().callee().clone(),
+                        status: input.status(),
+                    });
+                } else if input.value().coverage() != CandidateCoverage::Exhaustive
+                    || input.value().context().was_truncated()
+                {
+                    first_incomplete_cause = Some(ValueFlowIncompleteCause::CallBindingCoverage {
+                        call: input.value().call().clone(),
+                        callee: input.value().callee().clone(),
+                    });
+                }
+            }
+            let complete = input.status().is_complete()
                 && input.value().coverage() == CandidateCoverage::Exhaustive
                 && !input.value().context().was_truncated();
+            non_snapshot_discovery_complete &= complete;
+            discovery_complete &= complete;
             structural_discovery_complete &= !input.value().context().was_truncated();
             for binding in input.value().bindings() {
                 relation_count = relation_count.saturating_add(call_binding_rule_count(binding));
@@ -633,16 +832,36 @@ impl ValueFlowPlan {
         }
         for source in &sources {
             validate_event(source.point(), source.carrier(), mount)?;
-            discovery_complete &= matches!(source.proof(), ProofStatus::Proven)
+            if first_incomplete_cause.is_none()
+                && !(matches!(source.proof(), ProofStatus::Proven)
+                    && matches!(source.completeness(), EvidenceCompleteness::Complete))
+            {
+                first_incomplete_cause = Some(ValueFlowIncompleteCause::SourceEvidence {
+                    point: source.point().clone(),
+                });
+            }
+            let complete = matches!(source.proof(), ProofStatus::Proven)
                 && matches!(source.completeness(), EvidenceCompleteness::Complete);
+            non_snapshot_discovery_complete &= complete;
+            discovery_complete &= complete;
             structural_discovery_complete &= matches!(source.proof(), ProofStatus::Proven)
                 && matches!(source.completeness(), EvidenceCompleteness::Complete);
             carrier_candidates.push(source.carrier().clone());
         }
         for sink in &sinks {
             validate_event(sink.point(), sink.carrier(), mount)?;
-            discovery_complete &= matches!(sink.proof(), ProofStatus::Proven)
+            if first_incomplete_cause.is_none()
+                && !(matches!(sink.proof(), ProofStatus::Proven)
+                    && matches!(sink.completeness(), EvidenceCompleteness::Complete))
+            {
+                first_incomplete_cause = Some(ValueFlowIncompleteCause::SinkEvidence {
+                    point: sink.point().clone(),
+                });
+            }
+            let complete = matches!(sink.proof(), ProofStatus::Proven)
                 && matches!(sink.completeness(), EvidenceCompleteness::Complete);
+            non_snapshot_discovery_complete &= complete;
+            discovery_complete &= complete;
             structural_discovery_complete &= matches!(sink.proof(), ProofStatus::Proven)
                 && matches!(sink.completeness(), EvidenceCompleteness::Complete);
             carrier_candidates.push(sink.carrier().clone());
@@ -650,6 +869,11 @@ impl ValueFlowPlan {
         if relation_count > limits.max_relations {
             return Err(ValueFlowPlanError::LimitExceeded);
         }
+        debug_assert_eq!(
+            first_incomplete_cause.is_some(),
+            !discovery_complete,
+            "the retained cause and discovery completeness must agree"
+        );
 
         let mut keyed = carrier_candidates
             .into_iter()
@@ -765,6 +989,9 @@ impl ValueFlowPlan {
             snapshot_procedures: snapshot_procedures.into_boxed_slice(),
             binding_pairs: binding_pairs.into_boxed_slice(),
             discovery_status,
+            first_incomplete_cause,
+            snapshot_discoveries: snapshot_discoveries.into_boxed_slice(),
+            non_snapshot_discovery_complete,
             ambiguous_dispatch,
             discovery_complete,
             structural_discovery_complete,
@@ -815,6 +1042,14 @@ impl ValueFlowPlan {
         }
         for sink in &self.sinks {
             visit_procedure(sink.spec.point().procedure());
+        }
+        if let Some(cause) = &self.first_incomplete_cause {
+            visit_procedure(cause.procedure());
+            if let ValueFlowIncompleteCause::CallBinding { call, .. }
+            | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } = cause
+            {
+                visit_procedure(call.procedure());
+            }
         }
     }
 
@@ -1245,6 +1480,13 @@ impl ValueFlowPlan {
             snapshot_procedures: first.snapshot_procedures.clone(),
             binding_pairs: first.binding_pairs.clone(),
             discovery_status: first.discovery_status,
+            first_incomplete_cause: plans
+                .iter()
+                .find_map(|plan| plan.first_incomplete_cause.clone()),
+            snapshot_discoveries: first.snapshot_discoveries.clone(),
+            non_snapshot_discovery_complete: plans
+                .iter()
+                .all(|plan| plan.non_snapshot_discovery_complete),
             ambiguous_dispatch: plans.iter().any(|plan| plan.ambiguous_dispatch),
             discovery_complete: plans.iter().all(|plan| plan.discovery_complete),
             structural_discovery_complete: plans
@@ -1260,6 +1502,13 @@ impl ValueFlowPlan {
 
     pub const fn discovery_status(&self) -> SemanticInputStatus {
         self.discovery_status
+    }
+
+    /// The first discovery input, in the plan's deterministic input order, that
+    /// prevented `discovery_complete` (#1952). `None` exactly when discovery is
+    /// complete.
+    pub const fn first_incomplete_cause(&self) -> Option<&ValueFlowIncompleteCause> {
+        self.first_incomplete_cause.as_ref()
     }
 
     pub const fn has_ambiguous_dispatch(&self) -> bool {
@@ -1330,6 +1579,7 @@ impl ValueFlowPlan {
     ) -> bool {
         if !result.termination().is_fixed_point()
             || !self.execution_discovery_modeled(result, requirement)
+            || !self.discovery_closed_by(result, requirement)
         {
             return false;
         }
@@ -1364,6 +1614,29 @@ impl ValueFlowPlan {
                 .boundaries()
                 .iter()
                 .all(|boundary| self.boundary_is_fully_modeled(result, boundary, requirement))
+    }
+
+    /// Whether typed discovery is closed for this execution result (#1952):
+    /// every non-snapshot input is complete, and every snapshot is either
+    /// complete (possibly refined by this plan's own bindings) or refinable
+    /// with each residual call fully modeled by this result's boundaries (a
+    /// complete external summary or curated model).
+    fn discovery_closed_by<Fact>(
+        &self,
+        result: &SummaryDataflowResult<Fact>,
+        requirement: SummaryProofRequirement,
+    ) -> bool {
+        self.non_snapshot_discovery_complete
+            && self
+                .snapshot_discoveries
+                .iter()
+                .all(|discovery| match discovery {
+                    SnapshotDiscovery::Complete => true,
+                    SnapshotDiscovery::Incomplete => false,
+                    SnapshotDiscovery::Refinable { calls } => calls.iter().all(|call| {
+                        self.call_boundaries_are_fully_modeled(result, call, requirement)
+                    }),
+                })
     }
 
     fn call_boundaries_are_fully_modeled<Fact>(
@@ -1402,11 +1675,74 @@ impl ValueFlowPlan {
         requirement: SummaryProofRequirement,
     ) -> bool {
         if matches!(boundary.kind(), SummaryBoundaryKind::Semantic(_)) {
+            if self.exceptional_exit_boundary_is_abort_only(boundary) {
+                return true;
+            }
             return boundary.origin().is_some_and(|call| {
                 self.call_boundaries_are_fully_modeled(result, call, requirement)
             });
         }
         self.dispatch_boundary_is_fully_modeled(boundary, requirement)
+    }
+
+    /// Whether an exceptional-exit profile boundary reports only unlowered
+    /// implicit abort edges that cannot carry a value (#1952).
+    ///
+    /// The exit profile keeps an `Unsupported` exceptional-control-flow status
+    /// when a procedure's implicit abort edges are not lowered. When no
+    /// procedure in this plan runs user code on an abort path -- no handler
+    /// and no cleanup body anywhere in the analyzed region -- those edges can
+    /// only unwind, so the boundary cannot hide a flow the demanded endpoints
+    /// could observe. One handler anywhere keeps every such boundary open,
+    /// because a callee's implicit throw decides that handler's reachability.
+    /// The solver coverage's semantic-status merge, minus the abort-only
+    /// exceptional-exit boundaries this plan's completion logic discharges
+    /// (#1952), so public projections and completion agree on one status.
+    pub fn public_semantic_status<Fact>(
+        &self,
+        result: &SummaryDataflowResult<Fact>,
+    ) -> SemanticInputStatus {
+        result
+            .coverage()
+            .boundaries()
+            .iter()
+            .filter(|boundary| !self.exceptional_exit_boundary_is_abort_only(boundary))
+            .filter_map(|boundary| match boundary.kind() {
+                SummaryBoundaryKind::Semantic(status) => Some(*status),
+                SummaryBoundaryKind::Dispatch(_)
+                | SummaryBoundaryKind::Limit(_)
+                | SummaryBoundaryKind::Continuation { .. } => None,
+            })
+            .fold(SemanticInputStatus::Complete, |current, incoming| {
+                current.merge(incoming)
+            })
+    }
+
+    pub(crate) fn exceptional_exit_boundary_is_abort_only(
+        &self,
+        boundary: &SummaryBoundary,
+    ) -> bool {
+        let SummaryBoundaryKind::Semantic(SemanticInputStatus::Unsupported {
+            capability: crate::analyzer::semantic::SemanticCapability::ExceptionalControlFlow,
+        }) = boundary.kind()
+        else {
+            return false;
+        };
+        if boundary.origin().is_some()
+            || boundary.at().id()
+                != boundary
+                    .at()
+                    .procedure()
+                    .semantics()
+                    .exceptional_exit_point()
+        {
+            return false;
+        }
+        self.summary_procedures().all(|procedure| {
+            !crate::analyzer::semantic::workspace_oracle::abort_paths_run_user_code(
+                procedure.semantics(),
+            )
+        })
     }
 
     fn dispatch_boundary_is_fully_modeled(
@@ -1750,6 +2086,17 @@ impl ValueFlowPlan {
             );
         }
 
+        // A call this plan bound is modeled by its call/return rules; the
+        // caller-side continuation edge preserves unrelated facts as identity
+        // (#1952). Neither the paranoid fallback smear nor the require-model
+        // abstention applies to it.
+        if boundary.is_none() && self.has_binding_for_call(call) {
+            return BoundaryTransferApplication {
+                modeled: true,
+                complete: true,
+                abstained: false,
+            };
+        }
         let is_input = self.is_call_input(call, input);
         if self.unmodeled_call_behavior == UnmodeledCallBehavior::Paranoid && is_input {
             self.visit_fallback_outputs(call, kind, |target| {

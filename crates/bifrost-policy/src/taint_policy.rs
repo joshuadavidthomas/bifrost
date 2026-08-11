@@ -70,8 +70,9 @@ use brokk_bifrost_analysis::analyzer::taint::{
     TaintUniverse, collect_taint_findings_with_limits,
 };
 use brokk_bifrost_analysis::analyzer::value_flow::{
-    ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
-    ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec, ValueFlowSourceSpec,
+    ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowIncompleteCause,
+    ValueFlowInput, ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec,
+    ValueFlowSourceSpec,
 };
 
 #[derive(Debug)]
@@ -1287,6 +1288,7 @@ fn solve_and_project_batch(
         let spec = policy
             .resolved_taint()
             .ok_or_else(|| "compiled taint policy lost its resolved specification".to_owned())?;
+        let mut dropped_for_missing_origins = 0usize;
         let projected = project_policy_findings(
             workspace,
             policy,
@@ -1295,6 +1297,7 @@ fn solve_and_project_batch(
             retained.plan().universe(),
             retained.report(),
             budget,
+            &mut dropped_for_missing_origins,
         )?;
         let payload = payloads
             .get_mut(&plan.policy_id)
@@ -1312,6 +1315,29 @@ fn solve_and_project_batch(
             PolicyWorkUnit::Count,
             u64::try_from(batch.projections().len().saturating_sub(1)).unwrap_or(u64::MAX),
         )?;
+        if dropped_for_missing_origins > 0
+            && matches!(payload.completion, PolicyRunCompletion::Complete)
+        {
+            // The run solved cleanly, but a candidate finding retained no
+            // source origin evidence and could not be projected. Reporting
+            // Complete would silently drop a real candidate, so the run
+            // stays typed inconclusive until origin retention is fixed.
+            payload.completion =
+                PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
+                    .map_err(|error| error.to_string())?;
+            if let Ok(diagnostic) = PolicyDiagnostic::try_new(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                format!(
+                    "{dropped_for_missing_origins} candidate finding(s) retained no source origin evidence and could not be projected"
+                ),
+                None,
+                Vec::new(),
+            ) {
+                payload.diagnostics.push(diagnostic);
+            }
+        }
         if !retained.report().is_complete() {
             if retained.report().is_proven_by_authored_summaries() {
                 // The run terminates precisely, but every open boundary was
@@ -1322,10 +1348,46 @@ fn solve_and_project_batch(
                     payload.completion = PolicyRunCompletion::ProvenBySummary;
                 }
             } else {
-                payload.completion = PolicyRunCompletion::inconclusive(vec![
-                    PolicyIncompleteReason::PartialDiscovery,
-                ])
-                .map_err(|error| error.to_string())?;
+                // Keep the first path-relevant cause the plan retained (#1952):
+                // an unavailable capability stays a typed capability reason and
+                // the diagnostic names the input that opened the run instead of
+                // collapsing everything into a bare partial-discovery verdict.
+                let cause = batch.analysis().value_flow().first_incomplete_cause();
+                let reason = match cause.and_then(ValueFlowIncompleteCause::status) {
+                    Some(SemanticInputStatus::Unsupported { .. }) => {
+                        PolicyIncompleteReason::CapabilityIncomplete
+                    }
+                    _ => PolicyIncompleteReason::PartialDiscovery,
+                };
+                payload.completion = PolicyRunCompletion::inconclusive(vec![reason])
+                    .map_err(|error| error.to_string())?;
+                if let Some(cause) = cause {
+                    let locator = cause.procedure().semantics().locator();
+                    let name = locator
+                        .declaration()
+                        .segments()
+                        .iter()
+                        .filter_map(|segment| segment.name())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let status = cause
+                        .status()
+                        .map_or("incomplete coverage", SemanticInputStatus::label);
+                    if let Ok(diagnostic) = PolicyDiagnostic::try_new(
+                        PolicyDiagnosticCode::EvaluationFailure,
+                        PolicyDiagnosticSeverity::Warning,
+                        PolicyDiagnosticImpact::RunIncomplete,
+                        format!(
+                            "taint discovery is incomplete: {} for {}:{name} is {status}",
+                            cause.label(),
+                            locator.path().as_str(),
+                        ),
+                        None,
+                        Vec::new(),
+                    ) {
+                        payload.diagnostics.push(diagnostic);
+                    }
+                }
             }
         }
     }
@@ -1400,6 +1462,7 @@ struct ProjectedSourceGroup<'a> {
     labels: Vec<TaintLabel>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn project_policy_findings(
     workspace: &WorkspaceAnalyzer,
     _policy: &LoadedPolicy,
@@ -1408,6 +1471,7 @@ fn project_policy_findings(
     universe: &TaintUniverse,
     report: &TaintFindingReport,
     budget: &PolicyBudget,
+    dropped_for_missing_origins: &mut usize,
 ) -> Result<Vec<TaintProjectedFinding>, String> {
     let mut projected = Vec::new();
     let mut projected_sinks = Vec::<ValueFlowEventKey>::new();
@@ -1502,6 +1566,14 @@ fn project_policy_findings(
             }
         }
         if groups.is_empty() {
+            // A finding with no retained origin evidence cannot be projected
+            // at all; that is an evidence-retention defect, not a clean
+            // absence, so the caller must not report a complete run over it.
+            // A finding whose retained origins simply belong to another
+            // policy in the shared batch is not this policy's finding.
+            if finding.origins().evidence().is_empty() {
+                *dropped_for_missing_origins = dropped_for_missing_origins.saturating_add(1);
+            }
             continue;
         }
         groups.sort_by(|left, right| left.source.identity.cmp(&right.source.identity));

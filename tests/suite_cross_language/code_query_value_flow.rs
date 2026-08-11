@@ -4,8 +4,7 @@ use std::sync::Arc;
 use brokk_bifrost::analyzer::dataflow::{SemanticInputStatus, SolverBudgetDimension, SolverWork};
 use brokk_bifrost::analyzer::semantic::{
     CancellationToken, EvidenceCompleteness, OracleCallContext, ProcedureHandle, ProcedureKind,
-    ProofStatus, SemanticBudget, SemanticCapability, SemanticRequest, ValueFlowOracle,
-    ValueFlowRelationKind,
+    ProofStatus, SemanticBudget, SemanticRequest, ValueFlowOracle, ValueFlowRelationKind,
 };
 use brokk_bifrost::analyzer::structural::{
     CodeQuery, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, ProtocolRegistrationSet,
@@ -983,9 +982,11 @@ fn retained_witness_budget_inventory_has_exact_contiguous_boundaries() {
                 assert_eq!(witness["quality"]["completeness"], "partial");
                 assert_contiguous_step_prefix(exact_steps, &witness["steps"]);
             }
+            // The analysis itself completes since #1952; only witness
+            // retention is truncated, which keeps its own typed diagnostic.
             assert!(
-                has_diagnostic(&exceeded["result"], "value_flow_analysis_partial"),
-                "{} truncation diagnostic: {exceeded:#}",
+                !has_diagnostic(&exceeded["result"], "value_flow_analysis_partial"),
+                "{} unexpected analysis-partial diagnostic: {exceeded:#}",
                 dimension.label()
             );
             assert!(
@@ -1770,24 +1771,14 @@ fn typescript_exact_indices_preserve_distinct_public_location_symbols() {
 #[test]
 fn java_over_bound_access_path_preserves_public_summary_negative() {
     with_java_over_bound_field_flow(|case| {
-        assert_shared_helper_scenario_with_status(
-            case,
-            SemanticInputStatus::Unsupported {
-                capability: SemanticCapability::ExceptionalControlFlow,
-            },
-        );
+        assert_shared_helper_scenario_with_status(case, SemanticInputStatus::Unproven);
     });
 }
 
 #[test]
 fn typescript_over_bound_access_path_preserves_public_summary_negative() {
     with_typescript_over_bound_field_flow(|case| {
-        assert_shared_helper_scenario_with_status(
-            case,
-            SemanticInputStatus::Unsupported {
-                capability: SemanticCapability::ExceptionalControlFlow,
-            },
-        );
+        assert_shared_helper_scenario_with_status(case, SemanticInputStatus::Unknown);
     });
 }
 

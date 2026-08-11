@@ -2822,11 +2822,28 @@ fn production_taint_discovers_an_unselected_common_caller_for_sibling_callees() 
         outcome.report().diagnostics()
     );
     let run = &outcome.report().runs()[0];
-    assert!(matches!(
+    // Discovery and the solve complete since #1952, but the sibling-callee
+    // finding still retains no source origin evidence through the summary
+    // join (an origin-retention defect owned by #1951's minimization), so
+    // the run stays typed inconclusive with a diagnostic naming the dropped
+    // candidate instead of claiming a clean complete run over it.
+    assert!(
+        matches!(
+            run.completion(),
+            PolicyRunCompletion::Inconclusive { reasons }
+                if reasons.contains(&PolicyIncompleteReason::PartialDiscovery)
+        ),
+        "{:?}: {:?}",
         run.completion(),
-        PolicyRunCompletion::Inconclusive { reasons }
-            if reasons.contains(&PolicyIncompleteReason::PartialDiscovery)
-    ));
+        run.diagnostics()
+    );
+    assert!(
+        run.diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message().contains("no source origin evidence")),
+        "{:?}",
+        run.diagnostics()
+    );
     assert!(run.findings().is_empty());
     assert_eq!(outcome.taint_findings().len(), 1);
     assert_eq!(
@@ -2837,6 +2854,47 @@ fn production_taint_discovers_an_unselected_common_caller_for_sibling_callees() 
             .map(|metric| metric.value()),
         Some(1)
     );
+}
+
+/// The balanced negative from #1952: the source result is unused and the sink
+/// receives a constant. A complete run with zero findings is the honest clean
+/// verdict; an inconclusive run here would keep the negative meaningless.
+#[test]
+fn production_taint_balanced_negative_completes_without_findings() {
+    let policy = single_policy(
+        "test.balanced-negative-taint",
+        "(language python (call :callee (name \"source_one\")))",
+        "return-value",
+    );
+    let outcome = evaluate_one(
+        r#"
+def source_one():
+    return "one"
+
+def sink_one(value):
+    pass
+
+def run():
+    unused = source_one()
+    sink_one("constant")
+"#,
+        &policy,
+    );
+    assert_eq!(
+        outcome.report().runs().len(),
+        1,
+        "{:?}",
+        outcome.report().diagnostics()
+    );
+    let run = &outcome.report().runs()[0];
+    assert!(
+        matches!(run.completion(), PolicyRunCompletion::Complete),
+        "{:?}: {:?}",
+        run.completion(),
+        run.diagnostics()
+    );
+    assert!(run.findings().is_empty(), "{:?}", run.findings());
+    assert!(outcome.taint_findings().is_empty());
 }
 
 /// Builds a Python project where `entry_count` entry procedures all call the

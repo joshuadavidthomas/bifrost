@@ -1109,6 +1109,10 @@ impl IdeDataflowProblem for TaintFlowProblem<'_> {
         TaintFact::ZERO
     }
 
+    fn resolved_call_to_return(&self) -> bool {
+        true
+    }
+
     fn zero_value(&self) -> Self::Value {
         self.plan.universe().empty_set()
     }

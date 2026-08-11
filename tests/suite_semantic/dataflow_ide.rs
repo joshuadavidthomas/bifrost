@@ -100,6 +100,10 @@ impl IdeDataflowProblem for QualifierProblem {
         QualifierFact::Zero
     }
 
+    fn resolved_call_to_return(&self) -> bool {
+        true
+    }
+
     fn zero_value(&self) -> Self::Value {
         Qualifier::Bottom
     }

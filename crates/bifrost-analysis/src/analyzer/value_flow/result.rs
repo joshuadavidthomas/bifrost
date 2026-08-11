@@ -122,6 +122,11 @@ impl ValueFlowSummaryResult {
                 owner: Arc::clone(plan.owner()),
             });
         }
+        // `execution_result_complete` embeds typed discovery closure (#1952):
+        // an open snapshot keeps the run incomplete unless its residual
+        // refinement calls are fully modeled by this result's boundaries, so
+        // absence of a meeting never reads as a clean negative past an open
+        // discovery input.
         let discovery_complete = plan.execution_result_complete(&result);
         // Mirrors the taint layer (#1916): the run is not derived-complete, yet
         // accepting authored-complete external summaries closes it.
