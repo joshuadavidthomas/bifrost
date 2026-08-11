@@ -1,9 +1,12 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
+use crate::analyzer::structural::resolution::RejectionReason;
+use crate::analyzer::usages::applicability::{ApplicabilityOutcome, arity_applicability};
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisWork, ReceiverBudgetLimit,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_jvm::java::graph_support::JavaSource;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -1270,50 +1273,120 @@ fn java_object_creation_focus_is_terminal_type(
     node_contains_focus(terminal, focus)
 }
 
-fn java_filter_candidates_by_arity(
-    analyzer: &dyn IAnalyzer,
-    session: &JavaResolutionSession<'_>,
-    candidates: Vec<CodeUnit>,
-    arity: Option<usize>,
-) -> Vec<CodeUnit> {
-    let Some(expected) = arity else {
-        return candidates;
-    };
-    candidates
-        .iter()
-        .filter(|unit| java_callable_accepts_arity(analyzer, Some(session), unit, expected))
-        .cloned()
-        .collect()
-}
-
-fn java_arity_candidates(
+/// The one Java applicability check (#1478 M3).
+///
+/// Every Java seam that discriminates overloads calls this, and it returns both
+/// halves of the answer in one value: the candidates the resolver binds
+/// (`winners`) and the per-candidate verdict with its typed rejection reason
+/// (`verdicts`). Before this factoring the same check ran twice in spirit --
+/// once as a `filter` that produced the binding and once as a trace loop that
+/// re-derived who had lost -- and only the survivors escaped. There is now one
+/// computation, so the rows a policy reads and the declaration the resolver
+/// bound cannot drift apart.
+fn java_candidate_applicability(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,
     candidates: &[CodeUnit],
     arity: Option<usize>,
-) -> Option<Vec<CodeUnit>> {
-    let expected = arity?;
-    let filtered: Vec<_> = candidates
-        .iter()
-        .filter(|unit| java_callable_accepts_arity(analyzer, Some(session), unit, expected))
-        .cloned()
-        .collect();
-    (!filtered.is_empty()).then_some(filtered)
+) -> ApplicabilityOutcome {
+    arity_applicability(candidates, arity, |unit| {
+        Some(java_declared_arity(analyzer, Some(session), unit))
+    })
 }
 
-fn java_callable_accepts_arity(
+/// The parameter list a Java callable declares, as the resolver has always read
+/// it: the persisted arity when the extractor recorded one, and otherwise the
+/// count the indexed signature states. Java therefore always has a declared
+/// arity, which is why a Java candidate is never an undecided verdict once the
+/// call's argument count is known.
+fn java_declared_arity(
     analyzer: &dyn IAnalyzer,
     session: Option<&JavaResolutionSession<'_>>,
     unit: &CodeUnit,
-    actual: usize,
-) -> bool {
+) -> crate::analyzer::CallableArity {
     java_signature_metadata(analyzer, session, unit)
         .into_iter()
         .find_map(|metadata| metadata.callable_arity())
         .unwrap_or_else(|| {
             crate::analyzer::CallableArity::exact(java_signature_arity(unit.signature()))
         })
-        .accepts(actual)
+}
+
+/// Narrow `candidates` to the overloads that accept the call, binding nothing
+/// when none does.
+///
+/// An earlier form of this filter kept the whole candidate set when no overload
+/// accepted the call. `e9033e203` removed that fallback so a constructor a
+/// semantic model supplies -- a Lombok `@NoArgsConstructor`, for example -- can
+/// be reported instead of an authored constructor the call cannot reach, and the
+/// same answer is what #1478's rule contract states: zero applicable candidates
+/// stay unresolved. Every refused candidate therefore becomes a rejected
+/// applicability row carrying its typed reason, and the site's selection summary
+/// reports `unresolved` rather than a bound set nobody accepted.
+fn java_filter_candidates_by_arity(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    candidates: Vec<CodeUnit>,
+    arity: Option<usize>,
+) -> Vec<CodeUnit> {
+    if arity.is_none() {
+        return candidates;
+    }
+    let applicability = java_candidate_applicability(analyzer, session, &candidates, arity);
+    java_record_callable_applicability(&applicability, &applicability.winners);
+    applicability.winners
+}
+
+/// Emit the callable-applicability trace for a seam with no member walk behind
+/// it, such as a constructor call or a static import.
+///
+/// A refused candidate the seam did **not** bind becomes a rejected row
+/// carrying its typed reason; a candidate the seam bound gets its verdict
+/// staged for the outcome constructor. Since `e9033e203` removed the
+/// no-accept fallback, every Java seam binds `ApplicabilityOutcome::winners`
+/// or nothing, so a bound candidate is never `inapplicable`: a site no overload
+/// accepts binds nothing, and its rows are the rejected ones. The one bound
+/// verdict that is not `applicable` is `unknown`, which the static-import seam
+/// stages when the call's argument count is unreadable and no candidate was
+/// measured at all.
+fn java_record_callable_applicability(applicability: &ApplicabilityOutcome, bound: &[CodeUnit]) {
+    if !trace::recording() {
+        return;
+    }
+    for verdict in &applicability.verdicts {
+        if verdict.verdict != ApplicabilityVerdict::Inapplicable
+            || bound.contains(&verdict.candidate)
+        {
+            continue;
+        }
+        trace::record(
+            trace::TraceCandidate::rejected(
+                trace::TraceCandidateRef::Unit(verdict.candidate.clone()),
+                None,
+                RejectionReason::CallableApplicabilityDeferred,
+            )
+            .with_callable(trace::CallableApplicabilityRecord {
+                verdict: verdict.verdict,
+                reason: verdict.reason,
+            }),
+        );
+    }
+    trace::stage_callable_context(
+        applicability
+            .verdicts
+            .iter()
+            .filter(|verdict| bound.contains(&verdict.candidate))
+            .map(|verdict| {
+                (
+                    verdict.candidate.fq_name(),
+                    trace::CallableApplicabilityRecord {
+                        verdict: verdict.verdict,
+                        reason: verdict.reason,
+                    },
+                )
+            })
+            .collect(),
+    );
 }
 
 fn java_signature_metadata(
@@ -2735,42 +2808,61 @@ impl JavaMemberTrace {
         })
     }
 
-    /// Stage attribution for `winners` on the outcome the caller is about to
-    /// construct, and record every member of `considered` that is not a winner
-    /// as a rejected row. Java's losers here always lost the arity check, whose
-    /// structured story belongs to the callable axis (#1478), so the rejection
-    /// reason defers to it.
+    /// Stage attribution for the candidates this lookup is about to bind, and
+    /// record every refused candidate it discarded as a rejected row.
+    ///
+    /// `applicability` is the *same* value the caller used to decide what to
+    /// bind (#1478 M3): the winners here are the winners the resolver bound,
+    /// and each row's verdict and typed reason are the ones the check produced.
+    /// `bound` is what the seam actually returns, which is `winners` where the
+    /// call's argument count is known, the whole considered set where it is not
+    /// (every verdict is then `unknown`), and empty where nothing accepted the
+    /// call. A bound candidate is never reported as rejected.
+    ///
+    /// On the resolution axis a refused candidate keeps
+    /// [`RejectionReason::CallableApplicabilityDeferred`]: that reason now
+    /// points at real evidence rather than standing in for it, because the
+    /// candidate's applicability row carries the exact callable reason.
     fn stage_selection(
         &self,
         base: &CodeUnit,
-        winners: &[CodeUnit],
-        considered: &[CodeUnit],
-        winner_applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
+        applicability: &ApplicabilityOutcome,
+        bound: &[CodeUnit],
     ) {
-        use crate::analyzer::structural::{PrecedenceTier, RejectionReason};
-        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+        use crate::analyzer::structural::PrecedenceTier;
 
-        for loser in considered.iter().filter(|unit| !winners.contains(unit)) {
-            let tier = self.found.get(loser).map(|(_, depth)| {
+        let tier_of = |unit: &CodeUnit| {
+            self.found.get(unit).map(|(_, depth)| {
                 if *depth == 0 {
                     PrecedenceTier::OwnMember
                 } else {
                     PrecedenceTier::InheritedMember
                 }
-            });
+            })
+        };
+        for verdict in &applicability.verdicts {
+            if verdict.verdict != ApplicabilityVerdict::Inapplicable
+                || bound.contains(&verdict.candidate)
+            {
+                continue;
+            }
             let mut row = trace::TraceCandidate::rejected(
-                trace::TraceCandidateRef::Unit(loser.clone()),
-                tier,
+                trace::TraceCandidateRef::Unit(verdict.candidate.clone()),
+                tier_of(&verdict.candidate),
                 RejectionReason::CallableApplicabilityDeferred,
-            );
+            )
+            .with_callable(trace::CallableApplicabilityRecord {
+                verdict: verdict.verdict,
+                reason: verdict.reason,
+            });
             if let Some(enrichment) =
-                self.enrichment(base, loser, ApplicabilityVerdict::Inapplicable)
+                self.enrichment(base, &verdict.candidate, ApplicabilityVerdict::Inapplicable)
             {
                 row = row.with_member(enrichment);
             }
             trace::record(row);
         }
-        let winner_tier = winners
+        let winner_tier = bound
             .iter()
             .filter_map(|unit| self.found.get(unit))
             .map(|(_, depth)| *depth)
@@ -2783,14 +2875,39 @@ impl JavaMemberTrace {
                 }
             });
         if let Some(tier) = winner_tier {
-            trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
+            trace::stage_tier(tier, bound.iter().map(|unit| unit.fq_name()).collect());
         }
+        let verdict_of = |unit: &CodeUnit| {
+            applicability
+                .verdicts
+                .iter()
+                .find(|verdict| verdict.candidate == *unit)
+        };
         trace::stage_member_context(
-            winners
+            bound
                 .iter()
                 .filter_map(|unit| {
-                    self.enrichment(base, unit, winner_applicability)
+                    let applicability = verdict_of(unit)
+                        .map(|verdict| verdict.verdict)
+                        .unwrap_or(ApplicabilityVerdict::Unknown);
+                    self.enrichment(base, unit, applicability)
                         .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+        trace::stage_callable_context(
+            bound
+                .iter()
+                .filter_map(|unit| {
+                    verdict_of(unit).map(|verdict| {
+                        (
+                            unit.fq_name(),
+                            trace::CallableApplicabilityRecord {
+                                verdict: verdict.verdict,
+                                reason: verdict.reason,
+                            },
+                        )
+                    })
                 })
                 .collect(),
         );
@@ -2943,8 +3060,6 @@ fn java_member_candidates(
     kind: JavaMemberLookupKind,
     arity: Option<usize>,
 ) -> DefinitionLookupOutcome {
-    use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
-
     let support: &dyn BoundedDefinitionLookup = session;
     let owner_fqn = owner.fq_name();
     let mut member_trace = trace::recording().then(JavaMemberTrace::default);
@@ -2955,26 +3070,19 @@ fn java_member_candidates(
     if let Some(state) = member_trace.as_mut() {
         state.record_found(&candidates, owner, 0);
     }
-    if let Some(filtered_candidates) = java_arity_candidates(analyzer, session, &candidates, arity)
-    {
+    // One applicability computation decides what to bind and what to report
+    // (#1478 M3): `winners` is the production filter, `verdicts` is the
+    // evidence, and neither can drift from the other.
+    let applicability = java_candidate_applicability(analyzer, session, &candidates, arity);
+    if arity.is_some() && !applicability.winners.is_empty() {
         if let Some(state) = member_trace.as_ref() {
-            state.stage_selection(
-                owner,
-                &filtered_candidates,
-                &candidates,
-                ApplicabilityVerdict::Applicable,
-            );
+            state.stage_selection(owner, &applicability, &applicability.winners);
         }
-        return candidates_outcome(filtered_candidates);
+        return candidates_outcome(applicability.winners);
     }
     if !candidates.is_empty() && arity.is_none() {
         if let Some(state) = member_trace.as_ref() {
-            state.stage_selection(
-                owner,
-                &candidates,
-                &candidates,
-                ApplicabilityVerdict::Unknown,
-            );
+            state.stage_selection(owner, &applicability, &candidates);
         }
         return candidates_outcome(candidates);
     }
@@ -2982,7 +3090,7 @@ fn java_member_candidates(
         // Arity is known and nothing accepted (#1755): the direct set is
         // discarded, never bound. Record the discard as rejected rows.
         if let Some(state) = member_trace.as_ref() {
-            state.stage_selection(owner, &[], &candidates, ApplicabilityVerdict::Inapplicable);
+            state.stage_selection(owner, &applicability, &[]);
         }
     }
 
@@ -3034,28 +3142,22 @@ fn java_member_candidates(
             }
             sort_units(&mut level_candidates);
             level_candidates.dedup();
-            if let Some(filtered_level_candidates) =
-                java_arity_candidates(analyzer, session, &level_candidates, arity)
-            {
+            let level_applicability =
+                java_candidate_applicability(analyzer, session, &level_candidates, arity);
+            if arity.is_some() && !level_applicability.winners.is_empty() {
                 if let Some(state) = member_trace.as_ref() {
                     state.stage_selection(
                         owner,
-                        &filtered_level_candidates,
-                        &level_candidates,
-                        ApplicabilityVerdict::Applicable,
+                        &level_applicability,
+                        &level_applicability.winners,
                     );
                 }
-                return candidates_outcome(filtered_level_candidates);
+                return candidates_outcome(level_applicability.winners);
             }
             if !level_candidates.is_empty() {
                 if arity.is_none() {
                     if let Some(state) = member_trace.as_ref() {
-                        state.stage_selection(
-                            owner,
-                            &level_candidates,
-                            &level_candidates,
-                            ApplicabilityVerdict::Unknown,
-                        );
+                        state.stage_selection(owner, &level_applicability, &level_candidates);
                     }
                     return candidates_outcome(level_candidates);
                 }
@@ -3063,12 +3165,7 @@ fn java_member_candidates(
                 // accepting overload is discarded, never bound. Record the
                 // discard as rejected rows while the walk still knows them.
                 if let Some(state) = member_trace.as_ref() {
-                    state.stage_selection(
-                        owner,
-                        &[],
-                        &level_candidates,
-                        ApplicabilityVerdict::Inapplicable,
-                    );
+                    state.stage_selection(owner, &level_applicability, &[]);
                 }
             }
             level = next_level;
@@ -3233,14 +3330,19 @@ fn java_static_import_candidates(
     }
     sort_units(&mut candidates);
     candidates.dedup();
-    if let Some(filtered_candidates) = java_arity_candidates(analyzer, session, &candidates, arity)
-    {
-        return candidates_outcome(filtered_candidates);
+    let applicability = java_candidate_applicability(analyzer, session, &candidates, arity);
+    if arity.is_some() && !applicability.winners.is_empty() {
+        java_record_callable_applicability(&applicability, &applicability.winners);
+        return candidates_outcome(applicability.winners);
     }
     // A statically imported overload that cannot accept the call's argument list
     // is not the target (#1755), so it never stands in for one that can.
     if !candidates.is_empty() && arity.is_none() {
+        java_record_callable_applicability(&applicability, &candidates);
         return candidates_outcome(candidates);
+    }
+    if !candidates.is_empty() {
+        java_record_callable_applicability(&applicability, &[]);
     }
     // `saw_external` is set only when an import target is both unindexed and
     // `!java_workspace_fqn_exists(owner)`, so `!saw_external` is the workspace

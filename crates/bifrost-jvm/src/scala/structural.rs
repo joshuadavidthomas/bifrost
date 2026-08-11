@@ -5,6 +5,9 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_argument_role_with_derived_name, attach_role_with_derived_name, attach_terminal_callee,
     first_named_child,
 };
+use brokk_bifrost_core::analyzer::structural::callable::{
+    CallKind, CallSiteContext, CallSiteFacts,
+};
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
@@ -17,7 +20,7 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
+    CALLABLE_APPLICABILITY_ONLY_SUPPORT, LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT,
@@ -381,6 +384,44 @@ impl StructuralSpec for ScalaStructuralSpec {
         kind != NormalizedKind::Assignment || !is_named_argument_assignment(node)
     }
 
+    /// Scala's grammar names two call shapes the shared arena cannot: an
+    /// `infix_expression` is an infix application (an `operator_identifier`
+    /// operator makes it a symbolic operator application), and a
+    /// `call_expression` whose own function is another `call_expression` is
+    /// one more argument list of a curried application, not a call of the
+    /// inner call's result. `new Foo(1)` is deliberately absent: the grammar
+    /// spells it `instance_expression`, which this adapter's kind table does
+    /// not admit as a call at all, so there is no Scala constructor call site
+    /// to classify yet (#1478).
+    fn call_site_facts(
+        &self,
+        node: Node<'_>,
+        _source: &str,
+        _context: &CallSiteContext,
+    ) -> Option<CallSiteFacts> {
+        match node.kind() {
+            "infix_expression" => {
+                let operator = node.child_by_field_name("operator")?;
+                Some(CallSiteFacts::of_kind(
+                    if operator.kind() == "operator_identifier" {
+                        CallKind::Operator
+                    } else {
+                        CallKind::Infix
+                    },
+                ))
+            }
+            "call_expression" => {
+                let function = callable_target_node(
+                    node.child_by_field_name("function")
+                        .map(expression_target_node)?,
+                )?;
+                (function.kind() == "call_expression")
+                    .then(|| CallSiteFacts::unrefined().continuing())
+            }
+            _ => None,
+        }
+    }
+
     fn supports_kind(&self, kind: NormalizedKind) -> bool {
         kind == NormalizedKind::Method
             || self
@@ -397,7 +438,11 @@ impl StructuralSpec for ScalaStructuralSpec {
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        &NO_LEXICAL_ENVIRONMENT_SUPPORT
+        // Scala classifies no scopes, binding intervals, import binders or
+        // package clause, but `scala_filter_callable_units` reports
+        // per-candidate callable applicability (#1478 M3). The per-axis table
+        // states exactly that rather than rounding it either way.
+        &CALLABLE_APPLICABILITY_ONLY_SUPPORT
     }
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {

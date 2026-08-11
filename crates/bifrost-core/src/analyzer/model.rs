@@ -347,6 +347,13 @@ impl CallableArity {
         arity >= self.required && (self.repeated || arity <= self.total)
     }
 
+    /// How many arguments a call must supply. Lower than [`Self::total`]
+    /// exactly when the declaration has defaults or otherwise omittable
+    /// parameters, which is what makes an arity a range rather than a count.
+    pub fn required(self) -> usize {
+        self.required
+    }
+
     pub fn total(self) -> usize {
         self.total
     }

@@ -115,7 +115,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `typescript_analyzer_update_test`
 - `typescript_import_test`
 
-### `suite_bench_policy` (29 modules)
+### `suite_bench_policy` (30 modules)
 
 - `benchmark_compare`
 - `benchmark_manifest`
@@ -135,6 +135,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `policy_loading_workspace`
 - `policy_loop_invariance_prototype`
 - `policy_match_evaluation`
+- `policy_overload_selection_trio`
 - `policy_rendering`
 - `policy_resolution_assertions`
 - `policy_resolution_conformance`
@@ -147,8 +148,12 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `taint_policy_adapter`
 - `temp_storage_scripts`
 
-### `suite_cross_language` (21 modules)
+### `suite_cross_language` (24 modules)
 
+- `code_query_call_shape_languages`
+- `code_query_callable_applicability`
+- `code_query_callable_applicability_conformance`
+- `code_query_callable_signature`
 - `code_query_cpp_receiver`
 - `code_query_docs`
 - `code_query_edge_conformance`

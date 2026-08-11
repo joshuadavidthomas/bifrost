@@ -25,6 +25,10 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::CallShape { .. }
                 | CodeQueryResultValue::CallArgumentGroup { .. }
                 | CodeQueryResultValue::CallArgument { .. }
+                | CodeQueryResultValue::CallableSignature { .. }
+                | CodeQueryResultValue::SignatureParameter { .. }
+                | CodeQueryResultValue::CallableApplicability { .. }
+                | CodeQueryResultValue::OverloadSelection { .. }
                 | CodeQueryResultValue::MemberSelection { .. }
                 | CodeQueryResultValue::DispatchOutcome { .. }
                 | CodeQueryResultValue::DispatchTarget { .. }
@@ -386,6 +390,89 @@ impl CodeQueryResult {
                             value.group_id
                         ));
                     }
+                    CodeQueryResultValue::CallableSignature { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [callable signature {}; {}; {}] {} arity={} generics={}{}{}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.ordinal,
+                            value.role,
+                            value.coverage,
+                            value.declaration.fq_name,
+                            arity_label(value),
+                            value.generic_arity,
+                            value
+                                .receiver_contract
+                                .map(|contract| format!("; receiver={contract}"))
+                                .unwrap_or_default(),
+                            value
+                                .return_type
+                                .as_deref()
+                                .map(|return_type| format!("; returns={return_type}"))
+                                .unwrap_or_default(),
+                        ));
+                    }
+                    CodeQueryResultValue::SignatureParameter { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [parameter {}] `{}`{}{}{}; signature={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.parameter_index,
+                            value.label,
+                            value
+                                .declared_type
+                                .as_deref()
+                                .map(|declared| format!("; type={declared}"))
+                                .unwrap_or_default(),
+                            match value.optional {
+                                Some(true) => "; optional",
+                                Some(false) => "",
+                                None => "; optionality unrecorded",
+                            },
+                            if value.repeated == Some(true) {
+                                "; repeated"
+                            } else {
+                                ""
+                            },
+                            value.signature_id
+                        ));
+                    }
+                    CodeQueryResultValue::OverloadSelection { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [overload selection; {}] considered={} applicable={} inapplicable={} unknown={} site_ast={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.resolution,
+                            value.considered_count,
+                            value.applicable_count,
+                            value.inapplicable_count,
+                            value.unknown_count,
+                            value.site_ast_id
+                        ));
+                    }
+                    CodeQueryResultValue::CallableApplicability { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [callable applicability {}; {}]{}{}{} site_ast={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.ordinal,
+                            value.verdict,
+                            value
+                                .reason
+                                .map(|reason| format!("; {reason}"))
+                                .unwrap_or_default(),
+                            value
+                                .tier
+                                .map(|tier| format!("; tier {tier}"))
+                                .unwrap_or_default(),
+                            if value.selected { "; selected" } else { "" },
+                            value.site_ast_id
+                        ));
+                    }
                     CodeQueryResultValue::MemberSelection { value } => {
                         out.push_str(&format!(
                             "[member selection; {}; {}; {}] `{}` selected={} candidates={} site_ast={}\n",
@@ -664,5 +751,24 @@ fn line_span_label(start_line: usize, end_line: usize) -> String {
         start_line.to_string()
     } else {
         format!("{start_line}-{end_line}")
+    }
+}
+
+/// The arity a signature row states, rendered as a range when defaults make
+/// one, with a trailing `+` for a repeating trailing parameter. An arity the
+/// language never recorded renders as `unrecorded` rather than as `0`.
+fn arity_label(value: &CodeQueryCallableSignature) -> String {
+    let (Some(required), Some(total)) = (value.required_arity, value.total_arity) else {
+        return "unrecorded".to_owned();
+    };
+    let range = if required == total {
+        total.to_string()
+    } else {
+        format!("{required}..{total}")
+    };
+    if value.repeated {
+        format!("{range}+")
+    } else {
+        range
     }
 }

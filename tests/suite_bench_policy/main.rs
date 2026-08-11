@@ -31,6 +31,7 @@ mod policy_loading_workspace;
 mod policy_loop_invariant_sort;
 mod policy_match_evaluation;
 mod policy_materialization_assertions;
+mod policy_overload_selection_trio;
 mod policy_relational_assertions;
 mod policy_rendering;
 mod policy_resolution_assertions;

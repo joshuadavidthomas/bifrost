@@ -343,6 +343,22 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryCallShapeArgument>,
     },
+    CallableSignature {
+        #[serde(flatten)]
+        value: Box<CodeQueryCallableSignature>,
+    },
+    SignatureParameter {
+        #[serde(flatten)]
+        value: Box<CodeQuerySignatureParameter>,
+    },
+    CallableApplicability {
+        #[serde(flatten)]
+        value: Box<CodeQueryCallableApplicability>,
+    },
+    OverloadSelection {
+        #[serde(flatten)]
+        value: Box<CodeQueryOverloadSelection>,
+    },
     MemberSelection {
         #[serde(flatten)]
         value: Box<CodeQueryMemberSelection>,

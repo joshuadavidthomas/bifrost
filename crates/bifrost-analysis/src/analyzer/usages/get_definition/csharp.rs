@@ -3,6 +3,9 @@ use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::csharp::{graph_support, hierarchy};
 use crate::analyzer::structural::{PrecedenceTier, RejectionReason};
 use crate::analyzer::tree_walk::node_for_exact_range;
+use crate::analyzer::usages::applicability::{
+    ApplicabilityOutcome, CandidateApplicability, arity_verdict,
+};
 use crate::analyzer::usages::common::same_node;
 use crate::analyzer::usages::csharp_graph::{
     canonical_builtin_type_identity, csharp_extension_invocation_return_type_fq_name_in_session,
@@ -17,7 +20,9 @@ use crate::analyzer::{
     csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
     csharp_normalize_full_name, csharp_source_identifier,
 };
-use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_core::analyzer::structural::callable::{
+    ApplicabilityVerdict, CallableRejectionReason,
+};
 use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
 use brokk_bifrost_csharp::graph_support::CSharpSource;
 use brokk_bifrost_csharp::syntax::{
@@ -2240,18 +2245,26 @@ fn csharp_member_outcome(
     }
     sort_units(&mut direct_candidates);
     direct_candidates.dedup();
-    let direct_candidates = csharp_filter_candidates_by_generic_arity(
+    // One applicability computation decides what the walk binds and what it
+    // reports (#1478 M3): `winners` is the production filter, `verdicts` is the
+    // evidence, and neither can drift from the other. C# refuses on two axes,
+    // so the two checks are chained rather than run independently -- a
+    // candidate the explicit type-argument check discarded keeps that reason
+    // instead of reaching the trace unattributed.
+    let generic =
+        csharp_generic_arity_applicability(definitions, &direct_candidates, explicit_generic_arity);
+    let direct_candidates = generic.winners.clone();
+    let applicability = generic.then(csharp_candidate_applicability(
+        analyzer,
         definitions,
         &direct_candidates,
-        explicit_generic_arity,
-    );
-    let applicable =
-        csharp_filter_candidates_by_arity(analyzer, definitions, &direct_candidates, arity);
-    if !applicable.is_empty() {
+        arity,
+    ));
+    if !applicability.winners.is_empty() {
         if let Some(state) = member_trace.as_ref() {
-            state.stage_selection(&applicable, csharp_winner_applicability(arity));
+            state.stage_selection(&applicability, &applicability.winners);
         }
-        return candidates_outcome(applicable);
+        return candidates_outcome(applicability.winners);
     }
     let mut fallback_candidates = direct_candidates;
 
@@ -2302,18 +2315,23 @@ fn csharp_member_outcome(
             }
             sort_units(&mut level_candidates);
             level_candidates.dedup();
-            let level_candidates = csharp_filter_candidates_by_generic_arity(
+            let level_generic = csharp_generic_arity_applicability(
                 definitions,
                 &level_candidates,
                 explicit_generic_arity,
             );
-            let applicable =
-                csharp_filter_candidates_by_arity(analyzer, definitions, &level_candidates, arity);
-            if !applicable.is_empty() {
+            let level_candidates = level_generic.winners.clone();
+            let level_applicability = level_generic.then(csharp_candidate_applicability(
+                analyzer,
+                definitions,
+                &level_candidates,
+                arity,
+            ));
+            if !level_applicability.winners.is_empty() {
                 if let Some(state) = member_trace.as_ref() {
-                    state.stage_selection(&applicable, csharp_winner_applicability(arity));
+                    state.stage_selection(&level_applicability, &level_applicability.winners);
                 }
-                return candidates_outcome(applicable);
+                return candidates_outcome(level_applicability.winners);
             }
             if fallback_candidates.is_empty() && !level_candidates.is_empty() {
                 fallback_candidates = level_candidates;
@@ -2330,8 +2348,10 @@ fn csharp_member_outcome(
             // Discarded, never bound: the arity filter accepted none of them,
             // and the inverse usage scan refuses such a site for exactly the
             // same reason (#1797). Record the discard while the walk still
-            // knows the rows.
-            state.stage_selection(&fallback_candidates, ApplicabilityVerdict::Inapplicable);
+            // knows the rows, with the reason the filter itself produced.
+            let discarded =
+                csharp_candidate_applicability(analyzer, definitions, &fallback_candidates, arity);
+            state.stage_selection(&discarded, &[]);
         }
         // An overload whose parameter list cannot accept this argument list is
         // not the target. When the receiver's own hierarchy leaves the indexed
@@ -2445,17 +2465,6 @@ fn csharp_object_declares_overload(member: &str, arity: Option<usize>) -> bool {
     OBJECT_MEMBERS
         .iter()
         .any(|(name, arities)| *name == member && arities.contains(&arity))
-}
-
-/// The verdict a winning C# member candidate carries: the member seams check
-/// the call's argument count and nothing else about the call, so an unknown
-/// arity leaves the callable axis (#1478) unclaimed.
-fn csharp_winner_applicability(arity: Option<usize>) -> ApplicabilityVerdict {
-    if arity.is_some() {
-        ApplicabilityVerdict::Applicable
-    } else {
-        ApplicabilityVerdict::Unknown
-    }
 }
 
 /// Where the C# member walk found one candidate: the exact type it read the
@@ -2610,11 +2619,20 @@ impl CSharpMemberTrace {
     /// explicit type-argument count or the argument count -- whose structured
     /// story belongs to the callable axis (#1478), so the reason defers to it.
     ///
-    /// This runs only on a return that constructs an outcome from `winners`.
-    /// A member walk that resolves nothing stages nothing, because the caller
-    /// re-runs the walk with a wider fallback and the reference's real answer
-    /// may still come from a different seam entirely.
-    fn stage_selection(&self, winners: &[CodeUnit], applicability: ApplicabilityVerdict) {
+    /// `applicability` is the *same* value the caller used to decide what to
+    /// bind (#1478 M3), so a loser's reason is the reason the filter acted on.
+    /// `winners` is what the seam actually returns: the bound candidates on a
+    /// return that constructs an outcome, and empty where the walk discarded a
+    /// whole level. An empty `winners` therefore stages no attribution, only
+    /// the rejected rows, because the reference's real answer may still come
+    /// from a different seam entirely.
+    fn stage_selection(&self, applicability: &ApplicabilityOutcome, winners: &[CodeUnit]) {
+        let verdict_of = |unit: &CodeUnit| {
+            applicability
+                .verdicts
+                .iter()
+                .find(|verdict| verdict.candidate == *unit)
+        };
         for loser in self
             .considered
             .iter()
@@ -2625,6 +2643,12 @@ impl CSharpMemberTrace {
                 self.precedence_tier(loser),
                 RejectionReason::CallableApplicabilityDeferred,
             );
+            if let Some(verdict) = verdict_of(loser) {
+                row = row.with_callable(trace::CallableApplicabilityRecord {
+                    verdict: verdict.verdict,
+                    reason: verdict.reason,
+                });
+            }
             if let Some(enrichment) = self.enrichment(loser, ApplicabilityVerdict::Inapplicable) {
                 row = row.with_member(enrichment);
             }
@@ -2641,8 +2665,27 @@ impl CSharpMemberTrace {
             winners
                 .iter()
                 .filter_map(|unit| {
+                    let applicability = verdict_of(unit)
+                        .map(|verdict| verdict.verdict)
+                        .unwrap_or(ApplicabilityVerdict::Unknown);
                     self.enrichment(unit, applicability)
                         .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+        trace::stage_callable_context(
+            winners
+                .iter()
+                .filter_map(|unit| {
+                    verdict_of(unit).map(|verdict| {
+                        (
+                            unit.fq_name(),
+                            trace::CallableApplicabilityRecord {
+                                verdict: verdict.verdict,
+                                reason: verdict.reason,
+                            },
+                        )
+                    })
                 })
                 .collect(),
         );
@@ -2801,57 +2844,103 @@ fn csharp_identifier_allows_type_fallback(node: Node<'_>) -> bool {
         && csharp_member_access_receiver(parent).is_some_and(|receiver| same_node(receiver, node))
 }
 
+/// The one C# call-shape applicability check (#1478 M3): the candidates the
+/// resolver's arity filter admits and the typed verdict for every candidate it
+/// considered.
+///
+/// Three states are distinct here, and each is preserved exactly as the filter
+/// has always treated it.
+///
+/// A non-callable member declares no parameter list: a delegate-valued property
+/// or field is invoked through its own type's signature, which this side does
+/// not read. The inverse scan gates such a target on nothing but its name
+/// (`TargetSpec::callable_arity` is `None` for a field), so neither does this
+/// side -- otherwise the two disagree about every `configuration.Select(1)`
+/// site. It is admitted, and its verdict is `unknown` because no parameter list
+/// was measured.
+///
+/// A candidate the scope budget stopped on is not a verdict about its parameter
+/// list at all. It is not admitted, exactly as before, and records `unknown`
+/// rather than a rejection nobody computed.
+///
+/// A callable whose parameter list C# never recorded is compared against a
+/// defaulted zero arity, which is a language-side choice this factoring
+/// preserves rather than changes: the row states the refusal the resolver acted
+/// on. See the plan's Surprises entry.
+fn csharp_candidate_applicability(
+    analyzer: &dyn IAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    candidates: &[CodeUnit],
+    arity: Option<usize>,
+) -> ApplicabilityOutcome {
+    let Some(expected) = arity else {
+        return ApplicabilityOutcome::undecidable(candidates);
+    };
+    let mut winners = Vec::new();
+    let mut verdicts = Vec::new();
+    for unit in candidates {
+        if !definitions.scope_step() {
+            verdicts.push(CandidateApplicability::unknown(unit.clone()));
+            continue;
+        }
+        if !unit.is_function() {
+            winners.push(unit.clone());
+            verdicts.push(CandidateApplicability::unknown(unit.clone()));
+            continue;
+        }
+        let declared = definitions
+            .query(|| csharp_callable_arity(analyzer, unit))
+            .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0));
+        let verdict = arity_verdict(unit, Some(&[declared]), expected);
+        if verdict.verdict != ApplicabilityVerdict::Inapplicable {
+            winners.push(unit.clone());
+        }
+        verdicts.push(verdict);
+    }
+    ApplicabilityOutcome { winners, verdicts }
+}
+
 fn csharp_filter_candidates_by_arity(
     analyzer: &dyn IAnalyzer,
     definitions: &CSharpDefinitionProvider<'_>,
     candidates: &[CodeUnit],
     arity: Option<usize>,
 ) -> Vec<CodeUnit> {
-    let Some(expected) = arity else {
-        return candidates.to_vec();
-    };
-    candidates
-        .iter()
-        .filter(|unit| {
-            if !definitions.scope_step() {
-                return false;
-            }
-            // A non-callable member declares no parameter list: a
-            // delegate-valued property or field is invoked through its own
-            // type's signature, which this side does not read. The inverse scan
-            // gates such a target on nothing but its name
-            // (`TargetSpec::callable_arity` is `None` for a field), so neither
-            // does this side -- otherwise the two disagree about every
-            // `configuration.Select(1)` site.
-            if !unit.is_function() {
-                return true;
-            }
-            definitions
-                .query(|| csharp_callable_arity(analyzer, unit))
-                .unwrap_or_else(|| crate::analyzer::CallableArity::exact(0))
-                .accepts(expected)
-        })
-        .cloned()
-        .collect()
+    csharp_candidate_applicability(analyzer, definitions, candidates, arity).winners
 }
 
-fn csharp_filter_candidates_by_generic_arity(
+/// The explicit type-argument check, on the same one-pass shape.
+///
+/// A method reference written `Convert<int>` names a generic arity, and a
+/// candidate whose declared type-parameter count differs is not that method.
+/// The verdict says exactly that, which is what separates this refusal from a
+/// value-argument mismatch in a row a policy reads.
+fn csharp_generic_arity_applicability(
     definitions: &CSharpDefinitionProvider<'_>,
     candidates: &[CodeUnit],
     explicit_generic_arity: Option<usize>,
-) -> Vec<CodeUnit> {
-    candidates
-        .iter()
-        .filter(|unit| {
-            if !definitions.scope_step() {
-                return false;
-            }
-            explicit_generic_arity.is_none_or(|arity| {
-                unit.is_function() && csharp_method_generic_arity(unit.signature()) == arity
-            })
-        })
-        .cloned()
-        .collect()
+) -> ApplicabilityOutcome {
+    let Some(expected) = explicit_generic_arity else {
+        return ApplicabilityOutcome::undecidable(candidates);
+    };
+    let mut winners = Vec::new();
+    let mut verdicts = Vec::new();
+    for unit in candidates {
+        if !definitions.scope_step() {
+            verdicts.push(CandidateApplicability::unknown(unit.clone()));
+            continue;
+        }
+        if unit.is_function() && csharp_method_generic_arity(unit.signature()) == expected {
+            winners.push(unit.clone());
+            verdicts.push(CandidateApplicability::applicable(unit.clone()));
+        } else {
+            verdicts.push(CandidateApplicability::inapplicable(
+                unit.clone(),
+                CallableRejectionReason::TypeArgumentArityMismatch,
+            ));
+        }
+    }
+    ApplicabilityOutcome { winners, verdicts }
 }
 
 #[derive(Clone, Copy)]

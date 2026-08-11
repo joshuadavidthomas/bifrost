@@ -5,6 +5,9 @@ use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
 };
+use brokk_bifrost_core::analyzer::structural::callable::{
+    CallKind, CallSiteContext, CallSiteFacts,
+};
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
@@ -17,7 +20,7 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
+    CALLABLE_APPLICABILITY_ONLY_SUPPORT, LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityAxis, IdentityRouteSupport, RouteHopKind,
@@ -288,6 +291,19 @@ impl StructuralSpec for CSharpStructuralSpec {
             || variable_declarator_value(node).is_some()
     }
 
+    /// C# spells object creation as its own grammar node, so a constructor
+    /// call is a node-type reading (#1478). Named arguments already reach the
+    /// shared arena as keyword roles and need no classification here.
+    fn call_site_facts(
+        &self,
+        node: Node<'_>,
+        _source: &str,
+        _context: &CallSiteContext,
+    ) -> Option<CallSiteFacts> {
+        (node.kind() == "object_creation_expression")
+            .then(|| CallSiteFacts::of_kind(CallKind::Constructor))
+    }
+
     /// C# has not learned occurrence-role classification yet (#1473).
     /// The empty table is the honest answer: queries and assertions that ask
     /// for an occurrence role here report incomplete rather than clean-empty.
@@ -296,7 +312,10 @@ impl StructuralSpec for CSharpStructuralSpec {
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        &NO_LEXICAL_ENVIRONMENT_SUPPORT
+        // C# classifies no scopes, binding intervals, import binders or
+        // package clause, but its member walk reports per-candidate callable
+        // applicability (#1478 M3). The per-axis table states exactly that.
+        &CALLABLE_APPLICABILITY_ONLY_SUPPORT
     }
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {

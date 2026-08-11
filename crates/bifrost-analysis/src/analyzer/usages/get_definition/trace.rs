@@ -40,7 +40,9 @@ use crate::analyzer::structural::resolution::{
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile};
 use crate::cancellation::CancellationToken;
-use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_core::analyzer::structural::callable::{
+    ApplicabilityVerdict, CallableRejectionReason,
+};
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -122,6 +124,26 @@ pub struct MemberEnrichment {
     pub route: Vec<HierarchyHopRecord>,
 }
 
+/// Callable-applicability attribution for one candidate (#1478): whether the
+/// candidate's declared parameter list accepts this call site's argument shape,
+/// and the typed reason it does not.
+///
+/// This is the callable axis, and it is deliberately separate from
+/// [`MemberEnrichment`]'s `applicability`, which is the member axis #1477
+/// recorded: a constructor call or a free-function call has no member walk at
+/// all and still has an applicability answer. A candidate without this record
+/// is unattributed on the callable axis, never applicable.
+///
+/// The record is produced by the same function that produced the resolver's
+/// winners -- see `crate::analyzer::usages::applicability` -- so the rows and
+/// the binding cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallableApplicabilityRecord {
+    pub verdict: ApplicabilityVerdict,
+    /// Set only when `verdict` is [`ApplicabilityVerdict::Inapplicable`].
+    pub reason: Option<CallableRejectionReason>,
+}
+
 /// One candidate the resolver considered for one reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceCandidate {
@@ -139,6 +161,9 @@ pub struct TraceCandidate {
     /// Member-selection attribution, present only when the seam that recorded
     /// the candidate is a member lookup that knows its owner and route.
     pub member: Option<Box<MemberEnrichment>>,
+    /// Callable-applicability attribution (#1478), present only when the seam
+    /// that recorded the candidate ran the language's own call-shape check.
+    pub callable: Option<CallableApplicabilityRecord>,
 }
 
 impl TraceCandidate {
@@ -152,6 +177,7 @@ impl TraceCandidate {
             visibility: DeclaredVisibility::Unknown,
             external_target: None,
             member: None,
+            callable: None,
         }
     }
 
@@ -169,6 +195,7 @@ impl TraceCandidate {
             visibility: DeclaredVisibility::Unknown,
             external_target: None,
             member: None,
+            callable: None,
         }
     }
 
@@ -179,6 +206,11 @@ impl TraceCandidate {
 
     pub fn with_member(mut self, member: MemberEnrichment) -> Self {
         self.member = Some(Box::new(member));
+        self
+    }
+
+    pub fn with_callable(mut self, callable: CallableApplicabilityRecord) -> Self {
+        self.callable = Some(callable);
         self
     }
 
@@ -297,11 +329,21 @@ struct PendingMemberContext {
     by_fq_name: Vec<(String, MemberEnrichment)>,
 }
 
+/// Callable-applicability attribution an applicability check has staged for the
+/// outcome constructor it is about to reach (#1478), keyed by the candidate's
+/// fully-qualified name. Consumed under the same discipline as
+/// [`PendingMemberContext`].
+#[derive(Debug, Clone, Default)]
+struct PendingCallableContext {
+    by_fq_name: Vec<(String, CallableApplicabilityRecord)>,
+}
+
 #[derive(Debug, Default)]
 struct Recorder {
     candidates: Vec<TraceCandidate>,
     pending: Option<PendingSelection>,
     pending_member: Option<PendingMemberContext>,
+    pending_callable: Option<PendingCallableContext>,
     /// The reference name the currently instrumented deep path is resolving.
     /// Deep emission sites compare against it so that a nested lookup for a
     /// different name (a receiver type, an owner) cannot be attributed to this
@@ -345,6 +387,29 @@ pub(crate) fn stage_member_context(by_fq_name: Vec<(String, MemberEnrichment)>) 
     with_recorder(|recorder| {
         recorder.pending_member = Some(PendingMemberContext { by_fq_name });
     });
+}
+
+/// Stage callable-applicability attribution for the next outcome constructor
+/// whose candidates the map names (#1478). Callers guard with [`recording`]
+/// before building the entries.
+pub(crate) fn stage_callable_context(by_fq_name: Vec<(String, CallableApplicabilityRecord)>) {
+    with_recorder(|recorder| {
+        recorder.pending_callable = Some(PendingCallableContext { by_fq_name });
+    });
+}
+
+/// Take the staged callable attribution for `unit` if the staged map names it.
+fn take_callable_for(
+    recorder: &mut Recorder,
+    unit: &CodeUnit,
+) -> Option<CallableApplicabilityRecord> {
+    let pending = recorder.pending_callable.as_ref()?;
+    let fq = unit.fq_name();
+    pending
+        .by_fq_name
+        .iter()
+        .find(|(name, _)| *name == fq)
+        .map(|(_, record)| *record)
 }
 
 /// The member attribution the walk that ran most recently staged, exactly as it
@@ -434,6 +499,7 @@ impl TraceSession {
         with_recorder(|recorder| {
             recorder.pending = None;
             recorder.pending_member = None;
+            recorder.pending_callable = None;
             std::mem::take(&mut recorder.candidates)
         })
         .unwrap_or_default()
@@ -465,12 +531,16 @@ pub(super) fn record_selected_units(outcome: &DefinitionLookupOutcome) {
                 if let Some(enrichment) = take_member_for(recorder, unit) {
                     row = row.with_member(enrichment);
                 }
+                if let Some(record) = take_callable_for(recorder, unit) {
+                    row = row.with_callable(record);
+                }
                 row
             })
             .collect();
         // The staged member context belonged to this lookup whether or not it
         // matched; a stale map must never attribute a later, unrelated lookup.
         recorder.pending_member = None;
+        recorder.pending_callable = None;
         rows
     })
     .unwrap_or_default();

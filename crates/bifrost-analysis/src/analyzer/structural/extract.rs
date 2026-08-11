@@ -6,6 +6,7 @@
 //! inverted-edge builders treat their per-file trees.
 
 use super::facts::{FileFacts, NormalizedNode};
+use super::kinds::NormalizedKind;
 use super::occurrences::OccurrenceRole;
 use super::spec::{CompiledKinds, RoleSink, RoleSinkStop, StructuralSpec};
 use crate::cancellation::CancellationToken;
@@ -103,6 +104,10 @@ pub(crate) fn extract_file_facts_limited(
         };
     };
     let compiled = CompiledKinds::compile(grammar, spec.kind_table());
+    // One per-file scan, before any call site is classified: a language whose
+    // call shapes depend on file-wide facts (C/C++ function-like macros) reads
+    // the whole tree once here instead of once per call.
+    let call_site_context = spec.call_site_context(tree.root_node(), source);
 
     // Pass 1: create facts in pre-order with parent links, and remember which
     // tree-sitter node produced each fact so pass 2 can resolve role targets.
@@ -147,6 +152,9 @@ pub(crate) fn extract_file_facts_limited(
                         parent: enclosing,
                         name: None,
                         subtree_end: fact_id + 1,
+                        call_site: (kind == NormalizedKind::Call)
+                            .then(|| spec.call_site_facts(node, source, &call_site_context))
+                            .flatten(),
                     });
                     fact_by_ts_node.insert(node.id(), fact_id);
                     fact_sources.push(Some(node));
@@ -193,6 +201,8 @@ pub(crate) fn extract_file_facts_limited(
                             parent: Some(fact_id),
                             name: None,
                             subtree_end: embedded_id + 1,
+                            // An embedded leaf fact is never a call site.
+                            call_site: None,
                         });
                         fact_sources.push(None);
                         embedded_occurrence_roles.push((embedded_id, fact.occurrence_role));

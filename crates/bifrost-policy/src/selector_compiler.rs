@@ -526,6 +526,65 @@ pub(super) fn selected_site_quality(
                     )
                 },
             ),
+            // A signature row is proven evidence of what the analyzer
+            // persisted, but it is only complete when the language actually
+            // recorded an arity. An `arity_unrecorded` or `unrecorded` row
+            // must turn an exact-arity assertion unreliable rather than clean.
+            CodeQueryResultValue::CallableSignature { value } => (
+                ProofStatus::Proven,
+                if value.coverage == "exact" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        format!("callable signature coverage is {}", value.coverage).into(),
+                    )
+                },
+            ),
+            // A parameter row whose optionality the language never recorded
+            // cannot support a required-versus-optional claim.
+            CodeQueryResultValue::SignatureParameter { value } => (
+                ProofStatus::Proven,
+                if value.optional.is_some() {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        "declared parameter optionality is unrecorded".into(),
+                    )
+                },
+            ),
+            // An overload-selection summary is proven evidence of what the
+            // resolver considered, but it is complete only when every verdict
+            // was decidable. `unknown_shape` -- an unsupported language, an
+            // untraced site, or any undecidable candidate -- must turn an
+            // exact-cardinality assertion over the site unreliable rather than
+            // clean.
+            CodeQueryResultValue::OverloadSelection { value } => (
+                ProofStatus::Proven,
+                if value.resolution == "unknown_shape" {
+                    EvidenceCompleteness::Partial(
+                        if value.supported {
+                            "overload selection is undecidable at this site"
+                        } else {
+                            "this language does not report callable applicability"
+                        }
+                        .into(),
+                    )
+                } else {
+                    EvidenceCompleteness::Complete
+                },
+            ),
+            // A candidate whose applicability nobody could decide cannot
+            // support an applicable-or-not claim.
+            CodeQueryResultValue::CallableApplicability { value } => (
+                ProofStatus::Proven,
+                if value.verdict == "unknown" {
+                    EvidenceCompleteness::Partial(
+                        "candidate applicability is undecided".into(),
+                    )
+                } else {
+                    EvidenceCompleteness::Complete
+                },
+            ),
             CodeQueryResultValue::CallArgumentGroup { .. }
             | CodeQueryResultValue::CallArgument { .. } => (
                 ProofStatus::Proven,
