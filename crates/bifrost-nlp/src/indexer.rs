@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, mpsc};
@@ -436,7 +436,7 @@ fn worker_loop(
             IndexerMsg::Gc(done) => {
                 // Forced, unthrottled; reply on the request's channel and skip
                 // the readiness bookkeeping (gc doesn't affect query freshness).
-                done.send(run_gc(&store, &repo)).ok();
+                done.send(run_gc(&store, &repo, &workspace_root)).ok();
                 continue;
             }
             IndexerMsg::FullBuild(snapshot) => {
@@ -476,7 +476,7 @@ fn worker_loop(
         // walk can take minutes on a large repo, so running it here (not inside the build)
         // keeps it off the path `wait_ready` and queries block on. Memory is bounded by
         // run_gc's cache intersection.
-        maybe_gc(&store, &repo);
+        maybe_gc(&store, &repo, &workspace_root);
     }
 }
 
@@ -679,11 +679,20 @@ fn language_of(file: &ProjectFile) -> Option<String> {
 }
 
 /// Forced shared GC for explicit maintenance requests.
-fn run_gc(store: &SemanticStore, repo: &git2::Repository) -> Result<(), String> {
-    brokk_bifrost_analysis::cache_gc::force_gc_for_semantic(store.db_path(), repo).map(|_| ())
+fn run_gc(
+    store: &SemanticStore,
+    repo: &git2::Repository,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    brokk_bifrost_analysis::cache_gc::force_gc_for_semantic(store.db_path(), repo, workspace_root)
+        .map(|_| ())
 }
 
 /// Best-effort throttled GC run after a full build; errors are swallowed.
-fn maybe_gc(store: &SemanticStore, repo: &git2::Repository) {
-    let _ = brokk_bifrost_analysis::cache_gc::maybe_gc_for_semantic(store.db_path(), repo);
+fn maybe_gc(store: &SemanticStore, repo: &git2::Repository, workspace_root: &Path) {
+    let _ = brokk_bifrost_analysis::cache_gc::maybe_gc_for_semantic(
+        store.db_path(),
+        repo,
+        workspace_root,
+    );
 }
