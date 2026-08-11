@@ -49,6 +49,9 @@ use crate::analyzer::structural::{
     HierarchyRelation, MemberDispatchTier, PrecedenceTier, RejectionReason,
 };
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
+use crate::analyzer::usages::applicability::{
+    ApplicabilityOutcome, arity_applicability_over_entries,
+};
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{BoundedDefinitionLookup, ForwardQueryProvider, SignatureMetadata};
@@ -1016,11 +1019,33 @@ impl<'a> KotlinCtx<'a> {
             .collect()
     }
 
-    /// Whether a member declaration can answer a call of `arity`. A property is
-    /// never rejected on a call shape: what it holds decides that, not the
-    /// property's own declaration.
-    fn member_accepts_arity(&self, unit: &CodeUnit, arity: Option<usize>) -> bool {
-        arity.is_none_or(|arity| !unit.is_function() || self.accepts_arity(unit, arity))
+    /// The one Kotlin member applicability check (#1478 M3): the winners the
+    /// walk binds and the per-candidate verdict, from one pass.
+    ///
+    /// Two candidates are undecidable rather than accepted, and the distinction
+    /// is the point. A property is never rejected on a call shape -- what it
+    /// holds decides that, not the property's own declaration -- and a callable
+    /// whose parameter list nothing recorded is an absence of evidence, which
+    /// must not become a confident rejection. Both stay reachable, and both say
+    /// `unknown` rather than `applicable`.
+    fn member_applicability(
+        &self,
+        candidates: &[CodeUnit],
+        arity: Option<usize>,
+    ) -> ApplicabilityOutcome {
+        arity_applicability_over_entries(candidates, arity, |unit| {
+            if !unit.is_function() {
+                return None;
+            }
+            let metadata = self.signature_metadata(unit);
+            if metadata.is_empty() {
+                return None;
+            }
+            metadata
+                .iter()
+                .map(|entry| entry.callable_arity())
+                .collect::<Option<Vec<_>>>()
+        })
     }
 
     /// The innermost class-like declaration enclosing `byte` in the requesting
@@ -1973,8 +1998,6 @@ fn kotlin_member_candidates(
     arity: Option<usize>,
     site_byte: usize,
 ) -> Vec<CodeUnit> {
-    use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
-
     let mut member_trace = trace::recording().then(KotlinMemberTrace::default);
     for required_arity in [arity, None] {
         let mut seen = Vec::new();
@@ -1997,33 +2020,21 @@ fn kotlin_member_candidates(
                     owners.extend(companions);
                 }
                 for scope in owners {
-                    let mut found = Vec::new();
-                    let mut inapplicable = Vec::new();
-                    for unit in ctx.member_declarations(&format!("{}.{member}", scope.fq_name())) {
-                        if ctx.member_accepts_arity(&unit, required_arity) {
-                            found.push(unit);
-                        } else if member_trace.is_some() {
-                            // Computed by the walk and discarded on the call
-                            // shape alone: a row, not a silence (#1477 rule 5).
-                            inapplicable.push(unit);
-                        }
-                    }
+                    // One applicability computation decides what the walk binds
+                    // and what it reports (#1478 M3). The survivors are the
+                    // candidates the check did not refuse, which is exactly
+                    // what the per-unit filter this replaced returned.
+                    let declarations =
+                        ctx.member_declarations(&format!("{}.{member}", scope.fq_name()));
+                    let applicability = ctx.member_applicability(&declarations, required_arity);
+                    let found = applicability.winners.clone();
                     if let Some(state) = member_trace.as_mut() {
-                        state.record_found(&found, &scope, level);
-                        state.record_found(&inapplicable, &scope, level);
-                        state.record_inapplicable(&receiver.owner, &inapplicable);
+                        state.record_found(&declarations, &scope, level);
+                        state.record_inapplicable(&receiver.owner, &applicability);
                     }
                     if !found.is_empty() {
                         if let Some(state) = member_trace.as_ref() {
-                            state.stage_selection(
-                                &receiver.owner,
-                                &found,
-                                if required_arity.is_some() {
-                                    ApplicabilityVerdict::Applicable
-                                } else {
-                                    ApplicabilityVerdict::Unknown
-                                },
-                            );
+                            state.stage_selection(&receiver.owner, &applicability, &found);
                         }
                         return found;
                     }
@@ -2204,15 +2215,23 @@ impl KotlinMemberTrace {
     /// they cannot accept the call's argument list. The structured story of an
     /// argument-list mismatch belongs to the callable axis (#1478), so the
     /// rejection reason defers to it.
-    fn record_inapplicable(&self, base: &CodeUnit, losers: &[CodeUnit]) {
+    fn record_inapplicable(&self, base: &CodeUnit, applicability: &ApplicabilityOutcome) {
         use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 
-        for loser in losers {
+        for verdict in &applicability.verdicts {
+            if verdict.verdict != ApplicabilityVerdict::Inapplicable {
+                continue;
+            }
+            let loser = &verdict.candidate;
             let mut row = trace::TraceCandidate::rejected(
                 trace::TraceCandidateRef::Unit(loser.clone()),
                 self.precedence_tier(loser),
                 RejectionReason::CallableApplicabilityDeferred,
-            );
+            )
+            .with_callable(trace::CallableApplicabilityRecord {
+                verdict: verdict.verdict,
+                reason: verdict.reason,
+            });
             if let Some(enrichment) =
                 self.enrichment(base, loser, ApplicabilityVerdict::Inapplicable)
             {
@@ -2227,9 +2246,11 @@ impl KotlinMemberTrace {
     fn stage_selection(
         &self,
         base: &CodeUnit,
+        applicability: &ApplicabilityOutcome,
         winners: &[CodeUnit],
-        applicability: brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict,
     ) {
+        use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+
         if let Some(tier) = winners
             .iter()
             .filter_map(|unit| self.precedence_tier(unit))
@@ -2237,12 +2258,37 @@ impl KotlinMemberTrace {
         {
             trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
         }
+        let verdict_of = |unit: &CodeUnit| {
+            applicability
+                .verdicts
+                .iter()
+                .find(|verdict| verdict.candidate == *unit)
+        };
         trace::stage_member_context(
             winners
                 .iter()
                 .filter_map(|unit| {
-                    self.enrichment(base, unit, applicability)
+                    let verdict = verdict_of(unit)
+                        .map(|verdict| verdict.verdict)
+                        .unwrap_or(ApplicabilityVerdict::Unknown);
+                    self.enrichment(base, unit, verdict)
                         .map(|enrichment| (unit.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+        trace::stage_callable_context(
+            winners
+                .iter()
+                .filter_map(|unit| {
+                    verdict_of(unit).map(|verdict| {
+                        (
+                            unit.fq_name(),
+                            trace::CallableApplicabilityRecord {
+                                verdict: verdict.verdict,
+                                reason: verdict.reason,
+                            },
+                        )
+                    })
                 })
                 .collect(),
         );

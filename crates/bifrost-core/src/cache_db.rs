@@ -453,8 +453,9 @@ pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
 /// writable TEMP schema permits connection-local membership and FTS tables.
 pub fn open_readonly_temp_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
+    let db_path = canonicalize_cache_db_parent(db_path)?;
     let conn = Connection::open_with_flags(
-        db_path,
+        &db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|err| format!("cache DB active-session SQLite error: {err}"))?;

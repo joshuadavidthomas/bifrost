@@ -70,6 +70,10 @@ pub enum QueryValueKind {
     CallShape,
     CallArgumentGroup,
     CallArgument,
+    CallableSignature,
+    SignatureParameter,
+    CallableApplicability,
+    OverloadSelection,
     MemberSelection,
     DispatchOutcome,
     DispatchTarget,
@@ -111,6 +115,10 @@ impl QueryValueKind {
             Self::CallShape => "call_shape",
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
+            Self::CallableSignature => "callable_signature",
+            Self::SignatureParameter => "signature_parameter",
+            Self::CallableApplicability => "callable_applicability",
+            Self::OverloadSelection => "overload_selection",
             Self::MemberSelection => "member_selection",
             Self::DispatchOutcome => "dispatch_outcome",
             Self::DispatchTarget => "dispatch_target",
@@ -266,6 +274,10 @@ pub enum QueryStep {
     CallShape,
     CallArgumentGroups,
     CallArguments,
+    CallableSignature,
+    SignatureParameters,
+    CallableApplicability,
+    OverloadSelection,
     MemberSelection,
     DispatchOutcome,
     DispatchTargets,
@@ -752,6 +764,10 @@ impl QueryStep {
             Self::CallShape => QueryStepOp::CallShape,
             Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
             Self::CallArguments => QueryStepOp::CallArguments,
+            Self::CallableSignature => QueryStepOp::CallableSignature,
+            Self::SignatureParameters => QueryStepOp::SignatureParameters,
+            Self::CallableApplicability => QueryStepOp::CallableApplicability,
+            Self::OverloadSelection => QueryStepOp::OverloadSelection,
             Self::MemberSelection => QueryStepOp::MemberSelection,
             Self::DispatchOutcome => QueryStepOp::DispatchOutcome,
             Self::DispatchTargets => QueryStepOp::DispatchTargets,
@@ -826,6 +842,10 @@ impl QueryStep {
             QueryStepOp::CallShape => Some(Self::CallShape),
             QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
             QueryStepOp::CallArguments => Some(Self::CallArguments),
+            QueryStepOp::CallableSignature => Some(Self::CallableSignature),
+            QueryStepOp::SignatureParameters => Some(Self::SignatureParameters),
+            QueryStepOp::CallableApplicability => Some(Self::CallableApplicability),
+            QueryStepOp::OverloadSelection => Some(Self::OverloadSelection),
             QueryStepOp::MemberSelection => Some(Self::MemberSelection),
             QueryStepOp::DispatchOutcome => Some(Self::DispatchOutcome),
             QueryStepOp::DispatchTargets => Some(Self::DispatchTargets),
@@ -906,6 +926,10 @@ impl QueryStep {
                 | QueryValueKind::CallShape
                 | QueryValueKind::CallArgumentGroup
                 | QueryValueKind::CallArgument
+                | QueryValueKind::CallableSignature
+                | QueryValueKind::SignatureParameter
+                | QueryValueKind::CallableApplicability
+                | QueryValueKind::OverloadSelection
                 | QueryValueKind::MemberSelection
                 | QueryValueKind::DispatchOutcome
                 | QueryValueKind::DispatchTarget
@@ -975,6 +999,18 @@ impl QueryStep {
             }
             (Self::CallArguments, QueryValueKind::CallArgumentGroup) => {
                 Some(QueryValueKind::CallArgument)
+            }
+            (Self::CallableSignature, QueryValueKind::Declaration) => {
+                Some(QueryValueKind::CallableSignature)
+            }
+            (Self::SignatureParameters, QueryValueKind::CallableSignature) => {
+                Some(QueryValueKind::SignatureParameter)
+            }
+            (Self::CallableApplicability, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::CallableApplicability)
+            }
+            (Self::OverloadSelection, QueryValueKind::Occurrence) => {
+                Some(QueryValueKind::OverloadSelection)
             }
             (Self::MemberSelection, QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::MemberSelection)
@@ -1122,6 +1158,9 @@ pub(super) fn validate_query_steps(
             QueryStep::CallShape => "structural_match, call_site, or occurrence",
             QueryStep::CallArgumentGroups => "call_shape",
             QueryStep::CallArguments => "call_argument_group",
+            QueryStep::CallableSignature => "declaration",
+            QueryStep::SignatureParameters => "callable_signature",
+            QueryStep::CallableApplicability | QueryStep::OverloadSelection => "occurrence",
             QueryStep::MemberSelection => "occurrence",
             QueryStep::DispatchOutcome | QueryStep::DispatchTargets => {
                 "structural_match, call_site, reference_site, or occurrence"

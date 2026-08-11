@@ -847,6 +847,41 @@ fn occurrence_filter_help_and_value_diagnostics_are_range_precise() {
     }
 }
 
+/// The callable-signature row wrappers hover from the same registry that
+/// parses them, and live validation accepts the wrapper chain and rejects a
+/// misspelling with a range-precise diagnostic (#1478 M2).
+#[test]
+fn callable_signature_form_help_and_diagnostics_are_range_precise() {
+    let rql = "(signature-parameters (callable-signature (enclosing-decl (method))))";
+    for token in ["signature-parameters", "callable-signature"] {
+        let offset = rql.find(token).unwrap();
+        let help =
+            query_source_help_at(rql, offset).unwrap_or_else(|| panic!("no help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(
+        validate_query_source(rql).is_empty(),
+        "{rql}: {:#?}",
+        validate_query_source(rql)
+    );
+
+    // The underscore spelling is the same form.
+    let underscored = "(signature_parameters (callable_signature (enclosing-decl (method))))";
+    assert!(
+        validate_query_source(underscored).is_empty(),
+        "{underscored}: {:#?}",
+        validate_query_source(underscored)
+    );
+
+    let misspelled = "(callable-signatures (enclosing-decl (method)))";
+    let diagnostic = validate_query_source(misspelled)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-form")
+        .expect("unknown-form diagnostic");
+    assert_eq!(&misspelled[diagnostic.range.clone()], "callable-signatures");
+}
+
 /// Materialization filters are validated against the registries in both
 /// frontends, and hover reaches every option keyword (#1476).
 #[test]

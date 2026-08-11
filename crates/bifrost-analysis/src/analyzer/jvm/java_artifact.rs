@@ -202,7 +202,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::PythonStub
                 | ExternalArtifactKind::PythonSource
                 | ExternalArtifactKind::RubyGemArchive
-                | ExternalArtifactKind::ComposerPackageSourceSet => false,
+                | ExternalArtifactKind::ComposerPackageSourceSet
+                | ExternalArtifactKind::CppHeaderSourceSet => false,
             };
             if !selected {
                 continue;
@@ -222,7 +223,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::PythonStub
                 | ExternalArtifactKind::PythonSource
                 | ExternalArtifactKind::RubyGemArchive
-                | ExternalArtifactKind::ComposerPackageSourceSet => unreachable!(),
+                | ExternalArtifactKind::ComposerPackageSourceSet
+                | ExternalArtifactKind::CppHeaderSourceSet => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
             if entry.size() > entry_limit || next_total > MAX_TOTAL_ARCHIVE_BYTES {
@@ -287,7 +289,8 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::PythonStub
                 | ExternalArtifactKind::PythonSource
                 | ExternalArtifactKind::RubyGemArchive
-                | ExternalArtifactKind::ComposerPackageSourceSet => unreachable!(),
+                | ExternalArtifactKind::ComposerPackageSourceSet
+                | ExternalArtifactKind::CppHeaderSourceSet => unreachable!(),
             }
         }
         if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {

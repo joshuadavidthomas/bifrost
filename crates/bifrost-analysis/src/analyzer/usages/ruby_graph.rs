@@ -5,6 +5,7 @@
 //! returned in the unproven usage tier so callers can treat them as
 //! inconclusive evidence instead of query failure.
 
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
@@ -71,10 +72,16 @@ where
 {
     let language = tree_sitter_ruby::LANGUAGE.into();
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            let support = analyzer.global_usage_definition_index();
-            brokk_bifrost_ruby::graph::inverted::scan_file(graph, ruby, &support, file, input)
-        })
+        parse_and_collect(
+            analyzer,
+            file,
+            nodes,
+            ParseSpec::whole(&language),
+            |input| {
+                let support = analyzer.global_usage_definition_index();
+                brokk_bifrost_ruby::graph::inverted::scan_file(graph, ruby, &support, file, input)
+            },
+        )
     })
 }
 

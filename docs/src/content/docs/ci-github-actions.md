@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: BrokkAi/bifrost/.github/actions/policy-scan@v0.8.24
+      - uses: BrokkAi/bifrost/.github/actions/policy-scan@v0.9.1
 ```
 
 The default configuration installs the pinned Bifrost release, runs the `bifrost.code-smells` pack on the checkout, writes `bifrost-policy.sarif`, uploads it, and gates on the exit code.
@@ -58,7 +58,13 @@ The gate distinguishes three results:
 | `cache` | `true` | Restore and save the analyzer cache between runs. |
 | `working-directory` | `.` | Workspace root to analyze, relative to the checkout. |
 
-The action exposes `exit-code` and `sarif-file` as outputs for later steps.
+The action exposes these outputs for later steps:
+
+| Output | Meaning |
+| --- | --- |
+| `exit-code` | Raw bifrost policy exit code (0, 1, or 2). |
+| `sarif-file` | Path of the SARIF report, relative to the checkout. |
+| `bifrost-bin` | Absolute path of the bifrost executable the run used. |
 
 ## Analyzer cache
 
@@ -80,7 +86,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: BrokkAi/bifrost/.github/actions/policy-scan@v0.8.24
+      - uses: BrokkAi/bifrost/.github/actions/policy-scan@v0.9.1
         with:
           diff-base: ${{ github.event.pull_request.base.sha }}
 ```

@@ -10,6 +10,9 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     linear_chain_tokens, qualified_chain_root, spelled_generic_arity,
 };
+use brokk_bifrost_core::analyzer::structural::callable::{
+    CallKind, CallSiteContext, CallSiteFacts,
+};
 use brokk_bifrost_core::analyzer::structural::edges::{
     DEEP_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
@@ -21,7 +24,7 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     OccurrenceRole, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS,
+    BindingActivation, BindingKind, DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_CALLABLE_APPLICABILITY,
     HoistingClass, LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
@@ -364,11 +367,35 @@ impl StructuralSpec for JavaStructuralSpec {
     }
 
     fn generator_construct(&self, node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
-        (node.kind() == "method_reference").then_some("java_method_reference")
+        match node.kind() {
+            "method_reference" => Some("java_method_reference"),
+            "object_creation_expression" => Some("java_object_creation"),
+            _ => None,
+        }
     }
 
     fn supports_role(&self, role: Role) -> bool {
         role != Role::Kwarg
+    }
+
+    /// Java spells its non-ordinary call shapes as distinct grammar nodes, so
+    /// the classification is a node-type reading with no source-text work:
+    /// `new T(x)` is an `object_creation_expression` and `T::f` a
+    /// `method_reference`, which names a callable without applying it
+    /// (#1478). `this(x)`/`super(x)` stay unclassified because
+    /// `explicit_constructor_invocation` is not in this adapter's kind table,
+    /// so those sites are not call facts at all.
+    fn call_site_facts(
+        &self,
+        node: Node<'_>,
+        _source: &str,
+        _context: &CallSiteContext,
+    ) -> Option<CallSiteFacts> {
+        match node.kind() {
+            "object_creation_expression" => Some(CallSiteFacts::of_kind(CallKind::Constructor)),
+            "method_reference" => Some(CallSiteFacts::of_kind(CallKind::MethodValue)),
+            _ => None,
+        }
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
@@ -376,7 +403,7 @@ impl StructuralSpec for JavaStructuralSpec {
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS
+        &DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_CALLABLE_APPLICABILITY
     }
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {

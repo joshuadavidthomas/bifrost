@@ -30,8 +30,8 @@ use crate::graph::resolver::{
     reference_type_text, resolve_type_fq_name_at, resolve_unqualified_method_group_for_owner,
     same_node, unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
     usage_direct_base, usage_member_declared_type_fq_name,
-    usage_method_return_type_fq_name_for_arity, usage_unqualified_value_member_shadows_type,
-    usage_visible_extension_method_candidates,
+    usage_method_return_type_fq_name_for_arity, usage_relational_generic_call_has_type_argument,
+    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
 };
 use crate::graph_support::CSharpSource;
 use crate::hierarchy;
@@ -39,8 +39,9 @@ use crate::syntax::{
     CSharpMemberName, CSharpNamedArgumentLabel, csharp_attribute_type_names,
     csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
     csharp_member_access_type_receiver, csharp_member_name, csharp_named_argument_label,
-    csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
-    csharp_unqualified_invocation_for_name,
+    csharp_nameof_type_candidates, csharp_relational_generic_call,
+    csharp_relational_generic_call_for_argument, csharp_type_leftmost_identifier,
+    csharp_type_reference_root, csharp_unqualified_invocation_for_name,
 };
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node, first_precise,
@@ -294,6 +295,18 @@ fn walk(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &mut LocalInferenceEngin
 }
 
 fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInferenceEngine<String>) {
+    let recovered_method_group =
+        csharp_relational_generic_call_for_argument(node).is_some_and(|call| {
+            usage_relational_generic_call_has_type_argument(
+                call,
+                ctx.graph,
+                ctx.csharp,
+                ctx.file,
+                &ctx.class_ranges,
+                ctx.source,
+                bindings,
+            )
+        });
     if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
         record_structured_type_candidate(candidate, true, ctx, bindings);
     }
@@ -306,7 +319,8 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
     {
         record_structured_type_candidate(owner, true, ctx, bindings);
     }
-    if let Some(root) = csharp_type_reference_root(node)
+    if !recovered_method_group
+        && let Some(root) = csharp_type_reference_root(node)
         && same_node(root, node)
     {
         record_structured_type_candidate(root, false, ctx, bindings);
@@ -398,9 +412,10 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                 }
                 return;
             }
-            if is_declaration_name(node) || !is_type_reference_node(node) {
+            if recovered_method_group || is_declaration_name(node) || !is_type_reference_node(node)
+            {
                 // Unqualified calls and method-group values attribute to the enclosing class.
-                if is_unqualified_method_group_value(node, ctx.source) {
+                if recovered_method_group || is_unqualified_method_group_value(node, ctx.source) {
                     let Some(owner_fqn) = ctx
                         .class_ranges
                         .enclosing(node.start_byte())
@@ -474,11 +489,28 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                 return;
             }
             if let Some(owner) = receiver_type_fqn(receiver, ctx, bindings) {
-                let call_arity = node.parent().and_then(|parent| {
-                    (parent.kind() == "invocation_expression"
-                        && parent.child_by_field_name("function") == Some(node))
-                    .then(|| argument_count(parent, ctx.source))
+                let recovered_call = csharp_relational_generic_call(node).filter(|call| {
+                    usage_relational_generic_call_has_type_argument(
+                        *call,
+                        ctx.graph,
+                        ctx.csharp,
+                        ctx.file,
+                        &ctx.class_ranges,
+                        ctx.source,
+                        bindings,
+                    )
                 });
+                let call_arity = node
+                    .parent()
+                    .and_then(|parent| {
+                        (parent.kind() == "invocation_expression"
+                            && parent.child_by_field_name("function") == Some(node))
+                        .then(|| argument_count(parent, ctx.source))
+                    })
+                    .or_else(|| recovered_call.map(|call| call.call_arity));
+                let explicit_generic_arity = name_shape
+                    .explicit_generic_arity
+                    .or_else(|| recovered_call.map(|call| call.explicit_generic_arity));
                 // `this.Member` / own-type-static `Owner.Member` (from within
                 // `Owner`) is a same-owner reference (#1138) → unproven inbound.
                 // `base.Member` and a call through another same-type variable stay
@@ -489,7 +521,7 @@ fn record_reference(node: Node<'_>, ctx: &mut CsScan<'_>, bindings: &LocalInfere
                     name,
                     name_shape.identifier,
                     call_arity,
-                    name_shape.explicit_generic_arity,
+                    explicit_generic_arity,
                     same_owner,
                 );
             } else {

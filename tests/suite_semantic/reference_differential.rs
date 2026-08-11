@@ -676,14 +676,13 @@ fn census_scala_adjudicated_local_binder_is_not_graded_as_a_gap() {
     );
 }
 
-/// The keep side of the same contract: a bare call in an implicit-receiver
-/// language still reaches a same-file member the site's own template inherits
-/// or self-types to, so the Scala bindability answer must not degrade into a
-/// strict own-template containment test. The sangria witness (`QueryParser`'s
-/// `trait Tokens` members reached through `this: Parser with Tokens =>`) is a
-/// real forward gap the census must keep grading tier 1.
+/// A bare call in an implicit-receiver language reaches a same-file member the
+/// site's own template inherits or self-types to. The sangria witness has
+/// `QueryParser` reach `trait Tokens` members through
+/// `this: Parser with Tokens =>`. The resolved forward and inverse answers must
+/// agree, so the census must not grade the site as a gap.
 #[test]
-fn census_scala_bare_call_keeps_self_type_member_evidence() {
+fn census_scala_bare_call_resolves_self_type_member() {
     let source = concat!(
         "package fx\n",
         "\n",
@@ -705,18 +704,25 @@ fn census_scala_bare_call_keeps_self_type_member_evidence() {
         .find(|site| site.start_byte == call_start)
         .unwrap_or_else(|| panic!("census must propose the bare call: {:#?}", census.sites));
     assert_eq!(
-        site.forward_status, "no_definition",
-        "witness requires a forward-unresolvable bare call: {site:#?}"
+        site.forward_status, "resolved",
+        "the self-type member must resolve in the forward path: {site:#?}"
     );
     assert_eq!(
-        site.tier,
-        Some(1),
-        "a self-type member stays actionable same-file evidence: {site:#?}"
+        site.targets
+            .iter()
+            .map(|target| target.fq_name.as_str())
+            .collect::<Vec<_>>(),
+        ["fx.Tokens.ws"],
+        "the forward path must select the self-type member: {site:#?}"
+    );
+    assert_eq!(
+        site.tier, None,
+        "a resolved self-type call is not a census gap: {site:#?}"
     );
     assert_eq!(
         site.classification,
-        ReferenceClassification::Missing,
-        "the self-type forward gap must keep its finding: {site:#?}"
+        ReferenceClassification::Consistent,
+        "the forward and inverse self-type answers must agree: {site:#?}"
     );
 }
 

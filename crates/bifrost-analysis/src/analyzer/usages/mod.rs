@@ -12,8 +12,10 @@
 //! - Language-specific graph strategies for JavaScript / TypeScript, Python, PHP, Rust,
 //!   Java, Kotlin, C#, C++, Go, Ruby, and Scala targets.
 
+pub mod applicability;
 pub mod call_relations;
 pub mod call_shape;
+pub mod callable_signature;
 mod candidates;
 pub(crate) mod common;
 pub mod cpp_graph;
@@ -28,6 +30,7 @@ pub(crate) mod java_graph;
 pub(crate) mod js_ts_graph;
 pub(crate) mod kotlin_graph;
 pub mod member_family;
+pub mod overload_selection;
 pub(crate) mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;

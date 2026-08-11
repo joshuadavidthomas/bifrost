@@ -12,10 +12,14 @@ use crate::analyzer::structural::resolution::{
     HierarchyRelation, MemberDispatchTier, PrecedenceTier, RejectionReason,
 };
 use crate::analyzer::tree_walk::subtree_contains;
+use crate::analyzer::usages::applicability::{
+    ApplicabilityOutcome, CandidateApplicability, arity_verdict,
+};
 use crate::analyzer::usages::cpp_graph::canonical_cpp_scope_components;
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{SignatureMetadata, StructuredTypeName};
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
 use brokk_bifrost_cpp::call_match::{
     CppArgType, cpp_filter_candidates_by_args, cpp_literal_arg_type, cpp_parameter_type_text,
     cpp_signature_param_types, cpp_signature_trailing_qualifiers, cpp_type_text_pointer_depth,
@@ -440,6 +444,7 @@ pub(crate) struct CppBoundedTypeResolution {
 }
 
 struct CppBoundedProvider<'a> {
+    analyzer: &'a dyn IAnalyzer,
     cpp: &'a CppAnalyzer,
     session: &'a ResolutionSession,
 }
@@ -566,6 +571,7 @@ pub(crate) fn resolve_cpp_bounded(
         ));
     };
     let provider = CppBoundedProvider {
+        analyzer,
         cpp,
         session: &session,
     };
@@ -711,7 +717,8 @@ fn cpp_bounded_reference_node<'tree>(
             ) && parent.child_by_field_name("name") == Some(current))
             || (parent.kind() == "field_expression"
                 && parent.child_by_field_name("field") == Some(current))
-            || (parent.kind() == "call_expression"
+            || (current.kind() != "call_expression"
+                && parent.kind() == "call_expression"
                 && parent.child_by_field_name("function") == Some(current))
             || (parent.kind() == "new_expression"
                 && parent.start_byte() <= current.start_byte()
@@ -772,9 +779,31 @@ fn resolve_cpp_bounded_member(
     if member.is_empty() {
         return no_definition("no_member_name", "C++ member name is blank");
     }
+    let external_owner_name =
+        cpp_external_receiver_type_name_from_ast(source, root, receiver, provider.session);
     let Some(resolution) =
         cpp_bounded_type_resolution_for_node(provider, file, source, root, receiver)
     else {
+        if let Some(owner_name) = external_owner_name
+            && matches!(
+                crate::analyzer::cpp::external::external_member_resolution(
+                provider.cpp,
+                provider.analyzer.semantic_model_overlay().as_deref(),
+                file,
+                &owner_name,
+                member,
+                ),
+                crate::analyzer::cpp::external::CppExternalMemberResolution::Indexed
+                    | crate::analyzer::cpp::external::CppExternalMemberResolution::DeclaredUnindexed
+            )
+        {
+            // gated upstream: the structured receiver type and exact activated
+            // owner/member fact prove that this route leaves the workspace.
+            super::trace::record_named_boundary(member.to_owned());
+            return boundary_unchecked(format!(
+                "C++ member `{owner_name}::{member}` routes through an external header"
+            ));
+        }
         return no_definition(
             "unsupported_cpp_receiver",
             format!("receiver for C++ member `{member}` is not resolved"),
@@ -923,6 +952,30 @@ fn resolve_cpp_bounded_member(
         });
     }
     outcome
+}
+
+fn cpp_external_receiver_type_name_from_ast(
+    source: &str,
+    root: Node<'_>,
+    receiver: Node<'_>,
+    session: &ResolutionSession,
+) -> Option<String> {
+    let type_node = match receiver.kind() {
+        "identifier" | "field_identifier" => {
+            cpp_bounded_binding_type_node(source, root, receiver, session)?
+        }
+        "new_expression" | "compound_literal_expression" => receiver
+            .child_by_field_name("type")
+            .or_else(|| cpp_constructor_type_node(receiver))?,
+        _ => return None,
+    };
+    let type_name = cpp_bounded_structured_type_path(type_node, source, session)
+        .map(|path| path.fqn)
+        .or_else(|| {
+            cpp_bounded_type_name_node(type_node, session)
+                .map(|name| cpp_node_text(name, source).to_owned())
+        })?;
+    (!type_name.is_empty()).then_some(type_name)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1163,7 +1216,11 @@ pub(crate) fn cpp_type_lookup_resolution_in_session(
     if !brokk_bifrost_cpp::imports::receiver_query_supported(file) {
         return None;
     }
-    let provider = CppBoundedProvider { cpp, session };
+    let provider = CppBoundedProvider {
+        analyzer,
+        cpp,
+        session,
+    };
     let node = cpp_bounded_smallest_node(
         tree.root_node(),
         site.focus_start_byte,
@@ -2004,7 +2061,11 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
             current = parent;
             continue;
         }
-        if parent.kind() == "call_expression"
+        // Keep the call whose callee contains the focused token.  In
+        // `factory()(arg)`, the inner call is itself the outer call's callee,
+        // but lookup at `factory` must not move to the outer invocation.
+        if current.kind() != "call_expression"
+            && parent.kind() == "call_expression"
             && parent.child_by_field_name("function") == Some(current)
         {
             current = parent;
@@ -2652,12 +2713,20 @@ fn cpp_template_application_node(mut node: Node<'_>) -> Option<Node<'_>> {
 /// the referencing file itself, plus definitions in headers the file
 /// includes directly (structured include-target resolution, the same
 /// information the boundary heuristic uses).
-fn cpp_macro_candidates(analyzer: &dyn IAnalyzer, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
+fn cpp_macro_candidates(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    name: &str,
+    before_byte: usize,
+) -> Vec<CodeUnit> {
     if name.is_empty() || name.contains(':') {
         return Vec::new();
     }
     let include_targets =
         resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.include_target_index());
+    let dispatch = CppDispatch::new(analyzer);
+    let source = dispatch.source();
     analyzer
         .definitions(name)
         .filter(CodeUnit::is_macro)
@@ -2676,6 +2745,18 @@ fn cpp_macro_candidates(analyzer: &dyn IAnalyzer, file: &ProjectFile, name: &str
                             targets.iter().any(|target| target == unit.source())
                         })
                 })
+        })
+        .filter(|unit| {
+            unit.source() != file
+                || analyzer
+                    .ranges(unit)
+                    .iter()
+                    .any(|range| range.start_byte < before_byte)
+        })
+        .filter(|unit| {
+            visibility.macro_binding_matches_target_at(&source, file, name, before_byte, unit)
+                || (visibility.macro_name_may_be_bound_at(file, name, before_byte)
+                    && visibility.macro_target_is_visible_candidate(file, unit))
         })
         .collect()
 }
@@ -3163,7 +3244,7 @@ fn resolve_cpp_type_without_focused_qualifier(
             .collect();
         return candidates_outcome(candidates);
     }
-    let macros = cpp_macro_candidates(analyzer, file, text);
+    let macros = cpp_macro_candidates(analyzer, visibility, file, text, node.start_byte());
     if !macros.is_empty() {
         return candidates_outcome(macros);
     }
@@ -4216,7 +4297,13 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 }
                 CppBareCallTargetResolution::Missing => {}
             }
-            let macros = cpp_macro_candidates(ctx.analyzer, ctx.file, name);
+            let macros = cpp_macro_candidates(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                name,
+                call.start_byte(),
+            );
             if !macros.is_empty() {
                 return candidates_outcome(macros);
             }
@@ -4495,6 +4582,9 @@ fn resolve_cpp_field(
     else {
         return no_definition("no_member_receiver", "C++ field expression has no receiver");
     };
+    let external_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+    let external_owner_name =
+        cpp_external_receiver_type_name_from_ast(ctx.source, ctx.root, receiver, &external_session);
     let owners = cpp_field_receiver_type_units(
         ctx.analyzer,
         ctx.support,
@@ -4513,6 +4603,27 @@ fn resolve_cpp_field(
     let receiver_resolved = !owners.is_empty();
     let candidates = cpp_member_candidates(ctx, owners, member, arity, arg_types);
     if candidates.is_empty() {
+        if let Some(owner_name) = external_owner_name
+            && let Some(cpp) = resolve_analyzer::<CppAnalyzer>(ctx.analyzer)
+            && matches!(
+                crate::analyzer::cpp::external::external_member_resolution(
+                cpp,
+                ctx.analyzer.semantic_model_overlay().as_deref(),
+                ctx.file,
+                &owner_name,
+                member,
+                ),
+                crate::analyzer::cpp::external::CppExternalMemberResolution::Indexed
+                    | crate::analyzer::cpp::external::CppExternalMemberResolution::DeclaredUnindexed
+            )
+        {
+            // gated upstream: the structured receiver type and exact activated
+            // owner/member fact prove that this route leaves the workspace.
+            super::trace::record_named_boundary(member.to_owned());
+            return boundary_unchecked(format!(
+                "C++ member `{owner_name}::{member}` routes through an external header"
+            ));
+        }
         if receiver_resolved {
             return no_definition(
                 "no_indexed_definition",
@@ -4662,6 +4773,7 @@ fn cpp_unit_matches_kind(
         }
         CppTargetKind::MemberField => unit.is_field(),
         CppTargetKind::Constructor | CppTargetKind::Method => true,
+        CppTargetKind::Macro => unit.is_macro(),
     }
 }
 
@@ -5124,6 +5236,7 @@ impl CppMemberTrace {
         dropped: impl Iterator<Item = &'unit CodeUnit>,
         reason: RejectionReason,
         applicability: ApplicabilityVerdict,
+        callable: Option<&ApplicabilityOutcome>,
     ) {
         for loser in dropped {
             let mut row = trace::TraceCandidate::rejected(
@@ -5131,6 +5244,17 @@ impl CppMemberTrace {
                 self.precedence_tier(loser),
                 reason,
             );
+            if let Some(verdict) = callable.and_then(|outcome| {
+                outcome
+                    .verdicts
+                    .iter()
+                    .find(|verdict| verdict.candidate == *loser)
+            }) {
+                row = row.with_callable(trace::CallableApplicabilityRecord {
+                    verdict: verdict.verdict,
+                    reason: verdict.reason,
+                });
+            }
             if let Some(enrichment) = self.enrichment(loser, applicability) {
                 row = row.with_member(enrichment);
             }
@@ -5152,15 +5276,20 @@ impl CppMemberTrace {
         non_callable: &[CodeUnit],
         arity: Option<usize>,
     ) {
+        // A member that is not callable never reached the call-shape check, so
+        // it carries no callable verdict: it lost the declaration space.
         self.record_rejected(
             non_callable.iter(),
             RejectionReason::WrongDeclarationSpace,
             ApplicabilityVerdict::Unknown,
+            None,
         );
+        let applicability = cpp_candidate_applicability(analyzer, considered, arity);
         self.record_rejected(
             considered.iter().filter(|unit| !winners.contains(unit)),
             RejectionReason::CallableApplicabilityDeferred,
             ApplicabilityVerdict::Inapplicable,
+            Some(&applicability),
         );
         self.stage_winners(analyzer, winners, arity);
     }
@@ -5186,34 +5315,78 @@ impl CppMemberTrace {
         if let Some(tier) = winner_tier {
             trace::stage_tier(tier, winners.iter().map(|unit| unit.fq_name()).collect());
         }
+        // One computation for the member axis and the callable axis both: the
+        // verdict staged here is the one the arity filter itself produced.
+        let applicability = cpp_candidate_applicability(analyzer, winners, arity);
         trace::stage_member_context(
-            winners
+            applicability
+                .verdicts
                 .iter()
-                .filter_map(|unit| {
-                    self.enrichment(unit, cpp_applicability_verdict(analyzer, unit, arity))
-                        .map(|enrichment| (unit.fq_name(), enrichment))
+                .filter_map(|verdict| {
+                    self.enrichment(&verdict.candidate, verdict.verdict)
+                        .map(|enrichment| (verdict.candidate.fq_name(), enrichment))
+                })
+                .collect(),
+        );
+        trace::stage_callable_context(
+            applicability
+                .verdicts
+                .iter()
+                .map(|verdict| {
+                    (
+                        verdict.candidate.fq_name(),
+                        trace::CallableApplicabilityRecord {
+                            verdict: verdict.verdict,
+                            reason: verdict.reason,
+                        },
+                    )
                 })
                 .collect(),
         );
     }
 }
 
-/// What the C++ arity check proved about one candidate for one call shape.
-/// `Unknown` covers both "no call shape here" and "this declaration's parameter
-/// list is not recorded", which are the two states the filter tolerates.
-fn cpp_applicability_verdict(
+/// The one C++ call-shape applicability check (#1478 M3): the candidates the
+/// resolver's arity filter admits and the typed verdict for every candidate it
+/// considered.
+///
+/// Before this factoring the same question was asked twice -- inline in each
+/// arity filter as `is_function() && arity.is_none_or(accepts)`, and again in a
+/// separate verdict function the trace called per winner. One function now
+/// answers it, so a row can never state a verdict the filter did not act on.
+///
+/// Two refusals are distinct and stay distinct. A member that is not callable
+/// at all lost the declaration space, not the call shape. A callable whose
+/// parameter list the analyzer never recorded is undecidable: it stays
+/// reachable, exactly as the filter has always left it, and reports `unknown`
+/// rather than being promoted to `applicable` by surviving a check that never
+/// refused it.
+fn cpp_candidate_applicability(
     analyzer: &dyn IAnalyzer,
-    unit: &CodeUnit,
+    candidates: &[CodeUnit],
     arity: Option<usize>,
-) -> ApplicabilityVerdict {
+) -> ApplicabilityOutcome {
     let Some(expected) = arity else {
-        return ApplicabilityVerdict::Unknown;
+        return ApplicabilityOutcome::undecidable(candidates);
     };
-    match cpp_known_callable_arity(analyzer, unit) {
-        Some(known) if known.accepts(expected) => ApplicabilityVerdict::Applicable,
-        Some(_) => ApplicabilityVerdict::Inapplicable,
-        None => ApplicabilityVerdict::Unknown,
-    }
+    ApplicabilityOutcome::from_verdicts(
+        candidates
+            .iter()
+            .map(|unit| {
+                if !unit.is_function() {
+                    return CandidateApplicability::inapplicable(
+                        unit.clone(),
+                        CallableRejectionReason::CallKindMismatch,
+                    );
+                }
+                arity_verdict(
+                    unit,
+                    cpp_known_callable_arity(analyzer, unit).as_slice().into(),
+                    expected,
+                )
+            })
+            .collect(),
+    )
 }
 
 /// The C++ member lookup itself: the receiver's own members first, and the
@@ -5556,10 +5729,16 @@ fn cpp_member_candidates(
     candidates.dedup();
     if let Some(state) = member_trace.as_ref() {
         let considered = considered.expect("a recording walk always keeps its considered set");
+        // The same check the filter above ran, so a loser's reason is the one
+        // it actually lost on. A candidate the *argument-type* filter dropped
+        // has no arity verdict to state, and is left unattributed rather than
+        // given one the arity check never produced.
+        let applicability = cpp_candidate_applicability(ctx.analyzer, &considered, arity);
         state.record_rejected(
             considered.iter().filter(|unit| !candidates.contains(unit)),
             RejectionReason::CallableApplicabilityDeferred,
             ApplicabilityVerdict::Inapplicable,
+            Some(&applicability),
         );
         state.stage_winners(ctx.analyzer, &candidates, arity);
     }
@@ -5859,15 +6038,7 @@ fn cpp_filter_candidates_by_arity(
     let Some(expected) = arity else {
         return candidates;
     };
-    let filtered = candidates
-        .iter()
-        .filter(|unit| {
-            unit.is_function()
-                && cpp_known_callable_arity(analyzer, unit)
-                    .is_none_or(|arity| arity.accepts(expected))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let filtered = cpp_candidate_applicability(analyzer, &candidates, arity).winners;
     if filtered.is_empty() {
         candidates
     } else {
@@ -5901,17 +6072,7 @@ fn cpp_filter_candidates_by_arity_strict(
     arity: Option<usize>,
     analyzer: &dyn IAnalyzer,
 ) -> Vec<CodeUnit> {
-    let Some(expected) = arity else {
-        return candidates;
-    };
-    candidates
-        .into_iter()
-        .filter(|unit| {
-            unit.is_function()
-                && cpp_known_callable_arity(analyzer, unit)
-                    .is_none_or(|arity| arity.accepts(expected))
-        })
-        .collect()
+    cpp_candidate_applicability(analyzer, &candidates, arity).winners
 }
 
 fn cpp_known_callable_arity(

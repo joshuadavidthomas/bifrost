@@ -35,7 +35,7 @@ use brokk_bifrost_core::analyzer::tree_walk::collect_parse_errors;
 use brokk_bifrost_core::analyzer::usages::local_inference::LocalInferenceEngine;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::text_utils::compute_line_starts;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 use crate::graph_support::{
     CSharpSource, first_logical_type_fqn, logical_type_count, visible_type_candidates,
@@ -140,20 +140,7 @@ pub fn collect_csharp_semantic_diagnostics(
         report.push_incomplete(None, vec![SemanticDiagnosticIncompleteReason::Truncated]);
         return report;
     }
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-        .is_err()
-    {
-        report.push_incomplete(
-            None,
-            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
-                detail: "C# parser is unavailable".to_string(),
-            }],
-        );
-        return report;
-    }
-    let Some(tree) = parser.parse(source, None) else {
+    let Some((tree, scan)) = crate::preprocessor::parse_csharp_scanned(source) else {
         report.push_incomplete(
             None,
             vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
@@ -162,6 +149,17 @@ pub fn collect_csharp_semantic_diagnostics(
         );
         return report;
     };
+    if scan.has_inactive_regions {
+        // Index honesty: a declaration that exists only under the inactive
+        // configuration is absent from the index, so nothing this pass says
+        // about the file is a complete statement about every configuration.
+        report.push_incomplete(
+            None,
+            vec![SemanticDiagnosticIncompleteReason::UnsupportedSemantics {
+                detail: crate::preprocessor::CSHARP_INACTIVE_BRANCHES_DETAIL.to_string(),
+            }],
+        );
+    }
     let mut parse_errors = Vec::new();
     collect_parse_errors(tree.root_node(), &mut parse_errors);
     if !parse_errors.is_empty() {

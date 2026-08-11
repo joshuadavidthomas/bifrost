@@ -19,6 +19,7 @@
 //! over it can never be silently clean.
 
 use super::occurrences::labelled_enum;
+use crate::hash::HashSet;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -172,6 +173,146 @@ labelled_enum! {
     }
 }
 
+labelled_enum! {
+    /// How much of one callable's declared shape the persisted signature
+    /// contract actually holds (issue #1478, Milestone 2).
+    ///
+    /// The declaration side of overload selection is read from the
+    /// `SignatureMetadata`/`CallableArity` facts the analyzer already
+    /// persists. Not every language records every fact, and a missing fact
+    /// must never read as a proven zero.
+    ///
+    /// - `Exact`: the language published an arity, so the required and total
+    ///   counts and the repeated flag are the adapter's own answer.
+    /// - `ArityUnrecorded`: signature metadata exists but records no arity.
+    ///   Parameter evidence may still exist; an exact-arity assertion over
+    ///   such a signature must not come out clean.
+    /// - `Unrecorded`: the analyzer publishes no signature metadata at all for
+    ///   the declaration. This is the mandatory row that keeps an empty
+    ///   relation from reading as a proven-empty signature.
+    SignatureCoverage, ALL_SIGNATURE_COVERAGES {
+        Exact => "exact",
+        ArityUnrecorded => "arity_unrecorded",
+        Unrecorded => "unrecorded",
+    }
+}
+
+labelled_enum! {
+    /// What a declaration is, as the declaration-side counterpart of a call
+    /// site's [`CallKind`]. A policy joins the two to ask whether a
+    /// constructor call reached a constructor, or whether a method value
+    /// referenced a method.
+    ///
+    /// The categories are the analyzer's own coarse unit classification plus
+    /// the persisted constructor flag and structural ownership: a callable
+    /// with a structural owner is a `Method`, one without is a `Function`.
+    DeclarationRole, ALL_DECLARATION_ROLES {
+        Function => "function",
+        Method => "method",
+        Constructor => "constructor",
+        Field => "field",
+        Class => "class",
+        Module => "module",
+        Macro => "macro",
+        FileScope => "file_scope",
+    }
+}
+
+/// What one language's structural lowering says about a call site beyond the
+/// receiver and argument roles the shared fact arena already records.
+///
+/// The shared arena models one positional group, one named group, a receiver
+/// and a callee. That is enough to say `Function` versus `Method` and nothing
+/// else, so every refinement here comes from the grammar node itself: a Java
+/// `object_creation_expression` is a constructor call, a Scala
+/// `infix_expression` is an infix application, and a Scala `call_expression`
+/// whose own function is another `call_expression` continues that call's
+/// argument-list sequence rather than starting a new call site.
+///
+/// Every field is a refinement of an honest baseline, never a replacement for
+/// missing structure. A language that says nothing keeps the baseline: kind
+/// from receiver presence, [`CallShapeCoverage::Exact`] coverage, and one
+/// call site per call node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallSiteFacts {
+    /// The refined call kind. `None` keeps the receiver-derived baseline.
+    pub call_kind: Option<CallKind>,
+    /// How much of this site's argument structure the lowering could read.
+    pub coverage: CallShapeCoverage,
+    /// Whether this call's argument list continues the argument-list sequence
+    /// of the call in its own callee position, as a Scala curried application
+    /// `f(a)(b)` does. False everywhere the outer application applies the
+    /// *result* of the inner one, which is what `f(a)(b)` means in JavaScript.
+    pub continues_callee_groups: bool,
+}
+
+impl CallSiteFacts {
+    /// The baseline: kind from receiver presence, readable arguments, one
+    /// site per call node. Chain [`CallSiteFacts::continuing`] off this to
+    /// refine only the argument-list sequence.
+    pub const fn unrefined() -> Self {
+        Self {
+            call_kind: None,
+            coverage: CallShapeCoverage::Exact,
+            continues_callee_groups: false,
+        }
+    }
+
+    /// A site whose kind the grammar names exactly, with readable arguments.
+    pub const fn of_kind(call_kind: CallKind) -> Self {
+        Self {
+            call_kind: Some(call_kind),
+            coverage: CallShapeCoverage::Exact,
+            continues_callee_groups: false,
+        }
+    }
+
+    /// A site whose kind stays at the receiver-derived baseline but whose
+    /// argument structure the lowering could only partly (or not at all) read.
+    pub const fn of_coverage(coverage: CallShapeCoverage) -> Self {
+        Self {
+            call_kind: None,
+            coverage,
+            continues_callee_groups: false,
+        }
+    }
+
+    /// Mark this application as one more argument list of the call in its
+    /// callee position.
+    pub const fn continuing(mut self) -> Self {
+        self.continues_callee_groups = true;
+        self
+    }
+}
+
+/// Per-file knowledge a language spec gathers once, before any call site is
+/// classified, because the answer for one call lives elsewhere in the file.
+///
+/// Today it carries exactly one axis: the callee names whose argument list is
+/// produced by a macro this analyzer does not expand. C and C++ need it —
+/// `FOO(a, b)` where `FOO` is a function-like macro has a source argument
+/// count that is not the called callable's arity — and the answer is the set
+/// of function-like macro definitions in the translation unit, which is one
+/// scan of the tree rather than one scan per call.
+#[derive(Debug, Default, Clone)]
+pub struct CallSiteContext {
+    macro_derived_callees: HashSet<String>,
+}
+
+impl CallSiteContext {
+    pub fn with_macro_derived_callees(names: HashSet<String>) -> Self {
+        Self {
+            macro_derived_callees: names,
+        }
+    }
+
+    /// Whether a call to `callee` expands a macro, so its source argument list
+    /// is not the callable's argument list.
+    pub fn is_macro_derived_callee(&self, callee: &str) -> bool {
+        self.macro_derived_callees.contains(callee)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +349,8 @@ mod tests {
         check!(ALL_CALLABLE_REJECTION_REASONS, CallableRejectionReason);
         check!(ALL_SELECTION_RESOLUTIONS, SelectionResolution);
         check!(ALL_RECEIVER_CONTRACTS, ReceiverContract);
+        check!(ALL_SIGNATURE_COVERAGES, SignatureCoverage);
+        check!(ALL_DECLARATION_ROLES, DeclarationRole);
 
         assert!(CallKind::from_label("not_a_kind").is_none());
         assert!(CallableRejectionReason::from_label("not_a_reason").is_none());

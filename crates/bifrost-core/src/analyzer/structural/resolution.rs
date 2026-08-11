@@ -383,6 +383,8 @@ environment_axes! {
         "Which candidate the resolver selected for a reference, and at which precedence tier.",
     CandidateRejection => "candidate_rejection":
         "Which candidates the resolver rejected for a reference, and for which typed reason.",
+    CallableApplicability => "callable_applicability":
+        "Whether each considered callable candidate accepts the call site's argument shape, and for which typed callable reason it does not.",
 }
 
 impl fmt::Display for EnvironmentAxis {
@@ -489,7 +491,36 @@ const DEEP_SELECTION_ONLY: LexicalEnvironmentSupport = LexicalEnvironmentSupport
 /// rejection row for it means "the resolver did not reject anything there",
 /// while for an adapter that does not claim it an absent row means nothing.
 pub static DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS: LexicalEnvironmentSupport =
+    DEEP_WITH_REJECTIONS;
+
+const DEEP_WITH_REJECTIONS: LexicalEnvironmentSupport =
     DEEP_SELECTION_ONLY.supported(EnvironmentAxis::CandidateRejection);
+
+/// The table an adapter returns when its resolver reports per-candidate
+/// callable applicability and nothing else about the file's lexical
+/// environment (#1478).
+///
+/// Kotlin is the case: its member walk's applicability check is factored so the
+/// winners it binds and the per-candidate verdicts come from one function, but
+/// the adapter classifies no scopes, no binding intervals, and no occurrence
+/// roles. The support table is per axis exactly so that combination can be
+/// stated instead of rounded to "nothing" or to "everything".
+pub static CALLABLE_APPLICABILITY_ONLY_SUPPORT: LexicalEnvironmentSupport =
+    LexicalEnvironmentSupport::NONE.supported(EnvironmentAxis::CallableApplicability);
+
+/// The table a deep adapter returns when its resolver additionally reports, per
+/// considered callable candidate, whether that candidate's declared parameter
+/// list accepts the call site's argument shape (#1478).
+///
+/// This is a third table rather than a widening of the one above for the same
+/// reason the second exists: the axis is a claim about instrumentation. An
+/// adapter reaches it only after its own applicability check has been factored
+/// so that the winners the resolver binds and the per-candidate verdicts come
+/// from one function. There is no default `supported`; a language that has not
+/// been factored keeps the table it had, and its sites honestly report an
+/// undecidable overload selection.
+pub static DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_CALLABLE_APPLICABILITY: LexicalEnvironmentSupport =
+    DEEP_WITH_REJECTIONS.supported(EnvironmentAxis::CallableApplicability);
 
 #[cfg(test)]
 mod tests {
@@ -637,22 +668,29 @@ mod tests {
         assert!(NO_LEXICAL_ENVIRONMENT_SUPPORT.is_empty());
     }
 
-    /// The two shared deep-adapter tables are the one place the deep adapters
+    /// The three shared deep-adapter tables are the one place the deep adapters
     /// state what they answer, so their contents are asserted once here rather
-    /// than eleven times across the adapters. The only axis they disagree on is
-    /// the one that separates them.
+    /// than eleven times across the adapters. Each table adds exactly one axis
+    /// to the one before it, and the axis it adds is the whole difference
+    /// between them.
     #[test]
-    fn deep_adapter_tables_differ_only_in_rejections() {
+    fn deep_adapter_tables_add_exactly_one_axis_each() {
         for &axis in ALL_ENVIRONMENT_AXES {
-            let expected = axis != EnvironmentAxis::CandidateRejection;
+            let selection_only = axis != EnvironmentAxis::CandidateRejection
+                && axis != EnvironmentAxis::CallableApplicability;
             assert_eq!(
                 DEEP_LEXICAL_ENVIRONMENT_SUPPORT.is_supported(axis),
-                expected,
+                selection_only,
                 "unexpected selection-only deep-adapter support for {axis}"
             );
-            assert!(
+            assert_eq!(
                 DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_REJECTIONS.is_supported(axis),
-                "a traced deep adapter must answer {axis}"
+                axis != EnvironmentAxis::CallableApplicability,
+                "unexpected rejection-reporting deep-adapter support for {axis}"
+            );
+            assert!(
+                DEEP_LEXICAL_ENVIRONMENT_SUPPORT_WITH_CALLABLE_APPLICABILITY.is_supported(axis),
+                "an applicability-reporting deep adapter must answer {axis}"
             );
         }
     }

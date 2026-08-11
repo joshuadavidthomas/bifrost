@@ -1,8 +1,8 @@
 use crate::declarations::rust_node_text;
 use crate::graph_support::{
-    RustFactSource, is_rust_enum_declaration, is_rust_struct_declaration,
-    is_rust_trait_declaration, is_rust_type_alias_declaration, resolve_imported_export_from_binder,
-    resolve_module_files, rust_named_declaration_node,
+    RustFactSource, inspect_rust_named_declaration_node, is_rust_enum_declaration,
+    is_rust_struct_declaration, is_rust_trait_declaration, is_rust_type_alias_declaration,
+    resolve_imported_export_from_binder, resolve_module_files,
 };
 use crate::imports::{resolve_rust_module_path_with_crate, rust_crate_root_package};
 use crate::lexical_scope::{parse_rust_tree, visible_import_binder_at};
@@ -25,26 +25,32 @@ pub fn rust_trait_for_impl_member(
 ) -> Option<CodeUnit> {
     let source = rust.project().read_source(member.source()).ok()?;
     let tree = parse_rust_tree(&source)?;
-    let declaration =
-        rust_named_declaration_node(rust.code_units(), member, tree.root_node(), &source)?;
-    let mut ancestor = declaration.parent();
-    let impl_item = loop {
-        let candidate = ancestor?;
-        if candidate.kind() == "impl_item" {
-            break candidate;
-        }
-        ancestor = candidate.parent();
-    };
-    let (trait_ref, _) = trait_impl_parts(impl_item, &source)?;
-    let binder = visible_import_binder_at(&source, impl_item.start_byte());
-    resolve_rust_hierarchy_trait_ref(
-        rust,
-        member.source(),
+    inspect_rust_named_declaration_node(
+        rust.code_units(),
+        member,
+        tree.root_node(),
         &source,
-        impl_item,
-        &binder,
-        trait_ref,
-    )
+        |declaration, source| {
+            let mut ancestor = declaration.parent();
+            let impl_item = loop {
+                let candidate = ancestor?;
+                if candidate.kind() == "impl_item" {
+                    break candidate;
+                }
+                ancestor = candidate.parent();
+            };
+            let (trait_ref, _) = trait_impl_parts(impl_item, source)?;
+            let binder = visible_import_binder_at(source, impl_item.start_byte());
+            resolve_rust_hierarchy_trait_ref(
+                rust,
+                member.source(),
+                source,
+                impl_item,
+                &binder,
+                trait_ref,
+            )
+        },
+    )?
 }
 
 pub fn resolve_rust_hierarchy_trait_ref(

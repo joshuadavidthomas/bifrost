@@ -83,7 +83,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+mod applicability;
 mod call_shape;
+mod callable_signature;
 mod dispatch;
 mod edges;
 mod environment;
@@ -99,6 +101,8 @@ mod pipeline;
 mod receiver;
 mod relations;
 mod render;
+use applicability::{CallableApplicabilityValue, OverloadSelectionValue};
+use callable_signature::{CallableSignatureValue, SignatureParameterValue};
 use dispatch::{DispatchSiteValue, DispatchTargetValue};
 use environment::{
     BindingKey, BindingValue, CandidateHopKey, CandidateHopValue, CandidateKey, CandidateValue,
@@ -172,6 +176,8 @@ pub use results::CodeQueryCallArgumentGroup;
 pub use results::CodeQueryCallShape;
 pub use results::CodeQueryCallShapeArgument;
 pub use results::CodeQueryCallSite;
+pub use results::CodeQueryCallableApplicability;
+pub use results::CodeQueryCallableSignature;
 pub use results::CodeQueryCandidateHop;
 pub use results::CodeQueryCandidateRef;
 pub use results::CodeQueryCapture;
@@ -214,6 +220,7 @@ pub use results::CodeQueryMemberFamilyEdge;
 pub use results::CodeQueryMemberSelection;
 pub use results::CodeQueryOccurrence;
 pub use results::CodeQueryOccurrenceTarget;
+pub use results::CodeQueryOverloadSelection;
 pub use results::CodeQueryPathSegment;
 pub use results::CodeQueryProcedure;
 pub use results::CodeQueryProgramPoint;
@@ -245,6 +252,7 @@ pub use results::CodeQuerySemanticEvidence;
 pub use results::CodeQuerySemanticLimits;
 pub use results::CodeQuerySemanticProof;
 pub use results::CodeQuerySemanticWork;
+pub use results::CodeQuerySignatureParameter;
 pub use results::CodeQuerySourceSite;
 pub use results::CodeQueryStableOwnerCandidate;
 pub use results::CodeQueryStableOwnerDerivation;
@@ -553,6 +561,10 @@ enum PipelineValue {
     CallShape(CallShapeValue),
     CallArgumentGroup(CallArgumentGroupValue),
     CallArgument(CallArgumentValue),
+    CallableSignature(Box<CallableSignatureValue>),
+    SignatureParameter(Box<SignatureParameterValue>),
+    CallableApplicability(Box<CallableApplicabilityValue>),
+    OverloadSelection(Box<OverloadSelectionValue>),
     MemberSelection(MemberSelectionValue),
     DispatchOutcome(Box<DispatchSiteValue>),
     DispatchTarget(Box<DispatchTargetValue>),
@@ -629,6 +641,10 @@ enum PipelineKey {
     CallShape(String),
     CallArgumentGroup(String),
     CallArgument(String),
+    CallableSignature(String),
+    SignatureParameter(String),
+    CallableApplicability(String),
+    OverloadSelection(String),
     MemberSelection(String),
     DispatchOutcome(String),
     DispatchTarget(String),
@@ -687,6 +703,18 @@ impl PipelineValue {
                     .id
                     .clone(),
             ),
+            Self::CallableSignature(value) => {
+                PipelineKey::CallableSignature(value.report.signature.id.clone())
+            }
+            Self::SignatureParameter(value) => {
+                PipelineKey::SignatureParameter(value.row().id.clone())
+            }
+            Self::CallableApplicability(value) => {
+                PipelineKey::CallableApplicability(value.row().id.clone())
+            }
+            Self::OverloadSelection(value) => {
+                PipelineKey::OverloadSelection(value.row().id.clone())
+            }
             Self::MemberSelection(value) => PipelineKey::MemberSelection(value.occurrence.ast_id()),
             Self::DispatchOutcome(value) => PipelineKey::DispatchOutcome(value.site_id.clone()),
             Self::DispatchTarget(value) => PipelineKey::DispatchTarget(value.id()),
@@ -921,6 +949,10 @@ enum PipelineTraceValue {
     CallShape(CallShapeValue),
     CallArgumentGroup(CallArgumentGroupValue),
     CallArgument(CallArgumentValue),
+    CallableSignature(Box<CallableSignatureValue>),
+    SignatureParameter(Box<SignatureParameterValue>),
+    CallableApplicability(Box<CallableApplicabilityValue>),
+    OverloadSelection(Box<OverloadSelectionValue>),
     MemberSelection(MemberSelectionValue),
     DispatchOutcome(Box<DispatchSiteValue>),
     DispatchTarget(Box<DispatchTargetValue>),
@@ -2980,6 +3012,62 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::CallableSignature(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::CallableSignature,
+            key: DetailedCodeQueryKey::CallableSignature {
+                id: value.report.signature.id.clone(),
+                declaration_id: callable_signature::declaration_site_id(&value.declaration),
+            },
+            file: value.file().clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.declaration.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+        },
+        PipelineValue::SignatureParameter(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::SignatureParameter,
+            key: DetailedCodeQueryKey::SignatureParameter {
+                id: value.row().id.clone(),
+                signature_id: value.row().signature_id.clone(),
+            },
+            file: value.file().clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.signature.declaration.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+        },
+        PipelineValue::CallableApplicability(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::CallableApplicability,
+            key: DetailedCodeQueryKey::CallableApplicability {
+                id: value.row().id.clone(),
+                site_ast_id: value.row().site_ast_id.clone(),
+            },
+            file: value.occurrence.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.occurrence.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+        },
+        PipelineValue::OverloadSelection(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::OverloadSelection,
+            key: DetailedCodeQueryKey::OverloadSelection {
+                id: value.row().id.clone(),
+                site_ast_id: value.row().site_ast_id.clone(),
+            },
+            file: value.occurrence.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.occurrence.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+        },
         PipelineValue::MemberSelection(value) => {
             let row = &value.occurrence;
             DetailedCodeQueryEvidence {
@@ -3348,6 +3436,10 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::ReferenceSite(site) => Some(&site.file),
         PipelineValue::CallSite(site) => Some(&site.0.file),
         PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
+        PipelineValue::CallableSignature(value) => Some(value.file()),
+        PipelineValue::SignatureParameter(value) => Some(value.file()),
+        PipelineValue::CallableApplicability(value) => Some(&value.occurrence.file),
+        PipelineValue::OverloadSelection(value) => Some(&value.occurrence.file),
         PipelineValue::CallShape(value) => Some(&value.report.outcome.file),
         PipelineValue::CallArgumentGroup(value) => Some(&value.shape.report.outcome.file),
         PipelineValue::CallArgument(value) => Some(&value.shape.report.outcome.file),
@@ -3476,6 +3568,18 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::CallArgument(value) => {
             files.insert(value.shape.report.outcome.file.clone());
         }
+        PipelineValue::CallableSignature(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::SignatureParameter(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::CallableApplicability(value) => {
+            files.insert(value.occurrence.file.clone());
+        }
+        PipelineValue::OverloadSelection(value) => {
+            files.insert(value.occurrence.file.clone());
+        }
         PipelineValue::MemberSelection(value) => {
             files.insert(value.occurrence.file.clone());
         }
@@ -3552,6 +3656,18 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         }
         PipelineTraceValue::CallArgument(value) => {
             files.insert(value.shape.report.outcome.file.clone());
+        }
+        PipelineTraceValue::CallableSignature(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::SignatureParameter(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::CallableApplicability(value) => {
+            files.insert(value.occurrence.file.clone());
+        }
+        PipelineTraceValue::OverloadSelection(value) => {
+            files.insert(value.occurrence.file.clone());
         }
         PipelineTraceValue::MemberSelection(value) => {
             files.insert(value.occurrence.file.clone());
@@ -3943,6 +4059,46 @@ fn detailed_trace_provenance_ref(
             },
             value.file(),
             value.site.range,
+            cache,
+        ),
+        PipelineTraceValue::CallableSignature(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::CallableSignature,
+            DetailedCodeQueryKey::CallableSignature {
+                id: value.report.signature.id.clone(),
+                declaration_id: callable_signature::declaration_site_id(&value.declaration),
+            },
+            value.file(),
+            value.declaration.range,
+            cache,
+        ),
+        PipelineTraceValue::SignatureParameter(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::SignatureParameter,
+            DetailedCodeQueryKey::SignatureParameter {
+                id: value.row().id.clone(),
+                signature_id: value.row().signature_id.clone(),
+            },
+            value.file(),
+            value.signature.declaration.range,
+            cache,
+        ),
+        PipelineTraceValue::CallableApplicability(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::CallableApplicability,
+            DetailedCodeQueryKey::CallableApplicability {
+                id: value.row().id.clone(),
+                site_ast_id: value.row().site_ast_id.clone(),
+            },
+            &value.occurrence.file,
+            value.occurrence.range,
+            cache,
+        ),
+        PipelineTraceValue::OverloadSelection(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::OverloadSelection,
+            DetailedCodeQueryKey::OverloadSelection {
+                id: value.row().id.clone(),
+                site_ast_id: value.row().site_ast_id.clone(),
+            },
+            &value.occurrence.file,
+            value.occurrence.range,
             cache,
         ),
         PipelineTraceValue::MemberFamily(value) => detailed_environment_provenance_ref(
@@ -4490,6 +4646,18 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         }
         PipelineValue::DispatchTarget(value) => {
             Some(PipelineTraceValue::DispatchTarget(value.clone()))
+        }
+        PipelineValue::CallableSignature(value) => {
+            Some(PipelineTraceValue::CallableSignature(value.clone()))
+        }
+        PipelineValue::CallableApplicability(value) => {
+            Some(PipelineTraceValue::CallableApplicability(value.clone()))
+        }
+        PipelineValue::OverloadSelection(value) => {
+            Some(PipelineTraceValue::OverloadSelection(value.clone()))
+        }
+        PipelineValue::SignatureParameter(value) => {
+            Some(PipelineTraceValue::SignatureParameter(value.clone()))
         }
         PipelineValue::MemberFamily(value) => Some(PipelineTraceValue::MemberFamily(value.clone())),
         PipelineValue::MemberFamilyEdge(value) => {

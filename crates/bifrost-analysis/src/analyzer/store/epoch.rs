@@ -432,6 +432,8 @@ lang_epoch!(
 // the salted content now comes from a different crate's `include_str!`. The
 // bytes are unchanged, which is exactly why the salt has to carry the
 // relocation.
+// Salt bumped again (#1860): Scala anonymous template bodies now publish a
+// synthetic class owner and source-backed member CodeUnits.
 lang_epoch!(
     Python,
     "python",
@@ -522,7 +524,7 @@ lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08;scala-anonymous-template-code-units-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
 // crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the
@@ -531,11 +533,16 @@ lang_epoch!(
 // Salt bumped again (#1735): C# callable metadata now treats the interop
 // OptionalAttribute as omittable. Warm rows recorded the old exact arity and
 // would make persisted inverse usage search reject valid omitted arguments.
+// Salt bumped again (#1478): C# callable metadata now records the declaration's
+// modifiers -- static, constructor, and written accessibility. Rows persisted
+// before this change say "nobody read the modifiers", and a consumer that
+// distinguishes a static callable from an instance one would read every warm
+// C# callable as undecided.
 lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08;callable-modifier-metadata-2026-08;preprocessor-directive-aware-parsing-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Ruby `.scm` query assets moved from
 // this crate's `resources/treesitter/ruby/` into `brokk-bifrost-ruby`, so the

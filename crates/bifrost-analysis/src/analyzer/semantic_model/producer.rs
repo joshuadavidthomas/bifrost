@@ -26,6 +26,8 @@ pub enum ExternalArtifactKind {
     /// than a compiled artifact, so the ecosystem names the input instead of
     /// the language, exactly as `NpmPackageManifest` does.
     ComposerPackageSourceSet,
+    /// One explicit C++ include root containing exact header sources.
+    CppHeaderSourceSet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

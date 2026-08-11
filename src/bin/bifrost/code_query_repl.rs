@@ -1478,6 +1478,95 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         group_id,
                     ));
                 }
+                CodeQueryResultValue::OverloadSelection { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} considered={} applicable={} inapplicable={} unknown={}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "overload selection:", use_color),
+                        value.resolution,
+                        value.considered_count,
+                        value.applicable_count,
+                        value.inapplicable_count,
+                        value.unknown_count,
+                    ));
+                }
+                CodeQueryResultValue::CallableApplicability { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} #{} {}{}{}{}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "callable applicability:",
+                            use_color
+                        ),
+                        value.ordinal,
+                        value.verdict,
+                        value
+                            .reason
+                            .map(|reason| format!(" {reason}"))
+                            .unwrap_or_default(),
+                        value
+                            .tier
+                            .map(|tier| format!(" tier={tier}"))
+                            .unwrap_or_default(),
+                        if value.selected { " selected" } else { "" },
+                    ));
+                }
+                CodeQueryResultValue::CallableSignature { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let fq_name = sanitize_terminal_text(&value.declaration.fq_name);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} [{}; {}] arity={} generics={}{}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "callable signature:",
+                            use_color
+                        ),
+                        fq_name,
+                        value.role,
+                        value.coverage,
+                        match (value.required_arity, value.total_arity) {
+                            (Some(required), Some(total)) if required == total =>
+                                format!("{total}"),
+                            (Some(required), Some(total)) => format!("{required}..{total}"),
+                            _ => "unrecorded".to_owned(),
+                        },
+                        value.generic_arity,
+                        value
+                            .receiver_contract
+                            .map(|contract| format!(" receiver={contract}"))
+                            .unwrap_or_default(),
+                    ));
+                }
+                CodeQueryResultValue::SignatureParameter { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let label = sanitize_terminal_text(&value.label);
+                    let signature_id = sanitize_terminal_text(&value.signature_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} #{} {}{}\n  signature {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "parameter:", use_color),
+                        value.parameter_index,
+                        label,
+                        value
+                            .declared_type
+                            .as_deref()
+                            .map(|declared| format!(" type={}", sanitize_terminal_text(declared)))
+                            .unwrap_or_default(),
+                        signature_id,
+                    ));
+                }
                 CodeQueryResultValue::Occurrence { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let spelling = sanitize_terminal_text(

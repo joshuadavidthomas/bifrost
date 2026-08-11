@@ -652,6 +652,47 @@ fn maybe_record_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         TargetKind::Method => maybe_record_method_hit(node, ctx),
         TargetKind::GlobalField => maybe_record_global_field_hit(node, ctx),
         TargetKind::MemberField => maybe_record_member_field_hit(node, ctx),
+        TargetKind::Macro => maybe_record_macro_hit(node, ctx),
+    }
+}
+
+fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if !matches!(
+        node.kind(),
+        "identifier"
+            | "field_identifier"
+            | "type_identifier"
+            | "namespace_identifier"
+            | "preproc_arg"
+    ) || node_text(node, ctx.source) != ctx.spec.member_name
+        || node.parent().is_some_and(|parent| {
+            matches!(parent.kind(), "preproc_def" | "preproc_function_def")
+                && parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| same_node(name, node))
+        })
+    {
+        return;
+    }
+    if ctx.visibility.macro_binding_matches_target_at(
+        &ctx.analyzer,
+        ctx.file,
+        &ctx.spec.member_name,
+        node.start_byte(),
+        &ctx.spec.target,
+    ) {
+        *ctx.raw_match_count += 1;
+        push_hit(node, ctx);
+    } else if ctx.visibility.macro_name_may_be_bound_at(
+        ctx.file,
+        &ctx.spec.member_name,
+        node.start_byte(),
+    ) && ctx
+        .visibility
+        .macro_target_is_visible_candidate(ctx.file, &ctx.spec.target)
+    {
+        *ctx.raw_match_count += 1;
+        push_unproven_hit(node, ctx);
     }
 }
 

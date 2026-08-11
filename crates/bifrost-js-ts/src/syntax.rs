@@ -270,7 +270,9 @@ pub fn pattern_binder_identifiers(pattern: Node<'_>) -> Vec<Node<'_>> {
     let mut stack = vec![pattern];
     while let Some(node) = stack.pop() {
         match node.kind() {
-            "identifier" | "shorthand_property_identifier_pattern" => binders.push(node),
+            "identifier" | "type_identifier" | "shorthand_property_identifier_pattern" => {
+                binders.push(node)
+            }
             "required_parameter" | "optional_parameter" => {
                 if let Some(pattern) = node
                     .child_by_field_name("pattern")
@@ -875,6 +877,14 @@ mod tests {
         parser.parse(source, None).expect("JavaScript tree")
     }
 
+    fn parse_typescript(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript grammar");
+        parser.parse(source, None).expect("TypeScript tree")
+    }
+
     #[test]
     fn commonjs_redeclaration_replaces_binding_without_static_ambiguity() {
         let source = r#"
@@ -981,6 +991,22 @@ function render(tasks) {
             bindings.binding_scope_at("task", for_of_use),
             bindings.binding_scope_at("task", arrow_use)
         );
+    }
+
+    #[test]
+    fn lexical_binding_index_tracks_typescript_class_names() {
+        let source = r#"
+export class ApiClient {
+  static create() {}
+}
+
+ApiClient.create();
+"#;
+        let tree = parse_typescript(source);
+        let bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let use_byte = source.rfind("ApiClient.create").expect("static class use");
+
+        assert!(bindings.is_program_binding_at("ApiClient", use_byte, tree.root_node()));
     }
 
     #[test]

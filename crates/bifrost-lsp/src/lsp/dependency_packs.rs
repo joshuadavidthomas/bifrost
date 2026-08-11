@@ -384,7 +384,10 @@ mod tests {
             ecosystems_for_languages(&languages(&[Language::Kotlin, Language::Go])),
             vec![DependencyPackEcosystem::Jvm, DependencyPackEcosystem::Go]
         );
-        assert!(ecosystems_for_languages(&languages(&[Language::Cpp])).is_empty());
+        assert_eq!(
+            ecosystems_for_languages(&languages(&[Language::Cpp])),
+            vec![DependencyPackEcosystem::Cpp]
+        );
     }
 
     #[test]

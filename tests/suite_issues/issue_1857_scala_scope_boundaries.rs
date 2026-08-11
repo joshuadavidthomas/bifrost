@@ -14,8 +14,8 @@
 //!    `val x =\n  new T { ... }` gets an `indented_block`; the same code on one
 //!    line does not. The anonymous member was therefore called "a local Scala
 //!    value" on one layout and honestly missed on the other (3 corpus sites).
-//!    Modelling anonymous-class members is issue #1860; this only makes the
-//!    boundary - and so the diagnostic - honest.
+//!    Issue #1860 now models the anonymous owner and its members. The boundary
+//!    remains layout-independent.
 
 use crate::common::{BuiltInlineTestProject, InlineTestProject, call_tool};
 use brokk_bifrost::searchtools::{
@@ -152,9 +152,8 @@ trait Task {
 "#;
 
 /// A member of an anonymous `new T { ... }` class is not a local of whatever
-/// block the layout wrapped the `new` in. Before #1857 the continuation-line
-/// layout produced an `indented_block` that the boundary walk mistook for the
-/// declaring scope, and the reference was reported as "a local Scala value".
+/// block the layout wrapped the `new` in. Issue #1860 gives both overloads the
+/// same source-backed anonymous owner.
 #[test]
 fn anonymous_class_member_is_not_reported_local() {
     const CONTINUATION: &str = r#"package app
@@ -172,17 +171,22 @@ object Holder {
         .file("app/Holder.scala", CONTINUATION)
         .build();
     let result = definition_at(&project, "app/Holder.scala", CONTINUATION, "= run", "run");
+    let definitions = result["definitions"].as_array().expect("definitions");
     assert_eq!(
-        diagnostic_kinds(&result),
-        vec!["no_indexed_definition".to_string()],
-        "an anonymous-class member is a member of that class, not a local of \
-         the enclosing block: {result:#}"
+        definitions.len(),
+        2,
+        "both overloads must resolve: {result:#}"
+    );
+    assert!(
+        definitions.iter().all(|definition| definition["fqn"]
+            .as_str()
+            .is_some_and(|fqn| fqn.contains("anon$") && fqn.ends_with(".run"))),
+        "an anonymous-class member must resolve to its anonymous owner: {result:#}"
     );
 }
 
-/// The same code on one line has no wrapping `indented_block`, and always
-/// reported the honest diagnostic. Both layouts must now agree - the defect was
-/// layout-dependent, the miss underneath it is not.
+/// The same code on one line has no wrapping `indented_block`. Both layouts
+/// must resolve the same anonymous member set.
 #[test]
 fn anonymous_class_member_diagnostic_does_not_depend_on_layout() {
     const SAME_LINE: &str = r#"package app
@@ -199,10 +203,17 @@ object Holder {
         .file("app/Holder.scala", SAME_LINE)
         .build();
     let result = definition_at(&project, "app/Holder.scala", SAME_LINE, "= run", "run");
+    let definitions = result["definitions"].as_array().expect("definitions");
     assert_eq!(
-        diagnostic_kinds(&result),
-        vec!["no_indexed_definition".to_string()],
-        "the same-line layout answers the same diagnostic: {result:#}"
+        definitions.len(),
+        2,
+        "both overloads must resolve: {result:#}"
+    );
+    assert!(
+        definitions.iter().all(|definition| definition["fqn"]
+            .as_str()
+            .is_some_and(|fqn| fqn.contains("anon$") && fqn.ends_with(".run"))),
+        "the same-line layout must resolve the anonymous owner: {result:#}"
     );
 }
 

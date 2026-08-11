@@ -11,7 +11,8 @@ use crate::graph::resolver::{
     resolves_to_target, resolves_to_target_at, same_node, seed_visible_bindings_at,
     type_identity_matches, unqualified_member_has_local_binding,
     unqualified_member_has_structured_shadow, unqualified_member_resolves_to_owner,
-    usage_unqualified_value_member_shadows_type, usage_visible_extension_method_candidates,
+    usage_relational_generic_call_has_type_argument, usage_unqualified_value_member_shadows_type,
+    usage_visible_extension_method_candidates,
 };
 use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
@@ -19,8 +20,10 @@ use crate::syntax::{
     CSharpNamedArgumentLabel, csharp_attribute_terminal_name, csharp_attribute_type_names,
     csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
     csharp_member_access_type_receiver, csharp_member_name, csharp_named_argument_label,
-    csharp_nameof_type_candidates, csharp_type_leftmost_identifier, csharp_type_reference_root,
-    csharp_type_terminal_identifier, csharp_unqualified_invocation_for_name,
+    csharp_nameof_type_candidates, csharp_relational_generic_call,
+    csharp_relational_generic_call_for_argument, csharp_type_leftmost_identifier,
+    csharp_type_reference_root, csharp_type_terminal_identifier,
+    csharp_unqualified_invocation_for_name,
 };
 use brokk_bifrost_core::analyzer::common::is_unparseable_source;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
@@ -34,7 +37,7 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 pub struct ScanState<'a> {
     pub max_usages: usize,
@@ -62,14 +65,7 @@ pub fn prepare_file(csharp: &dyn CSharpSource, file: &ProjectFile) -> Option<Pre
         return None;
     }
 
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-        .is_err()
-    {
-        return None;
-    }
-    let tree = parser.parse(source.as_str(), None)?;
+    let tree = crate::preprocessor::parse_csharp(source.as_str())?;
     let line_starts = compute_line_starts(&source);
     let class_ranges = ClassRangeIndex::build(csharp, file);
     let using_aliases = csharp.using_aliases_of(file);
@@ -377,11 +373,40 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(name) = csharp_member_name(name_node) else {
         return;
     };
+    let recovered_shape = csharp_relational_generic_call(node);
+    let recovered_bindings = recovered_shape.map(|_| {
+        let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+        seed_visible_bindings_at(
+            binding_scope_node(node),
+            node,
+            ctx.csharp,
+            ctx.file,
+            ctx.source,
+            &mut bindings,
+        );
+        bindings
+    });
+    let recovered_call = recovered_shape.filter(|call| {
+        usage_relational_generic_call_has_type_argument(
+            *call,
+            ctx.graph,
+            ctx.csharp,
+            ctx.file,
+            &ctx.class_ranges,
+            ctx.source,
+            recovered_bindings
+                .as_ref()
+                .expect("recovered call bindings were seeded"),
+        )
+    });
+    let explicit_generic_arity = name
+        .explicit_generic_arity
+        .or_else(|| recovered_call.map(|call| call.explicit_generic_arity));
     if node_text(name.identifier, ctx.source) != ctx.spec.member_name
         || (ctx.spec.kind == TargetKind::Method
             && !ctx
                 .spec
-                .accepts_explicit_generic_arity(name.explicit_generic_arity))
+                .accepts_explicit_generic_arity(explicit_generic_arity))
     {
         return;
     }
@@ -389,8 +414,9 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if is_nameof_argument(node, ctx.source) {
         return;
     }
-    let call_arity =
-        enclosing_invocation(node).map(|invocation| argument_count(invocation, ctx.source));
+    let call_arity = enclosing_invocation(node)
+        .map(|invocation| argument_count(invocation, ctx.source))
+        .or_else(|| recovered_call.map(|call| call.call_arity));
     let ordinary_call_arity_matches = call_arity.is_none_or(|call_arity| {
         ctx.spec
             .callable_arity
@@ -429,15 +455,18 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
 
-    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    seed_visible_bindings_at(
-        binding_scope_node(node),
-        node,
-        ctx.csharp,
-        ctx.file,
-        ctx.source,
-        &mut bindings,
-    );
+    let bindings = recovered_bindings.unwrap_or_else(|| {
+        let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+        seed_visible_bindings_at(
+            binding_scope_node(node),
+            node,
+            ctx.csharp,
+            ctx.file,
+            ctx.source,
+            &mut bindings,
+        );
+        bindings
+    });
     if ctx.spec.kind == TargetKind::Method && ctx.spec.is_extension_method() {
         match receiver_targets_owner(
             receiver_node,
@@ -450,9 +479,9 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             SymbolResolution::Precise(targets) => {
                 let receiver_type_names = targets.into_iter().collect::<Vec<_>>();
                 if extension_call_resolution(
-                    node,
                     name.identifier,
-                    name.explicit_generic_arity,
+                    explicit_generic_arity,
+                    member_call_arity,
                     &receiver_type_names,
                     ctx,
                 ) == TargetMemberResolution::MatchesTarget
@@ -462,9 +491,9 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             }
             SymbolResolution::Ambiguous | SymbolResolution::Unknown => {
                 if extension_call_resolution(
-                    node,
                     name.identifier,
-                    name.explicit_generic_arity,
+                    explicit_generic_arity,
+                    member_call_arity,
                     &[],
                     ctx,
                 ) == TargetMemberResolution::MatchesTarget
@@ -487,7 +516,7 @@ fn scan_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             if targets.iter().any(|target| {
                 receiver_fqn_target_member_resolution(
                     target,
-                    name.explicit_generic_arity,
+                    explicit_generic_arity,
                     member_call_arity,
                     ctx,
                 ) == TargetMemberResolution::MatchesTarget
@@ -528,16 +557,15 @@ fn csharp_static_receiver_is_same_owner(receiver_node: Node<'_>, ctx: &ScanCtx<'
 }
 
 fn extension_call_resolution(
-    member_access: Node<'_>,
     name: Node<'_>,
     explicit_generic_arity: Option<usize>,
+    call_arity: Option<usize>,
     receiver_type_names: &[String],
     ctx: &mut ScanCtx<'_>,
 ) -> TargetMemberResolution {
-    let Some(invocation) = enclosing_invocation(member_access) else {
+    let Some(call_arity) = call_arity else {
         return TargetMemberResolution::NotFound;
     };
-    let call_arity = argument_count(invocation, ctx.source);
     let mut normalized_receivers = receiver_type_names.to_vec();
     normalized_receivers.sort();
     normalized_receivers.dedup();
@@ -618,7 +646,10 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 TargetMemberResolution::NotFound => push_unproven_hit(node, ctx),
             }
         }
-        TargetKind::Method if is_unqualified_method_group_value(node, ctx.source) => {
+        TargetKind::Method
+            if is_unqualified_method_group_value(node, ctx.source)
+                || relational_generic_call_argument_is_method_group(node, ctx) =>
+        {
             let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
             seed_visible_bindings_at(
                 binding_scope_node(node),
@@ -730,6 +761,30 @@ pub(super) fn is_unqualified_method_group_value(node: Node<'_>, source: &str) ->
     containing_method_group_value_context(node)
 }
 
+fn relational_generic_call_argument_is_method_group(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let Some(call) = csharp_relational_generic_call_for_argument(node) else {
+        return false;
+    };
+    let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
+    seed_visible_bindings_at(
+        binding_scope_node(call.member_access),
+        call.member_access,
+        ctx.csharp,
+        ctx.file,
+        ctx.source,
+        &mut bindings,
+    );
+    usage_relational_generic_call_has_type_argument(
+        call,
+        ctx.graph,
+        ctx.csharp,
+        ctx.file,
+        &ctx.class_ranges,
+        ctx.source,
+        &bindings,
+    )
+}
+
 fn containing_method_group_value_context(node: Node<'_>) -> bool {
     let mut current = node;
     while let Some(parent) = current.parent() {
@@ -753,6 +808,11 @@ fn containing_method_group_value_context(node: Node<'_>) -> bool {
             "property_declaration" => {
                 return parent.child_by_field_name("value") == Some(current);
             }
+            // Collection, dictionary, and array initializer entries are
+            // expression children. A bare method name in one of these entries
+            // is a delegate value, including entries in a nested dictionary
+            // element initializer (#1798).
+            "initializer_expression" => return true,
             "binary_expression" => return is_delegate_binary_operand(current, parent),
             // Both ternary arms are delegate value positions (#1798). The
             // condition is not: an identifier there is a boolean expression,

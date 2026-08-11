@@ -1,10 +1,16 @@
-//! End-to-end coverage for RQLP relational assertion plans (issue #1477).
+//! End-to-end coverage for RQLP relational assertion plans (issues #1477 and
+//! #1478).
 //!
 //! These tests execute named `bind` queries and typed row expansions through
 //! the production `run_policy` evaluation path: every binding is a real
 //! CodeQuery against a real analyzer snapshot, joins are typed row-field
 //! equality, and each violated group becomes one finding anchored at the exact
 //! source range of its contributing rows.
+//!
+//! The last two families are the #1478 Milestone 4 additions: the
+//! `assert-selected-in-winning-tier` sugar over overload-selection and
+//! callable-applicability rows, and the `ordered-equal` aggregate over two
+//! ordered row sequences.
 
 use std::sync::Arc;
 
@@ -465,4 +471,233 @@ fn open_world_dispatch_never_satisfies_the_exact_set_assertion() {
         0,
         "an open arm must never be counted as a proven dispatch"
     );
+}
+
+/// A workspace snapshot over one inline file, for the row families that need
+/// the production resolver rather than a single-file analyzer.
+fn workspace(
+    path: &str,
+    source: &str,
+) -> (
+    crate::common::BuiltInlineTestProject,
+    brokk_bifrost::analyzer::WorkspaceAnalyzer,
+) {
+    let project = InlineTestProject::new().file(path, source).build();
+    let workspace = brokk_bifrost::analyzer::WorkspaceAnalyzer::build(
+        project.project_dyn(),
+        brokk_bifrost::AnalyzerConfig::default(),
+    );
+    (project, workspace)
+}
+
+/// The #1478 Milestone 4 sugar, executed end to end: every call site must have
+/// exactly one candidate that is both selected and applicable.
+const SELECTED_IN_WINNING_TIER: &str = r#"(policy
+  :id "test.relational.winning-tier"
+  :name "The selected callable is applicable"
+  :message "the resolver must select a callable its own applicability check accepted"
+  :severity error
+  :analysis (analysis
+    :type assertion
+    (bind :name site :query
+      (rql (overload-selection (occurrences :role [member_position]))))
+    (bind :name cand :query
+      (rql (callable-applicability (occurrences :role [member_position]))))
+    (assert-selected-in-winning-tier :id one-winner :site site :candidates cand)))"#;
+
+const JAVA_OVERLOADS: &str = r#"package app;
+
+public class Widget {
+    int render() { return 0; }
+    int render(int width) { return width; }
+
+    int caller(Widget widget) {
+        return widget.render(1);
+    }
+}
+"#;
+
+const JAVA_NO_OVERLOAD_ACCEPTS: &str = r#"package app;
+
+public class Widget {
+    int render() { return 0; }
+    int render(int width) { return width; }
+
+    int caller(Widget widget) {
+        return widget.render(1, 2, 3);
+    }
+}
+"#;
+
+const JAVA_TWO_EQUAL_WINNERS: &str = r#"package app;
+
+public class Widget {
+    int render(int width) { return width; }
+    int render(String label) { return label.length(); }
+
+    int caller(Widget widget) {
+        return widget.render(1);
+    }
+}
+"#;
+
+/// The aggregate value of the sole violated group, which for these policies is
+/// the exact number the assertion rejected.
+fn violated_count(run: &PolicyRun) -> u64 {
+    assert_eq!(run.findings().len(), 1, "{:?}", run.findings());
+    let PolicyFindingEvidence::Assertion { evidence } = run.findings()[0].evidence() else {
+        panic!("relational assertion policies produce assertion evidence");
+    };
+    evidence.actual_count()
+}
+
+/// Clean: the resolver selects the one-argument overload, and its own
+/// applicability check accepted that overload.
+#[test]
+fn the_selected_overload_sits_in_the_winning_tier() {
+    let (_project, workspace) = workspace("app/Widget.java", JAVA_OVERLOADS);
+    let run = evaluate_with_workspace(
+        SELECTED_IN_WINNING_TIER,
+        &workspace,
+        &mut PolicyBudget::default(),
+    );
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert!(run.findings().is_empty(), "{:?}", run.findings());
+}
+
+/// Finding: no overload accepts three arguments, so the resolver binds no
+/// callable and the site has zero candidates that are both `selected` and
+/// `applicable`. The sugar's default cardinality states that every call site
+/// resolves to exactly one accepted callable, so the unresolved site is one
+/// finding of `actual 0` at the call.
+#[test]
+fn a_selection_outside_the_winning_tier_is_one_finding_at_the_call_site() {
+    let (_project, workspace) = workspace("app/Widget.java", JAVA_NO_OVERLOAD_ACCEPTS);
+    let run = evaluate_with_workspace(
+        SELECTED_IN_WINNING_TIER,
+        &workspace,
+        &mut PolicyBudget::default(),
+    );
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert_eq!(violated_count(&run), 0);
+    let finding = &run.findings()[0];
+    assert_eq!(finding.primary().path(), "app/Widget.java");
+    assert_eq!(
+        finding
+            .primary()
+            .region()
+            .expect("the violation anchors at the row's exact display range")
+            .start_line(),
+        8,
+        "the finding points at the call, not at any declaration"
+    );
+    let PolicyFindingEvidence::Assertion { evidence } = finding.evidence() else {
+        panic!("relational assertion policies produce assertion evidence");
+    };
+    assert_eq!(evidence.expectation(), "(exactly 1)");
+    assert_eq!(evidence.anchor().assert_id(), "one-winner");
+}
+
+/// Zero stays assertable rather than being an error state: a site where the
+/// resolver accepted nothing is exactly what `(exactly 0)` states, and the
+/// same fixture is clean under it.
+#[test]
+fn an_unresolved_site_is_assertable_as_zero_winners() {
+    let source = SELECTED_IN_WINNING_TIER.replace(
+        ":site site :candidates cand)",
+        ":site site :candidates cand :cardinality (exactly 0))",
+    );
+    let (_project, workspace) = workspace("app/Widget.java", JAVA_NO_OVERLOAD_ACCEPTS);
+    let run = evaluate_with_workspace(&source, &workspace, &mut PolicyBudget::default());
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert!(run.findings().is_empty(), "{:?}", run.findings());
+}
+
+/// Many stays assertable too. Two overloads of one arity are both accepted by
+/// Java's arity check, so the site keeps two winners rather than having one
+/// picked by candidate order, and `(at-least 2)` states that outcome.
+#[test]
+fn an_ambiguous_site_is_assertable_as_several_winners() {
+    let ambiguous = SELECTED_IN_WINNING_TIER.replace(
+        ":site site :candidates cand)",
+        ":site site :candidates cand :cardinality (at-least 2))",
+    );
+    let (_project, workspace) = workspace("app/Widget.java", JAVA_TWO_EQUAL_WINNERS);
+    let run = evaluate_with_workspace(&ambiguous, &workspace, &mut PolicyBudget::default());
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert!(run.findings().is_empty(), "{:?}", run.findings());
+
+    // The same site is a finding under the uniqueness assertion, which is what
+    // makes the ambiguity observable rather than silently tolerated.
+    let unique = evaluate_with_workspace(
+        SELECTED_IN_WINNING_TIER,
+        &workspace,
+        &mut PolicyBudget::default(),
+    );
+    assert_eq!(violated_count(&unique), 2);
+}
+
+const ARGUMENT_ORDER: &str = r#"(policy
+  :id "test.relational.argument-order"
+  :name "Named arguments follow declaration order"
+  :message "a named argument must sit at the position its parameter was declared at"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    (bind :name arg :query
+      (rql (call-arguments (call-argument-groups
+        (call-shape (language python (call :callee "greet")))))))
+    (bind :name param :query
+      (rql (signature-parameters (callable-signature
+        (enclosing-decl (language python (function :name "greet")))))))
+    (join :left arg :right param :on ((name label)))
+    (group :name shape :by (arg.site_id)
+      (aggregate :name parity :op ordered-equal
+        :left (arg.argument_index arg.name)
+        :right (param.parameter_index param.label)))
+    (assert :group shape :value parity :cardinality (exactly 1))))"#;
+
+const PYTHON_IN_ORDER: &str = r#"def greet(name, greeting):
+    return greeting + name
+
+
+def caller():
+    return greet(name="ada", greeting="hi")
+"#;
+
+/// The same two named arguments, written in the other order. A set-equality
+/// check cannot tell this fixture from the one above; the ordered predicate
+/// exists because that difference is the whole invariant.
+const PYTHON_OUT_OF_ORDER: &str = r#"def greet(name, greeting):
+    return greeting + name
+
+
+def caller():
+    return greet(greeting="hi", name="ada")
+"#;
+
+#[test]
+fn ordered_equal_is_clean_when_named_arguments_follow_declaration_order() {
+    let (_project, workspace) = workspace("app.py", PYTHON_IN_ORDER);
+    let run = evaluate_with_workspace(ARGUMENT_ORDER, &workspace, &mut PolicyBudget::default());
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert!(run.findings().is_empty(), "{:?}", run.findings());
+
+    // The clean result is a satisfied assertion, not an absent group: the same
+    // fixture violates the inverted assertion.
+    let inverted = ARGUMENT_ORDER.replace(
+        ":value parity :cardinality (exactly 1)",
+        ":value parity :cardinality (exactly 0)",
+    );
+    let run = evaluate_with_workspace(&inverted, &workspace, &mut PolicyBudget::default());
+    assert_eq!(violated_count(&run), 1, "parity was computed and held");
+}
+
+#[test]
+fn ordered_equal_reports_the_same_set_written_in_a_different_order() {
+    let (_project, workspace) = workspace("app.py", PYTHON_OUT_OF_ORDER);
+    let run = evaluate_with_workspace(ARGUMENT_ORDER, &workspace, &mut PolicyBudget::default());
+    assert_eq!(run.completion(), &PolicyRunCompletion::Complete);
+    assert_eq!(violated_count(&run), 0, "the lists are equal as sets only");
+    assert_eq!(run.findings()[0].primary().path(), "app.py");
 }

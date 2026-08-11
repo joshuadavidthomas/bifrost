@@ -2,11 +2,12 @@ use super::inverted::{ProjectTypes, scan_edge_file, scan_scala_query_file};
 use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{
     ClassRangeIndex, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
-    build_file_declarations_from_declaration_ranges, class_range_index_from_declaration_ranges,
-    parse_source_and_collect_with_declarations,
+    build_file_declarations_from_declaration_ranges_filtered,
+    class_range_index_from_declaration_ranges, parse_source_and_collect_with_declarations,
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile, Range, ScalaAnalyzer,
@@ -49,15 +50,21 @@ where
     let language = brokk_bifrost_jvm::scala::language::LANGUAGE.into();
     build_edge_output(&graph.files, keep_file, |file| {
         let state = graph.types.bulk_file_state(file)?;
-        let declarations =
-            build_file_declarations_from_declaration_ranges(&state.declarations, &state.ranges);
+        // Synthetic anonymous classes are not public graph nodes. Do not let
+        // their ranges hide references from the enclosing callable. Their
+        // named members remain eligible callers through their own ranges.
+        let declarations = build_file_declarations_from_declaration_ranges_filtered(
+            &state.declarations,
+            &state.ranges,
+            |unit| !(unit.is_class() && unit.is_synthetic()),
+        );
         let class_ranges =
             class_range_index_from_declaration_ranges(&state.declarations, &state.ranges);
         parse_source_and_collect_with_declarations(
             graph.types.source_for_file(scala, file)?,
             file,
             nodes,
-            &language,
+            ParseSpec::whole(&language),
             declarations,
             |input| scan_edge_file(scala, &graph.types, file, state, class_ranges, input),
         )

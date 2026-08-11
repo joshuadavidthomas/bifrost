@@ -440,6 +440,122 @@ object App { def caller(service: Service): Unit = service.run() }
     assert_eq!(member.hierarchy_depth, 0);
     assert_eq!(member.dispatch_tier, MemberDispatchTier::InherentOrDirect);
     assert_eq!(row.tier, Some(PrecedenceTier::OwnMember));
+
+    // The deferral now points at real evidence (#1478 M3): the same filter that
+    // discarded the candidate said which end of the declared list it missed.
+    let callable = row
+        .callable
+        .expect("a candidate the applicability filter refused states why");
+    assert_eq!(callable.verdict.label(), "inapplicable");
+    assert_eq!(
+        callable.reason.map(|reason| reason.label()),
+        Some("arity_below_required"),
+        "an empty argument list cannot fill a one-parameter list: {rows:?}"
+    );
+}
+
+/// A curried declaration is the case Scala's matcher exists for, and the reason
+/// names the *list* that refused rather than a whole-shape verdict: a second
+/// list with the wrong count is an arity miss, while writing more lists than
+/// the declaration and its result can consume is a list-shape mismatch.
+#[test]
+fn a_curried_call_reports_which_argument_list_refused() {
+    let wrong_count = member_candidates(
+        r#"class Service { def run(first: Int)(second: Int): Unit = {} }
+object App { def caller(service: Service): Unit = service.run(1)(2, 3) }
+"#,
+        "run",
+        1,
+    );
+    let refused = wrong_count
+        .iter()
+        .find(|row| !row.is_selected() && fq_name(row) == "Service.run")
+        .unwrap_or_else(|| panic!("the curried loser must be recorded: {wrong_count:?}"));
+    assert_eq!(
+        refused
+            .callable
+            .and_then(|callable| callable.reason)
+            .map(|reason| reason.label()),
+        Some("arity_above_total"),
+        "the second list takes one argument, not two: {wrong_count:?}"
+    );
+
+    let too_many_lists = member_candidates(
+        r#"class Service { def run(first: Int): Unit = {} }
+object App { def caller(service: Service): Unit = service.run(1)(2) }
+"#,
+        "run",
+        1,
+    );
+    let refused = too_many_lists
+        .iter()
+        .find(|row| !row.is_selected() && fq_name(row) == "Service.run")
+        .unwrap_or_else(|| panic!("the over-applied loser must be recorded: {too_many_lists:?}"));
+    assert_eq!(
+        refused
+            .callable
+            .and_then(|callable| callable.reason)
+            .map(|reason| reason.label()),
+        Some("list_shape_mismatch"),
+        "a second list the declaration and its result cannot consume is a shape \
+         disagreement, not an arity miss: {too_many_lists:?}"
+    );
+}
+
+/// A contextual (`using`) list the declaration models is filled by the
+/// compiler, so a call that writes only the explicit list is applicable rather
+/// than short by one list.
+#[test]
+fn a_contextual_list_does_not_make_an_explicit_call_inapplicable() {
+    let rows = member_candidates(
+        r#"class Key
+class Service { def run(first: Int)(using key: Key): Unit = {} }
+object App { def caller(service: Service): Unit = service.run(1) }
+"#,
+        "run",
+        1,
+    );
+    let selected = rows
+        .iter()
+        .find(|row| row.is_selected() && fq_name(row) == "Service.run")
+        .unwrap_or_else(|| panic!("the contextual declaration is selected: {rows:?}"));
+    assert_eq!(
+        selected.callable.map(|callable| callable.verdict.label()),
+        Some("applicable"),
+        "a contextual list the compiler fills is not a missing argument list: {rows:?}"
+    );
+}
+
+/// Both equally applicable overloads of an ambiguous call keep their rows and
+/// their `applicable` verdicts. Nothing here breaks the tie by candidate order.
+#[test]
+fn two_equally_applicable_overloads_both_stay_applicable() {
+    let rows = member_candidates(
+        r#"class Service {
+  def run(first: Int): Unit = {}
+  def run(first: String): Unit = {}
+}
+object App { def caller(service: Service): Unit = service.run(1) }
+"#,
+        "run",
+        2,
+    );
+    let applicable = rows
+        .iter()
+        .filter(|row| {
+            row.callable
+                .is_some_and(|callable| callable.verdict.label() == "applicable")
+        })
+        .count();
+    assert_eq!(
+        applicable, 2,
+        "both same-arity overloads are admitted and both say so: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.callable.and_then(|callable| callable.reason).is_none()),
+        "an admitted candidate carries no rejection reason: {rows:?}"
+    );
 }
 
 /// An inherited overload the walk computed and the call-shape filter then
