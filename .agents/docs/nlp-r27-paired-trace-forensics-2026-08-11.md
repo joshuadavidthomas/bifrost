@@ -28,6 +28,13 @@ The fixed scorer keeps the repository and path strict.
 It normalizes only the final symbol component.
 Brokkbench commit `384754071f9` contains this correction and its tests.
 
+The fixed scorer also uses prepared source roots for repository inference.
+Brokkbench commit `514bf9ff891` contains this correction and its tests.
+
+Both fixes produce 12 scorable same-task pairs.
+The means are 0.4758 bare and 0.4992 NLP.
+NLP leads by 0.0234.
+
 ## Same-task pairs
 
 | Task | Official bare | Official NLP | Fixed bare | Fixed NLP | Main cause |
@@ -97,6 +104,8 @@ Repository inference recovers one NLP answer.
 Two additional NLP answers use the wrong object keys.
 Those failures are not retrieval failures.
 
+The official scorer now includes repository inference.
+
 Latency is also not isolated to semantic search.
 Across seven bare-win pairs, semantic calls used 624 seconds.
 Usage scans used 1,582 seconds.
@@ -105,22 +114,23 @@ No pair timed out.
 Three usage scans each took approximately 250 seconds.
 These calls delayed good and bad answers alike.
 
+Open issue `BrokkAi/bifrost#1748` already covers this latency class.
+The issue now includes the three exact r27 calls and timings.
+
 ## Decisions
 
 Use qualified-name normalization in the canonical scorer.
 Do not use the old official symbol scores for product conclusions.
 
-Keep `source_roots` correction separate.
-It fixes repository attribution, not symbol identity.
+Use prepared source roots for repository attribution.
+This change is separate from symbol identity.
 
 Treat bare versus NLP as a product-toolset comparison.
 Treat symbols versus symbols-plus-NLP as the semantic-search ablation.
 
 ## Next work
 
-1. Add source-root repository inference to the official scorer.
-2. Give each arm the same answer validation capability.
-3. Investigate the 250-second usage scans separately.
-4. Review semantic over-expansion on `domain-137` and `incident-144`.
-5. Select future tasks with the current bare runtime and fixed scorer.
-
+1. Give each arm the same answer validation capability.
+2. Profile one 250-second usage scan in an isolated warm process.
+3. Review semantic over-expansion on `domain-137` and `incident-144`.
+4. Select future tasks with the current bare runtime and fixed scorer.
