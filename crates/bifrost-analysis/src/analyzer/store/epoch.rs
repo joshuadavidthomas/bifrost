@@ -28,6 +28,12 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
+// v10: `SignatureMetadata::field_has_initializer` changed the bincode record
+// shape shared by every language. Rows written before that field existed end
+// before the current decoder reaches it, so every language must rebuild its
+// analyzer facts. Semantic chunks and vectors have a separate identity and
+// remain valid.
+//
 // v9: migration 0019 merged `import_details` into `import_statements`, so an
 // import is one row per binding instead of a raw statement plus a bincode
 // `ImportInfo`. What the writer records changed as well as where: Go segments
@@ -35,7 +41,7 @@ use tree_sitter::Language as TsLanguage;
 // and Scala and TypeScript now emit one row per binding rather than one per
 // declaration. `binder_span` (#1600) rides along as a column on that row
 // rather than as a bincode field, because the blob it used to live in is gone.
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v9-import-bindings-with-binder-span";
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v10-signature-metadata-field-initializer";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
