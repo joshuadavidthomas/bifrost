@@ -98,7 +98,11 @@ mod unix {
         )
         .expect("seed unrelated config");
         let second = run_install(&bin, &logs, &home);
-        assert!(second.status.success(), "second install must be idempotent");
+        assert!(
+            second.status.success(),
+            "second install must be idempotent: {}",
+            String::from_utf8_lossy(&second.stderr)
+        );
         let updated: Value = serde_json::from_str(
             &fs::read_to_string(config_path).expect("updated Oh My Pi MCP config"),
         )
@@ -200,7 +204,7 @@ mod unix {
             if name == "omp" {
                 "#!/bin/sh\nif [ \"$1\" = config ] && [ \"$2\" = path ]; then\n  printf '%s\\n' \"$HOME/.omp/agent\"\n  exit 0\nfi\nexit 1\n".to_string()
             } else if name == "claude" {
-                format!("#!/bin/sh\nif [ \"$1\" = mcp ] && [ \"$2\" = remove ]; then\n  rm -f \"$LOG_DIR/claude-state\"\n  exit 0\nfi\nif [ -e \"$LOG_DIR/claude-state\" ]; then\n  printf '%s\\n' 'MCP server brokk already exists in user config' >&2\n  exit 1\nfi\ntouch \"$LOG_DIR/claude-state\"\nprintf '%s\\n' \"$@\" > \"$LOG_DIR/{name}\"\n")
+                format!("#!/bin/sh\nif [ \"$1\" = mcp ] && [ \"$2\" = remove ]; then\n  printf '%s\\n' removed > \"$LOG_DIR/claude-state\"\n  exit 0\nfi\nif [ -e \"$LOG_DIR/claude-state\" ]; then\n  IFS= read -r state < \"$LOG_DIR/claude-state\"\n  if [ \"$state\" = active ]; then\n    printf '%s\\n' 'MCP server brokk already exists in user config' >&2\n    exit 1\n  fi\nfi\nprintf '%s\\n' active > \"$LOG_DIR/claude-state\"\nprintf '%s\\n' \"$@\" > \"$LOG_DIR/{name}\"\n")
             } else if name == "hermes" {
                 format!("#!/bin/sh\nif [ \"$1\" = mcp ] && [ \"$2\" = list ]; then\n  printf '%s\\n' brokk\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > \"$LOG_DIR/{name}\"\n")
             } else {
