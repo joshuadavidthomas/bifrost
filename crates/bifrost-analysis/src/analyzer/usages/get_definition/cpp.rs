@@ -713,7 +713,8 @@ fn cpp_bounded_reference_node<'tree>(
             ) && parent.child_by_field_name("name") == Some(current))
             || (parent.kind() == "field_expression"
                 && parent.child_by_field_name("field") == Some(current))
-            || (parent.kind() == "call_expression"
+            || (current.kind() != "call_expression"
+                && parent.kind() == "call_expression"
                 && parent.child_by_field_name("function") == Some(current))
             || (parent.kind() == "new_expression"
                 && parent.start_byte() <= current.start_byte()
@@ -2056,7 +2057,11 @@ fn cpp_reference_node(node: Node<'_>) -> Option<CppReferenceNode<'_>> {
             current = parent;
             continue;
         }
-        if parent.kind() == "call_expression"
+        // Keep the call whose callee contains the focused token.  In
+        // `factory()(arg)`, the inner call is itself the outer call's callee,
+        // but lookup at `factory` must not move to the outer invocation.
+        if current.kind() != "call_expression"
+            && parent.kind() == "call_expression"
             && parent.child_by_field_name("function") == Some(current)
         {
             current = parent;
@@ -4738,6 +4743,7 @@ fn cpp_unit_matches_kind(
         }
         CppTargetKind::MemberField => unit.is_field(),
         CppTargetKind::Constructor | CppTargetKind::Method => true,
+        CppTargetKind::Macro => unit.is_macro(),
     }
 }
 

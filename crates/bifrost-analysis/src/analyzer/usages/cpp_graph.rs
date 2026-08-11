@@ -186,7 +186,8 @@ pub(crate) fn dead_code_bulk_eligibility(
         | TargetKind::FreeFunction
         | TargetKind::Method
         | TargetKind::GlobalField
-        | TargetKind::MemberField => CppDeadCodeBulkEligibility::NeedsPrecise,
+        | TargetKind::MemberField
+        | TargetKind::Macro => CppDeadCodeBulkEligibility::NeedsPrecise,
     }
 }
 
