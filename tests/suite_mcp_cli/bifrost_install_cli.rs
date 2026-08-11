@@ -206,7 +206,7 @@ mod unix {
             } else if name == "claude" {
                 format!("#!/bin/sh\nstate=missing\nif [ -e \"$LOG_DIR/claude-state\" ]; then\n  IFS= read -r state < \"$LOG_DIR/claude-state\"\nfi\nif [ \"$1\" = mcp ] && [ \"$2\" = remove ]; then\n  printf '%s\\n' removed > \"$LOG_DIR/claude-state\"\n  exit 0\nfi\nif [ \"$state\" = active ]; then\n  printf '%s\\n' 'MCP server brokk already exists in user config' >&2\n  exit 1\nfi\nprintf '%s\\n' active > \"$LOG_DIR/claude-state\"\nprintf '%s\\n' \"$@\" > \"$LOG_DIR/{name}\"\n")
             } else if name == "hermes" {
-                format!("#!/bin/sh\nif [ \"$1\" = mcp ] && [ \"$2\" = list ]; then\n  printf '%s\\n' brokk\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > \"$LOG_DIR/{name}\"\n")
+                format!("#!/bin/sh\nif [ \"$1\" = mcp ] && [ \"$2\" = list ]; then\n  printf '%s\\n' brokk\n  exit 0\nfi\nIFS= read -r answer\nprintf '%s\\n' \"$@\" > \"$LOG_DIR/{name}\"\n")
             } else {
                 format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOG_DIR/{name}\"\n")
             },

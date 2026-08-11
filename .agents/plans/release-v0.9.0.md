@@ -11,7 +11,8 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 - [x] (2026-08-11 04:40Z) Read the release process and fetch current branches and tags.
 - [x] (2026-08-11 04:45Z) Find the failed Linux installer test and failed policy scan on `master`.
 - [x] (2026-08-11 05:08Z) Correct and validate the confirmed `master` blockers.
-- [ ] Commit and push the validated `master` repair.
+- [x] (2026-08-11 05:35Z) Commit and push the first validated `master` repair.
+- [x] (2026-08-11 06:10Z) Correct the remaining Hermes fixture race found by the full Linux CI job.
 - [ ] Create and push `dave/v0.9.0-rc` from the green `master` commit.
 - [ ] Set the workspace version to 0.9.0, synchronize release metadata, and commit the projection.
 - [ ] Copy the version projection to `master`, as required by the release process.
@@ -34,6 +35,12 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 - Observation: The debug policy scan took approximately 140 seconds, including a warm second run.
   Evidence: Both local `target/debug/bifrost` runs exceeded two minutes; the release CI build completed its scan in 60 seconds.
 
+- Observation: The full Linux job found a second fixture race after the first focused test passed.
+  Evidence: CI run 31462640467 reported a broken pipe while the installer wrote the Hermes confirmation response. The fake Hermes host exited before it read standard input.
+
+- Observation: `brokk-bifrost-rql` was the only release crate that did not exist on crates.io.
+  Evidence: The 0.8.24 package dry run passed. The bootstrap publication then succeeded, and its trusted publisher now names `BrokkAi/bifrost`, `release.yml`, and the `release` environment.
+
 ## Decision Log
 
 - Decision: Repair `master` before selecting the RC commit.
@@ -46,11 +53,11 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 
 ## Outcomes & Retrospective
 
-The first milestone corrected the Linux-only test fixture and accepted six reviewed policy findings. No tag or publication has occurred.
+The first milestone corrected two Linux-only test fixture defects and accepted six reviewed policy findings. The RQL crate is bootstrapped. No release tag exists.
 
 ## Context and Orientation
 
-`Cargo.toml` contains `[workspace.package].version`, the release version source. `scripts/release-version.mjs sync` copies that value into committed plugin and editor files. `CONTRIBUTING.md` requires an RC branch, requires every RC fix on `master`, and requires the final tag on the validated RC commit. `.github/workflows/release.yml` runs after the tag is pushed. `.bifrost/baseline.json` accepts reviewed existing code-smell findings for the repository policy scan.
+`Cargo.toml` contains `[workspace.package].version`, the release version source. `scripts/release-version.mjs sync` copies that value into committed plugin and editor files. `CONTRIBUTING.md` requires an RC branch, requires every RC fix on `master`, and requires the final tag on the validated RC commit. `.github/workflows/release.yml` runs after the tag is pushed. `.bifrost/suppressions.json` records reviewed code-smell findings for the repository policy scan.
 
 The RC branch is a stable branch cut from one selected `master` commit. Only release fixes can move it. The release tag starts publication from one immutable commit.
 
@@ -98,6 +105,7 @@ Current evidence:
     master: b898da7fd0b16a27aac0d672ccaa0d531680b5ee
     CI: https://github.com/BrokkAi/bifrost/actions/runs/31450971490
     policy: https://github.com/BrokkAi/bifrost/actions/runs/31450971428
+    first repair CI: https://github.com/BrokkAi/bifrost/actions/runs/31462640467
     focused installer test: 1 passed; 0 failed
     local policy scan after review: exit 0
 
@@ -108,3 +116,5 @@ Do not add a crate or dependency. Keep `install_mcp_hosts` behavior unchanged un
 Revision note: Created this plan after current `master` failed two release gates. The plan includes master repair before RC selection.
 
 Revision note: Updated the first milestone after the focused installer test passed and the reviewed policy scan exited cleanly.
+
+Revision note: Recorded the Hermes confirmation race and the RQL crate bootstrap before the second master repair checkpoint.
