@@ -6243,7 +6243,7 @@ int consume() {
 }
 
 #[test]
-fn scan_usages_cpp_macro_failure_is_actionable_and_hides_strategy_details() {
+fn scan_usages_cpp_macro_reports_its_active_invocation() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("defs.h", "#define TEST_DECLARE(name) int name\n")
         .file(
@@ -6269,25 +6269,16 @@ void run() {
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
-    let failure = only_result(&value);
+    let result = only_result(&value);
 
-    assert_eq!("failure", failure["status"], "payload: {value}");
+    assert_eq!("found", result["status"], "payload: {value}");
+    assert_eq!(1, result["total_hits"], "payload: {value}");
+    assert_eq!("uses.cpp", result["files"][0]["path"], "payload: {value}");
+    assert_eq!(5, result["files"][0]["hits"][0]["line"], "payload: {value}");
     assert_eq!(
-        "unsupported_target_shape", failure["reason_kind"],
+        "run", result["files"][0]["hits"][0]["enclosing"],
         "payload: {value}"
     );
-    let message = failure["message"].as_str().expect("failure message");
-    assert!(message.contains("C/C++ macro"), "payload: {value}");
-    assert!(message.contains("query_code"), "payload: {value}");
-    assert!(
-        message.contains("syntactic invocation candidates"),
-        "payload: {value}"
-    );
-    assert!(
-        !message.contains("CppUsageGraphStrategy"),
-        "payload: {value}"
-    );
-    assert!(failure.get("strategy").is_none(), "payload: {value}");
 
     let anchored_payload = service
         .call_tool_json(
