@@ -13526,6 +13526,154 @@ function render() {
 }
 
 #[test]
+fn javascript_unbound_receiver_does_not_match_nested_same_file_member() {
+    let source = r#"
+function convert(json) {
+  const formattedJson = {};
+  formattedJson.settings = {
+    encodeUrl: true
+  };
+
+  return typeof settings.encodeUrl === "boolean";
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("tomlToJson.js", source)
+        .build();
+
+    let reference = source
+        .find("settings.encodeUrl")
+        .expect("unbound Bruno receiver")
+        + "settings.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("tomlToJson.js", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn typescript_unbound_receiver_does_not_match_nested_same_file_member() {
+    let source = r#"
+function convert() {
+  const formattedJson: any = {};
+  formattedJson.settings = {
+    encodeUrl: true
+  };
+
+  return settings.encodeUrl;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("tomlToJson.ts", source)
+        .build();
+
+    let reference = source
+        .find("settings.encodeUrl")
+        .expect("unbound TypeScript receiver")
+        + "settings.".len();
+    let value = lookup(
+        project.root(),
+        &location_reference("tomlToJson.ts", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_unbound_receiver_does_not_match_nested_cross_file_member() {
+    let consumer = r#"
+function convert() {
+  return settings.encodeUrl;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file(
+            "definitions.js",
+            r#"
+const formattedJson = {};
+formattedJson.settings = {
+  encodeUrl: true
+};
+"#,
+        )
+        .file("consumer.js", consumer)
+        .build();
+
+    let reference = consumer.find("encodeUrl").expect("unbound nested member");
+    let value = lookup(
+        project.root(),
+        &location_reference("consumer.js", consumer, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
+fn javascript_bound_nested_receiver_resolves_exact_chain() {
+    let source = r#"
+function convert() {
+  const formattedJson = {};
+  formattedJson.settings = {
+    encodeUrl: true
+  };
+
+  return formattedJson.settings.encodeUrl;
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let reference = source.rfind("encodeUrl").expect("bound nested member read");
+    let value = lookup(
+        project.root(),
+        &location_reference("app.js", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "formattedJson.settings.encodeUrl",
+        "{value}"
+    );
+    assert_eq!(result["definitions"][0]["start_line"], 5, "{value}");
+}
+
+#[test]
+fn javascript_bound_nested_receiver_read_before_definition_fails_closed() {
+    let source = r#"
+function convert() {
+  const formattedJson = {};
+  consume(formattedJson.settings.encodeUrl);
+  formattedJson.settings = {
+    encodeUrl: true
+  };
+}
+"#;
+    let project = InlineTestProject::with_language(Language::JavaScript)
+        .file("app.js", source)
+        .build();
+
+    let reference = source.find("encodeUrl").expect("member read before write");
+    let value = lookup(
+        project.root(),
+        &location_reference("app.js", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "no_definition", "{value}");
+    assert!(result["definitions"].is_null(), "{value}");
+}
+
+#[test]
 fn javascript_local_member_read_before_write_stays_unresolved() {
     let source = r#"
 function render(task) {
