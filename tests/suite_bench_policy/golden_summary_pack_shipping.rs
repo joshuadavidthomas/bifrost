@@ -76,8 +76,8 @@ fn the_conversion_is_deterministic() {
 fn the_audit_report_records_the_real_outcome() {
     let conversion = convert_golden_candidates(&candidates_dir()).expect("conversion");
     let audit = &conversion.audit;
-    assert_eq!(audit.candidates_total, 54);
-    assert_eq!(audit.shipped_summaries, 54);
+    assert_eq!(audit.candidates_total, 55);
+    assert_eq!(audit.shipped_summaries, 55);
     assert_eq!(audit.rejected, 0);
     assert!(audit.rejects.is_empty());
     assert_eq!(audit.packs.len(), 1);
@@ -87,7 +87,7 @@ fn the_audit_report_records_the_real_outcome() {
         pack.pinned,
         "the golden pack is pinned by the jdk toolchain"
     );
-    assert_eq!(pack.shipped_summaries, 54);
+    assert_eq!(pack.shipped_summaries, 55);
 }
 
 #[test]

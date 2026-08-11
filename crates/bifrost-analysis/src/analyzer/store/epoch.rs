@@ -432,6 +432,8 @@ lang_epoch!(
 // the salted content now comes from a different crate's `include_str!`. The
 // bytes are unchanged, which is exactly why the salt has to carry the
 // relocation.
+// Salt bumped again (#1860): Scala anonymous template bodies now publish a
+// synthetic class owner and source-backed member CodeUnits.
 lang_epoch!(
     Python,
     "python",
@@ -522,7 +524,7 @@ lang_epoch!(
     Scala,
     "scala",
     "treesitter/scala/",
-    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08"
+    "synthetic-file-scope-code-units-2026-07;scala-raw-supertypes-and-traits-2026-07;ast-test-detection-2026-07;curried-constructor-and-parameter-field-semantics-2026-07;recovered-indentation-type-ownership-2026-07;parser-backed-export-facts-2026-07;parameterized-enum-case-declarations-2026-07;supertype-package-prefix-context-2026-07;supertype-lexical-scope-context-2026-07;tree-sitter-scala-bifrost-patches-1016-1068-1073-2026-07;comment-immune-tuple-pattern-binding-names-2026-07;fq-interned-segments-2026-07;scalachess-fqn-recovery-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;tree-sitter-scala-0.26.2-2026-08;scala-anonymous-template-code-units-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the C# `.scm` query assets moved from this
 // crate's `resources/treesitter/c_sharp/` into `brokk-bifrost-csharp`, so the
@@ -531,11 +533,16 @@ lang_epoch!(
 // Salt bumped again (#1735): C# callable metadata now treats the interop
 // OptionalAttribute as omittable. Warm rows recorded the old exact arity and
 // would make persisted inverse usage search reject valid omitted arguments.
+// Salt bumped again (#1478): C# callable metadata now records the declaration's
+// modifiers -- static, constructor, and written accessibility. Rows persisted
+// before this change say "nobody read the modifiers", and a consumer that
+// distinguishes a static callable from an instance one would read every warm
+// C# callable as undecided.
 lang_epoch!(
     CSharp,
     "csharp",
     "treesitter/c_sharp/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;static-using-type-identifiers-2026-07;as-expression-type-identifiers-2026-07;generic-type-identity-2026-07;attribute-type-identifiers-2026-07;callable-arity-and-static-import-metadata-2026-07;generic-method-arity-identity-2026-07;structured-return-type-metadata-2026-07;tuple-element-type-identifiers-2026-07;nameof-type-identifiers-2026-07;callable-dispatch-extensibility-metadata-2026-07;fq-interned-segments-2026-07;csharp-query-assets-in-brokk-bifrost-csharp-2026-08;interop-optional-callable-arity-2026-08;callable-modifier-metadata-2026-08;preprocessor-directive-aware-parsing-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Ruby `.scm` query assets moved from
 // this crate's `resources/treesitter/ruby/` into `brokk-bifrost-ruby`, so the
@@ -547,9 +554,9 @@ lang_epoch!(
     "treesitter/ruby/",
     "synthetic-file-scope-code-units-2026-07;attr-macro-accessor-identities-2026-07;fq-interned-segments-2026-07;ruby-query-assets-in-brokk-bifrost-ruby-2026-08"
 );
-// The live grammar fingerprint does not include parser tables. Keep the
-// vendored Kotlin revision in the salt so conflict-resolution-only grammar
-// changes cannot reuse analysis produced by an older parser.
+// The live grammar fingerprint does not include parser tables. Keep the exact
+// Kotlin crate release in the salt so parser-only grammar changes cannot reuse
+// analysis produced by an older parser.
 // Salt bumped (#1345): Kotlin callables now publish their written return type
 // and, for an extension, the receiver type they extend; Kotlin properties now
 // carry `SignatureMetadata` at all. Persisted rows written before this change
@@ -561,8 +568,8 @@ lang_epoch!(
 // own name without re-parsing the declaring file. A companion indexed before
 // this change carries no metadata at all, and a warm workspace would read every
 // companion as an ordinary nested object — losing every `Base.of()` edge.
-// Salt bumped (#1548 stage 3 fleet): Kotlin's `highlights.scm` and the vendored
-// grammar moved from this crate into `brokk-bifrost-jvm`. Unlike Java's and
+// Salt bumped (#1548 stage 3 fleet): Kotlin's `highlights.scm` and grammar
+// binding moved from this crate into `brokk-bifrost-jvm`. Unlike Java's and
 // Scala's, this bump is not forced by the mechanism -- `treesitter/kotlin/`
 // selects no entry in the salted asset set, because Kotlin is
 // declaration-walk-only and neither of its `.scm` files has ever been in
@@ -571,7 +578,7 @@ lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "tree-sitter-kotlin-fwcd-c8ac3d26-2026-07;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
+    "brokk-tree-sitter-kotlin-0.4.0-2026-08;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
 );
 
 #[cfg(test)]

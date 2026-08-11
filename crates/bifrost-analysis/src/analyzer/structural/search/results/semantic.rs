@@ -440,6 +440,9 @@ pub struct CodeQueryTaintWitness {
     pub alternatives_truncated: bool,
     #[serde(skip_serializing_if = "is_false")]
     pub retention_truncated: bool,
+    /// Stable label of the exact first cause when `truncated` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation_cause: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

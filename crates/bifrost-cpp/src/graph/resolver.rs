@@ -42,6 +42,7 @@ pub enum TargetKind {
     Method,
     GlobalField,
     MemberField,
+    Macro,
 }
 
 pub enum LexicalTypeResolution {
@@ -428,6 +429,17 @@ impl TargetSpec {
             );
             spec.owner_is_forward_declaration = owner_is_forward_declaration;
             return Some(spec);
+        }
+
+        if target.is_macro() {
+            return Some(Self::new(
+                target.clone(),
+                TargetKind::Macro,
+                None,
+                target.identifier().to_string(),
+                None,
+                None,
+            ));
         }
 
         None
@@ -1501,6 +1513,66 @@ impl<'a> VisibilityIndex<'a> {
         self.macro_environment(file, before_byte)
             .binding(name)
             .is_some()
+    }
+
+    pub fn macro_name_may_be_bound_at(
+        &self,
+        file: &ProjectFile,
+        name: &str,
+        before_byte: usize,
+    ) -> bool {
+        self.macro_environment(file, before_byte).may_bind(name)
+    }
+
+    /// Whether the active macro binding at this reference is the requested
+    /// indexed definition. Name equality alone is not enough because two
+    /// headers can define the same macro for different translation units.
+    pub fn macro_binding_matches_target_at(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        name: &str,
+        before_byte: usize,
+        target: &CodeUnit,
+    ) -> bool {
+        let environment = self.macro_environment(file, before_byte);
+        let Some(binding) = environment.binding(name) else {
+            return false;
+        };
+        // A normal header guard makes the replacement text conditional, but
+        // it does not erase the definition site's source and byte identity.
+        // Keep that identity even when expansion details are not exact.
+        if binding.source != *target.source() {
+            return false;
+        }
+        let Some(prepared) = self.cpp.prepared_syntax(target.source()) else {
+            return false;
+        };
+        analyzer.ranges(target).iter().any(|range| {
+            let Some(mut node) = node_for_exact_range(prepared.tree().root_node(), range) else {
+                return false;
+            };
+            while !matches!(node.kind(), "preproc_def" | "preproc_function_def") {
+                let Some(parent) = node.parent() else {
+                    return false;
+                };
+                node = parent;
+            }
+            node.start_byte() == binding.declaration_byte
+        })
+    }
+
+    /// Whether this target is an indexed macro visible from this file.
+    ///
+    /// An unresolved conditional can make more than one same-name macro a
+    /// possible active binding. Each possible target can keep the site as an
+    /// unproven hit. A macro in an unrelated translation unit stays excluded.
+    pub fn macro_target_is_visible_candidate(&self, file: &ProjectFile, target: &CodeUnit) -> bool {
+        self.visible_identifier_candidates(file, target.identifier())
+            .filter(|candidate| candidate.is_macro())
+            .any(|candidate| {
+                candidate.source() == target.source() && candidate.fq_name() == target.fq_name()
+            })
     }
 
     pub fn object_macro_replacement_at(
@@ -3855,6 +3927,54 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
+    /// Return true when a class-owned alias names the requested type as one
+    /// structured qualifier in its target path.
+    ///
+    /// A dependent target such as `Primary<T>::Type` cannot resolve to one
+    /// indexed class. Forward lookup can still retain `Primary` as its bounded
+    /// canonical identity. Inverse lookup needs the same evidence when later
+    /// references use only the alias spelling.
+    pub fn structured_class_alias_path_preserves_target(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        alias: &CodeUnit,
+        target: &CodeUnit,
+    ) -> bool {
+        let Some(owner) = type_owner_of(analyzer, alias).filter(CodeUnit::is_class) else {
+            return false;
+        };
+        let Some(StructuredAliasTarget::Named {
+            components, global, ..
+        }) = self.structured_alias_target(analyzer, alias)
+        else {
+            return false;
+        };
+        let lexical_scope = canonical_cpp_scope_components(&owner);
+        (1..components.len()).rev().any(|component_count| {
+            matches!(
+                self.resolve_type_components_lexically_for_target(
+                    analyzer,
+                    visible_from,
+                    &components[..component_count],
+                    global,
+                    &lexical_scope,
+                    target,
+                ),
+                LexicalTypeResolution::Resolved {
+                    ref unit,
+                    ref candidates,
+                    ..
+                } if same_visible_symbol(unit, target)
+                    || self.same_template_member_identity(analyzer, unit, target)
+                    || candidates.iter().any(|candidate| {
+                        same_visible_symbol(candidate, target)
+                            || self.same_template_member_identity(analyzer, candidate, target)
+                    })
+            )
+        })
+    }
+
     fn flattened_macro_namespace_alias_target_matches(
         &self,
         analyzer: &CppGraphSource<'_>,
@@ -5560,7 +5680,8 @@ pub fn cpp_reference_fqn_candidates(reference: &str, kind: TargetKind) -> Vec<St
             TargetKind::FreeFunction
             | TargetKind::Method
             | TargetKind::GlobalField
-            | TargetKind::MemberField => {
+            | TargetKind::MemberField
+            | TargetKind::Macro => {
                 push_cpp_fqn_candidate(&mut candidates, &package, &rest.join("."));
                 if rest.len() > 1 {
                     let owner = rest[..rest.len() - 1].join("$");
@@ -9652,6 +9773,7 @@ pub fn matches_kind_for_lookup(unit: &CodeUnit, kind: TargetKind) -> bool {
         | TargetKind::MemberField => true,
         TargetKind::FreeFunction => unit.is_function(),
         TargetKind::GlobalField => unit.is_field(),
+        TargetKind::Macro => unit.is_macro(),
     }
 }
 

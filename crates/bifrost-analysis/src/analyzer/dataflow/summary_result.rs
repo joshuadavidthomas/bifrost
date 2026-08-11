@@ -715,9 +715,14 @@ impl<Fact> SummaryDataflowResult<Fact> {
             .reached
             .get(reached_index)
             .ok_or(SummaryWitnessError::TargetNotInResult)?;
-        if !reached.path_qualities.contains(quality) {
+        // A finding's point value conjoins this row's local quality with its
+        // entry-context prefix, which can only degrade it, so the caller may
+        // ask for a quality the row holds only in a dominating form. The
+        // dominating quality's concrete path witnesses the weaker claim
+        // (#1917).
+        let Some(quality) = reached.path_qualities.dominating_quality(quality) else {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
-        }
+        };
         let Some(evidence) = reached.witnesses.first(quality) else {
             return if self.witness_retention_truncated {
                 Ok(SummaryWitness::retention_truncated_marker(quality))
@@ -756,9 +761,12 @@ impl<Fact> SummaryDataflowResult<Fact> {
                     )
             })
             .ok_or(SummaryWitnessError::TargetNotInResult)?;
-        if !summary.path_qualities.contains(quality) {
+        // Same dominance rule as `witness_for_reached_index` (#1917): a
+        // caller's conjoined quality may be weaker than any locally retained
+        // one, and a dominating retained path witnesses the weaker claim.
+        let Some(quality) = summary.path_qualities.dominating_quality(quality) else {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
-        }
+        };
         let Some(evidence) = summary.witnesses.first(quality) else {
             return if self.witness_retention_truncated {
                 Ok(SummaryWitness::retention_truncated_marker(quality))

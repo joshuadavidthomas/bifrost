@@ -309,7 +309,7 @@ fn python_nested_function_body_is_not_counted() {
 // implementation to match byte-for-byte (issue #1243 is new coverage, not a
 // port), so these assert plausible scores derived by hand-tracing the
 // scorer against `KOTLIN_COGNITIVE_CONFIG` rather than a reference fixture.
-// Fixtures are deliberately multi-line: the vendored grammar emits a
+// Fixtures are deliberately multi-line: the Kotlin grammar emits a
 // MISSING `_automatic_semicolon` error node for a single-line function body,
 // which would make `compute_cognitive_complexities` see an unparseable file.
 

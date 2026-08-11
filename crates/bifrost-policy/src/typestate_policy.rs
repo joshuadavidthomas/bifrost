@@ -1023,7 +1023,6 @@ fn projected_report(
             id.clone(),
             retained_step_limit,
             retained_byte_limit,
-            false,
             |kind| match kind {
                 SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "typestate seed"),
                 SummaryWitnessStepKind::Edge(_) => {

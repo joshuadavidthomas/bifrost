@@ -197,7 +197,7 @@ impl ValueFlowQueryState {
                 }
                 self.record_semantic_status(
                     plan.discovery_status()
-                        .merge(solved.result().coverage().semantic_status()),
+                        .merge(plan.public_semantic_status(solved.result())),
                 );
                 if !solved.is_complete() {
                     self.push_diagnostic(
@@ -240,7 +240,9 @@ impl ValueFlowQueryState {
                 SemanticInputStatus::Ambiguous
             )
             || matches!(
-                analysis.result.result().coverage().semantic_status(),
+                analysis
+                    .plan
+                    .public_semantic_status(analysis.result.result()),
                 SemanticInputStatus::Ambiguous
             );
         let mut meetings_by_sink = HashMap::default();
@@ -666,10 +668,11 @@ impl SemanticFlowWitnessValue {
 }
 
 fn analysis_semantic_status(analysis: &ValueFlowAnalysisResult) -> SemanticInputStatus {
-    analysis
-        .plan
-        .discovery_status()
-        .merge(analysis.result.result().coverage().semantic_status())
+    analysis.plan.discovery_status().merge(
+        analysis
+            .plan
+            .public_semantic_status(analysis.result.result()),
+    )
 }
 
 fn public_completion(

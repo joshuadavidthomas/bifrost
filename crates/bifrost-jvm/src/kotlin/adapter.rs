@@ -14,7 +14,7 @@ use tree_sitter::Node;
 pub const KOTLIN_FILE_EXTENSION: &str = "kt";
 
 /// Tree-sitter node-kind mapping used by the cognitive-complexity scorer for
-/// Kotlin (#1243). The vendored grammar names most control-flow nodes with an
+/// Kotlin (#1243). The Kotlin grammar names most control-flow nodes with an
 /// `_expression` suffix (`if_expression`, `when_expression`, …) rather than
 /// the `_statement` shape other languages use, and folds `break`, `continue`,
 /// `return`, and `throw` into one `jump_expression` kind — hence the custom
@@ -64,7 +64,7 @@ fn kotlin_is_default_when_entry(node: Node<'_>, _source: &str) -> bool {
 /// Whether a `jump_expression` is a labeled `break@`/`continue@`/`return@`.
 ///
 /// The label is parsed as its own named `label` node (see
-/// `_break_at`/`_continue_at`/`_return_at` in the vendored grammar), never as
+/// `_break_at`/`_continue_at`/`_return_at` in the Kotlin grammar), never as
 /// part of the value a plain `return`/`throw` carries, so checking for that
 /// specific child kind — rather than any named child at all — is what keeps
 /// an unlabeled `return value` or `throw value` from being misread as a

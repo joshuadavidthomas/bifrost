@@ -1295,13 +1295,17 @@ fn typestate_finding_identity_locations_and_witnesses_match_human_and_sarif() {
 
 #[test]
 fn java_and_typescript_resource_rqlp_retain_identity_through_all_renderers() {
-    for (language, project) in [
+    // Java's typestate run completes since #1952 (exit 0); TypeScript still
+    // carries open binding evidence and stays unreliable (exit 2).
+    for (language, expected_status, project) in [
         (
             "typescript",
+            2,
             resource_policy_project("src/resource.ts", CROSS_LANGUAGE_TYPESCRIPT_RESOURCE_SOURCE),
         ),
         (
             "java",
+            0,
             resource_policy_project("src/ResourceLifecycle.java", JAVA_RESOURCE_SOURCE),
         ),
     ] {
@@ -1315,7 +1319,7 @@ fn java_and_typescript_resource_rqlp_retain_identity_through_all_renderers() {
             project.root(),
             &[&arguments[..], &["--format", "json"]].concat(),
         );
-        assert_status(&json, 2);
+        assert_status(&json, expected_status);
         let json = json_stdout(&json);
         let findings = json["runs"][0]["findings"]
             .as_array()
@@ -1328,7 +1332,7 @@ fn java_and_typescript_resource_rqlp_retain_identity_through_all_renderers() {
         assert!(!finding["witnesses"].as_array().unwrap().is_empty());
 
         let human = run(project.root(), &[&arguments[..], &["--verbose"]].concat());
-        assert_status(&human, 2);
+        assert_status(&human, expected_status);
         let human = String::from_utf8(human.stdout).expect("UTF-8 typestate report");
         assert!(human.contains(finding_id), "{human}");
         assert!(human.contains(policy_id), "{human}");
@@ -1337,7 +1341,7 @@ fn java_and_typescript_resource_rqlp_retain_identity_through_all_renderers() {
             project.root(),
             &[&arguments[..], &["--format", "sarif"]].concat(),
         );
-        assert_status(&sarif, 2);
+        assert_status(&sarif, expected_status);
         let sarif = json_stdout(&sarif);
         let result = &sarif["runs"][0]["results"][0];
         assert_eq!(result["ruleId"], policy_id);
@@ -1376,7 +1380,7 @@ fn repeated_typestate_policies_share_production_summaries_with_explicit_counters
             "never",
         ],
     );
-    assert_status(&output, 2);
+    assert_status(&output, 0);
     let report = json_stdout(&output);
     let runs = report["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 2);

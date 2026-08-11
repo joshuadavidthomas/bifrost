@@ -1,6 +1,6 @@
 //! Kotlin structural spec for `query_code` (issue #1240).
 //!
-//! This maps the vendored fwcd tree-sitter-kotlin node types onto Bifrost's
+//! This maps the `brokk-tree-sitter-kotlin` node types onto Bifrost's
 //! normalized structural vocabulary and extracts role edges from the tree.
 //!
 //! The grammar is field-poor — of everything this adapter reads, only
@@ -53,7 +53,7 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
+    CALLABLE_APPLICABILITY_ONLY_SUPPORT, LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityRouteSupport, NO_IDENTITY_ROUTE_SUPPORT,
@@ -479,7 +479,10 @@ impl StructuralSpec for KotlinStructuralSpec {
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        &NO_LEXICAL_ENVIRONMENT_SUPPORT
+        // Kotlin classifies no scopes, binding intervals, import binders or
+        // package clause, but its member walk does report per-candidate
+        // callable applicability (#1478 M3). The table states exactly that.
+        &CALLABLE_APPLICABILITY_ONLY_SUPPORT
     }
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {

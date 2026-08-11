@@ -15,10 +15,22 @@
 //! languages whose lowering cannot see a macro- or configuration-derived list
 //! report the incomplete coverages when their per-language enrichment lands.
 //!
+//! Per-language enrichment reaches this module through
+//! [`NormalizedNode::call_site`], which each language spec fills from its own
+//! grammar node during extraction: a refined [`CallKind`] (a Java
+//! `object_creation_expression` is a constructor call, a Scala
+//! `infix_expression` is an infix application), a [`CallShapeCoverage`] below
+//! `Exact` when the lowering cannot read the argument list at all (a C call
+//! whose arguments come from a function-like macro), and a flag marking an
+//! application that continues its callee's argument-list sequence, which is
+//! how a Scala curried call `f(a)(b)` becomes one site with two ordered
+//! groups. A language that fills nothing keeps the baseline.
+//!
 //! This module is derivation only: it never re-parses source, and it never
 //! guesses arguments a language's structural lowering did not record.
 
 use crate::analyzer::semantic::LengthDelimitedDigest;
+use crate::analyzer::structural::facts::NormalizedNode;
 use crate::analyzer::structural::occurrence_rows::ast_id;
 use crate::analyzer::structural::{FileFacts, NormalizedKind, Role};
 use crate::analyzer::{ProjectFile, Range};
@@ -82,105 +94,98 @@ pub struct CallShapeReport {
     pub arguments: Vec<ArgumentRow>,
 }
 
-/// Derive the call shape of one exact facts-arena call node.
+/// Derive the call shape of the call site `call_id` belongs to.
 ///
-/// Returns `None` when `call_id` is not a call node. The facts arena models
-/// positional arguments, named arguments, spread flags, receiver, and callee
-/// today, so this derivation emits at most one `Ordinary` group followed by
-/// at most one `Named` group, and classifies the site as `Method` or
-/// `Function` by receiver presence. Constructor, extractor, infix,
-/// method-value, and curried/contextual/block/type-argument groups need
-/// structure the shared lowering does not record; they arrive with the
-/// per-language enrichment milestones and must never be inferred here from
-/// source text.
+/// Returns `None` when `call_id` is not a call node. When `call_id` is one
+/// application of a curried sequence, the report describes the whole sequence:
+/// `f(a)(b)` is one call site with two ordered `Ordinary` groups, whichever of
+/// its two arena nodes was asked for.
+///
+/// The facts arena models positional arguments, named arguments, spread flags,
+/// receiver, and callee, so each application in the sequence contributes at
+/// most one `Ordinary` group followed by at most one `Named` group. Type
+/// arguments, contextual (`using`) lists, and trailing blocks are not recorded
+/// by the shared lowering and are therefore never emitted; approximating them
+/// from source text is forbidden.
 pub fn call_shape_for_call(
     facts: &FileFacts,
     file: &ProjectFile,
     call_id: u32,
 ) -> Option<CallShapeReport> {
-    let call = facts.node(call_id);
-    if call.kind != NormalizedKind::Call {
+    if facts.node(call_id).kind != NormalizedKind::Call {
         return None;
     }
+    // The site is the outermost application of the curried sequence, and its
+    // argument lists are the sequence's lists in source order.
+    let site_call_id = application_root(facts, call_id);
+    let applications = application_sequence(facts, site_call_id);
+    let call = facts.node(site_call_id);
+
     let content_identity = facts.source_identity();
     let mut digest = LengthDelimitedDigest::new(CALL_SHAPE_SITE_ID_DOMAIN);
     digest.push(content_identity.as_bytes());
     digest.push(&call.range.start_byte.to_le_bytes());
     digest.push(&call.range.end_byte.to_le_bytes());
     let site_id = digest.finish().to_string();
-    let site_ast_id = ast_id(content_identity, call_id);
+    let site_ast_id = ast_id(content_identity, site_call_id);
 
-    let receiver = facts.role_targets(call_id, Role::Receiver).next();
     let callee_range = call
         .name
         .map(|span| range_for_bytes(facts, span.start_byte, span.end_byte));
-
-    let mut positional = Vec::new();
-    let mut named = Vec::new();
-    for target in facts.roles(call_id) {
-        match target.role {
-            Role::Arg => positional.push((
-                range_for_bytes(facts, target.span.start_byte, target.span.end_byte),
-                None,
-                target.spread,
-            )),
-            Role::Kwarg => named.push((
-                range_for_bytes(facts, target.span.start_byte, target.span.end_byte),
-                target
-                    .keyword
-                    .map(|keyword| keyword.text(facts.source()).to_owned()),
-                target.spread,
-            )),
-            _ => {}
-        }
-    }
+    // Coverage is the least complete answer any application in the sequence
+    // gave: one unreadable list makes the whole site's shape unreadable.
+    let coverage = applications
+        .iter()
+        .map(|&id| site_coverage(facts.node(id)))
+        .max_by_key(|coverage| coverage_rank(*coverage))
+        .unwrap_or(CallShapeCoverage::Exact);
+    let call_kind = call_kind_for(facts, &applications);
 
     let mut groups = Vec::new();
     let mut arguments = Vec::new();
-    let mut group_index = 0usize;
-    for (kind, members) in [
-        (ArgumentListKind::Ordinary, positional),
-        (ArgumentListKind::Named, named),
-    ] {
-        // A call with no positional arguments still has one empty `Ordinary`
-        // group: "called with zero arguments" is a shape, while a missing
-        // `Named` group means "no named arguments exist", not "zero named
-        // arguments were passed".
-        if members.is_empty() && kind != ArgumentListKind::Ordinary {
-            continue;
+    // An unreadable shape emits no group and no argument row. A fabricated
+    // empty list would be indistinguishable from a real zero-argument call,
+    // which is exactly the confusion the coverage field exists to prevent.
+    if coverage == CallShapeCoverage::Exact {
+        let mut group_index = 0usize;
+        for &application in &applications {
+            for (kind, members) in argument_groups_of(facts, application) {
+                // A call with no positional arguments still has one empty
+                // `Ordinary` group: "applied to zero arguments" is a shape,
+                // while a missing `Named` group means "no named arguments
+                // exist", not "zero named arguments were passed".
+                if members.is_empty() && kind != ArgumentListKind::Ordinary {
+                    continue;
+                }
+                let mut digest = LengthDelimitedDigest::new(CALL_SHAPE_GROUP_ID_DOMAIN);
+                digest.push(site_id.as_bytes());
+                digest.push(&group_index.to_le_bytes());
+                let group_id = digest.finish().to_string();
+                for (argument_index, member) in members.iter().enumerate() {
+                    let mut digest = LengthDelimitedDigest::new(CALL_SHAPE_ARGUMENT_ID_DOMAIN);
+                    digest.push(group_id.as_bytes());
+                    digest.push(&argument_index.to_le_bytes());
+                    arguments.push(ArgumentRow {
+                        id: digest.finish().to_string(),
+                        group_id: group_id.clone(),
+                        argument_index,
+                        name: member.name.clone(),
+                        spread: member.spread,
+                        range: member.range,
+                    });
+                }
+                groups.push(ArgumentGroupRow {
+                    id: group_id,
+                    site_id: site_id.clone(),
+                    group_index,
+                    kind,
+                    argument_count: members.len(),
+                });
+                group_index += 1;
+            }
         }
-        let mut digest = LengthDelimitedDigest::new(CALL_SHAPE_GROUP_ID_DOMAIN);
-        digest.push(site_id.as_bytes());
-        digest.push(&group_index.to_le_bytes());
-        let group_id = digest.finish().to_string();
-        for (argument_index, (range, name, spread)) in members.iter().enumerate() {
-            let mut digest = LengthDelimitedDigest::new(CALL_SHAPE_ARGUMENT_ID_DOMAIN);
-            digest.push(group_id.as_bytes());
-            digest.push(&argument_index.to_le_bytes());
-            arguments.push(ArgumentRow {
-                id: digest.finish().to_string(),
-                group_id: group_id.clone(),
-                argument_index,
-                name: name.clone(),
-                spread: *spread,
-                range: *range,
-            });
-        }
-        groups.push(ArgumentGroupRow {
-            id: group_id,
-            site_id: site_id.clone(),
-            group_index,
-            kind,
-            argument_count: members.len(),
-        });
-        group_index += 1;
     }
 
-    let call_kind = if receiver.is_some() {
-        CallKind::Method
-    } else {
-        CallKind::Function
-    };
     Some(CallShapeReport {
         outcome: CallShapeOutcome {
             id: site_id.clone(),
@@ -190,15 +195,18 @@ pub fn call_shape_for_call(
             range: call.range,
             callee_range,
             call_kind,
-            coverage: CallShapeCoverage::Exact,
+            coverage,
         },
         groups,
         arguments,
     })
 }
 
-/// Derive the shapes of every call node in one file's facts, in arena order,
+/// Derive the shapes of every call site in one file's facts, in arena order,
 /// up to `limit` sites.
+///
+/// An application that only continues a curried sequence is not a site of its
+/// own: `f(a)(b)` reports once, not twice.
 pub fn call_shapes_in_file(
     facts: &FileFacts,
     file: &ProjectFile,
@@ -213,11 +221,148 @@ pub fn call_shapes_in_file(
             continue;
         }
         let call_id = u32::try_from(id).expect("facts arena node IDs fit u32");
+        if application_root(facts, call_id) != call_id {
+            continue;
+        }
         if let Some(report) = call_shape_for_call(facts, file, call_id) {
             reports.push(report);
         }
     }
     reports
+}
+
+/// One argument of one group, before it is given a row identity.
+struct ArgumentMember {
+    range: Range,
+    name: Option<String>,
+    spread: bool,
+}
+
+/// The positional and named groups one application node contributes.
+fn argument_groups_of(
+    facts: &FileFacts,
+    call_id: u32,
+) -> [(ArgumentListKind, Vec<ArgumentMember>); 2] {
+    let mut positional = Vec::new();
+    let mut named = Vec::new();
+    for target in facts.roles(call_id) {
+        let member = ArgumentMember {
+            range: range_for_bytes(facts, target.span.start_byte, target.span.end_byte),
+            name: target
+                .keyword
+                .map(|keyword| keyword.text(facts.source()).to_owned()),
+            spread: target.spread,
+        };
+        match target.role {
+            Role::Arg => positional.push(member),
+            Role::Kwarg => named.push(member),
+            _ => {}
+        }
+    }
+    [
+        (ArgumentListKind::Ordinary, positional),
+        (ArgumentListKind::Named, named),
+    ]
+}
+
+/// The outermost application of the curried sequence `call_id` belongs to.
+///
+/// Walks up the containment chain while the enclosing call declares that its
+/// own argument list continues this call's sequence. The walk is iterative and
+/// bounded by the arena's parent chain, which is strictly decreasing in id.
+fn application_root(facts: &FileFacts, call_id: u32) -> u32 {
+    let mut current = call_id;
+    while let Some(parent) = facts.node(current).parent {
+        if continued_application_of(facts, parent) != Some(current) {
+            break;
+        }
+        current = parent;
+    }
+    current
+}
+
+/// The applications of the curried sequence rooted at `root`, in source order
+/// (the innermost application, whose list is written first, comes first).
+fn application_sequence(facts: &FileFacts, root: u32) -> Vec<u32> {
+    let mut sequence = vec![root];
+    let mut current = root;
+    while let Some(inner) = continued_application_of(facts, current) {
+        sequence.push(inner);
+        current = inner;
+    }
+    sequence.reverse();
+    sequence
+}
+
+/// The application `call_id` continues, when its language says it continues
+/// one: the call node directly below it that starts at the same byte.
+///
+/// The callee role edge points at the callee's *name* token, not at the inner
+/// application, so the inner application is found through the arena's own
+/// containment structure. Only one direct child call can begin where its
+/// parent call begins, and that child is exactly the callee expression, so no
+/// source text is consulted.
+fn continued_application_of(facts: &FileFacts, call_id: u32) -> Option<u32> {
+    let call = facts.node(call_id);
+    if call.kind != NormalizedKind::Call
+        || !call
+            .call_site
+            .is_some_and(|site| site.continues_callee_groups)
+    {
+        return None;
+    }
+    let mut child = call_id + 1;
+    while child < call.subtree_end {
+        let node = facts.node(child);
+        if node.parent == Some(call_id)
+            && node.kind == NormalizedKind::Call
+            && node.range.start_byte == call.range.start_byte
+        {
+            return Some(child);
+        }
+        // Skip the whole subtree of a child that is not the continued
+        // application: only direct children can be it.
+        child = if node.parent == Some(call_id) {
+            node.subtree_end
+        } else {
+            child + 1
+        };
+    }
+    None
+}
+
+fn site_coverage(node: &NormalizedNode) -> CallShapeCoverage {
+    node.call_site
+        .map_or(CallShapeCoverage::Exact, |facts| facts.coverage)
+}
+
+/// How incomplete a coverage is, so the least complete one wins.
+fn coverage_rank(coverage: CallShapeCoverage) -> u8 {
+    match coverage {
+        CallShapeCoverage::Exact => 0,
+        CallShapeCoverage::Partial => 1,
+        CallShapeCoverage::UnknownDynamic => 2,
+        CallShapeCoverage::UnknownMacroDerived => 3,
+    }
+}
+
+/// The call kind of a site: the language's own classification when it made
+/// one, otherwise the receiver-derived baseline. A curried sequence is named
+/// by its innermost application, which is where the callee and its receiver
+/// are written.
+fn call_kind_for(facts: &FileFacts, applications: &[u32]) -> CallKind {
+    let innermost = *applications.first().expect("a site has one application");
+    if let Some(kind) = facts.node(innermost).call_site.and_then(|f| f.call_kind) {
+        return kind;
+    }
+    if applications
+        .iter()
+        .any(|&id| facts.role_targets(id, Role::Receiver).next().is_some())
+    {
+        CallKind::Method
+    } else {
+        CallKind::Function
+    }
 }
 
 fn range_for_bytes(facts: &FileFacts, start_byte: usize, end_byte: usize) -> Range {
@@ -235,6 +380,9 @@ mod tests {
 
     use super::*;
     use crate::analyzer::structural::extract::extract_file_facts;
+    use brokk_bifrost_cpp::structural::CPP_STRUCTURAL_SPEC;
+    use brokk_bifrost_jvm::java::structural::JAVA_STRUCTURAL_SPEC;
+    use brokk_bifrost_jvm::scala::structural::SCALA_STRUCTURAL_SPEC;
     use brokk_bifrost_python::structural::PYTHON_STRUCTURAL_SPEC;
 
     fn file(name: &str) -> ProjectFile {
@@ -384,6 +532,156 @@ mod tests {
                 assert!(ids.insert(argument.id.clone()));
             }
         }
+    }
+
+    /// A Scala curried application is one call site whose argument lists are
+    /// the sequence's lists in source order, not two sites.
+    #[test]
+    fn scala_curried_application_is_one_site_with_ordered_groups() {
+        let source =
+            "object App {\n  def f(a: Int)(b: Int): Int = a + b\n  def g: Int = f(1)(2)\n}\n";
+        let grammar = brokk_bifrost_jvm::scala::language::LANGUAGE.into();
+        let facts = extract_file_facts(&SCALA_STRUCTURAL_SPEC, &grammar, source)
+            .expect("Scala structural facts");
+        let reports = call_shapes_in_file(&facts, &file("App.scala"), usize::MAX);
+
+        let curried: Vec<_> = reports
+            .iter()
+            .filter(|report| {
+                let range = report.outcome.range;
+                &source[range.start_byte..range.end_byte] == "f(1)(2)"
+            })
+            .collect();
+        assert_eq!(curried.len(), 1, "one site, not one per argument list");
+        let report = curried[0];
+        assert_eq!(report.outcome.call_kind, CallKind::Function);
+        assert_eq!(report.groups.len(), 2, "{:?}", report.groups);
+        assert!(
+            report
+                .groups
+                .iter()
+                .all(|group| group.kind == ArgumentListKind::Ordinary)
+        );
+        assert_eq!(
+            report
+                .groups
+                .iter()
+                .map(|group| group.group_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        let texts: Vec<_> = report
+            .arguments
+            .iter()
+            .map(|argument| &source[argument.range.start_byte..argument.range.end_byte])
+            .collect();
+        assert_eq!(texts, ["1", "2"], "lists stay in source order");
+
+        // Asking for the inner application answers for the whole site.
+        let inner_id = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                node.kind == NormalizedKind::Call
+                    && &source[node.range.start_byte..node.range.end_byte] == "f(1)"
+            })
+            .map(|(id, _)| u32::try_from(id).expect("node id fits u32"))
+            .expect("inner application is a call fact");
+        let from_inner =
+            call_shape_for_call(&facts, &file("App.scala"), inner_id).expect("call shape");
+        assert_eq!(&from_inner, report);
+    }
+
+    /// Scala infix applications carry the grammar's own distinction between a
+    /// symbolic operator and a named infix method.
+    #[test]
+    fn scala_infix_and_operator_applications_are_classified() {
+        let source = "object App {\n  def g(a: Int, b: Int): Int = a max b\n  def h(a: Int, b: Int): Int = a + b\n}\n";
+        let grammar = brokk_bifrost_jvm::scala::language::LANGUAGE.into();
+        let facts = extract_file_facts(&SCALA_STRUCTURAL_SPEC, &grammar, source)
+            .expect("Scala structural facts");
+        let kinds: Vec<_> = call_shapes_in_file(&facts, &file("App.scala"), usize::MAX)
+            .into_iter()
+            .map(|report| {
+                let range = report.outcome.range;
+                (
+                    source[range.start_byte..range.end_byte].to_owned(),
+                    report.outcome.call_kind,
+                )
+            })
+            .collect();
+        assert!(
+            kinds.contains(&("a max b".to_owned(), CallKind::Infix)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("a + b".to_owned(), CallKind::Operator)),
+            "{kinds:?}"
+        );
+    }
+
+    /// A Java `new T(...)` site is a constructor call, and an ordinary
+    /// invocation beside it is not.
+    #[test]
+    fn java_object_creation_is_a_constructor_call() {
+        let source = "class Widget { Widget(int size) {} static void build() { new Widget(2); helper(3); } static void helper(int a) {} }\n";
+        let grammar = tree_sitter_java::LANGUAGE.into();
+        let facts = extract_file_facts(&JAVA_STRUCTURAL_SPEC, &grammar, source)
+            .expect("Java structural facts");
+        let kinds: Vec<_> = call_shapes_in_file(&facts, &file("Widget.java"), usize::MAX)
+            .into_iter()
+            .map(|report| {
+                let range = report.outcome.range;
+                (
+                    source[range.start_byte..range.end_byte].to_owned(),
+                    report.outcome.call_kind,
+                )
+            })
+            .collect();
+        assert!(
+            kinds.contains(&("new Widget(2)".to_owned(), CallKind::Constructor)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("helper(3)".to_owned(), CallKind::Function)),
+            "{kinds:?}"
+        );
+    }
+
+    /// A C++ call of a function-like macro defined in the same file reports
+    /// unknown coverage and no argument rows: its source arguments are the
+    /// macro's, not the callable's.
+    #[test]
+    fn cpp_macro_derived_call_has_unknown_coverage_and_no_arguments() {
+        let source = "#define CALL_TWICE(a) helper(a, 1)\nint helper(int a, int b);\nint main() { CALL_TWICE(2); helper(1, 2); return 0; }\n";
+        let grammar = tree_sitter_cpp::LANGUAGE.into();
+        let facts = extract_file_facts(&CPP_STRUCTURAL_SPEC, &grammar, source).expect("C++ facts");
+        let reports = call_shapes_in_file(&facts, &file("main.cpp"), usize::MAX);
+        let by_text = |text: &str| {
+            reports
+                .iter()
+                .find(|report| {
+                    let range = report.outcome.range;
+                    &source[range.start_byte..range.end_byte] == text
+                })
+                .unwrap_or_else(|| panic!("no call shape for `{text}`"))
+        };
+
+        let macro_call = by_text("CALL_TWICE(2)");
+        assert_eq!(
+            macro_call.outcome.coverage,
+            CallShapeCoverage::UnknownMacroDerived
+        );
+        assert!(
+            macro_call.groups.is_empty() && macro_call.arguments.is_empty(),
+            "an unreadable shape must fabricate no rows: {macro_call:?}"
+        );
+
+        let ordinary = by_text("helper(1, 2)");
+        assert_eq!(ordinary.outcome.coverage, CallShapeCoverage::Exact);
+        assert_eq!(ordinary.groups.len(), 1);
+        assert_eq!(ordinary.arguments.len(), 2);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "reason": "Pre-existing bifrost.code-smells findings accepted at dogfood adoption (2026-08-08). Burn down by fixing findings; the audit reports fixed entries as stale for pruning.",
+  "reason": "Pre-existing bifrost.code-smells findings, accepted 2026-08-08 when this repository adopted the policy gate. Findings introduced after acceptance still gate. Burn this baseline down by fixing findings; the audit then reports the fixed entries as stale, and we prune them.",
   "accepted_at": "2026-08-08",
   "policies": [
     {

@@ -160,38 +160,41 @@ pub fn rust_declaration_facts(
         facts
             .identities
             .push((declaration.clone(), identity.clone()));
-        let declaration_node = prepared.as_ref().and_then(|syntax| {
-            crate::graph_support::rust_named_declaration_node(
+        let declaration_cfg_condition = prepared.as_ref().and_then(|syntax| {
+            crate::graph_support::inspect_rust_named_declaration_node(
                 analyzer.code_units(),
                 declaration,
                 syntax.tree().root_node(),
                 syntax.source(),
+                rust_cfg_condition,
             )
         });
         // A declaration whose node this build cannot find proves nothing about
         // its guard, so it is `Unknown` rather than `Always`.
         ordered_cfg_conditions.push((
             identity.clone(),
-            match (prepared.as_ref(), declaration_node) {
-                (Some(syntax), Some(node)) => rust_cfg_condition(node, syntax.source()),
-                _ => RustCfgCondition::Unknown,
-            },
+            declaration_cfg_condition.unwrap_or(RustCfgCondition::Unknown),
         ));
         let constructor_domain = prepared.as_ref().and_then(|syntax| {
-            let node = declaration_node?;
-            rust_value_constructor_visibilities(node, syntax.source())?
-                .into_iter()
-                .map(|visibility| {
-                    direct_import_scope_for_module(
-                        file,
-                        &owner.package(),
-                        visibility,
-                        is_actual_crate_root,
-                    )
-                })
-                .try_fold(Domain::Public, |effective, domain| {
-                    effective.intersect(&domain?)
-                })
+            crate::graph_support::inspect_rust_named_declaration_node(
+                analyzer.code_units(),
+                declaration,
+                syntax.tree().root_node(),
+                syntax.source(),
+                rust_value_constructor_visibilities,
+            )??
+            .into_iter()
+            .map(|visibility| {
+                direct_import_scope_for_module(
+                    file,
+                    &owner.package(),
+                    visibility,
+                    is_actual_crate_root,
+                )
+            })
+            .try_fold(Domain::Public, |effective, domain| {
+                effective.intersect(&domain?)
+            })
         });
         let declaration_domain = if namespace == RustSymbolNamespace::Macro
             && crate::graph_support::is_rust_macro_export_declaration(

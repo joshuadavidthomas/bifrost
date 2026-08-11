@@ -648,6 +648,10 @@ fn validate_wrapper(
         | RqlForm::CallShape
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
+        | RqlForm::CallableSignature
+        | RqlForm::SignatureParameters
+        | RqlForm::CallableApplicability
+        | RqlForm::OverloadSelection
         | RqlForm::MemberSelection
         | RqlForm::CandidateHierarchy
         | RqlForm::DispatchOutcome

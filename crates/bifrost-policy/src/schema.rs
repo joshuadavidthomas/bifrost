@@ -221,8 +221,9 @@ policy_records! {
     Bind { labels: ["bind"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind :name NAME (:query SELECTOR | :from NAME :step STEP))", description: "Bind one named typed row relation from a CodeQuery or an earlier binding expansion." }
     Join { labels: ["join"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(join :left NAME :right NAME [:kind inner|anti] :on ((LEFT RIGHT)...))", description: "Join two named row relations by registered equal-typed fields." }
     Group { labels: ["group"], layout: Mixed, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(group :name NAME :by (BINDING.FIELD...) (aggregate ...) ...)", description: "Group joined rows by registered fields and compute named aggregates." }
-    Aggregate { labels: ["aggregate"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(aggregate :name NAME :op min|count|count-distinct [:value BINDING.FIELD] [:where ((BINDING.FIELD eq VALUE)...)] )", description: "Compute one bounded typed aggregate within a row group." }
+    Aggregate { labels: ["aggregate"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(aggregate :name NAME :op min|count|count-distinct|ordered-equal [:value BINDING.FIELD] [:left (BINDING.POSITION BINDING.VALUE) :right (BINDING.POSITION BINDING.VALUE)] [:where ((BINDING.FIELD eq VALUE)...)] )", description: "Compute one bounded typed aggregate within a row group." }
     RowAssert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert [:id ID] :group NAME :value NAME :cardinality (exactly|at-least|at-most N))", description: "Assert a cardinality over one named aggregate in every row group." }
+    RowAssertSelectedInWinningTier { labels: ["assert-selected-in-winning-tier"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-selected-in-winning-tier :id ID :site NAME :candidates NAME [:cardinality (exactly|at-least|at-most N)])", description: "Require the selected candidate of every overload-selection row to sit in the winning applicability tier, meaning the set of candidates the resolver's own applicability check accepted. Authoring sugar: it lowers to one inner join on site_ast_id, one group keyed on the site, one counting aggregate over selected applicable candidates, and one cardinality assertion, and adds no evaluation rule of its own." }
     Assert { labels: ["assert"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert :id ID :at CAPTURE :role ROLE :expect declaration|reference|binding|none [:cardinality (exactly N)] [:namespace NAMESPACE] [:require-target true|false])", description: "Require or forbid occurrences at one captured AST node with exact cardinality." }
     AssertResolution { labels: ["assert-resolution"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-resolution :id ID :at CAPTURE :role ROLE :expect-tier TIER [:at-least true|false] [:forbid-tier TIER] [:require-unique true|false])", description: "Require the resolver's selected candidate for one captured reference to sit at, or above, one precedence tier." }
     AssertReaching { labels: ["assert-reaching"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-reaching :id ID :at CAPTURE :role ROLE :declared inside|outside :relative-to CAPTURE)", description: "Require the reaching binding of one captured reference to be declared inside or outside a second captured node." }
@@ -571,6 +572,7 @@ macro_rules! value_shapes {
                     | Self::RowFieldRef
                     | Self::RowFieldRefs
                     | Self::RowJoinConditions
+                    | Self::RowOrderedSequence
                     | Self::RowPredicates => None,
                 }
             }
@@ -685,6 +687,7 @@ macro_rules! value_shapes {
                         PolicyRecord::Join,
                         PolicyRecord::Group,
                         PolicyRecord::RowAssert,
+                        PolicyRecord::RowAssertSelectedInWinningTier,
                     ],
                     Self::RowAggregates => &[PolicyRecord::Aggregate],
                     Self::AssertCardinality => &[
@@ -760,6 +763,7 @@ macro_rules! value_shapes {
                     | Self::RowFieldRef
                     | Self::RowFieldRefs
                     | Self::RowJoinConditions
+                    | Self::RowOrderedSequence
                     | Self::RowPredicates => &[],
                 }
             }
@@ -803,7 +807,7 @@ value_shapes! {
     EdgeClassAxis => "relation, usage, site-class, or kind",
     EdgeClassValues => "one or more classification labels of the constrained axis",
     AssertEntries => "assert records",
-    AssertionPlanEntries => "bind, join, group, and relational assert records",
+    AssertionPlanEntries => "bind, join, group, relational assert, and assert-selected-in-winning-tier records",
     RowAggregates => "aggregate records",
     RowName => "a bounded row binding, group, or aggregate name",
     RowFieldRef => "a binding.field row reference",
@@ -812,7 +816,8 @@ value_shapes! {
     RowPredicates => "zero or more typed equality predicates",
     RowExpansionStep => "a registered typed row expansion",
     RowJoinKind => "inner or anti",
-    RowAggregateOp => "min, count, or count-distinct",
+    RowAggregateOp => "min, count, count-distinct, or ordered-equal",
+    RowOrderedSequence => "a (POSITION-FIELD VALUE-FIELD) ordered sequence pair",
     Boolean => "true or false",
     AnalysisRecord => "an analysis record whose fields agree with its explicit type",
     ReportOptions => "a report record",
@@ -1051,10 +1056,16 @@ policy_fields! {
     AggregateOp { record: Aggregate, labels: ["op"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowAggregateOp, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":op min|count|count-distinct", description: "Choose the bounded aggregate operation." }
     AggregateValue { record: Aggregate, labels: ["value"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: RowFieldRef, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":value BINDING.FIELD", description: "Select the typed input field for min or count-distinct." }
     AggregateWhere { record: Aggregate, labels: ["where"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(0, 16), shape: RowPredicates, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":where ((BINDING.FIELD eq VALUE)...)", description: "Conjoin bounded typed equality predicates before aggregation." }
+    AggregateLeft { record: Aggregate, labels: ["left"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: RowOrderedSequence, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":left (BINDING.POSITION BINDING.VALUE)", description: "Name the left ordered sequence of an ordered-equal aggregate: its integer position field and the value read at that position." }
+    AggregateRight { record: Aggregate, labels: ["right"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: RowOrderedSequence, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":right (BINDING.POSITION BINDING.VALUE)", description: "Name the right ordered sequence of an ordered-equal aggregate; its value field must have the same scalar type as the left one." }
     RowAssertId { record: RowAssert, labels: ["id"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id ID", description: "Optionally override the stable assertion identity derived from group and aggregate names." }
     RowAssertGroup { record: RowAssert, labels: ["group"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":group NAME", description: "Name the row group being asserted." }
     RowAssertValue { record: RowAssert, labels: ["value"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":value NAME", description: "Name the aggregate being asserted." }
     RowAssertCardinality { record: RowAssert, labels: ["cardinality"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: AssertCardinality, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":cardinality (exactly|at-least|at-most N)", description: "Set the expected aggregate cardinality." }
+    WinningTierId { record: RowAssertSelectedInWinningTier, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id ID", description: "Set the assertion identity, which also names the row group this sugar declares." }
+    WinningTierSite { record: RowAssertSelectedInWinningTier, labels: ["site"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":site NAME", description: "Name the binding holding one overload-selection row per call site." }
+    WinningTierCandidates { record: RowAssertSelectedInWinningTier, labels: ["candidates"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":candidates NAME", description: "Name the binding holding the callable-applicability rows of the same sites." }
+    WinningTierCardinality { record: RowAssertSelectedInWinningTier, labels: ["cardinality"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: AssertCardinality, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":cardinality (exactly|at-least|at-most N)", description: "Bound the number of candidates that are both selected and applicable; omission means exactly 1. State (exactly 0) to assert an unresolved site and (at-least 2) to assert an ambiguous one." }
 
     RqlSchemaVersion { record: Rql, labels: ["schema-version"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: SchemaVersion, owner: OwnerApplicability::BOTH, signature: ":schema-version N", description: "Pin the nested RQL version exactly; omission uses the RQL compatible head." }
     RqlQuery { record: Rql, labels: [], placement: FieldPlacement::Positional { index: 0 }, required: Required, multiplicity: SCALAR, shape: RqlQuery, owner: OwnerApplicability::BOTH, signature: "QUERY", description: "Embed exactly one spanned RQL query subtree." }
@@ -1577,6 +1588,7 @@ atom_values! {
     RowAggregateMin { domain: RowAggregateOp, spellings: ["min"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Compute the minimum integer value." }
     RowAggregateCount { domain: RowAggregateOp, spellings: ["count"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Count retained rows." }
     RowAggregateCountDistinct { domain: RowAggregateOp, spellings: ["count-distinct"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Count distinct non-null typed values." }
+    RowAggregateOrderedEqual { domain: RowAggregateOp, spellings: ["ordered-equal"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Compare two ordered row sequences position by position: one when they hold the same value at every position and have the same length, zero otherwise." }
 }
 
 pub fn atom_values(domain: AtomDomain) -> impl Iterator<Item = &'static AtomValueDescriptor> {

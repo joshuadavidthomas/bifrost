@@ -1163,6 +1163,7 @@ impl Decoder {
     ) -> Result<AssertionPolicySpec, PolicySourceError> {
         let mut bindings = Vec::new();
         let mut joins = Vec::new();
+        let mut sugar_joins = Vec::new();
         let mut groups = Vec::new();
         let mut assertions = Vec::new();
         for (index, entry) in fields.variadic().iter().enumerate() {
@@ -1174,6 +1175,7 @@ impl Decoder {
                     PolicyRecord::Join,
                     PolicyRecord::Group,
                     PolicyRecord::RowAssert,
+                    PolicyRecord::RowAssertSelectedInWinningTier,
                 ],
                 "relational assertion plan entry",
             )? {
@@ -1181,9 +1183,20 @@ impl Decoder {
                 PolicyRecord::Join => joins.push(decode_row_join(entry)?),
                 PolicyRecord::Group => groups.push(decode_row_group(entry)?),
                 PolicyRecord::RowAssert => assertions.push(decode_row_assertion(entry)?),
+                PolicyRecord::RowAssertSelectedInWinningTier => {
+                    lower_selected_in_winning_tier(
+                        entry,
+                        &mut sugar_joins,
+                        &mut groups,
+                        &mut assertions,
+                    )?;
+                }
                 other => unreachable!("relational plan registry returned {other:?}"),
             }
         }
+        // Every sugar-declared join is appended after the authored joins, so
+        // the sugar can only extend a tuple set the author already connected.
+        joins.extend(sugar_joins);
         let subject = bindings
             .iter()
             .find_map(|binding| match &binding.source {
@@ -4494,12 +4507,29 @@ fn decode_row_aggregate(expr: &Expr) -> Result<RowAggregate, PolicySourceError> 
         PolicyAtomValue::RowAggregateMin => RowAggregateOp::Min,
         PolicyAtomValue::RowAggregateCount => RowAggregateOp::Count,
         PolicyAtomValue::RowAggregateCountDistinct => RowAggregateOp::CountDistinct,
+        PolicyAtomValue::RowAggregateOrderedEqual => RowAggregateOp::OrderedEqual,
         value => unreachable!("RowAggregateOp registry returned {value:?}"),
     };
     let value = fields
         .get("value")
         .map(|value| decode_row_field_ref(value, "row aggregate value"))
         .transpose()?;
+    // `:left` and `:right` are one unit: an ordered comparison needs both
+    // sequences, and half a comparison has no meaning to report.
+    let sequences = match (fields.get("left"), fields.get("right")) {
+        (None, None) => None,
+        (Some(left), Some(right)) => Some(RowOrderedSequencePair {
+            left: decode_row_ordered_sequence(left, "left ordered sequence")?,
+            right: decode_row_ordered_sequence(right, "right ordered sequence")?,
+        }),
+        (left, _) => {
+            return Err(source_error(
+                "incomplete-ordered-sequence-pair",
+                left.unwrap_or(expr).range.clone(),
+                "an ordered aggregate requires both :left and :right",
+            ));
+        }
+    };
     let predicate = fields
         .get("where")
         .map(decode_row_predicates)
@@ -4509,7 +4539,20 @@ fn decode_row_aggregate(expr: &Expr) -> Result<RowAggregate, PolicySourceError> 
         name,
         op,
         value,
+        sequences,
         predicate,
+    })
+}
+
+/// Decode one `(BINDING.POSITION BINDING.VALUE)` ordered sequence reference.
+fn decode_row_ordered_sequence(
+    expr: &Expr,
+    what: &str,
+) -> Result<RowOrderedSequence, PolicySourceError> {
+    let values = expect_sequence(expr, what, 2, 2)?;
+    Ok(RowOrderedSequence {
+        position: decode_row_field_ref(&values[0], "ordered sequence position field")?,
+        value: decode_row_field_ref(&values[1], "ordered sequence value field")?,
     })
 }
 
@@ -4575,6 +4618,104 @@ fn decode_row_assertion(expr: &Expr) -> Result<RowAssertion, PolicySourceError> 
         aggregate,
         cardinality: decode_assert_cardinality(fields.required("cardinality"))?,
     })
+}
+
+/// Lower `(assert-selected-in-winning-tier ...)` into the relational
+/// operations that already exist.
+///
+/// The winning tier of a call site is the set of candidates the resolver's own
+/// applicability check accepted, which is exactly the `applicable` verdict the
+/// `callable_applicability` rows carry. The assertion therefore counts, per
+/// site, the candidates that are both `selected` and `applicable`, and bounds
+/// that count. Nothing here is a new evaluation rule: the emitted join, group,
+/// aggregate and assertion are the same records an author could write by hand,
+/// which is why a violated sugar reports through the ordinary relational
+/// finding path with the ordinary evidence and representative rows.
+///
+/// The zero/one/many outcomes stay assertable rather than being normalized
+/// away. `(exactly 1)`, the default, is the uniquely resolved site;
+/// `(exactly 0)` is the unresolved site, where the resolver accepted nothing;
+/// `(at-least 2)` is the site that bound more than one accepted candidate.
+fn lower_selected_in_winning_tier(
+    expr: &Expr,
+    joins: &mut Vec<RowJoin>,
+    groups: &mut Vec<RowGroup>,
+    assertions: &mut Vec<RowAssertion>,
+) -> Result<(), PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::RowAssertSelectedInWinningTier,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "row assertion ID")?;
+    let site: RowBindingName = parse_identifier(fields.required("site"), "site row binding name")?;
+    let candidates: RowBindingName =
+        parse_identifier(fields.required("candidates"), "candidate row binding name")?;
+    // The group and the aggregate this sugar declares are named after the
+    // assertion, so a hand-written record of the same name collides and is
+    // reported as a duplicate instead of silently sharing a group.
+    let group = RowGroupName::new(id.as_str()).map_err(|error| {
+        source_error(
+            "invalid-derived-group-name",
+            expr.range.clone(),
+            format!("derived row group name is invalid: {error}"),
+        )
+    })?;
+    let aggregate = RowAggregateName::new("selected-applicable")
+        .expect("the derived aggregate name is a valid identifier");
+    let cardinality = fields
+        .get("cardinality")
+        .map(decode_assert_cardinality)
+        .transpose()?
+        .unwrap_or(AssertCardinality::Exactly(1));
+
+    joins.push(RowJoin {
+        left: site.clone(),
+        right: candidates.clone(),
+        kind: RowJoinKind::Inner,
+        on: vec![RowJoinCondition {
+            left_field: "site_ast_id".to_string(),
+            right_field: "site_ast_id".to_string(),
+        }],
+    });
+    groups.push(RowGroup {
+        name: group.clone(),
+        by: vec![RowFieldRef {
+            binding: site,
+            field: "site_ast_id".to_string(),
+        }],
+        aggregates: vec![RowAggregate {
+            name: aggregate.clone(),
+            op: RowAggregateOp::Count,
+            value: None,
+            sequences: None,
+            predicate: vec![
+                RowPredicate {
+                    field: RowFieldRef {
+                        binding: candidates.clone(),
+                        field: "selected".to_string(),
+                    },
+                    op: RowPredicateOp::Eq,
+                    value: RowLiteral::Boolean(true),
+                },
+                RowPredicate {
+                    field: RowFieldRef {
+                        binding: candidates,
+                        field: "verdict".to_string(),
+                    },
+                    op: RowPredicateOp::Eq,
+                    value: RowLiteral::ConstrainedEnum("applicable".to_string()),
+                },
+            ],
+        }],
+    });
+    assertions.push(RowAssertion {
+        id,
+        group,
+        aggregate,
+        cardinality,
+    });
+    Ok(())
 }
 
 fn decode_row_field_ref(expr: &Expr, what: &str) -> Result<RowFieldRef, PolicySourceError> {
@@ -5525,6 +5666,256 @@ mod tests {
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.assertions.len(), 1);
         assert_eq!(plan.assertions[0].id.as_str(), "by-site-winners");
+    }
+
+    /// The ordered-list predicate the #1478 Milestone 4 requires: two ordered
+    /// sequences named by their own position columns, compared position by
+    /// position rather than as sets.
+    fn ordered_equal_policy(left: &str, right: &str) -> String {
+        format!(
+            r#"(policy
+              :id "test.ordered" :name "Ordered" :message "M" :severity warning
+              :analysis (analysis :type assertion
+                (bind :name arg :query
+                  (rql (call-arguments (call-argument-groups
+                    (call-shape (language python (call :callee "greet")))))))
+                (bind :name param :query
+                  (rql (signature-parameters (callable-signature
+                    (enclosing-decl (language python (function :name "greet")))))))
+                (join :left arg :right param :on ((site_id signature_id)))
+                (group :name shape :by (arg.site_id)
+                  (aggregate :name parity :op ordered-equal
+                    :left ({left})
+                    :right ({right})))
+                (assert :group shape :value parity :cardinality (exactly 1))))"#
+        )
+    }
+
+    #[test]
+    fn decodes_an_ordered_equal_aggregate_over_two_position_columns() {
+        let parsed = parse(&ordered_equal_policy(
+            "arg.argument_index arg.name",
+            "param.parameter_index param.label",
+        ))
+        .unwrap();
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        let plan = spec.relational.expect("relational plan");
+        let aggregate = &plan.groups[0].aggregates[0];
+        assert_eq!(aggregate.op, RowAggregateOp::OrderedEqual);
+        assert!(aggregate.value.is_none());
+        let sequences = aggregate.sequences.as_ref().expect("ordered sequences");
+        assert_eq!(sequences.left.position.field, "argument_index");
+        assert_eq!(sequences.left.value.field, "name");
+        assert_eq!(sequences.right.position.field, "parameter_index");
+        assert_eq!(sequences.right.value.field, "label");
+    }
+
+    #[test]
+    fn an_ordered_aggregate_reports_its_own_typing_mistakes_in_range() {
+        // Half a comparison is reported at the half that was written.
+        let half = ordered_equal_policy(
+            "arg.argument_index arg.name",
+            "param.parameter_index param.label",
+        )
+        .replace(":right (param.parameter_index param.label)", "");
+        assert_error_token(
+            &half,
+            "incomplete-ordered-sequence-pair",
+            "(arg.argument_index arg.name)",
+        );
+
+        // A position column that is not an integer cannot order anything.
+        let unordered =
+            ordered_equal_policy("arg.name arg.name", "param.parameter_index param.label");
+        let error = parse(&unordered).unwrap_err().diagnostic;
+        assert_eq!(error.code, "invalid-relational-assertion-plan");
+        assert_eq!(&unordered[error.range], "assertion");
+        assert!(
+            error.message.contains("position field `arg.name`"),
+            "{}",
+            error.message
+        );
+
+        // Comparing two different scalar types would be false at every
+        // position, which is an authoring mistake, not an answer.
+        let mismatched = ordered_equal_policy(
+            "arg.argument_index arg.spread",
+            "param.parameter_index param.label",
+        );
+        let error = parse(&mismatched).unwrap_err().diagnostic;
+        assert_eq!(error.code, "invalid-relational-assertion-plan");
+        assert!(
+            error
+                .message
+                .contains("compares a Boolean value with a String value"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn ordered_equal_vocabulary_is_registered_for_hover() {
+        let source = ordered_equal_policy(
+            "arg.argument_index arg.name",
+            "param.parameter_index param.label",
+        );
+        let help = rqlp_source_help_at(&source, source.find("ordered-equal").unwrap() + 2)
+            .expect("registered atom has hover help");
+        assert_eq!(help.signature, "ordered-equal");
+        assert!(
+            help.description.contains("position by position"),
+            "{}",
+            help.description
+        );
+    }
+
+    /// The Milestone 4 sugar: it must add no evaluation rule of its own, so
+    /// the decoded plan is exactly the join, group, aggregate and assertion an
+    /// author could have written by hand.
+    #[test]
+    fn selected_in_winning_tier_lowers_to_existing_relational_operations() {
+        let parsed = parse(
+            r#"(policy
+              :id "test.winning-tier" :name "Winning tier" :message "M" :severity warning
+              :analysis (analysis :type assertion
+                (bind :name site :query
+                  (rql (overload-selection (occurrences :role [member_position]))))
+                (bind :name cand :query
+                  (rql (callable-applicability (occurrences :role [member_position]))))
+                (assert-selected-in-winning-tier :id one-winner
+                  :site site :candidates cand)))"#,
+        )
+        .unwrap();
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        let plan = spec.relational.expect("relational plan");
+
+        assert_eq!(plan.joins.len(), 1);
+        assert_eq!(plan.joins[0].left.as_str(), "site");
+        assert_eq!(plan.joins[0].right.as_str(), "cand");
+        assert_eq!(plan.joins[0].kind, RowJoinKind::Inner);
+        assert_eq!(plan.joins[0].on[0].left_field, "site_ast_id");
+        assert_eq!(plan.joins[0].on[0].right_field, "site_ast_id");
+
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].name.as_str(), "one-winner");
+        assert_eq!(plan.groups[0].by[0].field, "site_ast_id");
+        let aggregate = &plan.groups[0].aggregates[0];
+        assert_eq!(aggregate.op, RowAggregateOp::Count);
+        let predicates = aggregate
+            .predicate
+            .iter()
+            .map(|predicate| (predicate.field.field.as_str(), predicate.value.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            predicates,
+            vec![
+                ("selected", RowLiteral::Boolean(true)),
+                (
+                    "verdict",
+                    RowLiteral::ConstrainedEnum("applicable".to_string())
+                ),
+            ]
+        );
+
+        assert_eq!(plan.assertions.len(), 1);
+        assert_eq!(plan.assertions[0].id.as_str(), "one-winner");
+        assert_eq!(plan.assertions[0].group.as_str(), "one-winner");
+        assert_eq!(
+            plan.assertions[0].cardinality,
+            AssertCardinality::Exactly(1),
+            "omitting the cardinality means the uniquely resolved site"
+        );
+    }
+
+    /// Zero and many stay assertable: an unresolved site accepted nothing, and
+    /// an ambiguous one accepted several.
+    #[test]
+    fn selected_in_winning_tier_states_zero_one_and_many_honestly() {
+        for (authored, expected) in [
+            (":cardinality (exactly 0)", AssertCardinality::Exactly(0)),
+            (":cardinality (at-least 2)", AssertCardinality::AtLeast(2)),
+        ] {
+            let source = format!(
+                r#"(policy
+                  :id "test.winning-tier" :name "Winning tier" :message "M" :severity warning
+                  :analysis (analysis :type assertion
+                    (bind :name site :query
+                      (rql (overload-selection (occurrences :role [member_position]))))
+                    (bind :name cand :query
+                      (rql (callable-applicability (occurrences :role [member_position]))))
+                    (assert-selected-in-winning-tier :id outcome
+                      :site site :candidates cand {authored})))"#
+            );
+            let parsed = parse(&source).unwrap();
+            let RqlpDocument::Policy { definition } = parsed.document else {
+                panic!("expected policy")
+            };
+            let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+                panic!("expected assertion policy")
+            };
+            let plan = spec.relational.expect("relational plan");
+            assert_eq!(plan.assertions[0].cardinality, expected);
+        }
+    }
+
+    /// The sugar names bindings, and a binding whose rows have no
+    /// `site_ast_id` is reported before any workspace query runs.
+    #[test]
+    fn selected_in_winning_tier_reports_a_binding_that_is_not_a_selection_row() {
+        let source = r#"(policy
+          :id "test.winning-tier" :name "Winning tier" :message "M" :severity warning
+          :analysis (analysis :type assertion
+            (bind :name site :query
+              (rql (occurrences :role [member_position])))
+            (bind :name cand :query
+              (rql (callable-applicability (occurrences :role [member_position]))))
+            (assert-selected-in-winning-tier :id one-winner
+              :site site :candidates cand)))"#;
+        let error = parse(source).unwrap_err().diagnostic;
+        assert_eq!(error.code, "invalid-relational-assertion-plan");
+        assert_eq!(
+            error.message, "unknown field `site.site_ast_id`",
+            "the occurrence row states `ast_id`, not the call site's `site_ast_id`"
+        );
+    }
+
+    #[test]
+    fn selected_in_winning_tier_is_registered_for_hover() {
+        let source = r#"(policy
+          :id "test.winning-tier" :name "Winning tier" :message "M" :severity warning
+          :analysis (analysis :type assertion
+            (bind :name site :query
+              (rql (overload-selection (occurrences :role [member_position]))))
+            (bind :name cand :query
+              (rql (callable-applicability (occurrences :role [member_position]))))
+            (assert-selected-in-winning-tier :id one-winner
+              :site site :candidates cand)))"#;
+        let help = rqlp_source_help_at(
+            source,
+            source.find("assert-selected-in-winning-tier").unwrap() + 2,
+        )
+        .expect("registered record has hover help");
+        assert!(
+            help.signature
+                .starts_with("(assert-selected-in-winning-tier"),
+            "{}",
+            help.signature
+        );
+        assert!(
+            help.description.contains("winning applicability tier"),
+            "{}",
+            help.description
+        );
     }
 
     #[test]

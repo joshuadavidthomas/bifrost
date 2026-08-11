@@ -1,5 +1,6 @@
 use super::*;
 
+use brokk_bifrost_core::analyzer::model::CallableArity;
 use brokk_bifrost_core::analyzer::structural::resolution::MethodFamilyRelation;
 
 pub(super) fn insert_pipeline_row(
@@ -87,6 +88,22 @@ pub(super) fn render_pipeline_item(
         },
         PipelineValue::CallArgument(value) => CodeQueryResultValue::CallArgument {
             value: Box::new(render_call_shape_argument(analyzer, &value, cache)),
+        },
+        PipelineValue::CallableSignature(value) => CodeQueryResultValue::CallableSignature {
+            value: Box::new(render_callable_signature(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::SignatureParameter(value) => CodeQueryResultValue::SignatureParameter {
+            value: Box::new(render_signature_parameter(analyzer, &value, cache)),
+        },
+        PipelineValue::CallableApplicability(value) => {
+            CodeQueryResultValue::CallableApplicability {
+                value: Box::new(render_callable_applicability(
+                    analyzer, &value, detail, cache,
+                )),
+            }
+        }
+        PipelineValue::OverloadSelection(value) => CodeQueryResultValue::OverloadSelection {
+            value: Box::new(render_overload_selection(analyzer, &value, cache)),
         },
         PipelineValue::MemberSelection(value) => CodeQueryResultValue::MemberSelection {
             value: Box::new(render_member_selection(analyzer, &value, cache)),
@@ -211,6 +228,50 @@ pub(super) fn render_provenance(
                             path: rendered.path,
                             range: rendered.range,
                             argument_index: rendered.argument_index,
+                        }
+                    }
+                    PipelineTraceValue::CallableSignature(value) => {
+                        let rendered = render_callable_signature(analyzer, value, detail, cache);
+                        CodeQueryResultRef::CallableSignature {
+                            id: rendered.id,
+                            declaration_id: rendered.declaration.id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            role: rendered.role,
+                            coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::SignatureParameter(value) => {
+                        let rendered = render_signature_parameter(analyzer, value, cache);
+                        CodeQueryResultRef::SignatureParameter {
+                            id: rendered.id,
+                            signature_id: rendered.signature_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            parameter_index: rendered.parameter_index,
+                        }
+                    }
+                    PipelineTraceValue::CallableApplicability(value) => {
+                        let rendered =
+                            render_callable_applicability(analyzer, value, detail, cache);
+                        CodeQueryResultRef::CallableApplicability {
+                            id: rendered.id,
+                            site_ast_id: rendered.site_ast_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            ordinal: rendered.ordinal,
+                            verdict: rendered.verdict,
+                            selected: rendered.selected,
+                        }
+                    }
+                    PipelineTraceValue::OverloadSelection(value) => {
+                        let rendered = render_overload_selection(analyzer, value, cache);
+                        CodeQueryResultRef::OverloadSelection {
+                            id: rendered.id,
+                            site_ast_id: rendered.site_ast_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            resolution: rendered.resolution,
                         }
                     }
                     PipelineTraceValue::MemberSelection(value) => {
@@ -496,6 +557,59 @@ pub(super) fn render_member_selection(
     }
 }
 
+/// The mandatory overload-selection summary of one occurrence (#1478 M3).
+pub(super) fn render_overload_selection(
+    analyzer: &dyn IAnalyzer,
+    value: &OverloadSelectionValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryOverloadSelection {
+    let occurrence = &value.occurrence;
+    let row = value.row();
+    CodeQueryOverloadSelection {
+        id: row.id.clone(),
+        site_ast_id: row.site_ast_id.clone(),
+        path: rel_path_string(&occurrence.file),
+        language: crate::analyzer::common::language_for_file(&occurrence.file).config_label(),
+        range: render_source_range(analyzer, &occurrence.file, &occurrence.range, cache),
+        resolution: row.resolution.label(),
+        supported: row.supported,
+        considered_count: row.considered,
+        applicable_count: row.applicable,
+        inapplicable_count: row.inapplicable,
+        unknown_count: row.unknown,
+    }
+}
+
+/// One considered candidate's applicability row (#1478 M3).
+pub(super) fn render_callable_applicability(
+    analyzer: &dyn IAnalyzer,
+    value: &CallableApplicabilityValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallableApplicability {
+    let occurrence = &value.occurrence;
+    let row = value.row();
+    CodeQueryCallableApplicability {
+        id: row.id.clone(),
+        site_ast_id: row.site_ast_id.clone(),
+        path: rel_path_string(&occurrence.file),
+        language: crate::analyzer::common::language_for_file(&occurrence.file).config_label(),
+        range: render_source_range(analyzer, &occurrence.file, &occurrence.range, cache),
+        ordinal: row.ordinal,
+        verdict: row.verdict.label(),
+        reason: row.reason.map(|reason| reason.label()),
+        tier: row.tier.map(|tier| tier.label()),
+        selected: row.selected,
+        candidate: render_trace_candidate_ref(
+            analyzer,
+            occurrence,
+            &value.candidate.candidate,
+            detail,
+            cache,
+        ),
+    }
+}
+
 pub(super) fn render_member_selection_ref(
     analyzer: &dyn IAnalyzer,
     value: &MemberSelectionValue,
@@ -605,15 +719,18 @@ pub(super) fn render_declaration_state(
     materialization::public_declaration_state(value, range)
 }
 
-pub(super) fn render_resolution_candidate(
+/// What one trace candidate points at, rendered for a result row.
+///
+/// Shared by the `candidates` and `callable_applicability` domains so the two
+/// never describe the same candidate differently.
+pub(super) fn render_trace_candidate_ref(
     analyzer: &dyn IAnalyzer,
-    value: &CandidateValue,
+    occurrence: &OccurrenceRow,
+    candidate: &TraceCandidateRef,
     detail: CodeQueryResultDetail,
     cache: &mut PipelineRenderCache,
-) -> CodeQueryResolutionCandidate {
-    let occurrence = &value.occurrence;
-    let range = render_source_range(analyzer, &occurrence.file, &occurrence.range, cache);
-    let candidate = match &value.candidate.candidate {
+) -> CodeQueryCandidateRef {
+    match candidate {
         TraceCandidateRef::Unit(unit) => {
             match render_unit_declaration(analyzer, unit, detail, cache) {
                 Some(declaration) => CodeQueryCandidateRef::Unit {
@@ -656,7 +773,24 @@ pub(super) fn render_resolution_candidate(
         TraceCandidateRef::ExternalRoute { name } => {
             CodeQueryCandidateRef::ExternalRoute { name: name.clone() }
         }
-    };
+    }
+}
+
+pub(super) fn render_resolution_candidate(
+    analyzer: &dyn IAnalyzer,
+    value: &CandidateValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResolutionCandidate {
+    let occurrence = &value.occurrence;
+    let range = render_source_range(analyzer, &occurrence.file, &occurrence.range, cache);
+    let candidate = render_trace_candidate_ref(
+        analyzer,
+        occurrence,
+        &value.candidate.candidate,
+        detail,
+        cache,
+    );
     let canonical_member_id = environment::candidate_unit(&value.candidate.candidate)
         .map(|unit| canonical_member_digest(analyzer, unit));
     let owner = value
@@ -1684,6 +1818,57 @@ pub(super) fn render_call_shape_argument(
         argument_index: argument.argument_index,
         name: argument.name.clone(),
         spread: argument.spread,
+    }
+}
+
+pub(super) fn render_callable_signature(
+    analyzer: &dyn IAnalyzer,
+    value: &CallableSignatureValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallableSignature {
+    let signature = &value.report.signature;
+    let file = value.file();
+    CodeQueryCallableSignature {
+        id: signature.id.clone(),
+        path: rel_path_string(file),
+        language: crate::analyzer::common::language_for_file(file).config_label(),
+        range: render_source_range(analyzer, file, &value.declaration.range, cache),
+        declaration: render_declaration(analyzer, &value.declaration, detail, cache),
+        ordinal: signature.ordinal,
+        coverage: signature.coverage.label(),
+        role: signature.role.label(),
+        label: signature.label.clone(),
+        required_arity: signature.arity.map(CallableArity::required),
+        total_arity: signature.arity.map(CallableArity::total),
+        repeated: signature.arity.is_some_and(CallableArity::is_repeated),
+        generic_arity: signature.generic_arity,
+        receiver_contract: signature.receiver_contract.map(|contract| contract.label()),
+        return_type: signature.return_type.clone(),
+        declaration_only: signature.declaration_only,
+        parameter_count: signature.parameter_count,
+    }
+}
+
+pub(super) fn render_signature_parameter(
+    analyzer: &dyn IAnalyzer,
+    value: &SignatureParameterValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQuerySignatureParameter {
+    let parameter = value.row();
+    let file = value.file();
+    CodeQuerySignatureParameter {
+        id: parameter.id.clone(),
+        signature_id: parameter.signature_id.clone(),
+        path: rel_path_string(file),
+        range: render_source_range(analyzer, file, &value.signature.declaration.range, cache),
+        parameter_index: parameter.parameter_index,
+        label: parameter.label.clone(),
+        declared_type: parameter.declared_type.clone(),
+        optional: parameter.optional,
+        repeated: parameter.repeated,
+        label_start_byte: parameter.label_start_byte,
+        label_end_byte: parameter.label_end_byte,
     }
 }
 

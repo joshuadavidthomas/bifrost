@@ -307,7 +307,11 @@ pub fn parse_source_range_with_cancellation(
 }
 
 /// Advance `point` across `bytes[from..to]`. Tree-sitter columns count bytes.
-fn advance_ts_point(
+///
+/// Public because every producer of `tree_sitter::Range` must compute points
+/// with this exact math: a point that disagrees with its byte offset corrupts
+/// the positions of every node in the parse.
+pub fn advance_ts_point(
     bytes: &[u8],
     point: tree_sitter::Point,
     from: usize,

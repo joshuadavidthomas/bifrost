@@ -741,7 +741,11 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::FamilyEdges
         | RqlForm::CallShape
         | RqlForm::CallArgumentGroups
-        | RqlForm::CallArguments => {
+        | RqlForm::CallArguments
+        | RqlForm::CallableSignature
+        | RqlForm::SignatureParameters
+        | RqlForm::CallableApplicability
+        | RqlForm::OverloadSelection => {
             expect_len(expr, items, 2, head)?;
             let mut query = query_object(&items[1])?;
             let op = match form {
@@ -750,6 +754,10 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 RqlForm::CallShape => "call_shape",
                 RqlForm::CallArgumentGroups => "call_argument_groups",
                 RqlForm::CallArguments => "call_arguments",
+                RqlForm::CallableSignature => "callable_signature",
+                RqlForm::SignatureParameters => "signature_parameters",
+                RqlForm::CallableApplicability => "callable_applicability",
+                RqlForm::OverloadSelection => "overload_selection",
                 RqlForm::MemberSelection => "member_selection",
                 RqlForm::CandidateHierarchy => "candidate_hierarchy",
                 RqlForm::DispatchOutcome => "dispatch_outcome",
@@ -1516,6 +1524,10 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CallShape
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
+        | RqlForm::CallableSignature
+        | RqlForm::SignatureParameters
+        | RqlForm::CallableApplicability
+        | RqlForm::OverloadSelection
         | RqlForm::MemberSelection
         | RqlForm::Occurrences
         | RqlForm::OccurrencesOf

@@ -363,3 +363,74 @@ fn cpp_overload_loser_defers_to_the_callable_axis() {
         assert_eq!(member.hierarchy_depth, 0);
     }
 }
+
+/// The deferral now points at real evidence (#1478 M3): the same arity check
+/// that discarded the overload states which end of its declared parameter list
+/// the call missed, and the selected overload states that it was admitted.
+#[test]
+fn cpp_overload_rows_carry_the_verdict_the_arity_check_produced() {
+    let trace = trace_of(
+        "struct Service {\n\
+         \x20 void run(int one) {}\n\
+         \x20 void run(int one, int two) {}\n\
+         };\n\
+         void caller(Service* service) { service->run(1); }\n",
+        "service->run(1)",
+        "run",
+    );
+    let selected = attributed_selection(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    assert_eq!(
+        selected[0]
+            .callable
+            .map(|callable| callable.verdict.label()),
+        Some("applicable"),
+        "the admitted overload states that the check admitted it: {:?}",
+        trace.candidates
+    );
+
+    let refused: Vec<_> = trace
+        .rejected()
+        .filter_map(|row| row.callable)
+        .filter(|callable| callable.verdict.label() == "inapplicable")
+        .collect();
+    assert!(
+        !refused.is_empty(),
+        "the discarded overload states a callable verdict: {:?}",
+        trace.candidates
+    );
+    for callable in refused {
+        assert_eq!(
+            callable.reason.map(|reason| reason.label()),
+            Some("arity_below_required"),
+            "a one-argument call cannot reach the two-parameter overload: {:?}",
+            trace.candidates
+        );
+    }
+}
+
+/// A C variadic parameter list has no upper bound, so a call that exceeds the
+/// declared count is applicable rather than refused. This is the C/C++ case the
+/// motivating commits are about: a conservative arity filter that treats
+/// `...` as a fixed count turns a correct call into a wrong resolution.
+#[test]
+fn cpp_a_variadic_declaration_accepts_more_arguments_than_it_names() {
+    let trace = trace_of(
+        "struct Service {\n\
+         \x20 void log(const char* format, ...) {}\n\
+         };\n\
+         void caller(Service* service) { service->log(\"a\", 1, 2); }\n",
+        "service->log(\"a\", 1, 2)",
+        "log",
+    );
+    let selected = attributed_selection(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    assert_ne!(
+        selected[0]
+            .callable
+            .map(|callable| callable.verdict.label()),
+        Some("inapplicable"),
+        "a variadic list is not exceeded by extra arguments: {:?}",
+        trace.candidates
+    );
+}

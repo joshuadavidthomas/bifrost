@@ -326,6 +326,172 @@ fn csharp_overload_discarded_on_arity_is_recorded_as_a_deferred_rejection() {
     assert_eq!(member.hierarchy_depth, 0);
     assert_eq!(member.dispatch_tier.label(), "inherent_or_direct");
     assert_eq!(member.applicability.label(), "inapplicable");
+
+    // The deferral now points at real evidence (#1478 M3): the same filter that
+    // discarded the overload states which end of the declared list the call
+    // missed, and the winner states that the filter admitted it.
+    assert_eq!(
+        selected[0]
+            .callable
+            .map(|callable| callable.verdict.label()),
+        Some("applicable"),
+        "{:?}",
+        trace.candidates
+    );
+    let callable = loser
+        .callable
+        .expect("a candidate the applicability filter refused states why");
+    assert_eq!(callable.verdict.label(), "inapplicable");
+    assert_eq!(
+        callable.reason.map(|reason| reason.label()),
+        Some("arity_above_total"),
+        "a one-argument call exceeds the zero-parameter overload: {:?}",
+        trace.candidates
+    );
+}
+
+/// A default parameter widens the declared range, so one call reaches an
+/// overload it does not fill completely -- and its same-name sibling that needs
+/// more arguments is refused from the low end.
+#[test]
+fn csharp_a_default_parameter_widens_the_range_the_verdict_measures() {
+    let trace = csharp_trace(
+        &[(
+            "App.cs",
+            "namespace App {
+             class Service {
+             public void Run(int count, int extra = 1) { }
+             public void Run(int count, int extra, int third) { }
+             }
+             class Caller { void Go(Service service) { service.Run(1); } }
+             }
+",
+        )],
+        "App.cs",
+        "service.Run(1)",
+        "Run",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    assert_eq!(
+        selected[0]
+            .callable
+            .map(|callable| callable.verdict.label()),
+        Some("applicable"),
+        "a default parameter lets one argument fill a two-parameter list: {:?}",
+        trace.candidates
+    );
+    let refused: Vec<_> = trace
+        .rejected()
+        .filter_map(|row| row.callable)
+        .filter(|callable| callable.verdict.label() == "inapplicable")
+        .collect();
+    assert!(!refused.is_empty(), "{:?}", trace.candidates);
+    for callable in refused {
+        assert_eq!(
+            callable.reason.map(|reason| reason.label()),
+            Some("arity_below_required"),
+            "the three-parameter overload needs more than one argument: {:?}",
+            trace.candidates
+        );
+    }
+}
+
+/// A static method and an instance method are both reachable by the member
+/// walk, and Milestone 2 made the C# extractor record the modifiers that decide
+/// which. The applicability rows stay about the argument list: a static
+/// declaration the call shape fits is applicable, and the receiver contract is
+/// the signature row's field, joined separately.
+#[test]
+fn csharp_a_static_declaration_is_still_judged_on_its_argument_list() {
+    let trace = csharp_trace(
+        &[(
+            "App.cs",
+            "namespace App {
+             class Service {
+             public static void Run(int count) { }
+             }
+             class Caller { void Go() { Service.Run(1); } }
+             }
+",
+        )],
+        "App.cs",
+        "Service.Run(1)",
+        "Run",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    assert_eq!(
+        selected[0]
+            .callable
+            .map(|callable| callable.verdict.label()),
+        Some("applicable"),
+        "{:?}",
+        trace.candidates
+    );
+}
+
+/// Generic siblings separated by their declared type-parameter count (#1478
+/// Milestone 5). A reference written `Convert<int>` names a generic arity, and
+/// the sibling declaring two type parameters is not that method -- so its
+/// refusal is `type_argument_arity_mismatch` rather than an arity reason about
+/// value arguments it was never measured against. That distinction is the whole
+/// point of giving the explicit type-argument check its own reason: a policy
+/// reading the row can tell "the wrong number of type arguments" from "the
+/// wrong number of arguments".
+///
+/// The near miss is the value-argument sibling in the same class: `Convert<T>`
+/// with a second parameter shares both the name and the generic arity, and is
+/// therefore still a generic-arity winner. Whether it survives the value-arity
+/// check is the other axis, which the fixtures above cover.
+#[test]
+fn csharp_a_generic_sibling_is_refused_on_type_argument_arity_not_on_arity() {
+    let trace = csharp_trace(
+        &[(
+            "App.cs",
+            "namespace App {
+             class Service {
+             public static T Convert<T>(object value) { return default(T); }
+             public static T Convert<T, U>(object value) { return default(T); }
+             }
+             class Caller { void Go() { Service.Convert<int>(1); } }
+             }
+",
+        )],
+        "App.cs",
+        "Service.Convert<int>(1)",
+        "Convert",
+    );
+    let selected = selected(&trace);
+    assert_eq!(selected.len(), 1, "{:?}", trace.candidates);
+    assert_eq!(fq_name(selected[0]), "App.Service.Convert");
+    assert_eq!(
+        selected[0]
+            .callable
+            .map(|callable| callable.verdict.label()),
+        Some("applicable"),
+        "the one-type-parameter declaration is the one written: {:?}",
+        trace.candidates
+    );
+
+    let refused: Vec<&TraceCandidate> = trace
+        .candidates
+        .iter()
+        .filter(|row| {
+            row.callable
+                .is_some_and(|callable| callable.verdict.label() == "inapplicable")
+        })
+        .collect();
+    assert_eq!(refused.len(), 1, "{:?}", trace.candidates);
+    assert_eq!(
+        refused[0]
+            .callable
+            .and_then(|callable| callable.reason)
+            .map(|reason| reason.label()),
+        Some("type_argument_arity_mismatch"),
+        "the two-type-parameter sibling missed on type arguments, not on values: {:?}",
+        trace.candidates
+    );
 }
 
 /// A near miss for the arity rejection above: with no same-name overload to

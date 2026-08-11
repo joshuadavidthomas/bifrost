@@ -2303,7 +2303,7 @@ class Consumer {
 
     for caller in [
         "app.Consumer.methodLocal",
-        "app.Consumer.anonymousLocal",
+        "app.Consumer.anonymousLocal$anon$6:28.run",
         "app.Consumer.aliasLocal",
         "app.Consumer.siblingScope",
     ] {
@@ -2315,7 +2315,7 @@ class Consumer {
     }
     for caller in [
         "app.Consumer.methodLocal",
-        "app.Consumer.anonymousLocal",
+        "app.Consumer.anonymousLocal$anon$6:28.run",
         "app.Consumer.siblingScope",
     ] {
         assert!(

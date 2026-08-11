@@ -183,6 +183,31 @@ enum BoundedParse {
     Rejected,
 }
 
+/// Point `parser` at `file`'s grammar and, when the language restricts what the
+/// parse may read, at the included ranges for `source`.
+///
+/// Returns false when the grammar or the ranges are rejected, which is the
+/// caller's signal that this file yields no tree.
+fn set_parser_for_file<A: LanguageAdapter + ?Sized>(
+    parser: &mut Parser,
+    adapter: &A,
+    file: &ProjectFile,
+    source: &str,
+) -> bool {
+    if parser
+        .set_language(&adapter.parser_language_for_file(file))
+        .is_err()
+    {
+        return false;
+    }
+    match adapter.parser_included_ranges(file, source) {
+        Some(ranges) => parser.set_included_ranges(&ranges).is_ok(),
+        // A parser is reused across files, so an earlier file's ranges must be
+        // cleared rather than left in place.
+        None => parser.set_included_ranges(&[]).is_ok(),
+    }
+}
+
 fn parse_complete_file_bounded(
     parser: &mut Parser,
     source: &str,
@@ -337,6 +362,23 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn parser_language_for_file(&self, file: &ProjectFile) -> TsLanguage {
         crate::analyzer::parser_language_for_path(self.language(), file.rel_path())
             .expect("analyzable language must have a registered parser grammar")
+    }
+    /// The byte ranges of `source` this file's parser may read, or `None` to
+    /// read the whole file.
+    ///
+    /// Only C# overrides this. Its grammar cannot represent a preprocessor
+    /// directive inside a declaration, so a directive that splits a member
+    /// signature or an expression breaks the parse and the declaration walk
+    /// then loses the members around it (issue #1803). C# answers with the
+    /// ranges that hide directive lines and inactive conditional branches.
+    /// Ranges select bytes of the original source, so every node keeps its
+    /// raw-file offset and no transformed source exists.
+    fn parser_included_ranges(
+        &self,
+        _file: &ProjectFile,
+        _source: &str,
+    ) -> Option<Vec<tree_sitter::Range>> {
+        None
     }
     /// The storage key this specific `file` was (or would be) persisted
     /// under. Derived from the file's own detected language rather than
@@ -2695,9 +2737,9 @@ where
         if crate::analyzer::common::is_unparseable_source(source.as_str()) {
             return None;
         }
-        parser
-            .set_language(&adapter.parser_language_for_file(file))
-            .ok()?;
+        if !set_parser_for_file(parser, adapter, file, source.as_str()) {
+            return None;
+        }
         let tree = match parse_complete_file_bounded(parser, &source, None, budget) {
             BoundedParse::Complete(tree) => tree,
             BoundedParse::TimedOut => {
@@ -4809,10 +4851,7 @@ where
             return PreparedSyntaxPreparation::Cancelled;
         }
         let mut parser = Parser::new();
-        if parser
-            .set_language(&self.adapter.parser_language_for_file(file))
-            .is_err()
-        {
+        if !set_parser_for_file(&mut parser, self.adapter.as_ref(), file, source.source()) {
             return PreparedSyntaxPreparation::Complete(None);
         }
         *self
@@ -10005,7 +10044,10 @@ where
         if crate::analyzer::common::is_unparseable_source(source) {
             return Vec::new();
         }
-        let mut parser = Self::build_parser(self.adapter.parser_language_for_file(file));
+        let mut parser = Parser::new();
+        if !set_parser_for_file(&mut parser, self.adapter.as_ref(), file, source) {
+            return Vec::new();
+        }
         let Some(tree) = parser.parse(source, None) else {
             return Vec::new();
         };

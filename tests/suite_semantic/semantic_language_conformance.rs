@@ -353,8 +353,12 @@ fn assert_direct_call_project_conformance(
             && (gap.subject == SemanticGapSubject::Point
                 || gap.subject == SemanticGapSubject::CallSite(direct_call.id))
     });
-    let has_unresolved_dynamic_dispatch =
-        has_dynamic_dispatch_gap && !expectations.closed_dispatch_refinement;
+    // A receiverless free-function call's blanket dispatch gap is discharged
+    // by the resolver-proven target set since #1952; receiver dispatch keeps
+    // its boundary unless the language declares closed refinement.
+    let has_unresolved_dynamic_dispatch = has_dynamic_dispatch_gap
+        && !expectations.closed_dispatch_refinement
+        && direct_call.receiver.is_some();
     let call_boundary_count = if expectations.unproven_link_unit {
         2
     } else {
@@ -6865,7 +6869,9 @@ def make_deferred():
             root(),
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Unproven);
+    // The deferred invocations stay typed dispatch boundaries below; the
+    // snapshot status itself closes since #1952.
+    graph.assert_outcome(IcfgOutcomeKind::Complete);
     graph.assert_boundary(
         "async_invoke",
         ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchDeferred(
@@ -6873,23 +6879,11 @@ def make_deferred():
         ))
         .originating_call("async_call"),
     );
-    graph.assert_boundary(
-        "async_invoke",
-        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
-            .originating_call("async_call"),
-    );
     graph.assert_successors(
         "async_invoke",
         &[
             icfg_edge("async_normal", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("async_call"),
-            icfg_edge("async_normal", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("async_call"),
-            icfg_edge(
-                "async_exceptional",
-                IcfgEdgeKind::CallToExceptionalContinuation,
-            )
-            .originating_call("async_call"),
             icfg_edge(
                 "async_exceptional",
                 IcfgEdgeKind::CallToExceptionalContinuation,
@@ -6902,8 +6896,6 @@ def make_deferred():
         &[
             icfg_edge("async_invoke", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("async_call"),
-            icfg_edge("async_invoke", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("async_call"),
         ],
     );
     graph.assert_boundary(
@@ -6913,23 +6905,11 @@ def make_deferred():
         ))
         .originating_call("generator_call"),
     );
-    graph.assert_boundary(
-        "generator_invoke",
-        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
-            .originating_call("generator_call"),
-    );
     graph.assert_successors(
         "generator_invoke",
         &[
             icfg_edge("generator_normal", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("generator_call"),
-            icfg_edge("generator_normal", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("generator_call"),
-            icfg_edge(
-                "generator_exceptional",
-                IcfgEdgeKind::CallToExceptionalContinuation,
-            )
-            .originating_call("generator_call"),
             icfg_edge(
                 "generator_exceptional",
                 IcfgEdgeKind::CallToExceptionalContinuation,
@@ -6940,8 +6920,6 @@ def make_deferred():
     graph.assert_predecessors(
         "generator_normal",
         &[
-            icfg_edge("generator_invoke", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("generator_call"),
             icfg_edge("generator_invoke", IcfgEdgeKind::CallToNormalContinuation)
                 .originating_call("generator_call"),
         ],
@@ -8879,7 +8857,12 @@ fn csharp_target_typed_new_evaluates_arguments_then_initializer() {
 }
 
 #[test]
-fn csharp_method_preprocessor_condition_is_a_terminal_typed_boundary() {
+fn csharp_method_preprocessor_chain_keeps_control_flow_through_the_active_branch() {
+    // Before #1803 a `#if` inside a method body was a terminal typed gap: the
+    // control-flow graph stopped at the directive and everything after the
+    // `#endif` was unreachable. C# is now parsed through included ranges that
+    // hide directive lines and inactive branches, so the graph runs straight
+    // through the active branch and reaches the statements after the chain.
     let project = InlineTestProject::with_language(Language::CSharp)
         .file(
             "csharp/Configured.cs",
@@ -8928,17 +8911,14 @@ fn csharp_method_preprocessor_condition_is_a_terminal_typed_boundary() {
                 .outgoing_kind(ControlEdgeKind::Normal),
         )
         .bind(
-            "before_configuration_exceptional",
-            PointSelector::new("BeforeConfiguration()")
-                .procedure("Run")
-                .effect("call_continuation")
-                .outgoing_kind(ControlEdgeKind::Exceptional),
+            "first_branch_statement",
+            PointSelector::new("FirstBranch();").procedure("Run"),
         )
         .bind(
-            "configuration_boundary",
-            PointSelector::new("#if FIRST")
+            "first_branch_invoke",
+            PointSelector::new("FirstBranch()")
                 .procedure("Run")
-                .effect("gap"),
+                .effect("invoke"),
         )
         .bind(
             "after_configuration_statement",
@@ -8951,36 +8931,14 @@ fn csharp_method_preprocessor_condition_is_a_terminal_typed_boundary() {
                 .effect("invoke"),
         );
 
-    graph.assert_successors(
-        "before_configuration_invoke",
-        &[
-            cfg_edge("before_configuration_normal", ControlEdgeKind::Normal),
-            cfg_edge(
-                "before_configuration_exceptional",
-                ControlEdgeKind::Exceptional,
-            ),
-        ],
-    );
+    // The active branch is scheduled, and the chain no longer terminates flow.
     graph.assert_successors(
         "before_configuration_normal",
-        &[cfg_edge("configuration_boundary", ControlEdgeKind::Normal)],
+        &[cfg_edge("first_branch_statement", ControlEdgeKind::Normal)],
     );
-    graph.assert_predecessors(
-        "configuration_boundary",
-        &[cfg_edge(
-            "before_configuration_normal",
-            ControlEdgeKind::Normal,
-        )],
-    );
-    graph.assert_point_gap(
-        "configuration_boundary",
-        SemanticCapability::NormalControlFlow,
-        SemanticGapKind::Unsupported,
-    );
-    graph.assert_successors("configuration_boundary", &[]);
-    graph.assert_reachable("configured_entry", "configuration_boundary");
-    graph.assert_unreachable("configured_entry", "after_configuration_statement");
-    graph.assert_unreachable("configuration_boundary", "after_configuration_statement");
+    graph.assert_reachable("configured_entry", "first_branch_invoke");
+    graph.assert_reachable("first_branch_invoke", "after_configuration_invoke");
+    graph.assert_reachable("configured_entry", "after_configuration_statement");
     graph.assert_successors(
         "after_configuration_statement",
         &[cfg_edge(
@@ -8989,7 +8947,9 @@ fn csharp_method_preprocessor_condition_is_a_terminal_typed_boundary() {
         )],
     );
 
-    for branch_call in ["FirstBranch()", "SecondBranch()", "FallbackBranch()"] {
+    // The inactive branches contribute no program point at all: the parser
+    // never saw them, so nothing about them is guessed.
+    for branch_call in ["SecondBranch()", "FallbackBranch()"] {
         let error = graph
             .try_bind(
                 format!("unscheduled_{branch_call}"),
@@ -8997,9 +8957,20 @@ fn csharp_method_preprocessor_condition_is_a_terminal_typed_boundary() {
                     .procedure("Run")
                     .effect("invoke"),
             )
-            .expect_err("preprocessor branch statements must not be guessed without configuration");
+            .expect_err("an inactive preprocessor branch must contribute no semantics");
         assert!(error.to_string().contains("matched no semantic"));
     }
+
+    // Nor does the directive line itself.
+    let error = graph
+        .try_bind(
+            "configuration_boundary",
+            PointSelector::new("#if FIRST")
+                .procedure("Run")
+                .effect("gap"),
+        )
+        .expect_err("the directive line is no longer a typed control-flow gap");
+    assert!(error.to_string().contains("matched no semantic"));
 
     graph.assert_adjacency_symmetric();
     let rendered = graph.render_topology();

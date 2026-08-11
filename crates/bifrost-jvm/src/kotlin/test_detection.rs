@@ -17,7 +17,7 @@
 //! distinct AST shapes — ordinary calls (kotlin.test, JUnit `Assertions.*`,
 //! MockK `verify`) and infix expressions (Kotest's `shouldBe` family) — which
 //! a structural walk distinguishes far more reliably than a regex would, and
-//! the vendored grammar exposes both shapes as ordinary named nodes.
+//! the Kotlin grammar exposes both shapes as ordinary named nodes.
 //!
 //! Deliberately out of scope: Kotest's `"name" should { … }` test-declaration
 //! form is recognized for [`kotlin_contains_tests`] but is not treated as its

@@ -20,8 +20,9 @@ function helper(resource: object): void {
   useResource(resource);
 }
 
-function lifecycle(resource: object): void {
+function lifecycle(resource: object, dispose: (resource: object) => void): void {
   helper(resource);
+  dispose(resource);
 }
 "#;
 

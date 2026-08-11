@@ -310,6 +310,27 @@ pub(super) fn resolve_js_ts(
             }
             same_file
         };
+        let dotted_lookup = JstsDottedLookup {
+            analyzer,
+            host,
+            support,
+            file,
+            root: tree.root_node(),
+            source,
+            reference,
+            receiver: qualifier,
+            value_position,
+            before_byte: site.range.start_byte,
+        };
+        let lexical_receiver_candidates = if imported_receiver_binding {
+            Vec::new()
+        } else {
+            jsts_lexically_bound_receiver_candidates(
+                dotted_lookup,
+                &lexical_bindings,
+                &receiver_candidates,
+            )
+        };
         // One accumulator per candidate set, staged at the return that reports
         // that exact set (#1477). The JavaScript fallback below goes through the
         // shared `jsts_member_candidates`, whose per-receiver split is not
@@ -326,7 +347,7 @@ pub(super) fn resolve_js_ts(
                     value_position,
                     &mut generic_finds,
                 )
-            } else if language == Language::TypeScript {
+            } else if language == Language::TypeScript && imported_receiver_binding {
                 ts_member_candidates(
                     analyzer,
                     host,
@@ -336,26 +357,11 @@ pub(super) fn resolve_js_ts(
                     value_position,
                     &mut generic_finds,
                 )
-            } else {
+            } else if language == Language::JavaScript {
                 jsts_member_candidates(host, support, receiver_candidates, name, value_position)
+            } else {
+                Vec::new()
             };
-        let program_binding = lexical_bindings.is_program_binding_at(
-            qualifier,
-            site.focus_start_byte,
-            tree.root_node(),
-        );
-        let dotted_lookup = JstsDottedLookup {
-            analyzer,
-            host,
-            support,
-            file,
-            root: tree.root_node(),
-            source,
-            reference,
-            receiver: qualifier,
-            value_position,
-            before_byte: site.range.start_byte,
-        };
         if language == Language::JavaScript
             && !imported_receiver_binding
             && let Some(local_candidates) = focused.and_then(|node| {
@@ -375,7 +381,31 @@ pub(super) fn resolve_js_ts(
                 format!("`{reference}` did not resolve to an indexed JS/TS definition"),
             );
         }
-        if (imported_receiver_binding || program_binding) && !generic_member_candidates.is_empty() {
+        let mut lexical_finds = JsTsMemberFinds::default();
+        let lexical_member_candidates = if language == Language::TypeScript {
+            ts_member_candidates(
+                analyzer,
+                host,
+                support,
+                lexical_receiver_candidates,
+                name,
+                value_position,
+                &mut lexical_finds,
+            )
+        } else {
+            jsts_member_candidates(
+                host,
+                support,
+                lexical_receiver_candidates,
+                name,
+                value_position,
+            )
+        };
+        if !lexical_member_candidates.is_empty() {
+            lexical_finds.stage();
+            return js_ts_candidates_outcome(analyzer, lexical_member_candidates);
+        }
+        if imported_receiver_binding && !generic_member_candidates.is_empty() {
             generic_finds.stage();
             return js_ts_candidates_outcome(analyzer, generic_member_candidates);
         }
@@ -454,14 +484,6 @@ pub(super) fn resolve_js_ts(
         if !new_receiver_member_candidates.is_empty() {
             new_receiver_finds.stage();
             return js_ts_candidates_outcome(analyzer, new_receiver_member_candidates);
-        }
-        if !generic_member_candidates.is_empty() {
-            generic_finds.stage();
-            return js_ts_candidates_outcome(analyzer, generic_member_candidates);
-        }
-        let exact_same_file = jsts_unproven_same_file_dotted_candidates(dotted_lookup);
-        if !exact_same_file.is_empty() {
-            return js_ts_candidates_outcome(analyzer, exact_same_file);
         }
         if language == Language::TypeScript {
             let inferred_receivers = ts_local_receiver_owner_candidates(
@@ -622,7 +644,7 @@ pub(super) fn resolve_js_ts(
 ///
 /// The project-wide question is the one `jsts_exact_dotted_candidates` asks --
 /// `support.fqn` on the reference as written -- and the declaration-side gate
-/// is the one `jsts_cross_file_dotted_receiver_has_global_identity` applies:
+/// is the one `jsts_dotted_receiver_has_global_identity` applies:
 /// the declaring file must be a script, and the name must bind at that script's
 /// program scope, the only scope the shared global has.
 ///
@@ -1106,90 +1128,6 @@ fn jsts_file_scoped_dotted_candidates(
     candidates
 }
 
-fn jsts_unproven_same_file_dotted_candidates(ctx: JstsDottedLookup<'_, '_>) -> Vec<CodeUnit> {
-    let mut candidates = ctx.same_file_candidates();
-    candidates.retain(|unit| {
-        !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
-            ctx.analyzer,
-            unit,
-            ctx.receiver,
-        ) || jsts_same_file_unbound_assignment_matches_reference_scope(
-            ctx.analyzer,
-            unit,
-            ctx.receiver,
-            ctx.root,
-            ctx.source,
-            ctx.before_byte,
-        )
-    });
-    candidates
-}
-
-fn jsts_same_file_unbound_assignment_matches_reference_scope(
-    analyzer: &dyn IAnalyzer,
-    target: &CodeUnit,
-    qualifier: &str,
-    root: Node<'_>,
-    source: &str,
-    before_byte: usize,
-) -> bool {
-    let Some((object_name, property_name)) = jsts_unbound_assigned_property_shape(analyzer, target)
-    else {
-        return false;
-    };
-    if object_name != qualifier {
-        return false;
-    }
-    let target_ranges = analyzer.ranges(target);
-    let reference_scope = smallest_named_node_covering(root, before_byte, before_byte)
-        .and_then(jsts_nearest_reference_fallback_scope)
-        .unwrap_or(JstsReceiverBindingScope {
-            start_byte: root.start_byte(),
-            end_byte: root.end_byte(),
-        });
-
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "member_expression"
-            && node.parent().is_some_and(|parent| {
-                parent.kind() == "assignment_expression"
-                    && parent
-                        .child_by_field_name("left")
-                        .is_some_and(|left| left.id() == node.id())
-            })
-            && let (Some(object), Some(property)) = (
-                node.child_by_field_name("object"),
-                node.child_by_field_name("property"),
-            )
-            && node_text(object, source) == object_name
-            && node_text(property, source) == property_name
-            && property.start_byte() < before_byte
-            && target_ranges.iter().any(|range| {
-                range.start_byte <= property.start_byte() && property.end_byte() <= range.end_byte
-            })
-        {
-            let assignment_scope =
-                jsts_nearest_reference_fallback_scope(node).unwrap_or(JstsReceiverBindingScope {
-                    start_byte: root.start_byte(),
-                    end_byte: root.end_byte(),
-                });
-            if assignment_scope == reference_scope {
-                return true;
-            }
-        }
-
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-    false
-}
-
-fn jsts_nearest_reference_fallback_scope(node: Node<'_>) -> Option<JstsReceiverBindingScope> {
-    jsts_nearest_lexical_scope(node).or_else(|| jsts_nearest_var_scope(node))
-}
-
 #[derive(Clone, Copy)]
 struct JstsDottedLookup<'a, 'tree> {
     analyzer: &'a dyn IAnalyzer,
@@ -1216,13 +1154,18 @@ impl JstsDottedLookup<'_, '_> {
     }
 }
 
+/// Proves an exact same-file member chain from its AST definitions.
+///
+/// A bound receiver must keep the same lexical identity. An unbound receiver
+/// must keep the same complete chain and fallback scope. Both forms require a
+/// definition before the reference, so an unsupported shape fails closed.
 fn jsts_exact_local_dotted_candidates(
     ctx: JstsDottedLookup<'_, '_>,
     lexical_bindings: &JsTsLexicalBindingIndex,
     focused: Node<'_>,
     hinted_candidates: &[CodeUnit],
 ) -> Option<Vec<CodeUnit>> {
-    let binding_scope = lexical_bindings.binding_scope_at(ctx.receiver, ctx.before_byte)?;
+    let binding_scope = lexical_bindings.binding_scope_at(ctx.receiver, ctx.before_byte);
     let (reference_receiver, property) =
         jsts_focused_reference_receiver_property(focused, ctx.source)?;
     let target_member = slice(property, ctx.source);
@@ -1254,6 +1197,9 @@ fn jsts_exact_local_dotted_candidates(
     if candidates_with_definitions.is_empty() {
         return None;
     }
+    let reference_fallback_scope = binding_scope
+        .is_none()
+        .then(|| jsts_reference_fallback_scope(focused, ctx.root));
     let candidates = candidates_with_definitions
         .into_iter()
         .filter_map(|(candidate, definitions)| {
@@ -1270,15 +1216,67 @@ fn jsts_exact_local_dotted_candidates(
                             .all(|(actual, expected)| {
                                 slice(*actual, ctx.source) == slice(*expected, ctx.source)
                             })
-                        && lexical_bindings
-                            .binding_scope_at(ctx.receiver, definition.receiver.root.start_byte())
-                            == Some(binding_scope)
+                        && match binding_scope {
+                            Some(binding_scope) => {
+                                lexical_bindings.binding_scope_at(
+                                    ctx.receiver,
+                                    definition.receiver.root.start_byte(),
+                                ) == Some(binding_scope)
+                            }
+                            None => {
+                                lexical_bindings
+                                    .binding_scope_at(
+                                        ctx.receiver,
+                                        definition.receiver.root.start_byte(),
+                                    )
+                                    .is_none()
+                                    && Some(jsts_reference_fallback_scope(
+                                        definition.receiver.root,
+                                        ctx.root,
+                                    )) == reference_fallback_scope
+                            }
+                        }
                         && definition.property_range.end_byte <= ctx.before_byte
                 })
                 .then_some(candidate)
         })
         .collect();
     Some(candidates)
+}
+
+/// Keeps only declaration candidates that share the reference receiver's
+/// lexical binding. Member expansion can then support indexed declaration
+/// shapes that `direct_property_definitions` does not model, such as object
+/// methods and schema-builder fields, without accepting a same-name owner.
+fn jsts_lexically_bound_receiver_candidates(
+    ctx: JstsDottedLookup<'_, '_>,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+    receiver_candidates: &[CodeUnit],
+) -> Vec<CodeUnit> {
+    let Some(binding_scope) = lexical_bindings.binding_scope_at(ctx.receiver, ctx.before_byte)
+    else {
+        return Vec::new();
+    };
+    receiver_candidates
+        .iter()
+        .filter(|candidate| candidate.source() == ctx.file)
+        .filter(|candidate| {
+            ctx.analyzer.ranges(candidate).iter().any(|range| {
+                lexical_bindings.binding_scope_at(ctx.receiver, range.start_byte)
+                    == Some(binding_scope)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn jsts_reference_fallback_scope(node: Node<'_>, root: Node<'_>) -> JstsReceiverBindingScope {
+    jsts_nearest_lexical_scope(node)
+        .or_else(|| jsts_nearest_var_scope(node))
+        .unwrap_or(JstsReceiverBindingScope {
+            start_byte: root.start_byte(),
+            end_byte: root.end_byte(),
+        })
 }
 
 fn jsts_all_visible_import_bindings<'a>(
@@ -1350,13 +1348,8 @@ fn jsts_exact_dotted_candidates(
         }
     }
     if let Some(qualifier) = qualifier {
-        candidates.retain(|unit| {
-            (unit.source() == file
-                || jsts_cross_file_dotted_receiver_has_global_identity(analyzer, unit, qualifier))
-                && !jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
-                    analyzer, unit, qualifier,
-                )
-        });
+        candidates
+            .retain(|unit| jsts_dotted_receiver_has_global_identity(analyzer, unit, qualifier));
     }
     if value_position {
         candidates = jsts_value_space_candidates(host, candidates);
@@ -1366,7 +1359,7 @@ fn jsts_exact_dotted_candidates(
     candidates
 }
 
-fn jsts_cross_file_dotted_receiver_has_global_identity(
+fn jsts_dotted_receiver_has_global_identity(
     analyzer: &dyn IAnalyzer,
     candidate: &CodeUnit,
     receiver: &str,
@@ -1686,83 +1679,6 @@ fn jsts_top_level_path_component(file: &ProjectFile) -> Option<&str> {
         .components()
         .next()
         .and_then(|component| component.as_os_str().to_str())
-}
-
-fn jsts_js_unbound_assigned_property_candidate_requires_exact_receiver(
-    analyzer: &dyn IAnalyzer,
-    candidate: &CodeUnit,
-    qualifier: &str,
-) -> bool {
-    let Some((object_name, _property_name)) =
-        jsts_unbound_assigned_property_shape(analyzer, candidate)
-    else {
-        return false;
-    };
-    object_name == qualifier && object_name != "window"
-}
-
-fn jsts_unbound_assigned_property_shape<'a>(
-    analyzer: &dyn IAnalyzer,
-    target: &'a CodeUnit,
-) -> Option<(&'a str, &'a str)> {
-    if !target.is_field() && !target.is_function() {
-        return None;
-    }
-    let [object_id, property_id] = target.fq().segments() else {
-        return None;
-    };
-    let interner = crate::analyzer::fq_name::segment_interner();
-    let (object_name, _) = interner.resolve(*object_id);
-    let (property_name, _) = interner.resolve(*property_id);
-    if object_name.is_empty() || property_name.is_empty() {
-        return None;
-    }
-
-    let language = crate::analyzer::common::language_for_file(target.source());
-    if !matches!(language, Language::JavaScript | Language::TypeScript) {
-        return None;
-    }
-    let Ok(source) = target.source().read_to_string() else {
-        return None;
-    };
-    let tree = parse_js_ts_tree(target.source(), &source, language)?;
-    let root = tree.root_node();
-    let lexical_bindings = JsTsLexicalBindingIndex::build(root, &source);
-    let target_ranges = analyzer.ranges(target);
-
-    let mut found = false;
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "member_expression"
-            && node.parent().is_some_and(|parent| {
-                parent.kind() == "assignment_expression"
-                    && parent
-                        .child_by_field_name("left")
-                        .is_some_and(|left| left.id() == node.id())
-            })
-            && let (Some(object), Some(property)) = (
-                node.child_by_field_name("object"),
-                node.child_by_field_name("property"),
-            )
-            && node_text(object, &source) == object_name
-            && node_text(property, &source) == property_name
-            && target_ranges.iter().any(|range| {
-                range.start_byte <= property.start_byte() && property.end_byte() <= range.end_byte
-            })
-        {
-            found = true;
-            if lexical_bindings.is_bound_at(object_name, object.start_byte()) {
-                return None;
-            }
-        }
-
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-
-    found.then_some((object_name, property_name))
 }
 
 /// Narrows a dotted site to the chain the caret actually names: a caret on a

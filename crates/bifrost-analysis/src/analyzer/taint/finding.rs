@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, error::Error, fmt, mem::size_of_val, sync::Arc}
 
 use crate::analyzer::dataflow::{
     PathQualityFrontier, SummaryWitness, SummaryWitnessError, WitnessReconstructionLimits,
+    WitnessTruncationCause,
 };
 use crate::analyzer::semantic::{
     ProcedureHandle, ProgramPointHandle, SemanticArtifactKey, SemanticLocator,
@@ -36,12 +37,40 @@ impl TaintFindingKey {
     }
 }
 
+/// Why retained witness evidence for one finding is incomplete.
+///
+/// The first cause encountered while collecting the finding is retained.
+/// Unretained sibling alternatives are not a cause: the retained witness's own
+/// steps are complete without them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaintWitnessTruncationCause {
+    /// The finding-collection witness, step, expansion, or byte budget refused
+    /// a reconstruction or a reconstructed witness.
+    CollectionBudget,
+    /// The solver did not retain a witness for a reached path quality.
+    QualityNotRetained,
+    /// A retained witness's own reconstruction is incomplete.
+    Reconstruction(WitnessTruncationCause),
+}
+
+impl TaintWitnessTruncationCause {
+    /// Stable diagnostic label safe for public projection.
+    pub const fn stable_label(self) -> &'static str {
+        match self {
+            Self::CollectionBudget => "collection_budget",
+            Self::QualityNotRetained => "quality_not_retained",
+            Self::Reconstruction(cause) => cause.stable_label(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintOriginStatus {
     origins: Box<[SourceEventKey]>,
     evidence: Box<[TaintOriginFindingEvidence]>,
     origin_truncated: bool,
     witness_truncated: bool,
+    witness_truncation_cause: Option<TaintWitnessTruncationCause>,
     witness_unavailable: bool,
 }
 
@@ -113,6 +142,11 @@ impl TaintOriginStatus {
 
     pub const fn witness_truncated(&self) -> bool {
         self.witness_truncated
+    }
+
+    /// The exact first cause that made retained witness evidence incomplete.
+    pub const fn witness_truncation_cause(&self) -> Option<TaintWitnessTruncationCause> {
+        self.witness_truncation_cause
     }
 
     pub const fn witness_unavailable(&self) -> bool {
@@ -451,7 +485,7 @@ pub fn collect_taint_findings_with_limits(
             witness_limits,
             &mut budget,
         )?;
-        findings.push(TaintFinding {
+        let finding = TaintFinding {
             key,
             sink,
             classes,
@@ -464,7 +498,14 @@ pub fn collect_taint_findings_with_limits(
                 && point_value.path_qualities().has_proven_path(),
             complete: result.is_complete() && point_value.path_qualities().has_complete_path(),
             origins,
-        });
+        };
+        // Distinct summary entries can reach one sink with identical facts --
+        // the resolved-call continuation edges (#1952) make that routine --
+        // and an identical finding carries no additional information.
+        if findings.contains(&finding) {
+            continue;
+        }
+        findings.push(finding);
     }
     findings.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(TaintFindingReport {
@@ -503,6 +544,7 @@ fn reconstruct_origins(
     let mut origin_truncated = false;
     let mut witness_unavailable = false;
     let mut witness_truncated = false;
+    let mut witness_truncation_cause = None::<TaintWitnessTruncationCause>;
     let problem = super::TaintFlowProblem::new(plan);
     for quality in point_value.path_qualities().iter() {
         let remaining_steps = budget
@@ -518,6 +560,8 @@ fn reconstruct_origins(
             || remaining_expansions == 0
         {
             witness_truncated = true;
+            witness_truncation_cause =
+                witness_truncation_cause.or(Some(TaintWitnessTruncationCause::CollectionBudget));
             budget.truncated = true;
             continue;
         }
@@ -539,6 +583,8 @@ fn reconstruct_origins(
                         .saturating_sub(budget.retained_witness_bytes)
                 {
                     witness_truncated = true;
+                    witness_truncation_cause = witness_truncation_cause
+                        .or(Some(TaintWitnessTruncationCause::CollectionBudget));
                     budget.truncated = true;
                     continue;
                 }
@@ -552,12 +598,15 @@ fn reconstruct_origins(
                 budget.retained_witness_bytes =
                     budget.retained_witness_bytes.saturating_add(retained_bytes);
                 let witness = Arc::new(witness);
-                witness_truncated |= witness.truncated()
-                    || witness.alternatives_truncated()
-                    || witness.retention_truncated();
-                budget.truncated |= witness.truncated()
-                    || witness.alternatives_truncated()
-                    || witness.retention_truncated();
+                // Unretained sibling alternatives are deliberately not folded
+                // in: the retained witness's own steps are complete without
+                // them, and the production retention limit of one alternative
+                // per quality would otherwise mark nearly every witness.
+                witness_truncated |= witness.truncated();
+                witness_truncation_cause = witness_truncation_cause.or(witness
+                    .truncation_cause()
+                    .map(TaintWitnessTruncationCause::Reconstruction));
+                budget.truncated |= witness.truncated();
                 for step in witness.steps() {
                     let input = result
                         .fact_result()
@@ -611,7 +660,11 @@ fn reconstruct_origins(
                 }
             }
             Err(SummaryWitnessError::RetentionDisabled) => witness_unavailable = true,
-            Err(SummaryWitnessError::QualityNotRetained(_)) => witness_truncated = true,
+            Err(SummaryWitnessError::QualityNotRetained(_)) => {
+                witness_truncated = true;
+                witness_truncation_cause = witness_truncation_cause
+                    .or(Some(TaintWitnessTruncationCause::QualityNotRetained));
+            }
             Err(error) => return Err(TaintFindingError::Witness(error)),
         }
     }
@@ -629,6 +682,7 @@ fn reconstruct_origins(
             .into_boxed_slice(),
         origin_truncated,
         witness_truncated,
+        witness_truncation_cause,
         witness_unavailable,
     })
 }

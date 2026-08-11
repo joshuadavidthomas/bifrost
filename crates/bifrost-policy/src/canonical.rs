@@ -784,7 +784,16 @@ fn row_aggregate_to_json(aggregate: &RowAggregate) -> Value {
         "name": aggregate.name.as_str(),
         "op": aggregate.op.label(),
         "value": aggregate.value.as_ref().map(row_field_ref_to_json),
+        "left": aggregate.sequences.as_ref().map(|pair| row_ordered_sequence_to_json(&pair.left)),
+        "right": aggregate.sequences.as_ref().map(|pair| row_ordered_sequence_to_json(&pair.right)),
         "where": aggregate.predicate.iter().map(row_predicate_to_json).collect::<Vec<_>>(),
+    })
+}
+
+fn row_ordered_sequence_to_json(sequence: &crate::definition::RowOrderedSequence) -> Value {
+    json!({
+        "position": row_field_ref_to_json(&sequence.position),
+        "value": row_field_ref_to_json(&sequence.value),
     })
 }
 

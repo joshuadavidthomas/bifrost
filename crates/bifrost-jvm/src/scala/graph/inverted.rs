@@ -55,7 +55,7 @@ use super::syntax::{
     scala_callable_shape_matches, scala_import_is_visible_at_byte, scala_pattern_binder_names,
     scala_source_facts, scala_union_type_alternative_paths, stable_identifier_prefix_reference,
     stable_identifier_reference, stable_type_prefix_reference, template_direct_term_member_named,
-    template_self_type, terminal_invocation_owner_name,
+    template_self_types, terminal_invocation_owner_name,
 };
 use crate::scala::declarations::scala_class_parameter_field_keyword;
 use crate::scala::graph_support::{
@@ -10469,11 +10469,12 @@ fn record_lexically_visible_call(
             BareMemberResolution::Unresolved => return true,
             BareMemberResolution::NoMatch => {}
         }
-        if let Some(self_owner) = template_self_type(declaration)
-            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
-            && record_ordinary_class_methods(&self_owner, member, fallback_arities, node, ctx)
-        {
-            return true;
+        for self_type in template_self_types(declaration) {
+            if let Some(self_owner) = resolve_receiver_type_node(self_type, ctx)
+                && record_ordinary_class_methods(&self_owner, member, fallback_arities, node, ctx)
+            {
+                return true;
+            }
         }
     }
     false
@@ -10542,11 +10543,12 @@ fn record_lexically_visible_parameterless_method(
             BareMemberResolution::Unresolved => return true,
             BareMemberResolution::NoMatch => {}
         }
-        if let Some(self_owner) = template_self_type(declaration)
-            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
-            && record_ordinary_class_methods(&self_owner, member, None, node, ctx)
-        {
-            return true;
+        for self_type in template_self_types(declaration) {
+            if let Some(self_owner) = resolve_receiver_type_node(self_type, ctx)
+                && record_ordinary_class_methods(&self_owner, member, None, node, ctx)
+            {
+                return true;
+            }
         }
     }
     false
@@ -11539,30 +11541,30 @@ fn lexically_visible_unqualified_member_return_type(
             MemberReturnResolution::NoMatch => {}
             resolution => return resolution,
         }
-        let Some(self_owner) = template_self_type(declaration)
-            .and_then(|type_node| resolve_receiver_type_node(type_node, ctx))
-        else {
-            continue;
-        };
-        let mut declarations = ctx
-            .scala
-            .definitions(&self_owner)
-            .filter(CodeUnit::is_class);
-        let Some(declaration) = declarations.next() else {
-            continue;
-        };
-        if declarations.next().is_some() {
-            return MemberReturnResolution::Unresolved;
-        }
-        match ctx.types.unqualified_member_return_type(
-            ctx.scala,
-            &ctx.resolver,
-            &declaration,
-            member,
-            call_arities,
-        ) {
-            MemberReturnResolution::NoMatch => {}
-            resolution => return resolution,
+        for self_type in template_self_types(declaration) {
+            let Some(self_owner) = resolve_receiver_type_node(self_type, ctx) else {
+                continue;
+            };
+            let mut declarations = ctx
+                .scala
+                .definitions(&self_owner)
+                .filter(CodeUnit::is_class);
+            let Some(declaration) = declarations.next() else {
+                continue;
+            };
+            if declarations.next().is_some() {
+                return MemberReturnResolution::Unresolved;
+            }
+            match ctx.types.unqualified_member_return_type(
+                ctx.scala,
+                &ctx.resolver,
+                &declaration,
+                member,
+                call_arities,
+            ) {
+                MemberReturnResolution::NoMatch => {}
+                resolution => return resolution,
+            }
         }
     }
     MemberReturnResolution::NoMatch

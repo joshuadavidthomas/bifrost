@@ -1062,6 +1062,38 @@ trait Overloads[A] {
     }
 
     #[test]
+    fn scala_source_jar_preserves_infix_type_overloads_in_anonymous_class() {
+        let source = r#"
+package sample
+trait Evidence
+new Evidence {
+  def compose[C](value: C <:< Any): C = value
+  def compose[C](value: C =:= Any): C = value
+}
+"#;
+        let jar = source_jar(&[("sample/Evidence.scala", source)]);
+        let pack = ScalaSourceJarPackProducer
+            .produce_exact_artifact(
+                &request(jar.path().to_owned()),
+                &ArtifactProducerLimits::default(),
+            )
+            .pack
+            .unwrap();
+        let AuthoredPayload::DeclarationFacts { members, .. } = &pack.shards[0].payload else {
+            panic!("Scala producer should emit declaration facts");
+        };
+        let overloads = members
+            .iter()
+            .filter(|member| member.name == "compose")
+            .collect::<Vec<_>>();
+
+        assert_eq!(overloads.len(), 2, "members={members:#?}");
+        assert_ne!(overloads[0].id, overloads[1].id);
+        assert!(overloads.iter().all(|member| member.signature.is_some()));
+        compile_pack(&pack, &Default::default()).unwrap();
+    }
+
+    #[test]
     fn scala_source_jar_is_deterministic_across_archive_order_and_path() {
         let first = source_jar(&[
             ("z/Second.scala", "package sample\nclass Second"),

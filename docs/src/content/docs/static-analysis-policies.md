@@ -240,7 +240,7 @@ source/sink leaves should normally use endpoint documents.
 | `match` | One inline or file-backed RQL selector returning supported, location-bearing terminal results. | Executable. |
 | `taint` | Set-oriented sources, sinks, sanitizers, transforms, external models, and optional finding combinations. | Executes the production compiler, compatible batch planner, solver, retained report, and human/JSON/SARIF projection. |
 | `typestate` | Tracked subjects, typed events, deterministic transitions, uncertainty rules, and terminal expectations. | Executes query-local semantic bindings and emits production findings with stable identity, primary/related locations, bounded witnesses, and completeness metadata. |
-| `assertion` | A subject selector that captures identifier tokens, plus one or more `assert`, `assert-resolution`, `assert-reaching`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant. |
+| `assertion` | Either a subject selector that captures identifier tokens plus one or more `assert`, `assert-resolution`, `assert-reaching`, `assert-boundary`, `assert-canonical`, `assert-route`, or `assert-round-trip` invariants about the [occurrence](/rune-query-language/) each captured token carries and about how it resolved; or a relational plan of `bind`, `join`, `group`, and `assert` records over typed rows. | Executes. Correlates captures to occurrence, candidate, and binding rows by AST identity and emits one multi-location finding per violated invariant or violated row group. |
 
 ### Taint: broad libraries, specific findings
 
@@ -418,6 +418,99 @@ language whose resolver records selections but not rejections; and a reference
 for which nothing was selected at all. A capture with no lexical binding in
 effect is not one of them -- that is a complete answer, so a containment
 requirement over an absent binding is simply skipped.
+
+#### Relational assertions over typed rows
+
+The asserts above each address one captured token. An assertion policy can
+instead state an invariant over named relations of typed rows. It replaces
+`:subject` and `:asserts` with a plan: `(bind ...)` names one relation, either
+an RQL query or an expansion of an earlier binding; `(join ...)` relates two
+bindings by equal-typed registered fields, as an inner join or an anti-join;
+`(group ...)` groups the joined rows by registered fields and computes named
+`(aggregate ...)` values; and `(assert :group NAME :value NAME :cardinality
+...)` bounds one aggregate in every group. A group that violates its assertion
+becomes one finding anchored at the exact source ranges of the rows that
+produced it. A binding the query engine had to truncate makes the run
+inconclusive, never clean.
+
+The aggregate operations are `count`, `count-distinct`, `min`, and
+`ordered-equal`. The first three fold one column. `ordered-equal` compares two
+ordered sequences instead, each named by its own integer position field and the
+value read at that position:
+
+```lisp
+(aggregate :name parity :op ordered-equal
+  :left (arg.argument_index arg.name)
+  :right (param.parameter_index param.label))
+```
+
+It yields one when the two sequences hold the same value at every position and
+have the same length, and zero otherwise, so `:cardinality (exactly 1)` states
+complete list parity. Position awareness is the point: a call that passes the
+same named arguments in a different order is equal to the declaration as a set
+and different as a list. A sequence is recovered from the group's rows rather
+than from row order, so two states are undefined and never reported as parity:
+a row that states no position, and two rows that claim one position and
+disagree.
+
+Whether a length difference is visible is a property of your join, not of the
+predicate. Joining on the compared value keeps only positions that already
+matched on both sides, and two such projections have equal length by
+construction; joining on a correlation key instead -- one call site to one
+callable -- puts both complete sequences in the group.
+
+`(assert-selected-in-winning-tier :id ID :site NAME :candidates NAME
+[:cardinality ...])` is authoring sugar over the callable-applicability rows.
+`:site` names a binding of `overload-selection` rows and `:candidates` a
+binding of `callable-applicability` rows for the same sites. It lowers to one
+inner join on `site_ast_id`, one group keyed on the site, one aggregate
+counting the candidates that are both `selected` and `applicable`, and one
+cardinality assertion -- exactly what you could write by hand, which is why it
+reports through the same finding path. The winning tier is the set of
+candidates the resolver's own applicability check accepted. The default
+cardinality `(exactly 1)` is the uniquely resolved site; `(exactly 0)` states a
+site where the resolver accepted nothing; `(at-least 2)` states a site that
+bound more than one accepted candidate.
+
+An undecided candidate is not an accepted one. A candidate whose verdict is
+`unknown` -- the language does not report the callable axis, or it never
+recorded that declaration's parameter list -- is not counted, so a site whose
+candidates are all undecided counts zero accepted candidates and violates the
+default cardinality. Bind the sites your invariant is about, and read the
+`overload-selection` row's `resolution` and `supported` fields when you need to
+tell an undecidable site from a resolved one. A site the resolver enumerated no
+candidate for contributes no tuple to the join at all, so it forms no group and
+is never asserted.
+
+#### Completeness in a relational plan
+
+A relational assertion counts rows, so the one completeness signal it can act
+on is a bound row that says its own producer suppressed the row *set* it heads.
+Today exactly one row says that: a `call_shape` row whose `coverage` is not
+`exact`. A macro-derived or otherwise unreadable argument list emits no
+argument-group and no argument row at all, precisely so it cannot look
+byte-identical to a real zero-argument call, and binding such a row makes the
+whole run inconclusive rather than clean.
+
+That signal lives on the mandatory `call_shape` row, so a plan that asserts
+anything about a call's arguments must bind that row. A plan that binds only
+the projected argument rows sees a legitimately empty set for a macro-derived
+site and reports it clean:
+
+```lisp
+(bind :name shape :query (rql (call-shape (occurrences :role [member_position]))))
+(bind :name arg :query
+  (rql (call-arguments (call-argument-groups
+    (call-shape (occurrences :role [member_position]))))))
+(join :left shape :right arg :on ((site_id site_id)))
+```
+
+Nothing weaker poisons the run. An `unknown_shape` overload summary, an
+undecided candidate verdict, and a signature whose arity the language never
+recorded all publish exact values in their own fields and emit every row they
+head, so a whole file is never reported inconclusive because one site in it was
+undecidable. Exclude those rows with `:where` when your invariant needs them
+excluded.
 
 #### A worked loop-invariance rule
 

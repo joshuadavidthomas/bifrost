@@ -31,6 +31,7 @@ mod policy_loading_workspace;
 mod policy_loop_invariant_sort;
 mod policy_match_evaluation;
 mod policy_materialization_assertions;
+mod policy_overload_selection_trio;
 mod policy_relational_assertions;
 mod policy_rendering;
 mod policy_resolution_assertions;
@@ -51,6 +52,9 @@ mod sanitizer_pack_shipping;
 // so this acceptance runs with that feature enabled.
 #[cfg(feature = "release-tooling")]
 mod golden_summary_pack_shipping;
+mod issue_1917_bodied_sink;
+mod issue_1953_ruby_call_binding;
+mod issue_1954_direct_call_witness;
 mod scan_usages_same_owner_policy;
 // Milestone 3 of the procedure-summary foundry (#1871). The fixture engine and
 // its runner are generation-time tooling behind `release-tooling`, so this

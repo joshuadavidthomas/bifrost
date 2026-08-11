@@ -1958,11 +1958,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ================================================================================
-Bifrost-pinned tree-sitter-kotlin parser
+brokk-tree-sitter-kotlin parser
 ================================================================================
 
-Vendored source: https://github.com/fwcd/tree-sitter-kotlin/tree/c8ac3d2627240160b999a2c100de3babbdb8f419
-Source notice: crates/bifrost-jvm/vendor/tree-sitter-kotlin/LICENSE
+Rust package: brokk-tree-sitter-kotlin@0.4.0
+Package source: https://crates.io/crates/brokk-tree-sitter-kotlin/0.4.0
+Source notice: LICENSE
 Inclusion: compiled into Bifrost on every release target
 
 The MIT License (MIT)

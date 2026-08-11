@@ -4,12 +4,12 @@
   "version": "0.1.0",
   "producer": {
     "name": "bifrost-golden-foundry",
-    "version": "0.8.24"
+    "version": "0.9.0"
   },
   "language": "java",
   "ecosystem": "jdk",
   "compatibility": {
-    "bifrost": ">=0.8.0, <0.9.0",
+    "bifrost": ">=0.8.0, <0.10.0",
     "toolchains": [
       {
         "name": "jdk",

@@ -3,6 +3,7 @@ mod cache;
 mod clones;
 #[cfg(test)]
 mod diagnostics;
+pub(crate) mod external;
 mod hierarchy;
 mod identity;
 mod imports;
@@ -352,6 +353,16 @@ impl CppAnalyzer {
         self.compile_contexts
             .get_or_init(|| CppCompileContexts::load(self.inner.project()))
             .contexts_for(file)
+    }
+
+    pub(crate) fn resolve_external_angle_include(
+        &self,
+        file: &ProjectFile,
+        include: &std::path::Path,
+    ) -> brokk_bifrost_cpp::compile_context::CppExternalIncludeResolution {
+        self.compile_contexts
+            .get_or_init(|| CppCompileContexts::load(self.inner.project()))
+            .resolve_external_angle_include(file, include)
     }
 
     pub(crate) fn prepared_syntax(
