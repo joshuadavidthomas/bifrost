@@ -914,6 +914,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         return;
     }
+    if let Some(scope) = target_guided_dependent_alias_qualifier_scope(node, ctx) {
+        *ctx.raw_match_count += 1;
+        push_unproven_hit(scope, ctx);
+        return;
+    }
     if !recovered_type && is_nested_type_node(node) {
         // A concrete template specialization can be absent from the coarse
         // per-file component-name index: that index contains the primary name
@@ -1214,6 +1219,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             {
                 *ctx.raw_match_count += 1;
                 push_type_hit(leaf, ctx);
+            } else if let Some(leaf) = target_guided_dependent_class_alias_leaf(node, ctx) {
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(leaf, ctx);
             }
             return;
         }
@@ -1223,6 +1231,9 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 for scope in scopes {
                     push_type_hit(scope, ctx);
                 }
+            } else if let Some(leaf) = target_guided_dependent_class_alias_leaf(node, ctx) {
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(leaf, ctx);
             } else if let Some(leaf) = target_guided_missing_alias_rhs_type_leaf(node, ctx)
                 .or_else(|| target_guided_missing_member_alias_type_leaf(node, ctx))
                 .or_else(|| target_guided_ambiguous_owned_alias_type_leaf(node, ctx))
@@ -1233,6 +1244,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             return;
         }
         LexicalTypeResolution::Missing => {
+            if let Some(leaf) = target_guided_dependent_class_alias_leaf(node, ctx) {
+                *ctx.raw_match_count += 1;
+                push_unproven_hit(leaf, ctx);
+                return;
+            }
             if let Some(leaf) = target_guided_missing_type_leaf(node, ctx) {
                 *ctx.raw_match_count += 1;
                 push_type_hit(leaf, ctx);
@@ -2680,6 +2696,144 @@ fn canonical_alias_target(candidate: &CodeUnit, ctx: &ScanCtx<'_>) -> CodeUnit {
         return canonical.clone();
     }
     structured.unwrap_or_else(|| candidate.clone())
+}
+
+/// Preserve the alias component of a qualified reference when the alias target
+/// is a dependent nested type and forward lookup retains its primary template
+/// as the bounded identity.
+fn target_guided_dependent_alias_qualifier_scope<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    if !matches!(
+        node.kind(),
+        "qualified_identifier" | "scoped_type_identifier"
+    ) {
+        return None;
+    }
+    let target = physically_visible_type_target(ctx)?;
+    let alias_provider = ctx.analyzer.type_alias_provider()?;
+    if !target.is_class() || alias_provider.is_type_alias(target) {
+        return None;
+    }
+    let nodes = cpp_name_component_nodes(node)?;
+    let names = nodes
+        .iter()
+        .map(|component| node_text(*component, ctx.source).to_string())
+        .collect::<Vec<_>>();
+    let global = is_globally_qualified_cpp_name(node);
+    let lexical_scope = match enclosing_lexical_scope_components(
+        node,
+        &ctx.analyzer,
+        ctx.visibility,
+        ctx.file,
+        ctx.source,
+    ) {
+        LexicalScopeResolution::Resolved(scope) => scope,
+        LexicalScopeResolution::Ambiguous | LexicalScopeResolution::Missing => {
+            enclosing_namespace_components(node, ctx.source)
+        }
+    };
+    for component_count in 1..=names.len() {
+        let components = &names[..component_count];
+        let name = components.last()?;
+        let candidates = ctx
+            .visibility
+            .visible_identifier_candidates(ctx.file, name)
+            .filter(|candidate| alias_provider.is_type_alias(candidate))
+            .filter(|candidate| {
+                ctx.visibility.is_physically_visible(ctx.file, candidate)
+                    && ctx
+                        .visibility
+                        .external_type_candidate_guard_compatible_in_context(
+                            &ctx.analyzer,
+                            ctx.file,
+                            candidate,
+                            node,
+                        )
+            })
+            .filter(|candidate| {
+                let candidate_components = canonical_cpp_scope_components(candidate);
+                lexical_component_tiers(components, global, &lexical_scope)
+                    .any(|tier| tier == candidate_components)
+                    || (component_count == 1
+                        && member_alias_owner_matches_reference_for(
+                            candidate,
+                            nodes[component_count - 1],
+                            ctx,
+                        ))
+            })
+            .filter(|candidate| {
+                ctx.visibility.structured_class_alias_path_preserves_target(
+                    &ctx.analyzer,
+                    ctx.file,
+                    candidate,
+                    target,
+                )
+            });
+        let mut aliases: Vec<&CodeUnit> = Vec::new();
+        for candidate in candidates {
+            if !aliases
+                .iter()
+                .any(|existing| same_logical_symbol(existing, candidate))
+            {
+                aliases.push(candidate);
+            }
+        }
+        if aliases.len() == 1 {
+            return nodes.get(component_count - 1).copied();
+        }
+        if aliases.len() > 1 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Preserve an unqualified class-owned alias when its dependent target path
+/// retains the requested primary template as the bounded forward identity.
+fn target_guided_dependent_class_alias_leaf<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    if node.kind() != "type_identifier"
+        || is_declaration_name(node)
+        || local_type_name_shadows(node, ctx)
+    {
+        return None;
+    }
+    let target = physically_visible_type_target(ctx)?;
+    let alias_provider = ctx.analyzer.type_alias_provider()?;
+    if !target.is_class() || alias_provider.is_type_alias(target) {
+        return None;
+    }
+    let name = node_text(node, ctx.source);
+    let aliases = ctx
+        .visibility
+        .visible_identifier_candidates(ctx.file, name)
+        .filter(|candidate| alias_provider.is_type_alias(candidate))
+        .filter(|candidate| member_alias_owner_matches_reference_for(candidate, node, ctx))
+        .filter(|candidate| {
+            ctx.visibility.is_physically_visible(ctx.file, candidate)
+                && ctx
+                    .visibility
+                    .external_type_candidate_guard_compatible_in_context(
+                        &ctx.analyzer,
+                        ctx.file,
+                        candidate,
+                        node,
+                    )
+        })
+        .filter(|candidate| {
+            ctx.visibility.structured_class_alias_path_preserves_target(
+                &ctx.analyzer,
+                ctx.file,
+                candidate,
+                target,
+            )
+        })
+        .collect::<Vec<_>>();
+    matches!(aliases.as_slice(), [_]).then_some(node)
 }
 
 /// Recover a namespace alias whose guard state blocks ordinary visibility.

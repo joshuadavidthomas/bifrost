@@ -2616,12 +2616,14 @@ fn execute_internal_with_analysis_strategy(
     if let Some(out) = access_failure_out {
         *out = state.access_failure.take();
     }
+    let mut result = CodeQueryResult {
+        results,
+        truncated: truncated || cancelled,
+        diagnostics,
+    };
+    result.cap_flow_completion_by_run();
     let detailed = DetailedCodeQueryResult {
-        result: CodeQueryResult {
-            results,
-            truncated: truncated || cancelled,
-            diagnostics,
-        },
+        result,
         work,
         evidence,
         profile,

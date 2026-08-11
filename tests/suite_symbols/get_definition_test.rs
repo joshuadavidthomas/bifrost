@@ -32324,7 +32324,7 @@ object Uri {
 // Kotlin definition navigation (issue #1238).
 //
 // Fixtures are written multi-line with blank lines between declarations, the
-// way real Kotlin is written: the vendored grammar emits `MISSING
+// way real Kotlin is written: the Kotlin grammar emits `MISSING
 // _automatic_semicolon` recovery nodes for single-line declaration bodies, so a
 // compressed fixture would exercise recovery rather than the shape under test.
 // ---------------------------------------------------------------------------

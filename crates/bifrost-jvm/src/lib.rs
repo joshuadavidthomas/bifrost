@@ -5,7 +5,7 @@
 //!
 //! This crate sits between [`brokk_bifrost_core`] and `brokk-bifrost-analysis`.
 //! It holds Java, Scala and Kotlin *language knowledge* as plain functions and
-//! data, and it ships the vendored Kotlin tree-sitter grammar. It depends on no
+//! data, and it uses the released Brokk Kotlin tree-sitter grammar. It depends on no
 //! other Bifrost crate than core, so nothing here
 //! may name `IAnalyzer`, `TreeSitterAnalyzer`, `JavaAnalyzer`, `ScalaAnalyzer`
 //! or `KotlinAnalyzer`.
@@ -23,11 +23,10 @@
 //!
 //! # The grammar packages
 //!
-//! Scala uses the released `tree-sitter-scala` crate. Kotlin stays vendored,
-//! and `build.rs` compiles its `parser.c` and `scanner.c` through `cc` with
-//! private symbols. [`scala::language::LANGUAGE`] re-exports Scala's public
-//! entry point. [`kotlin::language::LANGUAGE`] binds Kotlin's private entry
-//! point. `brokk-bifrost-analysis` re-imports both for parsing and store epochs.
+//! Scala uses the released `tree-sitter-scala` crate. Kotlin uses the released
+//! `brokk-tree-sitter-kotlin` crate. Both grammar crates use distinct native
+//! symbols. `brokk-bifrost-analysis` re-imports both languages for parsing and
+//! store epochs.
 //!
 //! Where analysis code would reach for an analyzer handle, the functions here
 //! take a source trait -- a core

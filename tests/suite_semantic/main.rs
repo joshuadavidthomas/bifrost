@@ -102,5 +102,7 @@ mod typestate_binding;
 mod typestate_client;
 mod typestate_production_summary;
 mod typestate_protocol;
+mod value_flow_balanced_source_call;
 mod value_flow_client;
 mod value_flow_language_conformance;
+mod value_flow_path_relevant_completion;

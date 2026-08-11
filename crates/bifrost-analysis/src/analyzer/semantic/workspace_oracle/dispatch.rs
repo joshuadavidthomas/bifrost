@@ -10,18 +10,18 @@ use sha2::{Digest, Sha256};
 
 use super::WorkspaceSemanticOracle;
 use crate::analyzer::semantic::{
-    CallSiteHandle, CancellationToken, CandidateCoverage, ContentIdentity, DeclarationLocator,
-    DeclarationSegment, DeclarationSegmentKind, DispatchBoundary, DispatchBoundaryKind,
-    DispatchCandidate, DispatchExtensibility, DispatchOracle, DispatchResult, EvidenceCompleteness,
-    EvidenceHandle, ExactExternalProcedureTarget, OracleLimits, OracleRelationArena,
-    OracleRelationId, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
-    ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact,
-    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact,
-    SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork, SourceAnchor,
-    SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget, WorkspaceMountId,
-    WorkspaceRelativePath, split_qualified_member, unmaterialized_external_mount,
-    unmaterialized_external_path,
+    CallSiteHandle, CallableTarget, CallableTargetResolution, CancellationToken, CandidateCoverage,
+    ContentIdentity, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
+    DispatchBoundary, DispatchBoundaryKind, DispatchCandidate, DispatchExtensibility,
+    DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
+    ExactExternalProcedureTarget, OracleLimits, OracleRelationArena, OracleRelationId,
+    OracleRelationOwner, OracleRelationRecord, OracleRelationSubject, ProcedureHandle,
+    ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact, SemanticBudgetExceeded,
+    SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticLanguage, SemanticLocator, SemanticOutcome, SemanticProviderError,
+    SemanticRequest, SemanticRole, SemanticWork, SourceAnchor, SourcePosition, SourceSpan,
+    StableDigest, UnmaterializedExternalTarget, WorkspaceMountId, WorkspaceRelativePath,
+    split_qualified_member, unmaterialized_external_mount, unmaterialized_external_path,
 };
 use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
@@ -556,8 +556,19 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 merge_dispatch_quality(materialization_quality, DispatchQuality::Truncated);
         }
 
-        let call_dispatch_gap =
-            call_dispatch_gap.filter(|gap| !closed_dispatch_discharges_gap(&candidates, gap));
+        let call_dispatch_gap = call_dispatch_gap.filter(|gap| {
+            !closed_dispatch_discharges_gap(&candidates, gap)
+                && !proven_static_target_discharges_gap(
+                    call.procedure(),
+                    &semantic_call.declared_targets,
+                    semantic_call.receiver.is_none(),
+                    &candidates,
+                    &boundaries,
+                    lookup.status == Some(DefinitionLookupStatus::Resolved),
+                    materialization_quality,
+                    gap,
+                )
+        });
         let gap_exceeded = call_dispatch_gap
             .and_then(|gap| gap.budget)
             .or_else(|| procedure_call_gap.and_then(|gap| gap.budget));
@@ -720,6 +731,89 @@ fn closed_dispatch_discharges_gap(candidates: &[DispatchCandidate], gap: &Semant
                 .dispatch_extensibility
                 == DispatchExtensibility::Closed
         })
+}
+
+/// Whether a statically proven target set discharges an avoidable per-call
+/// dynamic-dispatch gap (#1952).
+///
+/// Several adapters publish a blanket `Unknown` dynamic-dispatch gap on every
+/// call site -- "complete target coverage requires lexical and value-flow
+/// refinement" -- including calls whose target is statically known. The gap is
+/// answered, and must not open the run, in exactly two proven situations:
+/// the adapter itself proved `declared_targets` and dispatch retained that
+/// target with proven, complete evidence; or the workspace resolver performed
+/// the demanded whole-program refinement and proved a clean result (lookup
+/// resolved, every retained candidate proven and complete, no boundary, no
+/// truncation). `Unsupported`, `Ambiguous`, and `ExceededBudget` gaps keep
+/// standing: they assert something a proven target set does not answer.
+#[allow(clippy::too_many_arguments)]
+fn proven_static_target_discharges_gap(
+    caller: &ProcedureHandle,
+    declared_targets: &CallableTargetResolution,
+    receiverless: bool,
+    candidates: &[DispatchCandidate],
+    boundaries: &[DispatchBoundary],
+    lookup_resolved: bool,
+    materialization_quality: DispatchQuality,
+    gap: &SemanticGap,
+) -> bool {
+    if gap.capability != SemanticCapability::DynamicDispatch
+        || !matches!(
+            gap.kind,
+            SemanticGapKind::Unknown | SemanticGapKind::Unproven
+        )
+        || candidates.is_empty()
+    {
+        return false;
+    }
+    let proven_complete = |candidate: &DispatchCandidate| {
+        matches!(candidate.proof, ProofStatus::Proven)
+            && matches!(candidate.completeness, EvidenceCompleteness::Complete)
+    };
+    if let CallableTargetResolution::Proven(target) = declared_targets
+        && candidates.iter().all(|candidate| {
+            proven_complete(candidate)
+                && candidate_matches_declared_target(caller, candidate, target)
+        })
+    {
+        return true;
+    }
+    // The resolver-proven arm accepts only receiverless calls whose retained
+    // candidates are free functions: a plain function call's target set is
+    // exactly what the whole-program resolver proved. Receiver dispatch and
+    // member candidates (virtual methods, including implicit-object calls
+    // that carry no explicit receiver value) can gain overrides the proven
+    // candidates do not enumerate; those discharge only through the
+    // closed-extensibility rule.
+    receiverless
+        && lookup_resolved
+        && boundaries.is_empty()
+        && materialization_quality == DispatchQuality::Complete
+        && candidates.iter().all(|candidate| {
+            proven_complete(candidate)
+                && matches!(
+                    candidate.target().semantics().kind(),
+                    ProcedureKind::Function | ProcedureKind::LocalFunction
+                )
+        })
+}
+
+fn candidate_matches_declared_target(
+    caller: &ProcedureHandle,
+    candidate: &DispatchCandidate,
+    target: &CallableTarget,
+) -> bool {
+    match target {
+        CallableTarget::Local(id) => {
+            candidate.target().artifact().key() == caller.artifact().key()
+                && candidate.target().id() == *id
+        }
+        CallableTarget::Unmaterialized(locator) | CallableTarget::External(locator) => {
+            let candidate_locator = candidate.target().semantics().locator();
+            candidate_locator.path() == locator.path()
+                && candidate_locator.declaration() == locator.declaration()
+        }
+    }
 }
 
 fn finish_dispatch_interruption(

@@ -10,9 +10,9 @@ use crate::gitblob;
 
 /// Best-effort GC: drop cache entries no longer reachable from git refs or held
 /// by any worktree's uncommitted working set.
-fn run_gc(db_path: PathBuf, repo: &git2::Repository) -> Result<(), String> {
+fn run_gc(db_path: PathBuf, repo: &git2::Repository, workspace_root: &Path) -> Result<(), String> {
     let store = AnalyzerStore::open_persistent(&db_path).map_err(|err| err.to_string())?;
-    crate::cache_gc::maybe_gc_for_analyzer(&store, repo).map(|_| ())
+    crate::cache_gc::maybe_gc_for_analyzer(&store, repo, workspace_root).map(|_| ())
 }
 
 /// Owns best-effort analyzer cache GC tasks for one workspace lifetime.
@@ -51,7 +51,7 @@ impl AnalyzerGcCoordinator {
                 if !is_open(&coordinator) {
                     return;
                 }
-                let _ = run_gc(db_path, &repo);
+                let _ = run_gc(db_path, &repo, &root);
             })
         else {
             return;

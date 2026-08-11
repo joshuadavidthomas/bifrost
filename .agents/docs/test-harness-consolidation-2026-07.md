@@ -115,7 +115,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `typescript_analyzer_update_test`
 - `typescript_import_test`
 
-### `suite_bench_policy` (30 modules)
+### `suite_bench_policy` (31 modules)
 
 - `benchmark_compare`
 - `benchmark_manifest`
@@ -124,6 +124,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `bifrost_policy_cli`
 - `builtin_policy_pack`
 - `cvss_classification`
+- `issue_1951_balanced_policy`
 - `measure_semantic_summary_taint_lifecycle`
 - `no_stringly_name_parsing`
 - `policy_assertion_conformance`
@@ -257,7 +258,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `unified_cache`
 - `workspace_analyzer_test`
 
-### `suite_semantic` (45 modules)
+### `suite_semantic` (46 modules)
 
 - `dataflow_clients`
 - `dataflow_ide`
@@ -303,6 +304,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `typestate_client`
 - `typestate_production_summary`
 - `typestate_protocol`
+- `value_flow_balanced_source_call`
 - `value_flow_client`
 - `value_flow_language_conformance`
 

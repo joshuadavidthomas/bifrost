@@ -1895,8 +1895,16 @@ class Sample {
     assert_java_sibling_scopes(&java, JAVA);
     assert_value_flow_oracle(&analyzer, &typescript);
     assert_value_flow_oracle(&analyzer, &java);
-    assert_call_bindings(&analyzer, &typescript, TYPESCRIPT, CandidateCoverage::Open);
-    assert_call_bindings(&analyzer, &java, JAVA, CandidateCoverage::Open);
+    // Candidate-specific bindings close since #1952: target-set openness
+    // lives in the dispatch result (asserted Open above), while the binding
+    // rows for one retained candidate are themselves exhaustive.
+    assert_call_bindings(
+        &analyzer,
+        &typescript,
+        TYPESCRIPT,
+        CandidateCoverage::Exhaustive,
+    );
+    assert_call_bindings(&analyzer, &java, JAVA, CandidateCoverage::Exhaustive);
     assert_variadic_and_static_receiver_bindings(&analyzer, &typescript, TYPESCRIPT);
     assert_variadic_and_static_receiver_bindings(&analyzer, &java, JAVA);
     assert_java_dispatch_closure(&analyzer, &java, JAVA);

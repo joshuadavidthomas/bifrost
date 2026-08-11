@@ -1,6 +1,6 @@
 //! Structured reads of the Kotlin syntax tree, shared by every Kotlin consumer.
 //!
-//! The vendored Kotlin grammar (`crates/bifrost-analysis/vendor/tree-sitter-kotlin`)
+//! The `brokk-tree-sitter-kotlin` grammar
 //! is field-poor: of everything this module reads, only `function_declaration`
 //! and `property_declaration` carry a tree-sitter field (`receiver`). The callee
 //! of a call, the member of a navigation, the label of a named argument, and the

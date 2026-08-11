@@ -1,4 +1,4 @@
-//! The pinned, vendored tree-sitter Kotlin grammar, re-imported from
+//! The pinned tree-sitter Kotlin crate, re-imported from
 //! `brokk-bifrost-jvm`.
 //!
 //! The vendor tree, `build.rs` and the `cc` build-dependency moved with the JVM
