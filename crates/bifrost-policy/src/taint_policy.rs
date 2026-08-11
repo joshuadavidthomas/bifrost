@@ -48,9 +48,6 @@ use brokk_bifrost_analysis::analyzer::dataflow::{
     SummarySemanticsVersion, SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits,
     WitnessRetentionLimits,
 };
-use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
-    ProcedureRangeLookupStatus, procedures_for_source_ranges,
-};
 use brokk_bifrost_analysis::analyzer::semantic::{
     CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget, OracleCallContext,
     ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticBudget, SemanticOutcome, ValueHandle,
@@ -692,46 +689,44 @@ impl<'a> TaintPolicyCompiler<'a> {
             .selectors
             .materialize(&selection.file)
             .map_err(taint_selector_error)?;
-        let lookup = procedures_for_source_ranges(
-            &artifact,
-            &[super::selector_compiler::source_range(&selection.span)],
-            self.selectors
-                .remaining_semantic_traversal_steps()
-                .map_err(taint_selector_error)?,
-            self.selectors.cancellation(),
-        );
-        if !self
+        // Bind against every procedure in the file artifact. Narrowing by
+        // procedure-anchor containment loses calls in languages whose
+        // procedure anchors cover only the declaration header (Ruby anchors
+        // `def name`, not the body, #1953); the call site's own source anchor
+        // in select_call is the identity that decides the binding.
+        let max_steps = self
             .selectors
-            .execution_budget()
-            .charge_traversal(lookup.examined)
-        {
-            return Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                "taint enclosing-procedure lookup exhausted the shared traversal budget",
-            ));
-        }
-        match lookup.status {
-            ProcedureRangeLookupStatus::Complete => {}
-            ProcedureRangeLookupStatus::Cancelled => {
+            .remaining_semantic_traversal_steps()
+            .map_err(taint_selector_error)?;
+        let cancellation = self.selectors.cancellation();
+        let mut handles = Vec::with_capacity(artifact.procedures().len());
+        let mut examined = 0_usize;
+        for procedure in artifact.procedures() {
+            if cancellation.is_cancelled() {
                 return Err(TaintPolicyCompileError::QueryIncomplete {
                     completion: CodeQueryCompletion::Cancelled,
-                    detail: "taint enclosing-procedure lookup was cancelled".to_owned(),
+                    detail: "taint semantic call binding was cancelled".to_owned(),
                 });
             }
-            ProcedureRangeLookupStatus::BudgetExhausted => {
+            examined = examined.saturating_add(1 + procedure.call_sites().len());
+            if examined > max_steps {
                 return Err(query_budget_error(
                     CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                    "taint enclosing-procedure lookup exhausted the shared traversal budget",
+                    "taint semantic call binding exhausted the shared traversal budget",
                 ));
             }
-            ProcedureRangeLookupStatus::SourceChanged => {
-                return Err(TaintPolicyCompileError::SemanticUnavailable(
-                    "taint enclosing-procedure lookup observed a changed source snapshot"
-                        .to_owned(),
-                ));
-            }
+            let handle = artifact
+                .procedure_handle(procedure.id())
+                .expect("validated artifact procedure has a scoped handle");
+            handles.push(handle);
         }
-        let (procedure, call) = select_call(&lookup.handles, &selection)?;
+        if !self.selectors.execution_budget().charge_traversal(examined) {
+            return Err(query_budget_error(
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                "taint semantic call binding exhausted the shared traversal budget",
+            ));
+        }
+        let (procedure, call) = select_call(&handles, &selection)?;
         let (value, point) = select_value(&procedure, &call, &selection.span, binding)?;
         Ok(vec![ResolvedTaintValue {
             point,
@@ -1880,6 +1875,15 @@ fn required_selector<'a>(
         .ok_or_else(|| TaintPolicyCompileError::MissingSelector(path.as_str().to_owned()))
 }
 
+/// Bind one selector row to the semantic call site it identifies.
+///
+/// The primary identity is exact source-anchor equality between the selector
+/// row and a call site's own anchor; this is what binds Ruby calls with and
+/// without parentheses, whose structural rows and semantic call anchors share
+/// one node (#1953). A call whose anchor strictly encloses the row is a
+/// secondary candidate for adapters whose rows sit inside the call expression.
+/// Equal-rank candidates stay a typed ambiguity; no candidate stays a typed
+/// capability failure.
 fn select_call(
     procedures: &[ProcedureHandle],
     selection: &SelectedSite,
