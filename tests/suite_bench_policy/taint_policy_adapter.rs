@@ -1324,12 +1324,12 @@ fn canonical_public_taint_witnesses(
         .iter()
         .flat_map(|finding| &finding.witnesses)
         .map(|witness| {
-            let mut omitted = u64::try_from(witness.omitted_steps_lower_bound).unwrap_or(u64::MAX);
-            if (witness.truncated || witness.alternatives_truncated || witness.retention_truncated)
-                && omitted == 0
-            {
-                omitted = 1;
-            }
+            let omitted = u64::try_from(witness.omitted_steps_lower_bound).unwrap_or(u64::MAX);
+            assert_eq!(
+                witness.truncated,
+                omitted > 0,
+                "public witness truncation must carry a positive omitted lower bound"
+            );
             CanonicalTaintWitness {
                 steps: witness
                     .steps
