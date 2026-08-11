@@ -1786,12 +1786,10 @@ fn go_field_unit_type_text(
         .map(str::to_string)
         .or_else(|| index.signatures(field_unit).first().cloned())?;
     let trimmed = signature.trim();
-    if let Some(type_text) = trimmed
-        .strip_prefix(field)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    if let Some(suffix) = trimmed.strip_prefix(field)
+        && suffix.chars().next().is_some_and(char::is_whitespace)
     {
-        return Some(type_text.to_string());
+        return Some(suffix.trim().to_string());
     }
     let simple = go_simple_type_name(trimmed)?;
     (simple == field).then(|| trimmed.to_string())
