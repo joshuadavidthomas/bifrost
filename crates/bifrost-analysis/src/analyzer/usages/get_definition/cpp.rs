@@ -2709,12 +2709,20 @@ fn cpp_template_application_node(mut node: Node<'_>) -> Option<Node<'_>> {
 /// the referencing file itself, plus definitions in headers the file
 /// includes directly (structured include-target resolution, the same
 /// information the boundary heuristic uses).
-fn cpp_macro_candidates(analyzer: &dyn IAnalyzer, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
+fn cpp_macro_candidates(
+    analyzer: &dyn IAnalyzer,
+    visibility: &CppVisibilityIndex,
+    file: &ProjectFile,
+    name: &str,
+    before_byte: usize,
+) -> Vec<CodeUnit> {
     if name.is_empty() || name.contains(':') {
         return Vec::new();
     }
     let include_targets =
         resolve_analyzer::<CppAnalyzer>(analyzer).map(|cpp| cpp.include_target_index());
+    let dispatch = CppDispatch::new(analyzer);
+    let source = dispatch.source();
     analyzer
         .definitions(name)
         .filter(CodeUnit::is_macro)
@@ -2733,6 +2741,18 @@ fn cpp_macro_candidates(analyzer: &dyn IAnalyzer, file: &ProjectFile, name: &str
                             targets.iter().any(|target| target == unit.source())
                         })
                 })
+        })
+        .filter(|unit| {
+            unit.source() != file
+                || analyzer
+                    .ranges(unit)
+                    .iter()
+                    .any(|range| range.start_byte < before_byte)
+        })
+        .filter(|unit| {
+            visibility.macro_binding_matches_target_at(&source, file, name, before_byte, unit)
+                || (visibility.macro_name_may_be_bound_at(file, name, before_byte)
+                    && visibility.macro_target_is_visible_candidate(file, unit))
         })
         .collect()
 }
@@ -3220,7 +3240,7 @@ fn resolve_cpp_type_without_focused_qualifier(
             .collect();
         return candidates_outcome(candidates);
     }
-    let macros = cpp_macro_candidates(analyzer, file, text);
+    let macros = cpp_macro_candidates(analyzer, visibility, file, text, node.start_byte());
     if !macros.is_empty() {
         return candidates_outcome(macros);
     }
@@ -4273,7 +4293,13 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 }
                 CppBareCallTargetResolution::Missing => {}
             }
-            let macros = cpp_macro_candidates(ctx.analyzer, ctx.file, name);
+            let macros = cpp_macro_candidates(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                name,
+                call.start_byte(),
+            );
             if !macros.is_empty() {
                 return candidates_outcome(macros);
             }
