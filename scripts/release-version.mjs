@@ -58,6 +58,7 @@ export const RELEASED_CARGO_MANIFESTS = [
   "crates/bifrost-python/Cargo.toml",
   "crates/bifrost-ruby/Cargo.toml",
   "crates/bifrost-rust/Cargo.toml",
+  "crates/bifrost-rql/Cargo.toml",
   "crates/bifrost-analysis/Cargo.toml",
   "crates/bifrost-nlp/Cargo.toml",
   "crates/bifrost-policy/Cargo.toml",

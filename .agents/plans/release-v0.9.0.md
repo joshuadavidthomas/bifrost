@@ -13,8 +13,8 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 - [x] (2026-08-11 05:08Z) Correct and validate the confirmed `master` blockers.
 - [x] (2026-08-11 05:35Z) Commit and push the first validated `master` repair.
 - [x] (2026-08-11 06:10Z) Correct the remaining Hermes fixture race found by the full Linux CI job.
-- [ ] Create and push `dave/v0.9.0-rc` from the green `master` commit.
-- [ ] Set the workspace version to 0.9.0, synchronize release metadata, and commit the projection.
+- [x] (2026-08-11 07:00Z) Create and push `dave/v0.9.0-rc` from master commit `35868e505`.
+- [x] (2026-08-11 07:08Z) Set the workspace version to 0.9.0 and synchronize release metadata.
 - [ ] Copy the version projection to `master`, as required by the release process.
 - [ ] Run the release validation gates and confirm remote RC checks are green.
 - [ ] Tag the validated RC commit as `v0.9.0` and push the tag.
@@ -41,6 +41,9 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 - Observation: `brokk-bifrost-rql` was the only release crate that did not exist on crates.io.
   Evidence: The 0.8.24 package dry run passed. The bootstrap publication then succeeded, and its trusted publisher now names `BrokkAi/bifrost`, `release.yml`, and the `release` environment.
 
+- Observation: The release sync script omitted `crates/bifrost-rql/Cargo.toml`.
+  Evidence: `cargo check --workspace --locked` rejected the remaining `brokk-bifrost-core = "=0.8.24"` dependency after the first 0.9.0 sync. A behavior test now verifies this projection.
+
 ## Decision Log
 
 - Decision: Repair `master` before selecting the RC commit.
@@ -49,6 +52,10 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 
 - Decision: Stop at any failed validation or publication gate.
   Rationale: A release tag must identify evidence that all common package forms passed.
+  Date/Author: 2026-08-11 / Codex
+
+- Decision: Freeze the current master tip before its full push workflow completes.
+  Rationale: The RC branch is the stable snapshot. New master pushes twice cancelled long master jobs. The RC branch supplies the exact validation target.
   Date/Author: 2026-08-11 / Codex
 
 ## Outcomes & Retrospective
@@ -106,8 +113,12 @@ Current evidence:
     CI: https://github.com/BrokkAi/bifrost/actions/runs/31450971490
     policy: https://github.com/BrokkAi/bifrost/actions/runs/31450971428
     first repair CI: https://github.com/BrokkAi/bifrost/actions/runs/31462640467
+    frozen RC source: 35868e505e26cf56c49c8e93cc293eaa66f857ad
     focused installer test: 1 passed; 0 failed
     local policy scan after review: exit 0
+    release metadata checks: passed at 0.9.0
+    agent plugin tests: 116 passed; 0 failed
+    cargo check --workspace --locked: passed
 
 ## Interfaces and Dependencies
 
@@ -118,3 +129,7 @@ Revision note: Created this plan after current `master` failed two release gates
 Revision note: Updated the first milestone after the focused installer test passed and the reviewed policy scan exited cleanly.
 
 Revision note: Recorded the Hermes confirmation race and the RQL crate bootstrap before the second master repair checkpoint.
+
+Revision note: Corrected the gate sequence after two fast master pushes cancelled long jobs. The RC branch now freezes the validation target first.
+
+Revision note: Recorded and corrected the missing RQL dependency projection found during the 0.9.0 locked Cargo check.

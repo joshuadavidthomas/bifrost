@@ -66,6 +66,23 @@ test("release version check rejects projection drift", async () => {
   }
 });
 
+test("release version update synchronizes RQL internal dependencies", async () => {
+  const root = await createFixture("1.2.4", "1.2.3", "\n");
+  const manifest = path.join(root, "crates/bifrost-rql/Cargo.toml");
+  try {
+    await writeFile(
+      manifest,
+      '[package]\nname = "brokk-bifrost-rql"\nversion.workspace = true\n\n[dependencies]\nbrokk-bifrost-core = { path = "../bifrost-core", version = "=1.2.3" }\n',
+    );
+
+    await execFileAsync(process.execPath, [releaseVersionScript, "sync"], { cwd: root });
+
+    assert.match(await readFile(manifest, "utf8"), /version = "=1\.2\.4"/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("GitHub outputs are emitted only after successful release validation", async () => {
   const root = await createFixture("1.2.3", "1.2.3", "\n");
   const outputPath = path.join(root, "github-output.txt");
