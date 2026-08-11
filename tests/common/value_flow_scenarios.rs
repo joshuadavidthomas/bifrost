@@ -1398,6 +1398,8 @@ macro_rules! direct_ready_value_flow_scenario_entries {
         }
     };
 }
+// Shared across harnesses; a given suite may consume only one entries macro.
+#[allow(unused_imports)]
 pub(crate) use direct_ready_value_flow_scenario_entries;
 
 macro_rules! define_direct_ready_value_flow_scenarios {
@@ -3956,4 +3958,873 @@ end
         2,
         execute,
     )
+}
+
+// ===== Issue #1951: balanced source-call scenario =====
+//
+// The smallest DataFlowBench shape. The positive routes a source call's
+// returned value directly into sink argument 0:
+//
+//     dfb_sink(dfb_source())
+//
+// The negative changes only the sink operand: the source result is unused
+// and the sink receives an independent constant:
+//
+//     dfb_source()
+//     dfb_sink("clean")
+//
+// Both cases bind the source with `ParameterSource::CallResult`, which
+// mirrors the production policy `:bind return-value` binding, and use
+// optimistic unmodeled-call behavior to match the shared DataFlowBench
+// `core-direct.rqlp` policy.
+
+/// One language's balanced fixture and its expected typed outcomes.
+pub struct BalancedSourceCallShape {
+    pub name: &'static str,
+    pub language: Language,
+    pub path: &'static str,
+    pub positive: &'static str,
+    pub negative: &'static str,
+    pub kind: ProcedureKind,
+    /// Exact source-call snippet in the positive fixture.
+    pub positive_source_call: &'static str,
+    /// Exact sink-call snippet in the positive fixture.
+    pub positive_sink_call: &'static str,
+    pub positive_discovery: SemanticInputStatus,
+    pub positive_result_complete: bool,
+    pub positive_meeting_count: usize,
+    pub positive_public_endpoint_count: usize,
+    pub positive_public_may_complete_count: usize,
+    pub positive_public_may_partial_count: usize,
+    pub negative_discovery: SemanticInputStatus,
+    pub negative_result_complete: bool,
+    /// `NotReached` when the negative completes; `Inconclusive` when a
+    /// path-relevant semantic gap keeps the language typed-incomplete.
+    pub negative_outcome: ExpectedSinkOutcome,
+}
+
+fn balanced_procedures(shape: &BalancedSourceCallShape) -> [ProcedureSelector<'static>; 3] {
+    [
+        ProcedureSelector {
+            alias: "run",
+            path: shape.path,
+            name: "run",
+            kind: shape.kind,
+        },
+        ProcedureSelector {
+            alias: "source",
+            path: shape.path,
+            name: "dfb_source",
+            kind: shape.kind,
+        },
+        ProcedureSelector {
+            alias: "sink",
+            path: shape.path,
+            name: "dfb_sink",
+            kind: shape.kind,
+        },
+    ]
+}
+
+const BALANCED_CALLS: &[CallSelector<'static>] = &[
+    CallSelector {
+        alias: "source_call",
+        caller: "run",
+        callee: "source",
+        occurrence: 0,
+    },
+    CallSelector {
+        alias: "sink_call",
+        caller: "run",
+        callee: "sink",
+        occurrence: 0,
+    },
+];
+
+pub fn with_balanced_source_call_positive<T>(
+    shape: &BalancedSourceCallShape,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let name = format!("{}_balanced_positive", shape.name);
+    let files = [InlineSourceFile {
+        path: shape.path,
+        source: shape.positive,
+    }];
+    let procedures = balanced_procedures(shape);
+    let sinks = [CallArgumentSink {
+        alias: "flowed",
+        call: "sink_call",
+        argument: 0,
+        outcome: ExpectedSinkOutcome::Reached,
+    }];
+    let carriers = vec![
+        CarrierMilestone::Value {
+            path: shape.path.into(),
+            procedure: "run".into(),
+            role: "temporary".into(),
+            ordinal: None,
+            snippet: shape.positive_source_call.into(),
+        },
+        CarrierMilestone::SinkArgument {
+            path: shape.path.into(),
+            caller: "run".into(),
+            callee: "sink".into(),
+            call: shape.positive_sink_call.into(),
+            ordinal: 0,
+        },
+    ];
+    let meetings = [ExpectedMeeting {
+        sink: "flowed",
+        meeting_count: shape.positive_meeting_count,
+        public_endpoint_count: shape.positive_public_endpoint_count,
+        may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count: shape.positive_public_may_complete_count,
+        public_may_partial_count: shape.positive_public_may_partial_count,
+        must_status: ValueFlowMustStatus::NotEstablished,
+        uncertain: false,
+        path_qualities: EXPECTED_PATH_QUALITIES,
+        witness: ExpectedWitness {
+            truncated: false,
+            may_status: ValueFlowMayStatus::Proven,
+            path_quality: PathQuality::PROVEN_COMPLETE,
+            carriers: &carriers,
+            interprocedural: &[],
+        },
+    }];
+    execute(&ValueFlowConformanceCase {
+        name: &name,
+        language: shape.language,
+        files: &files,
+        procedures: &procedures,
+        root: "run",
+        calls: BALANCED_CALLS,
+        unmodeled_call_behavior:
+            brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Optimistic,
+        source: ParameterSource::CallResult {
+            call: "source_call",
+        },
+        sinks: &sinks,
+        expected_discovery_status: shape.positive_discovery,
+        expected_discovery_complete: matches!(
+            shape.positive_discovery,
+            SemanticInputStatus::Complete
+        ),
+        expected_result_complete: shape.positive_result_complete,
+        expected_public_ambiguous: false,
+        expected_location_relations: &[],
+        expected_meetings: &meetings,
+    })
+}
+
+pub fn with_balanced_source_call_negative<T>(
+    shape: &BalancedSourceCallShape,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let name = format!("{}_balanced_negative", shape.name);
+    let files = [InlineSourceFile {
+        path: shape.path,
+        source: shape.negative,
+    }];
+    let procedures = balanced_procedures(shape);
+    let sinks = [CallArgumentSink {
+        alias: "clean",
+        call: "sink_call",
+        argument: 0,
+        outcome: shape.negative_outcome,
+    }];
+    execute(&ValueFlowConformanceCase {
+        name: &name,
+        language: shape.language,
+        files: &files,
+        procedures: &procedures,
+        root: "run",
+        calls: BALANCED_CALLS,
+        unmodeled_call_behavior:
+            brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Optimistic,
+        source: ParameterSource::CallResult {
+            call: "source_call",
+        },
+        sinks: &sinks,
+        expected_discovery_status: shape.negative_discovery,
+        expected_discovery_complete: matches!(
+            shape.negative_discovery,
+            SemanticInputStatus::Complete
+        ),
+        expected_result_complete: shape.negative_result_complete,
+        expected_public_ambiguous: false,
+        expected_location_relations: &[],
+        expected_meetings: &[],
+    })
+}
+
+pub fn python_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "python",
+        language: Language::Python,
+        path: "direct_flow.py",
+        positive: r#"
+def dfb_source():
+    return "tainted"
+
+
+def dfb_sink(value):
+    pass
+
+
+def run():
+    dfb_sink(dfb_source())
+"#,
+        negative: r#"
+def dfb_source():
+    return "tainted"
+
+
+def dfb_sink(value):
+    pass
+
+
+def run():
+    dfb_source()
+    dfb_sink("clean")
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn typescript_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "typescript",
+        language: Language::TypeScript,
+        path: "DirectFlow.ts",
+        positive: r#"
+function dfb_source(): string {
+  return "tainted";
+}
+
+function dfb_sink(value: string): void {}
+
+function run(): void {
+  dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+function dfb_source(): string {
+  return "tainted";
+}
+
+function dfb_sink(value: string): void {}
+
+function run(): void {
+  dfb_source();
+  dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+pub fn javascript_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "javascript",
+        language: Language::JavaScript,
+        path: "DirectFlow.js",
+        positive: r#"
+function dfb_source() {
+  return "tainted";
+}
+
+function dfb_sink(value) {}
+
+function run() {
+  dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+function dfb_source() {
+  return "tainted";
+}
+
+function dfb_sink(value) {}
+
+function run() {
+  dfb_source();
+  dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+pub fn java_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "java",
+        language: Language::Java,
+        path: "DirectFlow.java",
+        positive: r#"
+final class DirectFlow {
+    static String dfb_source() {
+        return "tainted";
+    }
+
+    static void dfb_sink(String value) {}
+
+    static void run() {
+        dfb_sink(dfb_source());
+    }
+}
+"#,
+        negative: r#"
+final class DirectFlow {
+    static String dfb_source() {
+        return "tainted";
+    }
+
+    static void dfb_sink(String value) {}
+
+    static void run() {
+        dfb_source();
+        dfb_sink("clean");
+    }
+}
+"#,
+        kind: ProcedureKind::Method,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn csharp_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "csharp",
+        language: Language::CSharp,
+        path: "DirectFlow.cs",
+        positive: r#"
+namespace DataFlowBench;
+
+static class DirectFlow
+{
+    static string dfb_source()
+    {
+        return "tainted";
+    }
+
+    static void dfb_sink(string value) { }
+
+    static void run()
+    {
+        dfb_sink(dfb_source());
+    }
+}
+"#,
+        negative: r#"
+namespace DataFlowBench;
+
+static class DirectFlow
+{
+    static string dfb_source()
+    {
+        return "tainted";
+    }
+
+    static void dfb_sink(string value) { }
+
+    static void run()
+    {
+        dfb_source();
+        dfb_sink("clean");
+    }
+}
+"#,
+        kind: ProcedureKind::Method,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn kotlin_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "kotlin",
+        language: Language::Kotlin,
+        path: "DirectFlow.kt",
+        positive: r#"
+package dataflowbench
+
+object DirectFlow {
+    fun dfb_source(): String {
+        return "tainted"
+    }
+
+    fun dfb_sink(value: String) {}
+
+    fun run() {
+        dfb_sink(dfb_source())
+    }
+}
+"#,
+        negative: r#"
+package dataflowbench
+
+object DirectFlow {
+    fun dfb_source(): String {
+        return "tainted"
+    }
+
+    fun dfb_sink(value: String) {}
+
+    fun run() {
+        dfb_source()
+        dfb_sink("clean")
+    }
+}
+"#,
+        kind: ProcedureKind::Method,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+pub fn scala_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "scala",
+        language: Language::Scala,
+        path: "DirectFlow.scala",
+        positive: r#"
+package dataflowbench
+
+object DirectFlow {
+  def dfb_source(): String = {
+    "tainted"
+  }
+
+  def dfb_sink(value: String): Unit = {}
+
+  def run(): Unit = {
+    dfb_sink(dfb_source())
+  }
+}
+"#,
+        negative: r#"
+package dataflowbench
+
+object DirectFlow {
+  def dfb_source(): String = {
+    "tainted"
+  }
+
+  def dfb_sink(value: String): Unit = {}
+
+  def run(): Unit = {
+    dfb_source()
+    dfb_sink("clean")
+  }
+}
+"#,
+        kind: ProcedureKind::Method,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+pub fn go_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "go",
+        language: Language::Go,
+        path: "direct_flow.go",
+        positive: r#"
+package dataflowbench
+
+func dfb_source() string {
+	return "tainted"
+}
+
+func dfb_sink(value string) {}
+
+func run() {
+	dfb_sink(dfb_source())
+}
+"#,
+        negative: r#"
+package dataflowbench
+
+func dfb_source() string {
+	return "tainted"
+}
+
+func dfb_sink(value string) {}
+
+func run() {
+	dfb_source()
+	dfb_sink("clean")
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn php_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "php",
+        language: Language::Php,
+        path: "direct_flow.php",
+        positive: r#"
+<?php
+function dfb_source(): string {
+    return "tainted";
+}
+
+function dfb_sink(string $value): void {}
+
+function run(): void {
+    dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+<?php
+function dfb_source(): string {
+    return "tainted";
+}
+
+function dfb_sink(string $value): void {}
+
+function run(): void {
+    dfb_source();
+    dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn ruby_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "ruby",
+        language: Language::Ruby,
+        path: "direct_flow.rb",
+        positive: r#"
+def dfb_source
+  "tainted"
+end
+
+def dfb_sink(value)
+end
+
+def run
+  dfb_sink(dfb_source())
+end
+"#,
+        negative: r#"
+def dfb_source
+  "tainted"
+end
+
+def dfb_sink(value)
+end
+
+def run
+  dfb_source
+  dfb_sink("clean")
+end
+"#,
+        kind: ProcedureKind::Method,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+pub fn rust_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "rust",
+        language: Language::Rust,
+        path: "direct_flow.rs",
+        positive: r#"
+fn dfb_source() -> &'static str {
+    "tainted"
+}
+
+fn dfb_sink(value: &str) {}
+
+fn run() {
+    dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+fn dfb_source() -> &'static str {
+    "tainted"
+}
+
+fn dfb_sink(value: &str) {}
+
+fn run() {
+    dfb_source();
+    dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn c_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "c",
+        language: Language::Cpp,
+        path: "direct_flow.c",
+        positive: r#"
+const char *dfb_source(void) {
+    return "tainted";
+}
+
+void dfb_sink(const char *value) {}
+
+void run(void) {
+    dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+const char *dfb_source(void) {
+    return "tainted";
+}
+
+void dfb_sink(const char *value) {}
+
+void run(void) {
+    dfb_source();
+    dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn cpp_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "cpp",
+        language: Language::Cpp,
+        path: "direct_flow.cpp",
+        positive: r#"
+const char *dfb_source() {
+    return "tainted";
+}
+
+void dfb_sink(const char *value) {}
+
+void run() {
+    dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+const char *dfb_source() {
+    return "tainted";
+}
+
+void dfb_sink(const char *value) {}
+
+void run() {
+    dfb_source();
+    dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+/// Every documented direct-ready language/dialect entry with its balanced
+/// shape constructor and per-route test names. New consumers stamp one test
+/// per entry so a missing language is a compile error, not a silent gap.
+macro_rules! balanced_source_call_scenario_entries {
+    ($consumer:ident) => {
+        $consumer! {
+            (python, python_balanced_source_call_shape, python_balanced_source_call_positive_direct, python_balanced_source_call_negative_direct, python_balanced_source_call_positive_public, python_balanced_source_call_negative_public),
+            (typescript, typescript_balanced_source_call_shape, typescript_balanced_source_call_positive_direct, typescript_balanced_source_call_negative_direct, typescript_balanced_source_call_positive_public, typescript_balanced_source_call_negative_public),
+            (javascript, javascript_balanced_source_call_shape, javascript_balanced_source_call_positive_direct, javascript_balanced_source_call_negative_direct, javascript_balanced_source_call_positive_public, javascript_balanced_source_call_negative_public),
+            (java, java_balanced_source_call_shape, java_balanced_source_call_positive_direct, java_balanced_source_call_negative_direct, java_balanced_source_call_positive_public, java_balanced_source_call_negative_public),
+            (csharp, csharp_balanced_source_call_shape, csharp_balanced_source_call_positive_direct, csharp_balanced_source_call_negative_direct, csharp_balanced_source_call_positive_public, csharp_balanced_source_call_negative_public),
+            (kotlin, kotlin_balanced_source_call_shape, kotlin_balanced_source_call_positive_direct, kotlin_balanced_source_call_negative_direct, kotlin_balanced_source_call_positive_public, kotlin_balanced_source_call_negative_public),
+            (scala, scala_balanced_source_call_shape, scala_balanced_source_call_positive_direct, scala_balanced_source_call_negative_direct, scala_balanced_source_call_positive_public, scala_balanced_source_call_negative_public),
+            (go, go_balanced_source_call_shape, go_balanced_source_call_positive_direct, go_balanced_source_call_negative_direct, go_balanced_source_call_positive_public, go_balanced_source_call_negative_public),
+            (php, php_balanced_source_call_shape, php_balanced_source_call_positive_direct, php_balanced_source_call_negative_direct, php_balanced_source_call_positive_public, php_balanced_source_call_negative_public),
+            (ruby, ruby_balanced_source_call_shape, ruby_balanced_source_call_positive_direct, ruby_balanced_source_call_negative_direct, ruby_balanced_source_call_positive_public, ruby_balanced_source_call_negative_public),
+            (rust, rust_balanced_source_call_shape, rust_balanced_source_call_positive_direct, rust_balanced_source_call_negative_direct, rust_balanced_source_call_positive_public, rust_balanced_source_call_negative_public),
+            (c, c_balanced_source_call_shape, c_balanced_source_call_positive_direct, c_balanced_source_call_negative_direct, c_balanced_source_call_positive_public, c_balanced_source_call_negative_public),
+            (cpp, cpp_balanced_source_call_shape, cpp_balanced_source_call_positive_direct, cpp_balanced_source_call_negative_direct, cpp_balanced_source_call_positive_public, cpp_balanced_source_call_negative_public),
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use balanced_source_call_scenario_entries;
+
+/// The balanced inventory covers every direct-ready language exactly once,
+/// with the C and C++ dialects as separate entries, and each shape keeps the
+/// balanced contract: one reached positive sink and one balanced negative
+/// whose expectation is either clean or typed-incomplete, never optimistic.
+pub fn assert_balanced_source_call_scenario_inventory() {
+    macro_rules! collect_shapes {
+        ($(($name:ident, $shape:ident, $($test:ident),*),)*) => {
+            vec![$($shape(),)*]
+        };
+    }
+    let shapes: Vec<BalancedSourceCallShape> =
+        balanced_source_call_scenario_entries!(collect_shapes);
+    assert_eq!(shapes.len(), 13);
+    let mut languages = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for shape in &shapes {
+        assert!(
+            names.insert(shape.name),
+            "duplicate balanced scenario {}",
+            shape.name
+        );
+        languages.insert(shape.language);
+        assert!(
+            matches!(
+                shape.negative_outcome,
+                ExpectedSinkOutcome::NotReached | ExpectedSinkOutcome::Inconclusive
+            ),
+            "{} negative must stay clean or typed-incomplete",
+            shape.name
+        );
+        assert_eq!(
+            shape.negative_result_complete,
+            shape.negative_outcome == ExpectedSinkOutcome::NotReached,
+            "{} negative completeness must match its outcome honesty",
+            shape.name
+        );
+    }
+    assert_eq!(
+        languages,
+        DIRECT_VALUE_FLOW_READY_LANGUAGES.into_iter().collect()
+    );
+    assert!(names.contains("c") && names.contains("cpp"));
 }

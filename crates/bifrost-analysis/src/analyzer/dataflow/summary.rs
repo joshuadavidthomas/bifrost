@@ -1523,11 +1523,16 @@ where
                     // The observation's row stays at the call point, so its
                     // witness evidence must also terminate there: record the
                     // crossing as a call-point step carrying the transfer's
-                    // own proof and completeness.
+                    // own proof and completeness. The step is not an entry
+                    // into the callee - the fact never leaves the calling
+                    // context - so it must not carry `IcfgEdgeKind::Call`,
+                    // which every consumer reads as a call needing a matched
+                    // return (#1954). It uses the same continuation kind a
+                    // native callee's boundary observation carries.
                     let observation_edge = ProcedureIcfgEdge {
                         source: point.clone(),
                         target: point.clone(),
-                        kind: IcfgEdgeKind::Call,
+                        kind: IcfgEdgeKind::CallToNormalContinuation,
                         origin: Some(origin.clone()),
                         proof: transfer.proof.clone(),
                         completeness: transfer.completeness.clone(),

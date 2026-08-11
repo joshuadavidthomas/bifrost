@@ -28,16 +28,24 @@ use crate::value_flow_conformance::{
 };
 use crate::value_flow_scenarios::{
     DirectReadyValueFlowScenario, assert_direct_ready_value_flow_scenario_inventory,
-    direct_ready_value_flow_scenario_entries, with_java_ambiguous_call_negative,
-    with_java_branch_merge, with_java_capture_flow, with_java_cleanup_flow, with_java_early_return,
-    with_java_exact_helper, with_java_exceptional_flow, with_java_field_access_flow,
-    with_java_field_alias_flow, with_java_index_access_flow, with_java_loop_exit,
-    with_java_over_bound_field_flow, with_java_receiver_flow, with_java_split_exact_helper,
-    with_java_two_matched_calls, with_java_unresolved_call_negative,
-    with_typescript_ambiguous_call_negative, with_typescript_branch_merge,
-    with_typescript_capture_flow, with_typescript_cleanup_flow, with_typescript_early_return,
-    with_typescript_exceptional_flow, with_typescript_field_access_flow,
-    with_typescript_field_alias_flow, with_typescript_index_access_flow, with_typescript_loop_exit,
+    balanced_source_call_scenario_entries, c_balanced_source_call_shape,
+    cpp_balanced_source_call_shape, csharp_balanced_source_call_shape,
+    direct_ready_value_flow_scenario_entries, go_balanced_source_call_shape,
+    java_balanced_source_call_shape, javascript_balanced_source_call_shape,
+    kotlin_balanced_source_call_shape, php_balanced_source_call_shape,
+    python_balanced_source_call_shape, ruby_balanced_source_call_shape,
+    rust_balanced_source_call_shape, scala_balanced_source_call_shape,
+    typescript_balanced_source_call_shape, with_balanced_source_call_negative,
+    with_balanced_source_call_positive, with_java_ambiguous_call_negative, with_java_branch_merge,
+    with_java_capture_flow, with_java_cleanup_flow, with_java_early_return, with_java_exact_helper,
+    with_java_exceptional_flow, with_java_field_access_flow, with_java_field_alias_flow,
+    with_java_index_access_flow, with_java_loop_exit, with_java_over_bound_field_flow,
+    with_java_receiver_flow, with_java_split_exact_helper, with_java_two_matched_calls,
+    with_java_unresolved_call_negative, with_typescript_ambiguous_call_negative,
+    with_typescript_branch_merge, with_typescript_capture_flow, with_typescript_cleanup_flow,
+    with_typescript_early_return, with_typescript_exceptional_flow,
+    with_typescript_field_access_flow, with_typescript_field_alias_flow,
+    with_typescript_index_access_flow, with_typescript_loop_exit,
     with_typescript_over_bound_field_flow, with_typescript_receiver_flow,
     with_typescript_two_matched_calls, with_typescript_unresolved_call_negative,
 };
@@ -1667,6 +1675,35 @@ direct_ready_value_flow_scenario_entries!(define_public_direct_ready_value_flow_
 fn direct_ready_value_flow_scenario_inventory_is_complete() {
     assert_direct_ready_value_flow_scenario_inventory();
 }
+
+macro_rules! define_public_balanced_source_call_tests {
+    ($(($name:ident, $shape:ident, $direct_positive:ident, $direct_negative:ident, $public_positive:ident, $public_negative:ident),)*) => {
+        $(
+            #[test]
+            fn $public_positive() {
+                with_balanced_source_call_positive(&$shape(), |case| {
+                    let seed_kind = match case.language {
+                        Language::Ruby => "function",
+                        _ => shared_scenario_seed_kind(case),
+                    };
+                    assert_shared_helper_scenario_with_seed_kind(case, seed_kind);
+                });
+            }
+
+            #[test]
+            fn $public_negative() {
+                with_balanced_source_call_negative(&$shape(), |case| {
+                    let seed_kind = match case.language {
+                        Language::Ruby => "function",
+                        _ => shared_scenario_seed_kind(case),
+                    };
+                    assert_shared_helper_scenario_with_seed_kind(case, seed_kind);
+                });
+            }
+        )*
+    };
+}
+balanced_source_call_scenario_entries!(define_public_balanced_source_call_tests);
 
 #[test]
 fn java_branch_merge_runs_through_direct_and_public_queries() {
