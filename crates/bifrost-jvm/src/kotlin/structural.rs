@@ -1,6 +1,6 @@
 //! Kotlin structural spec for `query_code` (issue #1240).
 //!
-//! This maps the vendored fwcd tree-sitter-kotlin node types onto Bifrost's
+//! This maps the `brokk-tree-sitter-kotlin` node types onto Bifrost's
 //! normalized structural vocabulary and extracts role edges from the tree.
 //!
 //! The grammar is field-poor — of everything this adapter reads, only

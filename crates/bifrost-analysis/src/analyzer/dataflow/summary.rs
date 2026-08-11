@@ -1473,6 +1473,53 @@ where
                         return Ok(Some(termination));
                     }
                 };
+                // An observation fact emitted while crossing the call edge
+                // records a monitored event on the caller's path. Publishing
+                // it as a callee entry would sever it from the concrete path
+                // that produced it (#1917), so it lands in the calling
+                // context at the call point instead.
+                let (observations, outputs): (Vec<Fact>, Vec<Fact>) = outputs
+                    .into_iter()
+                    .partition(|output| problem.is_flow_observation(output));
+                if !observations.is_empty() {
+                    // The observation's row stays at the call point, so its
+                    // witness evidence must also terminate there: record the
+                    // crossing as a call-point step carrying the transfer's
+                    // own proof and completeness.
+                    let observation_edge = ProcedureIcfgEdge {
+                        source: point.clone(),
+                        target: point.clone(),
+                        kind: IcfgEdgeKind::Call,
+                        origin: Some(origin.clone()),
+                        proof: transfer.proof.clone(),
+                        completeness: transfer.completeness.clone(),
+                        boundary: None,
+                    };
+                    let witness_source = if self.witness_arena.is_enabled() {
+                        Some(PathWitnessSource::Edge {
+                            predecessor: queued.evidence.ok_or(
+                                SummaryDataflowError::WitnessInvariant(
+                                    "enabled call observation has no caller evidence",
+                                ),
+                            )?,
+                            predecessor_quality: queued.quality,
+                            edge: &observation_edge,
+                            input_fact: queued.key.fact,
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(termination) = self.publish_path_outputs(
+                        queued.key.entry,
+                        queued.key.point,
+                        incoming_quality,
+                        &observations,
+                        witness_source,
+                        request,
+                    )? {
+                        return Ok(Some(termination));
+                    }
+                }
                 if let Some(termination) = self.publish_call_outputs(
                     queued.key,
                     queued.quality,

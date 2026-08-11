@@ -1,6 +1,6 @@
 //! Kotlin declaration extraction (issue #1236).
 //!
-//! Walks the pinned Kotlin tree-sitter grammar (`vendor/tree-sitter-kotlin`)
+//! Walks the pinned `brokk-tree-sitter-kotlin` grammar
 //! and produces the language-neutral [`ParsedFile`] model: packages, types,
 //! callables, fields, ranges, ownership, and signatures.
 //!

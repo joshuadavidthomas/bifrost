@@ -2,13 +2,13 @@
 //!
 //! Answers "the token at this location refers to which declaration?" for
 //! Kotlin source. Every fact comes from the pinned Kotlin tree-sitter syntax
-//! tree (`crates/bifrost-analysis/vendor/tree-sitter-kotlin`) or from the
+//! tree from `brokk-tree-sitter-kotlin` or from the
 //! analyzer's indexed declarations; nothing is recovered by scanning source
 //! text.
 //!
 //! # What the grammar gives us
 //!
-//! The vendored Kotlin grammar is field-poor: only `function_declaration` and
+//! The Kotlin grammar is field-poor: only `function_declaration` and
 //! `property_declaration` carry a `receiver` field, so "the callee of this
 //! call" and "the member of this navigation" are read positionally from named
 //! children rather than by field name. The shapes this module matches:

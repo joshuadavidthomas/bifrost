@@ -1117,6 +1117,13 @@ impl IdeDataflowProblem for TaintFlowProblem<'_> {
         self.plan.identity().clone()
     }
 
+    fn is_flow_observation(&self, fact: &Self::Fact) -> bool {
+        // A sink-meeting fact records that tainted data reached a bound sink
+        // on the current path. It is a terminal observation of the calling
+        // context, never a value entering a callee (#1917).
+        fact.sink().is_some()
+    }
+
     fn meet_values(&self, left: &Self::Value, right: &Self::Value) -> Self::Value {
         left.union(right)
     }

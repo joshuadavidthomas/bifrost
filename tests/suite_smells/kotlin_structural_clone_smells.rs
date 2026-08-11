@@ -4,7 +4,7 @@
 //! expression-body functions, trailing-lambda call styles, and
 //! companion-object members. Mirrors `ruby_structural_clone_smells.rs`.
 //!
-//! All fixtures keep statements on their own lines: the vendored Kotlin
+//! All fixtures keep statements on their own lines: the Kotlin
 //! grammar emits MISSING `_automatic_semicolon` nodes on single-line bodies.
 
 use brokk_bifrost::{CloneSmell, CloneSmellWeights, IAnalyzer, KotlinAnalyzer, Language};
