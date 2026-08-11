@@ -180,6 +180,12 @@ pub trait IdeDataflowProblem {
         right: &Self::EdgeFunction,
     ) -> Self::EdgeFunction;
 
+    /// Whether `fact` records a monitored observation on the current path.
+    /// See [`DistributiveDataflowProblem::is_flow_observation`].
+    fn is_flow_observation(&self, _fact: &Self::Fact) -> bool {
+        false
+    }
+
     fn normal_flow(
         &self,
         edge: DataflowEdge<'_, Self::Fact>,
@@ -712,6 +718,10 @@ where
 
     fn zero_fact(&self) -> Self::Fact {
         self.problem.zero_fact()
+    }
+
+    fn is_flow_observation(&self, fact: &Self::Fact) -> bool {
+        self.problem.is_flow_observation(fact)
     }
 
     fn normal_flow(
@@ -1544,6 +1554,7 @@ where
         trace,
         reusable_summaries,
         &mut functions,
+        &|fact| problem.is_flow_observation(fact),
         request,
     )?;
     let relation_count = raw_graph
@@ -1805,6 +1816,7 @@ fn build_raw_graph<Fact, EdgeFunction>(
     trace: &IdeTrace<Fact, EdgeFunction>,
     reusable_summaries: &[CapturedReusableIdeSummary<Fact, EdgeFunction>],
     functions: &mut FunctionArena<EdgeFunction>,
+    is_flow_observation: &dyn Fn(&Fact) -> bool,
     request: &mut DataflowRequest<'_>,
 ) -> Result<RawIdeGraph, IdeRunFailure>
 where
@@ -1933,6 +1945,37 @@ where
                                 "captured call output fact was not interned",
                             ),
                         )?;
+                        if is_flow_observation(&output.fact) {
+                            // The summary solver keeps a call-edge observation
+                            // in the calling context at the call point
+                            // (#1917), so its value relation is a direct one.
+                            let target = by_state
+                                .get(&(
+                                    caller_entry.clone(),
+                                    record.key.edge.source.clone(),
+                                    output.fact,
+                                ))
+                                .copied()
+                                .ok_or(IdeDataflowError::Invariant(
+                                    "captured call observation has no caller row",
+                                ))?;
+                            let relation = RawDirectRelation {
+                                source,
+                                target,
+                                function: call_function,
+                            };
+                            if !direct.contains(&relation) {
+                                ensure_relation_capacity(
+                                    direct
+                                        .len()
+                                        .saturating_add(summaries.len())
+                                        .saturating_add(entry_values.len()),
+                                    request,
+                                )?;
+                                direct.insert(relation);
+                            }
+                            continue;
+                        }
                         let callee_entry = SummaryEntry::new(
                             transfer.callee.clone(),
                             transfer.callee_entry.clone(),

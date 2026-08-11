@@ -66,7 +66,7 @@ impl PathQuality {
         self.through_evidence(&edge.proof, &edge.completeness)
     }
 
-    const fn dominates(self, other: Self) -> bool {
+    pub(crate) const fn dominates(self, other: Self) -> bool {
         (!other.proven || self.proven) && (!other.complete || self.complete)
     }
 
@@ -128,6 +128,17 @@ impl PathQualityFrontier {
         }
         self.bits |= quality_bit(candidate);
         self.bits != before
+    }
+
+    /// The strongest retained quality that component-wise dominates `quality`,
+    /// if any.
+    ///
+    /// A caller may hold a quality conjoined with an entry-context prefix,
+    /// which can only degrade this frontier's local qualities. A retained
+    /// dominating quality's concrete path therefore witnesses the weaker
+    /// conjoined claim.
+    pub(crate) fn dominating_quality(self, quality: PathQuality) -> Option<PathQuality> {
+        self.iter().find(|retained| retained.dominates(quality))
     }
 
     pub fn iter(self) -> impl Iterator<Item = PathQuality> {

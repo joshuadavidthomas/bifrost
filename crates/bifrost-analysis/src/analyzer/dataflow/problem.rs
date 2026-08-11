@@ -204,6 +204,17 @@ pub trait DistributiveDataflowProblem {
     /// facts from it. They do not need to return the zero fact themselves.
     fn zero_fact(&self) -> Self::Fact;
 
+    /// Whether `fact` records a monitored observation on the current path
+    /// rather than a value that flows onward.
+    ///
+    /// An observation fact emitted while crossing a call edge belongs to the
+    /// caller's path: the summary solver publishes it in the calling context
+    /// instead of seeding a callee entry with it, so the concrete path that
+    /// produced the observation stays reconstructable (#1917).
+    fn is_flow_observation(&self, _fact: &Self::Fact) -> bool {
+        false
+    }
+
     /// Transfer over an ordinary intraprocedural edge.
     ///
     /// This includes branch, loop, cleanup, and async-normal edges. Cleanup
