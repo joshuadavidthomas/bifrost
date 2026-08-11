@@ -148,7 +148,7 @@ fn conditional_macro_redefinitions_keep_the_indexed_target_unproven() {
             hits_by_overload,
             unproven_by_overload,
             ..
-        } = UsageFinder::new().find_usages_default(&analyzer, &[target.clone()])
+        } = UsageFinder::new().find_usages_default(&analyzer, std::slice::from_ref(&target))
         else {
             panic!("macro query must complete");
         };
