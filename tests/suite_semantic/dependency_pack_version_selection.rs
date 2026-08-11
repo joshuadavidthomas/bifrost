@@ -74,6 +74,63 @@ fn compiled_jdk_pack() -> CompiledSemanticModelPack {
     .unwrap_or_else(|diagnostics| panic!("fixture compilation failed: {diagnostics:#?}"))
 }
 
+/// The same pack as `JDK_21_PACK`, except it sets `safety.review_required =
+/// true`, the value every shipped pack declares. This fixture proves the
+/// document's `enable` list (#1937) is what lets such a pack reach `Active`
+/// through the shared document flow.
+const JDK_21_REVIEW_REQUIRED_PACK: &str = r#"{
+  "schema_version": 1,
+  "pack_id": "fixture.jdk-gated",
+  "version": "21.0.2",
+  "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "jdk", "requirement": "=21.0.2" }]
+  },
+  "provenance": { "source": "checked-in test source", "revision": "fixture-v1" },
+  "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": true },
+  "shards": [{
+    "id": "jdk.core",
+    "activation": [{
+      "toolchain": { "name": "jdk", "version": "=21.0.2" },
+      "targets": ["jvm"]
+    }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "jdk.java-util-arraylist",
+        "name": "java.util.ArrayList",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/ArrayList.java",
+          "symbol": "java.util.ArrayList"
+        }
+      }],
+      "members": [],
+      "relations": []
+    }
+  }]
+}"#;
+
+fn compiled_jdk_gated_pack() -> CompiledSemanticModelPack {
+    compile_source(
+        SourceFormat::Json,
+        JDK_21_REVIEW_REQUIRED_PACK.as_bytes(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("fixture compilation failed: {diagnostics:#?}"))
+}
+
 fn catalog_with_jdk_pack() -> SemanticPackCatalog {
     let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
     catalog
@@ -316,5 +373,118 @@ fn document_driven_jvm_activation_is_version_exact() {
             .records
             .is_empty(),
         "the activated pack must index its external declaration"
+    );
+}
+
+/// #1937: `.bifrost/packs.json` must be able to activate a
+/// `review_required` pack, not only leave it selected. The document's
+/// `enable` list is the control that does this, mirroring the in-process
+/// `Enable` control in `owasp_benchmark.rs`. Without an `enable` entry, an
+/// exact toolchain match still leaves the pack `ReviewRequired`, not
+/// `Active`.
+#[test]
+fn document_driven_activation_needs_an_enable_entry_for_review_required_packs() {
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("src/Main.java", "final class Main {}")
+        .build();
+    fs::create_dir_all(project.root().join(".bifrost")).unwrap();
+    let catalog_relative = ".bifrost/packs-catalog";
+    {
+        let catalog = SemanticPackCatalog::open(
+            &project.root().join(catalog_relative),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )
+        .unwrap();
+        catalog
+            .install(
+                &compiled_jdk_gated_pack(),
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::PreShipped,
+                    source_id: "test:fixture.jdk-gated@21.0.2".to_owned(),
+                },
+            )
+            .unwrap();
+    }
+    let homes = tempfile::tempdir().unwrap();
+    let analyzer_config = hermetic_jvm_config(write_jdk_home(homes.path(), "21.0.2"));
+
+    // Negative control: no `enable` entry. The toolchain evidence matches
+    // exactly, but `review_required` still gates the pack out of the active
+    // set.
+    fs::write(
+        project.root().join(WORKSPACE_PACKS_DOCUMENT_PATH),
+        format!(
+            r#"{{ "schema_version": 1, "catalog": "{catalog_relative}", "ecosystems": ["jvm"] }}"#
+        ),
+    )
+    .unwrap();
+    let config_without_enable = load_workspace_packs_config_at(project.root())
+        .unwrap()
+        .expect("packs document present");
+    assert!(config_without_enable.enable().is_empty());
+    let workspace = project.workspace_analyzer(analyzer_config.clone());
+    let activation = activate_workspace_packs(
+        &workspace,
+        &analyzer_config,
+        project.root(),
+        &config_without_enable,
+        &CancellationToken::default(),
+    )
+    .unwrap()
+    .expect("the jvm ecosystem serves this workspace");
+    let Some(SemanticModelRuntimeOutcome::Ready { active, .. }) = &activation.outcome.runtime
+    else {
+        panic!(
+            "expected a ready runtime outcome: {:#?}",
+            activation.outcome
+        );
+    };
+    let explanation = active
+        .activation_report()
+        .explanations
+        .iter()
+        .find(|entry| entry.pack_id.as_deref() == Some("fixture.jdk-gated"))
+        .expect("the gated pack must be explained");
+    assert_eq!(
+        explanation.status,
+        SemanticModelActivationStatus::ReviewRequired,
+        "{explanation:#?}"
+    );
+
+    // Positive: the document names the pack in `enable`, so the pack
+    // reaches `Active` and the overlay indexes its declaration.
+    fs::write(
+        project.root().join(WORKSPACE_PACKS_DOCUMENT_PATH),
+        format!(
+            r#"{{ "schema_version": 1, "catalog": "{catalog_relative}", "ecosystems": ["jvm"], "enable": ["fixture.jdk-gated"] }}"#
+        ),
+    )
+    .unwrap();
+    let config_with_enable = load_workspace_packs_config_at(project.root())
+        .unwrap()
+        .expect("packs document present");
+    assert_eq!(config_with_enable.enable(), ["fixture.jdk-gated"]);
+    let workspace = project.workspace_analyzer(analyzer_config.clone());
+    let activation = activate_workspace_packs(
+        &workspace,
+        &analyzer_config,
+        project.root(),
+        &config_with_enable,
+        &CancellationToken::default(),
+    )
+    .unwrap()
+    .expect("the jvm ecosystem serves this workspace");
+    assert!(activation.outcome.complete(), "{:#?}", activation.outcome);
+    let overlay = workspace
+        .analyzer()
+        .semantic_model_overlay()
+        .expect("an enabled review-required pack publishes the overlay");
+    assert!(
+        !overlay
+            .symbols_named("java.util.ArrayList")
+            .records
+            .is_empty(),
+        "the enabled pack must index its external declaration"
     );
 }

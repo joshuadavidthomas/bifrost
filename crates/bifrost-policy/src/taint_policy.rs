@@ -404,6 +404,49 @@ struct DiscoveredValueFlow {
     external_targets: Vec<ExactExternalProcedureTarget>,
 }
 
+/// Compile-scoped materialization cache for require-model taint discovery
+/// (#1936).
+///
+/// `discover_value_flow` runs once per root, and the root set includes every
+/// procedure of every materialized artifact. A callee subgraph that many roots
+/// share was therefore materialized -- and charged against the one shared
+/// `SemanticBudget` -- once per root. Total charged work grew with the sum of
+/// per-root closure sizes and could pass the semantic ceiling, so the compile
+/// abstained.
+///
+/// This cache lives for the whole compile. It sits in front of the three
+/// oracle calls. On a hit, `discover_value_flow` reuses the byte-identical
+/// result that a fresh call gives and skips the oracle call, so it also skips
+/// that call's budget charge. Each distinct procedure, dispatch, and binding is
+/// therefore materialized and charged one time for each compile.
+///
+/// The cache does not change any plan. Region membership stays a pure per-root
+/// forward closure, and each region plan is a pure function of its root,
+/// snapshots, bindings, and region-filtered specs. A hit returns the same
+/// `(value, status)` that the skipped call produced, so the region result is
+/// identical.
+#[derive(Default)]
+struct DiscoveryMaterializationCache {
+    procedures: HashMap<
+        ProcedureHandle,
+        ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::ValueFlowSnapshot>,
+    >,
+    dispatch: HashMap<
+        brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+        (
+            Option<brokk_bifrost_analysis::analyzer::semantic::DispatchResult>,
+            SemanticInputStatus,
+        ),
+    >,
+    bindings: HashMap<
+        (
+            brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+            ProcedureHandle,
+        ),
+        ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::CallBindings>,
+    >,
+}
+
 struct SelectedSummaryFamily {
     language: String,
     payload: Vec<CompiledProcedureSummary>,
@@ -559,8 +602,12 @@ impl<'a> TaintPolicyCompiler<'a> {
         roots.sort_by(|left, right| left.semantics().locator().cmp(right.semantics().locator()));
         roots.dedup();
         let mut discoveries = Vec::with_capacity(roots.len());
+        // One cache serves every root in this compile. It charges each shared
+        // procedure, dispatch, and binding one time, not one time for each root
+        // that reaches it (#1936).
+        let mut materialization = DiscoveryMaterializationCache::default();
         for root in roots {
-            discoveries.push(self.discover_value_flow(&root)?);
+            discoveries.push(self.discover_value_flow(&root, &mut materialization)?);
         }
         // Keep only regions that contain both a selected source and a selected
         // sink: those are the regions where a flow can exist, and each becomes
@@ -799,6 +846,7 @@ impl<'a> TaintPolicyCompiler<'a> {
     fn discover_value_flow(
         &mut self,
         root: &ProcedureHandle,
+        cache: &mut DiscoveryMaterializationCache,
     ) -> Result<DiscoveredValueFlow, TaintPolicyCompileError> {
         let oracle = self.selectors.workspace().semantic_oracle_provider();
         let context = OracleCallContext::empty();
@@ -813,40 +861,64 @@ impl<'a> TaintPolicyCompiler<'a> {
             if !seen.insert(procedure.clone()) {
                 continue;
             }
-            let outcome = {
-                let mut request = self.selectors.semantic_request();
-                oracle
-                    .procedure_relations(&procedure, &context, &mut request)
-                    .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+            // Reuse the cached snapshot when a prior root already materialized
+            // this procedure. The cache holds only present snapshots: the miss
+            // path returns a `SemanticUnavailable` error before it inserts, so a
+            // hit always carries a valid snapshot.
+            let snapshot_input = if let Some(cached) = cache.procedures.get(&procedure) {
+                cached.clone()
+            } else {
+                let outcome = {
+                    let mut request = self.selectors.semantic_request();
+                    oracle
+                        .procedure_relations(&procedure, &context, &mut request)
+                        .map_err(|error| {
+                            TaintPolicyCompileError::SemanticProvider(error.to_string())
+                        })?
+                };
+                require_uninterrupted_outcome(&outcome, "taint value-flow discovery")?;
+                self.selectors
+                    .require_execution_budget("taint value-flow discovery")
+                    .map_err(taint_selector_error)?;
+                let status = SemanticInputStatus::from_outcome(&outcome);
+                let snapshot = outcome.available_value().cloned().ok_or_else(|| {
+                    TaintPolicyCompileError::SemanticUnavailable(
+                        "taint value-flow discovery returned no procedure snapshot".to_owned(),
+                    )
+                })?;
+                let input = ValueFlowInput::new(snapshot, status);
+                cache.procedures.insert(procedure.clone(), input.clone());
+                input
             };
-            require_uninterrupted_outcome(&outcome, "taint value-flow discovery")?;
-            self.selectors
-                .require_execution_budget("taint value-flow discovery")
-                .map_err(taint_selector_error)?;
-            let status = SemanticInputStatus::from_outcome(&outcome);
-            let snapshot = outcome.available_value().cloned().ok_or_else(|| {
-                TaintPolicyCompileError::SemanticUnavailable(
-                    "taint value-flow discovery returned no procedure snapshot".to_owned(),
-                )
-            })?;
-            snapshots.push(ValueFlowInput::new(snapshot, status));
+            snapshots.push(snapshot_input);
 
             for call_row in procedure.semantics().call_sites() {
                 let call = procedure
                     .call_site_handle(call_row.id)
                     .expect("a live procedure owns each retained call site");
-                let dispatch = {
-                    let mut request = self.selectors.semantic_request();
-                    oracle.resolve_call(&call, &mut request).map_err(|error| {
-                        TaintPolicyCompileError::SemanticProvider(error.to_string())
-                    })?
-                };
-                require_uninterrupted_outcome(&dispatch, "taint call dispatch")?;
-                self.selectors
-                    .require_execution_budget("taint call dispatch")
-                    .map_err(taint_selector_error)?;
-                let dispatch_status = SemanticInputStatus::from_outcome(&dispatch);
-                let Some(dispatch) = dispatch.available_value() else {
+                // Reuse the cached dispatch when a prior root already resolved
+                // this call site. The per-discovery boundary and candidate walk
+                // below still runs, because it feeds this root's own region.
+                let (dispatch_value, dispatch_status) =
+                    if let Some(cached) = cache.dispatch.get(&call) {
+                        cached.clone()
+                    } else {
+                        let dispatch = {
+                            let mut request = self.selectors.semantic_request();
+                            oracle.resolve_call(&call, &mut request).map_err(|error| {
+                                TaintPolicyCompileError::SemanticProvider(error.to_string())
+                            })?
+                        };
+                        require_uninterrupted_outcome(&dispatch, "taint call dispatch")?;
+                        self.selectors
+                            .require_execution_budget("taint call dispatch")
+                            .map_err(taint_selector_error)?;
+                        let dispatch_status = SemanticInputStatus::from_outcome(&dispatch);
+                        let entry = (dispatch.available_value().cloned(), dispatch_status);
+                        cache.dispatch.insert(call.clone(), entry.clone());
+                        entry
+                    };
+                let Some(dispatch) = dispatch_value else {
                     continue;
                 };
                 for boundary in dispatch.boundaries() {
@@ -858,24 +930,38 @@ impl<'a> TaintPolicyCompiler<'a> {
                 }
                 for candidate in dispatch.candidates() {
                     let binding_key = (call.clone(), candidate.target().clone());
-                    if !seen_bindings.insert(binding_key) {
+                    if !seen_bindings.insert(binding_key.clone()) {
                         continue;
                     }
-                    let outcome = {
-                        let mut request = self.selectors.semantic_request();
-                        oracle
-                            .call_bindings(&call, candidate, &context, &mut request)
-                            .map_err(|error| {
-                                TaintPolicyCompileError::SemanticProvider(error.to_string())
-                            })?
+                    // Reuse the cached binding when a prior root already bound
+                    // this (call, target) pair. The cache holds only present
+                    // bindings, so a hit reproduces both the pushed binding and
+                    // the pushed callee.
+                    let binding_input = if let Some(cached) = cache.bindings.get(&binding_key) {
+                        Some(cached.clone())
+                    } else {
+                        let outcome = {
+                            let mut request = self.selectors.semantic_request();
+                            oracle
+                                .call_bindings(&call, candidate, &context, &mut request)
+                                .map_err(|error| {
+                                    TaintPolicyCompileError::SemanticProvider(error.to_string())
+                                })?
+                        };
+                        require_uninterrupted_outcome(&outcome, "taint call binding")?;
+                        self.selectors
+                            .require_execution_budget("taint call binding")
+                            .map_err(taint_selector_error)?;
+                        let status =
+                            dispatch_status.merge(SemanticInputStatus::from_outcome(&outcome));
+                        outcome.available_value().cloned().map(|binding| {
+                            let input = ValueFlowInput::new(binding, status);
+                            cache.bindings.insert(binding_key.clone(), input.clone());
+                            input
+                        })
                     };
-                    require_uninterrupted_outcome(&outcome, "taint call binding")?;
-                    self.selectors
-                        .require_execution_budget("taint call binding")
-                        .map_err(taint_selector_error)?;
-                    let status = dispatch_status.merge(SemanticInputStatus::from_outcome(&outcome));
-                    if let Some(binding) = outcome.available_value().cloned() {
-                        bindings.push(ValueFlowInput::new(binding, status));
+                    if let Some(binding_input) = binding_input {
+                        bindings.push(binding_input);
                         pending.push(candidate.target().clone());
                     }
                 }
