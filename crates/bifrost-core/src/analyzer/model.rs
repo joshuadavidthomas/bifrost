@@ -2516,6 +2516,20 @@ impl CodeUnit {
         &self.0.rendered_name.display[self.0.rendered_name.short_start..]
     }
 
+    /// The extractor-provided text of the final structured name segment.
+    ///
+    /// Unlike [`Self::short_name`], this never includes an enclosing type chain.
+    /// Consumers that need a member's own name must use this structured value
+    /// instead of splitting a rendered language spelling.
+    pub fn terminal_name(&self) -> &str {
+        let terminal = self
+            .0
+            .fq
+            .last()
+            .expect("a CodeUnit qualified name always has a terminal segment");
+        segment_interner().resolve(terminal).0
+    }
+
     pub fn fq(&self) -> &FqName {
         &self.0.fq
     }

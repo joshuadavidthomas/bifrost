@@ -440,6 +440,7 @@ pub(crate) struct CppBoundedTypeResolution {
 }
 
 struct CppBoundedProvider<'a> {
+    analyzer: &'a dyn IAnalyzer,
     cpp: &'a CppAnalyzer,
     session: &'a ResolutionSession,
 }
@@ -566,6 +567,7 @@ pub(crate) fn resolve_cpp_bounded(
         ));
     };
     let provider = CppBoundedProvider {
+        analyzer,
         cpp,
         session: &session,
     };
@@ -772,9 +774,31 @@ fn resolve_cpp_bounded_member(
     if member.is_empty() {
         return no_definition("no_member_name", "C++ member name is blank");
     }
+    let external_owner_name =
+        cpp_external_receiver_type_name_from_ast(source, root, receiver, provider.session);
     let Some(resolution) =
         cpp_bounded_type_resolution_for_node(provider, file, source, root, receiver)
     else {
+        if let Some(owner_name) = external_owner_name
+            && matches!(
+                crate::analyzer::cpp::external::external_member_resolution(
+                provider.cpp,
+                provider.analyzer.semantic_model_overlay().as_deref(),
+                file,
+                &owner_name,
+                member,
+                ),
+                crate::analyzer::cpp::external::CppExternalMemberResolution::Indexed
+                    | crate::analyzer::cpp::external::CppExternalMemberResolution::DeclaredUnindexed
+            )
+        {
+            // gated upstream: the structured receiver type and exact activated
+            // owner/member fact prove that this route leaves the workspace.
+            super::trace::record_named_boundary(member.to_owned());
+            return boundary_unchecked(format!(
+                "C++ member `{owner_name}::{member}` routes through an external header"
+            ));
+        }
         return no_definition(
             "unsupported_cpp_receiver",
             format!("receiver for C++ member `{member}` is not resolved"),
@@ -923,6 +947,30 @@ fn resolve_cpp_bounded_member(
         });
     }
     outcome
+}
+
+fn cpp_external_receiver_type_name_from_ast(
+    source: &str,
+    root: Node<'_>,
+    receiver: Node<'_>,
+    session: &ResolutionSession,
+) -> Option<String> {
+    let type_node = match receiver.kind() {
+        "identifier" | "field_identifier" => {
+            cpp_bounded_binding_type_node(source, root, receiver, session)?
+        }
+        "new_expression" | "compound_literal_expression" => receiver
+            .child_by_field_name("type")
+            .or_else(|| cpp_constructor_type_node(receiver))?,
+        _ => return None,
+    };
+    let type_name = cpp_bounded_structured_type_path(type_node, source, session)
+        .map(|path| path.fqn)
+        .or_else(|| {
+            cpp_bounded_type_name_node(type_node, session)
+                .map(|name| cpp_node_text(name, source).to_owned())
+        })?;
+    (!type_name.is_empty()).then_some(type_name)
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1163,7 +1211,11 @@ pub(crate) fn cpp_type_lookup_resolution_in_session(
     if !brokk_bifrost_cpp::imports::receiver_query_supported(file) {
         return None;
     }
-    let provider = CppBoundedProvider { cpp, session };
+    let provider = CppBoundedProvider {
+        analyzer,
+        cpp,
+        session,
+    };
     let node = cpp_bounded_smallest_node(
         tree.root_node(),
         site.focus_start_byte,
@@ -4495,6 +4547,9 @@ fn resolve_cpp_field(
     else {
         return no_definition("no_member_receiver", "C++ field expression has no receiver");
     };
+    let external_session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+    let external_owner_name =
+        cpp_external_receiver_type_name_from_ast(ctx.source, ctx.root, receiver, &external_session);
     let owners = cpp_field_receiver_type_units(
         ctx.analyzer,
         ctx.support,
@@ -4513,6 +4568,27 @@ fn resolve_cpp_field(
     let receiver_resolved = !owners.is_empty();
     let candidates = cpp_member_candidates(ctx, owners, member, arity, arg_types);
     if candidates.is_empty() {
+        if let Some(owner_name) = external_owner_name
+            && let Some(cpp) = resolve_analyzer::<CppAnalyzer>(ctx.analyzer)
+            && matches!(
+                crate::analyzer::cpp::external::external_member_resolution(
+                cpp,
+                ctx.analyzer.semantic_model_overlay().as_deref(),
+                ctx.file,
+                &owner_name,
+                member,
+                ),
+                crate::analyzer::cpp::external::CppExternalMemberResolution::Indexed
+                    | crate::analyzer::cpp::external::CppExternalMemberResolution::DeclaredUnindexed
+            )
+        {
+            // gated upstream: the structured receiver type and exact activated
+            // owner/member fact prove that this route leaves the workspace.
+            super::trace::record_named_boundary(member.to_owned());
+            return boundary_unchecked(format!(
+                "C++ member `{owner_name}::{member}` routes through an external header"
+            ));
+        }
         if receiver_resolved {
             return no_definition(
                 "no_indexed_definition",

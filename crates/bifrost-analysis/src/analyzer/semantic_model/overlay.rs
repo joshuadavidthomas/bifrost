@@ -211,6 +211,8 @@ pub struct SemanticModelSymbol {
     pub(crate) extension_receiver: Option<TypeRef>,
     #[serde(skip)]
     pub(crate) extension_receiver_constraints: Vec<TypeRef>,
+    #[serde(skip)]
+    pub(crate) locator_path: Option<String>,
     pub location: SemanticModelLocation,
     pub provenance: SemanticModelProvenance,
 }
@@ -2963,6 +2965,7 @@ fn emit_rule_match(
                         receiver: None,
                         extension_receiver: None,
                         extension_receiver_constraints: Vec::new(),
+                        locator_path: None,
                         location,
                         provenance: model_provenance,
                     },
@@ -3011,6 +3014,7 @@ fn emit_rule_match(
                             receiver: None,
                             extension_receiver: None,
                             extension_receiver_constraints: Vec::new(),
+                            locator_path: None,
                             location,
                             provenance: model_provenance,
                         }
@@ -3410,6 +3414,7 @@ fn type_symbol(
         receiver: None,
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
+        locator_path: Some(locator_path(&record.locator).to_owned()),
         provenance: provenance(
             active,
             shard,
@@ -3466,6 +3471,7 @@ fn member_symbol(
         receiver: record.receiver,
         extension_receiver: record.extension_receiver.clone(),
         extension_receiver_constraints: record.extension_receiver_constraints.clone(),
+        locator_path: Some(locator_path(&record.locator).to_owned()),
         provenance: provenance(
             active,
             shard,
@@ -3475,6 +3481,12 @@ fn member_symbol(
             ambiguous,
         ),
         location,
+    }
+}
+
+fn locator_path(locator: &Locator) -> &str {
+    match locator {
+        Locator::Source { path, .. } | Locator::Artifact { path, .. } => path,
     }
 }
 
@@ -3971,6 +3983,7 @@ mod tests {
             receiver: None,
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
+            locator_path: None,
             location: SemanticModelLocation::Model(SemanticModelVirtualLocation {
                 uri: format!("bifrost-model://v1/{qualified_name}"),
                 range: SemanticModelRange {

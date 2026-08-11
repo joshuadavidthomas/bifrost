@@ -517,6 +517,12 @@ pub(super) fn record_boundary_gate() {
     record(external_route_row(name));
 }
 
+pub(super) fn record_named_boundary(name: String) {
+    if recording() {
+        record(external_route_row(name));
+    }
+}
+
 fn external_route_row(name: String) -> TraceCandidate {
     TraceCandidate::rejected(
         TraceCandidateRef::ExternalRoute { name },
@@ -627,8 +633,8 @@ fn trace_completeness_for(file: &ProjectFile) -> TraceCompleteness {
 /// when its index answers nothing, so a declared dependency that discovery
 /// could not read to the end never collapses into "nothing is known".
 ///
-/// C++ stays [`BoundaryStatus::ExternalUnknown`]: it has no dependency-pack
-/// ecosystem and no discovery resolver yet, so there is no evidence to read.
+/// C++ uses literal angle includes, compile-context agreement, and activated
+/// header-pack facts. It does not infer implicit compiler include roots.
 /// This function never changes an outcome; it only sharpens what the trace
 /// says about one.
 fn finish_boundary(
@@ -640,7 +646,15 @@ fn finish_boundary(
     if outcome.status != DefinitionLookupStatus::UnresolvableImportBoundary {
         return;
     }
-    let name = outcome.resolved_reference_target().unwrap_or_default();
+    let name = trace
+        .candidates
+        .iter()
+        .find_map(|row| match &row.candidate {
+            TraceCandidateRef::ExternalRoute { name } if !name.is_empty() => Some(name.as_str()),
+            _ => None,
+        })
+        .unwrap_or_else(|| outcome.resolved_reference_target().unwrap_or_default())
+        .to_owned();
     // Boundary sites that bypass the gate (`boundary_unchecked`, each of which
     // documents where its guard lives) record nothing, so the route row is
     // synthesized here from the outcome the site produced. Either way the trace
@@ -650,14 +664,14 @@ fn finish_boundary(
         .iter()
         .any(|row| matches!(row.candidate, TraceCandidateRef::ExternalRoute { .. }))
     {
-        trace.candidates.push(external_route_row(name.to_owned()));
+        trace.candidates.push(external_route_row(name.clone()));
     }
-    let (status, external_target) = boundary_evidence(analyzer, file, name);
+    let (status, external_target) = boundary_evidence(analyzer, file, &name);
     for row in &mut trace.candidates {
         if let TraceCandidateRef::ExternalRoute { name: route } = &mut row.candidate
             && route.is_empty()
         {
-            route.push_str(name);
+            route.push_str(&name);
         }
         if row.boundary == BoundaryStatus::ExternalUnknown {
             row.boundary = status;
@@ -871,11 +885,17 @@ pub(in crate::analyzer::usages) fn boundary_evidence(
                 (BoundaryStatus::ExternalUnknown, None)
             }
         }
-        // C++ has no dependency-pack ecosystem (`DependencyPackEcosystem`
-        // names none for it), no overlay producer, and no discovery resolver,
-        // so there is no evidence to refine with; unconditional
-        // `ExternalUnknown` is the honest answer until one exists.
-        Language::Cpp | Language::None => (BoundaryStatus::ExternalUnknown, None),
+        Language::Cpp => resolve_analyzer::<crate::analyzer::CppAnalyzer>(analyzer)
+            .map(|cpp| {
+                crate::analyzer::cpp::external::external_boundary_evidence(
+                    cpp,
+                    analyzer.semantic_model_overlay().as_deref(),
+                    file,
+                    name,
+                )
+            })
+            .unwrap_or((BoundaryStatus::ExternalUnknown, None)),
+        Language::None => (BoundaryStatus::ExternalUnknown, None),
     }
 }
 
