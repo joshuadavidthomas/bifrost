@@ -9,7 +9,6 @@ pub(super) fn project_summary_witness(
     id: WitnessId,
     max_steps: usize,
     max_bytes: usize,
-    include_retention_truncation: bool,
     labels: impl Fn(&SummaryWitnessStepKind) -> (WitnessStepKind, &'static str),
 ) -> Result<Option<BoundedWitness>, String> {
     let mut steps = Vec::new();
@@ -37,16 +36,12 @@ pub(super) fn project_summary_witness(
     if steps.is_empty() {
         return Ok(None);
     }
-    let mut omitted = witness
+    // Internal truncation always carries a positive omitted lower bound, and
+    // unretained sibling alternatives do not make this witness incomplete, so
+    // no omitted step is fabricated here.
+    let omitted = witness
         .omitted_steps_lower_bound()
         .saturating_add(witness.steps().len().saturating_sub(steps.len()));
-    if (witness.truncated()
-        || include_retention_truncation
-            && (witness.alternatives_truncated() || witness.retention_truncated()))
-        && omitted == 0
-    {
-        omitted = 1;
-    }
     BoundedWitness::try_new(
         id,
         steps,

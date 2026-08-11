@@ -14,7 +14,7 @@ pub use client::{
 pub use finding::{
     TaintFinding, TaintFindingCollectionLimits, TaintFindingEntry, TaintFindingError,
     TaintFindingKey, TaintFindingReport, TaintOriginFindingEvidence, TaintOriginStatus,
-    collect_taint_findings, collect_taint_findings_with_limits,
+    TaintWitnessTruncationCause, collect_taint_findings, collect_taint_findings_with_limits,
 };
 pub use model::{
     MAX_TAINT_CLASSES, SourceClassId, SourceEventKey, TaintClassSet, TaintModelError,

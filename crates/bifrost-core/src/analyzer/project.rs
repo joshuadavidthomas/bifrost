@@ -959,6 +959,7 @@ fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
 /// directories in scope.
 pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>> {
     let _scope = crate::profiling::scope("project::collect_workspace_files");
+    let mut apply_parent_ignores = true;
     if let Some(repo) = crate::gitblob::discover(root) {
         let workdir = repo
             .workdir()
@@ -978,7 +979,13 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
                 project_rel.to_path_buf(),
             ));
         }
-        return Ok(files);
+        // An ancestor repository can discover this root while its ignore rules
+        // hide the complete subtree. In that case, Git cannot represent the
+        // explicitly selected workspace. Walk the selected root instead.
+        if !files.is_empty() {
+            return Ok(files);
+        }
+        apply_parent_ignores = false;
     }
 
     let walker = WalkBuilder::new(root)
@@ -987,7 +994,9 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .parents(true)
+        // When Git cannot represent the selected root, its ancestor ignore
+        // files must not erase that explicit workspace during the fallback.
+        .parents(apply_parent_ignores)
         .require_git(false)
         // Never descend into `.git`. We keep hidden entries (`hidden(false)`) so
         // legitimate dotted source/config like `.github/` is still analyzed, but
@@ -1512,6 +1521,29 @@ mod tests {
             .collect();
 
         assert_eq!(rels, BTreeSet::from(["src/db/mod.rs".to_string()]));
+    }
+
+    #[test]
+    fn collect_project_files_walks_explicit_root_ignored_by_ancestor_repository() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = crate::gitblob::test_repo::init_repo(&repo_root);
+        write_file(&repo_root, ".gitignore", "/target/\n");
+        crate::gitblob::test_repo::commit_all(&repo, "ignore build output");
+        write_file(
+            &repo_root,
+            "target/extracted/main.go",
+            "package main\n\nfunc main() {}\n",
+        );
+        let extracted_root = repo_root.join("target/extracted");
+
+        let rels: BTreeSet<String> = collect_workspace_files(&extracted_root)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        assert_eq!(rels, BTreeSet::from(["main.go".to_string()]));
     }
 
     #[cfg(unix)]

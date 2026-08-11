@@ -1859,7 +1859,6 @@ fn project_taint_witnesses(
             id.clone(),
             budget.max_witness_steps(),
             budget.max_witness_bytes(),
-            true,
             |kind| match kind {
                 SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "taint source"),
                 SummaryWitnessStepKind::Edge(_) => {
