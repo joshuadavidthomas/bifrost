@@ -605,6 +605,20 @@ fn scala_type_expression_path(node: Node<'_>, source: &str) -> Option<ScalaTypeE
             arguments,
         });
     }
+    if node.kind() == "infix_type" {
+        let operator = node.child_by_field_name("operator")?;
+        let operator = node_text(operator, source).trim();
+        if operator.is_empty() {
+            return None;
+        }
+        return Some(ScalaTypeExpressionPath {
+            segments: vec![operator.to_string()],
+            arguments: vec![
+                scala_type_expression_path(node.child_by_field_name("left")?, source)?,
+                scala_type_expression_path(node.child_by_field_name("right")?, source)?,
+            ],
+        });
+    }
     if matches!(node.kind(), "wildcard_type" | "wildcard") {
         return Some(ScalaTypeExpressionPath {
             segments: vec!["_".to_owned()],
@@ -2385,9 +2399,9 @@ pub fn terminal_invocation_owner_name(node: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
-/// Enclosing class/object/trait/enum declarations from the innermost template
-/// to the outermost. This includes local templates that the analyzer does not
-/// publish as global declarations.
+/// Enclosing class/object/trait/enum/anonymous-instance declarations from the
+/// innermost template to the outermost. This includes local templates that the
+/// analyzer does not publish as global declarations.
 pub fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
     let mut declarations = Vec::new();
     let mut current = node;
@@ -2396,7 +2410,11 @@ pub fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
             && let Some(declaration) = parent.parent()
             && matches!(
                 declaration.kind(),
-                "class_definition" | "object_definition" | "trait_definition" | "enum_definition"
+                "class_definition"
+                    | "object_definition"
+                    | "trait_definition"
+                    | "enum_definition"
+                    | "instance_expression"
             )
         {
             declarations.push(declaration);
@@ -2406,9 +2424,9 @@ pub fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
     declarations
 }
 
-pub fn template_self_type(declaration: Node<'_>) -> Option<Node<'_>> {
+pub fn template_self_types(declaration: Node<'_>) -> Vec<Node<'_>> {
     let mut declaration_cursor = declaration.walk();
-    declaration
+    let Some(bound) = declaration
         .named_children(&mut declaration_cursor)
         .find(|child| matches!(child.kind(), "template_body" | "enum_body"))
         .and_then(|body| {
@@ -2422,6 +2440,22 @@ pub fn template_self_type(declaration: Node<'_>) -> Option<Node<'_>> {
             let _binder = children.next()?;
             children.next()
         })
+    else {
+        return Vec::new();
+    };
+    if bound.kind() != "compound_type" {
+        return vec![bound];
+    }
+    let mut cursor = bound.walk();
+    bound
+        .named_children(&mut cursor)
+        .filter(|child| {
+            !matches!(
+                child.kind(),
+                "annotation" | "structural_type" | "type_arguments"
+            )
+        })
+        .collect()
 }
 
 /// Whether a template directly declares a term with `name`. For local

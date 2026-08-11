@@ -34,11 +34,12 @@ use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallableSiteRole, ScalaCallableSourceAlternative, ScalaDeclaredResult,
     ScalaFunctionParameterShape, ScalaParameterListKind, ScalaParameterTypeIdentity,
     ScalaQualifiedStableTypeRole, applied_expression_for_reference, call_arities_for_reference,
-    call_site_shape_for_reference, is_extractor_reference, is_infix_type_operator_reference,
-    is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
-    named_argument_invocation_owner, qualified_stable_type_reference,
-    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
-    scala_pattern_binder_names, scala_source_facts,
+    call_site_shape_for_reference, enclosing_template_declarations, is_extractor_reference,
+    is_infix_type_operator_reference, is_scala_case_pattern_binder, is_scala_class_reference,
+    is_scala_named_argument_assignment, named_argument_invocation_owner,
+    qualified_stable_type_reference, scala_callable_alternative_is_candidate,
+    scala_callable_alternative_matches, scala_pattern_binder_names, scala_source_facts,
+    template_self_types,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -3780,7 +3781,7 @@ fn resolve_scala_with_context(
                         return outcome;
                     }
                     if let Some(fqn) = resolver.resolve_member(text) {
-                        return scala_fqn_outcome(support, &fqn, text);
+                        return scala_identifier_member_outcome(ctx, root, identifier, &fqn, text);
                     }
                 }
                 if let Some(owner) = binding.and_then(|binding| binding.declaration_owner) {
@@ -3790,6 +3791,14 @@ fn resolve_scala_with_context(
                                 !ctx.scala.is_type_alias(unit)
                                     && !scala_constructor_only_callable(ctx.scala, unit)
                             });
+                            let call_shape =
+                                scala_identifier_invocation_shape(ctx, root, identifier);
+                            candidates = scala_filter_callable_units(
+                                ctx.scala,
+                                candidates,
+                                call_shape.as_ref(),
+                                ScalaCallableSiteRole::Ordinary,
+                            );
                             if !candidates.is_empty() {
                                 return candidates_outcome(candidates);
                             }
@@ -3816,7 +3825,7 @@ fn resolve_scala_with_context(
                 return outcome;
             }
             if let Some(fqn) = resolver.resolve_member(text) {
-                return scala_fqn_outcome(support, &fqn, text);
+                return scala_identifier_member_outcome(ctx, root, identifier, &fqn, text);
             }
             if let Some(owner) =
                 scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, identifier.start_byte())
@@ -3827,6 +3836,13 @@ fn resolve_scala_with_context(
                             !ctx.scala.is_type_alias(unit)
                                 && !scala_constructor_only_callable(ctx.scala, unit)
                         });
+                        let call_shape = scala_identifier_invocation_shape(ctx, root, identifier);
+                        candidates = scala_filter_callable_units(
+                            ctx.scala,
+                            candidates,
+                            call_shape.as_ref(),
+                            ScalaCallableSiteRole::Ordinary,
+                        );
                         if !candidates.is_empty() {
                             return candidates_outcome(candidates);
                         }
@@ -3839,6 +3855,18 @@ fn resolve_scala_with_context(
                     }
                     ScalaExactMemberResolution::NoMatch => {}
                 }
+            }
+            match scala_self_type_member_candidate_units(ctx, &resolver, identifier, text) {
+                ScalaExactMemberResolution::Found(candidates) => {
+                    return candidates_outcome(candidates);
+                }
+                ScalaExactMemberResolution::Ambiguous => {
+                    return no_definition(
+                        "ambiguous_scala_self_type_member",
+                        format!("`{text}` has multiple physical self-type member definitions"),
+                    );
+                }
+                ScalaExactMemberResolution::NoMatch => {}
             }
             if let Some(fqn) = scala_resolve_visible_term(ctx, &resolver, identifier, text) {
                 return scala_fqn_outcome(support, &fqn, text);
@@ -6629,6 +6657,35 @@ fn resolve_scala_call(
                     }
                 }
             }
+            match scala_self_type_member_candidate_units(ctx, resolver, function, name) {
+                ScalaExactMemberResolution::Found(candidates) => {
+                    let has_ordinary_member = candidates.iter().any(|unit| {
+                        scala_unit_has_callable_role(ctx.scala, unit, ScalaCallableRole::Ordinary)
+                    });
+                    let candidates = scala_filter_callable_units(
+                        ctx.scala,
+                        candidates,
+                        call_shape.as_ref(),
+                        ScalaCallableSiteRole::Ordinary,
+                    );
+                    if !candidates.is_empty() {
+                        return candidates_outcome(candidates);
+                    }
+                    if has_ordinary_member {
+                        return no_definition(
+                            "no_applicable_scala_callable",
+                            format!("`{name}` has no self-type member overload matching this call"),
+                        );
+                    }
+                }
+                ScalaExactMemberResolution::Ambiguous => {
+                    return no_definition(
+                        "ambiguous_scala_self_type_member",
+                        format!("`{name}` has multiple physical self-type member definitions"),
+                    );
+                }
+                ScalaExactMemberResolution::NoMatch => {}
+            }
             match resolver.resolve_explicit_singleton(name) {
                 ScalaNameResolution::Resolved(owner) => {
                     return scala_apply_or_constructor_outcome(
@@ -8359,6 +8416,65 @@ fn scala_exact_owner_member_candidate_units(
     }
 
     ScalaExactMemberResolution::NoMatch
+}
+
+fn scala_self_type_member_candidate_units(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    node: Node<'_>,
+    member: &str,
+) -> ScalaExactMemberResolution {
+    let mut candidates = Vec::new();
+    for template in enclosing_template_declarations(node) {
+        for self_type in template_self_types(template) {
+            let Some(owner) = scala_resolve_visible_type_declaration(ctx, resolver, self_type)
+            else {
+                continue;
+            };
+            match scala_exact_owner_member_candidate_units(ctx, &owner, member, false) {
+                ScalaExactMemberResolution::Found(found) => candidates.extend(found),
+                ScalaExactMemberResolution::Ambiguous => {
+                    return ScalaExactMemberResolution::Ambiguous;
+                }
+                ScalaExactMemberResolution::NoMatch => {}
+            }
+        }
+        if !candidates.is_empty() {
+            sort_units(&mut candidates);
+            candidates.dedup();
+            return ScalaExactMemberResolution::Found(candidates);
+        }
+    }
+    ScalaExactMemberResolution::NoMatch
+}
+
+fn scala_identifier_member_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    root: Node<'_>,
+    identifier: Node<'_>,
+    fqn: &str,
+    reference: &str,
+) -> DefinitionLookupOutcome {
+    if let Some(call_shape) = scala_identifier_invocation_shape(ctx, root, identifier) {
+        let candidates = scala_filter_callable_units(
+            ctx.scala,
+            ctx.support.fqn(fqn),
+            Some(&call_shape),
+            ScalaCallableSiteRole::Ordinary,
+        );
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+    }
+    scala_fqn_outcome(ctx.support, fqn, reference)
+}
+
+fn scala_identifier_invocation_shape(
+    ctx: ScalaLookupCtx<'_>,
+    root: Node<'_>,
+    identifier: Node<'_>,
+) -> Option<ScalaCallSiteShape> {
+    scala_call_site_shape(ctx, root, identifier).filter(|shape| !shape.type_arguments_only)
 }
 
 fn scala_direct_member_candidate_units_for_owner(
@@ -11491,9 +11607,9 @@ fn scala_seed_typed(
 /// block the layout happened to wrap the `new` in. A continuation-line
 /// `val x =` followed by an indented `new T { ... }` gets an `indented_block`,
 /// and a same-line one does not, so the same code was called local or not
-/// depending on where the line broke (#1857). Modelling those members is issue
-/// #1860; this only keeps the boundary honest and keeps them out of the
-/// enclosing scope.
+/// depending on where the line broke (#1857). The declaration pass now models
+/// these members under a synthetic owner (#1860). This boundary keeps them out
+/// of the enclosing scope.
 const SCALA_TEMPLATE_MEMBER_BOUNDARIES: [&str; 6] = [
     "class_definition",
     "object_definition",

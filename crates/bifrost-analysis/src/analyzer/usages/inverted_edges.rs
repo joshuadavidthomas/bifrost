@@ -150,13 +150,19 @@ pub(crate) fn build_file_declarations_from_state_with_file_scope<K: NodeKey>(
     )
 }
 
-/// [`build_file_declarations_from_state`] over the two maps it actually reads;
-/// see [`class_range_index_from_declaration_ranges`].
-pub(crate) fn build_file_declarations_from_declaration_ranges<K: NodeKey>(
+/// [`build_file_declarations_from_state`] over the two maps it actually reads,
+/// with a declaration filter; see [`class_range_index_from_declaration_ranges`].
+pub(crate) fn build_file_declarations_from_declaration_ranges_filtered<K: NodeKey>(
     declarations: &HashSet<CodeUnit>,
     ranges: &HashMap<CodeUnit, Vec<Range>>,
+    include: impl Fn(&CodeUnit) -> bool,
 ) -> FileDeclarations<K> {
-    build_file_declarations_from_declaration_ranges_with_file_scope(declarations, ranges, false)
+    build_file_declarations_from_declaration_ranges_with_filter(
+        declarations,
+        ranges,
+        false,
+        include,
+    )
 }
 
 pub(crate) fn build_file_declarations_from_declaration_ranges_with_file_scope<K: NodeKey>(
@@ -164,11 +170,26 @@ pub(crate) fn build_file_declarations_from_declaration_ranges_with_file_scope<K:
     ranges: &HashMap<CodeUnit, Vec<Range>>,
     include_file_scope: bool,
 ) -> FileDeclarations<K> {
+    build_file_declarations_from_declaration_ranges_with_filter(
+        declarations,
+        ranges,
+        include_file_scope,
+        |_| true,
+    )
+}
+
+fn build_file_declarations_from_declaration_ranges_with_filter<K: NodeKey>(
+    declarations: &HashSet<CodeUnit>,
+    ranges: &HashMap<CodeUnit, Vec<Range>>,
+    include_file_scope: bool,
+    include: impl Fn(&CodeUnit) -> bool,
+) -> FileDeclarations<K> {
     let mut enclosers = Vec::new();
     let mut definitions: HashMap<K, Vec<(usize, usize)>> = HashMap::default();
     for unit in declarations
         .iter()
         .filter(|unit| include_file_scope || !unit.is_file_scope())
+        .filter(|unit| include(unit))
     {
         let key = K::from_unit(unit);
         for unit_range in ranges.get(unit).into_iter().flatten() {
