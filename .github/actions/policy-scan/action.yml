@@ -13,7 +13,7 @@ inputs:
       install and uses `target/release/bifrost` from the checkout when it
       exists, otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.8.24
+    default: v0.9.1
   policy-packs:
     description: Space-separated built-in pack IDs to run.
     required: false
@@ -71,6 +71,9 @@ outputs:
   sarif-file:
     description: Path of the SARIF report, relative to the checkout.
     value: ${{ steps.run.outputs.sarif-file }}
+  bifrost-bin:
+    description: Absolute path of the bifrost executable the run used.
+    value: ${{ steps.install.outputs.bifrost_bin }}
 
 runs:
   using: composite
@@ -108,6 +111,9 @@ runs:
         cd "${dir}"
         curl -fsSL -O "${url}/${stage}.${archive}"
         curl -fsSL -O "${url}/${stage}.${archive}.sha256"
+        # Windows release checksum files carry CRLF from Out-File, and sha256sum -c rejects the \r in the filename.
+        tr -d '\r' < "${stage}.${archive}.sha256" > "${stage}.${archive}.sha256.lf"
+        mv "${stage}.${archive}.sha256.lf" "${stage}.${archive}.sha256"
         if command -v sha256sum >/dev/null 2>&1; then
           sha256sum -c "${stage}.${archive}.sha256"
         else
@@ -115,7 +121,9 @@ runs:
         fi
         if [ "${archive}" = zip ]; then
           if command -v unzip >/dev/null 2>&1; then
-            unzip -q "${stage}.zip"
+            # -o keeps the step idempotent: a second run in the same job
+            # re-extracts, and a bare unzip prompts instead of overwriting.
+            unzip -oq "${stage}.zip"
           else
             python3 -m zipfile -e "${stage}.zip" .
           fi
