@@ -14,6 +14,7 @@ mod classify_test_files_test;
 mod csharp_constructor_resolution;
 mod diff_analysis_test;
 mod get_definition_test;
+mod issue_1963_ignored_nested_workspace;
 mod most_relevant_files;
 mod optional_chain_reference_site;
 mod reusable_summaries;
