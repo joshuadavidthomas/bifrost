@@ -14,7 +14,9 @@ use serde::Deserialize;
 
 use crate::analyzer::semantic_model::{
     CatalogError, CatalogOpenMode, CatalogOptions, DependencyPackLimits,
-    SemanticModelActivationRequest, SemanticModelRuntimeLimits, SemanticPackCatalog,
+    SemanticModelActivationControl, SemanticModelActivationRequest, SemanticModelControlAction,
+    SemanticModelControlScope, SemanticModelPackSelector, SemanticModelRuntimeLimits,
+    SemanticPackCatalog,
 };
 use crate::analyzer::{
     AnalyzerConfig, DependencyPackActivationOutcome, DependencyPackEcosystem,
@@ -41,6 +43,7 @@ pub struct WorkspacePacksConfig {
     schema_version: u32,
     catalog: Option<PathBuf>,
     ecosystems: Vec<DependencyPackEcosystem>,
+    enable: Vec<String>,
 }
 
 impl WorkspacePacksConfig {
@@ -58,6 +61,13 @@ impl WorkspacePacksConfig {
     pub fn ecosystems(&self) -> &[DependencyPackEcosystem] {
         &self.ecosystems
     }
+
+    /// Pack ids the workspace opts into activating. Every shipped pack sets
+    /// `safety.review_required = true`, so a pack stays selected but inactive
+    /// until its id is named here (#1937).
+    pub fn enable(&self) -> &[String] {
+        &self.enable
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +77,8 @@ struct WirePacksDocument {
     #[serde(default)]
     catalog: Option<String>,
     ecosystems: Vec<String>,
+    #[serde(default)]
+    enable: Vec<String>,
 }
 
 /// Parse and validate one pack-activation document from its JSON source.
@@ -131,6 +143,7 @@ fn normalize_packs_document(
         schema_version: WORKSPACE_PACKS_SCHEMA_VERSION,
         catalog,
         ecosystems,
+        enable: wire.enable,
     })
 }
 
@@ -228,11 +241,29 @@ pub fn activate_workspace_packs(
         )?,
         None => SemanticPackCatalog::open_ephemeral(CatalogOptions::default())?,
     };
+    // Every shipped pack declares `safety.review_required`, so activation
+    // needs an explicit compatible `Enable` control keyed by pack id --
+    // matching evidence alone leaves it selected but inactive
+    // (`ReviewRequired`). The document's `enable` list is that control,
+    // matching the in-process control build in `owasp_benchmark.rs` (#1937).
+    let controls = config
+        .enable()
+        .iter()
+        .map(|pack_id| SemanticModelActivationControl {
+            scope: SemanticModelControlScope::Workspace,
+            action: SemanticModelControlAction::Enable,
+            selector: SemanticModelPackSelector {
+                pack_id: pack_id.clone(),
+                version: None,
+                manifest_digest: None,
+            },
+        })
+        .collect();
     let activation = SemanticModelActivationRequest {
         bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("package version must be semver"),
         evidence: Vec::new(),
-        controls: Vec::new(),
+        controls,
         limits: SemanticModelRuntimeLimits::default(),
     };
     let outcome = workspace.activate_dependency_packs(
@@ -388,6 +419,28 @@ mod tests {
                 DependencyPackEcosystem::Python
             ]
         );
+        assert!(config.enable().is_empty());
+    }
+
+    #[test]
+    fn a_document_that_names_enable_entries_exposes_them_in_order() {
+        let config = parse_workspace_packs_config(
+            r#"{
+                "schema_version": 1,
+                "ecosystems": ["jvm"],
+                "enable": ["acme.sanitizers", "acme.frameworks"]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.enable(), ["acme.sanitizers", "acme.frameworks"]);
+    }
+
+    #[test]
+    fn a_document_that_omits_enable_still_parses_with_an_empty_list() {
+        let config =
+            parse_workspace_packs_config(r#"{ "schema_version": 1, "ecosystems": ["jvm"] }"#)
+                .unwrap();
+        assert!(config.enable().is_empty());
     }
 
     #[test]

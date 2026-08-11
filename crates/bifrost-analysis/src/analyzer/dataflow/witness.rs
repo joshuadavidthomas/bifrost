@@ -199,6 +199,35 @@ impl Default for WitnessReconstructionLimits {
     }
 }
 
+/// Why a reconstructed witness's own step sequence is incomplete.
+///
+/// The first cause encountered during reconstruction is retained. Absent
+/// sibling alternatives (`SummaryWitness::alternatives_truncated`) are not a
+/// cause: they assert nothing about the retained witness's own steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WitnessTruncationCause {
+    /// Reconstruction reached the per-request emitted-step limit.
+    ReconstructionStepLimit,
+    /// Reconstruction reached the per-request evidence-expansion limit.
+    ReconstructionExpansionLimit,
+    /// A reusable cross-solve callee summary retained no internal steps.
+    ReusableSummaryOmitted,
+    /// Best-effort retention dropped the entire witness sidecar.
+    RetentionExhausted,
+}
+
+impl WitnessTruncationCause {
+    /// Stable diagnostic label safe for public projection.
+    pub const fn stable_label(self) -> &'static str {
+        match self {
+            Self::ReconstructionStepLimit => "reconstruction_step_limit",
+            Self::ReconstructionExpansionLimit => "reconstruction_expansion_limit",
+            Self::ReusableSummaryOmitted => "reusable_summary_omitted",
+            Self::RetentionExhausted => "retention_exhausted",
+        }
+    }
+}
+
 /// The semantic operation represented by one reconstructed witness step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SummaryWitnessStepKind {
@@ -350,10 +379,9 @@ impl WitnessReconstructionWork {
 pub struct SummaryWitness {
     steps: Box<[SummaryWitnessStep]>,
     quality: PathQuality,
-    truncated: bool,
+    truncation_cause: Option<WitnessTruncationCause>,
     omitted_steps_lower_bound: usize,
     alternatives_truncated: bool,
-    retention_truncated: bool,
     retained_bytes: usize,
     work: WitnessReconstructionWork,
 }
@@ -362,20 +390,19 @@ impl SummaryWitness {
     pub(crate) fn from_parts(
         steps: Vec<SummaryWitnessStep>,
         quality: PathQuality,
-        truncated: bool,
+        truncation_cause: Option<WitnessTruncationCause>,
         omitted_steps_lower_bound: usize,
         alternatives_truncated: bool,
         retained_bytes: usize,
         work: WitnessReconstructionWork,
     ) -> Self {
-        debug_assert_eq!(truncated, omitted_steps_lower_bound > 0);
+        debug_assert_eq!(truncation_cause.is_some(), omitted_steps_lower_bound > 0);
         Self {
             steps: steps.into_boxed_slice(),
             quality,
-            truncated,
+            truncation_cause,
             omitted_steps_lower_bound,
             alternatives_truncated,
-            retention_truncated: false,
             retained_bytes,
             work,
         }
@@ -385,10 +412,9 @@ impl SummaryWitness {
         Self {
             steps: Box::new([]),
             quality,
-            truncated: true,
+            truncation_cause: Some(WitnessTruncationCause::RetentionExhausted),
             omitted_steps_lower_bound: 1,
             alternatives_truncated: true,
-            retention_truncated: true,
             retained_bytes: size_of::<Self>(),
             work: WitnessReconstructionWork::default(),
         }
@@ -402,8 +428,14 @@ impl SummaryWitness {
         self.quality
     }
 
+    /// Whether this witness's own step sequence is incomplete.
     pub const fn truncated(&self) -> bool {
-        self.truncated
+        self.truncation_cause.is_some()
+    }
+
+    /// The exact first cause that made this witness incomplete.
+    pub const fn truncation_cause(&self) -> Option<WitnessTruncationCause> {
+        self.truncation_cause
     }
 
     pub const fn omitted_steps_lower_bound(&self) -> usize {
@@ -419,7 +451,10 @@ impl SummaryWitness {
     /// In this state the zero-step witness is an explicit availability marker,
     /// not evidence that the target was reached without semantic steps.
     pub const fn retention_truncated(&self) -> bool {
-        self.retention_truncated
+        matches!(
+            self.truncation_cause,
+            Some(WitnessTruncationCause::RetentionExhausted)
+        )
     }
 
     /// Bytes exclusively retained by this value.
@@ -1330,14 +1365,15 @@ impl WitnessStore {
         let mut stack = vec![Task::Expand(evidence)];
         let mut steps = Vec::new();
         let mut expansions = 0usize;
-        let mut truncated = false;
+        let mut truncation_cause = None::<WitnessTruncationCause>;
         let mut omitted_steps_lower_bound = 0usize;
 
         while let Some(task) = stack.pop() {
             match task {
                 Task::Expand(id) => {
                     if expansions >= limits.max_expansions() {
-                        truncated = true;
+                        truncation_cause = truncation_cause
+                            .or(Some(WitnessTruncationCause::ReconstructionExpansionLimit));
                         omitted_steps_lower_bound = 1 + stack
                             .iter()
                             .filter(|task| matches!(task, Task::Emit(_)))
@@ -1386,7 +1422,8 @@ impl WitnessStore {
                 Task::Emit(step) => {
                     let step = *step;
                     if steps.len() >= limits.max_steps() {
-                        truncated = true;
+                        truncation_cause = truncation_cause
+                            .or(Some(WitnessTruncationCause::ReconstructionStepLimit));
                         omitted_steps_lower_bound = 1 + stack
                             .iter()
                             .filter(|task| matches!(task, Task::Emit(_)))
@@ -1411,7 +1448,8 @@ impl WitnessStore {
                     steps.push(step);
                 }
                 Task::OmittedReusableSummary => {
-                    truncated = true;
+                    truncation_cause =
+                        truncation_cause.or(Some(WitnessTruncationCause::ReusableSummaryOmitted));
                     omitted_steps_lower_bound = omitted_steps_lower_bound.saturating_add(1);
                 }
             }
@@ -1429,7 +1467,7 @@ impl WitnessStore {
         Ok(SummaryWitness::from_parts(
             steps,
             quality,
-            truncated,
+            truncation_cause,
             omitted_steps_lower_bound,
             alternatives_truncated,
             retained_bytes,

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use brokk_bifrost::Language;
 use brokk_bifrost::analyzer::dataflow::{PathQuality, SemanticInputStatus};
-use brokk_bifrost::analyzer::semantic::{IcfgEdgeKind, ProcedureKind, SemanticCapability};
+use brokk_bifrost::analyzer::semantic::{IcfgEdgeKind, ProcedureKind};
 use brokk_bifrost::analyzer::value_flow::{
     DIRECT_VALUE_FLOW_READY_LANGUAGES, ValueFlowMayStatus, ValueFlowMustStatus, ValueFlowPortKey,
 };
@@ -1398,6 +1398,8 @@ macro_rules! direct_ready_value_flow_scenario_entries {
         }
     };
 }
+// Shared across harnesses; a given suite may consume only one entries macro.
+#[allow(unused_imports)]
 pub(crate) use direct_ready_value_flow_scenario_entries;
 
 macro_rules! define_direct_ready_value_flow_scenarios {
@@ -1548,10 +1550,10 @@ pub fn with_java_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<
         "src/ExactFlowFixture.java",
         "src/ExactFlowFixture.java",
         "relay(input)",
-        1,
-        1,
-        SemanticInputStatus::Unknown,
-        false,
+        3,
+        3,
+        SemanticInputStatus::Complete,
+        true,
         true,
         execute,
     )
@@ -1569,10 +1571,10 @@ pub fn with_java_split_exact_helper<T>(
         "src/SplitFlowFixture.java",
         "src/SplitRelay.java",
         "SplitRelay.relay(input)",
-        1,
-        1,
-        SemanticInputStatus::Unknown,
-        false,
+        3,
+        3,
+        SemanticInputStatus::Complete,
+        true,
         true,
         execute,
     )
@@ -1590,8 +1592,8 @@ pub fn with_typescript_exact_helper<T>(
         "src/exact_flow.ts",
         "src/exact_flow.ts",
         "relay(input)",
-        6,
-        4,
+        3,
+        3,
         SemanticInputStatus::Unknown,
         false,
         false,
@@ -1607,8 +1609,9 @@ pub fn with_java_branch_merge<T>(execute: impl FnOnce(&ValueFlowConformanceCase<
         JAVA_BRANCH_PROCEDURES,
         JAVA_BRANCH_SINKS,
         "src/BranchFlowFixture.java",
-        1,
-        1,
+        SemanticInputStatus::Complete,
+        3,
+        3,
         true,
         execute,
     )
@@ -1624,6 +1627,7 @@ pub fn with_typescript_branch_merge<T>(
         TYPESCRIPT_BRANCH_PROCEDURES,
         REACHED_FLOW_INCONCLUSIVE_CLEAN_SINKS,
         "src/branch_flow.ts",
+        SemanticInputStatus::Unknown,
         3,
         3,
         false,
@@ -1639,8 +1643,9 @@ pub fn with_java_loop_exit<T>(execute: impl FnOnce(&ValueFlowConformanceCase<'_>
         JAVA_LOOP_PROCEDURES,
         JAVA_BRANCH_SINKS,
         "src/LoopFlowFixture.java",
-        1,
-        1,
+        SemanticInputStatus::Complete,
+        3,
+        3,
         true,
         execute,
     )
@@ -1654,6 +1659,7 @@ pub fn with_typescript_loop_exit<T>(execute: impl FnOnce(&ValueFlowConformanceCa
         TYPESCRIPT_LOOP_PROCEDURES,
         REACHED_FLOW_INCONCLUSIVE_CLEAN_SINKS,
         "src/loop_flow.ts",
+        SemanticInputStatus::Unknown,
         3,
         3,
         false,
@@ -1670,8 +1676,9 @@ pub fn with_java_early_return<T>(execute: impl FnOnce(&ValueFlowConformanceCase<
         "src/EarlyReturnFlowFixture.java",
         ExpectedSinkOutcome::NotReached,
         ExpectedSinkOutcome::NotReached,
-        1,
-        1,
+        SemanticInputStatus::Complete,
+        3,
+        3,
         true,
         execute,
     )
@@ -1688,6 +1695,7 @@ pub fn with_typescript_early_return<T>(
         "src/early_return_flow.ts",
         ExpectedSinkOutcome::Inconclusive,
         ExpectedSinkOutcome::Inconclusive,
+        SemanticInputStatus::Unknown,
         3,
         3,
         false,
@@ -1705,8 +1713,9 @@ pub fn with_java_two_matched_calls<T>(
         JAVA_TWO_CALL_PROCEDURES,
         "src/TwoCallFlowFixture.java",
         ExpectedSinkOutcome::NotReached,
-        1,
-        1,
+        SemanticInputStatus::Complete,
+        3,
+        3,
         true,
         execute,
     )
@@ -1722,8 +1731,9 @@ pub fn with_typescript_two_matched_calls<T>(
         TYPESCRIPT_TWO_CALL_PROCEDURES,
         "src/two_call_flow.ts",
         ExpectedSinkOutcome::Inconclusive,
-        6,
-        4,
+        SemanticInputStatus::Unknown,
+        3,
+        3,
         false,
         execute,
     )
@@ -1737,8 +1747,8 @@ pub fn with_java_receiver_flow<T>(execute: impl FnOnce(&ValueFlowConformanceCase
         JAVA_RECEIVER_PROCEDURES,
         "src/ReceiverFlowFixture.java",
         ExpectedSinkOutcome::Inconclusive,
-        1,
-        1,
+        3,
+        3,
         ValueFlowMayStatus::Proven,
         EXPECTED_PATH_QUALITIES,
         ValueFlowMayStatus::Unproven,
@@ -1760,14 +1770,12 @@ pub fn with_typescript_receiver_flow<T>(
         "src/receiver_flow.ts",
         ExpectedSinkOutcome::Inconclusive,
         6,
-        4,
+        6,
         ValueFlowMayStatus::Proven,
         EXPECTED_PATH_QUALITIES,
         ValueFlowMayStatus::Proven,
         PathQuality::PROVEN_COMPLETE,
-        SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
+        SemanticInputStatus::Unknown,
         false,
         execute,
     )
@@ -1781,7 +1789,7 @@ pub fn with_java_exceptional_flow<T>(
             alias: "flowed",
             call: "sink_call",
             argument: 0,
-            outcome: ExpectedSinkOutcome::Inconclusive,
+            outcome: ExpectedSinkOutcome::Reached,
         },
         CallArgumentSink {
             alias: "clean",
@@ -1790,26 +1798,20 @@ pub fn with_java_exceptional_flow<T>(
             outcome: ExpectedSinkOutcome::Inconclusive,
         },
     ];
-    execute(&ValueFlowConformanceCase {
-        name: "java-exceptional-flow-unsupported",
-        language: Language::Java,
-        files: JAVA_EXCEPTIONAL_FILES,
-        procedures: JAVA_EXCEPTIONAL_PROCEDURES,
-        root: "run",
-        calls: EXCEPTIONAL_CALLS,
-        unmodeled_call_behavior: brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Paranoid,
-        source: ParameterSource::Parameter {
-            procedure: "run",
-            ordinal: 0,
-        },
-        sinks: &sinks,
-        expected_discovery_status: SemanticInputStatus::Unknown,
-        expected_discovery_complete: false,
-        expected_result_complete: false,
-        expected_public_ambiguous: false,
-        expected_location_relations: &[],
-        expected_meetings: &[],
-    })
+    with_exceptional_flow(
+        "java-exceptional-flow",
+        Language::Java,
+        JAVA_EXCEPTIONAL_FILES,
+        JAVA_EXCEPTIONAL_PROCEDURES,
+        &sinks,
+        "src/ExceptionalFlowFixture.java",
+        3,
+        3,
+        ValueFlowMayStatus::Unproven,
+        PathQuality::UNPROVEN_PARTIAL,
+        false,
+        execute,
+    )
 }
 
 pub fn with_typescript_exceptional_flow<T>(
@@ -1838,6 +1840,8 @@ pub fn with_typescript_exceptional_flow<T>(
         "src/exceptional_flow.ts",
         3,
         3,
+        ValueFlowMayStatus::Proven,
+        PathQuality::PROVEN_COMPLETE,
         false,
         execute,
     )
@@ -1941,9 +1945,7 @@ pub fn with_typescript_capture_flow<T>(
         TYPESCRIPT_CAPTURE_FILES,
         TYPESCRIPT_CAPTURE_PROCEDURES,
         "src/capture_flow.ts",
-        SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
+        SemanticInputStatus::Unknown,
         false,
         execute,
     )
@@ -2004,7 +2006,7 @@ pub fn with_java_over_bound_field_flow<T>(
         &files,
         &procedures,
         files[0].path,
-        SemanticInputStatus::Unknown,
+        SemanticInputStatus::Unproven,
         execute,
     )
 }
@@ -2068,9 +2070,7 @@ pub fn with_java_index_access_flow<T>(
         &files,
         &procedures,
         files[0].path,
-        SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
+        SemanticInputStatus::Unproven,
         execute,
     )
 }
@@ -2102,9 +2102,7 @@ pub fn with_typescript_index_access_flow<T>(
         &files,
         &procedures,
         files[0].path,
-        SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
+        SemanticInputStatus::Unknown,
         execute,
     )
 }
@@ -2119,9 +2117,7 @@ pub fn with_java_field_alias_flow<T>(
         JAVA_FIELD_ALIAS_PROCEDURES,
         "run",
         BRANCH_CALLS,
-        SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
+        SemanticInputStatus::Unknown,
         false,
         execute,
     )
@@ -2137,9 +2133,7 @@ pub fn with_typescript_field_alias_flow<T>(
         TYPESCRIPT_FIELD_ALIAS_PROCEDURES,
         "run",
         BRANCH_CALLS,
-        SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
+        SemanticInputStatus::Unknown,
         false,
         execute,
     )
@@ -2168,9 +2162,7 @@ pub fn with_typescript_unresolved_call_negative<T>(
         TYPESCRIPT_UNRESOLVED_CALL_FILES,
         TYPESCRIPT_UNRESOLVED_CALL_PROCEDURES,
         "src/unresolved_call_flow.ts",
-        SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
+        SemanticInputStatus::Unknown,
         execute,
     )
 }
@@ -2211,6 +2203,7 @@ fn with_branch_merge<T>(
     procedures: &[ProcedureSelector<'_>],
     sinks: &[CallArgumentSink<'_>],
     path: &str,
+    expected_discovery_status: SemanticInputStatus,
     meeting_count: usize,
     public_endpoint_count: usize,
     expected_result_complete: bool,
@@ -2243,11 +2236,7 @@ fn with_branch_merge<T>(
         public_endpoint_count,
         may_status: ValueFlowMayStatus::Proven,
         public_may_complete_count: 0,
-        public_may_partial_count: if language == Language::TypeScript {
-            public_endpoint_count.saturating_sub(1)
-        } else {
-            0
-        },
+        public_may_partial_count: 0,
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
@@ -2272,8 +2261,11 @@ fn with_branch_merge<T>(
             ordinal: 0,
         },
         sinks,
-        expected_discovery_status: SemanticInputStatus::Unknown,
-        expected_discovery_complete: false,
+        expected_discovery_complete: matches!(
+            expected_discovery_status,
+            SemanticInputStatus::Complete
+        ),
+        expected_discovery_status,
         expected_result_complete,
         expected_public_ambiguous: false,
         expected_location_relations: &[],
@@ -2290,6 +2282,7 @@ fn with_early_return<T>(
     path: &str,
     clean_outcome: ExpectedSinkOutcome,
     unreachable_outcome: ExpectedSinkOutcome,
+    expected_discovery_status: SemanticInputStatus,
     meeting_count: usize,
     public_endpoint_count: usize,
     expected_result_complete: bool,
@@ -2342,11 +2335,7 @@ fn with_early_return<T>(
         public_endpoint_count,
         may_status: ValueFlowMayStatus::Proven,
         public_may_complete_count: 0,
-        public_may_partial_count: if language == Language::TypeScript {
-            public_endpoint_count.saturating_sub(1)
-        } else {
-            0
-        },
+        public_may_partial_count: 0,
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
@@ -2371,8 +2360,11 @@ fn with_early_return<T>(
             ordinal: 0,
         },
         sinks: &sinks,
-        expected_discovery_status: SemanticInputStatus::Unknown,
-        expected_discovery_complete: false,
+        expected_discovery_complete: matches!(
+            expected_discovery_status,
+            SemanticInputStatus::Complete
+        ),
+        expected_discovery_status,
         expected_result_complete,
         expected_public_ambiguous: false,
         expected_location_relations: &[],
@@ -2388,12 +2380,14 @@ fn with_two_matched_calls<T>(
     procedures: &[ProcedureSelector<'_>],
     path: &str,
     clean_outcome: ExpectedSinkOutcome,
+    expected_discovery_status: SemanticInputStatus,
     meeting_count: usize,
     public_endpoint_count: usize,
     expected_result_complete: bool,
     execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
 ) -> T {
-    let public_may_complete_count = usize::from(language == Language::TypeScript);
+    let public_may_complete_count = 0;
+    let _ = language;
     let sinks = [
         CallArgumentSink {
             alias: "flowed",
@@ -2504,11 +2498,7 @@ fn with_two_matched_calls<T>(
         public_endpoint_count,
         may_status: ValueFlowMayStatus::Proven,
         public_may_complete_count,
-        public_may_partial_count: if language == Language::TypeScript {
-            public_endpoint_count.saturating_sub(1 + public_may_complete_count)
-        } else {
-            0
-        },
+        public_may_partial_count: 0,
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
@@ -2533,8 +2523,11 @@ fn with_two_matched_calls<T>(
             ordinal: 0,
         },
         sinks: &sinks,
-        expected_discovery_status: SemanticInputStatus::Unknown,
-        expected_discovery_complete: false,
+        expected_discovery_complete: matches!(
+            expected_discovery_status,
+            SemanticInputStatus::Complete
+        ),
+        expected_discovery_status,
         expected_result_complete,
         expected_public_ambiguous: false,
         expected_location_relations: &[],
@@ -2625,11 +2618,9 @@ fn with_receiver_flow<T>(
         public_endpoint_count,
         may_status,
         public_may_complete_count,
-        public_may_partial_count: if language == Language::TypeScript {
-            public_endpoint_count.saturating_sub(1 + public_may_complete_count)
-        } else {
-            0
-        },
+        // Receiver dispatch stays unproven for both languages: the public
+        // projection retains two may/partial endpoints beside the exact rows.
+        public_may_partial_count: 2,
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities,
@@ -2673,6 +2664,8 @@ fn with_exceptional_flow<T>(
     path: &str,
     meeting_count: usize,
     public_endpoint_count: usize,
+    witness_may_status: ValueFlowMayStatus,
+    witness_path_quality: PathQuality,
     expected_result_complete: bool,
     execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
 ) -> T {
@@ -2690,24 +2683,25 @@ fn with_exceptional_flow<T>(
             ordinal: 0,
         },
     ];
+    let qualities = [witness_path_quality];
     let meetings = [ExpectedMeeting {
         sink: "flowed",
         meeting_count,
         public_endpoint_count,
-        may_status: ValueFlowMayStatus::Proven,
+        may_status: witness_may_status,
         public_may_complete_count: 0,
-        public_may_partial_count: if language == Language::TypeScript {
-            public_endpoint_count.saturating_sub(1)
-        } else {
+        public_may_partial_count: if witness_path_quality == PathQuality::PROVEN_COMPLETE {
             0
+        } else {
+            public_endpoint_count.saturating_sub(1)
         },
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
-        path_qualities: EXPECTED_PATH_QUALITIES,
+        path_qualities: &qualities,
         witness: ExpectedWitness {
             truncated: false,
-            may_status: ValueFlowMayStatus::Unproven,
-            path_quality: PathQuality::UNPROVEN_PARTIAL,
+            may_status: witness_may_status,
+            path_quality: witness_path_quality,
             carriers: &carriers,
             interprocedural: EXCEPTIONAL_INTERPROCEDURAL,
         },
@@ -2873,9 +2867,7 @@ fn with_field_access_flow<T>(
             ordinal: 0,
         },
         sinks: &sinks,
-        expected_discovery_status: SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
+        expected_discovery_status: SemanticInputStatus::Unknown,
         expected_discovery_complete: false,
         expected_result_complete,
         expected_public_ambiguous: false,
@@ -2983,18 +2975,27 @@ fn with_index_access_flow<T>(
     expected_discovery_status: SemanticInputStatus,
     execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
 ) -> T {
+    let complete = matches!(expected_discovery_status, SemanticInputStatus::Complete);
     let sinks = [
         CallArgumentSink {
             alias: "flowed",
             call: "sink_call",
             argument: 0,
-            outcome: ExpectedSinkOutcome::Inconclusive,
+            outcome: if complete {
+                ExpectedSinkOutcome::Reached
+            } else {
+                ExpectedSinkOutcome::Inconclusive
+            },
         },
         CallArgumentSink {
             alias: "wrong",
             call: "sink_call",
             argument: 1,
-            outcome: ExpectedSinkOutcome::Inconclusive,
+            outcome: if complete {
+                ExpectedSinkOutcome::NotReached
+            } else {
+                ExpectedSinkOutcome::Inconclusive
+            },
         },
     ];
     let index_location = |snippet: &str| CarrierMilestone::Location {
@@ -3052,9 +3053,12 @@ fn with_index_access_flow<T>(
             ordinal: 0,
         },
         sinks: &sinks,
+        expected_discovery_complete: matches!(
+            expected_discovery_status,
+            SemanticInputStatus::Complete
+        ),
         expected_discovery_status,
-        expected_discovery_complete: false,
-        expected_result_complete: false,
+        expected_result_complete: complete,
         expected_public_ambiguous: false,
         expected_location_relations: &expected_location_relations,
         expected_meetings: &[],
@@ -3070,11 +3074,8 @@ fn with_unresolved_call_negative<T>(
     expected_discovery_status: SemanticInputStatus,
     execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
 ) -> T {
-    let meeting_count = if language == Language::TypeScript {
-        3
-    } else {
-        1
-    };
+    let meeting_count = 3;
+    let _ = language;
     let sinks = [
         CallArgumentSink {
             alias: "preserved",
@@ -3109,7 +3110,7 @@ fn with_unresolved_call_negative<T>(
         public_endpoint_count: meeting_count,
         may_status: ValueFlowMayStatus::Proven,
         public_may_complete_count: 0,
-        public_may_partial_count: meeting_count.saturating_sub(1),
+        public_may_partial_count: 0,
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
@@ -3153,11 +3154,8 @@ fn with_ambiguous_call_negative<T>(
     expected_discovery_status: SemanticInputStatus,
     execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
 ) -> T {
-    let meeting_count = if language == Language::TypeScript {
-        3
-    } else {
-        1
-    };
+    let meeting_count = 3;
+    let _ = language;
     let sinks = [
         CallArgumentSink {
             alias: "preserved",
@@ -3192,7 +3190,7 @@ fn with_ambiguous_call_negative<T>(
         public_endpoint_count: meeting_count,
         may_status: ValueFlowMayStatus::Proven,
         public_may_complete_count: 0,
-        public_may_partial_count: meeting_count.saturating_sub(1),
+        public_may_partial_count: 0,
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
@@ -3243,7 +3241,8 @@ fn with_exact_helper<T>(
     expected_result_complete: bool,
     execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
 ) -> T {
-    let public_may_complete_count = usize::from(language == Language::TypeScript);
+    let public_may_complete_count = 0;
+    let _ = language;
     let carriers = vec![
         CarrierMilestone::Port {
             path: run_path.into(),
@@ -3302,11 +3301,7 @@ fn with_exact_helper<T>(
         public_endpoint_count,
         may_status: ValueFlowMayStatus::Proven,
         public_may_complete_count,
-        public_may_partial_count: if language == Language::TypeScript {
-            public_endpoint_count.saturating_sub(1 + public_may_complete_count)
-        } else {
-            0
-        },
+        public_may_partial_count: 0,
         must_status: ValueFlowMustStatus::NotEstablished,
         uncertain: false,
         path_qualities: EXPECTED_PATH_QUALITIES,
@@ -3506,8 +3501,11 @@ pub fn with_single_file_exact_helper<T>(
             ordinal: 0,
         },
         sinks: &sinks,
+        expected_discovery_complete: matches!(
+            expected_discovery_status,
+            SemanticInputStatus::Complete
+        ),
         expected_discovery_status,
-        expected_discovery_complete: false,
         expected_result_complete,
         expected_public_ambiguous: false,
         expected_location_relations: &[],
@@ -3551,10 +3549,10 @@ pub fn with_csharp_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCas
         "relayed",
         "copy",
         ExpectedSinkOutcome::NotReached,
-        SemanticInputStatus::Unknown,
+        SemanticInputStatus::Complete,
         true,
-        1,
-        1,
+        3,
+        3,
         0,
         0,
         execute,
@@ -3588,8 +3586,8 @@ pub fn with_rust_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase<
         ExpectedSinkOutcome::Inconclusive,
         SemanticInputStatus::Unknown,
         false,
-        1,
-        1,
+        3,
+        3,
         0,
         0,
         execute,
@@ -3619,15 +3617,13 @@ pub fn with_python_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCas
         "sink(copy, clean)",
         "relayed",
         "copy",
-        ExpectedSinkOutcome::Inconclusive,
-        SemanticInputStatus::Unsupported {
-            capability: SemanticCapability::ExceptionalControlFlow,
-        },
-        false,
-        6,
-        4,
-        1,
-        2,
+        ExpectedSinkOutcome::NotReached,
+        SemanticInputStatus::Complete,
+        true,
+        3,
+        3,
+        0,
+        0,
         execute,
     )
 }
@@ -3663,8 +3659,8 @@ pub fn with_scala_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCase
         ExpectedSinkOutcome::Inconclusive,
         SemanticInputStatus::Unknown,
         false,
-        1,
-        1,
+        3,
+        3,
         0,
         0,
         execute,
@@ -3700,10 +3696,10 @@ pub fn with_kotlin_exact_helper<T>(execute: impl FnOnce(&ValueFlowConformanceCas
         "relayed",
         "copy",
         ExpectedSinkOutcome::NotReached,
-        SemanticInputStatus::Unknown,
+        SemanticInputStatus::Complete,
         true,
-        1,
-        1,
+        3,
+        3,
         0,
         0,
         execute,
@@ -3832,8 +3828,8 @@ fn with_c_family_exact_helper<T>(
         run_path,
         relay_path,
         "relay(input)",
-        1,
-        1,
+        3,
+        3,
         SemanticInputStatus::Unknown,
         false,
         false,
@@ -3868,10 +3864,10 @@ function run(input) {
         ExpectedSinkOutcome::Inconclusive,
         SemanticInputStatus::Unknown,
         false,
-        6,
-        4,
-        1,
-        2,
+        3,
+        3,
+        0,
+        0,
         execute,
     )
 }
@@ -3895,8 +3891,8 @@ func run(input string) { copy := relay(input); clean := "clean"; sink(copy, clea
         ExpectedSinkOutcome::Inconclusive,
         SemanticInputStatus::Unknown,
         false,
-        1,
-        1,
+        3,
+        3,
         0,
         0,
         execute,
@@ -3920,10 +3916,10 @@ function run(string $input): void { $copy = relay($input); $clean = "clean"; sin
         "$relayed",
         "$copy",
         ExpectedSinkOutcome::NotReached,
-        SemanticInputStatus::Unknown,
+        SemanticInputStatus::Complete,
         true,
-        1,
-        1,
+        3,
+        3,
         0,
         0,
         execute,
@@ -3957,9 +3953,878 @@ end
         SemanticInputStatus::Unknown,
         false,
         6,
-        4,
+        6,
         1,
         2,
         execute,
     )
+}
+
+// ===== Issue #1951: balanced source-call scenario =====
+//
+// The smallest DataFlowBench shape. The positive routes a source call's
+// returned value directly into sink argument 0:
+//
+//     dfb_sink(dfb_source())
+//
+// The negative changes only the sink operand: the source result is unused
+// and the sink receives an independent constant:
+//
+//     dfb_source()
+//     dfb_sink("clean")
+//
+// Both cases bind the source with `ParameterSource::CallResult`, which
+// mirrors the production policy `:bind return-value` binding, and use
+// optimistic unmodeled-call behavior to match the shared DataFlowBench
+// `core-direct.rqlp` policy.
+
+/// One language's balanced fixture and its expected typed outcomes.
+pub struct BalancedSourceCallShape {
+    pub name: &'static str,
+    pub language: Language,
+    pub path: &'static str,
+    pub positive: &'static str,
+    pub negative: &'static str,
+    pub kind: ProcedureKind,
+    /// Exact source-call snippet in the positive fixture.
+    pub positive_source_call: &'static str,
+    /// Exact sink-call snippet in the positive fixture.
+    pub positive_sink_call: &'static str,
+    pub positive_discovery: SemanticInputStatus,
+    pub positive_result_complete: bool,
+    pub positive_meeting_count: usize,
+    pub positive_public_endpoint_count: usize,
+    pub positive_public_may_complete_count: usize,
+    pub positive_public_may_partial_count: usize,
+    pub negative_discovery: SemanticInputStatus,
+    pub negative_result_complete: bool,
+    /// `NotReached` when the negative completes; `Inconclusive` when a
+    /// path-relevant semantic gap keeps the language typed-incomplete.
+    pub negative_outcome: ExpectedSinkOutcome,
+}
+
+fn balanced_procedures(shape: &BalancedSourceCallShape) -> [ProcedureSelector<'static>; 3] {
+    [
+        ProcedureSelector {
+            alias: "run",
+            path: shape.path,
+            name: "run",
+            kind: shape.kind,
+        },
+        ProcedureSelector {
+            alias: "source",
+            path: shape.path,
+            name: "dfb_source",
+            kind: shape.kind,
+        },
+        ProcedureSelector {
+            alias: "sink",
+            path: shape.path,
+            name: "dfb_sink",
+            kind: shape.kind,
+        },
+    ]
+}
+
+const BALANCED_CALLS: &[CallSelector<'static>] = &[
+    CallSelector {
+        alias: "source_call",
+        caller: "run",
+        callee: "source",
+        occurrence: 0,
+    },
+    CallSelector {
+        alias: "sink_call",
+        caller: "run",
+        callee: "sink",
+        occurrence: 0,
+    },
+];
+
+pub fn with_balanced_source_call_positive<T>(
+    shape: &BalancedSourceCallShape,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let name = format!("{}_balanced_positive", shape.name);
+    let files = [InlineSourceFile {
+        path: shape.path,
+        source: shape.positive,
+    }];
+    let procedures = balanced_procedures(shape);
+    let sinks = [CallArgumentSink {
+        alias: "flowed",
+        call: "sink_call",
+        argument: 0,
+        outcome: ExpectedSinkOutcome::Reached,
+    }];
+    let carriers = vec![
+        CarrierMilestone::Value {
+            path: shape.path.into(),
+            procedure: "run".into(),
+            role: "temporary".into(),
+            ordinal: None,
+            snippet: shape.positive_source_call.into(),
+        },
+        CarrierMilestone::SinkArgument {
+            path: shape.path.into(),
+            caller: "run".into(),
+            callee: "sink".into(),
+            call: shape.positive_sink_call.into(),
+            ordinal: 0,
+        },
+    ];
+    let meetings = [ExpectedMeeting {
+        sink: "flowed",
+        meeting_count: shape.positive_meeting_count,
+        public_endpoint_count: shape.positive_public_endpoint_count,
+        may_status: ValueFlowMayStatus::Proven,
+        public_may_complete_count: shape.positive_public_may_complete_count,
+        public_may_partial_count: shape.positive_public_may_partial_count,
+        must_status: ValueFlowMustStatus::NotEstablished,
+        uncertain: false,
+        path_qualities: EXPECTED_PATH_QUALITIES,
+        witness: ExpectedWitness {
+            truncated: false,
+            may_status: ValueFlowMayStatus::Proven,
+            path_quality: PathQuality::PROVEN_COMPLETE,
+            carriers: &carriers,
+            interprocedural: &[],
+        },
+    }];
+    execute(&ValueFlowConformanceCase {
+        name: &name,
+        language: shape.language,
+        files: &files,
+        procedures: &procedures,
+        root: "run",
+        calls: BALANCED_CALLS,
+        unmodeled_call_behavior:
+            brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Optimistic,
+        source: ParameterSource::CallResult {
+            call: "source_call",
+        },
+        sinks: &sinks,
+        expected_discovery_status: shape.positive_discovery,
+        expected_discovery_complete: matches!(
+            shape.positive_discovery,
+            SemanticInputStatus::Complete
+        ),
+        expected_result_complete: shape.positive_result_complete,
+        expected_public_ambiguous: false,
+        expected_location_relations: &[],
+        expected_meetings: &meetings,
+    })
+}
+
+pub fn with_balanced_source_call_negative<T>(
+    shape: &BalancedSourceCallShape,
+    execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
+) -> T {
+    let name = format!("{}_balanced_negative", shape.name);
+    let files = [InlineSourceFile {
+        path: shape.path,
+        source: shape.negative,
+    }];
+    let procedures = balanced_procedures(shape);
+    let sinks = [CallArgumentSink {
+        alias: "clean",
+        call: "sink_call",
+        argument: 0,
+        outcome: shape.negative_outcome,
+    }];
+    execute(&ValueFlowConformanceCase {
+        name: &name,
+        language: shape.language,
+        files: &files,
+        procedures: &procedures,
+        root: "run",
+        calls: BALANCED_CALLS,
+        unmodeled_call_behavior:
+            brokk_bifrost::analyzer::dataflow::UnmodeledCallBehavior::Optimistic,
+        source: ParameterSource::CallResult {
+            call: "source_call",
+        },
+        sinks: &sinks,
+        expected_discovery_status: shape.negative_discovery,
+        expected_discovery_complete: matches!(
+            shape.negative_discovery,
+            SemanticInputStatus::Complete
+        ),
+        expected_result_complete: shape.negative_result_complete,
+        expected_public_ambiguous: false,
+        expected_location_relations: &[],
+        expected_meetings: &[],
+    })
+}
+
+pub fn python_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "python",
+        language: Language::Python,
+        path: "direct_flow.py",
+        positive: r#"
+def dfb_source():
+    return "tainted"
+
+
+def dfb_sink(value):
+    pass
+
+
+def run():
+    dfb_sink(dfb_source())
+"#,
+        negative: r#"
+def dfb_source():
+    return "tainted"
+
+
+def dfb_sink(value):
+    pass
+
+
+def run():
+    dfb_source()
+    dfb_sink("clean")
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn typescript_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "typescript",
+        language: Language::TypeScript,
+        path: "DirectFlow.ts",
+        positive: r#"
+function dfb_source(): string {
+  return "tainted";
+}
+
+function dfb_sink(value: string): void {}
+
+function run(): void {
+  dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+function dfb_source(): string {
+  return "tainted";
+}
+
+function dfb_sink(value: string): void {}
+
+function run(): void {
+  dfb_source();
+  dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+pub fn javascript_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "javascript",
+        language: Language::JavaScript,
+        path: "DirectFlow.js",
+        positive: r#"
+function dfb_source() {
+  return "tainted";
+}
+
+function dfb_sink(value) {}
+
+function run() {
+  dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+function dfb_source() {
+  return "tainted";
+}
+
+function dfb_sink(value) {}
+
+function run() {
+  dfb_source();
+  dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+pub fn java_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "java",
+        language: Language::Java,
+        path: "DirectFlow.java",
+        positive: r#"
+final class DirectFlow {
+    static String dfb_source() {
+        return "tainted";
+    }
+
+    static void dfb_sink(String value) {}
+
+    static void run() {
+        dfb_sink(dfb_source());
+    }
+}
+"#,
+        negative: r#"
+final class DirectFlow {
+    static String dfb_source() {
+        return "tainted";
+    }
+
+    static void dfb_sink(String value) {}
+
+    static void run() {
+        dfb_source();
+        dfb_sink("clean");
+    }
+}
+"#,
+        kind: ProcedureKind::Method,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn csharp_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "csharp",
+        language: Language::CSharp,
+        path: "DirectFlow.cs",
+        positive: r#"
+namespace DataFlowBench;
+
+static class DirectFlow
+{
+    static string dfb_source()
+    {
+        return "tainted";
+    }
+
+    static void dfb_sink(string value) { }
+
+    static void run()
+    {
+        dfb_sink(dfb_source());
+    }
+}
+"#,
+        negative: r#"
+namespace DataFlowBench;
+
+static class DirectFlow
+{
+    static string dfb_source()
+    {
+        return "tainted";
+    }
+
+    static void dfb_sink(string value) { }
+
+    static void run()
+    {
+        dfb_source();
+        dfb_sink("clean");
+    }
+}
+"#,
+        kind: ProcedureKind::Method,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn kotlin_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "kotlin",
+        language: Language::Kotlin,
+        path: "DirectFlow.kt",
+        positive: r#"
+package dataflowbench
+
+object DirectFlow {
+    fun dfb_source(): String {
+        return "tainted"
+    }
+
+    fun dfb_sink(value: String) {}
+
+    fun run() {
+        dfb_sink(dfb_source())
+    }
+}
+"#,
+        negative: r#"
+package dataflowbench
+
+object DirectFlow {
+    fun dfb_source(): String {
+        return "tainted"
+    }
+
+    fun dfb_sink(value: String) {}
+
+    fun run() {
+        dfb_source()
+        dfb_sink("clean")
+    }
+}
+"#,
+        kind: ProcedureKind::Method,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+pub fn scala_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "scala",
+        language: Language::Scala,
+        path: "DirectFlow.scala",
+        positive: r#"
+package dataflowbench
+
+object DirectFlow {
+  def dfb_source(): String = {
+    "tainted"
+  }
+
+  def dfb_sink(value: String): Unit = {}
+
+  def run(): Unit = {
+    dfb_sink(dfb_source())
+  }
+}
+"#,
+        negative: r#"
+package dataflowbench
+
+object DirectFlow {
+  def dfb_source(): String = {
+    "tainted"
+  }
+
+  def dfb_sink(value: String): Unit = {}
+
+  def run(): Unit = {
+    dfb_source()
+    dfb_sink("clean")
+  }
+}
+"#,
+        kind: ProcedureKind::Method,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+pub fn go_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "go",
+        language: Language::Go,
+        path: "direct_flow.go",
+        positive: r#"
+package dataflowbench
+
+func dfb_source() string {
+	return "tainted"
+}
+
+func dfb_sink(value string) {}
+
+func run() {
+	dfb_sink(dfb_source())
+}
+"#,
+        negative: r#"
+package dataflowbench
+
+func dfb_source() string {
+	return "tainted"
+}
+
+func dfb_sink(value string) {}
+
+func run() {
+	dfb_source()
+	dfb_sink("clean")
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn php_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "php",
+        language: Language::Php,
+        path: "direct_flow.php",
+        positive: r#"
+<?php
+function dfb_source(): string {
+    return "tainted";
+}
+
+function dfb_sink(string $value): void {}
+
+function run(): void {
+    dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+<?php
+function dfb_source(): string {
+    return "tainted";
+}
+
+function dfb_sink(string $value): void {}
+
+function run(): void {
+    dfb_source();
+    dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn ruby_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "ruby",
+        language: Language::Ruby,
+        path: "direct_flow.rb",
+        positive: r#"
+def dfb_source
+  "tainted"
+end
+
+def dfb_sink(value)
+end
+
+def run
+  dfb_sink(dfb_source())
+end
+"#,
+        negative: r#"
+def dfb_source
+  "tainted"
+end
+
+def dfb_sink(value)
+end
+
+def run
+  dfb_source
+  dfb_sink("clean")
+end
+"#,
+        kind: ProcedureKind::Method,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+pub fn rust_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "rust",
+        language: Language::Rust,
+        path: "direct_flow.rs",
+        positive: r#"
+fn dfb_source() -> &'static str {
+    "tainted"
+}
+
+fn dfb_sink(value: &str) {}
+
+fn run() {
+    dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+fn dfb_source() -> &'static str {
+    "tainted"
+}
+
+fn dfb_sink(value: &str) {}
+
+fn run() {
+    dfb_source();
+    dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn c_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "c",
+        language: Language::Cpp,
+        path: "direct_flow.c",
+        positive: r#"
+const char *dfb_source(void) {
+    return "tainted";
+}
+
+void dfb_sink(const char *value) {}
+
+void run(void) {
+    dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+const char *dfb_source(void) {
+    return "tainted";
+}
+
+void dfb_sink(const char *value) {}
+
+void run(void) {
+    dfb_source();
+    dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
+    }
+}
+
+pub fn cpp_balanced_source_call_shape() -> BalancedSourceCallShape {
+    BalancedSourceCallShape {
+        name: "cpp",
+        language: Language::Cpp,
+        path: "direct_flow.cpp",
+        positive: r#"
+const char *dfb_source() {
+    return "tainted";
+}
+
+void dfb_sink(const char *value) {}
+
+void run() {
+    dfb_sink(dfb_source());
+}
+"#,
+        negative: r#"
+const char *dfb_source() {
+    return "tainted";
+}
+
+void dfb_sink(const char *value) {}
+
+void run() {
+    dfb_source();
+    dfb_sink("clean");
+}
+"#,
+        kind: ProcedureKind::Function,
+        positive_source_call: "dfb_source()",
+        positive_sink_call: "dfb_sink(dfb_source())",
+        positive_discovery: SemanticInputStatus::Unknown,
+        positive_result_complete: false,
+        positive_meeting_count: 3,
+        positive_public_endpoint_count: 3,
+        positive_public_may_complete_count: 0,
+        positive_public_may_partial_count: 0,
+        negative_discovery: SemanticInputStatus::Unknown,
+        negative_result_complete: false,
+        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+    }
+}
+
+/// Every documented direct-ready language/dialect entry with its balanced
+/// shape constructor and per-route test names. New consumers stamp one test
+/// per entry so a missing language is a compile error, not a silent gap.
+macro_rules! balanced_source_call_scenario_entries {
+    ($consumer:ident) => {
+        $consumer! {
+            (python, python_balanced_source_call_shape, python_balanced_source_call_positive_direct, python_balanced_source_call_negative_direct, python_balanced_source_call_positive_public, python_balanced_source_call_negative_public),
+            (typescript, typescript_balanced_source_call_shape, typescript_balanced_source_call_positive_direct, typescript_balanced_source_call_negative_direct, typescript_balanced_source_call_positive_public, typescript_balanced_source_call_negative_public),
+            (javascript, javascript_balanced_source_call_shape, javascript_balanced_source_call_positive_direct, javascript_balanced_source_call_negative_direct, javascript_balanced_source_call_positive_public, javascript_balanced_source_call_negative_public),
+            (java, java_balanced_source_call_shape, java_balanced_source_call_positive_direct, java_balanced_source_call_negative_direct, java_balanced_source_call_positive_public, java_balanced_source_call_negative_public),
+            (csharp, csharp_balanced_source_call_shape, csharp_balanced_source_call_positive_direct, csharp_balanced_source_call_negative_direct, csharp_balanced_source_call_positive_public, csharp_balanced_source_call_negative_public),
+            (kotlin, kotlin_balanced_source_call_shape, kotlin_balanced_source_call_positive_direct, kotlin_balanced_source_call_negative_direct, kotlin_balanced_source_call_positive_public, kotlin_balanced_source_call_negative_public),
+            (scala, scala_balanced_source_call_shape, scala_balanced_source_call_positive_direct, scala_balanced_source_call_negative_direct, scala_balanced_source_call_positive_public, scala_balanced_source_call_negative_public),
+            (go, go_balanced_source_call_shape, go_balanced_source_call_positive_direct, go_balanced_source_call_negative_direct, go_balanced_source_call_positive_public, go_balanced_source_call_negative_public),
+            (php, php_balanced_source_call_shape, php_balanced_source_call_positive_direct, php_balanced_source_call_negative_direct, php_balanced_source_call_positive_public, php_balanced_source_call_negative_public),
+            (ruby, ruby_balanced_source_call_shape, ruby_balanced_source_call_positive_direct, ruby_balanced_source_call_negative_direct, ruby_balanced_source_call_positive_public, ruby_balanced_source_call_negative_public),
+            (rust, rust_balanced_source_call_shape, rust_balanced_source_call_positive_direct, rust_balanced_source_call_negative_direct, rust_balanced_source_call_positive_public, rust_balanced_source_call_negative_public),
+            (c, c_balanced_source_call_shape, c_balanced_source_call_positive_direct, c_balanced_source_call_negative_direct, c_balanced_source_call_positive_public, c_balanced_source_call_negative_public),
+            (cpp, cpp_balanced_source_call_shape, cpp_balanced_source_call_positive_direct, cpp_balanced_source_call_negative_direct, cpp_balanced_source_call_positive_public, cpp_balanced_source_call_negative_public),
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use balanced_source_call_scenario_entries;
+
+/// The balanced inventory covers every direct-ready language exactly once,
+/// with the C and C++ dialects as separate entries, and each shape keeps the
+/// balanced contract: one reached positive sink and one balanced negative
+/// whose expectation is either clean or typed-incomplete, never optimistic.
+pub fn assert_balanced_source_call_scenario_inventory() {
+    macro_rules! collect_shapes {
+        ($(($name:ident, $shape:ident, $($test:ident),*),)*) => {
+            vec![$($shape(),)*]
+        };
+    }
+    let shapes: Vec<BalancedSourceCallShape> =
+        balanced_source_call_scenario_entries!(collect_shapes);
+    assert_eq!(shapes.len(), 13);
+    let mut languages = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for shape in &shapes {
+        assert!(
+            names.insert(shape.name),
+            "duplicate balanced scenario {}",
+            shape.name
+        );
+        languages.insert(shape.language);
+        assert!(
+            matches!(
+                shape.negative_outcome,
+                ExpectedSinkOutcome::NotReached | ExpectedSinkOutcome::Inconclusive
+            ),
+            "{} negative must stay clean or typed-incomplete",
+            shape.name
+        );
+        assert_eq!(
+            shape.negative_result_complete,
+            shape.negative_outcome == ExpectedSinkOutcome::NotReached,
+            "{} negative completeness must match its outcome honesty",
+            shape.name
+        );
+    }
+    assert_eq!(
+        languages,
+        DIRECT_VALUE_FLOW_READY_LANGUAGES.into_iter().collect()
+    );
+    assert!(names.contains("c") && names.contains("cpp"));
 }

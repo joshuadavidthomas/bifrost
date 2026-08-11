@@ -1109,12 +1109,23 @@ impl IdeDataflowProblem for TaintFlowProblem<'_> {
         TaintFact::ZERO
     }
 
+    fn resolved_call_to_return(&self) -> bool {
+        true
+    }
+
     fn zero_value(&self) -> Self::Value {
         self.plan.universe().empty_set()
     }
 
     fn identity_edge_function(&self) -> Self::EdgeFunction {
         self.plan.identity().clone()
+    }
+
+    fn is_flow_observation(&self, fact: &Self::Fact) -> bool {
+        // A sink-meeting fact records that tainted data reached a bound sink
+        // on the current path. It is a terminal observation of the calling
+        // context, never a value entering a callee (#1917).
+        fact.sink().is_some()
     }
 
     fn meet_values(&self, left: &Self::Value, right: &Self::Value) -> Self::Value {

@@ -386,6 +386,10 @@ impl DistributiveDataflowProblem for ValueFlowProblem<'_> {
         ValueFlowFact::ZERO
     }
 
+    fn resolved_call_to_return(&self) -> bool {
+        true
+    }
+
     fn normal_flow(
         &self,
         edge: DataflowEdge<'_, Self::Fact>,
