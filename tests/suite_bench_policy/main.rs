@@ -53,6 +53,7 @@ mod sanitizer_pack_shipping;
 #[cfg(feature = "release-tooling")]
 mod golden_summary_pack_shipping;
 mod issue_1953_ruby_call_binding;
+mod issue_1978_unmaterialized_external_summary;
 mod scan_usages_same_owner_policy;
 // Milestone 3 of the procedure-summary foundry (#1871). The fixture engine and
 // its runner are generation-time tooling behind `release-tooling`, so this

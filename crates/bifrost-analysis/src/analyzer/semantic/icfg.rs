@@ -978,6 +978,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                         dispatch: DispatchBoundary {
                             kind: boundary_kind,
                             exact_external_target: None,
+                            unmaterialized_external_target: None,
                             proof: candidate.proof,
                             completeness,
                             provenance,

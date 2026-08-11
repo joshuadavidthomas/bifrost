@@ -21,7 +21,10 @@ use crate::analyzer::dataflow::{
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmRequest, DenseBidirectionalGraph, strongly_connected_components,
 };
-use crate::analyzer::semantic::{SemanticArtifactKey, SemanticLocator, SemanticRole, StableDigest};
+use crate::analyzer::semantic::{
+    SemanticArtifactKey, SemanticLocator, SemanticRole, StableDigest,
+    is_unmaterialized_external_artifact,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, map_with_capacity};
 
@@ -351,10 +354,16 @@ fn verify_target(
         && binding.artifact.mount() == binding.procedure.mount()
         && binding.artifact.path() == binding.procedure.path()
         && binding.artifact.language() == binding.procedure.language();
-    if binding.target != *target
-        || target.path != binding.artifact.path().as_str()
-        || !exact_artifact_locator
-    {
+    // A materialized external target's authored path must equal its artifact
+    // path. A fully-qualified unmaterialized external target has no real artifact,
+    // so its artifact path is the synthetic provenance sentinel; validate that
+    // case by the canonical identity (language, owner, member, arity, receiver)
+    // that the boundary and the summary already agreed on, and by the receiver
+    // and parameter checks below, without weakening the materialized-path check
+    // (#1978).
+    let path_is_valid = is_unmaterialized_external_artifact(&binding.artifact)
+        || target.path == binding.artifact.path().as_str();
+    if binding.target != *target || !path_is_valid || !exact_artifact_locator {
         return Err(ProcedureSummaryBindingError::TargetMismatch {
             summary_id: summary.id.clone(),
         });

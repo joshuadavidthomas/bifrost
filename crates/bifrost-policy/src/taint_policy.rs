@@ -50,15 +50,16 @@ use brokk_bifrost_analysis::analyzer::dataflow::{
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
     CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget, OracleCallContext,
-    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticBudget, SemanticOutcome, ValueHandle,
-    WorkspaceIcfgProvider,
+    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticArtifactKey, SemanticBudget,
+    SemanticOutcome, UnmaterializedExternalTarget, ValueHandle, WorkspaceIcfgProvider,
+    split_qualified_member,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledProcedureSummary, CompiledSummaryEffect, ExactProcedureSummaryBoundary,
     ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
-    ExactProcedureSummaryTargetBinding, ProcedureSummaryTargetKey, ResolvedActiveSemanticModels,
-    SemanticModelMatchDisposition, bind_compiled_procedure_summaries,
+    ExactProcedureSummaryTargetBinding, ProcedureSummaryMemberKey, ProcedureSummaryTargetKey,
+    ResolvedActiveSemanticModels, SemanticModelMatchDisposition, bind_compiled_procedure_summaries,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits,
@@ -402,6 +403,10 @@ struct DiscoveredValueFlow {
     bindings: Vec<ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::CallBindings>>,
     procedures: HashSet<ProcedureHandle>,
     external_targets: Vec<ExactExternalProcedureTarget>,
+    /// Canonical identities of fully-qualified external callees that never
+    /// materialize to an artifact, kept separate from `external_targets` so the
+    /// materialized-external binding path is unchanged (#1978).
+    unmaterialized_external_targets: Vec<UnmaterializedExternalTarget>,
 }
 
 /// Compile-scoped materialization cache for require-model taint discovery
@@ -854,9 +859,11 @@ impl<'a> TaintPolicyCompiler<'a> {
         let mut seen = HashSet::new();
         let mut seen_bindings = HashSet::new();
         let mut seen_external_targets = HashSet::new();
+        let mut seen_unmaterialized_targets = HashSet::new();
         let mut snapshots = Vec::new();
         let mut bindings = Vec::new();
         let mut external_targets = Vec::new();
+        let mut unmaterialized_external_targets = Vec::new();
         while let Some(procedure) = pending.pop() {
             if !seen.insert(procedure.clone()) {
                 continue;
@@ -927,6 +934,14 @@ impl<'a> TaintPolicyCompiler<'a> {
                     {
                         external_targets.push(target.clone());
                     }
+                    // #1978: a fully-qualified external callee that never
+                    // materializes carries its canonical identity here instead of
+                    // a materialized `exact_external_target`.
+                    if let Some(target) = boundary.unmaterialized_external_target()
+                        && seen_unmaterialized_targets.insert(target.clone())
+                    {
+                        unmaterialized_external_targets.push(target.clone());
+                    }
                 }
                 for candidate in dispatch.candidates() {
                     let binding_key = (call.clone(), candidate.target().clone());
@@ -973,6 +988,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             bindings,
             procedures: seen,
             external_targets,
+            unmaterialized_external_targets,
         })
     }
 
@@ -985,7 +1001,8 @@ impl<'a> TaintPolicyCompiler<'a> {
     ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
         let external_summaries = self.bind_external_summaries(
             &discovery.external_targets,
-            discovery.root.artifact().key().dependencies(),
+            &discovery.unmaterialized_external_targets,
+            discovery.root.artifact().key(),
             call_behavior,
         )?;
         let plan = ValueFlowPlan::with_call_behavior(
@@ -1008,12 +1025,14 @@ impl<'a> TaintPolicyCompiler<'a> {
     fn bind_external_summaries(
         &self,
         targets: &[ExactExternalProcedureTarget],
-        dependencies: brokk_bifrost_analysis::analyzer::semantic::DependencyFingerprint,
+        unmaterialized: &[UnmaterializedExternalTarget],
+        root_artifact: &SemanticArtifactKey,
         call_behavior: brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior,
     ) -> Result<Option<ExternalSemanticSummarySet>, TaintPolicyCompileError> {
         let Some(active) = &self.active_semantic_models else {
             return Ok(None);
         };
+        let dependencies = root_artifact.dependencies();
         let compatibility = ExternalSummaryCompatibilityKey::new(
             SummarySchemaVersion::CURRENT,
             SummarySemanticsVersion::hash_bytes(b"bifrost.production-value-flow.semantic-pack.v1"),
@@ -1058,7 +1077,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 });
             family.root_ids.insert(selected.record.id.clone());
         }
-        if families.is_empty() {
+        if families.is_empty() && unmaterialized.is_empty() {
             return Ok(None);
         }
 
@@ -1158,6 +1177,150 @@ impl<'a> TaintPolicyCompiler<'a> {
             let set = bind_compiled_procedure_summaries(&summaries, bindings, compatibility)
                 .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))?;
             lowered.extend(set.entries().map(|(_, summary)| summary.clone()));
+        }
+
+        // #1978: bind activated summaries to fully-qualified external callees that
+        // never materialize. They select a summary by canonical identity
+        // (language, owner FQN, member, arity, has_receiver) rather than by
+        // artifact path or parameter-typed symbol, and anchor the lowered summary
+        // to the boundary's synthetic locator so it applies at solve time. The
+        // materialized-external binding above is untouched.
+        let mut unmaterialized_families = HashMap::<usize, SelectedSummaryFamily>::new();
+        for target in unmaterialized {
+            let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                target.language().stable_label(),
+                target.owner_fqn(),
+                target.member(),
+                target.has_receiver(),
+                target.arity(),
+            ));
+            match matched.disposition {
+                SemanticModelMatchDisposition::Empty => continue,
+                SemanticModelMatchDisposition::Conflict => {
+                    return Err(TaintPolicyCompileError::Model(format!(
+                        "conflicting activated procedure summaries target unmaterialized external {}.{}",
+                        target.owner_fqn(),
+                        target.member()
+                    )));
+                }
+                SemanticModelMatchDisposition::Unique => {}
+            }
+            let [selected] = matched.records.as_slice() else {
+                return Err(TaintPolicyCompileError::Model(
+                    "unique unmaterialized procedure-summary lookup returned a non-unique record set"
+                        .to_owned(),
+                ));
+            };
+            let family_key = selected.payload.as_ptr() as usize;
+            let family = unmaterialized_families
+                .entry(family_key)
+                .or_insert_with(|| SelectedSummaryFamily {
+                    language: selected.shard.manifest.language.clone(),
+                    payload: selected.payload.to_vec(),
+                    root_ids: HashSet::new(),
+                });
+            family.root_ids.insert(selected.record.id.clone());
+        }
+        let mut unmaterialized_families = unmaterialized_families.into_values().collect::<Vec<_>>();
+        unmaterialized_families.sort_unstable_by(|left, right| {
+            left.language.cmp(&right.language).then_with(|| {
+                left.payload
+                    .iter()
+                    .map(|summary| (&summary.model_id, &summary.id))
+                    .cmp(
+                        right
+                            .payload
+                            .iter()
+                            .map(|summary| (&summary.model_id, &summary.id)),
+                    )
+            })
+        });
+        for family in unmaterialized_families {
+            let by_id = family
+                .payload
+                .iter()
+                .map(|summary| (summary.id.as_str(), summary))
+                .collect::<HashMap<_, _>>();
+            let mut pending = family.root_ids.into_iter().collect::<Vec<_>>();
+            pending.sort_unstable_by(|left, right| right.cmp(left));
+            let mut selected_ids = HashSet::new();
+            while let Some(id) = pending.pop() {
+                if !selected_ids.insert(id.clone()) {
+                    continue;
+                }
+                let summary = by_id.get(id.as_str()).ok_or_else(|| {
+                    TaintPolicyCompileError::Model(format!(
+                        "activated procedure-summary dependency `{id}` is missing from its payload"
+                    ))
+                })?;
+                for effect in &summary.effects {
+                    match effect {
+                        CompiledSummaryEffect::Call { callee, .. } => pending.push(callee.clone()),
+                        CompiledSummaryEffect::AmbiguousCall { candidates, .. } => {
+                            pending.extend(candidates.iter().cloned());
+                        }
+                        CompiledSummaryEffect::Allocation { .. }
+                        | CompiledSummaryEffect::Escape { .. }
+                        | CompiledSummaryEffect::UnknownCall { .. }
+                        | CompiledSummaryEffect::UnknownCallBoundary { .. }
+                        | CompiledSummaryEffect::Sanitize { .. } => {}
+                    }
+                }
+            }
+            let summaries = family
+                .payload
+                .iter()
+                .filter(|summary| selected_ids.contains(&summary.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut bindings = Vec::with_capacity(summaries.len());
+            for summary in &summaries {
+                // Re-match this closure summary to its unmaterialized external
+                // target by canonical identity. Parameter types are discarded, so
+                // a same-arity overload set collapses to one identity here.
+                let mut exact = unmaterialized
+                    .iter()
+                    .filter(|target| {
+                        target.language().stable_label() == family.language
+                            && target.has_receiver() == summary.target.has_receiver
+                            && target.arity() == summary.target.parameter_count
+                            && split_qualified_member(&summary.target.symbol).is_some_and(
+                                |(owner, member)| {
+                                    owner == target.owner_fqn() && member == target.member()
+                                },
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                exact.sort_unstable_by(|left, right| left.locator().cmp(right.locator()));
+                exact.dedup();
+                let [target] = exact.as_slice() else {
+                    return Err(TaintPolicyCompileError::Model(format!(
+                        "unmaterialized procedure summary `{}` dependency closure lacks one external target identity",
+                        summary.id
+                    )));
+                };
+                let receiver = summary
+                    .target
+                    .has_receiver
+                    .then_some(ExactProcedureSummaryReceiver);
+                let parameters = (0..summary.target.parameter_count)
+                    .map(ExactProcedureSummaryParameter::new)
+                    .collect();
+                bindings.push(ExactProcedureSummaryTargetBinding::new(
+                    summary.id.clone(),
+                    summary.target.clone(),
+                    target.provenance_artifact_key(root_artifact),
+                    target.locator().clone(),
+                    ExactProcedureSummaryBoundary::new(receiver, parameters),
+                ));
+            }
+            let set = bind_compiled_procedure_summaries(&summaries, bindings, compatibility)
+                .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))?;
+            lowered.extend(set.entries().map(|(_, summary)| summary.clone()));
+        }
+
+        if lowered.is_empty() {
+            return Ok(None);
         }
         ExternalSemanticSummarySet::try_new(lowered, compatibility)
             .map(Some)

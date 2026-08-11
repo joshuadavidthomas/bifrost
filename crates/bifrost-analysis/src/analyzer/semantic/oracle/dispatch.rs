@@ -1,4 +1,7 @@
-use super::super::ids::{SemanticArtifactKey, SemanticLocator, SemanticRole};
+use super::super::ids::{
+    SemanticArtifactKey, SemanticLanguage, SemanticLocator, SemanticRole, WorkspaceMountId,
+    WorkspaceRelativePath,
+};
 use super::super::ir::{CallSiteHandle, EvidenceCompleteness, ProcedureHandle, ProofStatus};
 use super::error::OracleContractError;
 use super::limits::OracleLimits;
@@ -104,6 +107,13 @@ pub struct DispatchBoundary {
     /// any one of the exact artifact, declaration, symbol, receiver, or formal
     /// parameter facts required to bind an external procedure summary.
     pub exact_external_target: Option<ExactExternalProcedureTarget>,
+    /// Canonical identity for a fully-qualified external callee that never
+    /// materializes to any artifact (a JDK method such as
+    /// `java.net.URLDecoder.decode`). It carries the synthetic locator named by
+    /// `External(Some(_))` plus the owner FQN, member, arity, and receiver shape
+    /// that let an activated authored summary bind by identity (#1978). It is
+    /// mutually exclusive with `exact_external_target`.
+    pub unmaterialized_external_target: Option<UnmaterializedExternalTarget>,
     pub proof: ProofStatus,
     pub completeness: EvidenceCompleteness,
     pub provenance: Box<[OracleRelationHandle]>,
@@ -118,6 +128,13 @@ impl DispatchBoundary {
         self.exact_external_target.as_ref()
     }
 
+    /// The canonical identity of a fully-qualified external callee that never
+    /// materializes to an artifact, present only when this boundary carries one
+    /// (#1978).
+    pub fn unmaterialized_external_target(&self) -> Option<&UnmaterializedExternalTarget> {
+        self.unmaterialized_external_target.as_ref()
+    }
+
     /// Validate one retained boundary independently of the dispatch result
     /// that originally sealed it.
     ///
@@ -128,8 +145,12 @@ impl DispatchBoundary {
         &self,
         call: &CallSiteHandle,
     ) -> Result<(), OracleContractError> {
-        let exact_target_is_valid = match (&self.kind, &self.exact_external_target) {
-            (DispatchBoundaryKind::Unmaterialized(locator), Some(target)) => {
+        let exact_target_is_valid = match (
+            &self.kind,
+            &self.exact_external_target,
+            &self.unmaterialized_external_target,
+        ) {
+            (DispatchBoundaryKind::Unmaterialized(locator), Some(target), None) => {
                 locator == target.procedure()
                     && call
                         .procedure()
@@ -137,7 +158,18 @@ impl DispatchBoundary {
                         .call_site(call.id())
                         .is_some_and(|row| row.receiver.is_some() == target.has_receiver())
             }
-            (_, None) => true,
+            // #1978: a fully-qualified unmaterialized external callee names its
+            // synthetic locator through `External(Some(_))` and carries its
+            // canonical identity, but never a materialized `exact_external_target`.
+            (DispatchBoundaryKind::External(Some(locator)), None, Some(target)) => {
+                locator == target.locator()
+                    && call
+                        .procedure()
+                        .semantics()
+                        .call_site(call.id())
+                        .is_some_and(|row| row.receiver.is_some() == target.has_receiver())
+            }
+            (_, None, None) => true,
             _ => false,
         };
         if !exact_target_is_valid {
@@ -224,6 +256,127 @@ impl ExactExternalProcedureTarget {
     pub const fn parameter_count(&self) -> u32 {
         self.parameter_count
     }
+}
+
+/// Canonical identity for a fully-qualified external callee that never
+/// materializes to a workspace or classpath artifact, yet whose name lets an
+/// activated authored procedure summary bind (#1978).
+///
+/// The match identity is `(language, owner FQN, member, arity, has_receiver)`.
+/// Parameter types are unrecoverable for an unmaterialized callee, so same-arity
+/// overloads that differ only by parameter type cannot be told apart here. The
+/// synthetic `locator` -- and the provenance artifact key derived from it -- is
+/// not a real source location; it only anchors the bound summary so the boundary
+/// and the summary compare equal. The owner FQN and member are stored verbatim
+/// so the summary lookup never has to re-parse the locator.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UnmaterializedExternalTarget {
+    owner_fqn: Box<str>,
+    member: Box<str>,
+    arity: u32,
+    has_receiver: bool,
+    locator: SemanticLocator,
+}
+
+impl UnmaterializedExternalTarget {
+    pub(crate) fn new(
+        owner_fqn: impl Into<Box<str>>,
+        member: impl Into<Box<str>>,
+        arity: u32,
+        has_receiver: bool,
+        locator: SemanticLocator,
+    ) -> Self {
+        debug_assert_eq!(locator.role(), SemanticRole::Procedure);
+        debug_assert!(is_unmaterialized_external_artifact_locator(&locator));
+        Self {
+            owner_fqn: owner_fqn.into(),
+            member: member.into(),
+            arity,
+            has_receiver,
+            locator,
+        }
+    }
+
+    pub fn owner_fqn(&self) -> &str {
+        &self.owner_fqn
+    }
+
+    pub fn member(&self) -> &str {
+        &self.member
+    }
+
+    pub const fn arity(&self) -> u32 {
+        self.arity
+    }
+
+    pub const fn has_receiver(&self) -> bool {
+        self.has_receiver
+    }
+
+    pub fn language(&self) -> SemanticLanguage {
+        self.locator.language()
+    }
+
+    /// The synthetic procedure locator that both the boundary (at solve time) and
+    /// the bound summary (at discovery time) name, so the two compare equal.
+    pub fn locator(&self) -> &SemanticLocator {
+        &self.locator
+    }
+
+    /// Build the provenance artifact key that anchors the bound summary. It
+    /// reuses the synthetic mount, path, and language of `locator` -- so
+    /// `ExternalSummaryTarget::matches(self.locator())` succeeds -- and copies the
+    /// caller-analysis validity fields from `template` so the bound summary's
+    /// dependency fingerprint matches the active compatibility key.
+    pub fn provenance_artifact_key(&self, template: &SemanticArtifactKey) -> SemanticArtifactKey {
+        SemanticArtifactKey::new(
+            self.locator.mount(),
+            self.locator.path().clone(),
+            self.locator.language(),
+            template.revision(),
+            template.adapter().clone(),
+            template.ir_version(),
+            template.configuration(),
+            template.dependencies(),
+        )
+    }
+}
+
+/// Stable sentinel mount for synthetic unmaterialized-external identities. The
+/// mount and path are provenance only; both the boundary locator and the bound
+/// summary artifact key use them, so the two compare equal (#1978).
+pub(crate) fn unmaterialized_external_mount() -> WorkspaceMountId {
+    WorkspaceMountId::hash_bytes(b"bifrost.unmaterialized-external.mount.v1")
+}
+
+/// Stable sentinel provenance path for synthetic unmaterialized externals.
+pub(crate) fn unmaterialized_external_path() -> WorkspaceRelativePath {
+    WorkspaceRelativePath::new("bifrost-unmaterialized-external")
+        .expect("static sentinel path is portable")
+}
+
+/// Whether `key` is the synthetic provenance artifact of an unmaterialized
+/// external target rather than a real materialized artifact (#1978).
+pub(crate) fn is_unmaterialized_external_artifact(key: &SemanticArtifactKey) -> bool {
+    key.mount() == unmaterialized_external_mount()
+}
+
+fn is_unmaterialized_external_artifact_locator(locator: &SemanticLocator) -> bool {
+    locator.mount() == unmaterialized_external_mount()
+        && *locator.path() == unmaterialized_external_path()
+}
+
+/// Split a resolved or authored qualified callee symbol into `(owner FQN,
+/// member)`. It strips an optional trailing parameter list, then splits the
+/// final dotted segment as the member. It returns `None` when no owner qualifier
+/// is present. The parameter types are intentionally discarded: an unmaterialized
+/// callee cannot recover them, so the canonical identity never depends on them
+/// (#1978). This reads a resolved or authored call-target string, not a
+/// `CodeUnit` name accessor, so it does not re-infer declaration structure.
+pub fn split_qualified_member(symbol: &str) -> Option<(&str, &str)> {
+    let without_parameters = symbol.split_once('(').map_or(symbol, |(head, _tail)| head);
+    let (owner, member) = without_parameters.rsplit_once('.')?;
+    (!owner.is_empty() && !member.is_empty()).then_some((owner.trim(), member.trim()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,5 +557,51 @@ impl DispatchResult {
             return Err(OracleContractError::InvalidRelationIdentity);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod split_qualified_member_tests {
+    use super::split_qualified_member;
+
+    #[test]
+    fn splits_a_fully_qualified_callee_with_a_parameter_list() {
+        assert_eq!(
+            split_qualified_member("java.net.URLDecoder.decode(java.lang.String,java.lang.String)"),
+            Some(("java.net.URLDecoder", "decode"))
+        );
+    }
+
+    #[test]
+    fn splits_a_fully_qualified_callee_without_a_parameter_list() {
+        assert_eq!(
+            split_qualified_member("java.net.URLDecoder.decode"),
+            Some(("java.net.URLDecoder", "decode"))
+        );
+    }
+
+    #[test]
+    fn keeps_a_single_segment_owner_so_the_fully_qualified_gate_can_reject_it() {
+        // Import-qualified `URLDecoder.decode` still splits, but its owner has no
+        // dot; the fully-qualified gate at the call site rejects it.
+        assert_eq!(
+            split_qualified_member("URLDecoder.decode"),
+            Some(("URLDecoder", "decode"))
+        );
+    }
+
+    #[test]
+    fn rejects_an_unqualified_callee() {
+        assert_eq!(split_qualified_member("decode"), None);
+        assert_eq!(split_qualified_member("decode(x)"), None);
+    }
+
+    #[test]
+    fn does_not_reconstruct_parameter_types() {
+        // Only the owner and member are recovered; the parameter list is dropped.
+        let (owner, member) =
+            split_qualified_member("a.b.C.m(int, long)").expect("qualified split");
+        assert_eq!(owner, "a.b.C");
+        assert_eq!(member, "m");
     }
 }
