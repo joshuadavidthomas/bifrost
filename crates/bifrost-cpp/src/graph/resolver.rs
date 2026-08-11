@@ -3927,6 +3927,54 @@ impl<'a> VisibilityIndex<'a> {
         }
     }
 
+    /// Return true when a class-owned alias names the requested type as one
+    /// structured qualifier in its target path.
+    ///
+    /// A dependent target such as `Primary<T>::Type` cannot resolve to one
+    /// indexed class. Forward lookup can still retain `Primary` as its bounded
+    /// canonical identity. Inverse lookup needs the same evidence when later
+    /// references use only the alias spelling.
+    pub fn structured_class_alias_path_preserves_target(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        visible_from: &ProjectFile,
+        alias: &CodeUnit,
+        target: &CodeUnit,
+    ) -> bool {
+        let Some(owner) = type_owner_of(analyzer, alias).filter(CodeUnit::is_class) else {
+            return false;
+        };
+        let Some(StructuredAliasTarget::Named {
+            components, global, ..
+        }) = self.structured_alias_target(analyzer, alias)
+        else {
+            return false;
+        };
+        let lexical_scope = canonical_cpp_scope_components(&owner);
+        (1..components.len()).rev().any(|component_count| {
+            matches!(
+                self.resolve_type_components_lexically_for_target(
+                    analyzer,
+                    visible_from,
+                    &components[..component_count],
+                    global,
+                    &lexical_scope,
+                    target,
+                ),
+                LexicalTypeResolution::Resolved {
+                    ref unit,
+                    ref candidates,
+                    ..
+                } if same_visible_symbol(unit, target)
+                    || self.same_template_member_identity(analyzer, unit, target)
+                    || candidates.iter().any(|candidate| {
+                        same_visible_symbol(candidate, target)
+                            || self.same_template_member_identity(analyzer, candidate, target)
+                    })
+            )
+        })
+    }
+
     fn flattened_macro_namespace_alias_target_matches(
         &self,
         analyzer: &CppGraphSource<'_>,

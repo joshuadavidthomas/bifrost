@@ -9,6 +9,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod cpp_alias_primary_inverse_regression;
 mod cpp_member_dispatch_trace;
 mod csharp_bounded_receiver_hardening;
 mod csharp_ranks21_30_regression;
