@@ -726,7 +726,10 @@ pub fn usage_direct_base(
 
 fn csharp_is_class_base_declaration(graph: &CSharpGraphSource<'_>, candidate: &CodeUnit) -> bool {
     let language = tree_sitter_c_sharp::LANGUAGE.into();
-    let Some(parsed) = parse_tree_sitter_file(candidate.source(), &language) else {
+    let Some(parsed) = parse_tree_sitter_file(
+        candidate.source(),
+        crate::preprocessor::csharp_parse_spec(&language),
+    ) else {
         return false;
     };
     graph.index.ranges(candidate).into_iter().any(|range| {

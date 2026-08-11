@@ -77,6 +77,13 @@ pub(crate) fn extract_file_facts_limited(
     if parser.set_language(grammar).is_err() {
         return LimitedFileFacts::Unavailable;
     }
+    // C# hides preprocessor directive lines and inactive conditional branches
+    // from the parser; every other language parses the whole file.
+    if let Some(ranges) = spec.parser_included_ranges(source)
+        && parser.set_included_ranges(&ranges).is_err()
+    {
+        return LimitedFileFacts::Unavailable;
+    }
     let tree = if let Some(cancellation) = cancellation {
         let mut read = |offset: usize, _| &source.as_bytes()[offset..];
         let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();

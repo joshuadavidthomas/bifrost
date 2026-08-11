@@ -218,9 +218,13 @@ where
     let language = tree_sitter_c_sharp::LANGUAGE.into();
     let graph = csharp_graph_source(analyzer);
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            brokk_bifrost_csharp::graph::inverted::scan_file(&graph, csharp, file, input)
-        })
+        parse_and_collect(
+            analyzer,
+            file,
+            nodes,
+            brokk_bifrost_csharp::preprocessor::csharp_parse_spec(&language),
+            |input| brokk_bifrost_csharp::graph::inverted::scan_file(&graph, csharp, file, input),
+        )
     })
 }
 

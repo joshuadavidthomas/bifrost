@@ -261,6 +261,10 @@ impl StructuralSpec for CSharpStructuralSpec {
         Language::CSharp
     }
 
+    fn parser_included_ranges(&self, source: &str) -> Option<Vec<tree_sitter::Range>> {
+        crate::preprocessor::csharp_included_ranges(source)
+    }
+
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)] {
         CSHARP_KIND_TABLE
     }

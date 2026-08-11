@@ -8,6 +8,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, CppAnalyzer, IAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::{HashMap, HashSet};
@@ -341,14 +342,20 @@ where
     let language = tree_sitter_cpp::LANGUAGE.into();
     let dispatch = CppDispatch::new(analyzer);
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            brokk_bifrost_cpp::graph::inverted::scan_file(
-                &dispatch.source(),
-                visibility,
-                file,
-                input,
-            )
-        })
+        parse_and_collect(
+            analyzer,
+            file,
+            nodes,
+            ParseSpec::whole(&language),
+            |input| {
+                brokk_bifrost_cpp::graph::inverted::scan_file(
+                    &dispatch.source(),
+                    visibility,
+                    file,
+                    input,
+                )
+            },
+        )
     })
 }
 

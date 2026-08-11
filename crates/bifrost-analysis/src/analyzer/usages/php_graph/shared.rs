@@ -5,6 +5,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
@@ -150,9 +151,13 @@ impl<'a> PhpEdgeResolver<'a> {
         let source = php_graph_source(analyzer, &facts);
         let language = tree_sitter_php::LANGUAGE_PHP.into();
         build_edge_output(&self.files, keep_file, |file| {
-            parse_and_collect(analyzer, file, nodes, &language, |input| {
-                scan_php_file(source, self.php, file, input)
-            })
+            parse_and_collect(
+                analyzer,
+                file,
+                nodes,
+                ParseSpec::whole(&language),
+                |input| scan_php_file(source, self.php, file, input),
+            )
         })
     }
 }

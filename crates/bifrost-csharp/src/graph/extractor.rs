@@ -37,7 +37,7 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Node, Tree};
 
 pub struct ScanState<'a> {
     pub max_usages: usize,
@@ -65,14 +65,7 @@ pub fn prepare_file(csharp: &dyn CSharpSource, file: &ProjectFile) -> Option<Pre
         return None;
     }
 
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-        .is_err()
-    {
-        return None;
-    }
-    let tree = parser.parse(source.as_str(), None)?;
+    let tree = crate::preprocessor::parse_csharp(source.as_str())?;
     let line_starts = compute_line_starts(&source);
     let class_ranges = ClassRangeIndex::build(csharp, file);
     let using_aliases = csharp.using_aliases_of(file);

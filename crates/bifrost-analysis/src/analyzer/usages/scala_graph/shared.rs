@@ -7,6 +7,7 @@ use crate::analyzer::usages::inverted_edges::{
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     BulkFileStateSource, CodeUnit, IAnalyzer, Language, ProjectFile, Range, ScalaAnalyzer,
@@ -57,7 +58,7 @@ where
             graph.types.source_for_file(scala, file)?,
             file,
             nodes,
-            &language,
+            ParseSpec::whole(&language),
             declarations,
             |input| scan_edge_file(scala, &graph.types, file, state, class_ranges, input),
         )

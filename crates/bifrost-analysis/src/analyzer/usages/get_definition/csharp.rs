@@ -1718,11 +1718,7 @@ fn csharp_seed_symbol_for_type(
 }
 
 pub(super) fn parse_csharp_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source, None)
+    brokk_bifrost_csharp::preprocessor::parse_csharp(source)
 }
 
 enum CSharpReferenceNode<'tree> {

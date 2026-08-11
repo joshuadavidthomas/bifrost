@@ -78,6 +78,7 @@ mod usages_cpp_wuffs_alias_test;
 mod usages_cpp_wuffs_qualifier_test;
 mod usages_cpp_wuffs_typedef_field_test;
 mod usages_csharp_graph_test;
+mod usages_csharp_preprocessor_split_test;
 mod usages_finder_fallback_test;
 mod usages_go_graph_test;
 mod usages_java_graph_test;
