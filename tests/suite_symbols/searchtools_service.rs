@@ -6243,7 +6243,7 @@ int consume() {
 }
 
 #[test]
-fn scan_usages_cpp_macro_reports_its_active_invocation() {
+fn scan_usages_cpp_macro_succeeds_and_wrong_anchor_is_actionable() {
     let project = InlineTestProject::with_language(Language::Cpp)
         .file("defs.h", "#define TEST_DECLARE(name) int name\n")
         .file(
@@ -6269,14 +6269,15 @@ void run() {
         )
         .unwrap();
     let value: Value = serde_json::from_str(&payload).unwrap();
-    let result = only_result(&value);
+    let found = only_result(&value);
 
-    assert_eq!("found", result["status"], "payload: {value}");
-    assert_eq!(1, result["total_hits"], "payload: {value}");
-    assert_eq!("uses.cpp", result["files"][0]["path"], "payload: {value}");
-    assert_eq!(5, result["files"][0]["hits"][0]["line"], "payload: {value}");
+    assert_eq!("found", found["status"], "payload: {value}");
+    assert_eq!("defs.h", found["definition_path"], "payload: {value}");
+    assert_eq!(1, found["total_hits"], "payload: {value}");
+    assert_eq!("uses.cpp", found["files"][0]["path"], "payload: {value}");
+    assert_eq!(5, found["files"][0]["hits"][0]["line"], "payload: {value}");
     assert_eq!(
-        "run", result["files"][0]["hits"][0]["enclosing"],
+        "run", found["files"][0]["hits"][0]["enclosing"],
         "payload: {value}"
     );
 
