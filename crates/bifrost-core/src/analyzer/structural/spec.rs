@@ -43,6 +43,17 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// grammar bumps that rename nodes fail loudly.
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)];
 
+    /// Byte ranges of `source` the parser may read, or `None` to parse the
+    /// whole file.
+    ///
+    /// Only C# overrides this. Its grammar cannot represent a preprocessor
+    /// directive inside a declaration, so C# hides directive lines and inactive
+    /// conditional branches from the parser (issue #1803). Ranges select bytes
+    /// of the original source, so every fact keeps its raw-file offset.
+    fn parser_included_ranges(&self, _source: &str) -> Option<Vec<tree_sitter::Range>> {
+        None
+    }
+
     /// Context-sensitive refinement applied after table lookup. `enclosing`
     /// is the kind of the nearest enclosing normalized node.
     fn refine_kind(

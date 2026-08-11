@@ -35,13 +35,12 @@ pub(crate) use brokk_bifrost_core::analyzer::usages::inverted_edges::{
 
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::parsed_tree::{
-    ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
+    ParseSpec, ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
-use tree_sitter::Language as TreeSitterLanguage;
 
 /// [`ClassRangeIndex`] over a persisted file state, for scans that already
 /// hydrated one and would otherwise pay the declaration/range queries twice.
@@ -309,27 +308,27 @@ pub(crate) fn parse_and_collect<S>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     nodes: &HashSet<String>,
-    language: &TreeSitterLanguage,
+    spec: ParseSpec<'_>,
     scan: S,
 ) -> Option<PerFileEdges>
 where
     S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
-    let parsed = parse_tree_sitter_file(file, language)?;
+    let parsed = parse_tree_sitter_file(file, spec)?;
     Some(collect_file_edges(analyzer, file, nodes, &parsed, scan))
 }
 
 pub(crate) fn parse_and_collect_with_declarations<S>(
     file: &ProjectFile,
     nodes: &HashSet<String>,
-    language: &TreeSitterLanguage,
+    spec: ParseSpec<'_>,
     declarations: FileDeclarations,
     scan: S,
 ) -> Option<PerFileEdges>
 where
     S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
-    let parsed = parse_tree_sitter_file(file, language)?;
+    let parsed = parse_tree_sitter_file(file, spec)?;
     Some(collect_file_edges_with_declarations(
         file,
         nodes,
@@ -343,14 +342,14 @@ pub(crate) fn parse_source_and_collect_with_declarations<S>(
     source: String,
     file: &ProjectFile,
     nodes: &HashSet<String>,
-    language: &TreeSitterLanguage,
+    spec: ParseSpec<'_>,
     declarations: FileDeclarations,
     scan: S,
 ) -> Option<PerFileEdges>
 where
     S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
-    let parsed = parse_tree_sitter_source(source, language)?;
+    let parsed = parse_tree_sitter_source(source, spec)?;
     Some(collect_file_edges_with_declarations(
         file,
         nodes,

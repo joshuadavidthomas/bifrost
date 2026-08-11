@@ -7,6 +7,7 @@
 //! side data the go crate takes, and [`build_go_edges`], whose workspace fan-out
 //! needs an analyzer handle for each file's declaration index.
 
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::{
@@ -69,10 +70,16 @@ where
     let language = tree_sitter_go::LANGUAGE.into();
     build_edge_output(&files, keep_file, |file| {
         let file_pkg = index.package_name_of(file)?;
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            let (alias_packages, dot_packages) = index.namespace_packages(file);
-            scan_go_file(index, file_pkg, alias_packages, dot_packages, input)
-        })
+        parse_and_collect(
+            analyzer,
+            file,
+            nodes,
+            ParseSpec::whole(&language),
+            |input| {
+                let (alias_packages, dot_packages) = index.namespace_packages(file);
+                scan_go_file(index, file_pkg, alias_packages, dot_packages, input)
+            },
+        )
     })
 }
 

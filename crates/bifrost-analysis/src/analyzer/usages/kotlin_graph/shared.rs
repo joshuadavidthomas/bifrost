@@ -15,6 +15,7 @@ use crate::analyzer::usages::common::language_for_file;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
     BulkFileStateSource, CodeUnit, IAnalyzer, KotlinAnalyzer, Language, ProjectFile,
@@ -300,9 +301,13 @@ where
             let class_ranges = state
                 .map(class_range_index_from_state)
                 .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
-            parse_and_collect_with_declarations(file, nodes, &language, declarations, |input| {
-                scan_inverted_file(&graph, file, input, class_ranges)
-            })
+            parse_and_collect_with_declarations(
+                file,
+                nodes,
+                ParseSpec::whole(&language),
+                declarations,
+                |input| scan_inverted_file(&graph, file, input, class_ranges),
+            )
         })
     })
 }

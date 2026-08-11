@@ -830,3 +830,84 @@ fn a_request_searches_once_per_spelling_and_skips_namespaces_the_workspace_lacks
          so qualifying with it must not cost a search"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Index honesty for conditional compilation (#1803)
+// ---------------------------------------------------------------------------
+
+/// The wording hosts match on, pinned here as a literal. The producer is
+/// `brokk_bifrost_csharp::preprocessor::CSHARP_INACTIVE_BRANCHES_DETAIL`; this
+/// suite cannot name that crate, and the wording is the contract anyway.
+const INACTIVE_BRANCHES_DETAIL: &str =
+    "conditional compilation: inactive branches excluded from the index";
+
+fn inactive_branch_reasons(report: &SemanticDiagnosticReport) -> usize {
+    incomplete_reasons(report)
+        .into_iter()
+        .filter(|reason| {
+            matches!(
+                reason,
+                SemanticDiagnosticIncompleteReason::UnsupportedSemantics { detail }
+                    if detail == INACTIVE_BRANCHES_DETAIL
+            )
+        })
+        .count()
+}
+
+#[test]
+fn a_file_with_an_excluded_branch_reports_it_once() {
+    let fixture = CSharpFixture::new(&[(
+        APP,
+        "namespace App { public class Host {\n\
+         #if NET\n\
+             public void Modern() { }\n\
+         #else\n\
+             public void Legacy() { }\n\
+         #endif\n\
+         } }\n",
+    )]);
+    let report = fixture.report(APP);
+
+    assert_eq!(
+        inactive_branch_reasons(&report),
+        1,
+        "one excluded branch must be reported exactly once: {report:#?}"
+    );
+    assert_eq!(
+        report.status(),
+        SemanticDiagnosticReportStatus::Incomplete,
+        "a partial index is not a complete report"
+    );
+    assert!(
+        report.diagnostics().is_empty(),
+        "the notice is informational, never an error: {report:#?}"
+    );
+}
+
+#[test]
+fn a_directive_free_file_reports_nothing_about_conditional_compilation() {
+    let fixture = CSharpFixture::new(&[(
+        APP,
+        "namespace App { public class Host { public void Only() { } } }\n",
+    )]);
+
+    assert_eq!(inactive_branch_reasons(&fixture.report(APP)), 0);
+}
+
+#[test]
+fn a_directive_that_excludes_no_source_reports_nothing() {
+    // `#region` and a chain whose only branch is taken hide no declaration, so
+    // a notice there would be noise.
+    let fixture = CSharpFixture::new(&[(
+        APP,
+        "namespace App { public class Host {\n\
+         #region Members\n\
+         #if NET\n\
+             public void Modern() { }\n\
+         #endif\n\
+         #endregion\n\
+         } }\n",
+    )]);
+
+    assert_eq!(inactive_branch_reasons(&fixture.report(APP)), 0);
+}
