@@ -70,7 +70,7 @@ const PRODUCER_NAME: &str = "bifrost-sanitizer-foundry";
 const PACK_CONTENT_VERSION: &str = "0.1.0";
 
 /// The Bifrost compatibility requirement every generated pack declares.
-const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.9.0";
+const BIFROST_REQUIREMENT: &str = ">=0.8.0, <0.10.0";
 
 /// The authored sanitizer content is Bifrost's own claim, licensed like the
 /// workspace. It is not a slice of the described library.
@@ -615,7 +615,10 @@ fn summary_input(port: &SanitizerPort) -> AuthoredSummaryInput {
 /// Derive a stable, valid summary id from the target symbol. The id charset is
 /// lowercase ASCII alphanumerics plus `.`, `-`, and `_`; every other character
 /// collapses to a single `-`, and leading or trailing separators are trimmed.
-fn summary_id(symbol: &str) -> String {
+///
+/// Shared with the golden-core and framework-declaration converters, which slug
+/// a summary id or a pack coordinate the same way.
+pub(crate) fn summary_id(symbol: &str) -> String {
     let mut id = String::with_capacity(symbol.len());
     let mut last_dash = false;
     for character in symbol.chars() {

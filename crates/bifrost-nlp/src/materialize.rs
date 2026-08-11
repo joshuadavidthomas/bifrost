@@ -320,7 +320,7 @@ pub fn write_group(store: &SemanticStore, embedded: EmbeddedGroup) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Embedder, FakeHashEmbedder, ModelProfile};
+    use crate::engine::{Embedder, FakeHashEmbedder};
     use brokk_bifrost_analysis::analyzer::{JavaAnalyzer, Language, TestProject};
     use std::sync::Mutex;
 
@@ -330,11 +330,8 @@ mod tests {
     }
 
     impl Embedder for RecordingEmbedder {
-        fn profile(&self) -> ModelProfile {
-            ModelProfile {
-                dimension: 1,
-                ..crate::engine::VOYAGE_PROFILE
-            }
+        fn dim(&self) -> usize {
+            1
         }
 
         fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {

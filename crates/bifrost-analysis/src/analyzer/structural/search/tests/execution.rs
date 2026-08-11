@@ -1524,3 +1524,59 @@ fn sequential_union_retry_keeps_reporting_genuine_exhaustion() {
         "a retry must not spend more than the branch's own uncapped scan"
     );
 }
+
+#[test]
+fn arity_predicate_selects_a_call_overload_by_argument_count() {
+    // The OWASP Benchmark failure in miniature: a no-arg execute() shares its
+    // name with execute(String). A name-only selector binds both; the arity
+    // predicate keeps just the intended overload.
+    let source = "public class Sink {\n\
+        \x20   void run(java.sql.Statement stmt, String sql) throws Exception {\n\
+        \x20       stmt.execute();\n\
+        \x20       stmt.execute(sql);\n\
+        \x20   }\n\
+        }\n";
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "Sink.java")
+        .write(source)
+        .expect("write java source");
+    let workspace = WorkspaceAnalyzer::build(
+        Arc::new(TestProject::new(root, Language::Java)),
+        AnalyzerConfig::default(),
+    );
+
+    let match_texts = |query_source: &str| -> Vec<String> {
+        let query = CodeQuery::from_source(query_source).expect("arity selector should parse");
+        execute_workspace(&workspace, &query)
+            .results
+            .into_iter()
+            .map(|item| match item.value {
+                CodeQueryResultValue::StructuralMatch { value } => value.text,
+                other => panic!("expected a structural match, got {other:?}"),
+            })
+            .collect()
+    };
+
+    // Baseline: the name-only selector binds both overloads.
+    let both = match_texts(r#"(language java (call :callee (name "execute")))"#);
+    assert_eq!(both.len(), 2, "{both:?}");
+
+    // Arity 1 keeps only the one-argument call -- the overload carrying the
+    // SQL string -- and drops the no-arg execute() that aborted binding.
+    let one_arg = match_texts(r#"(language java (call :callee (name "execute") :arity 1))"#);
+    assert_eq!(one_arg.len(), 1, "{one_arg:?}");
+    assert!(one_arg[0].contains("execute(sql)"), "{one_arg:?}");
+
+    // Arity 0 keeps only the no-arg overload.
+    let zero_arg = match_texts(r#"(language java (call :callee (name "execute") (arity 0)))"#);
+    assert_eq!(zero_arg.len(), 1, "{zero_arg:?}");
+    assert!(zero_arg[0].contains("execute()"), "{zero_arg:?}");
+
+    // An open-ended ">= 1 argument" range binds the same single overload, so a
+    // sink can demand at least one operand without naming an exact arity.
+    let at_least_one =
+        match_texts(r#"(language java (call :callee (name "execute") (arity :min 1)))"#);
+    assert_eq!(at_least_one.len(), 1, "{at_least_one:?}");
+    assert!(at_least_one[0].contains("execute(sql)"), "{at_least_one:?}");
+}

@@ -1138,12 +1138,49 @@ fn java_constructor_outcome(
         return candidates_outcome(constructors);
     }
 
+    if java_modeled_constructor_exists(analyzer, session, &owner, arity) {
+        return no_definition(
+            "modeled_java_constructor",
+            format!(
+                "`{}.{}` is supplied by an active Java semantic model",
+                owner.fq_name(),
+                owner.identifier()
+            ),
+        );
+    }
+
     let indexed_owner = support.fqn(&owner.fq_name());
     if indexed_owner.is_empty() {
         candidates_outcome(vec![owner])
     } else {
         candidates_outcome(indexed_owner)
     }
+}
+
+fn java_modeled_constructor_exists(
+    analyzer: &dyn IAnalyzer,
+    session: &JavaResolutionSession<'_>,
+    owner: &CodeUnit,
+    arity: Option<usize>,
+) -> bool {
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return false;
+    };
+    session
+        .query_rows(|| overlay.members_of(&owner.fq_name()).records)
+        .into_iter()
+        .any(|symbol| {
+            symbol.language == "java"
+                && symbol.kind
+                    == crate::analyzer::semantic_model::SemanticModelSymbolKind::Constructor
+                && symbol.name == owner.identifier()
+                && arity.is_none_or(|arity| {
+                    symbol
+                        .structured_signature
+                        .as_ref()
+                        .is_some_and(|signature| signature.parameters.len() == arity)
+                })
+        })
 }
 
 fn java_enclosing_object_creation<'tree>(
@@ -1242,16 +1279,11 @@ fn java_filter_candidates_by_arity(
     let Some(expected) = arity else {
         return candidates;
     };
-    let filtered: Vec<_> = candidates
+    candidates
         .iter()
         .filter(|unit| java_callable_accepts_arity(analyzer, Some(session), unit, expected))
         .cloned()
-        .collect();
-    if filtered.is_empty() {
-        candidates
-    } else {
-        filtered
-    }
+        .collect()
 }
 
 fn java_arity_candidates(

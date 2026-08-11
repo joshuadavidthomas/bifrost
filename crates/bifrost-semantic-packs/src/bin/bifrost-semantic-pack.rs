@@ -18,6 +18,12 @@ use brokk_bifrost_semantic_packs::release_bundle::{
     BundleInput, ReleaseBundleRejects, generate_release_bundle, install_release_bundle,
     verify_release_bundle,
 };
+use brokk_bifrost_semantic_packs::summary_foundry::framework_pack::{
+    convert_framework_candidates, write_framework_packs,
+};
+use brokk_bifrost_semantic_packs::summary_foundry::golden_pack::{
+    convert_golden_candidates, write_golden_packs,
+};
 use brokk_bifrost_semantic_packs::summary_foundry::sanitizer_pack::{
     convert_sanitizer_candidates, write_sanitizer_packs,
 };
@@ -82,6 +88,8 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
         "install" => install_command(arguments, format),
         "summary-corpus-join" => summary_corpus_join_command(arguments, format),
         "sanitizer-pack" => sanitizer_pack_command(arguments, format),
+        "framework-decl-pack" => framework_decl_pack_command(arguments, format),
+        "golden-summary-pack" => golden_summary_pack_command(arguments, format),
         _ => Err(failure(2, usage(), format)),
     }
 }
@@ -538,6 +546,90 @@ fn sanitizer_pack_command(
     Ok(0)
 }
 
+/// Convert the framework declaration candidates into `declaration_facts` packs
+/// so the framework types resolve `external_indexed`, and write the pack sources
+/// plus the audit report. The conversion is deterministic.
+fn framework_decl_pack_command(
+    arguments: Vec<OsString>,
+    format: OutputFormat,
+) -> Result<u8, CommandFailure> {
+    require_human_release_output(format)?;
+    let [candidates_dir, output_root] = arguments.as_slice() else {
+        return Err(failure(2, usage(), format));
+    };
+    let conversion = convert_framework_candidates(Path::new(candidates_dir))
+        .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+    let written = write_framework_packs(&conversion, Path::new(output_root))
+        .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+
+    let audit = &conversion.audit;
+    println!(
+        "converted {} types and {} members into {} declaration pack(s)",
+        audit.types_total,
+        audit.members_total,
+        audit.packs.len(),
+    );
+    for pack in &audit.packs {
+        println!(
+            "  {} [{}] {} types, {} members, artifact={}",
+            pack.pack_id,
+            if pack.pinned { "pinned" } else { "staged" },
+            pack.types,
+            pack.members,
+            pack.artifact,
+        );
+        if let Some(reason) = &pack.staged_reason {
+            println!("    staged: {reason}");
+        }
+    }
+    for path in &written {
+        println!("wrote {}", path.display());
+    }
+    Ok(0)
+}
+
+/// Convert the golden-core JDK flow-through summaries into a `procedure_summaries`
+/// pack, drop the duplicate-target candidates, and write the pack source plus the
+/// audit report. The conversion is deterministic.
+fn golden_summary_pack_command(
+    arguments: Vec<OsString>,
+    format: OutputFormat,
+) -> Result<u8, CommandFailure> {
+    require_human_release_output(format)?;
+    let [candidates_dir, output_root] = arguments.as_slice() else {
+        return Err(failure(2, usage(), format));
+    };
+    let conversion = convert_golden_candidates(Path::new(candidates_dir))
+        .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+    let written = write_golden_packs(&conversion, Path::new(output_root))
+        .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+
+    let audit = &conversion.audit;
+    println!(
+        "converted {} candidates: {} shipped summaries, {} rejected",
+        audit.candidates_total, audit.shipped_summaries, audit.rejected,
+    );
+    for pack in &audit.packs {
+        println!(
+            "  {} [{}] {} summaries, artifact={}",
+            pack.pack_id,
+            if pack.pinned { "pinned" } else { "staged" },
+            pack.shipped_summaries,
+            pack.artifact,
+        );
+    }
+    for reject in &audit.rejects {
+        println!(
+            "  reject {} {}: {}",
+            reject.reason, reject.target_symbol, reject.message
+        );
+    }
+    for path in &written {
+        println!("wrote {}", path.display());
+    }
+    Ok(0)
+}
+
 fn require_human_release_output(format: OutputFormat) -> Result<(), CommandFailure> {
     if format == OutputFormat::Json {
         Err(failure(
@@ -801,5 +893,5 @@ impl ActivationControlInput {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT"
+    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT"
 }

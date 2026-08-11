@@ -36,6 +36,11 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - [x] (2026-08-04 22:20 +0200) Commit Milestone 5 as `4a099552b` after the final rebase, with a multiline checkpoint message.
 - [x] (2026-08-04 22:15 +0200) Run package checks, UsageBench cases, policy checks, formatting, and the applicable Rust gates. The complete policy result has only pre-existing findings outside changed lines.
 - [x] (2026-08-04 22:15 +0200) Complete the final specialist review. Restricted qualified-path fallback, retained Rust import scopes, and changed the positive case to the grouped jclassfile import form.
+- [x] (2026-08-11 15:05 +0200) Reopened the plan after issue #1153 received four exact ShardingSphere Lombok-constructor misses. Verified that PR #1603 merged the original work and that current `origin/master` is `b898da7fd`.
+- [x] (2026-08-11 15:05 +0200) Diagnosed the follow-up. The shipped Lombok pack emits accessors only. Java constructor lookup does not select model constructors after authored arity rejection.
+- [x] (2026-08-11 08:02 +0200) Implement Milestone 6. Added grouped captures, repeated signature parameters, and exact Lombok `NoArgsConstructor` and `RequiredArgsConstructor` rules.
+- [x] (2026-08-11 08:02 +0200) Review Milestone 6. Proved exact activation, arity, field order, authored precedence, forward navigation, and inverse usage.
+- [x] (2026-08-11 08:02 +0200) Ran 16 generated-behavior tests, 71 semantic-model tests, crate tests, formatting, diff checks, and featureless workspace clippy.
 
 ## Surprises & Discoveries
 
@@ -90,6 +95,21 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
 - Observation: Same-name Rust imports must be filtered at the trigger site.
   Evidence: The final review found that a nested import could block or activate a derive outside its lexical scope. Structured import paths now retain declaration ranges and lexical scope ranges.
 
+- Observation: The first shipped Lombok pack did not include constructor annotations.
+  Evidence: `crates/bifrost-semantic-packs/models/lombok-1.18.42.json` contains getter, setter, data-getter, and value-getter rules only.
+
+- Observation: One modeled constructor needs a variable-length ordered parameter list.
+  Evidence: The existing `many` capture cardinality emits one rule match per field. It cannot emit one seven-parameter constructor for the ShardingSphere `ColumnProjection` call.
+
+- Observation: Java constructor lookup returns the indexed owner after it rejects authored constructors by arity.
+  Evidence: `java_constructor_outcome` does not query `SemanticModelOverlay`, so the navigation layer never receives an empty result that it can complete from a model constructor.
+
+- Observation: Java constructor arity filtering retained all authored candidates when no candidate had the requested arity.
+  Evidence: The ShardingSphere-shaped regression test first resolved its three-argument negative case to a one-argument authored constructor. Exact filtering now returns no incompatible constructor.
+
+- Observation: Adding field initializer metadata changes the compiled semantic-pack wire representation.
+  Evidence: The checked-in schema, golden fixture, and embedded pack shards changed after deterministic regeneration. All exact artifact checks pass.
+
 ## Decision Log
 
 - Decision: Keep behavior in semantic-model rules. Add only general structured facts to language adapters.
@@ -128,6 +148,18 @@ The focused semantic-model tests and UsageBench cases will show the result. Nega
   Rationale: `"pub with_prefix"`, skip controls, and other values do not generate the supported field-name getter.
   Date/Author: 2026-08-04 / Codex
 
+- Decision: Extend the common generator model with grouped captures and repeated signature parameters.
+  Rationale: A Lombok constructor is one declaration with an ordered parameter for each selected field. Emitting one constructor per field gives false arities.
+  Date/Author: 2026-08-11 / Codex
+
+- Decision: Publish Java field-initializer presence in `SignatureMetadata`.
+  Rationale: `RequiredArgsConstructor` includes uninitialized final fields. The semantic-model matcher must use parser-derived structure, not source text.
+  Date/Author: 2026-08-11 / Codex
+
+- Decision: Keep authored constructors ahead of modeled constructors.
+  Rationale: The model augments missing generated declarations. It must not replace an exact workspace declaration.
+  Date/Author: 2026-08-11 / Codex
+
 ## Outcomes & Retrospective
 
 Five Bifrost milestones are implemented. The runtime substrate and all four requested behavior groups pass focused tests.
@@ -141,6 +173,12 @@ The getset pack selects only Cargo package `getset` version 0.1.7. It requires o
 Final validation passed. Thirteen generated-behavior tests, 69 semantic-model tests, the workspace check, featureless workspace Clippy, formatting, package checks, and all 179 UsageBench tests passed. The exact macro benchmark reports two true positives, no false results, two exact ranges, and one exact result set.
 
 The policy run completed all 12 `bifrost.code-smells` rules. It returned `finding` for four pre-existing sites outside the changed hunks. It returned no diagnostics or unreliable results. The policy latency evidence is recorded in issue #1452.
+
+Issue #1153 reopened on 2026-08-09. Four ShardingSphere construction sites remain unresolved because the first Lombok pack covered accessors but not generated constructors. Milestone 6 below is active follow-up work. The earlier four behavior groups remain complete.
+
+Milestone 6 is complete. The Lombok pack now emits exact no-argument and required-final-field constructors. Java object creation resolves these model declarations only after exact authored-constructor matching. The model preserves field order and excludes static or initialized final fields.
+
+Final follow-up validation passed. Sixteen generated-behavior tests and 71 semantic-model tests passed. The JVM and semantic-pack crate suites passed. The core suite passed 253 tests when it excluded one sandbox-only cache permission test. Featureless workspace clippy, formatting, and diff checks passed.
 
 ## Context and Orientation
 
@@ -248,6 +286,18 @@ Test the exact version, wrong owner, unsupported version, absent dependency, and
 
 Record the active pack, rule, digest, model URI, and authored anchor in test evidence.
 
+### Milestone 6: Ship exact Lombok constructor behavior
+
+Extend generator captures so a rule can keep several ordered field values as one group. Extend template signatures so one declaration can repeat a parameter template across that group. Existing `many` captures must keep their row-emission behavior for accessors.
+
+Publish whether each Java field has an initializer through `SignatureMetadata`. Add a grouped capture source for non-static final fields without initializers. Preserve authored field order.
+
+Add exact `lombok.NoArgsConstructor` and `lombok.RequiredArgsConstructor` rules to `crates/bifrost-semantic-packs/models/lombok-1.18.42.json`. Emit constructor symbols with the class name, exact parameter count and types, a class anchor, and a navigation relation to the authored class.
+
+Update Java object-creation structural facts so the navigation layer can recover the constructed owner. In `java_constructor_outcome`, check exact-arity model constructors only after no authored constructor matches. Return the model path before the existing owner fallback.
+
+Add behavior tests in `tests/suite_semantic/generated_behavior_models.rs`. Cover zero, two, and seven parameters; initialized and static final exclusions; wrong annotation owner; wrong dependency version; exact authored constructor precedence; forward definition; inverse usage; and stable model provenance.
+
 ## Concrete Steps
 
 Run all commands from `/Users/dave/.codex/worktrees/86d5/bifrost` unless stated otherwise.
@@ -272,6 +322,14 @@ After Lombok changes, run focused Java definition, source, and usage tests. Incl
 After workspace changes, run `rust-parity-macro-generated-function-reference` from UsageBench `origin/main` content.
 
 After getset changes, run its focused Rust model tests and the shipped-pack package checks.
+
+After Lombok constructor changes, run:
+
+    cargo test --test suite_semantic generated_behavior_models::lombok_generated_constructors
+    cargo test --test suite_semantic generated_behavior_models::lombok_requires_exact_package_version_and_annotation_owner
+    cargo test --test suite_semantic generated_behavior_models::authored_java_constructor_precedes_lombok_model
+
+Then run the complete `generated_behavior_models` test module.
 
 Run `cargo fmt` before each checkpoint commit. Run `git diff --check` after formatting.
 
@@ -298,6 +356,10 @@ Real declarations must win over modeled facts. Workspace models must win over in
 Scala `copy` must navigate to the case-class declaration. Each component accessor must navigate to its constructor parameter.
 
 Lombok and getset accessors must navigate to exact backing fields. Same-name wrong-owner annotations must miss.
+
+Lombok no-argument and required-argument object creation must resolve only with exact annotation-owner and dependency evidence. Required parameters must follow uninitialized final field order. Static and initialized final fields must not change the generated arity.
+
+An exact authored Java constructor must win over a modeled constructor with the same arity. A call with an unsupported arity must not resolve through a model with a different structured signature.
 
 The UsageBench macro call must navigate to the macro argument. Inverse usage must return the generated call site.
 
@@ -358,3 +420,7 @@ No model can execute code. No model can read outside its approved workspace path
 Plan revision note (2026-08-04): Created the initial plan after the live issue and dependency checks. The design follows observed runtime gaps.
 
 Plan revision note (2026-08-04): Recorded the complete implementation, final review repairs, UsageBench result, package validation, and policy result.
+
+Plan revision note (2026-08-11): Reopened the plan for the ShardingSphere Lombok-constructor residual. Added Milestone 6, its root-cause evidence, common grouped-capture design, and exact validation requirements.
+
+Plan revision note (2026-08-11): Recorded Milestone 6 completion, the exact-arity fallback repair, generated artifact updates, and final validation results.

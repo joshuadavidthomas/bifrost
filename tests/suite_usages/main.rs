@@ -18,6 +18,7 @@ mod issue_1450_cross_request_prepared_syntax;
 mod issue_1451_cross_request_import_infos;
 mod issue_1748_candidate_discovery_batching;
 mod issue_1748_hierarchy_deadline;
+mod issue_1749_rust_macro_wrapped_inverse;
 mod issue_1785_js_file_scope_enclosing;
 mod issue_1786_flow_usage_suppression;
 mod issue_1854_scala_enclosing_def_shadow;

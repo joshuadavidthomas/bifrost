@@ -211,6 +211,8 @@ pub struct SemanticModelSymbol {
     pub(crate) extension_receiver: Option<TypeRef>,
     #[serde(skip)]
     pub(crate) extension_receiver_constraints: Vec<TypeRef>,
+    #[serde(skip)]
+    pub(crate) locator_path: Option<String>,
     pub location: SemanticModelLocation,
     pub provenance: SemanticModelProvenance,
 }
@@ -1598,9 +1600,21 @@ fn evaluate_explanation_at_site(
             Ok(matches) if !matches.is_empty() => {
                 explanation.matched = true;
                 explanation.captures = matches[0]
+                    .values
                     .iter()
                     .map(|(name, value)| (name.clone(), value.value.clone()))
                     .collect();
+                explanation
+                    .captures
+                    .extend(matches[0].groups.iter().map(|(name, values)| {
+                        (
+                            name.clone(),
+                            format!(
+                                "{:?}",
+                                values.iter().map(|value| &value.value).collect::<Vec<_>>()
+                            ),
+                        )
+                    }));
                 let mut aliases = Vec::new();
                 for captures in &matches {
                     emit_rule_match(
@@ -1696,18 +1710,21 @@ pub fn preview_semantic_model_emissions(
         ));
         return report;
     }
-    let captures = captures
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.clone(),
-                CapturedValue {
-                    value: value.clone(),
-                    anchor: None,
-                },
-            )
-        })
-        .collect::<HashMap<_, _>>();
+    let captures = GeneratorRuleMatch {
+        values: captures
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    CapturedValue {
+                        value: value.clone(),
+                        anchor: None,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>(),
+        groups: HashMap::default(),
+    };
     let mut aliases = Vec::new();
     emit_rule_match(
         active,
@@ -2373,7 +2390,17 @@ struct CapturedValue {
     anchor: Option<SemanticModelAuthoredAnchor>,
 }
 
-type GeneratorRuleMatch = HashMap<String, CapturedValue>;
+#[derive(Debug, Clone, Default)]
+struct GeneratorRuleMatch {
+    values: HashMap<String, CapturedValue>,
+    groups: HashMap<String, Vec<CapturedValue>>,
+}
+
+impl GeneratorRuleMatch {
+    fn get(&self, name: &str) -> Option<&CapturedValue> {
+        self.values.get(name)
+    }
+}
 
 fn evaluate_rule_at_node(
     analyzer: &dyn IAnalyzer,
@@ -2518,6 +2545,7 @@ fn rule_capture_values(
 ) -> Result<Vec<GeneratorRuleMatch>, SemanticModelPredicateFailure> {
     let mut scalar_match = HashMap::default();
     let mut repeated = Vec::new();
+    let mut grouped = HashMap::default();
     for capture in &rule.captures {
         let values = capture_values(analyzer, &capture.binding, facts, node_id, file, enclosing);
         match (capture.cardinality, values.as_slice()) {
@@ -2538,6 +2566,9 @@ fn rule_capture_values(
             (super::CaptureCardinality::Many, values) => {
                 repeated.push((capture.name.clone(), values.to_vec()));
             }
+            (super::CaptureCardinality::Group, values) => {
+                grouped.insert(capture.name.clone(), values.to_vec());
+            }
             (_, _) => {
                 return Err(SemanticModelPredicateFailure {
                     code: "capture.cardinality".to_owned(),
@@ -2550,7 +2581,10 @@ fn rule_capture_values(
         }
     }
     let Some((_, first_values)) = repeated.first() else {
-        return Ok(vec![scalar_match]);
+        return Ok(vec![GeneratorRuleMatch {
+            values: scalar_match,
+            groups: grouped,
+        }]);
     };
     let row_count = first_values.len();
     if repeated.iter().any(|(_, values)| values.len() != row_count) {
@@ -2565,7 +2599,10 @@ fn rule_capture_values(
             for (name, values) in &repeated {
                 row.insert(name.clone(), values[index].clone());
             }
-            row
+            GeneratorRuleMatch {
+                values: row,
+                groups: grouped.clone(),
+            }
         })
         .collect())
 }
@@ -2627,7 +2664,9 @@ fn capture_values(
                 Some(code_unit_anchor(analyzer, &owner)),
             )
         }
-        CaptureSource::OwnedFields | CaptureSource::OwnedMutableFields => {
+        CaptureSource::OwnedFields
+        | CaptureSource::OwnedMutableFields
+        | CaptureSource::OwnedUninitializedFinalFields => {
             let Some(enclosing) = enclosing else {
                 return Vec::new();
             };
@@ -2642,8 +2681,22 @@ fn capture_values(
                 !metadata.iter().any(|metadata| metadata.field_is_static())
                     && (!matches!(&binding.source, CaptureSource::OwnedMutableFields)
                         || !metadata.iter().any(|metadata| metadata.field_is_final()))
+                    && (!matches!(
+                        &binding.source,
+                        CaptureSource::OwnedUninitializedFinalFields
+                    ) || metadata.iter().any(|metadata| metadata.field_is_final())
+                        && !metadata
+                            .iter()
+                            .any(|metadata| metadata.field_has_initializer()))
             });
-            fields.sort();
+            fields.sort_by_key(|field| {
+                analyzer
+                    .ranges(field)
+                    .into_iter()
+                    .map(|range| (range.start_byte, range.end_byte))
+                    .min()
+                    .unwrap_or((usize::MAX, usize::MAX))
+            });
             fields.dedup();
             fields
                 .into_iter()
@@ -2912,6 +2965,7 @@ fn emit_rule_match(
                         receiver: None,
                         extension_receiver: None,
                         extension_receiver_constraints: Vec::new(),
+                        locator_path: None,
                         location,
                         provenance: model_provenance,
                     },
@@ -2960,6 +3014,7 @@ fn emit_rule_match(
                             receiver: None,
                             extension_receiver: None,
                             extension_receiver_constraints: Vec::new(),
+                            locator_path: None,
                             location,
                             provenance: model_provenance,
                         }
@@ -3112,7 +3167,7 @@ fn render_template_signature(
     signature: &TemplateSignature,
     captures: &GeneratorRuleMatch,
 ) -> Option<String> {
-    let parameters = signature
+    let mut parameters = signature
         .parameters
         .iter()
         .map(|parameter| {
@@ -3125,6 +3180,7 @@ fn render_template_signature(
             ))
         })
         .collect::<Option<Vec<_>>>()?;
+    parameters.extend(render_repeated_parameters(signature, captures)?);
     let returns = match &signature.returns {
         Some(returns) => format!(" -> {}", render_template_type(returns, captures)?),
         None => String::new(),
@@ -3136,24 +3192,35 @@ fn evaluate_template_signature(
     signature: &TemplateSignature,
     captures: &GeneratorRuleMatch,
 ) -> Option<Signature> {
+    let mut parameters = signature
+        .parameters
+        .iter()
+        .map(|parameter| {
+            Some(super::Parameter {
+                name: Some(evaluate_template(&parameter.name, captures)?),
+                r#type: evaluate_template_type(&parameter.r#type, captures)?,
+                optional: parameter.optional,
+                variadic: parameter.variadic,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    for row in repeated_parameter_rows(signature, captures)? {
+        for parameter in &signature.repeated_parameters {
+            parameters.push(super::Parameter {
+                name: Some(evaluate_template(&parameter.name, &row)?),
+                r#type: evaluate_template_type(&parameter.r#type, &row)?,
+                optional: parameter.optional,
+                variadic: parameter.variadic,
+            });
+        }
+    }
     Some(Signature {
         type_parameters: signature
             .type_parameters
             .iter()
             .map(|parameter| evaluate_template(parameter, captures))
             .collect::<Option<Vec<_>>>()?,
-        parameters: signature
-            .parameters
-            .iter()
-            .map(|parameter| {
-                Some(super::Parameter {
-                    name: Some(evaluate_template(&parameter.name, captures)?),
-                    r#type: evaluate_template_type(&parameter.r#type, captures)?,
-                    optional: parameter.optional,
-                    variadic: parameter.variadic,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?,
+        parameters,
         returns: match &signature.returns {
             Some(returns) => Some(evaluate_template_type(returns, captures)?),
             None => None,
@@ -3196,7 +3263,7 @@ fn render_template_callable_shape(
     signature: &TemplateSignature,
     captures: &GeneratorRuleMatch,
 ) -> Option<String> {
-    let parameters = signature
+    let mut parameters = signature
         .parameters
         .iter()
         .map(|parameter| {
@@ -3207,9 +3274,72 @@ fn render_template_callable_shape(
                 if parameter.variadic { "..." } else { "" },
             ))
         })
-        .collect::<Option<Vec<_>>>()?
-        .join(",");
-    Some(format!("{}<{parameters}>", signature.type_parameters.len()))
+        .collect::<Option<Vec<_>>>()?;
+    for row in repeated_parameter_rows(signature, captures)? {
+        for parameter in &signature.repeated_parameters {
+            parameters.push(format!(
+                "{}{}{}",
+                render_template_type(&parameter.r#type, &row)?,
+                if parameter.optional { "?" } else { "" },
+                if parameter.variadic { "..." } else { "" },
+            ));
+        }
+    }
+    Some(format!(
+        "{}<{}>",
+        signature.type_parameters.len(),
+        parameters.join(",")
+    ))
+}
+
+fn repeated_parameter_rows(
+    signature: &TemplateSignature,
+    captures: &GeneratorRuleMatch,
+) -> Option<Vec<GeneratorRuleMatch>> {
+    if signature.repeated_parameters.is_empty() {
+        return Some(Vec::new());
+    }
+    let row_count = captures.groups.values().next()?.len();
+    if captures
+        .groups
+        .values()
+        .any(|values| values.len() != row_count)
+    {
+        return None;
+    }
+    Some(
+        (0..row_count)
+            .map(|index| {
+                let mut values = captures.values.clone();
+                for (name, group) in &captures.groups {
+                    values.insert(name.clone(), group[index].clone());
+                }
+                GeneratorRuleMatch {
+                    values,
+                    groups: HashMap::default(),
+                }
+            })
+            .collect(),
+    )
+}
+
+fn render_repeated_parameters(
+    signature: &TemplateSignature,
+    captures: &GeneratorRuleMatch,
+) -> Option<Vec<String>> {
+    let mut rendered = Vec::new();
+    for row in repeated_parameter_rows(signature, captures)? {
+        for parameter in &signature.repeated_parameters {
+            rendered.push(format!(
+                "{}: {}{}{}",
+                evaluate_template(&parameter.name, &row)?,
+                render_template_type(&parameter.r#type, &row)?,
+                if parameter.optional { "?" } else { "" },
+                if parameter.variadic { "..." } else { "" },
+            ));
+        }
+    }
+    Some(rendered)
 }
 
 fn render_template_type(
@@ -3284,6 +3414,7 @@ fn type_symbol(
         receiver: None,
         extension_receiver: None,
         extension_receiver_constraints: Vec::new(),
+        locator_path: Some(locator_path(&record.locator).to_owned()),
         provenance: provenance(
             active,
             shard,
@@ -3340,6 +3471,7 @@ fn member_symbol(
         receiver: record.receiver,
         extension_receiver: record.extension_receiver.clone(),
         extension_receiver_constraints: record.extension_receiver_constraints.clone(),
+        locator_path: Some(locator_path(&record.locator).to_owned()),
         provenance: provenance(
             active,
             shard,
@@ -3349,6 +3481,12 @@ fn member_symbol(
             ambiguous,
         ),
         location,
+    }
+}
+
+fn locator_path(locator: &Locator) -> &str {
+    match locator {
+        Locator::Source { path, .. } | Locator::Artifact { path, .. } => path,
     }
 }
 
@@ -3845,6 +3983,7 @@ mod tests {
             receiver: None,
             extension_receiver: None,
             extension_receiver_constraints: Vec::new(),
+            locator_path: None,
             location: SemanticModelLocation::Model(SemanticModelVirtualLocation {
                 uri: format!("bifrost-model://v1/{qualified_name}"),
                 range: SemanticModelRange {

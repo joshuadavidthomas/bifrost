@@ -13,7 +13,6 @@ Bifrost analyzes source on the machine where its process runs. That local execut
 | Agent MCP host | Bifrost tool schemas and returned results, which may include source excerpts | May include those results in model requests, logs, transcripts, or host caches according to host configuration. |
 | Agent-plugin launcher | Pinned release metadata and explicit environment or argument overrides | May download a checksum-verified Bifrost release from GitHub into a user cache. |
 | Optional semantic search | Workspace code chunks and a local embedding model | Downloads model files from Hugging Face on first use unless `BIFROST_EMBED_MODEL_DIR` points to local files; inference runs in a local Python sidecar and derived index data is cached. |
-| Skills and agent instructions | Instruction text | No repository analysis and no tools by themselves. The agent host decides how instruction text is used. |
 
 ## Workspace Scope
 
@@ -64,7 +63,7 @@ so the MCP tool list is negotiated again.
 
 ## Optional Semantic Model
 
-Semantic search is off by default and requires the `nlp` feature. When enabled without `BIFROST_EMBED_MODEL_DIR`, Bifrost resolves `BIFROST_EMBED_MODEL_ID` (by default `voyageai/voyage-4-nano`) through the Hugging Face cache, downloading missing configuration, tokenizer, and weight files. Set `BIFROST_EMBED_MODEL_DIR` to an approved local model directory for an offline or pre-audited setup.
+Semantic search is off by default and requires the `nlp` feature. `BIFROST_EMBED_MODEL_ID` selects an explicit Hugging Face model. Otherwise, Bifrost selects `brokkai/Muninn` with an accelerator and `brokkai/Muninn-small` without one. The Hugging Face cache downloads missing configuration, tokenizer, metadata, and weight files. Set `BIFROST_EMBED_MODEL_DIR` to an approved local model directory for an offline or pre-audited setup.
 
 The PyTorch sidecar receives code chunks for local embedding inference. It is a child process, not a hosted embedding API. Accelerator and device environment variables affect local execution, not the MCP/model-host boundary.
 

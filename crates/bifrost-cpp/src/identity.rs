@@ -10,9 +10,10 @@
 //!   downcast that produces them, because the searchtools identity block reaches
 //!   this predicate through `&dyn IAnalyzer` and there is no capability that
 //!   carries an `IncludeTargetIndex`.
-//! * The moka cell that memoizes [`cpp_reconciled_definitions`] per queried name
-//!   stays on the analyzer, as does every other cache, so `IAnalyzer::update`
-//!   keeps rebuilding them wholesale.
+//! * The moka cells that memoize [`cpp_reconcile_candidates`] per member
+//!   identifier and [`cpp_reconcile_group`] per [`CppReconcileGroupKey`] stay
+//!   on the analyzer, as does every other cache, so `IAnalyzer::update` keeps
+//!   rebuilding them wholesale.
 
 use crate::declarations::{cpp_file_using_namespaces, cpp_member_fq, node_text};
 use crate::graph_support::CppSource;
@@ -482,62 +483,120 @@ pub struct CppReconciledDefinitionIndex {
     pub provisional_of: HashMap<CodeUnit, CodeUnit>,
 }
 
-/// Reconcile the bounded candidate set for one queried canonical `fq_name`:
-/// every out-of-line member definition sharing its terminal identifier whose
-/// provisional per-file identity the include-visible class table re-keys onto
-/// exactly this name (the two ambiguous shapes left by #1121). A definition
-/// whose reconciled identity equals its provisional one (the overwhelming
-/// majority, including genuine `ns1::ns2::Klass::method` namespace chains)
-/// contributes nothing.
+/// Which candidates one reconcile group covers: a member identifier, and the
+/// terminal owner component that #1566's pre-filter admits.
 ///
-/// Deliberately **not** a workspace-wide index: building one would need a full
-/// declaration scan, and a warm forward lookup must not trigger one
-/// (`tests/analyzer_persistence.rs`'s candidate-bounded contract). Instead each
-/// queried name reconciles only the candidates the persisted terminal identifier
-/// index already offers, which is the same bounded lookup the ordinary
-/// resolution path uses.
-pub fn cpp_reconciled_definitions(
-    cpp: &dyn CppSource,
-    fq_name: &str,
-) -> CppReconciledDefinitionIndex {
-    let _scope = profiling::scope_with(|| format!("cpp.reconciled.build[{fq_name}]"));
-    let mut index = CppReconciledDefinitionIndex::default();
-    let interner = segment_interner();
-    // The queried name's terminal segment is the member identifier to probe
-    // the identifier index with. Parsed through the sanctioned input-edge
-    // parser rather than split here, and note `$` is not a segment boundary
-    // for it -- a nested owner chain stays one segment, so the terminal
-    // really is the member.
-    let query_fq = parse_symbol_path_fq(Language::Cpp, fq_name, interner);
-    let Some(member_segment) = query_fq.last() else {
-        return index;
-    };
-    let (member_identifier, _) = interner.resolve(member_segment);
-    if member_identifier.is_empty() {
-        return index;
-    }
+/// This -- not the queried fq name -- is the unit reconciliation is a function
+/// of, and keying the memo by it is the #1908 fix. The old key was the queried
+/// fq name, so a bare identifier that 1,277 distinct owners answer produced
+/// 1,277 distinct keys, none of which ever hit, each re-running the identical
+/// `lookup_candidates_by_identifier` store read and re-scanning the identical
+/// 2,898-candidate set: 3.70M candidate evaluations for one request.
+///
+/// The owner terminal stays in the key rather than being dropped for a plain
+/// per-identifier map. Dropping it would mean reconciling every same-named
+/// candidate in the workspace on the first query for that identifier, which is
+/// exactly the cost #1566 removed -- chromium paid ~75 s per member query that
+/// way. `reconcile_skips_same_named_members_of_unrelated_classes_1566` pins it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CppReconcileGroupKey {
+    /// The queried name's terminal segment: the member identifier the
+    /// persisted identifier index is probed with.
+    pub member_identifier: String,
+    /// The terminal component of the queried name's penultimate segment, or
+    /// `None` for a single-segment (bare) query, where #1566's pre-filter is
+    /// inert and every candidate has to be reconciled.
+    pub owner_terminal: Option<String>,
+}
 
+/// Which member identifier and owner terminal a queried canonical name asks
+/// about, or `None` when the name has no terminal segment to probe with.
+///
+/// Parsed through the sanctioned input-edge parser rather than split here, and
+/// note `$` is not a segment boundary for it -- a nested owner chain stays one
+/// segment, so the terminal really is the member.
+pub fn cpp_reconcile_group_key(fq_name: &str) -> Option<CppReconcileGroupKey> {
+    let interner = segment_interner();
+    let query_fq = parse_symbol_path_fq(Language::Cpp, fq_name, interner);
+    let (member_identifier, _) = interner.resolve(query_fq.last()?);
+    if member_identifier.is_empty() {
+        return None;
+    }
     // #1566 owner-terminal pre-filter: the reconciler only re-partitions a
     // candidate's qualifier -- the class chain it emits is always a suffix
     // of the candidate's owner segments (`reconcile.rs`) -- so the terminal
     // `$` component of any identity it can produce equals the candidate's
     // terminal owner segment. A candidate whose terminal owner differs
     // from the queried name's penultimate segment can therefore never
-    // re-key onto it, and skipping it here avoids the role check and, on
+    // re-key onto it, and skipping it avoids the role check and, on
     // whale repos, an include-closure class-table build per same-named
-    // candidate in the repo (chromium paid ~75s per member query that way:
-    // one BFS per same-named candidate file, 2.5M declaration queries per
-    // probe file for a gtest-shaped member name).
-    let query_owner_terminal = query_fq.segments().len().checked_sub(2).map(|penultimate| {
+    // candidate in the repo.
+    let owner_terminal = query_fq.segments().len().checked_sub(2).map(|penultimate| {
         let (text, _) = interner.resolve(query_fq.segments()[penultimate]);
         // fqname-M4: the input-edge parser above deliberately keeps a nested
         // owner chain as one `$`-joined segment (no structured sub-segments
         // exist at this surface), so the terminal component must come from
         // the raw text.
-        text.rsplit_once('$').map_or(text, |(_, tail)| tail)
+        text.rsplit_once('$')
+            .map_or(text, |(_, tail)| tail)
+            .to_string()
     });
+    Some(CppReconcileGroupKey {
+        member_identifier: member_identifier.to_string(),
+        owner_terminal,
+    })
+}
 
-    let mut using_by_file: HashMap<ProjectFile, Arc<Vec<String>>> = HashMap::default();
+/// Every callable declaration in the workspace sharing one member identifier,
+/// bucketed by its terminal owner segment.
+///
+/// One store read and one pass over the candidate set per identifier, memoized
+/// on the analyzer. Before #1908 both were re-run once per queried fq name.
+pub struct CppReconcileCandidates {
+    by_owner_terminal: HashMap<String, Vec<CodeUnit>>,
+    /// Every bucketed candidate, in the order the sorted candidate set
+    /// produced them. What a bare query has to reconcile, since #1566's
+    /// pre-filter cannot narrow it.
+    all: Vec<CodeUnit>,
+}
+
+impl CppReconcileCandidates {
+    /// The candidates a group key admits: one owner-terminal bucket, or every
+    /// candidate for a bare query.
+    fn for_group(&self, key: &CppReconcileGroupKey) -> &[CodeUnit] {
+        match &key.owner_terminal {
+            Some(owner_terminal) => self
+                .by_owner_terminal
+                .get(owner_terminal)
+                .map_or(&[][..], Vec::as_slice),
+            None => &self.all,
+        }
+    }
+
+    /// Every bucketed candidate, once. What a cache weigher has to charge for.
+    pub fn iter(&self) -> impl Iterator<Item = &CodeUnit> {
+        self.all.iter()
+    }
+
+    /// How many bucket entries reference those candidates. A candidate with no
+    /// owner segment is in no bucket, so this is not `len`.
+    pub fn bucketed_len(&self) -> usize {
+        self.by_owner_terminal.values().map(Vec::len).sum()
+    }
+}
+
+/// Read and bucket every callable declaration sharing `member_identifier`.
+///
+/// `keep_going` is polled per candidate batch; `None` means the caller's
+/// deadline expired and nothing may be memoized, because a truncated candidate
+/// set is indistinguishable from an identifier with fewer namesakes and every
+/// later reconcile reading it would silently lose definitions (#1908 fix D,
+/// the same contract `visible_type_units_while` carries).
+pub fn cpp_reconcile_candidates(
+    cpp: &dyn CppSource,
+    member_identifier: &str,
+    keep_going: &dyn Fn() -> bool,
+) -> Option<CppReconcileCandidates> {
     let candidates: BTreeSet<CodeUnit> = {
         let _lookup =
             profiling::scope_with(|| format!("cpp.reconcile.lookup[{member_identifier}]"));
@@ -549,12 +608,21 @@ pub fn cpp_reconciled_definitions(
             candidates.len()
         )
     });
-    for unit in candidates {
-        // Lazy: `fq_name` clones a String, and this loop runs once per
-        // same-named candidate in the repo (2.5M per probe file on chromium).
-        let _candidate =
-            profiling::scope_with(|| format!("cpp.reconcile.candidate[{}]", unit.fq_name()));
-        let candidate_owner_terminal = unit
+
+    let interner = segment_interner();
+    let mut by_owner_terminal: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+    let mut all = Vec::new();
+    for (index, unit) in candidates.into_iter().enumerate() {
+        // Bucketing is a segment walk per candidate, cheap next to the role
+        // check and class-table build the groups pay, so the poll runs per
+        // batch rather than per candidate.
+        if index % CANDIDATE_BUCKETING_POLL_STRIDE == 0 && !keep_going() {
+            return None;
+        }
+        if !unit.is_callable() {
+            continue;
+        }
+        let owner_terminal = unit
             .fq()
             .segments()
             .iter()
@@ -570,17 +638,71 @@ pub fn cpp_reconciled_definitions(
                 .then_some(text)
             })
             .last();
-        if let Some(query_terminal) = query_owner_terminal
-            && candidate_owner_terminal != Some(query_terminal)
-        {
-            continue;
+        if let Some(owner_terminal) = owner_terminal {
+            by_owner_terminal
+                .entry(owner_terminal.to_string())
+                .or_default()
+                .push(unit.clone());
         }
-        if !unit.is_callable() || unit.fq_name() == fq_name {
-            continue;
+        all.push(unit);
+    }
+    Some(CppReconcileCandidates {
+        by_owner_terminal,
+        all,
+    })
+}
+
+/// How many candidates the bucketing pass walks between deadline polls.
+const CANDIDATE_BUCKETING_POLL_STRIDE: usize = 256;
+
+/// Reconcile every candidate one group key admits, grouped by the canonical
+/// `fq_name` each re-keyed definition belongs under.
+///
+/// Deliberately **not** a workspace-wide index: building one would need a full
+/// declaration scan, and a warm forward lookup must not trigger one
+/// (`tests/analyzer_persistence.rs`'s candidate-bounded contract). Instead each
+/// group reconciles only the candidates the persisted terminal identifier
+/// index already offers, which is the same bounded lookup the ordinary
+/// resolution path uses.
+///
+/// A definition whose reconciled identity equals its provisional one (the
+/// overwhelming majority, including genuine `ns1::ns2::Klass::method` namespace
+/// chains) contributes nothing.
+///
+/// `None` means `keep_going` went false mid-scan. Nothing may be memoized
+/// then; see [`cpp_reconcile_candidates`].
+pub fn cpp_reconcile_group(
+    cpp: &dyn CppSource,
+    key: &CppReconcileGroupKey,
+    candidates: &CppReconcileCandidates,
+    keep_going: &dyn Fn() -> bool,
+    on_candidate: &dyn Fn(),
+) -> Option<HashMap<String, Arc<CppReconciledDefinitionIndex>>> {
+    let _scope = profiling::scope_with(|| {
+        format!(
+            "cpp.reconciled.build[{}#{}]",
+            key.member_identifier,
+            key.owner_terminal.as_deref().unwrap_or("*")
+        )
+    });
+    let mut groups: HashMap<String, CppReconciledDefinitionIndex> = HashMap::default();
+    let mut using_by_file: HashMap<ProjectFile, Arc<Vec<String>>> = HashMap::default();
+    for unit in candidates.for_group(key) {
+        // Per candidate, not per batch: each iteration below can run a role
+        // check (0.265 ms mean in the #1908 trace) and an include-visible
+        // class-table read, so an atomic load per iteration is free by
+        // comparison.
+        if !keep_going() {
+            return None;
         }
+        on_candidate();
+        // Lazy: `fq_name` clones a String, and this loop runs once per
+        // same-named candidate the group admits.
+        let _candidate =
+            profiling::scope_with(|| format!("cpp.reconcile.candidate[{}]", unit.fq_name()));
         let role = {
             let _role = profiling::scope("cpp.reconcile.role");
-            cpp_callable_unit_role(cpp, &unit)
+            cpp_callable_unit_role(cpp, unit)
         };
         if !matches!(
             role,
@@ -588,12 +710,18 @@ pub fn cpp_reconciled_definitions(
         ) {
             continue;
         }
-        let Some(reconciled) = cpp_reconcile_definition_identity(cpp, &unit, &mut using_by_file)
+        let Some(reconciled) = cpp_reconcile_definition_identity(cpp, unit, &mut using_by_file)
         else {
             continue;
         };
         let canonical_fq = reconciled.fq_name();
-        if canonical_fq != fq_name {
+        // A candidate that already carries the canonical identity is the
+        // stored declaration, not a re-keying of it. Before #1908 this read
+        // `unit.fq_name() == fq_name` against the queried name, checked before
+        // the reconcile; against the group's canonical key it is the same
+        // predicate for the same (query, candidate) pair, because a candidate
+        // only ever lands under its own reconciled identity.
+        if unit.fq_name() == canonical_fq {
             continue;
         }
         // Re-key onto the canonical identity while keeping the definition's
@@ -615,10 +743,16 @@ pub fn cpp_reconciled_definitions(
             unit.is_synthetic(),
             fq,
         );
+        let index = groups.entry(canonical_fq).or_default();
         index.rekeyed.push(rekeyed.clone());
-        index.provisional_of.insert(rekeyed, unit);
+        index.provisional_of.insert(rekeyed, unit.clone());
     }
-    index
+    Some(
+        groups
+            .into_iter()
+            .map(|(canonical_fq, index)| (canonical_fq, Arc::new(index)))
+            .collect(),
+    )
 }
 
 /// Reconcile one out-of-line member definition's provisional identity against

@@ -530,6 +530,7 @@ fn summarize_symbol_targets_with_cancellation(
     let mut summaries = Vec::new();
     let mut not_found = Vec::new();
     let mut ambiguous = Vec::new();
+    let mut too_broad = Vec::new();
 
     for target in targets {
         if cancellation.is_some_and(crate::CancellationToken::is_cancelled) {
@@ -588,7 +589,28 @@ fn summarize_symbol_targets_with_cancellation(
                 }
             }
         }
-        match resolve_selectable_definitions(analyzer, &target, resolve_codeunit_fuzzy) {
+        let keep_going = || !cancellation.is_some_and(crate::CancellationToken::is_cancelled);
+        let resolution =
+            resolve_selectable_definitions_bounded(analyzer, &target, |analyzer, lookup| {
+                resolve_codeunit_fuzzy_bounded(
+                    analyzer,
+                    lookup,
+                    FuzzyResolveBudget::new(&keep_going, SYMBOL_TOOL_MAX_RESOLUTION_CANDIDATES),
+                )
+            });
+        let resolution = match resolution {
+            Ok(resolution) => resolution,
+            // The selector names more declarations than this tool will
+            // summarize. Reported by its count, with no candidate list: the
+            // list is the work the cap skipped (#1908).
+            Err(FuzzyResolveStop::TooManyCandidates { total, limit }) => {
+                too_broad.push(too_broad_resolution_candidates(&target, total, limit));
+                continue;
+            }
+            // Same handling as the cancellation check at the top of this loop.
+            Err(FuzzyResolveStop::Cancelled) => break,
+        };
+        match resolution {
             SelectableDefinitionResolution::Resolved(code_units) => {
                 extend_symbol_summaries(
                     analyzer,
@@ -618,7 +640,7 @@ fn summarize_symbol_targets_with_cancellation(
         not_found,
         ambiguous,
         ambiguous_paths: Vec::new(),
-        too_broad: Vec::new(),
+        too_broad,
     }
 }
 
@@ -652,8 +674,13 @@ pub fn get_summaries_with_cancellation(
     let _scope = profiling::scope("searchtools::get_summaries");
     // Same request boundary as `get_symbol_sources`: routing builds a resolver
     // per target through `resolve_file_patterns`, so without a shared listing
-    // an N-target request walked the workspace O(N) times (#1334).
-    let _analyzer_query = AnalyzerQueryScope::new(analyzer);
+    // an N-target request walked the workspace O(N) times (#1334). It also
+    // carries the caller's deadline down to reads whose signatures do not take
+    // one, which is what `get_summaries[g]` needed in #1908.
+    let _analyzer_query = match cancellation {
+        Some(cancellation) => AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+        None => AnalyzerQueryScope::new(analyzer),
+    };
     let targets = route_summary_targets_with_cancellation(
         analyzer,
         &params.targets,
@@ -938,6 +965,9 @@ fn summarize_routed_targets_with_cancellation(
     file_output.summaries.extend(symbol_output.summaries);
     file_output.listings = summary_targets.listings.clone();
     file_output.too_broad = summary_targets.too_broad.clone();
+    // Routing reports file fan-out; symbol summarization reports resolution
+    // fan-out (#1908). One target can only produce one of them.
+    file_output.too_broad.extend(symbol_output.too_broad);
     file_output.not_found.extend(symbol_output.not_found);
     file_output.ambiguous.extend(symbol_output.ambiguous);
     file_output

@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["torch>=2.5", "transformers>=4.53", "numpy"]
 # ///
-"""Profile-driven embedding sidecar with subprocess and loopback TCP transports.
+"""Model-driven embedding sidecar with subprocess and loopback TCP transports.
 
 bifrost's Rust side spawns this behind the Embedder seam (one per CUDA device, pinned
 via CUDA_VISIBLE_DEVICES) and talks a small binary protocol over stdin/stdout:
@@ -11,7 +11,7 @@ via CUDA_VISIBLE_DEVICES) and talks a small binary protocol over stdin/stdout:
   response : u32_le length + [u32_le n][u32_le dim][f64 queue_s][f64 service_s]
              + n*dim float32 (little-endian)
 
-After model load it emits one ready frame: JSON {"ready": true, "dim": 512}.
+After model load it emits one ready frame with the model ID and output dimension.
 fd 1 is redirected to stderr so library logging can't corrupt the protocol; frames go
 to a dup'd copy of the real stdout.
 
@@ -28,7 +28,6 @@ score tensors. SDPA only fuses in fp16/bf16, so we run bf16 on CUDA and fp16 on
 Apple Metal (MPS); CPU falls back to fp32 (math kernel).
 
 Run the sidecar:   uv run scripts/voyage_sidecar.py
-Self-test parity:  uv run scripts/voyage_sidecar.py --selftest
 """
 
 from __future__ import annotations
@@ -46,71 +45,79 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-PROFILE_NAME = os.environ.get("BIFROST_EMBED_PROFILE", "voyage-4-nano")
-PROFILES = {
-    "voyage": {
-        "name": "voyage-4-nano",
-        "model_id": "voyageai/voyage-4-nano",
-        "dim": 512,
-        "max_seq": 8192,
-        "passage_prefix": "Represent the document for retrieval: ",
-        "query_prefix": "Represent the query for retrieving supporting documents: ",
-        "pooling": "mean-mrl",
-    },
-    "voyage-4-nano": {
-        "name": "voyage-4-nano",
-        "model_id": "voyageai/voyage-4-nano",
-        "dim": 512,
-        "max_seq": 8192,
-        "passage_prefix": "Represent the document for retrieval: ",
-        "query_prefix": "Represent the query for retrieving supporting documents: ",
-        "pooling": "mean-mrl",
-    },
-    "granite-r2": {
-        "name": "granite-r2",
-        "model_id": "ibm-granite/granite-embedding-small-english-r2",
-        "dim": 384,
-        "max_seq": 8192,
-        "passage_prefix": "Passage: Code chunk from repository.\n",
-        "query_prefix": "Given a GitHub issue, retrieve code that must be changed to fix it.\nQuery: ",
-        "pooling": "cls",
-    },
-    "dw10": {
-        "name": "dw10",
-        "model_id": "voyageai/voyage-4-nano",
-        "dim": 512,
-        "max_seq": 8192,
-        "passage_prefix": "Represent the document for retrieval: ",
-        "query_prefix": "Represent the query for retrieving supporting documents: ",
-        "pooling": "mean-mrl",
-    },
-}
-if PROFILE_NAME not in PROFILES:
-    raise RuntimeError(
-        f"unknown BIFROST_EMBED_PROFILE={PROFILE_NAME!r}; "
-        "expected voyage-4-nano, granite-r2, or dw10"
-    )
-PROFILE = PROFILES[PROFILE_NAME]
-PROFILE_NAME = PROFILE["name"]
-MODEL_ID = PROFILE["model_id"]
+def default_model_id() -> str:
+    if torch.cuda.is_available() or torch.backends.mps.is_available():
+        return "brokkai/Muninn"
+    return "brokkai/Muninn-small"
+
+
+MODEL_ID = os.environ.get("BIFROST_EMBED_MODEL_ID", default_model_id())
 MODEL_SOURCE = os.environ.get("BIFROST_EMBED_MODEL_DIR", MODEL_ID)
-OUT_DIM = PROFILE["dim"]
-MAX_SEQ = PROFILE["max_seq"]
+MAX_SEQ = 8192
 MPS_SDPA_QUERY_BLOCK = 512
 MPS_CACHE_DRAIN_FRACTION = 0.80
 # Max padded tokens (batch * longest_seq) per forward — bounds activation memory so a
 # few long chunks can't balloon a batch. Mem-efficient SDPA lets this exceed candle's.
 PADDED_TOKEN_BUDGET = 16384
-PASSAGE_PREFIX = PROFILE["passage_prefix"]
-QUERY_PREFIX = PROFILE["query_prefix"]
 
 
-def model_fingerprint() -> str:
-    hasher = hashlib.sha256()
-    hasher.update(PROFILE_NAME.encode())
-    hasher.update(b"\0")
+def metadata_path(name: str) -> str:
     if os.path.isdir(MODEL_SOURCE):
-        for name in ("config.json", "model.safetensors"):
+        path = os.path.join(MODEL_SOURCE, name)
+        if not os.path.isfile(path):
+            raise RuntimeError(f"embedding artifact is missing {path}")
+        return path
+    from transformers.utils.hub import cached_file
+
+    path = cached_file(MODEL_SOURCE, name)
+    if path is None:
+        raise RuntimeError(f"embedding model {MODEL_SOURCE} is missing {name}")
+    return path
+
+
+def load_metadata(name: str) -> dict:
+    with open(metadata_path(name), encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def load_model_contract() -> dict:
+    model_config = load_metadata("config.json")
+    sentence_config = load_metadata("config_sentence_transformers.json")
+    pooling_config = load_metadata("1_Pooling/config.json")
+    prompts = sentence_config.get("prompts", {})
+    query_prefix = prompts.get("query")
+    passage_prefix = prompts.get("document")
+    if not isinstance(query_prefix, str) or not isinstance(passage_prefix, str):
+        raise RuntimeError(
+            f"embedding model {MODEL_SOURCE} must define query and document prompts"
+        )
+    pooling = pooling_config.get("pooling_mode")
+    if pooling not in ("mean", "cls"):
+        raise RuntimeError(
+            f"embedding model {MODEL_SOURCE} uses unsupported pooling {pooling!r}"
+        )
+    native_dim = int(pooling_config["embedding_dimension"])
+    is_muninn_qwen = "Qwen3BidirectionalModel" in model_config.get(
+        "architectures", []
+    )
+    return {
+        "query_prefix": query_prefix,
+        "passage_prefix": passage_prefix,
+        "pooling": pooling,
+        "out_dim": min(native_dim, 512) if is_muninn_qwen else native_dim,
+        "is_muninn_qwen": is_muninn_qwen,
+    }
+
+
+def model_fingerprint(contract: dict) -> str:
+    hasher = hashlib.sha256()
+    if os.path.isdir(MODEL_SOURCE):
+        for name in (
+            "config.json",
+            "config_sentence_transformers.json",
+            "1_Pooling/config.json",
+            "model.safetensors",
+        ):
             path = os.path.join(MODEL_SOURCE, name)
             if not os.path.isfile(path):
                 raise RuntimeError(f"embedding artifact is missing {path}")
@@ -119,11 +126,16 @@ def model_fingerprint() -> str:
                     hasher.update(chunk)
     else:
         hasher.update(MODEL_SOURCE.encode())
+    for value in (
+        contract["query_prefix"],
+        contract["passage_prefix"],
+        contract["pooling"],
+        str(contract["out_dim"]),
+        str(MAX_SEQ),
+    ):
+        hasher.update(b"\0")
+        hasher.update(value.encode())
     return hasher.hexdigest()
-
-
-MODEL_FINGERPRINT = model_fingerprint()
-
 
 def log(*a):
     print("[sidecar]", *a, file=sys.stderr, flush=True)
@@ -197,7 +209,7 @@ def bifrost_attention_forward(
 ) -> tuple[torch.Tensor, None]:
     if dropout != 0.0:
         raise RuntimeError(
-            "voyage sidecar attention is inference-only; dropout must be zero"
+            "embedding sidecar attention is inference-only; dropout must be zero"
         )
     scaling = scaling if scaling is not None else getattr(module, "scaling", None)
 
@@ -239,8 +251,10 @@ class Embedder:
             self.device, self.dtype = torch.device("mps"), torch.float16
         else:
             self.device, self.dtype = torch.device("cpu"), torch.float32
-        self.is_voyage = PROFILE["pooling"] == "mean-mrl"
-        log(f"loading {MODEL_SOURCE} as {PROFILE_NAME} on {self.device} ({self.dtype})")
+        self.contract = load_model_contract()
+        self.model_fingerprint = model_fingerprint(self.contract)
+        self.is_qwen = self.contract["is_muninn_qwen"]
+        log(f"loading {MODEL_SOURCE} on {self.device} ({self.dtype})")
         model = AutoModel.from_pretrained(
             MODEL_SOURCE,
             trust_remote_code=True,
@@ -262,7 +276,7 @@ class Embedder:
                 torch.cuda.empty_cache()
                 time.sleep(2.0)
         self.tok = AutoTokenizer.from_pretrained(MODEL_SOURCE)
-        if self.is_voyage:
+        if self.is_qwen:
             ALL_ATTENTION_FUNCTIONS.register("bifrost_sdpa", bifrost_attention_forward)
             self.model.config._attn_implementation = "bifrost_sdpa"
             self.model.model.config._attn_implementation = "bifrost_sdpa"
@@ -271,7 +285,7 @@ class Embedder:
             ]
             if any(t != "full_attention" for t in layer_types):
                 raise RuntimeError(
-                    f"voyage sidecar only supports full attention layers: {layer_types}"
+                    f"Muninn sidecar only supports full attention layers: {layer_types}"
                 )
         # Enable the fused SDPA kernels (CUDA only; MPS selects its own fused kernel).
         if self.cuda:
@@ -345,7 +359,7 @@ class Embedder:
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
 
-        if self.is_voyage:
+        if self.is_qwen:
             inner = self.model.model  # Qwen3Model
             embeds = inner.embed_tokens(input_ids)
             # Prevent HF Qwen from synthesizing a causal mask.
@@ -362,14 +376,19 @@ class Embedder:
             hidden = self.model.linear(o.last_hidden_state)
             m = attention_mask[:, :, None].to(dtype=self.dtype)
             pooled = (hidden * m).sum(1) / m.sum(1)
-            v = pooled[:, :OUT_DIM].float()
+            v = pooled[:, : self.contract["out_dim"]].float()
         else:
             hidden = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 return_dict=True,
             ).last_hidden_state
-            v = hidden[:, 0, :OUT_DIM].float()
+            if self.contract["pooling"] == "mean":
+                mask = attention_mask[:, :, None].to(dtype=self.dtype)
+                pooled = (hidden * mask).sum(1) / mask.sum(1)
+            else:
+                pooled = hidden[:, 0]
+            v = pooled[:, : self.contract["out_dim"]].float()
         v = v / (v.norm(dim=-1, keepdim=True) + 1e-12)  # renorm
         vecs = v.cpu().numpy().astype(np.float32)
         for j, i in enumerate(idxs):
@@ -435,9 +454,9 @@ def serve_stream(emb: Embedder, stdin, send, model_lock=None) -> None:
         json.dumps(
             {
                 "ready": True,
-                "dim": OUT_DIM,
-                "profile": PROFILE_NAME,
-                "model_fingerprint": MODEL_FINGERPRINT,
+                "dim": emb.contract["out_dim"],
+                "model_id": MODEL_ID,
+                "model_fingerprint": emb.model_fingerprint,
             }
         ).encode()
     )
@@ -452,7 +471,11 @@ def serve_stream(emb: Embedder, stdin, send, model_lock=None) -> None:
         if body is None:
             return
         req = json.loads(body)
-        prefix = QUERY_PREFIX if req.get("kind") == "query" else PASSAGE_PREFIX
+        prefix = (
+            emb.contract["query_prefix"]
+            if req.get("kind") == "query"
+            else emb.contract["passage_prefix"]
+        )
         queue_started = time.perf_counter()
         if model_lock is not None:
             model_lock.acquire()
@@ -517,30 +540,8 @@ def serve_tcp(emb: Embedder, address: str) -> None:
         threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
 
-def selftest(emb: Embedder) -> None:
-    # scripts/voyage_sidecar.py -> repo root -> tests/fixtures (works on any checkout/OS).
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    ref_path = os.path.join(repo_root, "tests", "fixtures", "voyage_parity_ref.json")
-    with open(ref_path) as f:
-        ref = json.load(f)
-    worst = 1.0
-    for kind, prefix in [("docs", PASSAGE_PREFIX), ("queries", QUERY_PREFIX)]:
-        texts = list(ref[kind].keys())
-        got = emb.embed(texts, prefix)
-        for t, g in zip(texts, got):
-            e = np.array(ref[kind][t], dtype=np.float32)
-            cos = float(np.dot(g, e) / (np.linalg.norm(g) * np.linalg.norm(e) + 1e-12))
-            worst = min(worst, cos)
-            print(f"[{kind}] cos={cos:.6f} {t[:48]!r}")
-    print(
-        f"\nworst cosine = {worst:.6f} ({'PASS' if worst > 0.999 else 'FAIL'} @ >0.999)"
-    )
-
-
 def main() -> None:
-    if "--selftest" in sys.argv:
-        selftest(Embedder())
-    elif "--listen" in sys.argv:
+    if "--listen" in sys.argv:
         address = sys.argv[sys.argv.index("--listen") + 1]
         serve_tcp(Embedder(), address)
     else:

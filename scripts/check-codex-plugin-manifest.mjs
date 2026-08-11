@@ -7,15 +7,6 @@ import {
   MINIMUM_MCP_STARTUP_TIMEOUT_MS,
   SUPPORTED_TARGETS,
 } from "../plugins/bifrost-agent/bin/bifrost-launcher.mjs";
-import {
-  AMP_SKILL_BUNDLE_ROOT,
-  AMP_SKILL_NAME,
-  buildAmpSkillBundleFiles,
-} from "./generate-amp-skill-bundle.mjs";
-import {
-  CODEX_SKILL_BUNDLE_ROOT,
-  buildCodexSkillBundleFiles,
-} from "./generate-codex-skill-bundle.mjs";
 import { readCargoVersion } from "./release-version.mjs";
 
 const cargoToml = fs.readFileSync("Cargo.toml", "utf8");
@@ -56,16 +47,6 @@ assert.deepStrictEqual(
   piManifest.pi?.extensions,
   ["./extensions/bifrost.ts"],
   `${piManifestPath} should expose the native Bifrost Pi extension`,
-);
-assert.deepStrictEqual(
-  piManifest.pi?.skills,
-  [
-    "./skills/bifrost-code-navigation",
-    "./skills/bifrost-code-reading",
-    "./skills/bifrost-codebase-search",
-    "./skills/bifrost-policy-checking",
-  ],
-  `${piManifestPath} should expose exactly the four canonical Bifrost agent skills`,
 );
 assert.deepStrictEqual(
   piManifest.dependencies?.["@modelcontextprotocol/sdk"],
@@ -285,112 +266,6 @@ assert.deepStrictEqual(
   `${mcpPath} should retain the 300-second analyzer tool timeout`,
 );
 fs.accessSync("plugins/bifrost-agent/bin/bifrost-launcher.mjs", fsConstants.X_OK);
-
-const skillsRoot = "plugins/bifrost-agent/skills";
-const codexSkillsRoot = CODEX_SKILL_BUNDLE_ROOT;
-const expectedSkills = [
-  ["adversarial-test-sweep", "brokk-adversarial-test-sweep", "Adversarial Test Sweep", "Scope and authority", "Non-goals", "Completion and report", "Paul Hudson"],
-  ["bifrost-code-navigation", "bifrost-code-navigation", "search_symbols", "scan_usages_by_location", "get_symbol_locations"],
-  ["bifrost-code-reading", "bifrost-code-reading", "get_summaries", "get_symbol_sources"],
-  ["bifrost-codebase-search", "bifrost-codebase-search", "search_symbols", "query_code"],
-  ["bifrost-policy-checking", "bifrost-policy-checking", "list_policies", "run_policy", "policy_categories", "unreliable"],
-  ["git-exploration", "brokk-git-exploration", "git log", "git diff", "gh pr view"],
-  ["guided-issue", "brokk-guided-issue", "Guided Issue Resolution", "brokk:issue-diagnostician"],
-  ["guided-review", "brokk-guided-review", "Guided Code Review", "brokk:security-reviewer"],
-  ["review-pr", "brokk-review-pr", "Adversarial PR Review", "brokk:architect-reviewer"],
-  ["review", "review", "expert code reviewer", "Output format", "Issues"],
-  ["today", "brokk-today", "Slack-ready summary", "gh issue"],
-  ["write-issue", "brokk-write-issue", "Draft a new GitHub issue", "brokk:issue-enhancer"],
-];
-assert.deepStrictEqual(
-  codexManifest.skills,
-  "./codex-skills/",
-  `${codexManifestPath} should expose generated Codex-compatible Bifrost skills`,
-);
-assert.deepStrictEqual(
-  claudeManifest.skills,
-  "./skills/",
-  `${claudeManifestPath} should expose Bifrost skills`,
-);
-assert.deepStrictEqual(
-  cursorManifest.skills,
-  "./skills/",
-  `${cursorManifestPath} should expose Bifrost skills`,
-);
-for (const [skillDir, skillName, ...requiredTerms] of expectedSkills) {
-  const skillPath = `${skillsRoot}/${skillDir}/SKILL.md`;
-  const skill = fs.readFileSync(skillPath, "utf8");
-  if (!skill.includes(`name: ${skillName}`)) {
-    throw new Error(`${skillPath} should declare name: ${skillName}`);
-  }
-  for (const term of requiredTerms) {
-    if (!skill.includes(term)) {
-      throw new Error(`${skillPath} should mention ${term}`);
-    }
-  }
-}
-for (const [relativePath, expected] of buildCodexSkillBundleFiles()) {
-  const bundlePath = `${CODEX_SKILL_BUNDLE_ROOT}/${relativePath}`;
-  const actual = fs.readFileSync(bundlePath, "utf8");
-  assert.equal(
-    normalizeLineEndings(actual),
-    normalizeLineEndings(expected),
-    `${bundlePath} is stale; run node scripts/generate-codex-skill-bundle.mjs`,
-  );
-}
-for (const [skillDir, skillName] of expectedSkills) {
-  const skillPath = `${codexSkillsRoot}/${skillDir}/SKILL.md`;
-  const skill = fs.readFileSync(skillPath, "utf8");
-  if (!skill.includes(`name: ${skillName}`)) {
-    throw new Error(`${skillPath} should declare name: ${skillName}`);
-  }
-}
-
-for (const [relativePath, expected] of buildAmpSkillBundleFiles()) {
-  const bundlePath = `${AMP_SKILL_BUNDLE_ROOT}/${relativePath}`;
-  const actual = fs.readFileSync(bundlePath, "utf8");
-  assert.equal(
-    normalizeLineEndings(actual),
-    normalizeLineEndings(expected),
-    `${bundlePath} is stale; run node scripts/generate-amp-skill-bundle.mjs`,
-  );
-}
-
-function normalizeLineEndings(content) {
-  return content.replace(/\r\n?/g, "\n");
-}
-fs.accessSync(`${AMP_SKILL_BUNDLE_ROOT}/bin/bifrost-launcher.mjs`, fsConstants.X_OK);
-const ampSkill = fs.readFileSync(`${AMP_SKILL_BUNDLE_ROOT}/SKILL.md`, "utf8");
-if (!ampSkill.includes(`name: ${AMP_SKILL_NAME}`)) {
-  throw new Error(`${AMP_SKILL_BUNDLE_ROOT}/SKILL.md should declare name: ${AMP_SKILL_NAME}`);
-}
-const ampMcpConfig = JSON.parse(fs.readFileSync(`${AMP_SKILL_BUNDLE_ROOT}/mcp.json`, "utf8"));
-assert.deepStrictEqual(
-  Object.keys(ampMcpConfig),
-  ["bifrost"],
-  `${AMP_SKILL_BUNDLE_ROOT}/mcp.json should use Amp's direct server-name map`,
-);
-assert.deepStrictEqual(
-  ampMcpConfig.bifrost.command,
-  "sh",
-  `${AMP_SKILL_BUNDLE_ROOT}/mcp.json should use the portable launcher search shim`,
-);
-assert.deepStrictEqual(
-  ampMcpConfig.bifrost.args?.slice(3, 7),
-  ["--root", ".", "--mcp", "symbol|extended"],
-  `${AMP_SKILL_BUNDLE_ROOT}/mcp.json should launch Bifrost against Amp's current workspace`,
-);
-for (const tool of [
-  "search_symbols",
-  "get_summaries",
-  "scan_usages_by_location",
-  "list_policies",
-  "run_policy",
-]) {
-  if (!ampMcpConfig.bifrost.includeTools?.includes(tool)) {
-    throw new Error(`${AMP_SKILL_BUNDLE_ROOT}/mcp.json should include ${tool}`);
-  }
-}
 
 const expectedAgents = [
   "./agents/architect-reviewer.md",

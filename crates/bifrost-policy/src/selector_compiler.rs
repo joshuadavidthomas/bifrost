@@ -52,6 +52,7 @@ pub(super) struct PolicySelectorSession<'a> {
     workspace: &'a WorkspaceAnalyzer,
     analysis: &'static str,
     query_limits: CodeQueryExecutionLimits,
+    max_selector_results: usize,
     cancellation: &'a CancellationToken,
     semantic_budget: SemanticBudget,
     semantic_execution_budget: SemanticExecutionBudget,
@@ -64,12 +65,14 @@ impl<'a> PolicySelectorSession<'a> {
         workspace: &'a WorkspaceAnalyzer,
         analysis: &'static str,
         query_limits: CodeQueryExecutionLimits,
+        max_selector_results: usize,
         cancellation: &'a CancellationToken,
     ) -> Self {
         Self {
             workspace,
             analysis,
             query_limits,
+            max_selector_results,
             cancellation,
             semantic_budget: SemanticBudget::new(semantic_work_limits(query_limits.semantic))
                 .expect("validated CodeQuery semantic limits are positive"),
@@ -90,9 +93,19 @@ impl<'a> PolicySelectorSession<'a> {
         // so index reuse is guaranteed: build it on the first selector rather
         // than letting Auto's first-request deferral turn the whole batch
         // into repeated full-workspace scans.
+        //
+        // Endpoint selection must bind every matching site, not the interactive
+        // pagination sample the selector query carries: the catalog validates
+        // the authored `limit` to the shared `DEFAULT_LIMIT` of 100, which
+        // truncates a corpus-scale source or sink selector before binding and
+        // fails the compile closed (#1935). Raise the selection result cap to
+        // the host-controlled policy bound; the structural pipeline budget
+        // still governs honest truncation above it.
+        let mut query = selector.query.clone();
+        query.limit = self.max_selector_results;
         let detailed = execute_code_query_detailed_eager_index(
             self.workspace.analyzer(),
-            &selector.query,
+            &query,
             self.remaining_query_limits()?,
             Some(self.cancellation),
         );

@@ -176,6 +176,21 @@ pub struct ExactDependencyArtifact {
 }
 
 impl ExactDependencyArtifact {
+    #[cfg(test)]
+    pub(crate) fn from_exact(
+        role: DependencyArtifactRole,
+        kind: ExternalArtifactKind,
+        module: Option<String>,
+        artifact: ExactArtifact,
+    ) -> Self {
+        Self {
+            role,
+            kind,
+            module,
+            artifact,
+        }
+    }
+
     pub fn role(&self) -> DependencyArtifactRole {
         self.role
     }
@@ -1223,6 +1238,7 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::PythonSource => "python_source",
         ExternalArtifactKind::RubyGemArchive => "ruby_gem_archive",
         ExternalArtifactKind::ComposerPackageSourceSet => "composer_package_source_set",
+        ExternalArtifactKind::CppHeaderSourceSet => "cpp_header_source_set",
     }
 }
 

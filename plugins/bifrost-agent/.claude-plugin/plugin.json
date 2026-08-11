@@ -1,6 +1,6 @@
 {
   "name": "brokk",
-  "version": "0.8.24",
+  "version": "0.9.1",
   "description": "Multi-language code intelligence and Brokk/Bifrost engineering workflows.",
   "author": {
     "name": "Brokk",
@@ -15,7 +15,6 @@
     "code-intelligence",
     "tree-sitter"
   ],
-  "skills": "./skills/",
   "agents": [
     "./agents/architect-reviewer.md",
     "./agents/devops-reviewer.md",

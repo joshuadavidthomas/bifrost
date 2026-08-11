@@ -119,8 +119,11 @@ for package in "${packages[@]}"; do
 done
 
 require_archive_file brokk-bifrost-core src/lib.rs
-# The unified cache DB's migrations moved down with cache_db.rs.
-require_archive_file brokk-bifrost-core migrations/cache/0001-current-baseline.sql
+# The unified cache DB's migrations moved down with cache_db.rs. The baseline
+# is named for the schema version it creates, which is 18: migrations 1..18
+# were folded into it.
+require_archive_file brokk-bifrost-core migrations/cache/0018-current-baseline.sql
+require_archive_file brokk-bifrost-core migrations/cache/bridges/0016-optional-fact-manifest-after-19.sql
 # The C++, C#, Go, Java, PHP, Python, Ruby, Rust and Scala tree-sitter query
 # assets moved down with their language crates; the epoch salt hashes them from
 # there, so a missing file is a silent epoch change. Kotlin's `highlights.scm`
@@ -204,16 +207,6 @@ require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.m
 require_archive_file brokk-bifrost scripts/embedding_sidecar.py
 require_archive_file brokk-bifrost scripts/voyage_sidecar.py
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v1.schema.json
-
-embedded_skill_count=0
-while IFS= read -r skill_file; do
-  require_archive_file brokk-bifrost "$skill_file"
-  embedded_skill_count=$((embedded_skill_count + 1))
-done < <(grep -oE 'plugins/bifrost-agent/skills/[^" ]+/SKILL[.]md' src/skill_install.rs | sort -u)
-if (( embedded_skill_count == 0 )); then
-  echo "Failed to derive the embedded skill roster from src/skill_install.rs" >&2
-  exit 1
-fi
 
 root_archive=$(archive_for brokk-bifrost)
 root_files="$temporary/root-files.txt"

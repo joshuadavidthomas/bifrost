@@ -810,6 +810,9 @@ pub enum CaptureSource {
     /// direct fields.
     OwnedFields,
     OwnedMutableFields,
+    /// Direct non-static final fields without an authored initializer. The
+    /// matcher preserves declaration order for generated constructor inputs.
+    OwnedUninitializedFinalFields,
     ResolvedOwner,
     Argument {
         index: u32,
@@ -848,6 +851,9 @@ pub enum CaptureCardinality {
     One,
     Optional,
     Many,
+    /// Keep ordered values together for one emission instead of emitting one
+    /// rule match for each value.
+    Group,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -923,6 +929,8 @@ pub struct TemplateSignature {
     pub type_parameters: Vec<TemplateExpression>,
     #[serde(default)]
     pub parameters: Vec<TemplateParameter>,
+    #[serde(default)]
+    pub repeated_parameters: Vec<TemplateParameter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub returns: Option<TemplateTypeRef>,
 }

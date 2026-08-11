@@ -1,0 +1,217 @@
+[
+  {
+    "target": {
+      "path": "java.base/java/io/BufferedReader.java",
+      "symbol": "java.io.BufferedReader.readLine()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a line of text read from the receiver, whose state includes the wrapped Reader and the internal buffer, so the receiver reaches normal_return at receiver granularity. There is no parameter and the only other exit is an IOException, which carries no value derived from the receiver. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of BufferedReader.readLine(); JDK java.io.BufferedReader source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/io/ByteArrayOutputStream.java",
+      "symbol": "java.io.ByteArrayOutputStream.toByteArray()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a new byte array copied from the receiver's internal buffer, which holds everything written to the stream, so the receiver reaches normal_return. There is no parameter and the receiver is not mutated. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of ByteArrayOutputStream.toByteArray(); JDK java.io.ByteArrayOutputStream source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/io/ByteArrayOutputStream.java",
+      "symbol": "java.io.ByteArrayOutputStream.toString()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a String decoded from the receiver's internal buffer with the default charset, so the receiver reaches normal_return. There is no parameter and the receiver is not mutated. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of ByteArrayOutputStream.toString(); JDK java.io.ByteArrayOutputStream source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/io/ByteArrayOutputStream.java",
+      "symbol": "java.io.ByteArrayOutputStream.toString(java.nio.charset.Charset)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a String decoded from the receiver's internal buffer with the given charset, so the receiver reaches normal_return. The charset parameter only selects the decoding algorithm; its own value is not incorporated into the result, so it has no transfer. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of ByteArrayOutputStream.toString(Charset); JDK java.io.ByteArrayOutputStream source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/io/ByteArrayOutputStream.java",
+      "symbol": "java.io.ByteArrayOutputStream.write(byte[],int,int)",
+      "has_receiver": true,
+      "parameter_count": 3
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      }
+    ],
+    "rationale": "The selected region of the byte array (parameter 0) is copied into the receiver's internal buffer, so parameter 0 reaches the receiver's post-state, and the buffer's prior content remains (receiver to receiver). The offset and length parameters (1 and 2) only select the region; their values are not incorporated, so they have no transfer. The method returns void, so no input reaches normal_return.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of ByteArrayOutputStream.write(byte[], int, int); JDK java.io.ByteArrayOutputStream source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/io/StringWriter.java",
+      "symbol": "java.io.StringWriter.toString()",
+      "has_receiver": true,
+      "parameter_count": 0
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a String holding the current content of the receiver's internal StringBuffer, so the receiver reaches normal_return. There is no parameter and the receiver is not mutated. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringWriter.toString(); JDK java.io.StringWriter source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/io/StringWriter.java",
+      "symbol": "java.io.StringWriter.write(java.lang.String)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      }
+    ],
+    "rationale": "The argument's characters are appended to the receiver's internal StringBuffer, so parameter 0 reaches the receiver's post-state, and the buffer's prior content remains (receiver to receiver). The method returns void, so no input reaches normal_return. No other input-to-output pair exists.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of StringWriter.write(String); JDK java.io.StringWriter source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/io/Writer.java",
+      "symbol": "java.io.Writer.write(java.lang.String)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "partial",
+    "transfers": [
+      {
+        "input": { "kind": "receiver" },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      },
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "receiver" }
+      }
+    ],
+    "rationale": "The argument's characters are written to the destination the writer represents, modeled at receiver granularity as the receiver's post-state, so parameter 0 reaches the receiver, and the destination's prior content remains (receiver to receiver). The method returns void, so no input reaches normal_return. Writer is abstract and concrete subclasses forward to arbitrary destinations, so completeness stays partial.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "medium",
+    "citations": "Javadoc of Writer.write(String); JDK java.io.Writer source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Base64.java",
+      "symbol": "java.util.Base64.Decoder.decode(java.lang.String)",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is a byte array decoded from the Base64 characters of the argument, so parameter 0 reaches normal_return; decoding transforms the data but carries it through. The decoder instance (receiver) holds no input-derived state, so the receiver does not flow to the return. Decoding is a flow, not a sanitization; any sanitizer classification belongs to the sanitizer knowledge base, not here.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Base64.Decoder.decode(String); JDK java.util.Base64 source. No CodeQL or Joern model consulted."
+  },
+  {
+    "target": {
+      "path": "java.base/java/util/Base64.java",
+      "symbol": "java.util.Base64.Encoder.encodeToString(byte[])",
+      "has_receiver": true,
+      "parameter_count": 1
+    },
+    "completeness": "complete",
+    "transfers": [
+      {
+        "input": { "kind": "parameter", "ordinal": 0 },
+        "exit_kind": "normal",
+        "output": { "kind": "normal_return" }
+      }
+    ],
+    "rationale": "The result is the Base64 encoding of the argument's bytes, so parameter 0 reaches normal_return; encoding transforms the data but carries it through. The encoder instance (receiver) holds no input-derived state, so the receiver does not flow to the return. Encoding is a flow, not a sanitization; any sanitizer classification belongs to the sanitizer knowledge base, not here.",
+    "provenance": "hand-authored from javadoc and JDK source reasoning",
+    "confidence": "high",
+    "citations": "Javadoc of Base64.Encoder.encodeToString; JDK java.util.Base64 source. No CodeQL or Joern model consulted."
+  }
+]

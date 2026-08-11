@@ -3,7 +3,7 @@ title: Codex
 description: Install and validate Bifrost in Codex.
 ---
 
-Codex can use Bifrost through the Brokk agent plugin or through a manual MCP server entry. The plugin path is preferred because it includes Bifrost skills and a launcher that resolves the Bifrost binary.
+Codex can use Bifrost through the Brokk agent plugin or through a manual MCP server entry. The plugin path is preferred because it includes MCP configuration and a launcher that resolves the Bifrost binary.
 
 ## Plugin Install
 

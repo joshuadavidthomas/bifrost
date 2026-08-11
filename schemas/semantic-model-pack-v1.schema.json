@@ -640,11 +640,20 @@
       ]
     },
     "CaptureCardinality": {
-      "type": "string",
-      "enum": [
-        "one",
-        "optional",
-        "many"
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "one",
+            "optional",
+            "many"
+          ]
+        },
+        {
+          "description": "Keep ordered values together for one emission instead of emitting one\nrule match for each value.",
+          "type": "string",
+          "const": "group"
+        }
       ]
     },
     "CaptureDeclaration": {
@@ -742,6 +751,20 @@
             "kind": {
               "type": "string",
               "const": "owned_mutable_fields"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "description": "Direct non-static final fields without an authored initializer. The\nmatcher preserves declaration order for generated constructor inputs.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "owned_uninitialized_final_fields"
             }
           },
           "additionalProperties": false,
@@ -1901,6 +1924,13 @@
       "type": "object",
       "properties": {
         "parameters": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TemplateParameter"
+          }
+        },
+        "repeated_parameters": {
           "type": "array",
           "default": [],
           "items": {
