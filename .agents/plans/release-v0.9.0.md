@@ -44,6 +44,9 @@ Bifrost v0.9.0 must publish one consistent version of the Rust crates, command-l
 - Observation: The release sync script omitted `crates/bifrost-rql/Cargo.toml`.
   Evidence: `cargo check --workspace --locked` rejected the remaining `brokk-bifrost-core = "=0.8.24"` dependency after the first 0.9.0 sync. A behavior test now verifies this projection.
 
+- Observation: The active-session read-only cache opener failed for macOS temporary paths.
+  Evidence: SQLite `SQLITE_OPEN_NOFOLLOW` refused `/var/folders/...`, while the other read-only opener already canonicalized the parent to `/private/var/folders/...`.
+
 ## Decision Log
 
 - Decision: Repair `master` before selecting the RC commit.
@@ -133,3 +136,5 @@ Revision note: Recorded the Hermes confirmation race and the RQL crate bootstrap
 Revision note: Corrected the gate sequence after two fast master pushes cancelled long jobs. The RC branch now freezes the validation target first.
 
 Revision note: Recorded and corrected the missing RQL dependency projection found during the 0.9.0 locked Cargo check.
+
+Revision note: Recorded the macOS active-session cache path failure found by the RC pre-push gate.
