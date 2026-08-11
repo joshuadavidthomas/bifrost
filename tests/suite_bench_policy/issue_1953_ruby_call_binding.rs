@@ -121,7 +121,8 @@ fn span_of(source: &str, needle: &str) -> Range<usize> {
 /// Every selected row bound exactly and the solve ran. Ruby bare and
 /// receiver calls carry a dynamic-dispatch semantic gap, so the solved
 /// report stays honestly partial: completion is inconclusive
-/// partial-discovery, never a binding capability failure.
+/// partial-discovery, never a binding capability failure. Since #1952 the
+/// run also names the first path-relevant cause in a diagnostic.
 fn assert_reached_propagation(outcome: &PolicyBatchOutcome) {
     let run = &outcome.report().runs()[0];
     assert!(
@@ -134,7 +135,13 @@ fn assert_reached_propagation(outcome: &PolicyBatchOutcome) {
         run.completion(),
         run.diagnostics()
     );
-    assert!(run.diagnostics().is_empty(), "{:?}", run.diagnostics());
+    assert!(
+        run.diagnostics().iter().all(|diagnostic| diagnostic
+            .message()
+            .contains("taint discovery is incomplete")),
+        "{:?}",
+        run.diagnostics()
+    );
     assert_eq!(propagation_solves(outcome), Some(1), "no propagation solve");
 }
 

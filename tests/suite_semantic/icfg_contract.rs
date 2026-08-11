@@ -139,38 +139,15 @@ fn typescript_direct_call_has_matched_entry_and_normal_return() {
                 .effect("call_continuation")
                 .outgoing_kind(ControlEdgeKind::Normal),
             root(),
-        )
-        .bind_node(
-            "caller_exceptional_continuation",
-            "src/direct.ts",
-            PointSelector::new("leaf()")
-                .procedure("caller")
-                .effect("call_continuation")
-                .outgoing_kind(ControlEdgeKind::Exceptional),
-            root(),
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Unproven);
-    graph.assert_boundary(
-        "leaf_invoke",
-        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
-            .originating_call("leaf_call"),
-    );
+    // The receiverless call resolves to its single proven target since
+    // #1952: no blanket rebinding boundary remains, and the exceptional
+    // continuation is unreachable because `leaf` provably cannot throw.
+    graph.assert_outcome(IcfgOutcomeKind::Complete);
     graph.assert_successors(
         "leaf_invoke",
-        &[
-            icfg_edge("leaf_entry", IcfgEdgeKind::Call).originating_call("leaf_call"),
-            icfg_edge(
-                "caller_continuation",
-                IcfgEdgeKind::CallToNormalContinuation,
-            )
-            .originating_call("leaf_call"),
-            icfg_edge(
-                "caller_exceptional_continuation",
-                IcfgEdgeKind::CallToExceptionalContinuation,
-            )
-            .originating_call("leaf_call"),
-        ],
+        &[icfg_edge("leaf_entry", IcfgEdgeKind::Call).originating_call("leaf_call")],
     );
     graph.assert_predecessors(
         "leaf_entry",
@@ -267,15 +244,6 @@ fn typescript_cross_file_call_materializes_target_on_demand() {
             root(),
         )
         .bind_node(
-            "exceptional_continuation",
-            "src/consumer.ts",
-            PointSelector::new("target()")
-                .procedure("caller")
-                .effect("call_continuation")
-                .outgoing_kind(ControlEdgeKind::Exceptional),
-            root(),
-        )
-        .bind_node(
             "doubled",
             "src/consumer.ts",
             PointSelector::new("value * 2")
@@ -284,24 +252,13 @@ fn typescript_cross_file_call_materializes_target_on_demand() {
             root(),
         );
 
-    graph.assert_outcome(IcfgOutcomeKind::Unproven);
-    graph.assert_boundary(
-        "invoke",
-        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
-            .originating_call("target_call"),
-    );
+    // The imported target resolves as the complete receiverless target set
+    // since #1952: the call keeps only its interprocedural edge, and the
+    // callee provably cannot throw.
+    graph.assert_outcome(IcfgOutcomeKind::Complete);
     graph.assert_successors(
         "invoke",
-        &[
-            icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("target_call"),
-            icfg_edge("continuation", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("target_call"),
-            icfg_edge(
-                "exceptional_continuation",
-                IcfgEdgeKind::CallToExceptionalContinuation,
-            )
-            .originating_call("target_call"),
-        ],
+        &[icfg_edge("target_entry", IcfgEdgeKind::Call).originating_call("target_call")],
     );
     graph.assert_successors(
         "target_exit",
@@ -415,33 +372,17 @@ fn two_call_sites_to_one_callee_never_cross_return_contexts() {
         &[icfg_edge("second_continuation", IcfgEdgeKind::NormalReturn)
             .originating_call("second_call")],
     );
+    // The resolved calls keep only their matched-return edges since #1952:
+    // no blanket rebinding boundary projects continuation edges any more.
     graph.assert_predecessors(
         "first_continuation",
-        &[
-            icfg_edge("first_exit", IcfgEdgeKind::NormalReturn).originating_call("first_call"),
-            icfg_edge("first_invoke", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("first_call"),
-        ],
+        &[icfg_edge("first_exit", IcfgEdgeKind::NormalReturn).originating_call("first_call")],
     );
     graph.assert_predecessors(
         "second_continuation",
-        &[
-            icfg_edge("second_exit", IcfgEdgeKind::NormalReturn).originating_call("second_call"),
-            icfg_edge("second_invoke", IcfgEdgeKind::CallToNormalContinuation)
-                .originating_call("second_call"),
-        ],
+        &[icfg_edge("second_exit", IcfgEdgeKind::NormalReturn).originating_call("second_call")],
     );
-    graph.assert_outcome(IcfgOutcomeKind::Unproven);
-    graph.assert_boundary(
-        "first_invoke",
-        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
-            .originating_call("first_call"),
-    );
-    graph.assert_boundary(
-        "second_invoke",
-        ExpectedIcfgBoundary::new(ExpectedIcfgBoundaryKind::DispatchUnresolved)
-            .originating_call("second_call"),
-    );
+    graph.assert_outcome(IcfgOutcomeKind::Complete);
     graph.assert_adjacency_symmetric();
 }
 
@@ -1288,7 +1229,10 @@ fn python_exception_gap_keeps_matched_normal_return_complete() {
         );
     let expected =
         icfg_edge("continuation", IcfgEdgeKind::NormalReturn).originating_call("relay_call");
-    graph.assert_outcome(IcfgOutcomeKind::Unsupported);
+    // The implicit-exception gap no longer downgrades the normal-return
+    // snapshot when no abort path runs user code (#1952); the exceptional
+    // sibling test still pins the Unsupported downgrade.
+    graph.assert_outcome(IcfgOutcomeKind::Complete);
     graph.assert_successors("relay_exit", &[expected]);
     graph.assert_edge_proven_complete("relay_exit", expected);
     graph.assert_adjacency_symmetric();
@@ -1623,15 +1567,6 @@ fn explicit_throw_returns_to_the_exact_caller_handler() {
             root(),
         )
         .bind_node(
-            "normal_continuation",
-            "src/exceptional.ts",
-            PointSelector::new("fail(error)")
-                .procedure("caller")
-                .effect("call_continuation")
-                .outgoing_kind(ControlEdgeKind::Normal),
-            root(),
-        )
-        .bind_node(
             "catch_return",
             "src/exceptional.ts",
             PointSelector::new("return 1;")
@@ -1640,21 +1575,12 @@ fn explicit_throw_returns_to_the_exact_caller_handler() {
             root(),
         );
 
+    // The resolved call keeps only its interprocedural edge since #1952:
+    // `fail` returns `never`, so no normal continuation node exists, and the
+    // handler is reached through the callee's exceptional return.
     graph.assert_successors(
         "invoke",
-        &[
-            icfg_edge("fail_entry", IcfgEdgeKind::Call).originating_call("fail_call"),
-            icfg_edge(
-                "normal_continuation",
-                IcfgEdgeKind::CallToNormalContinuation,
-            )
-            .originating_call("fail_call"),
-            icfg_edge(
-                "handler_continuation",
-                IcfgEdgeKind::CallToExceptionalContinuation,
-            )
-            .originating_call("fail_call"),
-        ],
+        &[icfg_edge("fail_entry", IcfgEdgeKind::Call).originating_call("fail_call")],
     );
     graph.assert_successors(
         "fail_exceptional_exit",
@@ -2320,15 +2246,6 @@ fn nested_calls_dispatch_by_the_exact_whole_call_span() {
             root(),
         )
         .bind_node(
-            "inner_exceptional_continuation",
-            "src/nested.ts",
-            PointSelector::new("inner()")
-                .procedure("caller")
-                .effect("call_continuation")
-                .outgoing_kind(ControlEdgeKind::Exceptional),
-            root(),
-        )
-        .bind_node(
             "outer_normal_continuation",
             "src/nested.ts",
             PointSelector::new("outer(inner())")
@@ -2336,48 +2253,17 @@ fn nested_calls_dispatch_by_the_exact_whole_call_span() {
                 .effect("call_continuation")
                 .outgoing_kind(ControlEdgeKind::Normal),
             root(),
-        )
-        .bind_node(
-            "outer_exceptional_continuation",
-            "src/nested.ts",
-            PointSelector::new("outer(inner())")
-                .procedure("caller")
-                .effect("call_continuation")
-                .outgoing_kind(ControlEdgeKind::Exceptional),
-            root(),
         );
 
+    // Both calls resolve to proven free functions since #1952: only the
+    // interprocedural call edges remain, and neither callee can throw.
     graph.assert_successors(
         "inner_invoke",
-        &[
-            icfg_edge("inner_entry", IcfgEdgeKind::Call).originating_call("inner_call"),
-            icfg_edge(
-                "inner_normal_continuation",
-                IcfgEdgeKind::CallToNormalContinuation,
-            )
-            .originating_call("inner_call"),
-            icfg_edge(
-                "inner_exceptional_continuation",
-                IcfgEdgeKind::CallToExceptionalContinuation,
-            )
-            .originating_call("inner_call"),
-        ],
+        &[icfg_edge("inner_entry", IcfgEdgeKind::Call).originating_call("inner_call")],
     );
     graph.assert_successors(
         "outer_invoke",
-        &[
-            icfg_edge("outer_entry", IcfgEdgeKind::Call).originating_call("outer_call"),
-            icfg_edge(
-                "outer_normal_continuation",
-                IcfgEdgeKind::CallToNormalContinuation,
-            )
-            .originating_call("outer_call"),
-            icfg_edge(
-                "outer_exceptional_continuation",
-                IcfgEdgeKind::CallToExceptionalContinuation,
-            )
-            .originating_call("outer_call"),
-        ],
+        &[icfg_edge("outer_entry", IcfgEdgeKind::Call).originating_call("outer_call")],
     );
     graph.assert_reachable("inner_entry", "outer_invoke");
     graph.assert_adjacency_symmetric();

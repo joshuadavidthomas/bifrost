@@ -485,7 +485,7 @@ pub fn collect_taint_findings_with_limits(
             witness_limits,
             &mut budget,
         )?;
-        findings.push(TaintFinding {
+        let finding = TaintFinding {
             key,
             sink,
             classes,
@@ -498,7 +498,14 @@ pub fn collect_taint_findings_with_limits(
                 && point_value.path_qualities().has_proven_path(),
             complete: result.is_complete() && point_value.path_qualities().has_complete_path(),
             origins,
-        });
+        };
+        // Distinct summary entries can reach one sink with identical facts --
+        // the resolved-call continuation edges (#1952) make that routine --
+        // and an identical finding carries no additional information.
+        if findings.contains(&finding) {
+            continue;
+        }
+        findings.push(finding);
     }
     findings.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(TaintFindingReport {

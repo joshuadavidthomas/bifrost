@@ -204,6 +204,19 @@ pub trait DistributiveDataflowProblem {
     /// facts from it. They do not need to return the zero fact themselves.
     fn zero_fact(&self) -> Self::Fact;
 
+    /// Whether resolved calls also project their caller-side control
+    /// continuations as call-to-return edges (#1952).
+    ///
+    /// A problem that opts in receives `call_to_return_flow` for every
+    /// resolved call, so caller-side facts that are not passed into the
+    /// callee can survive the call; its flow function is responsible for
+    /// killing facts the callee rebinds. Problems that keep the default
+    /// receive call-to-return edges only from unresolved boundaries, which
+    /// preserves the historical kernel semantics.
+    fn resolved_call_to_return(&self) -> bool {
+        false
+    }
+
     /// Whether `fact` records a monitored observation on the current path
     /// rather than a value that flows onward.
     ///

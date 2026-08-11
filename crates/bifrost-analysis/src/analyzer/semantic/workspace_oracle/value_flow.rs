@@ -66,9 +66,20 @@ struct FlowRelationDraft {
     evidence: Vec<EvidenceHandle>,
 }
 
-fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
+/// Whether this procedure's relation stream is open because of a capability
+/// the procedure needs (#1952).
+///
+/// Scalar-core capabilities are a blanket requirement: without them the
+/// relation stream itself cannot be trusted, however simple the body is.
+/// Memory-family capabilities open the snapshot only when the procedure
+/// retains a memory row of that kind. IR validation rejects a memory row
+/// whose capability is unavailable, so an unavailable memory capability is
+/// by construction unused here; a construct the adapter could not lower is
+/// reported through its per-construct semantic gap instead, which the gap
+/// sweep in `procedure_relations` already applies.
+pub(crate) fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
     let capabilities = procedure.artifact().capabilities();
-    [
+    if [
         SemanticCapability::Values,
         SemanticCapability::Assignments,
         SemanticCapability::Allocations,
@@ -76,13 +87,170 @@ fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
         SemanticCapability::ParameterFlow,
         SemanticCapability::ReceiverFlow,
         SemanticCapability::ReturnFlow,
-        SemanticCapability::FieldMemory,
-        SemanticCapability::StaticMemory,
-        SemanticCapability::IndexMemory,
-        SemanticCapability::Captures,
     ]
     .into_iter()
     .any(|capability| !capabilities.is_available(capability))
+    {
+        return true;
+    }
+    let location_capability = |kind: &MemoryLocationKind| match kind {
+        MemoryLocationKind::Field { .. } => SemanticCapability::FieldMemory,
+        MemoryLocationKind::Static { .. } => SemanticCapability::StaticMemory,
+        MemoryLocationKind::Index { .. } => SemanticCapability::IndexMemory,
+        MemoryLocationKind::LexicalCell { .. } => SemanticCapability::LocalFlow,
+        MemoryLocationKind::Capture { .. } => SemanticCapability::Captures,
+    };
+    procedure
+        .semantics()
+        .memory_locations()
+        .iter()
+        .any(|location| !capabilities.is_available(location_capability(&location.kind)))
+        || (!procedure.semantics().captures().is_empty()
+            && !capabilities.is_available(SemanticCapability::Captures))
+}
+
+/// The call site a call-target refinement gap is scoped to, when the gap is
+/// of the dischargeable kind (#1952).
+///
+/// Adapters publish blanket `Unknown`/`Unproven` gaps ("target requires
+/// whole-program dispatch refinement") on every call's site and callee value.
+/// The workspace dispatch resolver performs exactly that refinement, so a gap
+/// of this shape is answered by a complete resolution of its call and must
+/// not independently open the selected path. `Unsupported`, `Ambiguous`, and
+/// `ExceededBudget` gaps are never of this shape.
+pub(crate) fn call_target_refinement_call(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    gap: &crate::analyzer::semantic::SemanticGap,
+) -> Option<crate::analyzer::semantic::CallSiteId> {
+    if !matches!(
+        gap.kind,
+        SemanticGapKind::Unknown | SemanticGapKind::Unproven
+    ) || !matches!(
+        gap.capability,
+        SemanticCapability::Calls
+            | SemanticCapability::CallableReferences
+            | SemanticCapability::DynamicDispatch
+    ) {
+        return None;
+    }
+    match gap.subject {
+        SemanticGapSubject::CallSite(call_site) => semantics.call_site(call_site).map(|row| row.id),
+        SemanticGapSubject::Value(value) => semantics
+            .call_sites()
+            .iter()
+            .find(|row| row.callee == value)
+            .map(|row| row.id),
+        _ => None,
+    }
+}
+
+/// Whether a call-target refinement gap is discharged directly by the
+/// adapter's own statically proven `declared_targets` (#1952). A refinement
+/// gap on a call the adapter could not prove stays relevant here; the plan
+/// discharges it only when the same plan retains a complete resolution and
+/// binding for that call.
+fn declared_proven_target_discharges_gap(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+    gap: &crate::analyzer::semantic::SemanticGap,
+) -> bool {
+    call_target_refinement_call(semantics, gap)
+        .and_then(|call| semantics.call_site(call))
+        .is_some_and(|row| {
+            matches!(
+                row.declared_targets,
+                crate::analyzer::semantic::CallableTargetResolution::Proven(_)
+            )
+        })
+}
+
+/// Whether a snapshot gap's impacts can affect value-flow relations at all.
+pub(crate) fn gap_impacts_value_flow(gap: &crate::analyzer::semantic::SemanticGap) -> bool {
+    gap.impacts.contains(SemanticGapImpact::ValueFlow)
+        || gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
+        || gap.impacts.contains(SemanticGapImpact::HeapRead)
+        || gap.impacts.contains(SemanticGapImpact::HeapWrite)
+}
+
+/// Whether any point reachable through an exceptional or cleanup edge, before
+/// the exceptional exit, runs user code (an assignment, flow, memory access,
+/// allocation, capture, call, or valued throw).
+///
+/// An adapter's implicit-exception gap states that an abort edge from a
+/// runtime operation to the exceptional exit is not lowered. When every abort
+/// path only unwinds -- no handler or cleanup body executes user code -- the
+/// missing edge can only remove paths from a may analysis, so it cannot hide
+/// a value flow and must not open the snapshot (#1952). When aborts can run
+/// user code, the gap keeps standing: a flow into that code may depend on the
+/// missing edge.
+pub(crate) fn abort_paths_run_user_code(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+) -> bool {
+    let exceptional_exit = semantics.exceptional_exit_point();
+    let mut pending = semantics
+        .cfg()
+        .edges()
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge.kind,
+                crate::analyzer::semantic::ControlEdgeKind::Exceptional
+                    | crate::analyzer::semantic::ControlEdgeKind::Cleanup
+            ) && edge.target_point != exceptional_exit
+        })
+        .map(|edge| edge.target_point)
+        .collect::<Vec<_>>();
+    let mut visited = HashSet::new();
+    while let Some(point_id) = pending.pop() {
+        if point_id == exceptional_exit || !visited.insert(point_id) {
+            continue;
+        }
+        let Some(point) = semantics.point(point_id) else {
+            continue;
+        };
+        if point.events.iter().any(|event| {
+            matches!(
+                event.effect,
+                SemanticEffect::Assignment { .. }
+                    | SemanticEffect::ValueFlow { .. }
+                    | SemanticEffect::Allocation { .. }
+                    | SemanticEffect::MemoryLoad { .. }
+                    | SemanticEffect::MemoryStore { .. }
+                    | SemanticEffect::CaptureBind { .. }
+                    | SemanticEffect::Invoke { .. }
+                    | SemanticEffect::Throw { value: Some(_) }
+            )
+        }) {
+            return true;
+        }
+        pending.extend(
+            semantics
+                .cfg()
+                .edges()
+                .iter()
+                .filter(|edge| edge.source_point == point_id)
+                .map(|edge| edge.target_point),
+        );
+    }
+    false
+}
+
+/// Whether an implicit-exception gap is discharged because every abort path
+/// in this procedure only unwinds.
+///
+/// Only an `Unsupported` gap qualifies: it states that a represented
+/// operation's implicit abort edge is not lowered, which cannot carry a value
+/// when aborts run no user code. An `Unknown` exceptional gap (deferred-call
+/// panic propagation, destructor unwinding) makes the represented route
+/// itself uncertain and always keeps standing, matching the matched-return
+/// rule in the ICFG exit profiles.
+pub(crate) fn implicit_abort_gap_is_discharged(
+    gap: &crate::analyzer::semantic::SemanticGap,
+    abort_user_code: bool,
+) -> bool {
+    gap.capability == SemanticCapability::ExceptionalControlFlow
+        && matches!(gap.subject, SemanticGapSubject::Point)
+        && gap.kind == SemanticGapKind::Unsupported
+        && !abort_user_code
 }
 
 fn proven_complete(evidence: &[EvidenceHandle]) -> bool {
@@ -280,6 +448,19 @@ fn resolve_access_path<'location>(
             AccessPathTail::Exact
         },
     }))
+}
+
+/// Whether a bounded location names an exact index selector. Two mentions of
+/// the same source index produce distinct index values, so exact-index
+/// equality across accesses is not value-proven; relations through such a
+/// location keep partial completeness (#1952) instead of letting a run claim
+/// a complete negative over an unproven index join.
+fn location_has_exact_index(location: &AbstractLocation) -> bool {
+    location
+        .path()
+        .selectors()
+        .iter()
+        .any(|selector| matches!(selector, AccessSelector::Index(IndexSelector::Exact(_))))
 }
 
 fn materialize_abstract_location(
@@ -757,6 +938,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         let mut open = value_flow_capabilities_are_open(procedure);
         let mut gap_quality = None;
         if interrupted.is_none() {
+            let abort_user_code = abort_paths_run_user_code(procedure.semantics());
             for gap in procedure.semantics().gaps() {
                 if request.cancellation.is_cancelled() {
                     interrupted = Some(Interruption::Cancelled);
@@ -769,10 +951,9 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     interrupted = Some(stop);
                     break;
                 }
-                let relevant = gap.impacts.contains(SemanticGapImpact::ValueFlow)
-                    || gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
-                    || gap.impacts.contains(SemanticGapImpact::HeapRead)
-                    || gap.impacts.contains(SemanticGapImpact::HeapWrite);
+                let relevant = gap_impacts_value_flow(gap)
+                    && !declared_proven_target_discharges_gap(procedure.semantics(), gap)
+                    && !implicit_abort_gap_is_discharged(gap, abort_user_code);
                 open |= relevant;
                 if relevant {
                     gap_quality = merge_gap_quality(gap_quality, gap);
@@ -951,6 +1132,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
 
                 let evidence = evidence_handle(procedure, event.evidence)?;
                 let (proof, mut completeness) = evidence_quality(std::slice::from_ref(&evidence));
+                let mut exact_index = false;
                 let (kind, source, target, summary) = match &event.effect {
                     SemanticEffect::Assignment { target, value } => (
                         ValueFlowRelationKind::Assignment,
@@ -1072,6 +1254,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 .expect("memory loads resolve an access path"),
                             *self.limits(),
                         )?;
+                        exact_index |= location_has_exact_index(&location);
                         (
                             ValueFlowRelationKind::MemoryLoad,
                             ValueFlowEndpoint::Location(Box::new(location)),
@@ -1087,6 +1270,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                                 .expect("memory stores resolve an access path"),
                             *self.limits(),
                         )?;
+                        exact_index |= location_has_exact_index(&location);
                         (
                             ValueFlowRelationKind::MemoryStore,
                             ValueFlowEndpoint::Value(value_handle(procedure, *value)?),
@@ -1147,6 +1331,10 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         "access path retains an unknown selector".into(),
                     );
                     open = true;
+                } else if exact_index && matches!(completeness, EvidenceCompleteness::Complete) {
+                    completeness = EvidenceCompleteness::Partial(
+                        "exact index identity is not value-proven across accesses".into(),
+                    );
                 }
                 let draft = FlowRelationDraft {
                     point: procedure.point_handle(point.id).ok_or_else(|| {
@@ -1235,6 +1423,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         let mut interrupted = None;
 
         let mut build = BindingBuild::new(false);
+        let caller_abort_user_code = abort_paths_run_user_code(call.procedure().semantics());
         for gap in call.procedure().semantics().gaps() {
             if interrupted.is_some() {
                 break;
@@ -1271,12 +1460,15 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             };
             let relevant = scoped_to_call
                 && (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
-                    || gap.impacts.contains(SemanticGapImpact::ValueFlow));
+                    || gap.impacts.contains(SemanticGapImpact::ValueFlow))
+                && call_target_refinement_call(call.procedure().semantics(), gap).is_none()
+                && !implicit_abort_gap_is_discharged(gap, caller_abort_user_code);
             build.open |= relevant;
             if relevant {
                 build.gap_quality = merge_gap_quality(build.gap_quality, gap);
             }
         }
+        let callee_abort_user_code = abort_paths_run_user_code(callee.semantics());
         for gap in callee.semantics().gaps() {
             if interrupted.is_some() {
                 break;
@@ -1292,9 +1484,11 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 interrupted = Some(stop);
                 break;
             }
-            let relevant = gap.impacts.contains(SemanticGapImpact::CallEvaluation)
+            let relevant = (gap.impacts.contains(SemanticGapImpact::CallEvaluation)
                 || gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
-                || gap.impacts.contains(SemanticGapImpact::ValueFlow);
+                || gap.impacts.contains(SemanticGapImpact::ValueFlow))
+                && call_target_refinement_call(callee.semantics(), gap).is_none()
+                && !implicit_abort_gap_is_discharged(gap, callee_abort_user_code);
             build.open |= relevant;
             if relevant {
                 build.gap_quality = merge_gap_quality(build.gap_quality, gap);

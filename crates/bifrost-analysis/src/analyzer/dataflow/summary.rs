@@ -1398,6 +1398,44 @@ where
                         projected_edges.push(edge);
                     }
                 }
+                // A resolved call also carries the caller's own control
+                // continuations (#1952): caller-side facts that are not passed
+                // into the callee survive the call unchanged, which used to be
+                // carried only by the boundary edges of blanket dispatch gaps.
+                // The edges are the caller's own scaffolding, so their
+                // evidence is proven and complete.
+                if problem.resolved_call_to_return() && !transfers.transfers.is_empty() {
+                    for (kind, continuation) in [
+                        (
+                            IcfgEdgeKind::CallToNormalContinuation,
+                            semantic_call.normal_continuation,
+                        ),
+                        (
+                            IcfgEdgeKind::CallToExceptionalContinuation,
+                            semantic_call.exceptional_continuation,
+                        ),
+                    ] {
+                        let crate::analyzer::semantic::ControlContinuation::Target(target_id) =
+                            continuation
+                        else {
+                            continue;
+                        };
+                        let target = caller.point_handle(target_id).ok_or_else(|| {
+                            SemanticProviderError::internal(
+                                "summary call continuation target is stale",
+                            )
+                        })?;
+                        projected_edges.push(ProcedureIcfgEdge {
+                            source: point.clone(),
+                            target,
+                            kind,
+                            origin: Some(origin.clone()),
+                            proof: ProofStatus::Proven,
+                            completeness: EvidenceCompleteness::Complete,
+                            boundary: None,
+                        });
+                    }
+                }
                 projected_edges.sort_by(compare_procedure_edges);
                 projected_edges.dedup();
                 for edge in &projected_edges {

@@ -150,6 +150,11 @@ pub trait IdeDataflowProblem {
     /// The distinguished fact preserved by the kernel on every edge.
     fn zero_fact(&self) -> Self::Fact;
 
+    /// See [`super::DistributiveDataflowProblem::resolved_call_to_return`].
+    fn resolved_call_to_return(&self) -> bool {
+        false
+    }
+
     /// The implicit value supplied at the distinguished zero fact.
     fn zero_value(&self) -> Self::Value;
 
@@ -718,6 +723,10 @@ where
 
     fn zero_fact(&self) -> Self::Fact {
         self.problem.zero_fact()
+    }
+
+    fn resolved_call_to_return(&self) -> bool {
+        self.problem.resolved_call_to_return()
     }
 
     fn is_flow_observation(&self, fact: &Self::Fact) -> bool {

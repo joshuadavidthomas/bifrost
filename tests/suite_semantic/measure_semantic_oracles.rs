@@ -908,7 +908,12 @@ fn rust_control_adapter_stays_behind_the_neutral_oracle_boundary() {
             );
             value_relations += 1;
         }
-        assert_eq!(snapshot.coverage(), CandidateCoverage::Open);
+        // A scalar Rust procedure without Drop or call gaps closes since
+        // #1952; procedures with such gaps keep an explicitly open answer.
+        assert!(matches!(
+            snapshot.coverage(),
+            CandidateCoverage::Open | CandidateCoverage::Exhaustive
+        ));
 
         if let Some(value) = procedure.values().first() {
             let point = handle
