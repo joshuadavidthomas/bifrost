@@ -1681,6 +1681,14 @@ fn model_backed_witnesses_preserve_each_distinct_source_event_origin() {
 
 fn assert_model_backed_renderers(outcome: &brokk_bifrost::policy::PolicyBatchOutcome) {
     let finding_id = outcome.report().runs()[0].findings()[0].id().to_string();
+    let mut concise = Vec::new();
+    write_policy_human(
+        outcome.report(),
+        &HumanRenderOptions::default(),
+        &mut concise,
+        usize::MAX,
+    )
+    .expect("model-backed concise human rendering");
     let mut human = Vec::new();
     write_policy_human(
         outcome.report(),
@@ -1702,6 +1710,34 @@ fn assert_model_backed_renderers(outcome: &brokk_bifrost::policy::PolicyBatchOut
     .expect("model-backed SARIF rendering");
 
     let human = String::from_utf8(human).expect("UTF-8 human policy output");
+    let concise = String::from_utf8(concise).expect("UTF-8 concise human policy output");
+    assert!(concise.contains("    #   Kind         Location  Code / symbol\n"));
+    assert!(
+        concise.contains(" source       "),
+        "missing source step:\n{concise}"
+    );
+    assert!(
+        concise.contains(" propagation  "),
+        "missing propagation step:\n{concise}"
+    );
+    assert!(
+        concise.contains(" sink         "),
+        "missing sink step:\n{concise}"
+    );
+    assert!(!concise.contains(&finding_id));
+    assert!(!concise.contains("[evidence"));
+    let mut ansi = Vec::new();
+    write_policy_human(
+        outcome.report(),
+        &HumanRenderOptions::new(HumanRenderDetail::Concise, HumanRenderColor::Ansi),
+        &mut ansi,
+        usize::MAX,
+    )
+    .expect("model-backed ANSI human rendering");
+    let ansi = String::from_utf8(ansi).expect("UTF-8 ANSI policy output");
+    assert!(ansi.contains("\u{001B}["));
+    assert!(ansi.contains("    #   Kind         Location  Code / symbol\n"));
+    assert!(ansi.contains(" sink         "));
     for expected in [&finding_id, "BROAD-TAINT", "untrusted", "app.java"] {
         assert!(human.contains(expected), "missing {expected} in:\n{human}");
     }
