@@ -74,5 +74,6 @@ mod summary_foundry_fixtures;
 #[cfg(feature = "release-tooling")]
 mod summary_foundry_demand;
 mod taint_policy_adapter;
+mod taint_regression_fixtures;
 #[cfg(unix)]
 mod temp_storage_scripts;
