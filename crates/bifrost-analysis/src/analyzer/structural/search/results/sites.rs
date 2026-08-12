@@ -189,6 +189,86 @@ pub struct CodeQueryMemberSelection {
     pub coverage: &'static str,
 }
 
+/// The mandatory overload-selection summary for one reference occurrence
+/// (#1478 M3).
+///
+/// Exactly one row exists per occurrence, always. `resolution` states the
+/// site's outcome, and it is computed from the verdict counts alone: no
+/// permutation of the resolver's candidate order can change it, zero applicable
+/// candidates stay `unresolved`, and several equally applicable winners stay
+/// `ambiguous` with every candidate row retained. Any candidate whose
+/// applicability nobody could decide, a language that does not report the
+/// callable axis, and an occurrence with no trace at all all reach
+/// `unknown_shape`, so a policy completeness gate turns an exact-cardinality
+/// assertion over such a site unreliable instead of clean.
+///
+/// The site's argument-shape coverage is deliberately not repeated here: it is
+/// the `call_shape` row's field, joined on the same `site_ast_id`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryOverloadSelection {
+    pub id: String,
+    /// The occurrence's content-scoped AST identity, shared with the
+    /// `call_shape`, `callable_applicability`, and occurrence rows.
+    pub site_ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    /// `resolved_unique`, `ambiguous`, `unresolved`, or `unknown_shape`.
+    pub resolution: &'static str,
+    /// Whether the language's resolver reports the callable-applicability axis
+    /// at all. `false` forces `resolution` to `unknown_shape`.
+    pub supported: bool,
+    pub considered_count: usize,
+    pub applicable_count: usize,
+    pub inapplicable_count: usize,
+    /// Candidates whose applicability nobody could decide.
+    pub unknown_count: usize,
+}
+
+/// One considered candidate's applicability to one call site (#1478 M3).
+///
+/// One row is one candidate the production resolver actually considered, with
+/// the verdict the resolver's own applicability check produced. A refused
+/// overload keeps its row and its typed `reason`, which is what makes a losing
+/// overload evidence rather than an absence.
+///
+/// `selected` and `verdict` are independent on purpose, and a policy must read
+/// both. No language seam binds a candidate its own check refused, so the
+/// wrong-overload signal is the *absence* of a selected applicable candidate at
+/// a site that considered some: zero winners means the resolver bound nothing
+/// and the site's `overload_selection` summary says `unresolved`. A row that is
+/// `selected` with an `unknown` verdict is a third state again -- the seam bound
+/// something no applicability check measured.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallableApplicability {
+    pub id: String,
+    /// The exact `site_ast_id` of the occurrence, and of the
+    /// `overload_selection` summary this row was counted in.
+    pub site_ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    /// The reference occurrence's range: an applicability row explains part of
+    /// the resolution of that position.
+    pub range: CodeQueryRange,
+    /// Position in the resolver's own consideration order, so two otherwise
+    /// identical rows stay separately addressable. Never a precedence signal.
+    pub ordinal: usize,
+    /// `applicable`, `inapplicable`, or `unknown`.
+    pub verdict: &'static str,
+    /// The typed callable reason, present only when `verdict` is
+    /// `inapplicable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// The precedence tier the resolver considered the candidate at. Absent is
+    /// unattributed, never weakest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<&'static str>,
+    pub selected: bool,
+    /// What the resolver considered. A lexical binder or an external route is
+    /// something the resolver weighed but is not a callable declaration.
+    pub candidate: CodeQueryCandidateRef,
+}
+
 /// The mandatory terminal row for one bounded-dispatch site (#1477 M4).
 ///
 /// Exactly one row exists per input site. Target rows may be empty, but this
@@ -447,6 +527,94 @@ pub struct CodeQueryCallShapeArgument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub spread: bool,
+}
+
+/// The mandatory row for one persisted signature entry of one declaration
+/// (#1478 M2).
+///
+/// Projected from the analyzer's own `SignatureMetadata`, never re-parsed, so
+/// a warm cache and a cold run agree by construction. Exactly one row exists
+/// per persisted entry, and a declaration whose language publishes no metadata
+/// at all still gets one row whose `coverage` is `unrecorded` -- zero
+/// parameter rows can therefore never be read as a proven-empty parameter
+/// list. An overload set that shares one fully qualified name separates into
+/// one row per overload, distinguished by `ordinal`.
+///
+/// A fact the adapter did not record is absent, never defaulted. The arity
+/// fields are absent when the language records no arity, and
+/// `receiver_contract` is absent when the adapter never inspected modifiers,
+/// because "not static" and "nobody looked" are different answers.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallableSignature {
+    pub id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub declaration: CodeQueryDeclaration,
+    /// Zero-based position among the declaration's persisted signature
+    /// entries.
+    pub ordinal: usize,
+    /// `exact`, `arity_unrecorded`, or `unrecorded`.
+    pub coverage: &'static str,
+    /// `function`, `method`, `constructor`, `field`, `class`, `module`,
+    /// `macro`, or `file_scope`.
+    pub role: &'static str,
+    /// The rendered signature header the adapter published. Evidence for a
+    /// human reading a finding; never parsed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// How many arguments a call must supply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_arity: Option<usize>,
+    /// How many arguments the declaration accepts, ignoring repetition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_arity: Option<usize>,
+    /// Whether the trailing parameter repeats, so a call may exceed
+    /// `total_arity`.
+    pub repeated: bool,
+    /// Declared type parameters.
+    pub generic_arity: usize,
+    /// `none`, `instance`, `static_or_companion`, or `extension`, when the
+    /// persisted facts decide it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_contract: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_type: Option<String>,
+    /// Whether this entry is a declaration without a body.
+    pub declaration_only: bool,
+    pub parameter_count: usize,
+}
+
+/// One ordered declared parameter of one callable signature (#1478 M2).
+///
+/// `range` is the *declaration's* range, because the persisted contract
+/// anchors a parameter only inside the rendered signature label; that anchor is
+/// published as `label_start_byte`/`label_end_byte` under its own name so it is
+/// never mistaken for a file offset.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQuerySignatureParameter {
+    pub id: String,
+    pub signature_id: String,
+    pub path: String,
+    pub range: CodeQueryRange,
+    pub parameter_index: usize,
+    /// The parameter label the adapter recorded.
+    pub label: String,
+    /// The declared type spelling, when the adapter records per-parameter
+    /// types. A spelling discriminates inside an already bounded candidate
+    /// set; it is not a resolved type identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_type: Option<String>,
+    /// Whether a call may omit this parameter. Absent when the signature
+    /// records no arity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optional: Option<bool>,
+    /// Whether this is the repeating trailing parameter. Absent when the
+    /// signature records no arity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeated: Option<bool>,
+    pub label_start_byte: usize,
+    pub label_end_byte: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]

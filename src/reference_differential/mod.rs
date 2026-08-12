@@ -2,7 +2,8 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::declaration_range::DeclarationNameRangeContext;
 use crate::analyzer::reference_candidates::{
     CensusBareNameBindings, ReferenceCandidateRanges, census_identifier_ranges,
-    reference_candidate_ranges, reference_candidate_requires_point_lookup,
+    go_is_declaration_or_import_name, reference_candidate_ranges,
+    reference_candidate_requires_point_lookup,
 };
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::cpp_graph::CppAuthoritativeUsageBatch;
@@ -699,6 +700,19 @@ fn collect_sampled_sites(
                     .descendant_for_byte_range(range.start_byte, range.end_byte)
                     .is_some_and(|node| {
                         rust_is_field_declaration_name(node, range.start_byte, range.end_byte)
+                    })
+            {
+                summary.declaration_sites_excluded =
+                    summary.declaration_sites_excluded.saturating_add(1);
+                continue;
+            }
+            if language == Language::Go
+                && root
+                    .named_descendant_for_byte_range(range.start_byte, range.end_byte)
+                    .is_some_and(|node| {
+                        node.start_byte() == range.start_byte
+                            && node.end_byte() == range.end_byte
+                            && go_is_declaration_or_import_name(node)
                     })
             {
                 summary.declaration_sites_excluded =
@@ -3176,6 +3190,65 @@ public sealed class Model {
             "{report:#?}"
         );
         assert!(report.sites.iter().all(|site| site.text != "payload"));
+    }
+
+    #[test]
+    fn go_census_sampler_excludes_unindexed_declaration_and_import_names() {
+        let source = concat!(
+            "package main\n",
+            "\n",
+            "import _ \"example.com/sidefx\"\n",
+            "\n",
+            "type Hostinfo struct{}\n",
+            "\n",
+            "func build() (result Hostinfo) {\n",
+            "    type Local struct {\n",
+            "        Hostinfo *Hostinfo\n",
+            "    }\n",
+            "    _ = Local{Hostinfo: &Hostinfo{}}\n",
+            "    return Hostinfo{}\n",
+            "}\n",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        fs::write(root.join("sample.go"), source).expect("write Go fixture");
+        let project = Arc::new(TestProject::new(&root, Language::Go));
+        let workspace = WorkspaceAnalyzer::build(project, AnalyzerConfig::default());
+        let config = ReferenceDifferentialConfig {
+            corpus_language: "go".to_string(),
+            probe_seed: ProbeSeed::Census,
+            max_files: 1,
+            max_sites: 100,
+            max_candidates_per_file: 100,
+            max_source_bytes: 10_000,
+            max_targets: 100,
+            max_usage_files: 10,
+            max_usages: 100,
+            ..ReferenceDifferentialConfig::default()
+        };
+
+        let report = run_reference_differential(workspace.analyzer(), &config).expect("run audit");
+        let excluded = [
+            source.find("main").expect("package name"),
+            source.find("_ \"").expect("blank import"),
+            source.find("result Hostinfo").expect("named result"),
+            source.find("Hostinfo *Hostinfo").expect("field name"),
+        ];
+        for start in excluded {
+            assert!(
+                report.sites.iter().all(|site| site.start_byte != start),
+                "Go declaration/import site at {start} entered the census report: {report:#?}"
+            );
+        }
+        let field_type = source.find("Hostinfo *Hostinfo").expect("field") + "Hostinfo *".len();
+        assert!(
+            report
+                .sites
+                .iter()
+                .any(|site| site.start_byte == field_type),
+            "the adjacent field type reference must remain sampled: {report:#?}"
+        );
+        assert!(report.summary.declaration_sites_excluded >= excluded.len() as u64);
     }
 
     #[test]

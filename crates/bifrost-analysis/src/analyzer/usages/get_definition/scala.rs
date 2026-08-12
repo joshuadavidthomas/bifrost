@@ -13,9 +13,11 @@ use crate::analyzer::scala::{
 use crate::analyzer::structural::{
     HierarchyRelation, MemberDispatchTier, PrecedenceTier, RejectionReason,
 };
+use crate::analyzer::usages::applicability::{ApplicabilityOutcome, CandidateApplicability};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use crate::analyzer::{ImportInfo, SignatureMetadata, StructuredImportPath, StructuredImportScope};
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
 use brokk_bifrost_jvm::scala::graph::local::{
     ScalaLocalBinding, precise_scala_binding, seed_scala_binding,
     seed_scala_binding_with_receiver_declaration,
@@ -30,15 +32,17 @@ use brokk_bifrost_jvm::scala::graph::resolver::{
     method_signature_arity, resolved_extension_receiver_type,
 };
 use brokk_bifrost_jvm::scala::graph::syntax::{
-    ScalaCallArgumentListKind, ScalaCallSiteShape, ScalaCallableParameterList, ScalaCallableRole,
-    ScalaCallableSiteRole, ScalaCallableSourceAlternative, ScalaDeclaredResult,
-    ScalaFunctionParameterShape, ScalaParameterListKind, ScalaParameterTypeIdentity,
-    ScalaQualifiedStableTypeRole, applied_expression_for_reference, call_arities_for_reference,
-    call_site_shape_for_reference, is_extractor_reference, is_infix_type_operator_reference,
+    ScalaCallArgumentListKind, ScalaCallShapeMismatch, ScalaCallSiteShape, ScalaCallableMismatch,
+    ScalaCallableParameterList, ScalaCallableRole, ScalaCallableSiteRole,
+    ScalaCallableSourceAlternative, ScalaDeclaredResult, ScalaFunctionParameterShape,
+    ScalaParameterListKind, ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole,
+    applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
+    enclosing_template_declarations, is_extractor_reference, is_infix_type_operator_reference,
     is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
     named_argument_invocation_owner, qualified_stable_type_reference,
     scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
-    scala_pattern_binder_names, scala_source_facts,
+    scala_callable_alternative_mismatch, scala_pattern_binder_names, scala_source_facts,
+    template_self_types,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -3780,7 +3784,7 @@ fn resolve_scala_with_context(
                         return outcome;
                     }
                     if let Some(fqn) = resolver.resolve_member(text) {
-                        return scala_fqn_outcome(support, &fqn, text);
+                        return scala_identifier_member_outcome(ctx, root, identifier, &fqn, text);
                     }
                 }
                 if let Some(owner) = binding.and_then(|binding| binding.declaration_owner) {
@@ -3790,6 +3794,14 @@ fn resolve_scala_with_context(
                                 !ctx.scala.is_type_alias(unit)
                                     && !scala_constructor_only_callable(ctx.scala, unit)
                             });
+                            let call_shape =
+                                scala_identifier_invocation_shape(ctx, root, identifier);
+                            candidates = scala_filter_callable_units(
+                                ctx.scala,
+                                candidates,
+                                call_shape.as_ref(),
+                                ScalaCallableSiteRole::Ordinary,
+                            );
                             if !candidates.is_empty() {
                                 return candidates_outcome(candidates);
                             }
@@ -3816,7 +3828,7 @@ fn resolve_scala_with_context(
                 return outcome;
             }
             if let Some(fqn) = resolver.resolve_member(text) {
-                return scala_fqn_outcome(support, &fqn, text);
+                return scala_identifier_member_outcome(ctx, root, identifier, &fqn, text);
             }
             if let Some(owner) =
                 scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, identifier.start_byte())
@@ -3827,6 +3839,13 @@ fn resolve_scala_with_context(
                             !ctx.scala.is_type_alias(unit)
                                 && !scala_constructor_only_callable(ctx.scala, unit)
                         });
+                        let call_shape = scala_identifier_invocation_shape(ctx, root, identifier);
+                        candidates = scala_filter_callable_units(
+                            ctx.scala,
+                            candidates,
+                            call_shape.as_ref(),
+                            ScalaCallableSiteRole::Ordinary,
+                        );
                         if !candidates.is_empty() {
                             return candidates_outcome(candidates);
                         }
@@ -3839,6 +3858,18 @@ fn resolve_scala_with_context(
                     }
                     ScalaExactMemberResolution::NoMatch => {}
                 }
+            }
+            match scala_self_type_member_candidate_units(ctx, &resolver, identifier, text) {
+                ScalaExactMemberResolution::Found(candidates) => {
+                    return candidates_outcome(candidates);
+                }
+                ScalaExactMemberResolution::Ambiguous => {
+                    return no_definition(
+                        "ambiguous_scala_self_type_member",
+                        format!("`{text}` has multiple physical self-type member definitions"),
+                    );
+                }
+                ScalaExactMemberResolution::NoMatch => {}
             }
             if let Some(fqn) = scala_resolve_visible_term(ctx, &resolver, identifier, text) {
                 return scala_fqn_outcome(support, &fqn, text);
@@ -6629,6 +6660,35 @@ fn resolve_scala_call(
                     }
                 }
             }
+            match scala_self_type_member_candidate_units(ctx, resolver, function, name) {
+                ScalaExactMemberResolution::Found(candidates) => {
+                    let has_ordinary_member = candidates.iter().any(|unit| {
+                        scala_unit_has_callable_role(ctx.scala, unit, ScalaCallableRole::Ordinary)
+                    });
+                    let candidates = scala_filter_callable_units(
+                        ctx.scala,
+                        candidates,
+                        call_shape.as_ref(),
+                        ScalaCallableSiteRole::Ordinary,
+                    );
+                    if !candidates.is_empty() {
+                        return candidates_outcome(candidates);
+                    }
+                    if has_ordinary_member {
+                        return no_definition(
+                            "no_applicable_scala_callable",
+                            format!("`{name}` has no self-type member overload matching this call"),
+                        );
+                    }
+                }
+                ScalaExactMemberResolution::Ambiguous => {
+                    return no_definition(
+                        "ambiguous_scala_self_type_member",
+                        format!("`{name}` has multiple physical self-type member definitions"),
+                    );
+                }
+                ScalaExactMemberResolution::NoMatch => {}
+            }
             match resolver.resolve_explicit_singleton(name) {
                 ScalaNameResolution::Resolved(owner) => {
                     return scala_apply_or_constructor_outcome(
@@ -8361,6 +8421,65 @@ fn scala_exact_owner_member_candidate_units(
     ScalaExactMemberResolution::NoMatch
 }
 
+fn scala_self_type_member_candidate_units(
+    ctx: ScalaLookupCtx<'_>,
+    resolver: &ScalaNameResolver<'_>,
+    node: Node<'_>,
+    member: &str,
+) -> ScalaExactMemberResolution {
+    let mut candidates = Vec::new();
+    for template in enclosing_template_declarations(node) {
+        for self_type in template_self_types(template) {
+            let Some(owner) = scala_resolve_visible_type_declaration(ctx, resolver, self_type)
+            else {
+                continue;
+            };
+            match scala_exact_owner_member_candidate_units(ctx, &owner, member, false) {
+                ScalaExactMemberResolution::Found(found) => candidates.extend(found),
+                ScalaExactMemberResolution::Ambiguous => {
+                    return ScalaExactMemberResolution::Ambiguous;
+                }
+                ScalaExactMemberResolution::NoMatch => {}
+            }
+        }
+        if !candidates.is_empty() {
+            sort_units(&mut candidates);
+            candidates.dedup();
+            return ScalaExactMemberResolution::Found(candidates);
+        }
+    }
+    ScalaExactMemberResolution::NoMatch
+}
+
+fn scala_identifier_member_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    root: Node<'_>,
+    identifier: Node<'_>,
+    fqn: &str,
+    reference: &str,
+) -> DefinitionLookupOutcome {
+    if let Some(call_shape) = scala_identifier_invocation_shape(ctx, root, identifier) {
+        let candidates = scala_filter_callable_units(
+            ctx.scala,
+            ctx.support.fqn(fqn),
+            Some(&call_shape),
+            ScalaCallableSiteRole::Ordinary,
+        );
+        if !candidates.is_empty() {
+            return candidates_outcome(candidates);
+        }
+    }
+    scala_fqn_outcome(ctx.support, fqn, reference)
+}
+
+fn scala_identifier_invocation_shape(
+    ctx: ScalaLookupCtx<'_>,
+    root: Node<'_>,
+    identifier: Node<'_>,
+) -> Option<ScalaCallSiteShape> {
+    scala_call_site_shape(ctx, root, identifier).filter(|shape| !shape.type_arguments_only)
+}
+
 fn scala_direct_member_candidate_units_for_owner(
     ctx: ScalaLookupCtx<'_>,
     owner: &CodeUnit,
@@ -8555,17 +8674,89 @@ fn scala_filter_callable_units(
         })
         .sum::<usize>();
     let unique_callable = callable_count == 1;
-    let considered = trace::recording().then(|| candidates.clone());
-    let admitted = candidates
-        .into_iter()
-        .filter(|unit| {
-            scala_member_unit_applies(scala, unit, call_shape, site_role, unique_callable)
-        })
-        .collect::<Vec<_>>();
-    if let Some(considered) = considered {
-        scala_record_applicability(&considered, &admitted, call_shape);
+    // One applicability computation decides what the resolver binds and what
+    // the trace reports (#1478 M3). `winners` is the production filter this
+    // function has always been; `verdicts` is the same pass's per-candidate
+    // answer, so the two cannot disagree.
+    let applicability =
+        scala_candidate_applicability(scala, &candidates, call_shape, site_role, unique_callable);
+    if trace::recording() {
+        scala_record_applicability(&applicability, call_shape);
     }
-    admitted
+    applicability.winners
+}
+
+/// The one Scala applicability check: the candidates the resolver admits and
+/// the typed verdict for every candidate it considered.
+///
+/// A candidate reached without any written argument list is undecidable on the
+/// callable axis rather than applicable. The filter still admits or refuses it
+/// -- on declaration space, which is the resolution axis -- but nothing about a
+/// call's argument list was measured, so claiming a callable verdict there
+/// would be a verdict nobody computed.
+fn scala_candidate_applicability(
+    scala: &ScalaAnalyzer,
+    candidates: &[CodeUnit],
+    call_shape: Option<&ScalaCallSiteShape>,
+    site_role: ScalaCallableSiteRole,
+    unique_callable: bool,
+) -> ApplicabilityOutcome {
+    ApplicabilityOutcome::from_verdicts(
+        candidates
+            .iter()
+            .map(|unit| {
+                match scala_unit_mismatch(scala, unit, call_shape, site_role, unique_callable) {
+                    None if call_shape.is_some() => {
+                        CandidateApplicability::applicable(unit.clone())
+                    }
+                    None => CandidateApplicability::unknown(unit.clone()),
+                    Some(mismatch) => CandidateApplicability::inapplicable(
+                        unit.clone(),
+                        scala_rejection_reason(mismatch),
+                    ),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The language-neutral reason for one Scala mismatch.
+///
+/// The mapping is total and made at one place: each Scala variant names the
+/// exact branch of the matcher that refused, so nothing here re-decides
+/// anything.
+fn scala_rejection_reason(mismatch: ScalaCallableMismatch) -> CallableRejectionReason {
+    match mismatch {
+        // A construction site reaching an ordinary method, or the reverse, is
+        // the site's call kind disagreeing with the declaration's.
+        ScalaCallableMismatch::Role => CallableRejectionReason::CallKindMismatch,
+        // A single list whose count missed one end of its declared range is an
+        // arity miss, and which end is stated exactly -- in a curried sequence
+        // this names the list that actually refused, not the whole shape.
+        ScalaCallableMismatch::Shape(ScalaCallShapeMismatch::ListArityBelow) => {
+            CallableRejectionReason::ArityBelowRequired
+        }
+        ScalaCallableMismatch::Shape(ScalaCallShapeMismatch::ListArityAbove) => {
+            CallableRejectionReason::ArityAboveTotal
+        }
+        // The *sequence* of lists disagrees: an ordinary list met a declared
+        // list only a contextual argument can fill, the site wrote more lists
+        // than the declaration and its result can consume, or more than one
+        // explicit list is left that no single further application can fill.
+        ScalaCallableMismatch::Shape(
+            ScalaCallShapeMismatch::ListShape | ScalaCallShapeMismatch::UnfillableRemainder,
+        ) => CallableRejectionReason::ListShapeMismatch,
+        // Only type arguments were written where a value list is required, so
+        // the required arguments are missing.
+        ScalaCallableMismatch::Shape(ScalaCallShapeMismatch::TypeArgumentsOnly)
+        | ScalaCallableMismatch::NoCallShape => CallableRejectionReason::MissingRequiredArgument,
+        // A partial application the site's expected function arity refutes, or
+        // one an ambiguous same-named callable makes undecidable, is a
+        // disagreement about how many argument lists the site supplies.
+        ScalaCallableMismatch::MethodValueArity | ScalaCallableMismatch::PartialApplication => {
+            CallableRejectionReason::ListShapeMismatch
+        }
+    }
 }
 
 fn scala_member_precedence_tier(enrichment: &trace::MemberEnrichment) -> PrecedenceTier {
@@ -8594,8 +8785,7 @@ fn scala_member_precedence_tier(enrichment: &trace::MemberEnrichment) -> Precede
 /// also runs over candidate sets that no member walk produced (a bare callable,
 /// an imported member), and those have no owner to attribute.
 fn scala_record_applicability(
-    considered: &[CodeUnit],
-    admitted: &[CodeUnit],
+    applicability: &ApplicabilityOutcome,
     call_shape: Option<&ScalaCallSiteShape>,
 ) {
     let staged = trace::staged_member_context();
@@ -8606,12 +8796,27 @@ fn scala_record_applicability(
             .find(|(name, _)| *name == fq_name)
             .map(|(_, enrichment)| enrichment.clone())
     };
-    for loser in considered.iter().filter(|unit| !admitted.contains(unit)) {
+    // The callable record is published only where an argument list was
+    // actually written (#1478 M3). Without one this filter measured the
+    // declaration space alone -- a constructor is not an ordinary call target
+    // -- and publishing a callable verdict for it would claim a check nobody
+    // ran on the callable axis.
+    let callable_record = |verdict: &CandidateApplicability| {
+        call_shape.map(|_| trace::CallableApplicabilityRecord {
+            verdict: verdict.verdict,
+            reason: verdict.reason,
+        })
+    };
+    for verdict in &applicability.verdicts {
+        if verdict.verdict != ApplicabilityVerdict::Inapplicable {
+            continue;
+        }
+        let loser = &verdict.candidate;
         let enrichment = enrichment_of(loser);
         // Where the call's argument list is known, the filter measured the
         // candidate against it, whose structured story belongs to the callable
-        // axis (#1478). Where it is not, the filter measured the declaration
-        // space alone: a constructor is not an ordinary call target.
+        // axis (#1478) and now reaches the row beside this reason. Where it is
+        // not, the filter measured the declaration space alone.
         let reason = if call_shape.is_some() {
             RejectionReason::CallableApplicabilityDeferred
         } else {
@@ -8622,6 +8827,9 @@ fn scala_record_applicability(
             enrichment.as_ref().map(scala_member_precedence_tier),
             reason,
         );
+        if let Some(record) = callable_record(verdict) {
+            row = row.with_callable(record);
+        }
         if let Some(mut enrichment) = enrichment {
             enrichment.applicability = ApplicabilityVerdict::Inapplicable;
             row = row.with_member(enrichment);
@@ -8631,18 +8839,35 @@ fn scala_record_applicability(
     if call_shape.is_none() {
         return;
     }
-    let upgraded = admitted
+    // Scala's filter runs *after* the member walk returned, so the winners'
+    // attribution has to be restaged with what this filter established. The
+    // callable channel needs the same counterpart, and for the same reason:
+    // the walk checks no call shape, so only this pass can state a verdict.
+    let winners = applicability
+        .verdicts
         .iter()
-        .filter_map(|unit| {
-            enrichment_of(unit).map(|mut enrichment| {
-                enrichment.applicability = ApplicabilityVerdict::Applicable;
-                (unit.fq_name(), enrichment)
+        .filter(|verdict| verdict.verdict != ApplicabilityVerdict::Inapplicable)
+        .collect::<Vec<_>>();
+    let upgraded = winners
+        .iter()
+        .filter_map(|verdict| {
+            enrichment_of(&verdict.candidate).map(|mut enrichment| {
+                enrichment.applicability = verdict.verdict;
+                (verdict.candidate.fq_name(), enrichment)
             })
         })
         .collect::<Vec<_>>();
     if !upgraded.is_empty() {
-        scala_stage_member_context(admitted, upgraded);
+        scala_stage_member_context(&applicability.winners, upgraded);
     }
+    trace::stage_callable_context(
+        winners
+            .iter()
+            .filter_map(|verdict| {
+                callable_record(verdict).map(|record| (verdict.candidate.fq_name(), record))
+            })
+            .collect(),
+    );
 }
 
 fn scala_member_candidate_applies(
@@ -8660,38 +8885,63 @@ fn scala_member_candidate_applies(
     )
 }
 
-fn scala_member_unit_applies(
+/// Whether one Scala declaration admits the site, and why it does not.
+///
+/// This is the one Scala admission decision (#1478 M3).
+/// [`scala_member_unit_applies`] is exactly this answer read as a boolean, so
+/// the resolver's binding and the reason a row publishes are one computation.
+///
+/// A declaration with several source alternatives -- a class carrying its
+/// primary constructor beside each `def this`, an overload set the parser
+/// recorded under one unit -- is admitted when *any* alternative admits the
+/// site, which is what the boolean check has always done. When none does, the
+/// reason reported is the first non-role mismatch, because a role mismatch
+/// means the site is in the wrong callable namespace entirely and says nothing
+/// about the argument lists; only when every alternative failed on the role is
+/// the role the answer.
+fn scala_unit_mismatch(
     scala: &ScalaAnalyzer,
     unit: &CodeUnit,
     call_shape: Option<&ScalaCallSiteShape>,
     site_role: ScalaCallableSiteRole,
     unique_callable: bool,
-) -> bool {
+) -> Option<ScalaCallableMismatch> {
     if unit.is_field() {
-        return true;
+        return None;
     }
     if !unit.is_function() {
-        return false;
+        return Some(ScalaCallableMismatch::Role);
     }
     let alternatives = scala_forward_callable_source_alternatives(scala, unit);
     if !alternatives.is_empty() {
-        return alternatives.iter().any(|alternative| {
-            scala_callable_alternative_matches(
+        let mut mismatches = Vec::new();
+        for alternative in &alternatives {
+            match scala_callable_alternative_mismatch(
                 alternative.role,
                 &alternative.shape,
                 alternative.result,
                 call_shape,
                 site_role,
                 unique_callable,
-            )
-        });
+            ) {
+                None => return None,
+                Some(mismatch) => mismatches.push(mismatch),
+            }
+        }
+        return Some(
+            mismatches
+                .iter()
+                .copied()
+                .find(|mismatch| *mismatch != ScalaCallableMismatch::Role)
+                .unwrap_or(ScalaCallableMismatch::Role),
+        );
     }
     let fallback = method_signature_arity(scala, unit)
         .map(crate::analyzer::CallableArity::exact)
         .map(ScalaCallableParameterList::explicit)
         .into_iter()
         .collect::<Vec<_>>();
-    scala_callable_alternative_matches(
+    scala_callable_alternative_mismatch(
         scala_fallback_callable_role(scala, unit),
         &fallback,
         ScalaDeclaredResult::UNDECLARED,
@@ -8699,6 +8949,16 @@ fn scala_member_unit_applies(
         site_role,
         unique_callable,
     )
+}
+
+fn scala_member_unit_applies(
+    scala: &ScalaAnalyzer,
+    unit: &CodeUnit,
+    call_shape: Option<&ScalaCallSiteShape>,
+    site_role: ScalaCallableSiteRole,
+    unique_callable: bool,
+) -> bool {
+    scala_unit_mismatch(scala, unit, call_shape, site_role, unique_callable).is_none()
 }
 
 fn scala_fallback_callable_role(scala: &ScalaAnalyzer, unit: &CodeUnit) -> ScalaCallableRole {
@@ -11491,9 +11751,9 @@ fn scala_seed_typed(
 /// block the layout happened to wrap the `new` in. A continuation-line
 /// `val x =` followed by an indented `new T { ... }` gets an `indented_block`,
 /// and a same-line one does not, so the same code was called local or not
-/// depending on where the line broke (#1857). Modelling those members is issue
-/// #1860; this only keeps the boundary honest and keeps them out of the
-/// enclosing scope.
+/// depending on where the line broke (#1857). The declaration pass now models
+/// these members under a synthetic owner (#1860). This boundary keeps them out
+/// of the enclosing scope.
 const SCALA_TEMPLATE_MEMBER_BOUNDARIES: [&str; 6] = [
     "class_definition",
     "object_definition",

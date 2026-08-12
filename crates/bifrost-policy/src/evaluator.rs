@@ -2216,6 +2216,10 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::CallShape
             | QueryValueKind::CallArgumentGroup
             | QueryValueKind::CallArgument
+            | QueryValueKind::CallableSignature
+            | QueryValueKind::SignatureParameter
+            | QueryValueKind::CallableApplicability
+            | QueryValueKind::OverloadSelection
             | QueryValueKind::MemberSelection
             | QueryValueKind::CandidateHop
             | QueryValueKind::DispatchOutcome
@@ -2752,6 +2756,16 @@ fn terminal_presentation(
         | CodeQueryResultValue::CallShape { .. }
         | CodeQueryResultValue::CallArgumentGroup { .. }
         | CodeQueryResultValue::CallArgument { .. }
+        // A callable-signature row describes a declaration's declared shape. It
+        // is an analysis projection anchored at the declaration, not a
+        // position a finding is reported at; the declaration row is.
+        | CodeQueryResultValue::CallableSignature { .. }
+        | CodeQueryResultValue::SignatureParameter { .. }
+        // An applicability row and its selection summary explain the resolution
+        // of a reference occurrence. The occurrence is the position a finding
+        // is anchored at; these are the analysis projection that explains it.
+        | CodeQueryResultValue::CallableApplicability { .. }
+        | CodeQueryResultValue::OverloadSelection { .. }
         | CodeQueryResultValue::MemberSelection { .. }
         // A hierarchy hop explains part of one candidate's route. It is an
         // analysis projection, not a position a finding is anchored at; the
@@ -3424,6 +3438,10 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::CallShape { .. } => "call_shape",
         CodeQueryResultRef::CallArgumentGroup { .. } => "call_argument_group",
         CodeQueryResultRef::CallArgument { .. } => "call_argument",
+        CodeQueryResultRef::CallableSignature { .. } => "callable_signature",
+        CodeQueryResultRef::SignatureParameter { .. } => "signature_parameter",
+        CodeQueryResultRef::CallableApplicability { .. } => "callable_applicability",
+        CodeQueryResultRef::OverloadSelection { .. } => "overload_selection",
         CodeQueryResultRef::Occurrence { .. } => "occurrence",
         CodeQueryResultRef::LexicalScope { .. } => "lexical_scope",
         CodeQueryResultRef::Binding { .. } => "binding",
@@ -3459,6 +3477,10 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::CallShape { path, .. }
         | CodeQueryResultRef::CallArgumentGroup { path, .. }
         | CodeQueryResultRef::CallArgument { path, .. }
+        | CodeQueryResultRef::CallableSignature { path, .. }
+        | CodeQueryResultRef::SignatureParameter { path, .. }
+        | CodeQueryResultRef::CallableApplicability { path, .. }
+        | CodeQueryResultRef::OverloadSelection { path, .. }
         | CodeQueryResultRef::MemberSelection { path, .. }
         | CodeQueryResultRef::CandidateHop { path, .. }
         | CodeQueryResultRef::DispatchOutcome { path, .. }
@@ -3527,6 +3549,10 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::CallShape
         | DetailedCodeQueryDomain::CallArgumentGroup
         | DetailedCodeQueryDomain::CallArgument
+        | DetailedCodeQueryDomain::CallableSignature
+        | DetailedCodeQueryDomain::SignatureParameter
+        | DetailedCodeQueryDomain::CallableApplicability
+        | DetailedCodeQueryDomain::OverloadSelection
         | DetailedCodeQueryDomain::MemberSelection
         | DetailedCodeQueryDomain::CandidateHop
         | DetailedCodeQueryDomain::DispatchOutcome
@@ -3704,6 +3730,19 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, site_id.as_bytes());
         }
+        DetailedCodeQueryKey::CallableApplicability { id, site_ast_id }
+        | DetailedCodeQueryKey::OverloadSelection { id, site_ast_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, site_ast_id.as_bytes());
+        }
+        DetailedCodeQueryKey::CallableSignature { id, declaration_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, declaration_id.as_bytes());
+        }
+        DetailedCodeQueryKey::SignatureParameter { id, signature_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, signature_id.as_bytes());
+        }
         DetailedCodeQueryKey::CallArgument { id, group_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, group_id.as_bytes());
@@ -3798,6 +3837,10 @@ fn domain_label(domain: DetailedCodeQueryDomain) -> &'static str {
         DetailedCodeQueryDomain::CallShape => "call_shape",
         DetailedCodeQueryDomain::CallArgumentGroup => "call_argument_group",
         DetailedCodeQueryDomain::CallArgument => "call_argument",
+        DetailedCodeQueryDomain::CallableSignature => "callable_signature",
+        DetailedCodeQueryDomain::SignatureParameter => "signature_parameter",
+        DetailedCodeQueryDomain::CallableApplicability => "callable_applicability",
+        DetailedCodeQueryDomain::OverloadSelection => "overload_selection",
         DetailedCodeQueryDomain::MemberSelection => "member_selection",
         DetailedCodeQueryDomain::CandidateHop => "candidate_hop",
         DetailedCodeQueryDomain::DispatchOutcome => "dispatch_outcome",

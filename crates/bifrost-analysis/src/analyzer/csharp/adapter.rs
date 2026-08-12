@@ -13,6 +13,7 @@ use brokk_bifrost_csharp::adapter::{
     csharp_extract_call_receiver, csharp_nested_owner_short_name_candidates,
 };
 use brokk_bifrost_csharp::declarations::parse_csharp_file;
+use brokk_bifrost_csharp::preprocessor::csharp_included_ranges;
 use brokk_bifrost_csharp::queries::CSHARP_QUERY_DIRECTORY;
 use brokk_bifrost_csharp::test_detection::csharp_contains_tests;
 use tree_sitter::Tree;
@@ -38,6 +39,17 @@ impl LanguageAdapter for CSharpAdapter {
 
     fn file_extension(&self) -> &'static str {
         CSHARP_FILE_EXTENSION
+    }
+
+    /// Hide preprocessor directive lines and inactive conditional branches from
+    /// the parser, so a directive inside a declaration stops breaking the parse
+    /// and losing the members around it (issue #1803).
+    fn parser_included_ranges(
+        &self,
+        _file: &ProjectFile,
+        source: &str,
+    ) -> Option<Vec<tree_sitter::Range>> {
+        csharp_included_ranges(source)
     }
 
     fn normalize_full_name(&self, fq_name: &str) -> String {

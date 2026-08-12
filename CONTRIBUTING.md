@@ -121,9 +121,10 @@ node scripts/release-version.mjs sync
 
 That script updates these committed version fields:
 
-- `plugins/bifrost-agent/.codex-plugin/plugin.json`
+- `plugins/bifrost-agent/plugin.json`
 - `plugins/bifrost-agent/.claude-plugin/plugin.json`
 - `plugins/bifrost-agent/.cursor-plugin/plugin.json`
+- `plugins/bifrost-agent/plugin.json`
 - `.cursor-plugin/marketplace.json`
 - `editors/vscode/package.json`
 - `editors/vscode/package-lock.json`
@@ -131,7 +132,6 @@ That script updates these committed version fields:
 - `plugins/bifrost-agent/package-lock.json`
 - the pinned npm install command in `plugins/bifrost-agent/README.md`
 - `plugins/bifrost-agent/bifrost-release.json`
-- `plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json`
 - `docs/src/content/docs/rust-library.md`
 
 The package and README entries keep the published Pi artifact and its install
@@ -147,15 +147,14 @@ archive checksums:
 
 - `editors/vscode/package.json`
 - `plugins/bifrost-agent/bifrost-release.json`
-- `plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/bifrost-release.json`
 
 Those checksum-bearing files must match the actual release archives.
 `scripts/release-version.mjs sync` only copies the current
 `plugins/bifrost-agent/bifrost-release.json` checksums into the VS Code manifest
 when that release metadata is already on the same version as `Cargo.toml`. The
 `release.yml` workflow prepares checksum metadata from the built `.sha256`
-sidecars with `scripts/prepare-vscode-extension-manifest.mjs`, regenerates the
-Amp skill bundle, validates the plugin manifests, packages
+sidecars with `scripts/prepare-vscode-extension-manifest.mjs`, validates the
+plugin manifests, packages
 `bifrost-agent-<tag>.tar.gz`, and publishes the VSIX. A separate Pi package job
 prepares the same release metadata for the npm tarball, validates the packed
 package, and attaches it to the existing GitHub Release. If you perform those
@@ -177,22 +176,21 @@ To cut a release:
    version-sync command above, and review the generated metadata. Release
    workflows generate the Rust dependency report from the tagged `Cargo.lock`;
    it is not committed.
-4. If skills, agents, launcher files, MCP config, or plugin manifests changed,
-   regenerate and validate the generated plugin bundles:
+4. If agents, launcher files, MCP config, or plugin manifests changed, validate
+   the plugin bundles:
 
    ```bash
    node scripts/release-version.mjs check
-   node scripts/generate-codex-skill-bundle.mjs
-   node scripts/generate-amp-skill-bundle.mjs
+   node scripts/check-agent-plugins-v1.mjs
    node scripts/check-codex-plugin-manifest.mjs
    node --test plugins/bifrost-agent/test/*.test.mjs
    ```
 
-   `check-codex-plugin-manifest.mjs` checks the Codex, Claude, Cursor, and Pi
-   manifests, the Cursor marketplace versions, the generated Codex and Amp
-   bundles, and parseability of the Codex and Claude marketplace files. It also
-   checks `plugins/bifrost-agent/bifrost-release.json`, so run it after that
-   release metadata has been prepared for the version being validated.
+   `check-agent-plugins-v1.mjs` checks the portable root `plugin.json` and
+   `mcp.json`. `check-codex-plugin-manifest.mjs` checks the portable package,
+   Claude, Cursor, and Pi adapters, the Cursor marketplace versions, and the
+   release metadata. Run both after
+   the release metadata has been prepared for the version being validated.
 5. Sync the release version projection and every stabilization fix from the RC
    branch back to `master`. An RC-only fix is not complete until its equivalent
    has landed on `master`; use a cherry-pick or an equivalent focused commit and

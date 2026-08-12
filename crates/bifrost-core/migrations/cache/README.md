@@ -1,27 +1,36 @@
 # Unified cache migrations
 
-`0001-current-baseline.sql` is the schema created by current Bifrost releases.
-It is immutable: existing caches with `cache_state` version `1/1/10` are marked
-as migration 1 without running it again.
+`0018-current-baseline.sql` is the schema every store starts from. It is the
+fold of the former migrations 0001..0018 and is named for the version it
+produces, not for its position. The four files beside it carry a store from
+version 18 to version 22, one version each.
 
-To change the cache schema, append one `M::up(include_str!(...))` entry to
-`CACHE_MIGRATIONS` in `src/cache_db.rs` and add its SQL file here. Migration SQL
-must contain only schema/data changes, end statements with semicolons, and omit
-transaction control and connection PRAGMAs. `rusqlite_migration` runs all pending
-entries atomically and stores their count in SQLite's `user_version` header.
+`BASELINE_MIGRATION_VERSION` and `CURRENT_MIGRATION_VERSION` in
+`src/cache_db.rs` name the two ends, and `CACHE_MIGRATIONS` writes the version
+beside each file's SQL rather than inferring it from a position. Compile-time
+assertions tie the list to both constants.
 
-Never edit or add a down migration for a released file. This cache is derived
-data: an older binary rejects a newer `user_version` without modifying it, while
-an unrecognized pre-migration cache is rebuilt from migration 1.
+To change the cache schema, add one numbered file here and one entry to
+`CACHE_MIGRATIONS`. Migration SQL must contain only schema/data changes, end
+statements with semicolons, and omit transaction control and connection
+PRAGMAs. All pending entries run in one transaction.
 
-Migration `0013-semantic-model-active-set.sql` adds only workspace-local
-semantic-pack activation identity and source references. Immutable pack bytes
-and global lifecycle roots belong to the independent semantic-pack catalog.
+Never edit a released file, and never add a down migration. This cache is
+derived data: a store from a newer schema is left alone, a store older than
+the baseline is declined and rebuilt from scratch, and a damaged store under
+this build's own name is rebuilt in place.
 
-Migration `0014-semantic-file-documents.sql` replaces the summary/component
-semantic schema with path-aware file materializations and direct document
-vectors. It discards only rebuildable semantic-index rows; analyzer and
-semantic-pack state remain intact.
+Do not prettify `0018-current-baseline.sql`. It is SQLite's own rendering of
+the schema the folded migrations produced, down to the quoted table names and
+the columns that sit after a table's closing parenthesis. SQLite stores a
+table's defining text verbatim, so a store carried forward from an older
+schema holds exactly this text, and `verify_upgraded_store` requires an
+upgraded store and a fresh one to be indistinguishable.
+
+`bridges/` holds SQL that is not a migration. A bridge repairs one recognized
+foreign schema -- a store from a branch that numbered its migrations
+differently -- onto a version of this chain. `RECOGNIZED_FOREIGN_STORES` in
+`src/cache_db.rs` is the only caller and explains why such a store exists.
 
 Migration `0022-drop-bm25-lexical-columns.sql` removes the two columns that
 only served the deleted lexical (BM25) retrieval arm:

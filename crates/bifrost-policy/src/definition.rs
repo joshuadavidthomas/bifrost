@@ -216,7 +216,29 @@ pub struct RowAggregate {
     pub name: RowAggregateName,
     pub op: RowAggregateOp,
     pub value: Option<RowFieldRef>,
+    /// The two ordered sequences compared by `ordered-equal`, and nothing
+    /// else. Every other operation folds one column, so it carries `None`.
+    pub sequences: Option<RowOrderedSequencePair>,
     pub predicate: Vec<RowPredicate>,
+}
+
+/// The two ordered sequences an `ordered-equal` aggregate compares.
+///
+/// A sequence is recovered from the group's tuples, not from row order: each
+/// contributing row states its own position, so the comparison is defined even
+/// though a joined tuple set has no inherent order.
+#[derive(Debug, Clone)]
+pub struct RowOrderedSequencePair {
+    pub left: RowOrderedSequence,
+    pub right: RowOrderedSequence,
+}
+
+/// One ordered sequence: an integer position column and the value column read
+/// at that position.
+#[derive(Debug, Clone)]
+pub struct RowOrderedSequence {
+    pub position: RowFieldRef,
+    pub value: RowFieldRef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -224,6 +246,12 @@ pub enum RowAggregateOp {
     Min,
     Count,
     CountDistinct,
+    /// Position-aware list parity: one when the group's two ordered sequences
+    /// hold the same value at the same position and have the same length,
+    /// zero otherwise. A set-equality check cannot express this, because two
+    /// sequences that hold the same values in a different order are equal as
+    /// sets and different as argument lists.
+    OrderedEqual,
 }
 
 impl RowAggregateOp {
@@ -232,6 +260,7 @@ impl RowAggregateOp {
             Self::Min => "min",
             Self::Count => "count",
             Self::CountDistinct => "count-distinct",
+            Self::OrderedEqual => "ordered-equal",
         }
     }
 }

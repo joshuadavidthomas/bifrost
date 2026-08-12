@@ -1484,13 +1484,13 @@ pub fn rust_declaration_visibility(rust: &dyn RustSource, code_unit: &CodeUnit) 
     let Some(prepared) = rust.prepared_syntax(code_unit.source()) else {
         return RustVisibility::Private;
     };
-    rust_named_declaration_node(
+    inspect_rust_named_declaration_node(
         rust.code_units(),
         code_unit,
         prepared.tree().root_node(),
         prepared.source(),
+        crate::imports::rust_item_visibility,
     )
-    .map(|node| crate::imports::rust_item_visibility(node, prepared.source()))
     .unwrap_or(RustVisibility::Private)
 }
 
@@ -1632,13 +1632,14 @@ pub fn is_external_module_declaration(rust: &dyn RustSource, code_unit: &CodeUni
     let Some(prepared) = rust.prepared_syntax(code_unit.source()) else {
         return false;
     };
-    rust_named_declaration_node(
+    inspect_rust_named_declaration_node(
         rust.code_units(),
         code_unit,
         prepared.tree().root_node(),
         prepared.source(),
+        |node, _| node.kind() == "mod_item" && node.child_by_field_name("body").is_none(),
     )
-    .is_some_and(|node| node.kind() == "mod_item" && node.child_by_field_name("body").is_none())
+    .unwrap_or(false)
 }
 
 pub fn rust_declaration_node_is<F>(
@@ -1647,7 +1648,7 @@ pub fn rust_declaration_node_is<F>(
     predicate: F,
 ) -> bool
 where
-    F: FnOnce(Node<'_>, &str) -> bool,
+    F: for<'tree> Fn(Node<'tree>, &str) -> bool,
 {
     let Ok(source) = index.project().read_source(code_unit.source()) else {
         return false;
@@ -1655,9 +1656,67 @@ where
     let Some(tree) = parse_rust_tree(&source) else {
         return false;
     };
-    rust_named_declaration_node(index, code_unit, tree.root_node(), &source)
-        .map(|node| predicate(node, &source))
+    inspect_rust_named_declaration_node(index, code_unit, tree.root_node(), &source, predicate)
         .unwrap_or(false)
+}
+
+/// Inspect the syntax node for a declaration, including an item written inside
+/// one or more item-position macro invocations.
+///
+/// The ordinary Rust tree parses a macro argument as a token tree. The
+/// declaration collector reparses item-shaped arguments and stores their exact
+/// source ranges, so metadata readers must repeat that structured reparse. Each
+/// loop reparses a smaller enclosing token tree. This keeps nested item macros
+/// stack safe and preserves the original byte offsets.
+pub fn inspect_rust_named_declaration_node<T>(
+    index: &dyn CodeUnitIndex,
+    code_unit: &CodeUnit,
+    root: Node<'_>,
+    source: &str,
+    inspect: impl for<'tree> Fn(Node<'tree>, &str) -> T,
+) -> Option<T> {
+    if let Some(node) = rust_named_declaration_node(index, code_unit, root, source) {
+        return Some(inspect(node, source));
+    }
+
+    let range = index.ranges(code_unit).into_iter().next()?;
+    let mut region = enclosing_macro_token_tree_interior(root, range.start_byte, range.end_byte)?;
+    loop {
+        let tree = crate::lexical_scope::parse_rust_region_tree(source, region.0, region.1)?;
+        let reparsed_root = tree.root_node();
+        if let Some(node) = rust_named_declaration_node(index, code_unit, reparsed_root, source) {
+            return Some(inspect(node, source));
+        }
+        let next =
+            enclosing_macro_token_tree_interior(reparsed_root, range.start_byte, range.end_byte)?;
+        if next == region {
+            return None;
+        }
+        region = next;
+    }
+}
+
+fn enclosing_macro_token_tree_interior(
+    root: Node<'_>,
+    start_byte: usize,
+    end_byte: usize,
+) -> Option<(usize, usize)> {
+    let mut node = root.descendant_for_byte_range(start_byte, end_byte)?;
+    loop {
+        if node.kind() == "macro_invocation" {
+            let arguments = crate::declarations::rust_macro_invocation_arguments(node)?;
+            let open = arguments.child(0)?;
+            let close = arguments.child(arguments.child_count().checked_sub(1)?)?;
+            if matches!(open.kind(), "(" | "[" | "{")
+                && matches!(close.kind(), ")" | "]" | "}")
+                && open.end_byte() <= start_byte
+                && end_byte <= close.start_byte()
+            {
+                return Some((open.end_byte(), close.start_byte()));
+            }
+        }
+        node = node.parent()?;
+    }
 }
 
 pub fn rust_named_declaration_node<'tree>(

@@ -81,5 +81,5 @@ pub use tabulation::solve;
 pub use witness::{
     MAX_WITNESS_ALTERNATIVES_PER_QUALITY, SummaryWitness, SummaryWitnessError, SummaryWitnessStep,
     SummaryWitnessStepKind, WitnessLimitError, WitnessReconstructionLimits,
-    WitnessReconstructionWork, WitnessRetentionLimits,
+    WitnessReconstructionWork, WitnessRetentionLimits, WitnessTruncationCause,
 };

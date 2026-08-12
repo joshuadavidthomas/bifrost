@@ -239,7 +239,13 @@ pub enum SemanticValueKind {
         ordinal: u32,
         multiplicity: FormalMultiplicity,
     },
-    Receiver,
+    /// The procedure's receiver formal. `dispatch` states whether the value
+    /// is the object the call dispatches on (`this`/`self`), as opposed to a
+    /// passed-in receiver -- a Kotlin or Scala extension receiver -- that
+    /// binds like a parameter and is never the caller's own `this`.
+    Receiver {
+        dispatch: bool,
+    },
     Return,
     Temporary,
     Constant,
@@ -315,7 +321,7 @@ impl SemanticValueKind {
         match self {
             Self::Local => "local",
             Self::Parameter { .. } => "parameter",
-            Self::Receiver => "receiver",
+            Self::Receiver { .. } => "receiver",
             Self::Return => "return",
             Self::Temporary => "temporary",
             Self::Constant => "constant",
@@ -942,6 +948,21 @@ impl SemanticGapImpacts {
     }
 }
 
+/// What answers a gap, stated by the adapter that published it.
+///
+/// `CallResolution` marks a call-site-scoped gap whose question a complete
+/// workspace resolution and binding of that call answers -- for example
+/// Scala argument-evaluation strictness, which the resolved signature proves
+/// because a deferring callee carries its own procedure-level gap that keeps
+/// every binding to it open. A gap without a declared discharge (`None`)
+/// stands until the adapter itself lowers the construct.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SemanticGapDischarge {
+    #[default]
+    None,
+    CallResolution,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticGap {
     pub id: SemanticGapId,
@@ -952,6 +973,8 @@ pub struct SemanticGap {
     pub kind: SemanticGapKind,
     /// Required exactly when `kind` is `ExceededBudget`.
     pub budget: Option<SemanticBudgetExceeded>,
+    /// Must be `None` unless `subject` is a call site.
+    pub discharge: SemanticGapDischarge,
     pub detail: Box<str>,
     pub source: SourceMappingId,
     pub evidence: EvidenceId,

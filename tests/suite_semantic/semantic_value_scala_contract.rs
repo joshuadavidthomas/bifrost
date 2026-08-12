@@ -70,7 +70,7 @@ object Sample {
     let formal_receiver = instance
         .values()
         .iter()
-        .find(|value| value.kind == SemanticValueKind::Receiver)
+        .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         .expect("Scala instance methods must publish their current receiver");
     let input = instance
         .values()

@@ -45,12 +45,6 @@ const PUBLIC_QUERY_SURFACES: &[&str] = &[
     "crates/bifrost-mcp/src/mcp_extended.rs",
     "src/bin/bifrost.rs",
     "src/bin/bifrost/code_query_repl.rs",
-    "plugins/bifrost-agent/skills/bifrost-codebase-search/SKILL.md",
-    "plugins/bifrost-agent/codex-skills/bifrost-codebase-search/SKILL.md",
-    "plugins/bifrost-agent/skills/bifrost-policy-checking/SKILL.md",
-    "plugins/bifrost-agent/codex-skills/bifrost-policy-checking/SKILL.md",
-    "plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/SKILL.md",
-    "plugins/bifrost-agent/amp-skills/bifrost-code-intelligence/mcp.json",
 ];
 
 const REQUIRED_JSON_EXAMPLES: &[&str] = &[

@@ -115,7 +115,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `typescript_analyzer_update_test`
 - `typescript_import_test`
 
-### `suite_bench_policy` (29 modules)
+### `suite_bench_policy` (31 modules)
 
 - `benchmark_compare`
 - `benchmark_manifest`
@@ -124,6 +124,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `bifrost_policy_cli`
 - `builtin_policy_pack`
 - `cvss_classification`
+- `issue_1951_balanced_policy`
 - `measure_semantic_summary_taint_lifecycle`
 - `no_stringly_name_parsing`
 - `policy_assertion_conformance`
@@ -135,6 +136,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `policy_loading_workspace`
 - `policy_loop_invariance_prototype`
 - `policy_match_evaluation`
+- `policy_overload_selection_trio`
 - `policy_rendering`
 - `policy_resolution_assertions`
 - `policy_resolution_conformance`
@@ -147,8 +149,12 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `taint_policy_adapter`
 - `temp_storage_scripts`
 
-### `suite_cross_language` (21 modules)
+### `suite_cross_language` (24 modules)
 
+- `code_query_call_shape_languages`
+- `code_query_callable_applicability`
+- `code_query_callable_applicability_conformance`
+- `code_query_callable_signature`
 - `code_query_cpp_receiver`
 - `code_query_docs`
 - `code_query_edge_conformance`
@@ -222,11 +228,11 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 
 - `bifrost_benchmark_cli`
 - `bifrost_benchmark_run`
+- `bifrost_install_cli`
 - `bifrost_lsp_server`
 - `bifrost_mcp_property_fuzzer_cli`
 - `bifrost_mcp_server`
 - `bifrost_reference_differential_cli`
-- `bifrost_skill_install_cli`
 - `bifrost_tool_cli`
 - `binary_file_handling`
 - `code_intelligence_runtime`
@@ -252,7 +258,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `unified_cache`
 - `workspace_analyzer_test`
 
-### `suite_semantic` (45 modules)
+### `suite_semantic` (46 modules)
 
 - `dataflow_clients`
 - `dataflow_ide`
@@ -298,6 +304,7 @@ No test is lost; the delta is redundant re-execution of the same 4 helper tests.
 - `typestate_client`
 - `typestate_production_summary`
 - `typestate_protocol`
+- `value_flow_balanced_source_call`
 - `value_flow_client`
 - `value_flow_language_conformance`
 

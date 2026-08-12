@@ -1664,7 +1664,9 @@ fn structured_receiver_owner(
                     if !names_reference {
                         return None;
                     }
-                    let role = if node.kind == NormalizedKind::Call {
+                    let role = if node.construct.as_deref() == Some("java_object_creation") {
+                        Role::Callee
+                    } else if node.kind == NormalizedKind::Call {
                         Role::Receiver
                     } else {
                         Role::Object

@@ -70,6 +70,13 @@ pub enum ParameterSource<'case> {
         procedure: &'case str,
         slot: u32,
     },
+    /// The returned value of a selected call, observed at the call's normal
+    /// continuation. This mirrors the production policy `:bind return-value`
+    /// binding so direct, public-query, and production routes observe the
+    /// same program point and carrier.
+    CallResult {
+        call: &'case str,
+    },
 }
 
 impl ParameterSource<'_> {
@@ -78,6 +85,9 @@ impl ParameterSource<'_> {
             Self::Parameter { procedure, .. }
             | Self::Port { procedure, .. }
             | Self::CaptureBinding { procedure, .. } => procedure,
+            Self::CallResult { .. } => {
+                panic!("a call-result source is resolved through its call alias")
+            }
         }
     }
 
@@ -87,7 +97,7 @@ impl ParameterSource<'_> {
                 Some(ValueFlowPortKey::Parameter { ordinal: *ordinal })
             }
             Self::Port { kind, .. } => Some(*kind),
-            Self::CaptureBinding { .. } => None,
+            Self::CaptureBinding { .. } | Self::CallResult { .. } => None,
         }
     }
 }
@@ -560,7 +570,127 @@ pub fn resolve_value_flow_conformance_case(
 
     let root = procedure(&procedures, case.root).clone();
     let resolved_root = root.clone();
-    let source_procedure = procedure(&procedures, case.source.procedure());
+    let source = match case.source {
+        ParameterSource::CallResult { call } => call_result_source_spec(&calls, call),
+        _ => relation_backed_source_spec(case, &procedures, &snapshots),
+    };
+
+    let mut sinks = Vec::new();
+    let mut witness_sinks = Vec::new();
+    let mut sink_keys = Vec::new();
+    for sink in case.sinks {
+        let call = calls
+            .get(sink.call)
+            .unwrap_or_else(|| panic!("missing call alias {}", sink.call));
+        let call_row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("selected call remains live");
+        let argument = call_row.arguments.get(sink.argument).unwrap_or_else(|| {
+            panic!(
+                "call {} has no argument {} for sink {}",
+                sink.call, sink.argument, sink.alias
+            )
+        });
+        let call_point = call
+            .procedure()
+            .point_handle(call_row.point)
+            .expect("call point remains live");
+        let value = call
+            .procedure()
+            .value_handle(argument.value)
+            .expect("call argument remains live");
+        let carrier = ValueFlowCarrier::Value(value);
+        let snapshot = snapshots
+            .iter()
+            .find(|input| input.value().procedure() == call.procedure())
+            .expect("call procedure snapshot");
+        let producer = snapshot
+            .value()
+            .relations()
+            .iter()
+            .find(|relation| ValueFlowCarrier::from(&relation.target) == carrier);
+        let key = ValueFlowEventKey::at_point(
+            &call_point,
+            sink.argument as u32,
+            ValueFlowEventKind::Sink,
+        )
+        .expect("stable sink event");
+        sink_keys.push((sink.alias, key.clone()));
+        sinks.push(ValueFlowSinkSpec::new(
+            key.clone(),
+            call_point.clone(),
+            ValueFlowObservationPhase::BeforeEffects,
+            carrier.clone(),
+            ProofStatus::Proven,
+            EvidenceCompleteness::Complete,
+        ));
+        // An argument with an intraprocedural producing relation (a local, a
+        // field load) is observed after that producer so the witness keeps
+        // its final step. A nested call result or bare constant has no such
+        // relation; the production compiler observes those at the call point
+        // itself, so the witness plan does the same.
+        witness_sinks.push(match producer {
+            Some(producer) => ValueFlowSinkSpec::new(
+                key,
+                producer.point().clone(),
+                ValueFlowObservationPhase::AfterEffects,
+                carrier,
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+            ),
+            None => ValueFlowSinkSpec::new(
+                key,
+                call_point,
+                ValueFlowObservationPhase::BeforeEffects,
+                carrier,
+                ProofStatus::Proven,
+                EvidenceCompleteness::Complete,
+            ),
+        });
+    }
+
+    let plan = ValueFlowPlan::with_call_behavior(
+        root.clone(),
+        snapshots.clone(),
+        bindings.clone(),
+        vec![source.clone()],
+        sinks,
+        case.unmodeled_call_behavior,
+    )
+    .unwrap_or_else(|error| panic!("{} plan failed: {error}", case.name));
+    let witness_plan = ValueFlowPlan::with_call_behavior(
+        root,
+        snapshots,
+        bindings,
+        vec![source],
+        witness_sinks,
+        case.unmodeled_call_behavior,
+    )
+    .unwrap_or_else(|error| panic!("{} witness plan failed: {error}", case.name));
+    let sink_ids = resolve_sink_ids(&plan, &sink_keys);
+    let witness_sink_ids = resolve_sink_ids(&witness_plan, &sink_keys);
+    ResolvedValueFlowConformanceCase {
+        _project: project,
+        analyzer,
+        root: resolved_root,
+        procedures,
+        calls,
+        call_bindings,
+        plan: Arc::new(plan),
+        witness_plan: Arc::new(witness_plan),
+        sink_ids,
+        witness_sink_ids,
+    }
+}
+
+fn relation_backed_source_spec(
+    case: &ValueFlowConformanceCase<'_>,
+    procedures: &HashMap<String, ProcedureHandle>,
+    snapshots: &[ValueFlowInput<ValueFlowSnapshot>],
+) -> ValueFlowSourceSpec {
+    let source_procedure = procedure(procedures, case.source.procedure());
     let root_snapshot = snapshots
         .iter()
         .find(|input| input.value().procedure() == source_procedure)
@@ -598,6 +728,9 @@ pub fn resolve_value_flow_conformance_case(
                                 if port_key(&port) == ValueFlowPortKey::Capture { slot }
                         )
                 }
+                ParameterSource::CallResult { .. } => {
+                    unreachable!("call-result sources are resolved from the selected call")
+                }
             }
         })
         .unwrap_or_else(|| {
@@ -608,7 +741,7 @@ pub fn resolve_value_flow_conformance_case(
                 root_snapshot.value().relations(),
             )
         });
-    let source = ValueFlowSourceSpec::new(
+    ValueFlowSourceSpec::new(
         ValueFlowEventKey::at_point(
             source_relation.point(),
             source_relation.event_index(),
@@ -620,107 +753,49 @@ pub fn resolve_value_flow_conformance_case(
         ValueFlowCarrier::from(&source_relation.source),
         ProofStatus::Proven,
         EvidenceCompleteness::Complete,
-    );
-
-    let mut sinks = Vec::new();
-    let mut witness_sinks = Vec::new();
-    let mut sink_keys = Vec::new();
-    for sink in case.sinks {
-        let call = calls
-            .get(sink.call)
-            .unwrap_or_else(|| panic!("missing call alias {}", sink.call));
-        let call_row = call
-            .procedure()
-            .semantics()
-            .call_site(call.id())
-            .expect("selected call remains live");
-        let argument = call_row.arguments.get(sink.argument).unwrap_or_else(|| {
-            panic!(
-                "call {} has no argument {} for sink {}",
-                sink.call, sink.argument, sink.alias
-            )
-        });
-        let call_point = call
-            .procedure()
-            .point_handle(call_row.point)
-            .expect("call point remains live");
-        let value = call
-            .procedure()
-            .value_handle(argument.value)
-            .expect("call argument remains live");
-        let carrier = ValueFlowCarrier::Value(value);
-        let snapshot = snapshots
-            .iter()
-            .find(|input| input.value().procedure() == call.procedure())
-            .expect("call procedure snapshot");
-        let producer = snapshot
-            .value()
-            .relations()
-            .iter()
-            .find(|relation| ValueFlowCarrier::from(&relation.target) == carrier)
-            .unwrap_or_else(|| {
-                panic!(
-                    "call {} argument {} has no structured producing relation",
-                    sink.call, sink.argument
-                )
-            });
-        let key = ValueFlowEventKey::at_point(
-            &call_point,
-            sink.argument as u32,
-            ValueFlowEventKind::Sink,
-        )
-        .expect("stable sink event");
-        sink_keys.push((sink.alias, key.clone()));
-        sinks.push(ValueFlowSinkSpec::new(
-            key.clone(),
-            call_point,
-            ValueFlowObservationPhase::BeforeEffects,
-            carrier.clone(),
-            ProofStatus::Proven,
-            EvidenceCompleteness::Complete,
-        ));
-        witness_sinks.push(ValueFlowSinkSpec::new(
-            key,
-            producer.point().clone(),
-            ValueFlowObservationPhase::AfterEffects,
-            carrier,
-            ProofStatus::Proven,
-            EvidenceCompleteness::Complete,
-        ));
-    }
-
-    let plan = ValueFlowPlan::with_call_behavior(
-        root.clone(),
-        snapshots.clone(),
-        bindings.clone(),
-        vec![source.clone()],
-        sinks,
-        case.unmodeled_call_behavior,
     )
-    .unwrap_or_else(|error| panic!("{} plan failed: {error}", case.name));
-    let witness_plan = ValueFlowPlan::with_call_behavior(
-        root,
-        snapshots,
-        bindings,
-        vec![source],
-        witness_sinks,
-        case.unmodeled_call_behavior,
+}
+
+/// Builds the source spec for a call-result source exactly as the production
+/// policy compiler binds `:bind return-value`: the carrier is the call's
+/// normal result value and the observation point is the call's normal
+/// continuation, before effects.
+fn call_result_source_spec(
+    calls: &HashMap<String, CallSiteHandle>,
+    alias: &str,
+) -> ValueFlowSourceSpec {
+    let call = calls
+        .get(alias)
+        .unwrap_or_else(|| panic!("missing source call alias {alias}"));
+    let call_row = call
+        .procedure()
+        .semantics()
+        .call_site(call.id())
+        .expect("selected source call remains live");
+    let result = call_row
+        .result
+        .unwrap_or_else(|| panic!("source call {alias} has no normal result"));
+    let continuation = call_row
+        .normal_continuation
+        .target()
+        .unwrap_or_else(|| panic!("source call {alias} has no normal continuation"));
+    let value = call
+        .procedure()
+        .value_handle(result)
+        .expect("source call result remains live");
+    let point = call
+        .procedure()
+        .point_handle(continuation)
+        .expect("source call continuation remains live");
+    ValueFlowSourceSpec::new(
+        ValueFlowEventKey::at_point(&point, 0, ValueFlowEventKind::Source)
+            .expect("stable source event"),
+        point,
+        ValueFlowObservationPhase::BeforeEffects,
+        ValueFlowCarrier::Value(value),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
     )
-    .unwrap_or_else(|error| panic!("{} witness plan failed: {error}", case.name));
-    let sink_ids = resolve_sink_ids(&plan, &sink_keys);
-    let witness_sink_ids = resolve_sink_ids(&witness_plan, &sink_keys);
-    ResolvedValueFlowConformanceCase {
-        _project: project,
-        analyzer,
-        root: resolved_root,
-        procedures,
-        calls,
-        call_bindings,
-        plan: Arc::new(plan),
-        witness_plan: Arc::new(witness_plan),
-        sink_ids,
-        witness_sink_ids,
-    }
 }
 
 fn assert_expected_location_relations(
@@ -1120,8 +1195,10 @@ fn assert_meeting_witness(
         .stable_key()
         .expect("source carrier has stable identity");
     let source_carrier = StableCarrier::from(&source_carrier_key);
-    let mut actual_carriers = Vec::new();
-    append_carrier_milestone(case, &mut actual_carriers, &source_carrier);
+    // The configured source is always a milestone, even when its carrier is
+    // a temporary such as a nested call result: the witness must show where
+    // the flow started.
+    let mut actual_carriers = vec![carrier_milestone(case, &source_carrier)];
     let mut entered_calls = Vec::new();
     for step in &projected {
         if matches!(step.kind, SummaryWitnessStepKind::Edge(IcfgEdgeKind::Call)) {

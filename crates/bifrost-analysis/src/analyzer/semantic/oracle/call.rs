@@ -506,9 +506,17 @@ impl CallBindings {
                     }
                     require_same_procedure(actual.procedure(), caller)?;
                     require_same_procedure(formal.procedure(), &callee)?;
-                    if call_row.receiver != Some(actual.id())
-                        || formal.kind() != ProcedurePortKind::Receiver
-                    {
+                    // A call that spells a receiver operand binds exactly that
+                    // operand. A receiverless call may instead bind the
+                    // caller's own dispatch receiver: a bare call between
+                    // members of one declaring type dispatches on `this`.
+                    let receiver_actual_matches = match call_row.receiver {
+                        Some(receiver) => receiver == actual.id(),
+                        None => caller.semantics().value(actual.id()).is_some_and(|row| {
+                            row.kind == SemanticValueKind::Receiver { dispatch: true }
+                        }),
+                    };
+                    if !receiver_actual_matches || formal.kind() != ProcedurePortKind::Receiver {
                         return Err(OracleContractError::InvalidCallBinding(
                             "receiver binding does not match the call receiver and callee receiver port",
                         ));
@@ -758,7 +766,7 @@ impl CallBindings {
                 .semantics()
                 .values()
                 .iter()
-                .any(|value| value.kind == SemanticValueKind::Receiver)
+                .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
                 || has_receiver;
             let returns_bound = call_row.result.is_none() || has_normal_return;
             let throws_bound = call_row.thrown.is_none() || has_exceptional_return;

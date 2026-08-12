@@ -763,6 +763,172 @@
                 }
               }
             ]
+          },
+          {
+            "id": "java.lombok.no-args-constructor",
+            "trigger": {
+              "kind": "annotation",
+              "name": "lombok.NoArgsConstructor"
+            },
+            "captures": [
+              {
+                "name": "owner_id",
+                "binding": {
+                  "source": { "kind": "owning_type" },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "one"
+              },
+              {
+                "name": "owner_name",
+                "binding": {
+                  "source": { "kind": "owning_type" },
+                  "projection": "name"
+                },
+                "value_kind": "identifier",
+                "cardinality": "one"
+              }
+            ],
+            "emissions": [
+              {
+                "kind": "declaration",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "owner_id" },
+                    { "op": "literal", "value": ".lombok-no-args-constructor" }
+                  ]
+                },
+                "name": { "op": "capture", "name": "owner_name" },
+                "anchor": { "op": "capture", "name": "owner_name" },
+                "declaration": {
+                  "kind": "member",
+                  "owner": { "op": "capture", "name": "owner_id" },
+                  "member_kind": "constructor",
+                  "visibility": "public",
+                  "signature": {
+                    "type_parameters": [],
+                    "parameters": []
+                  }
+                }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "owner_id" },
+                    { "op": "literal", "value": ".lombok-no-args-navigation" }
+                  ]
+                },
+                "relation_kind": "navigates_to",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "owner_id" },
+                    { "op": "literal", "value": ".lombok-no-args-constructor" }
+                  ]
+                },
+                "to": { "op": "capture", "name": "owner_id" }
+              }
+            ]
+          },
+          {
+            "id": "java.lombok.required-args-constructor",
+            "trigger": {
+              "kind": "annotation",
+              "name": "lombok.RequiredArgsConstructor"
+            },
+            "captures": [
+              {
+                "name": "owner_id",
+                "binding": {
+                  "source": { "kind": "owning_type" },
+                  "projection": "stable_id"
+                },
+                "value_kind": "stable_id",
+                "cardinality": "one"
+              },
+              {
+                "name": "owner_name",
+                "binding": {
+                  "source": { "kind": "owning_type" },
+                  "projection": "name"
+                },
+                "value_kind": "identifier",
+                "cardinality": "one"
+              },
+              {
+                "name": "field_name",
+                "binding": {
+                  "source": { "kind": "owned_uninitialized_final_fields" },
+                  "projection": "name"
+                },
+                "value_kind": "identifier",
+                "cardinality": "group"
+              },
+              {
+                "name": "field_type",
+                "binding": {
+                  "source": { "kind": "owned_uninitialized_final_fields" },
+                  "projection": "type"
+                },
+                "value_kind": "type",
+                "cardinality": "group"
+              }
+            ],
+            "emissions": [
+              {
+                "kind": "declaration",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "owner_id" },
+                    { "op": "literal", "value": ".lombok-required-args-constructor" }
+                  ]
+                },
+                "name": { "op": "capture", "name": "owner_name" },
+                "anchor": { "op": "capture", "name": "owner_name" },
+                "declaration": {
+                  "kind": "member",
+                  "owner": { "op": "capture", "name": "owner_id" },
+                  "member_kind": "constructor",
+                  "visibility": "public",
+                  "signature": {
+                    "type_parameters": [],
+                    "parameters": [],
+                    "repeated_parameters": [
+                      {
+                        "name": { "op": "capture", "name": "field_name" },
+                        "type": { "kind": "capture", "name": "field_type" },
+                        "optional": false,
+                        "variadic": false
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "kind": "relation",
+                "id": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "owner_id" },
+                    { "op": "literal", "value": ".lombok-required-args-navigation" }
+                  ]
+                },
+                "relation_kind": "navigates_to",
+                "from": {
+                  "op": "concat",
+                  "values": [
+                    { "op": "capture", "name": "owner_id" },
+                    { "op": "literal", "value": ".lombok-required-args-constructor" }
+                  ]
+                },
+                "to": { "op": "capture", "name": "owner_id" }
+              }
+            ]
           }
         ]
       }

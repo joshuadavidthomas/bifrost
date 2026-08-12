@@ -6,7 +6,7 @@
 //! reported — rather than on internal structure.
 //!
 //! Kotlin fixtures here are written multi-line with blank lines between
-//! declarations, because the vendored grammar emits `MISSING _automatic_semicolon`
+//! declarations, because the Kotlin grammar emits `MISSING _automatic_semicolon`
 //! error nodes for single-line bodies such as `class D { fun f() {} }`, and can
 //! degrade `object O { val p = 1 }` into expression recovery. Real Kotlin is
 //! written this way, so the fixtures are too.

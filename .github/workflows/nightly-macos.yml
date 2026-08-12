@@ -31,7 +31,9 @@ jobs:
         run: node --test plugins/bifrost-agent/test/launcher.test.mjs
 
       - name: Validate manifests
-        run: node scripts/check-codex-plugin-manifest.mjs
+        run: |
+          node scripts/check-agent-plugins-v1.mjs
+          node scripts/check-codex-plugin-manifest.mjs
 
   pi-package:
     name: Pi package
@@ -66,7 +68,9 @@ jobs:
         working-directory: plugins/bifrost-agent
 
       - name: Validate shared plugin manifests
-        run: node scripts/check-codex-plugin-manifest.mjs
+        run: |
+          node scripts/check-agent-plugins-v1.mjs
+          node scripts/check-codex-plugin-manifest.mjs
 
   rust:
     name: rust (aarch64-apple-darwin)

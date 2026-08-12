@@ -13,7 +13,6 @@ Bifrost analyzes source on the machine where its process runs. That local execut
 | Agent MCP host | Bifrost tool schemas and returned results, which may include source excerpts | May include those results in model requests, logs, transcripts, or host caches according to host configuration. |
 | Agent-plugin launcher | Pinned release metadata and explicit environment or argument overrides | May download a checksum-verified Bifrost release from GitHub into a user cache. |
 | Optional semantic search | Workspace code chunks and a local embedding model | Downloads model files from Hugging Face on first use unless `BIFROST_EMBED_MODEL_DIR` points to local files; inference runs in a local Python sidecar and derived index data is cached. |
-| Skills and agent instructions | Instruction text | No repository analysis and no tools by themselves. The agent host decides how instruction text is used. |
 
 ## Workspace Scope
 

@@ -1925,6 +1925,72 @@
       "accepted_by": "jbellis",
       "accepted_at": "2026-08-10",
       "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "6c905b718e15056814758f36cd7b3269febb98d304b729dd1817781f07951348",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration reads a different framework candidate file selected by its path. The read depends on that path and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "c96d9b41bd33ef172cd036a53dd099b1cc577510a7c11682b11db5641c8c4c1d",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration reads a different golden candidate file selected by its path. The read depends on that path and cannot be hoisted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "46bafe8d230ba861165268b4f8979c2964e26c2dd1a0d72c37b3969bb8a1248e",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration parses a different golden candidate file. The parse depends on that file and cannot be hoisted.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "a636a431ff5a4d4635c5797b438e22a81370d090bad99231779150447730298a",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each iteration parses a different framework candidate file. The parse depends on that file and cannot be hoisted.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "2807c64daa206e64cffc8027d8ae60f2e92fec8f321a833a101893bcb652bcad",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each artifact has a different member list. Sorting each list once gives stable pack output and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.sort-in-loop",
+      "finding_id": "8119aa76e62e25759f564b17a51843ebda70e77c636dbdc97d8f9d14afb3267f",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Each artifact has a different type list. Sorting each list once gives stable pack output and cannot move outside the loop.",
+      "policy_hash_at_acceptance": "15bc3b87a7a2103ec607e7ea94cc39d29b5cb4e073910a2f322be9668660c854",
+      "accepted_by": "codex",
+      "accepted_at": "2026-08-11",
+      "expires_at": null
     }
   ]
 }

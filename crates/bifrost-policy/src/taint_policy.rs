@@ -48,20 +48,18 @@ use brokk_bifrost_analysis::analyzer::dataflow::{
     SummarySemanticsVersion, SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits,
     WitnessRetentionLimits,
 };
-use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
-    ProcedureRangeLookupStatus, procedures_for_source_ranges,
-};
 use brokk_bifrost_analysis::analyzer::semantic::{
     CandidateCoverage, EvidenceCompleteness, ExactExternalProcedureTarget, OracleCallContext,
-    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticBudget, SemanticOutcome, ValueHandle,
-    WorkspaceIcfgProvider,
+    ProcedureHandle, ProgramPointHandle, ProofStatus, SemanticArtifactKey, SemanticBudget,
+    SemanticOutcome, UnmaterializedExternalTarget, ValueHandle, WorkspaceIcfgProvider,
+    split_qualified_member,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledProcedureSummary, CompiledSummaryEffect, ExactProcedureSummaryBoundary,
     ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
-    ExactProcedureSummaryTargetBinding, ProcedureSummaryTargetKey, ResolvedActiveSemanticModels,
-    SemanticModelMatchDisposition, bind_compiled_procedure_summaries,
+    ExactProcedureSummaryTargetBinding, ProcedureSummaryMemberKey, ProcedureSummaryTargetKey,
+    ResolvedActiveSemanticModels, SemanticModelMatchDisposition, bind_compiled_procedure_summaries,
 };
 use brokk_bifrost_analysis::analyzer::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits,
@@ -73,8 +71,9 @@ use brokk_bifrost_analysis::analyzer::taint::{
     TaintUniverse, collect_taint_findings_with_limits,
 };
 use brokk_bifrost_analysis::analyzer::value_flow::{
-    ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
-    ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec, ValueFlowSourceSpec,
+    ValueFlowCarrier, ValueFlowEventKey, ValueFlowEventKind, ValueFlowIncompleteCause,
+    ValueFlowInput, ValueFlowObservationPhase, ValueFlowPlan, ValueFlowSinkSpec,
+    ValueFlowSourceSpec,
 };
 
 #[derive(Debug)]
@@ -405,6 +404,53 @@ struct DiscoveredValueFlow {
     bindings: Vec<ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::CallBindings>>,
     procedures: HashSet<ProcedureHandle>,
     external_targets: Vec<ExactExternalProcedureTarget>,
+    /// Canonical identities of fully-qualified external callees that never
+    /// materialize to an artifact, kept separate from `external_targets` so the
+    /// materialized-external binding path is unchanged (#1978).
+    unmaterialized_external_targets: Vec<UnmaterializedExternalTarget>,
+}
+
+/// Compile-scoped materialization cache for require-model taint discovery
+/// (#1936).
+///
+/// `discover_value_flow` runs once per root, and the root set includes every
+/// procedure of every materialized artifact. A callee subgraph that many roots
+/// share was therefore materialized -- and charged against the one shared
+/// `SemanticBudget` -- once per root. Total charged work grew with the sum of
+/// per-root closure sizes and could pass the semantic ceiling, so the compile
+/// abstained.
+///
+/// This cache lives for the whole compile. It sits in front of the three
+/// oracle calls. On a hit, `discover_value_flow` reuses the byte-identical
+/// result that a fresh call gives and skips the oracle call, so it also skips
+/// that call's budget charge. Each distinct procedure, dispatch, and binding is
+/// therefore materialized and charged one time for each compile.
+///
+/// The cache does not change any plan. Region membership stays a pure per-root
+/// forward closure, and each region plan is a pure function of its root,
+/// snapshots, bindings, and region-filtered specs. A hit returns the same
+/// `(value, status)` that the skipped call produced, so the region result is
+/// identical.
+#[derive(Default)]
+struct DiscoveryMaterializationCache {
+    procedures: HashMap<
+        ProcedureHandle,
+        ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::ValueFlowSnapshot>,
+    >,
+    dispatch: HashMap<
+        brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+        (
+            Option<brokk_bifrost_analysis::analyzer::semantic::DispatchResult>,
+            SemanticInputStatus,
+        ),
+    >,
+    bindings: HashMap<
+        (
+            brokk_bifrost_analysis::analyzer::semantic::CallSiteHandle,
+            ProcedureHandle,
+        ),
+        ValueFlowInput<brokk_bifrost_analysis::analyzer::semantic::CallBindings>,
+    >,
 }
 
 struct SelectedSummaryFamily {
@@ -562,8 +608,12 @@ impl<'a> TaintPolicyCompiler<'a> {
         roots.sort_by(|left, right| left.semantics().locator().cmp(right.semantics().locator()));
         roots.dedup();
         let mut discoveries = Vec::with_capacity(roots.len());
+        // One cache serves every root in this compile. It charges each shared
+        // procedure, dispatch, and binding one time, not one time for each root
+        // that reaches it (#1936).
+        let mut materialization = DiscoveryMaterializationCache::default();
         for root in roots {
-            discoveries.push(self.discover_value_flow(&root)?);
+            discoveries.push(self.discover_value_flow(&root, &mut materialization)?);
         }
         // Keep only regions that contain both a selected source and a selected
         // sink: those are the regions where a flow can exist, and each becomes
@@ -692,46 +742,44 @@ impl<'a> TaintPolicyCompiler<'a> {
             .selectors
             .materialize(&selection.file)
             .map_err(taint_selector_error)?;
-        let lookup = procedures_for_source_ranges(
-            &artifact,
-            &[super::selector_compiler::source_range(&selection.span)],
-            self.selectors
-                .remaining_semantic_traversal_steps()
-                .map_err(taint_selector_error)?,
-            self.selectors.cancellation(),
-        );
-        if !self
+        // Bind against every procedure in the file artifact. Narrowing by
+        // procedure-anchor containment loses calls in languages whose
+        // procedure anchors cover only the declaration header (Ruby anchors
+        // `def name`, not the body, #1953); the call site's own source anchor
+        // in select_call is the identity that decides the binding.
+        let max_steps = self
             .selectors
-            .execution_budget()
-            .charge_traversal(lookup.examined)
-        {
-            return Err(query_budget_error(
-                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                "taint enclosing-procedure lookup exhausted the shared traversal budget",
-            ));
-        }
-        match lookup.status {
-            ProcedureRangeLookupStatus::Complete => {}
-            ProcedureRangeLookupStatus::Cancelled => {
+            .remaining_semantic_traversal_steps()
+            .map_err(taint_selector_error)?;
+        let cancellation = self.selectors.cancellation();
+        let mut handles = Vec::with_capacity(artifact.procedures().len());
+        let mut examined = 0_usize;
+        for procedure in artifact.procedures() {
+            if cancellation.is_cancelled() {
                 return Err(TaintPolicyCompileError::QueryIncomplete {
                     completion: CodeQueryCompletion::Cancelled,
-                    detail: "taint enclosing-procedure lookup was cancelled".to_owned(),
+                    detail: "taint semantic call binding was cancelled".to_owned(),
                 });
             }
-            ProcedureRangeLookupStatus::BudgetExhausted => {
+            examined = examined.saturating_add(1 + procedure.call_sites().len());
+            if examined > max_steps {
                 return Err(query_budget_error(
                     CodeQueryDiagnosticCode::SemanticBudgetExhausted,
-                    "taint enclosing-procedure lookup exhausted the shared traversal budget",
+                    "taint semantic call binding exhausted the shared traversal budget",
                 ));
             }
-            ProcedureRangeLookupStatus::SourceChanged => {
-                return Err(TaintPolicyCompileError::SemanticUnavailable(
-                    "taint enclosing-procedure lookup observed a changed source snapshot"
-                        .to_owned(),
-                ));
-            }
+            let handle = artifact
+                .procedure_handle(procedure.id())
+                .expect("validated artifact procedure has a scoped handle");
+            handles.push(handle);
         }
-        let (procedure, call) = select_call(&lookup.handles, &selection)?;
+        if !self.selectors.execution_budget().charge_traversal(examined) {
+            return Err(query_budget_error(
+                CodeQueryDiagnosticCode::SemanticBudgetExhausted,
+                "taint semantic call binding exhausted the shared traversal budget",
+            ));
+        }
+        let (procedure, call) = select_call(&handles, &selection)?;
         let (value, point) = select_value(&procedure, &call, &selection.span, binding)?;
         Ok(vec![ResolvedTaintValue {
             point,
@@ -804,6 +852,7 @@ impl<'a> TaintPolicyCompiler<'a> {
     fn discover_value_flow(
         &mut self,
         root: &ProcedureHandle,
+        cache: &mut DiscoveryMaterializationCache,
     ) -> Result<DiscoveredValueFlow, TaintPolicyCompileError> {
         let oracle = self.selectors.workspace().semantic_oracle_provider();
         let context = OracleCallContext::empty();
@@ -811,47 +860,73 @@ impl<'a> TaintPolicyCompiler<'a> {
         let mut seen = HashSet::new();
         let mut seen_bindings = HashSet::new();
         let mut seen_external_targets = HashSet::new();
+        let mut seen_unmaterialized_targets = HashSet::new();
         let mut snapshots = Vec::new();
         let mut bindings = Vec::new();
         let mut external_targets = Vec::new();
+        let mut unmaterialized_external_targets = Vec::new();
         while let Some(procedure) = pending.pop() {
             if !seen.insert(procedure.clone()) {
                 continue;
             }
-            let outcome = {
-                let mut request = self.selectors.semantic_request();
-                oracle
-                    .procedure_relations(&procedure, &context, &mut request)
-                    .map_err(|error| TaintPolicyCompileError::SemanticProvider(error.to_string()))?
+            // Reuse the cached snapshot when a prior root already materialized
+            // this procedure. The cache holds only present snapshots: the miss
+            // path returns a `SemanticUnavailable` error before it inserts, so a
+            // hit always carries a valid snapshot.
+            let snapshot_input = if let Some(cached) = cache.procedures.get(&procedure) {
+                cached.clone()
+            } else {
+                let outcome = {
+                    let mut request = self.selectors.semantic_request();
+                    oracle
+                        .procedure_relations(&procedure, &context, &mut request)
+                        .map_err(|error| {
+                            TaintPolicyCompileError::SemanticProvider(error.to_string())
+                        })?
+                };
+                require_uninterrupted_outcome(&outcome, "taint value-flow discovery")?;
+                self.selectors
+                    .require_execution_budget("taint value-flow discovery")
+                    .map_err(taint_selector_error)?;
+                let status = SemanticInputStatus::from_outcome(&outcome);
+                let snapshot = outcome.available_value().cloned().ok_or_else(|| {
+                    TaintPolicyCompileError::SemanticUnavailable(
+                        "taint value-flow discovery returned no procedure snapshot".to_owned(),
+                    )
+                })?;
+                let input = ValueFlowInput::new(snapshot, status);
+                cache.procedures.insert(procedure.clone(), input.clone());
+                input
             };
-            require_uninterrupted_outcome(&outcome, "taint value-flow discovery")?;
-            self.selectors
-                .require_execution_budget("taint value-flow discovery")
-                .map_err(taint_selector_error)?;
-            let status = SemanticInputStatus::from_outcome(&outcome);
-            let snapshot = outcome.available_value().cloned().ok_or_else(|| {
-                TaintPolicyCompileError::SemanticUnavailable(
-                    "taint value-flow discovery returned no procedure snapshot".to_owned(),
-                )
-            })?;
-            snapshots.push(ValueFlowInput::new(snapshot, status));
+            snapshots.push(snapshot_input);
 
             for call_row in procedure.semantics().call_sites() {
                 let call = procedure
                     .call_site_handle(call_row.id)
                     .expect("a live procedure owns each retained call site");
-                let dispatch = {
-                    let mut request = self.selectors.semantic_request();
-                    oracle.resolve_call(&call, &mut request).map_err(|error| {
-                        TaintPolicyCompileError::SemanticProvider(error.to_string())
-                    })?
-                };
-                require_uninterrupted_outcome(&dispatch, "taint call dispatch")?;
-                self.selectors
-                    .require_execution_budget("taint call dispatch")
-                    .map_err(taint_selector_error)?;
-                let dispatch_status = SemanticInputStatus::from_outcome(&dispatch);
-                let Some(dispatch) = dispatch.available_value() else {
+                // Reuse the cached dispatch when a prior root already resolved
+                // this call site. The per-discovery boundary and candidate walk
+                // below still runs, because it feeds this root's own region.
+                let (dispatch_value, dispatch_status) =
+                    if let Some(cached) = cache.dispatch.get(&call) {
+                        cached.clone()
+                    } else {
+                        let dispatch = {
+                            let mut request = self.selectors.semantic_request();
+                            oracle.resolve_call(&call, &mut request).map_err(|error| {
+                                TaintPolicyCompileError::SemanticProvider(error.to_string())
+                            })?
+                        };
+                        require_uninterrupted_outcome(&dispatch, "taint call dispatch")?;
+                        self.selectors
+                            .require_execution_budget("taint call dispatch")
+                            .map_err(taint_selector_error)?;
+                        let dispatch_status = SemanticInputStatus::from_outcome(&dispatch);
+                        let entry = (dispatch.available_value().cloned(), dispatch_status);
+                        cache.dispatch.insert(call.clone(), entry.clone());
+                        entry
+                    };
+                let Some(dispatch) = dispatch_value else {
                     continue;
                 };
                 for boundary in dispatch.boundaries() {
@@ -860,27 +935,49 @@ impl<'a> TaintPolicyCompiler<'a> {
                     {
                         external_targets.push(target.clone());
                     }
+                    // #1978: a fully-qualified external callee that never
+                    // materializes carries its canonical identity here instead of
+                    // a materialized `exact_external_target`.
+                    if let Some(target) = boundary.unmaterialized_external_target()
+                        && seen_unmaterialized_targets.insert(target.clone())
+                    {
+                        unmaterialized_external_targets.push(target.clone());
+                    }
                 }
                 for candidate in dispatch.candidates() {
                     let binding_key = (call.clone(), candidate.target().clone());
-                    if !seen_bindings.insert(binding_key) {
+                    if !seen_bindings.insert(binding_key.clone()) {
                         continue;
                     }
-                    let outcome = {
-                        let mut request = self.selectors.semantic_request();
-                        oracle
-                            .call_bindings(&call, candidate, &context, &mut request)
-                            .map_err(|error| {
-                                TaintPolicyCompileError::SemanticProvider(error.to_string())
-                            })?
+                    // Reuse the cached binding when a prior root already bound
+                    // this (call, target) pair. The cache holds only present
+                    // bindings, so a hit reproduces both the pushed binding and
+                    // the pushed callee.
+                    let binding_input = if let Some(cached) = cache.bindings.get(&binding_key) {
+                        Some(cached.clone())
+                    } else {
+                        let outcome = {
+                            let mut request = self.selectors.semantic_request();
+                            oracle
+                                .call_bindings(&call, candidate, &context, &mut request)
+                                .map_err(|error| {
+                                    TaintPolicyCompileError::SemanticProvider(error.to_string())
+                                })?
+                        };
+                        require_uninterrupted_outcome(&outcome, "taint call binding")?;
+                        self.selectors
+                            .require_execution_budget("taint call binding")
+                            .map_err(taint_selector_error)?;
+                        let status =
+                            dispatch_status.merge(SemanticInputStatus::from_outcome(&outcome));
+                        outcome.available_value().cloned().map(|binding| {
+                            let input = ValueFlowInput::new(binding, status);
+                            cache.bindings.insert(binding_key.clone(), input.clone());
+                            input
+                        })
                     };
-                    require_uninterrupted_outcome(&outcome, "taint call binding")?;
-                    self.selectors
-                        .require_execution_budget("taint call binding")
-                        .map_err(taint_selector_error)?;
-                    let status = dispatch_status.merge(SemanticInputStatus::from_outcome(&outcome));
-                    if let Some(binding) = outcome.available_value().cloned() {
-                        bindings.push(ValueFlowInput::new(binding, status));
+                    if let Some(binding_input) = binding_input {
+                        bindings.push(binding_input);
                         pending.push(candidate.target().clone());
                     }
                 }
@@ -892,6 +989,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             bindings,
             procedures: seen,
             external_targets,
+            unmaterialized_external_targets,
         })
     }
 
@@ -904,7 +1002,8 @@ impl<'a> TaintPolicyCompiler<'a> {
     ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
         let external_summaries = self.bind_external_summaries(
             &discovery.external_targets,
-            discovery.root.artifact().key().dependencies(),
+            &discovery.unmaterialized_external_targets,
+            discovery.root.artifact().key(),
             call_behavior,
         )?;
         let plan = ValueFlowPlan::with_call_behavior(
@@ -927,12 +1026,14 @@ impl<'a> TaintPolicyCompiler<'a> {
     fn bind_external_summaries(
         &self,
         targets: &[ExactExternalProcedureTarget],
-        dependencies: brokk_bifrost_analysis::analyzer::semantic::DependencyFingerprint,
+        unmaterialized: &[UnmaterializedExternalTarget],
+        root_artifact: &SemanticArtifactKey,
         call_behavior: brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior,
     ) -> Result<Option<ExternalSemanticSummarySet>, TaintPolicyCompileError> {
         let Some(active) = &self.active_semantic_models else {
             return Ok(None);
         };
+        let dependencies = root_artifact.dependencies();
         let compatibility = ExternalSummaryCompatibilityKey::new(
             SummarySchemaVersion::CURRENT,
             SummarySemanticsVersion::hash_bytes(b"bifrost.production-value-flow.semantic-pack.v1"),
@@ -977,7 +1078,7 @@ impl<'a> TaintPolicyCompiler<'a> {
                 });
             family.root_ids.insert(selected.record.id.clone());
         }
-        if families.is_empty() {
+        if families.is_empty() && unmaterialized.is_empty() {
             return Ok(None);
         }
 
@@ -1077,6 +1178,151 @@ impl<'a> TaintPolicyCompiler<'a> {
             let set = bind_compiled_procedure_summaries(&summaries, bindings, compatibility)
                 .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))?;
             lowered.extend(set.entries().map(|(_, summary)| summary.clone()));
+        }
+
+        // #1978: bind activated summaries to fully-qualified external callees that
+        // never materialize. They select a summary by canonical identity
+        // (language, owner FQN, member, arity, has_receiver) rather than by
+        // artifact path or parameter-typed symbol, and anchor the lowered summary
+        // to the boundary's synthetic locator so it applies at solve time. The
+        // materialized-external binding above is untouched.
+        let mut unmaterialized_families = HashMap::<usize, SelectedSummaryFamily>::new();
+        for target in unmaterialized {
+            let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+                target.language().stable_label(),
+                target.owner_fqn(),
+                target.member(),
+                target.has_receiver(),
+                target.arity(),
+            ));
+            match matched.disposition {
+                SemanticModelMatchDisposition::Empty => continue,
+                SemanticModelMatchDisposition::Conflict => {
+                    return Err(TaintPolicyCompileError::Model(format!(
+                        "conflicting activated procedure summaries target unmaterialized external {}.{}",
+                        target.owner_fqn(),
+                        target.member()
+                    )));
+                }
+                SemanticModelMatchDisposition::Unique => {}
+            }
+            let [selected] = matched.records.as_slice() else {
+                return Err(TaintPolicyCompileError::Model(
+                    "unique unmaterialized procedure-summary lookup returned a non-unique record set"
+                        .to_owned(),
+                ));
+            };
+            let family_key = selected.payload.as_ptr() as usize;
+            let family = unmaterialized_families
+                .entry(family_key)
+                .or_insert_with(|| SelectedSummaryFamily {
+                    language: selected.shard.manifest.language.clone(),
+                    payload: selected.payload.to_vec(),
+                    root_ids: HashSet::new(),
+                });
+            family.root_ids.insert(selected.record.id.clone());
+        }
+        let mut unmaterialized_families = unmaterialized_families.into_values().collect::<Vec<_>>();
+        unmaterialized_families.sort_unstable_by(|left, right| {
+            left.language.cmp(&right.language).then_with(|| {
+                left.payload
+                    .iter()
+                    .map(|summary| (&summary.model_id, &summary.id))
+                    .cmp(
+                        right
+                            .payload
+                            .iter()
+                            .map(|summary| (&summary.model_id, &summary.id)),
+                    )
+            })
+        });
+        for family in unmaterialized_families {
+            let by_id = family
+                .payload
+                .iter()
+                .map(|summary| (summary.id.as_str(), summary))
+                .collect::<HashMap<_, _>>();
+            let mut pending = family.root_ids.into_iter().collect::<Vec<_>>();
+            pending.sort_unstable_by(|left, right| right.cmp(left));
+            let mut selected_ids = HashSet::new();
+            while let Some(id) = pending.pop() {
+                if !selected_ids.insert(id.clone()) {
+                    continue;
+                }
+                let summary = by_id.get(id.as_str()).ok_or_else(|| {
+                    TaintPolicyCompileError::Model(format!(
+                        "activated procedure-summary dependency `{id}` is missing from its payload"
+                    ))
+                })?;
+                for effect in &summary.effects {
+                    match effect {
+                        CompiledSummaryEffect::Call { callee, .. } => pending.push(callee.clone()),
+                        CompiledSummaryEffect::AmbiguousCall { candidates, .. } => {
+                            pending.extend(candidates.iter().cloned());
+                        }
+                        CompiledSummaryEffect::Allocation { .. }
+                        | CompiledSummaryEffect::Escape { .. }
+                        | CompiledSummaryEffect::UnknownCall { .. }
+                        | CompiledSummaryEffect::UnknownCallBoundary { .. }
+                        | CompiledSummaryEffect::Sanitize { .. } => {}
+                    }
+                }
+            }
+            let summaries = family
+                .payload
+                .iter()
+                .filter(|summary| selected_ids.contains(&summary.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut bindings = Vec::with_capacity(summaries.len());
+            for summary in &summaries {
+                // Re-match this closure summary to its unmaterialized external
+                // target by canonical identity. Parameter types are discarded, so
+                // a same-arity overload set collapses to one identity here.
+                let binding_error = || {
+                    TaintPolicyCompileError::Model(format!(
+                        "unmaterialized procedure summary `{}` dependency closure lacks one external target identity",
+                        summary.id
+                    ))
+                };
+                let mut exact = unmaterialized.iter().filter(|target| {
+                    target.language().stable_label() == family.language
+                        && target.has_receiver() == summary.target.has_receiver
+                        && target.arity() == summary.target.parameter_count
+                        && split_qualified_member(&summary.target.symbol).is_some_and(
+                            |(owner, member)| {
+                                owner == target.owner_fqn() && member == target.member()
+                            },
+                        )
+                });
+                let Some(target) = exact.next() else {
+                    return Err(binding_error());
+                };
+                if exact.any(|candidate| candidate != target) {
+                    return Err(binding_error());
+                }
+                let receiver = summary
+                    .target
+                    .has_receiver
+                    .then_some(ExactProcedureSummaryReceiver);
+                let parameters = (0..summary.target.parameter_count)
+                    .map(ExactProcedureSummaryParameter::new)
+                    .collect();
+                bindings.push(ExactProcedureSummaryTargetBinding::new(
+                    summary.id.clone(),
+                    summary.target.clone(),
+                    target.provenance_artifact_key(root_artifact),
+                    target.locator().clone(),
+                    ExactProcedureSummaryBoundary::new(receiver, parameters),
+                ));
+            }
+            let set = bind_compiled_procedure_summaries(&summaries, bindings, compatibility)
+                .map_err(|error| TaintPolicyCompileError::Model(error.to_string()))?;
+            lowered.extend(set.entries().map(|(_, summary)| summary.clone()));
+        }
+
+        if lowered.is_empty() {
+            return Ok(None);
         }
         ExternalSemanticSummarySet::try_new(lowered, compatibility)
             .map(Some)
@@ -1206,6 +1452,7 @@ fn solve_and_project_batch(
         let spec = policy
             .resolved_taint()
             .ok_or_else(|| "compiled taint policy lost its resolved specification".to_owned())?;
+        let mut dropped_for_missing_origins = 0usize;
         let projected = project_policy_findings(
             workspace,
             policy,
@@ -1214,6 +1461,7 @@ fn solve_and_project_batch(
             retained.plan().universe(),
             retained.report(),
             budget,
+            &mut dropped_for_missing_origins,
         )?;
         let payload = payloads
             .get_mut(&plan.policy_id)
@@ -1231,6 +1479,29 @@ fn solve_and_project_batch(
             PolicyWorkUnit::Count,
             u64::try_from(batch.projections().len().saturating_sub(1)).unwrap_or(u64::MAX),
         )?;
+        if dropped_for_missing_origins > 0
+            && matches!(payload.completion, PolicyRunCompletion::Complete)
+        {
+            // The run solved cleanly, but a candidate finding retained no
+            // source origin evidence and could not be projected. Reporting
+            // Complete would silently drop a real candidate, so the run
+            // stays typed inconclusive until origin retention is fixed.
+            payload.completion =
+                PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::PartialDiscovery])
+                    .map_err(|error| error.to_string())?;
+            if let Ok(diagnostic) = PolicyDiagnostic::try_new(
+                PolicyDiagnosticCode::EvaluationFailure,
+                PolicyDiagnosticSeverity::Warning,
+                PolicyDiagnosticImpact::RunIncomplete,
+                format!(
+                    "{dropped_for_missing_origins} candidate finding(s) retained no source origin evidence and could not be projected"
+                ),
+                None,
+                Vec::new(),
+            ) {
+                payload.diagnostics.push(diagnostic);
+            }
+        }
         if !retained.report().is_complete() {
             if retained.report().is_proven_by_authored_summaries() {
                 // The run terminates precisely, but every open boundary was
@@ -1241,10 +1512,46 @@ fn solve_and_project_batch(
                     payload.completion = PolicyRunCompletion::ProvenBySummary;
                 }
             } else {
-                payload.completion = PolicyRunCompletion::inconclusive(vec![
-                    PolicyIncompleteReason::PartialDiscovery,
-                ])
-                .map_err(|error| error.to_string())?;
+                // Keep the first path-relevant cause the plan retained (#1952):
+                // an unavailable capability stays a typed capability reason and
+                // the diagnostic names the input that opened the run instead of
+                // collapsing everything into a bare partial-discovery verdict.
+                let cause = batch.analysis().value_flow().first_incomplete_cause();
+                let reason = match cause.and_then(ValueFlowIncompleteCause::status) {
+                    Some(SemanticInputStatus::Unsupported { .. }) => {
+                        PolicyIncompleteReason::CapabilityIncomplete
+                    }
+                    _ => PolicyIncompleteReason::PartialDiscovery,
+                };
+                payload.completion = PolicyRunCompletion::inconclusive(vec![reason])
+                    .map_err(|error| error.to_string())?;
+                if let Some(cause) = cause {
+                    let locator = cause.procedure().semantics().locator();
+                    let name = locator
+                        .declaration()
+                        .segments()
+                        .iter()
+                        .filter_map(|segment| segment.name())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let status = cause
+                        .status()
+                        .map_or("incomplete coverage", SemanticInputStatus::label);
+                    if let Ok(diagnostic) = PolicyDiagnostic::try_new(
+                        PolicyDiagnosticCode::EvaluationFailure,
+                        PolicyDiagnosticSeverity::Warning,
+                        PolicyDiagnosticImpact::RunIncomplete,
+                        format!(
+                            "taint discovery is incomplete: {} for {}:{name} is {status}",
+                            cause.label(),
+                            locator.path().as_str(),
+                        ),
+                        None,
+                        Vec::new(),
+                    ) {
+                        payload.diagnostics.push(diagnostic);
+                    }
+                }
             }
         }
     }
@@ -1319,6 +1626,7 @@ struct ProjectedSourceGroup<'a> {
     labels: Vec<TaintLabel>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn project_policy_findings(
     workspace: &WorkspaceAnalyzer,
     _policy: &LoadedPolicy,
@@ -1327,6 +1635,7 @@ fn project_policy_findings(
     universe: &TaintUniverse,
     report: &TaintFindingReport,
     budget: &PolicyBudget,
+    dropped_for_missing_origins: &mut usize,
 ) -> Result<Vec<TaintProjectedFinding>, String> {
     let mut projected = Vec::new();
     let mut projected_sinks = Vec::<ValueFlowEventKey>::new();
@@ -1421,6 +1730,14 @@ fn project_policy_findings(
             }
         }
         if groups.is_empty() {
+            // A finding with no retained origin evidence cannot be projected
+            // at all; that is an evidence-retention defect, not a clean
+            // absence, so the caller must not report a complete run over it.
+            // A finding whose retained origins simply belong to another
+            // policy in the shared batch is not this policy's finding.
+            if finding.origins().evidence().is_empty() {
+                *dropped_for_missing_origins = dropped_for_missing_origins.saturating_add(1);
+            }
             continue;
         }
         groups.sort_by(|left, right| left.source.identity.cmp(&right.source.identity));
@@ -1778,7 +2095,6 @@ fn project_taint_witnesses(
             id.clone(),
             budget.max_witness_steps(),
             budget.max_witness_bytes(),
-            true,
             |kind| match kind {
                 SummaryWitnessStepKind::Seed => (WitnessStepKind::Source, "taint source"),
                 SummaryWitnessStepKind::Edge(_) => {
@@ -1880,6 +2196,15 @@ fn required_selector<'a>(
         .ok_or_else(|| TaintPolicyCompileError::MissingSelector(path.as_str().to_owned()))
 }
 
+/// Bind one selector row to the semantic call site it identifies.
+///
+/// The primary identity is exact source-anchor equality between the selector
+/// row and a call site's own anchor; this is what binds Ruby calls with and
+/// without parentheses, whose structural rows and semantic call anchors share
+/// one node (#1953). A call whose anchor strictly encloses the row is a
+/// secondary candidate for adapters whose rows sit inside the call expression.
+/// Equal-rank candidates stay a typed ambiguity; no candidate stays a typed
+/// capability failure.
 fn select_call(
     procedures: &[ProcedureHandle],
     selection: &SelectedSite,

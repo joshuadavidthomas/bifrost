@@ -98,6 +98,10 @@ pub enum DetailedCodeQueryDomain {
     CallShape,
     CallArgumentGroup,
     CallArgument,
+    CallableSignature,
+    SignatureParameter,
+    CallableApplicability,
+    OverloadSelection,
     ReceiverEvidence,
     MemberSelection,
     DispatchOutcome,
@@ -137,6 +141,10 @@ pub const ALL_DETAILED_CODE_QUERY_DOMAINS: &[DetailedCodeQueryDomain] = &[
     DetailedCodeQueryDomain::CallShape,
     DetailedCodeQueryDomain::CallArgumentGroup,
     DetailedCodeQueryDomain::CallArgument,
+    DetailedCodeQueryDomain::CallableSignature,
+    DetailedCodeQueryDomain::SignatureParameter,
+    DetailedCodeQueryDomain::CallableApplicability,
+    DetailedCodeQueryDomain::OverloadSelection,
     DetailedCodeQueryDomain::ReceiverEvidence,
     DetailedCodeQueryDomain::MemberSelection,
     DetailedCodeQueryDomain::DispatchOutcome,
@@ -284,6 +292,10 @@ impl DetailedCodeQueryDomain {
             QueryValueKind::CallShape => Self::CallShape,
             QueryValueKind::CallArgumentGroup => Self::CallArgumentGroup,
             QueryValueKind::CallArgument => Self::CallArgument,
+            QueryValueKind::CallableSignature => Self::CallableSignature,
+            QueryValueKind::SignatureParameter => Self::SignatureParameter,
+            QueryValueKind::CallableApplicability => Self::CallableApplicability,
+            QueryValueKind::OverloadSelection => Self::OverloadSelection,
             QueryValueKind::ReceiverEvidence => Self::ReceiverEvidence,
             QueryValueKind::MemberSelection => Self::MemberSelection,
             QueryValueKind::DispatchOutcome => Self::DispatchOutcome,
@@ -326,6 +338,10 @@ impl DetailedCodeQueryDomain {
             Self::CallShape => "call_shape",
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
+            Self::CallableSignature => "callable_signature",
+            Self::SignatureParameter => "signature_parameter",
+            Self::CallableApplicability => "callable_applicability",
+            Self::OverloadSelection => "overload_selection",
             Self::ReceiverEvidence => "receiver_evidence",
             Self::MemberSelection => "member_selection",
             Self::DispatchOutcome => "dispatch_outcome",
@@ -543,6 +559,55 @@ impl DetailedCodeQueryDomain {
                 CodeQueryRowField::optional("name", Scalar::String),
                 CodeQueryRowField::required("spread", Scalar::Boolean),
             ],
+            Self::CallableSignature => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::optional("declaration_id", Scalar::DeclarationIdentity),
+                CodeQueryRowField::required("ordinal", Scalar::Integer),
+                CodeQueryRowField::required("coverage", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("role", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("required_arity", Scalar::Integer),
+                CodeQueryRowField::optional("total_arity", Scalar::Integer),
+                CodeQueryRowField::required("repeated", Scalar::Boolean),
+                CodeQueryRowField::required("generic_arity", Scalar::Integer),
+                CodeQueryRowField::optional("receiver_contract", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("return_type", Scalar::String),
+                CodeQueryRowField::required("declaration_only", Scalar::Boolean),
+                CodeQueryRowField::required("parameter_count", Scalar::Integer),
+            ],
+            Self::SignatureParameter => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("signature_id", Scalar::StableId),
+                CodeQueryRowField::required("parameter_index", Scalar::Integer),
+                CodeQueryRowField::required("label", Scalar::String),
+                CodeQueryRowField::optional("declared_type", Scalar::String),
+                CodeQueryRowField::optional("optional", Scalar::Boolean),
+                CodeQueryRowField::optional("repeated", Scalar::Boolean),
+            ],
+            Self::CallableApplicability => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::required("ordinal", Scalar::Integer),
+                CodeQueryRowField::required("verdict", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("reason", Scalar::ConstrainedEnum),
+                CodeQueryRowField::optional("tier", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("selected", Scalar::Boolean),
+                // The candidate declaration's identity, so an applicability row
+                // joins to the `callable_signature` row of the very callable it
+                // judged. Absent when the resolver weighed something that is not
+                // an indexed declaration (a lexical binder, an import route, an
+                // external target), exactly as the `candidates` domain reports.
+                CodeQueryRowField::optional("candidate_id", Scalar::DeclarationIdentity),
+            ],
+            Self::OverloadSelection => code_query_row_fields![
+                CodeQueryRowField::required("id", Scalar::StableId),
+                CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                CodeQueryRowField::required("resolution", Scalar::ConstrainedEnum),
+                CodeQueryRowField::required("supported", Scalar::Boolean),
+                CodeQueryRowField::required("considered_count", Scalar::Integer),
+                CodeQueryRowField::required("applicable_count", Scalar::Integer),
+                CodeQueryRowField::required("inapplicable_count", Scalar::Integer),
+                CodeQueryRowField::required("unknown_count", Scalar::Integer),
+            ],
             Self::MemberSelection => code_query_row_fields![
                 CodeQueryRowField::required("id", Scalar::StableId),
                 CodeQueryRowField::required("site_ast_id", Scalar::StableId),
@@ -706,6 +771,10 @@ impl CodeQueryResultValue {
             Self::CallShape { value } => Some(value.range),
             Self::CallArgumentGroup { value } => Some(value.range),
             Self::CallArgument { value } => Some(value.range),
+            Self::CallableSignature { value } => Some(value.range),
+            Self::SignatureParameter { value } => Some(value.range),
+            Self::CallableApplicability { value } => Some(value.range),
+            Self::OverloadSelection { value } => Some(value.range),
             Self::Occurrence { value } => Some(value.range),
             Self::LexicalScope { value } => Some(value.range),
             Self::Binding { value } => Some(value.range),
@@ -742,6 +811,10 @@ impl CodeQueryResultValue {
             Self::CallShape { .. } => DetailedCodeQueryDomain::CallShape,
             Self::CallArgumentGroup { .. } => DetailedCodeQueryDomain::CallArgumentGroup,
             Self::CallArgument { .. } => DetailedCodeQueryDomain::CallArgument,
+            Self::CallableSignature { .. } => DetailedCodeQueryDomain::CallableSignature,
+            Self::SignatureParameter { .. } => DetailedCodeQueryDomain::SignatureParameter,
+            Self::CallableApplicability { .. } => DetailedCodeQueryDomain::CallableApplicability,
+            Self::OverloadSelection { .. } => DetailedCodeQueryDomain::OverloadSelection,
             Self::MemberSelection { .. } => DetailedCodeQueryDomain::MemberSelection,
             Self::DispatchOutcome { .. } => DetailedCodeQueryDomain::DispatchOutcome,
             Self::DispatchTarget { .. } => DetailedCodeQueryDomain::DispatchTarget,
@@ -1040,6 +1113,121 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::CallArgument { value }, "name") => {
             value.name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "declaration_id") => value
+            .declaration
+            .id
+            .as_deref()
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CallableSignature { value }, "ordinal") => {
+            Some(Scalar::Integer(value.ordinal as u64))
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "role") => {
+            Some(Scalar::ConstrainedEnum(value.role))
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "required_arity") => value
+            .required_arity
+            .map(|arity| Scalar::Integer(arity as u64)),
+        (CodeQueryResultValue::CallableSignature { value }, "total_arity") => {
+            value.total_arity.map(|arity| Scalar::Integer(arity as u64))
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "repeated") => {
+            Some(Scalar::Boolean(value.repeated))
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "generic_arity") => {
+            Some(Scalar::Integer(value.generic_arity as u64))
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "receiver_contract") => {
+            value.receiver_contract.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "return_type") => {
+            value.return_type.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "declaration_only") => {
+            Some(Scalar::Boolean(value.declaration_only))
+        }
+        (CodeQueryResultValue::CallableSignature { value }, "parameter_count") => {
+            Some(Scalar::Integer(value.parameter_count as u64))
+        }
+        (CodeQueryResultValue::CallableApplicability { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::CallableApplicability { value }, "site_ast_id") => {
+            Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::CallableApplicability { value }, "ordinal") => {
+            Some(Scalar::Integer(value.ordinal as u64))
+        }
+        (CodeQueryResultValue::CallableApplicability { value }, "verdict") => {
+            Some(Scalar::ConstrainedEnum(value.verdict))
+        }
+        (CodeQueryResultValue::CallableApplicability { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallableApplicability { value }, "tier") => {
+            value.tier.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallableApplicability { value }, "selected") => {
+            Some(Scalar::Boolean(value.selected))
+        }
+        (CodeQueryResultValue::CallableApplicability { value }, "candidate_id") => {
+            match &value.candidate {
+                CodeQueryCandidateRef::Unit { unit } => {
+                    unit.id.as_deref().map(Scalar::DeclarationIdentity)
+                }
+                _ => None,
+            }
+        }
+        (CodeQueryResultValue::OverloadSelection { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::OverloadSelection { value }, "site_ast_id") => {
+            Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::OverloadSelection { value }, "resolution") => {
+            Some(Scalar::ConstrainedEnum(value.resolution))
+        }
+        (CodeQueryResultValue::OverloadSelection { value }, "supported") => {
+            Some(Scalar::Boolean(value.supported))
+        }
+        (CodeQueryResultValue::OverloadSelection { value }, "considered_count") => {
+            Some(Scalar::Integer(value.considered_count as u64))
+        }
+        (CodeQueryResultValue::OverloadSelection { value }, "applicable_count") => {
+            Some(Scalar::Integer(value.applicable_count as u64))
+        }
+        (CodeQueryResultValue::OverloadSelection { value }, "inapplicable_count") => {
+            Some(Scalar::Integer(value.inapplicable_count as u64))
+        }
+        (CodeQueryResultValue::OverloadSelection { value }, "unknown_count") => {
+            Some(Scalar::Integer(value.unknown_count as u64))
+        }
+        (CodeQueryResultValue::SignatureParameter { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::SignatureParameter { value }, "signature_id") => {
+            Some(Scalar::StableId(&value.signature_id))
+        }
+        (CodeQueryResultValue::SignatureParameter { value }, "parameter_index") => {
+            Some(Scalar::Integer(value.parameter_index as u64))
+        }
+        (CodeQueryResultValue::SignatureParameter { value }, "label") => {
+            Some(Scalar::String(&value.label))
+        }
+        (CodeQueryResultValue::SignatureParameter { value }, "declared_type") => {
+            value.declared_type.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::SignatureParameter { value }, "optional") => {
+            value.optional.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::SignatureParameter { value }, "repeated") => {
+            value.repeated.map(Scalar::Boolean)
         }
         (CodeQueryResultValue::CallArgument { value }, "spread") => {
             Some(Scalar::Boolean(value.spread))
@@ -1622,6 +1810,22 @@ pub enum DetailedCodeQueryKey {
         id: String,
         group_id: String,
     },
+    CallableSignature {
+        id: String,
+        declaration_id: String,
+    },
+    CallableApplicability {
+        id: String,
+        site_ast_id: String,
+    },
+    OverloadSelection {
+        id: String,
+        site_ast_id: String,
+    },
+    SignatureParameter {
+        id: String,
+        signature_id: String,
+    },
     MemberSelection {
         id: String,
         site_ast_id: String,
@@ -1804,6 +2008,22 @@ impl DetailedCodeQueryResult {
                             DetailedCodeQueryKey::CallArgument { .. }
                         )
                         | (
+                            DetailedCodeQueryDomain::CallableSignature,
+                            DetailedCodeQueryKey::CallableSignature { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::SignatureParameter,
+                            DetailedCodeQueryKey::SignatureParameter { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::CallableApplicability,
+                            DetailedCodeQueryKey::CallableApplicability { .. }
+                        )
+                        | (
+                            DetailedCodeQueryDomain::OverloadSelection,
+                            DetailedCodeQueryKey::OverloadSelection { .. }
+                        )
+                        | (
                             DetailedCodeQueryDomain::MemberSelection,
                             DetailedCodeQueryKey::MemberSelection { .. }
                         )
@@ -1981,6 +2201,10 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::CallShape { .. }
         | CodeQueryResultValue::CallArgumentGroup { .. }
         | CodeQueryResultValue::CallArgument { .. }
+        | CodeQueryResultValue::CallableSignature { .. }
+        | CodeQueryResultValue::SignatureParameter { .. }
+        | CodeQueryResultValue::CallableApplicability { .. }
+        | CodeQueryResultValue::OverloadSelection { .. }
         | CodeQueryResultValue::MemberSelection { .. }
         | CodeQueryResultValue::Occurrence { .. }
         | CodeQueryResultValue::LexicalScope { .. }
@@ -2044,6 +2268,10 @@ fn assert_detailed_terminal_identities(
                 | DetailedCodeQueryDomain::CallShape
                 | DetailedCodeQueryDomain::CallArgumentGroup
                 | DetailedCodeQueryDomain::CallArgument
+                | DetailedCodeQueryDomain::CallableSignature
+                | DetailedCodeQueryDomain::SignatureParameter
+                | DetailedCodeQueryDomain::CallableApplicability
+                | DetailedCodeQueryDomain::OverloadSelection
                 | DetailedCodeQueryDomain::MemberSelection
                 // An occurrence's identity is its own content-scoped digest,
                 // carried in the typed key rather than in a semantic-artifact
@@ -2106,6 +2334,10 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::CallShape { .. }
         | DetailedCodeQueryKey::CallArgumentGroup { .. }
         | DetailedCodeQueryKey::CallArgument { .. }
+        | DetailedCodeQueryKey::CallableSignature { .. }
+        | DetailedCodeQueryKey::SignatureParameter { .. }
+        | DetailedCodeQueryKey::CallableApplicability { .. }
+        | DetailedCodeQueryKey::OverloadSelection { .. }
         | DetailedCodeQueryKey::MemberSelection { .. }
         | DetailedCodeQueryKey::Occurrence { .. }
         | DetailedCodeQueryKey::LexicalScope { .. }

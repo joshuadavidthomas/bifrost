@@ -1,6 +1,6 @@
 ---
 title: CLI
-description: Use Bifrost from the terminal for one-shot code-intelligence queries and skill installation.
+description: Use Bifrost from the terminal for one-shot code-intelligence queries.
 ---
 
 Bifrost can run a single tool once and print the JSON result:
@@ -122,7 +122,7 @@ on its `expires_at` date and expires the following day. These options are valid
 only in policy mode.
 
 Policy mode cannot be combined with `--query-file`, `--tool`, `--args`,
-`--sources`, server/REPL modes, skill installation, `--no-line-numbers`, or
+`--sources`, server/REPL modes, `--no-line-numbers`, or
 `--force-semantic-cpu`.
 
 ### Policy output and thresholds
@@ -299,44 +299,6 @@ File-bearing CLI tool arguments also accept git history paths in `<commit-ish>:<
 
 Tool mode prints JSON by default. Pass `--no-line-numbers` to remove rendered line and line-range prefixes from text previews while keeping structured line metadata unchanged.
 
-## Install Agent Skills
-
-Some agent hosts, including Zed and Antigravity-style hosts, load reusable
-Agent Skills from filesystem roots instead of from the Bifrost plugin package.
-Use `--install-skills` to install Bifrost's generic skills into one of those
-roots:
-
-```bash
-bifrost --root /path/to/project --install-skills --target project
-```
-
-With no explicit destination, `bifrost --install-skills` opens a numbered menu.
-The built-in destinations are:
-
-- `--target project`: install to `<root>/.agents/skills`
-- `--target global`: install to `~/.agents/skills`
-- `--skills-root /path/to/skills`: install to an explicit skill root
-
-The default skill set installs four generic Bifrost agent skills:
-
-- `bifrost-code-navigation`
-- `bifrost-code-reading`
-- `bifrost-codebase-search`
-- `bifrost-policy-checking`
-
-Use `--skill-set all` to also install the Brokk workflow and review skills. Use
-`--mode copy` for self-contained copies, `--mode symlink` for checkout-local
-development links, or leave the default `--mode auto`.
-
-The installer is safe to rerun. It leaves matching installs unchanged, marks
-copied Bifrost-managed skills with `.bifrost-install.json`, and refuses to
-overwrite unrelated user skills. Use `--dry-run` to preview the actions and
-`--force` only to replace a drifted Bifrost-managed copy.
-
-Skill installation does not configure MCP. Skills tell an agent when and how to
-use Bifrost, while the MCP server makes Bifrost's analyzer tools available. Use
-[MCP Server](../mcp/) or the host-specific setup pages for MCP configuration.
-
 ## Help
 
 List modes and toolsets:
@@ -356,3 +318,11 @@ cargo build --bin most_relevant_files
 
 Pass `--exclude-tests` to omit files classified as tests or test support from
 the ranking without allowing them to consume the result limit.
+
+## Register Coding Hosts
+
+Run `bifrost --install` to register a user-level MCP server named `brokk` with
+installed Codex, Claude Code, OpenCode, Kimi Code, Hermes, and Oh My Pi clients.
+The action registers the current executable with `--mcp core|nlp`. It
+does not install skills, instruction files, host applications, or the original
+Pi extension. See [Install Bifrost](/install/#connect-coding-hosts) for details.

@@ -8,6 +8,7 @@
 use crate::analyzer::usages::inverted_edges::{
     UsageEdgeBuildOutput, build_edge_output, parse_and_collect,
 };
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::{CodeUnitIndex, IAnalyzer, ProjectFile, RustAnalyzer};
 use crate::hash::HashSet;
 use brokk_bifrost_rust::graph::inverted::{RustSeedsCache, scan_file};
@@ -31,16 +32,22 @@ where
     let seeds_cache = &seeds_cache;
     build_edge_output(&files, keep_file, |file| {
         let refs = rust.reference_context_of_with_progress(file, &|| keep_file(file))?;
-        parse_and_collect(analyzer, file, nodes, &language, |input| {
-            scan_file(
-                rust,
-                &support,
-                seeds_cache,
-                file,
-                refs.clone(),
-                input,
-                &|| keep_file(file),
-            )
-        })
+        parse_and_collect(
+            analyzer,
+            file,
+            nodes,
+            ParseSpec::whole(&language),
+            |input| {
+                scan_file(
+                    rust,
+                    &support,
+                    seeds_cache,
+                    file,
+                    refs.clone(),
+                    input,
+                    &|| keep_file(file),
+                )
+            },
+        )
     })
 }

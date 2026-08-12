@@ -8,6 +8,7 @@
 //! `callee`/`receiver`/`args`/... edges to facts. Everything else (walking,
 //! matching, planning, tooling) is language-independent.
 
+use super::callable::{CallSiteContext, CallSiteFacts};
 use super::edges::ReferenceEdgeSupport;
 use super::facts::{RoleTarget, Span};
 use super::kinds::{NormalizedKind, Role};
@@ -43,14 +44,29 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// grammar bumps that rename nodes fail loudly.
     fn kind_table(&self) -> &'static [(&'static str, NormalizedKind)];
 
+    /// Byte ranges of `source` the parser may read, or `None` to parse the
+    /// whole file.
+    ///
+    /// Only C# overrides this. Its grammar cannot represent a preprocessor
+    /// directive inside a declaration, so C# hides directive lines and inactive
+    /// conditional branches from the parser (issue #1803). Ranges select bytes
+    /// of the original source, so every fact keeps its raw-file offset.
+    fn parser_included_ranges(&self, _source: &str) -> Option<Vec<tree_sitter::Range>> {
+        None
+    }
+
     /// Context-sensitive refinement applied after table lookup. `enclosing`
-    /// is the kind of the nearest enclosing normalized node.
+    /// is the kind of the nearest enclosing normalized node, and `context` is
+    /// the per-file [`CallSiteContext`] from [`Self::call_site_context`], for
+    /// refinements that depend on file-wide facts (Ruby's value-position bare
+    /// calls).
     fn refine_kind(
         &self,
         _node: Node<'_>,
         kind: NormalizedKind,
         _enclosing: Option<NormalizedKind>,
         _source: &str,
+        _context: &CallSiteContext,
     ) -> NormalizedKind {
         kind
     }
@@ -67,6 +83,35 @@ pub trait StructuralSpec: Send + Sync + 'static {
     /// The label describes source syntax only. It must not describe generated
     /// behavior. Adapters must derive it from the tree-sitter node and fields.
     fn generator_construct(&self, _node: Node<'_>, _kind: NormalizedKind) -> Option<&'static str> {
+        None
+    }
+
+    /// Per-file knowledge this adapter needs before it can classify any call
+    /// site, gathered once from the file's own parse tree.
+    ///
+    /// The default is empty, which is the honest answer for a language whose
+    /// call sites are decided by their own grammar node alone. C and C++
+    /// override it to collect the function-like macro names of the
+    /// translation unit, because whether `FOO(a, b)` has a readable argument
+    /// list is a fact about the file's `#define`s, not about the call.
+    fn call_site_context(&self, _root: Node<'_>, _source: &str) -> CallSiteContext {
+        CallSiteContext::default()
+    }
+
+    /// What this adapter's grammar says about the call site at `node`, whose
+    /// normalized kind is [`NormalizedKind::Call`].
+    ///
+    /// `None` means "this language does not refine this site", which keeps the
+    /// shared baseline: the call kind follows receiver presence, coverage is
+    /// exact, and the site owns its own argument lists. Adapters must read
+    /// grammar node types and AST fields only — a call kind that source text
+    /// would have to be re-parsed to discover is left unrefined instead.
+    fn call_site_facts(
+        &self,
+        _node: Node<'_>,
+        _source: &str,
+        _context: &CallSiteContext,
+    ) -> Option<CallSiteFacts> {
         None
     }
 

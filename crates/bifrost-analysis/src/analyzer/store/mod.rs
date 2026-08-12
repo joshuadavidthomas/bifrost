@@ -11280,7 +11280,7 @@ mod tests {
     fn scala_empty_lambda_parser_epoch_invalidates_prior_parsed_blobs() {
         // This is the Scala epoch immediately before issue #1068's parser-table
         // change. The change does not add an ABI, node-kind, or field name, so
-        // the manual vendored-parser salt must invalidate old parsed blobs.
+        // the manual parser-release salt must invalidate old parsed blobs.
         const PRE_EMPTY_LAMBDA_EPOCH: &str =
             "68da221d12ed704b76c78dfe72b57f6eca7064aaa95ca39af8bcdcca1c2d1a29";
 
@@ -15969,6 +15969,7 @@ mod tests {
                 "export interface Shape { area(): number }\n",
                 "export type Alias = Shape;\n",
                 "export const answer = 42;\n",
+                "export const { high, low: renamed } = bounds;\n",
                 "export class Widget {}\n",
                 "const table = { greet: 'hi' };\n",
                 "export default table;\n",
@@ -15993,6 +15994,8 @@ mod tests {
                 (ExportForm::Named, "Shape".to_string()),
                 (ExportForm::Named, "Alias".to_string()),
                 (ExportForm::Named, "answer".to_string()),
+                (ExportForm::Named, "high".to_string()),
+                (ExportForm::Named, "renamed".to_string()),
                 (ExportForm::Named, "Widget".to_string()),
                 (ExportForm::DefaultNamed, "default".to_string()),
             ],
@@ -16014,6 +16017,8 @@ mod tests {
             "exports.js",
             concat!(
                 "export const answer = 42;\n",
+                "export const { alpha, beta: renamed = 1, ...rest } = source;\n",
+                "export const [first, second] = pair;\n",
                 "export function makeWidget() {}\n",
                 "const messages = { greet: 'hi' };\n",
                 "export default messages;\n",
@@ -16037,6 +16042,11 @@ mod tests {
             exports,
             vec![
                 (ExportForm::Named, "answer".to_string(), false),
+                (ExportForm::Named, "alpha".to_string(), false),
+                (ExportForm::Named, "renamed".to_string(), false),
+                (ExportForm::Named, "rest".to_string(), false),
+                (ExportForm::Named, "first".to_string(), false),
+                (ExportForm::Named, "second".to_string(), false),
                 (ExportForm::Named, "makeWidget".to_string(), false),
                 (ExportForm::DefaultNamed, "default".to_string(), false),
             ],

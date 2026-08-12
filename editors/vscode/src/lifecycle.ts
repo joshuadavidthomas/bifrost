@@ -61,20 +61,17 @@ export interface BifrostMcpHostCommands {
   claudeCode: string;
 }
 
-const BIFROST_CACHE_GITIGNORE_ENTRY = ".bifrost/cache";
-const BIFROST_CACHE_GITIGNORE_LINE = `${BIFROST_CACHE_GITIGNORE_ENTRY}/`;
+const BIFROST_CACHE_GITIGNORE_LINE = ".bifrost/cache/";
 
-export type BifrostGitignoreState = "configured" | "missing" | "legacy-whole-directory";
 export type BifrostGitignorePromptDecision = "accept" | "decline" | "defer";
 
 export const BIFROST_GITIGNORE_ASK_AGAIN_LATER = "Ask Again Later";
 export const BIFROST_GITIGNORE_DONT_ASK_AGAIN = "Don't Ask Again";
 
 export function decideBifrostGitignorePrompt(
-  choice: string | undefined,
-  acceptedChoice: "Add" | "Replace"
+  choice: string | undefined
 ): BifrostGitignorePromptDecision {
-  if (choice === acceptedChoice) {
+  if (choice === "Replace") {
     return "accept";
   }
   if (choice === BIFROST_GITIGNORE_DONT_ASK_AGAIN) {
@@ -235,51 +232,19 @@ export function supportedWorkspaceRoot(): string | null {
   return folders[0].uri.fsPath;
 }
 
-export async function workspaceGitignoreNeedsBifrostEntry(workspaceRoot: string): Promise<boolean> {
-  return (await inspectWorkspaceBifrostGitignore(workspaceRoot)) !== "configured";
-}
-
-export async function inspectWorkspaceBifrostGitignore(
+export async function workspaceGitignoreIncludesLegacyBifrostEntry(
   workspaceRoot: string
-): Promise<BifrostGitignoreState> {
+): Promise<boolean> {
   const gitignorePath = path.join(workspaceRoot, ".gitignore");
   try {
     const content = await fs.readFile(gitignorePath, "utf8");
-    if (gitignoreIncludesLegacyBifrostEntry(content)) {
-      return "legacy-whole-directory";
-    }
-    return gitignoreIncludesBifrostEntry(content) ? "configured" : "missing";
+    return gitignoreIncludesLegacyBifrostEntry(content);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return "missing";
+      return false;
     }
     throw error;
   }
-}
-
-export async function appendBifrostGitignoreEntry(workspaceRoot: string): Promise<void> {
-  const gitignorePath = path.join(workspaceRoot, ".gitignore");
-  let content = "";
-  try {
-    content = await fs.readFile(gitignorePath, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-  }
-
-  if (gitignoreIncludesBifrostEntry(content)) {
-    return;
-  }
-
-  const prefix = content && !content.endsWith("\n") ? "\n" : "";
-  await fs.writeFile(gitignorePath, `${content}${prefix}${BIFROST_CACHE_GITIGNORE_LINE}\n`);
-}
-
-export function gitignoreIncludesBifrostEntry(content: string): boolean {
-  return content
-    .split(/\r?\n/)
-    .some((line) => normalizedGitignoreEntry(line) === BIFROST_CACHE_GITIGNORE_ENTRY);
 }
 
 export function gitignoreIncludesLegacyBifrostEntry(content: string): boolean {

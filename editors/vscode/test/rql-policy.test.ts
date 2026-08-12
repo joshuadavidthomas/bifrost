@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { resolve } from "node:path";
 import {
   RUN_RQL_POLICY_METHOD,
   PolicyRunTracker,
@@ -10,6 +12,7 @@ import {
   policyReportCompletedWithoutFindings,
   policyRunDiagnosticCodeLabel,
   policySuppressionAuditSummary,
+  isRqlPolicyResponse,
   runRqlPolicy,
   utcEvaluationDate,
   type PolicyFinding,
@@ -22,11 +25,22 @@ function response(completion: unknown = { type: "complete" }): unknown {
     policyRootUri: "file:///workspace/service-a",
     reportRootUri: "file:///workspace",
     report: {
-      schema_version: 2,
+      schema_version: 3,
       evaluation: {
         evaluation_date: "2026-07-27",
         suppression_path: ".bifrost/suppressions.json",
-        suppression_document_state: "not_found"
+        suppression_document_state: "not_found",
+        scope_path: ".bifrost/scopes.json",
+        scope_document_state: "not_found"
+      },
+      execution: {
+        total_elapsed_ms: 1,
+        stage_timings: [],
+        termination: null,
+        terminal_stage: null,
+        active_policy_id: null,
+        completed_policy_ids: ["test.policy"],
+        pending_policy_ids: []
       },
       rules: [
         {
@@ -48,6 +62,7 @@ function response(completion: unknown = { type: "complete" }): unknown {
         }
       ],
       suppressions: [],
+      scope: [],
       diagnostics: [],
       diagnostics_truncated: false,
       omitted_diagnostics_lower_bound: 0,
@@ -65,6 +80,23 @@ function runner(overrides: Partial<RqlPolicyRunner> = {}): RqlPolicyRunner {
     ...overrides
   };
 }
+
+void test("accepts the canonical Rust schema-3 one-finding contract artifact", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      resolve(__dirname, "../../../../tests/fixtures/policy-report/v3-one-finding.json"),
+      "utf8"
+    )
+  ) as unknown;
+
+  assert.equal(isRqlPolicyResponse(fixture), true);
+  if (!isRqlPolicyResponse(fixture)) {
+    return;
+  }
+  assert.equal(fixture.report.schema_version, 3);
+  assert.equal(fixture.report.runs[0].findings.length, 1);
+  assert.equal(fixture.report.runs[0].findings[0].primary.path, "app.ts");
+});
 
 void test("runs unsaved policy text and lets the server derive workspace identity", async () => {
   const requests: Array<[string, unknown]> = [];
@@ -271,7 +303,7 @@ void test("extracts terminal symbols while keeping evidence structured", () => {
   );
 });
 
-void test("rejects wrong documents and outdated report shapes", async () => {
+void test("rejects wrong documents and reports observed and supported schemas", async () => {
   const warnings: string[] = [];
   const errors: string[] = [];
   let requests = 0;
@@ -283,7 +315,11 @@ void test("rejects wrong documents and outdated report shapes", async () => {
   const testRunner = runner({
     sendRequest: () => {
       requests += 1;
-      return Promise.resolve({ report: { schema_version: 1 } });
+      return Promise.resolve({
+        policyRootUri: "file:///workspace",
+        reportRootUri: "file:///workspace",
+        report: { schema_version: 99 }
+      });
     },
     showWarning: (message) => warnings.push(message),
     showError: (message) => errors.push(message)
@@ -293,7 +329,8 @@ void test("rejects wrong documents and outdated report shapes", async () => {
   assert.equal(await runRqlPolicy(base, testRunner), undefined);
   assert.equal(requests, 1);
   assert.equal(warnings.length, 1);
-  assert.match(errors[0], /updated language server/);
+  assert.match(errors[0], /schema 99/);
+  assert.match(errors[0], /schema 3/);
 });
 
 void test("publishes only the newest run and preserves changes during execution", () => {

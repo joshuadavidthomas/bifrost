@@ -1,16 +1,13 @@
 # Bifrost Agent Plugin
 
-This directory is the shared source for Bifrost integrations in Pi, Codex,
-Claude Code, Cursor, and Amp. Every host reuses the same launcher and pinned
-release metadata, but each distribution includes only the resources its host
-supports. The npm package `@brokk/bifrost-agent` contains the Pi extension and
-four generic Bifrost agent skills. The Claude, Codex, and Cursor plugin
-manifests expose their host-specific MCP configuration, broader workflow skills,
-and specialist agents, while Amp uses its generated skill bundle.
+This directory implements the Agent Plugins v1 package for Bifrost. Codex can
+use the root package files. Pi, Claude Code, and Cursor also use this directory
+with their host adapters. Every host reuses the same launcher and pinned release
+metadata. The npm package `@brokk/bifrost-agent` contains the Pi extension.
 
 None of these distributions bundles the Bifrost binary. The launcher resolves a
 released Bifrost binary and makes a multi-language code-analysis subset of the
-`bifrost` MCP tools discoverable through each host's plugin or skill system.
+`bifrost` MCP tools discoverable through each host's plugin system.
 
 The Claude Code and Codex stable install name is `brokk`. Cursor uses the
 Cursor-facing plugin name `bifrost` so the package is discoverable as Bifrost in
@@ -20,8 +17,26 @@ namespace-qualified install names.
 
 Claude Code starts
 `${CLAUDE_PLUGIN_ROOT}/bin/bifrost-launcher.mjs --mcp "symbol|extended"` from
-the host-specific `claude-mcp.json`. Codex starts the same launcher through its
-package-relative `.mcp.json`.
+the host-specific `claude-mcp.json`. Codex starts the same launcher through
+the portable root `mcp.json`.
+
+## Portable Agent Plugins v1 Package
+
+The package root contains the portable Agent Plugins v1 files:
+
+- `plugin.json` gives the shared package identity.
+- `mcp.json` gives the portable Bifrost stdio server.
+- `skills/` contains portable skill directories.
+
+Codex uses these root files without an adapter. Claude Code uses
+`.claude-plugin/plugin.json` and
+`claude-mcp.json`. Cursor uses `.cursor-plugin/plugin.json` and
+`cursor-mcp.json` because Cursor needs `${CURSOR_PLUGIN_ROOT}` and timeout
+settings. Pi uses its TypeScript extension.
+
+We tested package discovery with Codex CLI. We did not explicitly test the
+Agent Plugins v1 package with VS Code, GitHub Copilot, Kiro, or Cursor.
+
 The launcher uses `BIFROST_WORKSPACE_ROOT` when set, then a host-provided
 `--root` or `--workspace-root`. Without either explicit override, Bifrost
 starts unbound and requests the host's approved workspace through standard MCP
@@ -30,16 +45,14 @@ roots. On a rootless connection without advertised roots, it offers the
 supply the active task. Bifrost never treats the installed plugin directory as
 the analyzer workspace.
 Claude Code uses `${CLAUDE_PLUGIN_ROOT}` because its MCP commands otherwise
-resolve relative to the project directory, not the installed plugin. Codex
-retains the package-relative `.mcp.json`. Cursor's plugin manifest explicitly
-selects root `mcp.json`, which uses Cursor's documented `type: "stdio"` and
-`${CURSOR_PLUGIN_ROOT}` placeholder. Both host-specific entries start Bifrost
-rootless. Builds containing the post-0.8.9 Cursor compatibility fix
+resolve relative to the project directory, not the installed plugin. Cursor's
+plugin manifest explicitly selects `cursor-mcp.json`, which uses Cursor's documented `type: "stdio"` and
+`${CURSOR_PLUGIN_ROOT}` placeholder. The root `mcp.json` remains portable.
+Both host-specific entries start Bifrost rootless. Builds containing the post-0.8.9 Cursor compatibility fix
 accept both standard `file:` root URIs and Cursor's native absolute-path form
 while keeping MCP roots authoritative; the published 0.8.9 binary requires an
 explicit fixed-project root. Amp uses a different direct server-map shape for
-`mcp.json` and `--mcp-config`, so the generated Amp bundle lives under
-`plugins/bifrost-agent/amp-skills`.
+`mcp.json` and `--mcp-config`.
 
 Binary resolution order is:
 
@@ -88,10 +101,8 @@ pinned, checksum-verified Bifrost binary as the other hosts, starts one stdio
 MCP child for the session's workspace, and closes the child on session shutdown
 or reload. Pi-visible tools use a `bifrost_` namespace, so Bifrost's canonical
 MCP `query_code` tool appears as `bifrost_query_code`. The extension adds a
-short system-prompt note that explains this host-specific rendering. The four
-canonical `bifrost-code-navigation`, `bifrost-code-reading`,
-`bifrost-codebase-search`, and `bifrost-policy-checking` skills remain shared
-without Pi-specific copies.
+short system-prompt note that explains this host-specific rendering. The
+extension adds no host-specific instruction files.
 
 Install a local checkout after installing its package dependencies:
 
@@ -123,7 +134,7 @@ pi install "$(pwd)"
 After `@brokk/bifrost-agent` is published to npm, install a pinned release with:
 
 ```bash
-pi install npm:@brokk/bifrost-agent@0.8.24
+pi install npm:@brokk/bifrost-agent@0.9.2
 ```
 
 Run `/bifrost` in Pi's interactive TUI to configure Bifrost for the current
@@ -200,7 +211,8 @@ repository does not imply that npm publishing is configured automatically.
 
 ## Codex Install
 
-Add the Brokk marketplace from GitHub, then install Bifrost:
+Add the Brokk marketplace from GitHub, then install the Agent Plugins v1
+package:
 
 ```bash
 codex plugin marketplace add BrokkAi/bifrost --sparse .agents/plugins --sparse plugins
@@ -221,7 +233,7 @@ selected explicitly:
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" codex
 ```
 
-Start a fresh Codex session after installing the plugin. The plugin-provided
+Start a fresh Codex session after installing the package. The package-provided
 MCP server is registered automatically; do not add a second manual Bifrost MCP
 entry. It starts a separate stdio Bifrost process with:
 
@@ -253,67 +265,12 @@ Once the session starts, verify the tools by calling a lightweight analyzer
 operation such as `get_summaries` or `search_symbols` against files in the
 active workspace.
 
-## Bundled Skills
+## Host Instructions
 
-The Bifrost plugin owns the skills that explain the analyzer-backed MCP tools
-it installs, plus the broader Brokk/Bifrost workflow skills that build on those
-tools:
-
-- `bifrost-code-navigation`: definitions, references, call sites, and related
-  files with `search_symbols`, `get_symbol_locations`, `scan_usages_by_location`, and
-  `most_relevant_files`.
-- `bifrost-code-reading`: source summaries and exact symbol bodies with
-  `get_summaries` and `get_symbol_sources`.
-- `bifrost-codebase-search`: symbol, usage, file, and related-file discovery
-  with shell grep reserved for arbitrary text.
-- `bifrost-policy-checking`: built-in policy-pack and category discovery plus
-  combined built-in/repository RQL policy evaluation with `list_policies` and
-  `run_policy`.
-- `brokk-adversarial-test-sweep`: comprehensive test-suite hardening across
-  edge cases, malformed inputs, concurrency, resource pressure, corrupted
-  state, invalid assumptions, and weak or redundant coverage.
-- `brokk-git-exploration`: git-history exploration and commit inspection.
-- `brokk-guided-issue`: end-to-end GitHub issue resolution.
-- `brokk-guided-review`: interactive review of local changes, branches, or
-  remote PRs with specialist reviewer agents.
-- `brokk-review-pr`: adversarial multi-agent PR review.
-- `review`: concise code-review guidance for ordinary review requests.
-- `brokk-today`: GitHub issue and PR work-queue triage with a Slack-ready
-  summary.
-- `brokk-write-issue`: issue drafting with source-code context.
-
-The plugin also includes the specialist reviewer and issue-planning agents used
-by those workflows. The default plugin MCP toolset still does not expose
-Bifrost's `workspace` lifecycle tools, so the Brokk `workspace` skill is not
-copied here. Workflow skills should rely on the host-provided workspace context
-and the plugin's analyzer tools, or gracefully skip explicit workspace
-activation when `activate_workspace` is unavailable.
-
-Codex does not register plugin-provided `agents/*.md` files as named
-`brokk:*` subagent types. The Codex manifest therefore loads generated skills
-from `codex-skills/`; those files embed the specialist prompts and instruct
-Codex to use generic subagents with the matching prompt. Do not edit
-`codex-skills/` directly. Update `skills/` or `agents/`, then regenerate:
-
-```bash
-node scripts/generate-codex-skill-bundle.mjs
-```
-
-Hosts such as OpenCode, Zed, and Antigravity can also load generic Agent Skills
-directly from filesystem roots such as `~/.agents/skills` and
-`<worktree>/.agents/skills`. For those hosts, install Bifrost's generic skills
-with the Bifrost CLI instead of copying directories by hand:
-
-```bash
-bifrost --root /absolute/path/to/workspace --install-skills --target project
-```
-
-The default command installs the four generic Bifrost agent skills. Use
-`--target global` for `~/.agents/skills`, `--skills-root /path/to/skills` for an
-explicit skills root, `--mode copy` for self-contained copies, or
-`--skill-set all` to opt into the Brokk workflow/review skills as well. This
-step installs only instructions for the agent. It does not register the Bifrost
-MCP server; keep using the host-specific MCP setup below for analyzer tools.
+This package provides MCP configuration, the launcher, and specialist agents.
+It does not install instruction files into host-specific directories. Configure
+the host MCP entry, then start a new session and call a tool such as
+`get_summaries` or `search_symbols`.
 
 ## Claude Code Install
 
@@ -406,9 +363,9 @@ Cursor Agents 3.12.30 may return the base repository as its MCP root while an
 agent runs in a separate worktree. In that mode, verify a branch-only symbol or
 file instead of accepting a relative path that exists in both checkouts.
 
-The `cursor agent --plugin-dir` CLI path is useful for checking that Cursor can
-load plugin skills, but it has not proven reliable for plugin-provided MCP
-servers. Treat the desktop Customize/MCP path as the Cursor plugin MCP smoke.
+The `cursor agent --plugin-dir` CLI path is useful for checking plugin loading,
+but it has not proven reliable for plugin-provided MCP servers. Treat the
+desktop Customize/MCP path as the Cursor plugin MCP smoke.
 
 To publish publicly, submit the repository URL at
 <https://cursor.com/marketplace/publish>. The repository root contains
@@ -467,103 +424,35 @@ the file. Refresh normally reloads the MCP connection without restarting the
 whole application; use a fresh conversation to validate its tool surface. If
 the app still displays an old root after Refresh, fully quit and reopen it.
 
-Antigravity documents skills under workspace and global skill directories; see
-the official [Skills](https://antigravity.google/docs/skills) documentation for
-the host-side convention. In Antigravity 2.2.1 validation, workspace-local
-skills loaded reliably and appeared in project-specific settings. If global
-skills do not appear in your app session, install the Bifrost skills into each
-target workspace:
-
-```bash
-bifrost --root /absolute/path/to/workspace --install-skills --target project --mode copy
-```
-
-Open the project-specific settings page in Antigravity. The project
-**Customizations** section should list the installed Bifrost skills. Validate
-with a prompt that requires a Bifrost MCP tool on source code:
+Open the project-specific settings page in Antigravity. Validate with a prompt
+that requires a Bifrost MCP tool on source code:
 
 ```text
-Use the bifrost-code-reading skill. Use the Bifrost MCP get_summaries tool on src/analyzer/usages for source context, and name the files summarized from the MCP result.
+Use the Bifrost MCP get_summaries tool on src/analyzer/usages for source context, and name the files summarized from the MCP result.
 ```
 
 ## Amp Install and Local Testing
 
-Amp uses a generated skill collection at
-`plugins/bifrost-agent/amp-skills`. Do not edit files under that directory
-directly; update the canonical Bifrost agent skills in
-`plugins/bifrost-agent/skills`, then regenerate the Amp bundle:
+Configure Amp's direct MCP server map with the Bifrost launcher. For local
+testing, use the checked-out binary and an explicit workspace root.
 
-```bash
-node scripts/generate-amp-skill-bundle.mjs
+```json
+{
+  "bifrost": {
+    "command": "/absolute/path/to/bifrost",
+    "cwd": "/absolute/path/to/workspace",
+    "args": ["--root", ".", "--mcp", "symbol|extended"]
+  }
+}
 ```
 
-The generated Amp skill is intentionally narrower than the Claude/Codex/Cursor
-plugin package. It includes one `bifrost-code-intelligence` skill, a skill-local
-`mcp.json`, the Bifrost launcher, and the release metadata needed by that
-launcher. It does not include the Brokk workflow/review skills or specialist
-agents.
-
-From the repository root, build Bifrost:
-
-```bash
-cargo build --bin bifrost
-```
-
-Install the generated Amp skill collection into the current workspace. Use an
-absolute source path; Amp treats relative local skill sources like Git sources
-in some CLI paths:
-
-```bash
-mkdir -p .agents/skills
-amp skill add "$(pwd)/plugins/bifrost-agent/amp-skills" --target "$(pwd)/.agents/skills" --overwrite
-```
-
-For a user-global install, use Amp's global skill target instead:
-
-```bash
-amp skill add "$(pwd)/plugins/bifrost-agent/amp-skills" --global --overwrite
-```
-
-After the Amp bundle has landed on the repository's default branch, install it
-from GitHub with Amp's `owner/repo/path` source syntax:
-
-```bash
-amp skill add BrokkAi/bifrost/plugins/bifrost-agent/amp-skills --global --overwrite
-```
-
-Do not use a browser `https://github.com/.../tree/...` URL for Amp skill
-sources. The tested Amp CLI did not accept branch-qualified GitHub skill
-sources, so PR-branch validation should use a local checkout path and the
-GitHub shorthand should be re-tested after merge.
-
-The generated `mcp.json` uses Amp's direct server-map shape and a small shell
-shim that locates `bifrost-code-intelligence/bin/bifrost-launcher.mjs` from the
-workspace `.agents/skills` directory, the standard global Amp/agents skill
-directories, or `BIFROST_AGENT_SKILL_DIR`. Start Amp from the workspace root, or
-set `BIFROST_WORKSPACE_ROOT=/path/to/workspace`. For local checkout testing, set
-`BIFROST_BINARY_PATH` so the launcher uses this build instead of downloading the
-pinned release.
-
-Amp does not expose the same configurable MCP startup budget as the shared
-Claude/Codex and Cursor manifests. After updating the Amp bundle, run the
-installed launcher's `doctor` command and, when needed, `prepare` before opening
-a fresh Amp task. The commands are available through the bundled
-`bifrost-code-intelligence/bin/bifrost-launcher.mjs` file.
-
-Validate with a prompt that requires an analyzer MCP tool on source code, not a
-README or docs file:
+Start a fresh Amp task after changing the MCP configuration. Validate with a
+prompt that requires an analyzer MCP tool on source code:
 
 ```bash
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" amp -x \
-  'Load the bifrost-code-intelligence skill. Use the Bifrost MCP get_summaries tool on src/analyzer/usages/rust_graph/*.rs and name three symbols from the MCP result.'
+  'Use the Bifrost MCP get_summaries tool on src/analyzer/usages/rust_graph/*.rs and name three symbols from the MCP result.'
 ```
-
-Amp skill collection installs preserve skill-local support files only when the
-collection parent is installed. Installing an individual skill directory copies
-only `SKILL.md`. As of the tested Amp CLI, package-relative MCP commands such
-as `./bin/bifrost-launcher.mjs` are resolved from the Amp process working
-directory, not from the skill directory, so the generated `mcp.json` uses the
-launcher search shim instead of a package-relative command.
 
 ## Difference From `codex mcp add`
 
@@ -571,8 +460,8 @@ launcher search shim instead of a package-relative command.
 `amp mcp add` registers one MCP server directly in a user's host configuration.
 This plugin packages a safer default server shape behind host plugin flows
 where available, so users can install or remove Bifrost without hand-editing
-MCP configuration. Amp uses the generated skill bundle documented above, with a
-skill-local `mcp.json` rather than a host plugin manifest.
+MCP configuration. Amp uses its direct server-map configuration because it has
+no matching host plugin manifest here.
 
 The MCP process created by this plugin is independent from the VS Code language
 server process. They may point at the same `bifrost` binary, but each host

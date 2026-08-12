@@ -102,11 +102,14 @@ package from the Plugins view and repeat the GitHub install flow. Fully quit
 and reopen Cursor afterward, then confirm that the installed plugin metadata
 reports the expected version.
 
-The plugin needs two Cursor-specific compatibility details: the MCP definition
-resolves its launcher from Cursor's installed plugin directory, and Bifrost
-accepts the absolute native path that Cursor returns from `roots/list`. A
-connected MCP status or visible tool list is not sufficient evidence that both
-boundaries worked; complete the smoke test below.
+The portable package uses root `plugin.json` and `mcp.json` files. It can also
+include optional `skills/` files.
+Cursor still needs its native `.cursor-plugin/plugin.json` and
+`cursor-mcp.json` adapter. The adapter resolves its launcher from Cursor's
+installed plugin directory. Bifrost also accepts the absolute native path that
+Cursor returns from `roots/list`. A connected MCP status or visible tool list is
+not sufficient evidence that both boundaries worked; complete the smoke test
+below.
 
 :::caution[Upgrade from Bifrost 0.8.9]
 Bifrost 0.8.10 is the minimum release with both the Cursor plugin-root launcher
@@ -210,10 +213,10 @@ reject results from the base checkout. Cursor remains unchecked in the
 cross-host verification matrix until this exact-checkout boundary passes.
 :::
 
-The `cursor agent --plugin-dir` CLI path is useful for checking that Cursor can load plugin skills, but it has not proven reliable for plugin-provided MCP servers. Treat the desktop Customize/MCP flow as the MCP validation path.
+The `cursor agent --plugin-dir` CLI path is useful for checking plugin loading, but it has not proven reliable for plugin-provided MCP servers. Treat the desktop Customize/MCP flow as the MCP validation path.
 
 ## Can My Agent Run RQL?
 
 The packaged plugin uses `symbol|extended`. In a fresh chat after enabling MCP, confirm that the Bifrost tool list includes `query_code`, then call it with the inline JSON fields `{"match":{"kind":"declaration"},"limit":1}`. To validate saved RQL, check a workspace file named `bifrost-smoke.rql` containing `(limit 1 (declaration))`, then call `query_code` with `{"query_file":"bifrost-smoke.rql"}`.
 
-The inline call is canonical JSON. MCP accepts RQL only from a workspace `.rql` file through `query_file`. Loading plugin skills without enabling its MCP server provides instructions but no Bifrost tools. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the full surface matrix and [Agent Result Safety](/agent-result-safety/) before making completeness claims.
+The inline call is canonical JSON. MCP accepts RQL only from a workspace `.rql` file through `query_file`. See [MCP query and RQL availability](/mcp/#query-and-rql-availability) for the full surface matrix and [Agent Result Safety](/agent-result-safety/) before making completeness claims.

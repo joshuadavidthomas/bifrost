@@ -9,16 +9,21 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod cpp_alias_primary_inverse_regression;
 mod cpp_member_dispatch_trace;
 mod csharp_bounded_receiver_hardening;
+mod csharp_ranks21_30_regression;
+mod go_ranks21_30_regression;
 mod go_rust_bounded_receiver_acceptance;
 mod issue_1416_scan_name_gate;
 mod issue_1450_cross_request_prepared_syntax;
 mod issue_1451_cross_request_import_infos;
 mod issue_1748_candidate_discovery_batching;
 mod issue_1748_hierarchy_deadline;
+mod issue_1749_rust_macro_wrapped_inverse;
 mod issue_1785_js_file_scope_enclosing;
 mod issue_1786_flow_usage_suppression;
+mod issue_1819_cpp_macro_usages;
 mod issue_1854_scala_enclosing_def_shadow;
 mod issue_1855_scala_site_java_declaration;
 mod issue_1924_typescript_imported_returns;
@@ -75,6 +80,7 @@ mod usages_cpp_wuffs_alias_test;
 mod usages_cpp_wuffs_qualifier_test;
 mod usages_cpp_wuffs_typedef_field_test;
 mod usages_csharp_graph_test;
+mod usages_csharp_preprocessor_split_test;
 mod usages_finder_fallback_test;
 mod usages_go_graph_test;
 mod usages_java_graph_test;

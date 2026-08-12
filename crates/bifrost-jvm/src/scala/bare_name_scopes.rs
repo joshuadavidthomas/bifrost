@@ -42,9 +42,9 @@ const TEMPLATE_KINDS: [&str; 4] = [
 const TYPE_ONLY_DECLARATION_KINDS: [&str; 3] =
     ["type_definition", "type_declaration", "trait_definition"];
 
-/// Container kinds whose members the analyzer does not publish: a declaration
-/// under one of them is a local binder (or an anonymous-class member), never
-/// the same-file CodeUnit the census matched.
+/// Containers whose declarations do not contribute a named-template or
+/// file-scope census match. Anonymous-class members can have CodeUnits under a
+/// synthetic owner, but they are not visible outside their instance body.
 const LOCAL_CONTAINER_KINDS: [&str; 13] = [
     "block",
     "indented_block",

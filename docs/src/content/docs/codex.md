@@ -3,9 +3,11 @@ title: Codex
 description: Install and validate Bifrost in Codex.
 ---
 
-Codex can use Bifrost through the Brokk agent plugin or through a manual MCP server entry. The plugin path is preferred because it includes Bifrost skills and a launcher that resolves the Bifrost binary.
+Codex can use Bifrost through the Agent Plugins v1 package or through a manual
+MCP server entry. The package path is preferred because it includes skills, MCP
+configuration, and a launcher that resolves the Bifrost binary.
 
-## Plugin Install
+## Agent Plugins v1 Install
 
 Add the Brokk marketplace from GitHub, then install Bifrost:
 
@@ -13,6 +15,13 @@ Add the Brokk marketplace from GitHub, then install Bifrost:
 codex plugin marketplace add BrokkAi/bifrost --sparse .agents/plugins --sparse plugins
 codex plugin add brokk@bifrost
 ```
+
+The package uses root `plugin.json`, `mcp.json`, and `skills/`. It replaces the
+legacy Codex-only manifest and `.mcp.json` configuration.
+
+We tested this package with Codex CLI. [VS Code, GitHub Copilot, Kiro, and
+Cursor](https://agent-plugins.org/compatible-clients) support Agent Plugins v1,
+but we did not explicitly test Bifrost there.
 
 Refresh an existing marketplace installation before testing a newly published
 Bifrost version:
@@ -38,14 +47,14 @@ For a local checkout build, start Codex with the debug binary selected explicitl
 BIFROST_BINARY_PATH="$(pwd)/target/debug/bifrost" codex
 ```
 
-After installing, upgrading, or changing the plugin, fully quit and restart the
+After installing, upgrading, or changing the package, fully quit and restart the
 ChatGPT desktop app before opening a new Codex task. A new task inside an
 already-running desktop process can retain the previous plugin files, MCP
 process, or tool schemas. For Codex CLI, exit the current process and start a
 new session. This follows Codex's
 [plugin reload guidance](https://learn.chatgpt.com/docs/build-plugins).
 
-The packaged plugin uses `symbol|extended`, so it exposes both symbol navigation
+The packaged MCP server uses `symbol|extended`, so it exposes both symbol navigation
 and `query_code`.
 
 Installing the plugin automatically registers its packaged MCP server. Do not add a second manual Bifrost MCP entry for the same plugin. The launcher keeps package command resolution separate from analyzer scope: without an explicit override, Bifrost prefers standard MCP roots. On a rootless connection whose client did not advertise roots, Bifrost offers the `codex/sandbox-state-meta` extension. Current Codex accepts that capability and supplies the active task directory on each analyzer tool call. Bifrost binds that exact directory, follows later task-directory changes, and never analyzes the plugin cache. `BIFROST_WORKSPACE_ROOT` remains an authoritative explicit override for fixed-project or older-host configurations.
@@ -96,7 +105,7 @@ Use the failure boundary to decide what to inspect next:
 
 | Observation | Boundary to inspect |
 | --- | --- |
-| `brokk@bifrost` is absent, disabled, or stale after a full restart | Marketplace installation and plugin enablement |
+| `brokk@bifrost` is absent, disabled, or stale after a full restart | Marketplace installation and package enablement |
 | Tool discovery returns no `mcp__bifrost` schemas | Plugin MCP registration, host policy, and desktop restart |
 | A direct guessed function call fails before an MCP event exists | Deferred tool discovery; run the tool search first |
 | Bifrost reports that it is not bound to a workspace | MCP roots or negotiated Codex sandbox-state metadata |

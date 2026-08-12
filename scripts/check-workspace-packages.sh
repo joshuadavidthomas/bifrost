@@ -119,8 +119,11 @@ for package in "${packages[@]}"; do
 done
 
 require_archive_file brokk-bifrost-core src/lib.rs
-# The unified cache DB's migrations moved down with cache_db.rs.
-require_archive_file brokk-bifrost-core migrations/cache/0001-current-baseline.sql
+# The unified cache DB's migrations moved down with cache_db.rs. The baseline
+# is named for the schema version it creates, which is 18: migrations 1..18
+# were folded into it.
+require_archive_file brokk-bifrost-core migrations/cache/0018-current-baseline.sql
+require_archive_file brokk-bifrost-core migrations/cache/bridges/0016-optional-fact-manifest-after-19.sql
 # The C++, C#, Go, Java, PHP, Python, Ruby, Rust and Scala tree-sitter query
 # assets moved down with their language crates; the epoch salt hashes them from
 # there, so a missing file is a silent epoch change. Kotlin's `highlights.scm`
@@ -146,7 +149,6 @@ require_archive_file brokk-bifrost-jvm resources/treesitter/java/imports.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/scala/definitions.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/scala/imports.scm
 require_archive_file brokk-bifrost-jvm resources/treesitter/kotlin/highlights.scm
-require_archive_file brokk-bifrost-jvm build.rs
 require_archive_file brokk-bifrost-php resources/treesitter/php/definitions.scm
 require_archive_file brokk-bifrost-php resources/treesitter/php/imports.scm
 require_archive_file brokk-bifrost-python resources/treesitter/python/definitions.scm
@@ -165,23 +167,6 @@ require_archive_file brokk-bifrost-policy policy-packs/bifrost.code-smells/manif
 require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
-
-# The vendored Kotlin grammar lives in brokk-bifrost-jvm with build.rs. Its
-# `parser.c` bytes are named in the Kotlin epoch salt, so an archive missing it
-# would publish a crate that cannot build the parser that salt promises.
-required_jvm_vendor_files=(
-  vendor/tree-sitter-kotlin/LICENSE
-  vendor/tree-sitter-kotlin/BIFROST_PROVENANCE.md
-  vendor/tree-sitter-kotlin/grammar.js
-  vendor/tree-sitter-kotlin/src/parser.c
-  vendor/tree-sitter-kotlin/src/scanner.c
-  vendor/tree-sitter-kotlin/src/tree_sitter/alloc.h
-  vendor/tree-sitter-kotlin/src/tree_sitter/array.h
-  vendor/tree-sitter-kotlin/src/tree_sitter/parser.h
-)
-for required_file in "${required_jvm_vendor_files[@]}"; do
-  require_archive_file brokk-bifrost-jvm "$required_file"
-done
 
 manifest_policy_files="$temporary/manifest-policy-files.txt"
 checked_in_policy_files="$temporary/checked-in-policy-files.txt"
@@ -204,16 +189,6 @@ require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.m
 require_archive_file brokk-bifrost scripts/embedding_sidecar.py
 require_archive_file brokk-bifrost scripts/voyage_sidecar.py
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v1.schema.json
-
-embedded_skill_count=0
-while IFS= read -r skill_file; do
-  require_archive_file brokk-bifrost "$skill_file"
-  embedded_skill_count=$((embedded_skill_count + 1))
-done < <(grep -oE 'plugins/bifrost-agent/skills/[^" ]+/SKILL[.]md' src/skill_install.rs | sort -u)
-if (( embedded_skill_count == 0 )); then
-  echo "Failed to derive the embedded skill roster from src/skill_install.rs" >&2
-  exit 1
-fi
 
 root_archive=$(archive_for brokk-bifrost)
 root_files="$temporary/root-files.txt"

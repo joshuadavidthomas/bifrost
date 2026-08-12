@@ -13,13 +13,6 @@ const manifest = JSON.parse(await fsp.readFile(path.join(packageDir, "package.js
 const release = JSON.parse(await fsp.readFile(path.join(packageDir, "bifrost-release.json"), "utf8"));
 const readme = await fsp.readFile(path.join(packageDir, "README.md"), "utf8");
 
-const canonicalSkills = [
-  "./skills/bifrost-code-navigation",
-  "./skills/bifrost-code-reading",
-  "./skills/bifrost-codebase-search",
-  "./skills/bifrost-policy-checking",
-];
-
 const repoRoot = path.resolve(packageDir, "..", "..");
 const licenseNotices = [
   { packaged: "LICENSE.md", source: "LICENSE.md" },
@@ -36,6 +29,12 @@ for (const notice of licenseNotices) {
   );
 }
 assert.deepEqual(manifest.pi.extensions, ["./extensions/bifrost.ts"]);
+const canonicalSkills = [
+  "./skills/bifrost-code-navigation",
+  "./skills/bifrost-code-reading",
+  "./skills/bifrost-codebase-search",
+  "./skills/bifrost-policy-checking",
+];
 assert.deepEqual(manifest.pi.skills, canonicalSkills);
 assert.equal(manifest.dependencies["@modelcontextprotocol/sdk"], "1.29.0");
 assert.equal(manifest.peerDependencies["@earendil-works/pi-coding-agent"], "*");
@@ -58,6 +57,8 @@ const requiredFiles = [
   "bin/bifrost-launcher.mjs",
   "bin/bifrost-launcher.d.mts",
   "bifrost-release.json",
+  "plugin.json",
+  "mcp.json",
   "extensions/bifrost.ts",
   "extensions/bifrost-capabilities.ts",
   "extensions/bifrost-session.ts",
@@ -82,6 +83,5 @@ const exposedSkillFiles = files
   .sort();
 assert.deepEqual(exposedSkillFiles, requiredFiles.filter((file) => file.startsWith("skills/")).sort());
 assert.equal(files.some((file) => file.path.startsWith("test/")), false);
-assert.equal(files.some((file) => file.path.startsWith("codex-skills/")), false);
 
 console.log(`Validated Pi manifest and ${files.length} packed files.`);

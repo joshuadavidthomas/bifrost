@@ -46,4 +46,4 @@ that matches the thing you are looking for.
   source and tests.
 - For log messages, string literals, comments, config keys, or any other text
   that is not an indexed declaration or reference, use `rg` through the host
-  shell. The default Bifrost plugin does not expose the raw text MCP toolset.
+  shell. The default Bifrost plugin does not expose raw text-search MCP tools.

@@ -16,6 +16,13 @@ pub(crate) use dispatch::{exact_source_for_procedure, procedures_for_definition_
 // two, so they are public where the rest of dispatch stays crate-internal.
 pub use dispatch::{ProcedureRangeLookupStatus, procedures_for_source_ranges};
 pub use source::{SourceDispatchObservation, SourceDispatchResult, SourcePointsToResult};
+// The value-flow plan re-applies these relevance rules when it decides
+// whether a snapshot's residual openness was refined by its own complete
+// call resolutions (#1952).
+pub(crate) use value_flow::{
+    abort_paths_run_user_code, call_target_refinement_call, gap_impacts_value_flow,
+    implicit_abort_gap_is_discharged, value_flow_capabilities_are_open,
+};
 
 use std::fmt;
 

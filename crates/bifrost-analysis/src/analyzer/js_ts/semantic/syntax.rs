@@ -539,22 +539,21 @@ pub(super) fn is_callable_kind(kind: &str) -> bool {
 }
 
 pub(super) fn is_js_ts_nested_execution_boundary(node: Node<'_>, traversal_root: Node<'_>) -> bool {
+    // The traversal root is the current procedure's own body (a method body,
+    // a field initializer value, a static-block body), never a nested one.
+    if node.id() == traversal_root.id() {
+        return false;
+    }
     if is_callable_kind(node.kind()) && node.kind() != "method_definition" {
         return true;
     }
     if node.kind() == "class_static_block" {
         return true;
     }
-    node.parent().is_some_and(|parent| {
-        let belongs_to_procedure = match parent.kind() {
-            "field_definition" | "public_field_definition" => field_matches(parent, "value", node),
-            "method_definition" => !field_matches(parent, "name", node),
-            _ => false,
-        };
-        belongs_to_procedure
-            && !(parent.kind() == "method_definition"
-                && node.id() == traversal_root.id()
-                && field_matches(parent, "body", node))
+    node.parent().is_some_and(|parent| match parent.kind() {
+        "field_definition" | "public_field_definition" => field_matches(parent, "value", node),
+        "method_definition" => !field_matches(parent, "name", node),
+        _ => false,
     })
 }
 

@@ -6,6 +6,7 @@ use brokk_bifrost_core::analyzer::model::{
     SignatureMetadata, StructuredTypeIdentity, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
@@ -13,7 +14,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::imports::csharp_import_info_from_using_directive;
 use crate::syntax::{
-    csharp_attribute_type_names, csharp_constant_pattern_type_candidate,
+    csharp_attribute_type_names, csharp_constant_pattern_type_candidate, csharp_has_modifier,
     csharp_member_access_type_receiver, csharp_type_node_identity, csharp_type_reference_root,
 };
 
@@ -345,7 +346,12 @@ impl<'a> CSharpVisitor<'a> {
         let signature = csharp_method_skeleton(node, self.source);
         self.parsed.add_signature_with_metadata(
             code_unit,
-            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope),
+            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope)
+                .with_callable_modifiers(
+                    csharp_has_modifier(self.source, node, "static"),
+                    false,
+                    csharp_declared_visibility(node, self.source, DeclaredVisibility::Private),
+                ),
         );
     }
 
@@ -456,7 +462,12 @@ impl<'a> CSharpVisitor<'a> {
         let signature = csharp_constructor_skeleton(node, self.source);
         self.parsed.add_signature_with_metadata(
             code_unit,
-            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope),
+            csharp_signature_metadata(signature, node, self.source, &scope.lexical_scope)
+                .with_callable_modifiers(
+                    csharp_has_modifier(self.source, node, "static"),
+                    true,
+                    csharp_declared_visibility(node, self.source, DeclaredVisibility::Private),
+                ),
         );
     }
 
@@ -740,6 +751,28 @@ fn csharp_dispatch_signature_metadata(
             node,
             crate::syntax::csharp_has_modifier(source, node, "static"),
         ))
+}
+
+/// The accessibility a C# declaration writes, or `default` when it writes
+/// none. C# defaults differ by position -- a class member is private, a
+/// top-level type is internal -- so the caller states the default for its own
+/// position rather than this helper guessing one.
+fn csharp_declared_visibility(
+    node: Node<'_>,
+    source: &str,
+    default: DeclaredVisibility,
+) -> DeclaredVisibility {
+    for (modifier, visibility) in [
+        ("public", DeclaredVisibility::Public),
+        ("protected", DeclaredVisibility::Protected),
+        ("internal", DeclaredVisibility::Internal),
+        ("private", DeclaredVisibility::Private),
+    ] {
+        if csharp_has_modifier(source, node, modifier) {
+            return visibility;
+        }
+    }
+    default
 }
 
 fn csharp_signature_metadata(

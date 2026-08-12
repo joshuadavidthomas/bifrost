@@ -6,6 +6,7 @@
 //! traits), the inverted pass's fan-out and its two `FileState` decoders, the
 //! Java-to-Scala cross-language scan, and the dead-code bulk routing predicate.
 
+use crate::analyzer::usages::parsed_tree::ParseSpec;
 mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
@@ -331,9 +332,13 @@ where
             let class_ranges = state
                 .map(class_range_index_from_state)
                 .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
-            parse_and_collect_with_declarations(file, nodes, &language, declarations, |input| {
-                scan_inverted_file(java, &graph, file, input, class_ranges, &caches)
-            })
+            parse_and_collect_with_declarations(
+                file,
+                nodes,
+                ParseSpec::whole(&language),
+                declarations,
+                |input| scan_inverted_file(java, &graph, file, input, class_ranges, &caches),
+            )
         })
     })
 }

@@ -5,6 +5,9 @@ use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_positional_argument_roles, attach_role_with_derived_name, attach_terminal_callee,
     first_named_child,
 };
+use brokk_bifrost_core::analyzer::structural::callable::{
+    CallKind, CallShapeCoverage, CallSiteContext, CallSiteFacts,
+};
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
@@ -17,12 +20,13 @@ use brokk_bifrost_core::analyzer::structural::occurrences::{
     NO_OCCURRENCE_ROLE_SUPPORT, OccurrenceRoleSupport,
 };
 use brokk_bifrost_core::analyzer::structural::resolution::{
-    LexicalEnvironmentSupport, NO_LEXICAL_ENVIRONMENT_SUPPORT,
+    CALLABLE_APPLICABILITY_ONLY_SUPPORT, LexicalEnvironmentSupport,
 };
 use brokk_bifrost_core::analyzer::structural::routes::{
     IdentityAxis, IdentityRouteSupport, RouteHopKind,
 };
 use brokk_bifrost_core::analyzer::structural::spec::{RoleSink, StructuralSpec};
+use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
 #[derive(Debug, Default)]
@@ -220,6 +224,36 @@ fn unquoted_include_span(node: Node<'_>) -> Option<Span> {
     })
 }
 
+/// The names of every function-like macro this translation unit defines, read
+/// from `preproc_function_def` name fields.
+///
+/// The walk is iterative and descends only through preprocessor conditional
+/// blocks, which is where a definition can nest. A `#define` written inside a
+/// function body is not collected; that is a known and stated boundary, not an
+/// approximation of one.
+fn function_like_macro_names(root: Node<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::default();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        for index in 0..node.named_child_count() {
+            let Some(child) = node.named_child(index) else {
+                continue;
+            };
+            match child.kind() {
+                "preproc_function_def" => {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        names.insert(source[name.start_byte()..name.end_byte()].to_owned());
+                    }
+                }
+                "preproc_if" | "preproc_ifdef" | "preproc_else" | "preproc_elif"
+                | "preproc_elifdef" => stack.push(child),
+                _ => {}
+            }
+        }
+    }
+    names
+}
+
 impl StructuralSpec for CppStructuralSpec {
     fn language(&self) -> Language {
         Language::Cpp
@@ -235,6 +269,7 @@ impl StructuralSpec for CppStructuralSpec {
         kind: NormalizedKind,
         enclosing: Option<NormalizedKind>,
         source: &str,
+        _context: &CallSiteContext,
     ) -> NormalizedKind {
         if kind == NormalizedKind::Function
             && (enclosing == Some(NormalizedKind::Class)
@@ -262,6 +297,37 @@ impl StructuralSpec for CppStructuralSpec {
         !matches!(role, Role::Kwarg | Role::Decorator)
     }
 
+    fn call_site_context(&self, root: Node<'_>, source: &str) -> CallSiteContext {
+        CallSiteContext::with_macro_derived_callees(function_like_macro_names(root, source))
+    }
+
+    /// A `new_expression` is a constructor call, and a call whose callee names
+    /// a function-like macro of this translation unit has an argument list
+    /// that belongs to the macro, not to the callable that finally runs
+    /// (#1478). `CALL_TWICE(2)` parses as an ordinary call of two source
+    /// arguments even when the expansion calls a three-parameter callable, so
+    /// the honest answer is unknown coverage and no argument rows at all —
+    /// never a fabricated list an exact-arity assertion could read as clean.
+    ///
+    /// The boundary is deliberate: only macros defined in this file are
+    /// known here, because that is what this file's parse tree contains. A
+    /// macro defined in an included header leaves the site exact, which is
+    /// the same answer the analyzer gives today.
+    fn call_site_facts(
+        &self,
+        node: Node<'_>,
+        source: &str,
+        context: &CallSiteContext,
+    ) -> Option<CallSiteFacts> {
+        if node.kind() == "new_expression" {
+            return Some(CallSiteFacts::of_kind(CallKind::Constructor));
+        }
+        let callee = node.child_by_field_name("function")?;
+        (callee.kind() == "identifier"
+            && context.is_macro_derived_callee(&source[callee.start_byte()..callee.end_byte()]))
+        .then(|| CallSiteFacts::of_coverage(CallShapeCoverage::UnknownMacroDerived))
+    }
+
     /// C++ has not learned occurrence-role classification yet (#1473).
     /// The empty table is the honest answer: queries and assertions that ask
     /// for an occurrence role here report incomplete rather than clean-empty.
@@ -270,7 +336,10 @@ impl StructuralSpec for CppStructuralSpec {
     }
 
     fn lexical_environment_support(&self) -> &LexicalEnvironmentSupport {
-        &NO_LEXICAL_ENVIRONMENT_SUPPORT
+        // C and C++ classify no scopes, binding intervals, import binders or
+        // package clause, but the call seams report per-candidate callable
+        // applicability (#1478 M3). The per-axis table states exactly that.
+        &CALLABLE_APPLICABILITY_ONLY_SUPPORT
     }
 
     fn materialization_support(&self) -> &DeclarationMaterializationSupport {

@@ -37,8 +37,8 @@ pub use model::{
 };
 pub(crate) use plan::ValueFlowCarrierSummaryIdentity;
 pub use plan::{
-    ValueFlowCuratedCallModel, ValueFlowInput, ValueFlowPlan, ValueFlowPlanError,
-    ValueFlowPlanLimits, ValueFlowSummaryLocationBinding,
+    ValueFlowCuratedCallModel, ValueFlowIncompleteCause, ValueFlowInput, ValueFlowPlan,
+    ValueFlowPlanError, ValueFlowPlanLimits, ValueFlowSummaryLocationBinding,
 };
 pub use result::{
     ValueFlowMayStatus, ValueFlowMeeting, ValueFlowMustStatus, ValueFlowSinkOutcome,
