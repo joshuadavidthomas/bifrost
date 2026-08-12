@@ -112,8 +112,25 @@ impl ScalaReceiverOwner {
 enum ScalaNameResolution {
     Resolved(ScalaOwnerIdentity),
     MissingExplicitImport,
-    Ambiguous,
+    Ambiguous(Vec<ScalaOwnerIdentity>),
     Unresolved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ForwardScalaDirectAncestorResolution {
+    Resolved(Vec<CodeUnit>),
+    Ambiguous(Vec<CodeUnit>),
+    Incomplete(Vec<CodeUnit>),
+}
+
+impl ForwardScalaDirectAncestorResolution {
+    fn into_shared(self) -> ScalaDirectAncestorResolution {
+        match self {
+            Self::Resolved(ancestors) => ScalaDirectAncestorResolution::Resolved(ancestors),
+            Self::Ambiguous(_) => ScalaDirectAncestorResolution::Ambiguous,
+            Self::Incomplete(ancestors) => ScalaDirectAncestorResolution::Incomplete(ancestors),
+        }
+    }
 }
 
 /// Request-scoped, candidate-query replacement for Scala's global inverted
@@ -135,7 +152,7 @@ type ScalaNameResolver<'a> = ForwardScalaNameResolver<'a>;
 #[derive(Default)]
 pub(crate) struct ScalaLookupCache {
     direct_children_by_owner: RefCell<HashMap<CodeUnit, Vec<CodeUnit>>>,
-    direct_ancestors_by_owner: RefCell<HashMap<CodeUnit, ScalaDirectAncestorResolution>>,
+    direct_ancestors_by_owner: RefCell<HashMap<CodeUnit, ForwardScalaDirectAncestorResolution>>,
     #[cfg(test)]
     direct_children_builds: Cell<usize>,
     #[cfg(test)]
@@ -161,12 +178,12 @@ impl ScalaLookupCache {
         resolved
     }
 
-    fn direct_ancestors(
+    fn direct_ancestor_details(
         &self,
         scala: &ScalaAnalyzer,
         support: &dyn BoundedDefinitionLookup,
         owner: &CodeUnit,
-    ) -> ScalaDirectAncestorResolution {
+    ) -> ForwardScalaDirectAncestorResolution {
         if let Some(cached) = self.direct_ancestors_by_owner.borrow().get(owner) {
             return cached.clone();
         }
@@ -427,7 +444,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         match self.resolve_owner(raw, ScalaOwnerKind::Class) {
             ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
             ScalaNameResolution::MissingExplicitImport
-            | ScalaNameResolution::Ambiguous
+            | ScalaNameResolution::Ambiguous(_)
             | ScalaNameResolution::Unresolved => None,
         }
     }
@@ -436,7 +453,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         match self.resolve_owner(raw, ScalaOwnerKind::SingletonObject) {
             ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
             ScalaNameResolution::MissingExplicitImport
-            | ScalaNameResolution::Ambiguous
+            | ScalaNameResolution::Ambiguous(_)
             | ScalaNameResolution::Unresolved => None,
         }
     }
@@ -489,7 +506,9 @@ impl<'a> ForwardScalaNameResolver<'a> {
                     return ScalaNameResolution::MissingExplicitImport;
                 }
             }
-            ScalaNameResolution::Ambiguous => return ScalaNameResolution::Ambiguous,
+            ScalaNameResolution::Ambiguous(owners) => {
+                return ScalaNameResolution::Ambiguous(owners);
+            }
             ScalaNameResolution::Resolved(_) | ScalaNameResolution::Unresolved => {}
         }
 
@@ -660,7 +679,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
     ) -> ScalaNameResolution {
         let environment = self.wildcard_import_environment();
         if environment.ambiguous {
-            return ScalaNameResolution::Ambiguous;
+            return ScalaNameResolution::Ambiguous(Vec::new());
         }
         let mut candidates = environment
             .owners
@@ -754,7 +773,9 @@ impl<'a> ForwardScalaNameResolver<'a> {
                         resolved.push(owner);
                         break;
                     }
-                    ScalaNameResolution::Ambiguous => return ScalaNameResolution::Ambiguous,
+                    ScalaNameResolution::Ambiguous(owners) => {
+                        return ScalaNameResolution::Ambiguous(owners);
+                    }
                     ScalaNameResolution::MissingExplicitImport
                     | ScalaNameResolution::Unresolved => {}
                 }
@@ -764,7 +785,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         resolved.dedup();
         match resolved.as_slice() {
             [owner] => ScalaNameResolution::Resolved(owner.clone()),
-            [_, _, ..] => ScalaNameResolution::Ambiguous,
+            [_, _, ..] => ScalaNameResolution::Ambiguous(resolved),
             [] if matching_explicit_import => ScalaNameResolution::MissingExplicitImport,
             [] => ScalaNameResolution::Unresolved,
         }
@@ -837,7 +858,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         let mut owners = Vec::new();
         let environment = self.wildcard_import_environment();
         if environment.ambiguous {
-            return ScalaNameResolution::Ambiguous;
+            return ScalaNameResolution::Ambiguous(Vec::new());
         }
         for import_owner in environment.owners {
             let singleton = import_owner.is_singleton();
@@ -845,7 +866,9 @@ impl<'a> ForwardScalaNameResolver<'a> {
             let outcome = self.resolve_candidate_tier(candidates, ScalaOwnerKind::SingletonObject);
             match outcome {
                 ScalaNameResolution::Resolved(owner) => owners.push(owner),
-                ScalaNameResolution::Ambiguous => return ScalaNameResolution::Ambiguous,
+                ScalaNameResolution::Ambiguous(owners) => {
+                    return ScalaNameResolution::Ambiguous(owners);
+                }
                 ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Unresolved => {}
             }
         }
@@ -854,7 +877,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         match owners.as_slice() {
             [] => self.resolve_direct_wildcard_singleton(name),
             [owner] => ScalaNameResolution::Resolved(owner.clone()),
-            _ => ScalaNameResolution::Ambiguous,
+            _ => ScalaNameResolution::Ambiguous(owners),
         }
     }
 
@@ -893,7 +916,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
                 }
             }
             if selected.len() > 1 {
-                return ScalaNameResolution::Ambiguous;
+                return ScalaNameResolution::Ambiguous(selected);
             }
             owners.extend(selected);
         }
@@ -902,7 +925,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         match owners.as_slice() {
             [] => ScalaNameResolution::Unresolved,
             [owner] => ScalaNameResolution::Resolved(owner.clone()),
-            _ => ScalaNameResolution::Ambiguous,
+            _ => ScalaNameResolution::Ambiguous(owners),
         }
     }
 
@@ -979,7 +1002,7 @@ impl<'a> ForwardScalaNameResolver<'a> {
         match owners.as_slice() {
             [] => ScalaNameResolution::Unresolved,
             [owner] => ScalaNameResolution::Resolved(owner.clone()),
-            _ => ScalaNameResolution::Ambiguous,
+            _ => ScalaNameResolution::Ambiguous(owners),
         }
     }
 
@@ -3886,7 +3909,7 @@ fn resolve_scala_with_context(
                         "`{text}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                     ));
                 }
-                ScalaNameResolution::Ambiguous => {
+                ScalaNameResolution::Ambiguous(_) => {
                     return no_definition(
                         "ambiguous_scala_explicit_import",
                         format!("Scala explicit imports expose multiple `{text}` objects"),
@@ -4184,7 +4207,7 @@ fn scala_wildcard_import_owner_outcome(
     let singleton = match resolver.resolve_owner_segments(segments, ScalaOwnerKind::SingletonObject)
     {
         ScalaNameResolution::Resolved(owner) => Some(owner._declaration),
-        ScalaNameResolution::Ambiguous => {
+        ScalaNameResolution::Ambiguous(_) => {
             return Some(no_definition(
                 "ambiguous_scala_type",
                 format!("`{display}` resolves to multiple physical Scala owners"),
@@ -4200,7 +4223,7 @@ fn scala_wildcard_import_owner_outcome(
     for kind in [ScalaOwnerKind::Class, ScalaOwnerKind::TypeNamespace] {
         match resolver.resolve_owner_segments(segments, kind) {
             ScalaNameResolution::Resolved(owner) => owners.push(owner._declaration),
-            ScalaNameResolution::Ambiguous => {
+            ScalaNameResolution::Ambiguous(_) => {
                 return Some(no_definition(
                     "ambiguous_scala_type",
                     format!("`{display}` resolves to multiple physical Scala owners"),
@@ -4553,7 +4576,7 @@ fn resolve_scala_focused_qualified_path(
         ScalaNameResolution::Resolved(owner) => {
             return Some(scala_fqn_outcome(ctx.support, &owner.fqn, &display));
         }
-        ScalaNameResolution::Ambiguous => {
+        ScalaNameResolution::Ambiguous(_) => {
             return Some(no_definition(
                 "ambiguous_scala_type",
                 format!("`{display}` resolves to multiple physical Scala owners"),
@@ -4566,7 +4589,7 @@ fn resolve_scala_focused_qualified_path(
             ScalaNameResolution::Resolved(owner) => {
                 scala_fqn_outcome(ctx.support, &owner.fqn, &display)
             }
-            ScalaNameResolution::Ambiguous => no_definition(
+            ScalaNameResolution::Ambiguous(_) => no_definition(
                 "ambiguous_scala_type",
                 format!("`{display}` resolves to multiple physical Scala owners"),
             ),
@@ -4617,7 +4640,7 @@ fn scala_exact_qualified_apply_outcome(
             &display,
             call_site_shape_for_reference(node).as_ref(),
         )),
-        ScalaNameResolution::Ambiguous => Some(no_definition(
+        ScalaNameResolution::Ambiguous(_) => Some(no_definition(
             "ambiguous_scala_callable",
             format!("`{display}` resolves to multiple physical Scala companion owners"),
         )),
@@ -4631,7 +4654,7 @@ fn scala_exact_qualified_apply_outcome(
                         call_site_shape_for_reference(node).as_ref(),
                     ))
                 }
-                ScalaNameResolution::Ambiguous => Some(no_definition(
+                ScalaNameResolution::Ambiguous(_) => Some(no_definition(
                     "ambiguous_scala_callable",
                     format!("`{display}` resolves to multiple physical Scala class owners"),
                 )),
@@ -4716,7 +4739,7 @@ fn scala_exact_qualified_terminal_outcome(
                 .resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
             {
                 ScalaNameResolution::Resolved(owner) => owner._declaration,
-                ScalaNameResolution::Ambiguous => {
+                ScalaNameResolution::Ambiguous(_) => {
                     return Some(no_definition(
                         "ambiguous_scala_type",
                         format!(
@@ -4741,7 +4764,7 @@ fn scala_exact_qualified_terminal_outcome(
                 .resolve_owner_segments(owner_segments, ScalaOwnerKind::TypeNamespace)
             {
                 ScalaNameResolution::Resolved(owner) => owner._declaration,
-                ScalaNameResolution::Ambiguous => {
+                ScalaNameResolution::Ambiguous(_) => {
                     return Some(no_definition(
                         "ambiguous_scala_type",
                         format!(
@@ -4770,7 +4793,7 @@ fn scala_exact_qualified_terminal_outcome(
             ] {
                 match resolver.resolve_owner_segments(owner_segments, kind) {
                     ScalaNameResolution::Resolved(owner) => owners.push(owner._declaration),
-                    ScalaNameResolution::Ambiguous => {
+                    ScalaNameResolution::Ambiguous(_) => {
                         return Some(no_definition(
                             "ambiguous_scala_type",
                             format!(
@@ -4962,7 +4985,9 @@ fn scala_exact_exported_qualified_type(
                     .resolve_owner_segments(owner_segments, ScalaOwnerKind::SingletonObject)
                 {
                     ScalaNameResolution::Resolved(owner) => owner._declaration,
-                    ScalaNameResolution::Ambiguous => return ScalaTypeNamespaceResolution::NoMatch,
+                    ScalaNameResolution::Ambiguous(_) => {
+                        return ScalaTypeNamespaceResolution::NoMatch;
+                    }
                     ScalaNameResolution::MissingExplicitImport
                     | ScalaNameResolution::Unresolved => {
                         return ScalaTypeNamespaceResolution::NoMatch;
@@ -5134,7 +5159,7 @@ fn resolve_scala_parser_proven_term_role(
                 ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
                     "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                 )),
-                ScalaNameResolution::Ambiguous => no_definition(
+                ScalaNameResolution::Ambiguous(_) => no_definition(
                     "ambiguous_scala_term_namespace",
                     format!("`{display_name}` resolves to multiple physical Scala objects"),
                 ),
@@ -5159,7 +5184,7 @@ fn resolve_scala_parser_proven_term_role(
                         ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
                             "`{root_name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                         )),
-                        ScalaNameResolution::Ambiguous => no_definition(
+                        ScalaNameResolution::Ambiguous(_) => no_definition(
                             "ambiguous_scala_term_namespace",
                             format!(
                                 "`{display_name}` resolves to multiple physical Scala extractor classes"
@@ -5212,7 +5237,7 @@ fn resolve_scala_parser_proven_term_role(
         ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
             "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
         )),
-        ScalaNameResolution::Ambiguous => no_definition(
+        ScalaNameResolution::Ambiguous(_) => no_definition(
             "ambiguous_scala_term_namespace",
             format!("`{name}` resolves to multiple physical Scala objects"),
         ),
@@ -5231,7 +5256,7 @@ fn resolve_scala_parser_proven_term_role(
                 ScalaNameResolution::MissingExplicitImport => boundary_unchecked(format!(
                     "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                 )),
-                ScalaNameResolution::Ambiguous => no_definition(
+                ScalaNameResolution::Ambiguous(_) => no_definition(
                     "ambiguous_scala_term_namespace",
                     format!("`{name}` resolves to multiple physical Scala extractor classes"),
                 ),
@@ -6024,7 +6049,15 @@ impl ScalaLookupCtx<'_> {
     }
 
     fn direct_ancestors_for_owner(&self, owner: &CodeUnit) -> ScalaDirectAncestorResolution {
-        self.cache.direct_ancestors(self.scala, self.support, owner)
+        self.direct_ancestor_details_for_owner(owner).into_shared()
+    }
+
+    fn direct_ancestor_details_for_owner(
+        &self,
+        owner: &CodeUnit,
+    ) -> ForwardScalaDirectAncestorResolution {
+        self.cache
+            .direct_ancestor_details(self.scala, self.support, owner)
     }
 }
 
@@ -6240,7 +6273,7 @@ fn resolve_scala_type(
             // nothing (#1158, restoring the symmetry with the non-local branch).
             missing_local_import = true;
         }
-        Some(ScalaNameResolution::Ambiguous) => {
+        Some(ScalaNameResolution::Ambiguous(_)) => {
             return no_definition(
                 "ambiguous_scala_explicit_import",
                 format!("Local Scala explicit imports expose multiple `{text}` types"),
@@ -6287,7 +6320,7 @@ fn resolve_scala_type(
                     "`{text}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                 ));
             }
-            ScalaNameResolution::Ambiguous => {
+            ScalaNameResolution::Ambiguous(_) => {
                 return no_definition(
                     "ambiguous_scala_explicit_import",
                     format!("Scala explicit imports expose multiple `{text}` types"),
@@ -6328,7 +6361,7 @@ fn resolve_scala_type(
                         "`{intrinsic}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                     ));
                 }
-                ScalaNameResolution::Ambiguous => {
+                ScalaNameResolution::Ambiguous(_) => {
                     return no_definition(
                         "ambiguous_scala_type",
                         format!("`{intrinsic}` resolves to multiple higher-precedence Scala types"),
@@ -6714,7 +6747,7 @@ fn resolve_scala_call(
                         "`{name}` is bound by an explicit Scala import whose declaration is not indexed in this workspace"
                     ));
                 }
-                ScalaNameResolution::Ambiguous => {
+                ScalaNameResolution::Ambiguous(_) => {
                     return no_definition(
                         "ambiguous_scala_explicit_import",
                         format!("Scala explicit imports expose multiple `{name}` objects"),
@@ -6738,7 +6771,7 @@ fn resolve_scala_call(
                         call_shape.as_ref(),
                     );
                 }
-                ScalaNameResolution::Ambiguous => {
+                ScalaNameResolution::Ambiguous(_) => {
                     return no_definition(
                         "ambiguous_scala_wildcard_import",
                         format!("Scala wildcard imports expose multiple `{name}` objects"),
@@ -7380,7 +7413,7 @@ fn resolve_scala_stable_identifier(
                         Some(ScalaReceiverOwner::Exact(owner._declaration))
                     }
                     ScalaNameResolution::MissingExplicitImport
-                    | ScalaNameResolution::Ambiguous
+                    | ScalaNameResolution::Ambiguous(_)
                     | ScalaNameResolution::Unresolved => None,
                 }
             })
@@ -7755,8 +7788,9 @@ fn scala_exact_owner_typed_overload_resolution(
     let mut level = vec![owner.clone()];
     let mut seen = HashSet::default();
     let mut unindexed_supertype = false;
-    while !level.is_empty() {
-        let mut candidates = Vec::new();
+    let mut carried_candidates = Vec::new();
+    while !level.is_empty() || !carried_candidates.is_empty() {
+        let mut candidates = std::mem::take(&mut carried_candidates);
         let mut next = Vec::new();
         for current in level {
             if !seen.insert(current.clone()) {
@@ -7768,16 +7802,25 @@ fn scala_exact_owner_typed_overload_resolution(
                 Some(call_shape),
                 ScalaCallableSiteRole::Ordinary,
             ));
-            match ctx.direct_ancestors_for_owner(&current) {
-                ScalaDirectAncestorResolution::Resolved(ancestors) => next.extend(ancestors),
-                ScalaDirectAncestorResolution::Incomplete(ancestors) => {
+            match ctx.direct_ancestor_details_for_owner(&current) {
+                ForwardScalaDirectAncestorResolution::Resolved(ancestors) => {
+                    next.extend(ancestors);
+                }
+                ForwardScalaDirectAncestorResolution::Incomplete(ancestors) => {
                     next.extend(ancestors);
                     unindexed_supertype = true;
                 }
                 // A multiply declared supertype is not a boundary: the
                 // workspace holds those declarations, and the chain below
                 // reports the conflict where it can name it.
-                ScalaDirectAncestorResolution::Ambiguous => {}
+                ForwardScalaDirectAncestorResolution::Ambiguous(owners) => {
+                    carried_candidates.extend(scala_filter_callable_units(
+                        ctx.scala,
+                        scala_ambiguous_owner_member_candidates(ctx, owners, member),
+                        Some(call_shape),
+                        ScalaCallableSiteRole::Ordinary,
+                    ));
+                }
             }
         }
         sort_units(&mut candidates);
@@ -8323,6 +8366,20 @@ fn scala_owner_declaration(ctx: ScalaLookupCtx<'_>, owner_fqn: &str) -> Option<C
     Some(owner.clone())
 }
 
+fn scala_ambiguous_owner_member_candidates(
+    ctx: ScalaLookupCtx<'_>,
+    owners: Vec<CodeUnit>,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = owners
+        .into_iter()
+        .flat_map(|owner| scala_direct_member_candidate_units_for_owner(ctx, &owner, member))
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
 fn scala_exact_owner_member_candidate_units(
     ctx: ScalaLookupCtx<'_>,
     owner: &CodeUnit,
@@ -8339,11 +8396,16 @@ fn scala_exact_owner_member_candidate_units(
         return ScalaExactMemberResolution::Found(direct);
     }
 
-    let mut level = match ctx.direct_ancestors_for_owner(owner) {
-        ScalaDirectAncestorResolution::Resolved(ancestors)
-        | ScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
-        ScalaDirectAncestorResolution::Ambiguous => {
-            return ScalaExactMemberResolution::Ambiguous;
+    let mut level = match ctx.direct_ancestor_details_for_owner(owner) {
+        ForwardScalaDirectAncestorResolution::Resolved(ancestors)
+        | ForwardScalaDirectAncestorResolution::Incomplete(ancestors) => ancestors,
+        ForwardScalaDirectAncestorResolution::Ambiguous(owners) => {
+            let candidates = scala_ambiguous_owner_member_candidates(ctx, owners, member);
+            return if candidates.is_empty() {
+                ScalaExactMemberResolution::Ambiguous
+            } else {
+                ScalaExactMemberResolution::Found(candidates)
+            };
         }
     };
     if let Some(state) = member_trace.as_mut() {
@@ -8356,6 +8418,7 @@ fn scala_exact_owner_member_candidate_units(
         let mut matches = Vec::new();
         let mut next = Vec::new();
         let mut next_is_ambiguous = false;
+        let mut ambiguous_matches = Vec::new();
         for ancestor in level {
             if !seen.insert(ancestor.clone()) {
                 continue;
@@ -8365,15 +8428,19 @@ fn scala_exact_owner_member_candidate_units(
                 state.record_found(ctx.scala, &found, &ancestor, depth);
             }
             matches.extend(found);
-            match ctx.direct_ancestors_for_owner(&ancestor) {
-                ScalaDirectAncestorResolution::Resolved(ancestors)
-                | ScalaDirectAncestorResolution::Incomplete(ancestors) => {
+            match ctx.direct_ancestor_details_for_owner(&ancestor) {
+                ForwardScalaDirectAncestorResolution::Resolved(ancestors)
+                | ForwardScalaDirectAncestorResolution::Incomplete(ancestors) => {
                     if let Some(state) = member_trace.as_mut() {
                         state.record_supertypes(ctx.scala, &ancestor, &ancestors);
                     }
                     next.extend(ancestors);
                 }
-                ScalaDirectAncestorResolution::Ambiguous => next_is_ambiguous = true,
+                ForwardScalaDirectAncestorResolution::Ambiguous(owners) => {
+                    next_is_ambiguous = true;
+                    ambiguous_matches
+                        .extend(scala_ambiguous_owner_member_candidates(ctx, owners, member));
+                }
             }
         }
         sort_units(&mut matches);
@@ -8391,7 +8458,13 @@ fn scala_exact_owner_member_candidate_units(
             return ScalaExactMemberResolution::Found(matches);
         }
         if next_is_ambiguous {
-            return ScalaExactMemberResolution::Ambiguous;
+            sort_units(&mut ambiguous_matches);
+            ambiguous_matches.dedup();
+            return if ambiguous_matches.is_empty() {
+                ScalaExactMemberResolution::Ambiguous
+            } else {
+                ScalaExactMemberResolution::Found(ambiguous_matches)
+            };
         }
         level = next;
     }
@@ -8544,7 +8617,7 @@ fn scala_forward_callable_type_identity(
             };
             scala_builtin_type_name(simple).map(ScalaParameterTypeIdentity::Builtin)
         }
-        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => None,
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous(_) => None,
     }
 }
 
@@ -9365,8 +9438,8 @@ fn scala_ancestor_owners(
     let mut discovered = HashSet::from_iter([owner.fq_name()]);
     let mut ancestors = Vec::new();
     while let Some((current, depth)) = queue.pop_front() {
-        let (ScalaDirectAncestorResolution::Resolved(direct)
-        | ScalaDirectAncestorResolution::Incomplete(direct)) =
+        let (ForwardScalaDirectAncestorResolution::Resolved(direct)
+        | ForwardScalaDirectAncestorResolution::Incomplete(direct)) =
             scala_forward_direct_ancestor_resolution(scala, support, &current)
         else {
             break;
@@ -9391,9 +9464,9 @@ fn scala_forward_direct_ancestor_resolution(
     scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
     owner: &CodeUnit,
-) -> ScalaDirectAncestorResolution {
+) -> ForwardScalaDirectAncestorResolution {
     let Some(facts) = scala.forward_owner_facts(owner) else {
-        return ScalaDirectAncestorResolution::Resolved(Vec::new());
+        return ForwardScalaDirectAncestorResolution::Resolved(Vec::new());
     };
     let resolver = scala_name_resolver_for_unit(scala, support, owner);
     let mut ancestors = Vec::new();
@@ -9410,12 +9483,19 @@ fn scala_forward_direct_ancestor_resolution(
             .resolve_explicit_owner_segments(path.segments(), ScalaOwnerKind::Class)
         {
             ScalaNameResolution::Resolved(identity) => identity,
-            ScalaNameResolution::Ambiguous => return ScalaDirectAncestorResolution::Ambiguous,
+            ScalaNameResolution::Ambiguous(owners) => {
+                return ForwardScalaDirectAncestorResolution::Ambiguous(
+                    owners
+                        .into_iter()
+                        .map(|identity| identity._declaration)
+                        .collect(),
+                );
+            }
             ScalaNameResolution::MissingExplicitImport => continue,
             ScalaNameResolution::Unresolved => {
                 match resolver.resolve_lookup_path(&path, ScalaOwnerKind::Class) {
                     ScalaNameResolution::Resolved(identity) => identity,
-                    ScalaNameResolution::Ambiguous
+                    ScalaNameResolution::Ambiguous(ambiguous)
                         if !resolver.visible_imports().any(|import| import.is_wildcard) =>
                     {
                         let mut same_source = scala_nested_type_candidates(
@@ -9438,13 +9518,23 @@ fn scala_forward_direct_ancestor_resolution(
                             // indexed declaration and this source does not
                             // single one out. The workspace holds the
                             // supertype; it cannot say which one.
-                            return ScalaDirectAncestorResolution::Ambiguous;
+                            return ForwardScalaDirectAncestorResolution::Ambiguous(
+                                ambiguous
+                                    .into_iter()
+                                    .map(|identity| identity._declaration)
+                                    .collect(),
+                            );
                         };
                         ancestors.push(ancestor.clone());
                         continue;
                     }
-                    ScalaNameResolution::Ambiguous => {
-                        return ScalaDirectAncestorResolution::Ambiguous;
+                    ScalaNameResolution::Ambiguous(owners) => {
+                        return ForwardScalaDirectAncestorResolution::Ambiguous(
+                            owners
+                                .into_iter()
+                                .map(|identity| identity._declaration)
+                                .collect(),
+                        );
                     }
                     ScalaNameResolution::MissingExplicitImport => continue,
                     ScalaNameResolution::Unresolved => {
@@ -9459,9 +9549,9 @@ fn scala_forward_direct_ancestor_resolution(
     sort_units(&mut ancestors);
     ancestors.dedup();
     if unindexed_supertype {
-        ScalaDirectAncestorResolution::Incomplete(ancestors)
+        ForwardScalaDirectAncestorResolution::Incomplete(ancestors)
     } else {
-        ScalaDirectAncestorResolution::Resolved(ancestors)
+        ForwardScalaDirectAncestorResolution::Resolved(ancestors)
     }
 }
 
@@ -10282,14 +10372,16 @@ fn scala_resolve_visible_type_annotation(
         return match resolver.resolve_owner(base, ScalaOwnerKind::SingletonObject) {
             ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
             ScalaNameResolution::MissingExplicitImport
-            | ScalaNameResolution::Ambiguous
+            | ScalaNameResolution::Ambiguous(_)
             | ScalaNameResolution::Unresolved => None,
         };
     }
     let base = scala_type_base_text(type_text.trim()).unwrap_or(type_text);
     match resolver.resolve_owner(base, ScalaOwnerKind::Class) {
         ScalaNameResolution::Resolved(owner) => return Some(owner.fqn),
-        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => return None,
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous(_) => {
+            return None;
+        }
         ScalaNameResolution::Unresolved => {}
     }
     if scala_type_annotation_has_explicit_import(ctx, type_text) {
@@ -10380,7 +10472,7 @@ fn scala_resolve_visible_type_declaration(
     match resolver.resolve_type_node(node, ctx.source, kind) {
         ScalaNameResolution::Resolved(owner) => Some(owner._declaration),
         ScalaNameResolution::MissingExplicitImport
-        | ScalaNameResolution::Ambiguous
+        | ScalaNameResolution::Ambiguous(_)
         | ScalaNameResolution::Unresolved => None,
     }
 }
@@ -10408,7 +10500,7 @@ fn scala_resolve_visible_type_node_after_lexical_miss(
     }
     match resolver.resolve_type_node(node, ctx.source, kind) {
         ScalaNameResolution::Resolved(owner) => Some(owner.fqn),
-        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => None,
+        ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous(_) => None,
         // A structured qualified path is authoritative. Falling back to its
         // terminal spelling would allow `java.lang.Long` or
         // `_root_.scala.Boolean` to bind an unrelated root-level fixture.
@@ -10866,7 +10958,7 @@ fn scala_resolve_enclosing_qualified_type(
                 kind,
             ) {
                 ScalaNameResolution::Resolved(owner) => return Some(owner.fqn),
-                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => {
+                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous(_) => {
                     return None;
                 }
                 ScalaNameResolution::Unresolved => {}
@@ -10878,7 +10970,7 @@ fn scala_resolve_enclosing_qualified_type(
                 kind,
             ) {
                 ScalaNameResolution::Resolved(owner) => return Some(owner.fqn),
-                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous => {
+                ScalaNameResolution::MissingExplicitImport | ScalaNameResolution::Ambiguous(_) => {
                     return None;
                 }
                 ScalaNameResolution::Unresolved => {}
@@ -11538,7 +11630,7 @@ fn scala_exact_stable_value_owner(
     match resolver.resolve_owner_segments(&segments, ScalaOwnerKind::SingletonObject) {
         ScalaNameResolution::Resolved(owner) => Some(owner._declaration),
         ScalaNameResolution::MissingExplicitImport
-        | ScalaNameResolution::Ambiguous
+        | ScalaNameResolution::Ambiguous(_)
         | ScalaNameResolution::Unresolved => None,
     }
 }

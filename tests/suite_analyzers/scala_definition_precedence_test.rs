@@ -2462,6 +2462,7 @@ import replica.Base
 class External extends Base {
   val ambiguousField = count
   val ambiguousMethod = ready
+  val ambiguousOverload = overloaded(1)
 }
 "#;
     let project = InlineTestProject::with_language(Language::Scala)
@@ -2516,6 +2517,12 @@ class External extends Base {
         "ambiguousMethod",
         "ready",
     ));
+    references.push(reference(
+        "consumer/External.scala",
+        external,
+        "ambiguousOverload",
+        "overloaded",
+    ));
 
     let value = call_search_tool_json(
         project.root(),
@@ -2546,9 +2553,20 @@ class External extends Base {
         }
     }
     for result in &results[18..] {
-        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(result["status"], "ambiguous", "{value}");
         assert_eq!(
-            result["diagnostics"][0]["kind"], "ambiguous_scala_enclosing_member",
+            result["diagnostics"][0]["kind"], "ambiguous_definition",
+            "{value}"
+        );
+        let paths = result["definitions"]
+            .as_array()
+            .expect("ambiguous definitions")
+            .iter()
+            .map(|definition| definition["path"].as_str().expect("definition path"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            ["js/replica/Base.scala", "jvm/replica/Base.scala"],
             "{value}"
         );
     }
