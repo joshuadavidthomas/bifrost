@@ -3185,7 +3185,7 @@ class Host {
             procedure
                 .values()
                 .iter()
-                .any(|value| value.kind == SemanticValueKind::Receiver)
+                .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         };
 
         // A dead `this` publishes no receiver formal, so a receiverless call
