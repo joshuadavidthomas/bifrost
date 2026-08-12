@@ -37,7 +37,10 @@ use std::fmt;
 /// Version 7 adds the per-call-site classification a language spec reads from
 /// its own grammar node: refined call kind, argument-shape coverage, and
 /// whether the site continues its callee's argument-list sequence (#1478).
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 7;
+/// Version 8 makes TypeScript's bodiless callable declarations facts:
+/// `function_signature`, `method_signature`, and `abstract_method_signature`
+/// normalize as callables, so declaration-only stubs are addressable (#1658).
+pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralSnapshotError(String);
