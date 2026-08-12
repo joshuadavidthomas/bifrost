@@ -3083,6 +3083,14 @@ impl<'a> CppVisitor<'a> {
             return;
         }
         if in_class_body
+            && let Some(parent) = scope.class_unit.as_ref()
+            && let Some(call) =
+                recovered_macro_qualified_constructor_call(node, parent.identifier(), self.source)
+        {
+            self.visit_recovered_macro_qualified_constructor_definition(node, call, scope);
+            return;
+        }
+        if in_class_body
             && let Some(call) = recovered_macro_qualified_function_call(node, self.source)
         {
             self.visit_recovered_macro_qualified_function_declaration(node, call, scope);
@@ -3342,6 +3350,46 @@ impl<'a> CppVisitor<'a> {
         );
         let metadata = SignatureMetadata::with_parameter_labels(signature_label, parameter_labels)
             .with_declaration_only(true)
+            .with_callable_arity(CallableArity::exact(arity))
+            .with_callable_linkage(cpp_callable_linkage(declaration_node, self.source));
+        self.parsed
+            .add_signature_with_metadata(code_unit.clone(), metadata);
+        self.parsed.add_child(parent.clone(), code_unit);
+    }
+
+    fn visit_recovered_macro_qualified_constructor_definition(
+        &mut self,
+        declaration_node: Node<'_>,
+        call: Node<'_>,
+        scope: &ScopeInfo,
+    ) {
+        let Some(parent) = &scope.class_unit else {
+            return;
+        };
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return;
+        };
+        let Some((mut signature, parameter_labels)) =
+            recovered_macro_qualified_function_parameters(arguments, self.source)
+        else {
+            return;
+        };
+        if let Some(template_signature) = &scope.template_signature {
+            signature = format!("{template_signature}{signature}");
+        }
+        let arity = parameter_labels.len();
+        let function = FunctionInfo {
+            package_name: scope.package_name.clone(),
+            owner_path: Some(parent.short_name().to_string()),
+            name: parent.identifier().to_string(),
+            signature,
+        };
+        let code_unit = function.code_unit_with_synthetic(self.file.clone(), true);
+        self.parsed
+            .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
+        let signature_label = normalize_cpp_whitespace(node_text(declaration_node, self.source));
+        let metadata = SignatureMetadata::with_parameter_labels(signature_label, parameter_labels)
+            .with_declaration_only(false)
             .with_callable_arity(CallableArity::exact(arity))
             .with_callable_linkage(cpp_callable_linkage(declaration_node, self.source));
         self.parsed
@@ -8155,6 +8203,50 @@ fn recovered_macro_qualified_field_declarators<'tree>(
             .filter(|declarator| !same_node(*declarator, pseudo_declarator)),
     );
     Some(recovered)
+}
+
+/// Recover a macro-qualified constructor that tree-sitter represents as one
+/// field declaration. The constructor call remains inside the direct recovery
+/// error, while each member initializer becomes a false function declarator.
+/// The class owner proves the constructor name and lets the caller ignore those
+/// initializer declarators.
+fn recovered_macro_qualified_constructor_call<'tree>(
+    node: Node<'tree>,
+    class_name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if node.kind() != "field_declaration" {
+        return None;
+    }
+    let macro_type = node.child_by_field_name("type")?;
+    if macro_type.kind() != "type_identifier"
+        || !cpp_export_macro_token(&normalize_cpp_whitespace(node_text(macro_type, source)))
+    {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let bitfield = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "bitfield_clause")?;
+    let error = bitfield
+        .named_child(0)
+        .filter(|child| child.kind() == "ERROR")?;
+    let mut stack = vec![error];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "call_expression"
+            && current
+                .child_by_field_name("function")
+                .is_some_and(|function| node_text(function, source) == class_name)
+            && current
+                .child_by_field_name("arguments")
+                .is_some_and(|arguments| arguments.kind() == "argument_list")
+        {
+            return Some(current);
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    None
 }
 
 /// Recover a macro-qualified member function declaration that tree-sitter
