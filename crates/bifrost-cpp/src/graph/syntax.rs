@@ -35,7 +35,9 @@ pub fn qualified_callable_value(node: Node<'_>) -> Option<QualifiedCallableValue
         return None;
     }
     if node.parent().is_some_and(|parent| {
-        (parent.kind() == "call_expression" && parent.child_by_field_name("function") == Some(node))
+        parent.child_by_field_name("type") == Some(node)
+            || (parent.kind() == "call_expression"
+                && parent.child_by_field_name("function") == Some(node))
             || (parent.kind() == "pointer_expression"
                 && parent.child_by_field_name("argument") == Some(node))
             || matches!(
