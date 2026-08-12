@@ -16,6 +16,9 @@
 #      concurrently with the tests instead of after them.
 #
 # Nextest does not run doctests, so a `cargo test --doc` step remains.
+# Before any build starts, the gate also removes Cargo artifacts older than
+# seven days. Cargo retains every obsolete feature/profile hash indefinitely;
+# without this sweep, the shared target directory can grow by hundreds of GiB.
 #
 # The all-features clippy needs a PyO3-capable interpreter. If PYO3_PYTHON is
 # not already set and `uv` is available, the clippy leg runs through
@@ -54,6 +57,13 @@ fi
 
 gate_started=$(date +%s)
 step() { echo "[pre-push-gate +$(( $(date +%s) - gate_started ))s] $*"; }
+
+if command -v cargo-sweep >/dev/null 2>&1; then
+  step "cargo sweep --time 7"
+  cargo sweep --time 7 "${repo_root}"
+else
+  step "WARNING: cargo-sweep is not installed; stale target artifacts will not be removed (cargo install cargo-sweep --locked)"
+fi
 
 step "cargo fmt --check"
 cargo fmt --check
