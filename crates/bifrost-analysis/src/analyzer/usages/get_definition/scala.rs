@@ -5926,19 +5926,27 @@ fn scala_is_declaration_name(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
     };
-    parent.child_by_field_name("name") == Some(node)
-        && matches!(
-            parent.kind(),
-            "class_definition"
-                | "object_definition"
-                | "trait_definition"
-                | "enum_definition"
-                | "type_definition"
-                | "function_definition"
-                | "parameter"
-                | "val_definition"
-                | "var_definition"
-        )
+    if !matches!(
+        parent.kind(),
+        "class_definition"
+            | "object_definition"
+            | "trait_definition"
+            | "enum_definition"
+            | "type_definition"
+            | "function_definition"
+            | "parameter"
+            | "type_parameters"
+            | "covariant_type_parameter"
+            | "contravariant_type_parameter"
+            | "val_definition"
+            | "var_definition"
+    ) {
+        return false;
+    }
+    let mut cursor = parent.walk();
+    parent
+        .children_by_field_name("name", &mut cursor)
+        .any(|name| name.id() == node.id())
 }
 
 fn scala_is_type_position(node: Node<'_>) -> bool {
