@@ -118,7 +118,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let receiver = self.session.add_value_with_metadata(
                     builder,
                     metadata,
-                    SemanticValueKind::Receiver,
+                    SemanticValueKind::Receiver { dispatch: true },
                 )?;
                 self.receiver = Some(receiver);
             } else {
@@ -144,7 +144,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver,
+                SemanticValueKind::Receiver { dispatch: true },
             )?);
         }
         Ok(())

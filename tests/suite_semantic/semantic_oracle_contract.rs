@@ -277,7 +277,7 @@ fn build_artifact() -> Arc<SemanticArtifact> {
         },
         SemanticValue {
             id: ValueId::new(3),
-            kind: SemanticValueKind::Receiver,
+            kind: SemanticValueKind::Receiver { dispatch: true },
             source: SOURCE,
             evidence: EVIDENCE,
         },

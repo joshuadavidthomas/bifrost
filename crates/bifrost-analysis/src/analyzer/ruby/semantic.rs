@@ -1443,7 +1443,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let receiver = self.session.add_value_with_metadata(
             builder,
             receiver_metadata,
-            SemanticValueKind::Receiver,
+            SemanticValueKind::Receiver { dispatch: true },
         )?;
         self.receiver = Some(receiver);
         self.parameters.insert("self".into(), receiver);

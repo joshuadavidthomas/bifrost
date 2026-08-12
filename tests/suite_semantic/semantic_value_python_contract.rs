@@ -77,7 +77,7 @@ class Service:
     let formal_receiver = handle
         .values()
         .iter()
-        .find(|value| value.kind == SemanticValueKind::Receiver)
+        .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         .expect("Python instance method receiver");
     assert_eq!(
         mapped_source(handle, SOURCE, formal_receiver.source),

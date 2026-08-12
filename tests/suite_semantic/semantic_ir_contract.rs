@@ -604,7 +604,7 @@ fn bound_and_unbound_method_references_are_not_invocations() {
     procedure.values.extend([
         SemanticValue {
             id: ValueId::new(0),
-            kind: SemanticValueKind::Receiver,
+            kind: SemanticValueKind::Receiver { dispatch: true },
             source: SOURCE,
             evidence: EVIDENCE,
         },

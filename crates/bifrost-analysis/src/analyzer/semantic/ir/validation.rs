@@ -177,7 +177,7 @@ pub(super) fn measure_artifact_work(
                 } => account_text(name, &mut work),
                 SemanticValueKind::Local
                 | SemanticValueKind::Parameter { .. }
-                | SemanticValueKind::Receiver
+                | SemanticValueKind::Receiver { .. }
                 | SemanticValueKind::Return
                 | SemanticValueKind::Temporary
                 | SemanticValueKind::Constant
@@ -1116,7 +1116,7 @@ fn validate_capture_row(
             if capture.mode == CaptureMode::Receiver
                 && !matches!(
                     procedure.values[value.index()].kind,
-                    SemanticValueKind::Receiver
+                    SemanticValueKind::Receiver { .. }
                 )
             {
                 return Err(SemanticIrError::procedure(
@@ -2138,8 +2138,8 @@ fn validate_value_flow_kind(
                 || matches!(target_kind, SemanticValueKind::Parameter { .. })
         }
         ValueFlowKind::Receiver => {
-            matches!(source_kind, SemanticValueKind::Receiver)
-                || matches!(target_kind, SemanticValueKind::Receiver)
+            matches!(source_kind, SemanticValueKind::Receiver { .. })
+                || matches!(target_kind, SemanticValueKind::Receiver { .. })
         }
         ValueFlowKind::Return => {
             matches!(source_kind, SemanticValueKind::Return)

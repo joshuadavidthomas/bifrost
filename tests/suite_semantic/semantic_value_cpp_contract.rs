@@ -91,7 +91,7 @@ struct Service {
     let formal_receiver = use_procedure
         .values()
         .iter()
-        .find(|value| value.kind == SemanticValueKind::Receiver)
+        .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         .expect("C++ instance method receiver");
     let input = use_procedure
         .values()

@@ -128,7 +128,7 @@ fn root_evidence(
             .iter()
             .find(|value| match port.kind() {
                 crate::analyzer::semantic::ProcedurePortKind::Receiver => {
-                    value.kind == SemanticValueKind::Receiver
+                    matches!(value.kind, SemanticValueKind::Receiver { .. })
                 }
                 crate::analyzer::semantic::ProcedurePortKind::Parameter { ordinal } => matches!(
                     value.kind,
@@ -499,7 +499,7 @@ fn symbolic_object(
             ProcedurePortHandle::parameter(procedure.clone(), *ordinal)
                 .map_err(|error| internal_contract("invalid parameter object", error))?,
         ),
-        SemanticValueKind::Receiver => AbstractObjectIdentity::ProcedurePort(
+        SemanticValueKind::Receiver { .. } => AbstractObjectIdentity::ProcedurePort(
             ProcedurePortHandle::receiver(procedure.clone())
                 .map_err(|error| internal_contract("invalid receiver object", error))?,
         ),
@@ -1044,7 +1044,7 @@ fn resolve_objects(
                     .map_err(InterruptionOrProvider::Provider)?;
                 open |= !matches!(
                     value_row.kind,
-                    SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver
+                    SemanticValueKind::Parameter { .. } | SemanticValueKind::Receiver { .. }
                 );
                 push_object(&mut drafts, draft.object, draft.evidence);
             } else {

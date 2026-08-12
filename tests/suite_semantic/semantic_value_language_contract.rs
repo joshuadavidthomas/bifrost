@@ -83,7 +83,7 @@ fn assert_value_contract(
     let receiver = procedure
         .values()
         .iter()
-        .find(|value| value.kind == SemanticValueKind::Receiver)
+        .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         .expect("instance method must publish a receiver port");
     let call = procedure
         .call_sites()
@@ -337,7 +337,7 @@ fn assert_receiver_capture(graph: &SemanticGraph) {
     };
     assert_eq!(
         parent.value(captured).unwrap().kind,
-        SemanticValueKind::Receiver
+        SemanticValueKind::Receiver { dispatch: true }
     );
     assert_eq!(
         parent.allocations()[capture.environment.index()].kind,
@@ -1919,7 +1919,7 @@ class Sample {
             factory
                 .values()
                 .iter()
-                .all(|value| value.kind != SemanticValueKind::Receiver),
+                .all(|value| !matches!(value.kind, SemanticValueKind::Receiver { .. })),
             "static methods must not manufacture receiver ports"
         );
     }
@@ -2033,7 +2033,7 @@ class Sample {
         constructor
             .values()
             .iter()
-            .any(|value| value.kind == SemanticValueKind::Receiver),
+            .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. })),
         "instance constructors must publish their receiver port"
     );
     let factory = procedure_named(&csharp, "factory", ProcedureKind::Method);
@@ -2041,7 +2041,7 @@ class Sample {
         factory
             .values()
             .iter()
-            .all(|value| value.kind != SemanticValueKind::Receiver),
+            .all(|value| !matches!(value.kind, SemanticValueKind::Receiver { .. })),
         "static C# methods must not manufacture receiver ports"
     );
     assert_eq!(
@@ -3166,7 +3166,7 @@ class Host {
             procedure
                 .values()
                 .iter()
-                .find(|value| value.kind == SemanticValueKind::Receiver)
+                .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
                 .map(|value| value.id)
                 .unwrap_or_else(|| {
                     panic!(
@@ -3298,7 +3298,7 @@ class Host {
         let outer_receiver = outer
             .values()
             .iter()
-            .find(|value| value.kind == SemanticValueKind::Receiver)
+            .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
             .expect("outer instance method receiver");
         let outer_receiver_flows = outer
             .points()
@@ -3446,7 +3446,7 @@ class Boundary {
                 && procedure
                     .values()
                     .iter()
-                    .any(|value| value.kind == SemanticValueKind::Receiver)
+                    .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         }),
         "the anonymous Java field initializer must own its receiver"
     );
