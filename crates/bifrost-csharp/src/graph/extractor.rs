@@ -1063,6 +1063,7 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
             | "record_declaration"
             | "record_struct_declaration"
             | "method_declaration"
+            | "local_function_statement"
             | "constructor_declaration"
             | "property_declaration"
             | "variable_declarator"
