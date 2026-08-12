@@ -2,8 +2,8 @@ use crate::call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
 };
 use crate::declarations::{
-    cpp_export_macro_token, cpp_field_declaration_linkage, cpp_template_term, node_text,
-    normalize_cpp_whitespace, recovered_exported_class_has_body,
+    cpp_displaced_preprocessor_terminator, cpp_export_macro_token, cpp_field_declaration_linkage,
+    cpp_template_term, node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -6523,7 +6523,9 @@ pub fn preprocessor_conditional_family_range(
     let node = root.descendant_for_byte_range(start_byte, end_byte)?;
     let mut ancestor = Some(node);
     while let Some(current) = ancestor {
-        if is_preprocessor_conditional(current) {
+        if is_preprocessor_conditional(current)
+            && preprocessor_conditional_contains_descendant(current, node)
+        {
             let family = preprocessor_conditional_family_root(current);
             return Some((family.start_byte(), family.end_byte()));
         }
@@ -6535,7 +6537,9 @@ pub fn preprocessor_conditional_family_range(
 fn preprocessor_conditional_family_for_declaration(node: Node<'_>) -> Option<Node<'_>> {
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
-        if is_preprocessor_conditional(current) {
+        if is_preprocessor_conditional(current)
+            && preprocessor_conditional_contains_descendant(current, node)
+        {
             let family = preprocessor_conditional_family_root(current);
             if preprocessor_conditional_family_has_terminal_else(family) {
                 return Some(family);
@@ -6586,6 +6590,7 @@ pub fn preprocessor_guard_environment(
             conditional.kind(),
             "preproc_if" | "preproc_ifdef" | "preproc_elif"
         ) && !is_file_covering_include_guard(conditional, source)
+            && preprocessor_conditional_contains_descendant(conditional, node)
         {
             let guard = preprocessor_guard_for_descendant(conditional, node, source)?;
             match guard {
@@ -6629,6 +6634,14 @@ fn preprocessor_guard_for_descendant(
         guard = guard.negated();
     }
     Some(guard)
+}
+
+fn preprocessor_conditional_contains_descendant(
+    conditional: Node<'_>,
+    descendant: Node<'_>,
+) -> bool {
+    cpp_displaced_preprocessor_terminator(conditional)
+        .is_none_or(|terminator| descendant.start_byte() < terminator.end_byte())
 }
 
 pub fn merge_preprocessor_guards(
@@ -6852,6 +6865,7 @@ fn callable_preprocessor_context_is_visible_for_reference(
         if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
             && !is_file_covering_include_guard(conditional, source)
             && !is_split_cpp_language_linkage_wrapper(conditional, node, source)
+            && preprocessor_conditional_contains_descendant(conditional, node)
         {
             let Some(guard) = preprocessor_guard_for_descendant(conditional, node, source) else {
                 return false;
@@ -8082,8 +8096,12 @@ fn structured_include_path<'a>(path: Node<'_>, source: &'a str) -> Option<&'a st
 }
 
 fn has_preprocessor_conditional_ancestor(mut node: Node<'_>, source: &str) -> bool {
+    let descendant = node;
     while let Some(parent) = node.parent() {
-        if is_preprocessor_conditional(parent) && !is_file_covering_include_guard(parent, source) {
+        if is_preprocessor_conditional(parent)
+            && !is_file_covering_include_guard(parent, source)
+            && preprocessor_conditional_contains_descendant(parent, descendant)
+        {
             return true;
         }
         node = parent;
@@ -10805,6 +10823,71 @@ fn enclosing_cpp_field_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displaced_preprocessor_terminator_bounds_the_real_guard() {
+        let damaged = "#ifndef API_H\n#define API_H\nextern char option_buffer[\n#ifdef FEATURE_X\n    16 +\n#endif\n    1];\n\nvoid target(void);\n#endif\n";
+        let guarded = "#ifdef FEATURE_X\nvoid target(void);\n#endif\n";
+        let parse = |source: &str| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .expect("C++ grammar");
+            parser.parse(source, None).expect("fixture tree")
+        };
+
+        let tree = parse(damaged);
+        let root = tree.root_node();
+        let target = damaged.find("target").expect("target byte");
+        let declaration = root
+            .descendant_for_byte_range(target, target + "target".len())
+            .and_then(|mut node| {
+                loop {
+                    if node.kind() == "declaration" {
+                        break Some(node);
+                    }
+                    node = node.parent()?;
+                }
+            })
+            .expect("declaration after the displaced terminator");
+        let conditional = declaration
+            .parent()
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("damaged inner conditional");
+        let outer = conditional
+            .parent()
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("ordinary outer include guard");
+        let terminator = cpp_displaced_preprocessor_terminator(conditional)
+            .expect("structured displaced #endif");
+        assert_eq!(node_text(terminator, damaged), "#endif");
+        assert!(terminator.end_byte() <= declaration.start_byte());
+        assert!(!preprocessor_conditional_contains_descendant(
+            conditional,
+            declaration
+        ));
+        assert!(cpp_displaced_preprocessor_terminator(outer).is_none());
+        assert!(preprocessor_conditional_contains_descendant(
+            outer,
+            declaration
+        ));
+
+        let tree = parse(guarded);
+        let conditional = tree
+            .root_node()
+            .named_child(0)
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("ordinary conditional");
+        let declaration = conditional
+            .named_children(&mut conditional.walk())
+            .find(|node| node.kind() == "declaration")
+            .expect("guarded declaration");
+        assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
+        assert!(preprocessor_conditional_contains_descendant(
+            conditional,
+            declaration
+        ));
+    }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {
         let mut parser = Parser::new();

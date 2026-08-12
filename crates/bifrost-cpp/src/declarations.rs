@@ -2064,10 +2064,13 @@ impl<'a> CppVisitor<'a> {
                 // else/elif branches are children of the `preproc_if` node, so
                 // recording the openers covers every branch.
                 if matches!(kind, "preproc_if" | "preproc_ifdef" | "preproc_ifndef") {
+                    let mut range = cpp_declaration_range(node);
+                    if let Some(terminator) = cpp_displaced_preprocessor_terminator(node) {
+                        range.end_byte = terminator.end_byte();
+                        range.end_line = terminator.end_position().row + 1;
+                    }
                     self.parsed.record_materialization(
-                        MaterializationRecord::ConfigurationConditional {
-                            range: cpp_declaration_range(node),
-                        },
+                        MaterializationRecord::ConfigurationConditional { range },
                     );
                 }
                 stack.push(CppWork::Container(CppContainer {
@@ -5184,6 +5187,47 @@ fn class_has_displaced_preprocessor_terminator(class_node: Node<'_>) -> bool {
                 })
         })
     })
+}
+
+/// The real `#endif` that tree-sitter consumed inside an error subtree.
+///
+/// A preprocessor directive inside a malformed array bound can cause later
+/// declarations to remain children of the conditional. The non-missing token
+/// still gives the exact structured boundary. Ignore nested conditionals and
+/// select the last error-owned token. Tree-sitter can pair a later outer
+/// `#endif` with this conditional, so the direct terminator is not necessarily
+/// missing.
+pub fn cpp_displaced_preprocessor_terminator<'tree>(
+    conditional: Node<'tree>,
+) -> Option<Node<'tree>> {
+    let mut displaced = None;
+    let mut stack = (0..conditional.child_count())
+        .filter_map(|index| conditional.child(index))
+        .map(|child| (child, false))
+        .collect::<Vec<_>>();
+    while let Some((node, inside_error)) = stack.pop() {
+        if node.kind() == "#endif" && !node.is_missing() && inside_error {
+            if displaced.is_none_or(|current: Node<'_>| node.end_byte() > current.end_byte()) {
+                displaced = Some(node);
+            }
+            continue;
+        }
+        if node != conditional
+            && matches!(
+                node.kind(),
+                "preproc_if" | "preproc_ifdef" | "preproc_ifndef" | "preproc_elif"
+            )
+        {
+            continue;
+        }
+        let inside_error = inside_error || node.kind() == "ERROR";
+        for index in 0..node.child_count() {
+            if let Some(child) = node.child(index) {
+                stack.push((child, inside_error));
+            }
+        }
+    }
+    displaced
 }
 
 fn displaced_fragmented_class_terminator(parent: Node<'_>, error_index: usize) -> bool {

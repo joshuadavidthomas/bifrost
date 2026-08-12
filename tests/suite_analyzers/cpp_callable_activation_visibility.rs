@@ -262,6 +262,60 @@ void caller(void) {
 }
 
 #[test]
+fn c_declaration_after_a_guarded_array_bound_is_not_guarded() {
+    let damaged_header = r#"extern char option_buffer[
+#ifdef FEATURE_X
+    16 +
+#endif
+    1];
+
+void target(void);
+"#;
+    let guarded_header = r#"#ifdef FEATURE_X
+void target(void);
+#endif
+"#;
+    let source = r#"#include "api.h"
+
+void caller(void) {
+    target();
+}
+
+void target(void) {}
+"#;
+
+    for (name, header, expected_status) in [
+        ("repaired_array_bound", damaged_header, "resolved"),
+        ("real_guard", guarded_header, "no_definition"),
+    ] {
+        let project = InlineTestProject::with_language(Language::Cpp)
+            .file("api.h", header)
+            .file("a.c", source)
+            .build();
+        let analyzer = CppAnalyzer::from_project(project.project().clone());
+        let (status, definitions) = definitions_at(
+            &analyzer,
+            location("a.c", source, "    target();", "target"),
+        );
+        assert_eq!(
+            status,
+            expected_status,
+            "{name}: {definitions:?}; records: {:#?}",
+            analyzer.materialization_records(&project.file("api.h"))
+        );
+        if expected_status == "resolved" {
+            assert_eq!(
+                definitions,
+                vec!["a.c#target"],
+                "only the repaired header prototype can activate the later body"
+            );
+        } else {
+            assert!(definitions.is_empty(), "{name}: {definitions:?}");
+        }
+    }
+}
+
+#[test]
 fn cpp_free_and_member_recursion_resolve() {
     // The C++ analyzer shares the same resolver. A member function body sees
     // its own name through the complete class, a free function through its
