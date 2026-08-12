@@ -24,6 +24,7 @@ mod issue_1748_hierarchy_deadline;
 mod issue_1749_rust_macro_wrapped_inverse;
 mod issue_1785_js_file_scope_enclosing;
 mod issue_1786_flow_usage_suppression;
+mod issue_1788_non_js_file_scope_enclosing;
 mod issue_1819_cpp_macro_usages;
 mod issue_1854_scala_enclosing_def_shadow;
 mod issue_1855_scala_site_java_declaration;
