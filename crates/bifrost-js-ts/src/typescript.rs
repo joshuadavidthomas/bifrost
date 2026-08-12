@@ -18,6 +18,7 @@ use crate::imports::{
 use crate::model::*;
 use crate::parse::flow_dialect_blocks_extraction;
 use crate::providers::JsTsSource;
+use crate::syntax::js_program_is_external_module;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, SignatureMetadata};
@@ -38,6 +39,11 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
         return parsed;
     }
     let module = module_code_unit(file);
+    let top_level_field_identity = if js_program_is_external_module(root, source) {
+        file_scoped_field_identity
+    } else {
+        program_scoped_field_identity
+    };
     let mut module_has_imports = false;
     let exported_roots = ts_es_named_exported_roots(root, source);
 
@@ -63,10 +69,26 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
                 visit_ts_export(file, source, child, None, &mut parsed, &exported_roots)
             }
             "ambient_declaration" => {
-                visit_ts_ambient_declarations(file, source, child, None, &mut parsed, false);
+                visit_ts_ambient_declarations(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &mut parsed,
+                    false,
+                    top_level_field_identity,
+                );
             }
             "internal_module" if ts_is_global_internal_module(child, source) => {
-                visit_ts_ambient_declarations(file, source, child, None, &mut parsed, false);
+                visit_ts_ambient_declarations(
+                    file,
+                    source,
+                    child,
+                    None,
+                    &mut parsed,
+                    false,
+                    program_scoped_field_identity,
+                );
             }
             "class_declaration"
             | "abstract_class_declaration"
@@ -94,6 +116,7 @@ pub fn parse_typescript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
                     &mut parsed,
                     false,
                     &exported_roots,
+                    top_level_field_identity,
                 );
             }
             _ => {}
@@ -122,6 +145,7 @@ fn visit_ts_ambient_declarations(
     parent: Option<&CodeUnit>,
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
     exported: bool,
+    top_level_field_identity: TopLevelFieldIdentity,
 ) {
     let definition = if node.kind() == "export_statement" {
         node.child_by_field_name("declaration").unwrap_or(node)
@@ -132,14 +156,30 @@ fn visit_ts_ambient_declarations(
         "ambient_declaration" | "statement_block" => {
             let mut cursor = definition.walk();
             for child in definition.named_children(&mut cursor) {
-                visit_ts_ambient_declarations(file, source, child, parent, parsed, exported);
+                visit_ts_ambient_declarations(
+                    file,
+                    source,
+                    child,
+                    parent,
+                    parsed,
+                    exported,
+                    top_level_field_identity,
+                );
             }
         }
         "internal_module" if ts_is_global_internal_module(definition, source) => {
             if let Some(body) = definition.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.named_children(&mut cursor) {
-                    visit_ts_ambient_declarations(file, source, child, parent, parsed, false);
+                    visit_ts_ambient_declarations(
+                        file,
+                        source,
+                        child,
+                        parent,
+                        parsed,
+                        false,
+                        program_scoped_field_identity,
+                    );
                 }
             }
         }
@@ -162,6 +202,7 @@ fn visit_ts_ambient_declarations(
                 parsed,
                 exported,
                 &HashSet::default(),
+                top_level_field_identity,
             );
         }
         _ => {}
@@ -186,10 +227,26 @@ fn visit_ts_export(
     if let Some(declaration) = node.child_by_field_name("declaration") {
         match declaration.kind() {
             "ambient_declaration" => {
-                visit_ts_ambient_declarations(file, source, declaration, parent, parsed, true);
+                visit_ts_ambient_declarations(
+                    file,
+                    source,
+                    declaration,
+                    parent,
+                    parsed,
+                    true,
+                    file_scoped_field_identity,
+                );
             }
             "internal_module" if ts_is_global_internal_module(declaration, source) => {
-                visit_ts_ambient_declarations(file, source, declaration, parent, parsed, true);
+                visit_ts_ambient_declarations(
+                    file,
+                    source,
+                    declaration,
+                    parent,
+                    parsed,
+                    true,
+                    program_scoped_field_identity,
+                );
             }
             "class_declaration"
             | "abstract_class_declaration"
@@ -245,7 +302,16 @@ fn visit_ts_export(
                         record_named_declarator_exports(source, node, declaration, parsed);
                     }
                 }
-                visit_ts_value(file, source, node, parent, parsed, true, exported_roots);
+                visit_ts_value(
+                    file,
+                    source,
+                    node,
+                    parent,
+                    parsed,
+                    true,
+                    exported_roots,
+                    file_scoped_field_identity,
+                );
             }
             _ => {}
         }
@@ -536,6 +602,7 @@ fn visit_ts_function(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_ts_value(
     file: &ProjectFile,
     source: &str,
@@ -544,6 +611,7 @@ fn visit_ts_value(
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
     exported: bool,
     exported_roots: &HashSet<String>,
+    top_level_field_identity: TopLevelFieldIdentity,
 ) {
     let definition = if node.kind() == "export_statement" {
         node.child_by_field_name("declaration").unwrap_or(node)
@@ -615,7 +683,14 @@ fn visit_ts_value(
             let signature = ts_variable_signature(definition, child, source, exported);
             let range_node = if exported { node } else { definition };
             add_destructured_binder_units(
-                file, source, name_node, range_node, parent, &signature, parsed,
+                file,
+                source,
+                name_node,
+                range_node,
+                parent,
+                &signature,
+                parsed,
+                top_level_field_identity,
             );
             continue;
         }
@@ -638,22 +713,22 @@ fn visit_ts_value(
             if let Some(parent) = parent {
                 format!("{}.{}", parent.short_name(), name)
             } else {
-                file_scoped_field_name(file, &name)
+                top_level_field_identity(file, &name).0
             }
         } else {
             parent
                 .map(|parent| format!("{}.{}", parent.short_name(), name))
                 .unwrap_or_else(|| name.clone())
         };
-        // Mirrors `short_name` above segment-for-segment (see the analogous
-        // javascript `visit_js_variable_statement`).
+        // Mirrors `short_name` above segment-for-segment. Script and module
+        // fields use their program and file identities, respectively.
         let fq = if kind == brokk_bifrost_core::analyzer::model::CodeUnitType::Field {
             match parent {
                 Some(parent) => parent
                     .fq()
                     .clone()
                     .with_pushed(js_ts_segment(&name, SegmentKind::Member)),
-                None => file_scoped_field_fq(file, &name),
+                None => top_level_field_identity(file, &name).1,
             }
         } else {
             match parent {

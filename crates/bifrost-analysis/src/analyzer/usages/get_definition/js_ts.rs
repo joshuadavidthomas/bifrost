@@ -652,11 +652,9 @@ pub(super) fn resolve_js_ts(
 /// scripts that both declare the name really are two contenders, and the shared
 /// outcome machinery calls that Ambiguous (#1811).
 ///
-/// The reach is exactly what the JS/TS indexer gives a bare fq name: a
-/// program-scope function, class, or function-valued binder. A top-level
-/// plain-value `const`/`var` is indexed as the file-scoped field
-/// `<file name>.<name>` instead, so it has no bare fq to look up and stays
-/// invisible across scripts.
+/// The JS/TS indexer gives each program-scope script binding a bare qualified
+/// name. Module fields keep a file-scoped identity and fail the script gate
+/// below.
 fn jsts_script_global_bare_candidates(
     analyzer: &dyn IAnalyzer,
     host: &dyn JsTsSource,

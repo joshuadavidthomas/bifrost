@@ -410,11 +410,13 @@ mod query_content_tests {
 // declarations. `.js` files can be parsed through the TS grammar, so both
 // dialect salts carry the bump; rows persisted before it read every stub as
 // runnable.
+// Salt bumped again (#1862): plain top-level fields in scripts now use the
+// shared program-scope identity. Warm rows used a file-qualified identity.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08"
 );
 // TS salt bumped again (#1167): `is_simple_ts_initializer` now includes
 // `regex` (a regex-initialized binding renders its initializer inline in the
@@ -429,11 +431,13 @@ lang_epoch!(
 // Salt bumped again (#1658): overload signatures and ambient declarations now
 // persist declaration-only signature metadata. Rows written before this change
 // read every stub as runnable behavior, the da26602 regression.
+// Salt bumped again (#1862): plain top-level fields in scripts now use the
+// shared program-scope identity. Warm rows used a file-qualified identity.
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Python `.scm` query assets moved from
 // this crate's `resources/treesitter/python/` into `brokk-bifrost-python`, so

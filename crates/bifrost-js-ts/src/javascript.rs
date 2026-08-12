@@ -18,6 +18,7 @@ use crate::imports::{
 };
 use crate::model::*;
 use crate::parse::flow_dialect_blocks_extraction;
+use crate::syntax::js_program_is_external_module;
 use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ParameterMetadata, SignatureMetadata};
@@ -42,6 +43,11 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
         return parsed;
     }
     let module = module_code_unit(file);
+    let top_level_field_identity = if js_program_is_external_module(root, source) {
+        file_scoped_field_identity
+    } else {
+        program_scoped_field_identity
+    };
     let mut module_has_imports = false;
     let exported_roots = js_exported_binding_roots(root, source);
 
@@ -86,6 +92,7 @@ pub fn parse_javascript_file(file: &ProjectFile, source: &str, tree: &Tree) -> P
                     &mut parsed,
                     false,
                     &exported_roots,
+                    top_level_field_identity,
                 );
             }
             _ => {}
@@ -151,6 +158,7 @@ fn visit_js_export(
                     parsed,
                     true,
                     &HashSet::default(),
+                    file_scoped_field_identity,
                 );
             }
             _ => {}
@@ -529,6 +537,7 @@ fn visit_js_field(
     parsed.add_signature(code_unit, trim_statement(node_text(node, source)));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_js_variable_statement(
     file: &ProjectFile,
     source: &str,
@@ -537,6 +546,7 @@ fn visit_js_variable_statement(
     parsed: &mut brokk_bifrost_core::analyzer::parsed_file::ParsedFile,
     exported: bool,
     exported_roots: &HashSet<String>,
+    top_level_field_identity: TopLevelFieldIdentity,
 ) {
     let definition = if node.kind() == "export_statement" {
         node.child_by_field_name("declaration").unwrap_or(node)
@@ -557,7 +567,14 @@ fn visit_js_variable_statement(
             let signature = js_variable_signature(definition, child, source, exported);
             let range_node = if exported { node } else { definition };
             add_destructured_binder_units(
-                file, source, name_node, range_node, parent, &signature, parsed,
+                file,
+                source,
+                name_node,
+                range_node,
+                parent,
+                &signature,
+                parsed,
+                top_level_field_identity,
             );
             continue;
         }
@@ -582,24 +599,23 @@ fn visit_js_variable_statement(
             if let Some(parent) = parent {
                 format!("{}.{}", parent.short_name(), name)
             } else {
-                file_scoped_field_name(file, name)
+                top_level_field_identity(file, name).0
             }
         } else {
             parent
                 .map(|parent| format!("{}.{}", parent.short_name(), name))
                 .unwrap_or_else(|| name.to_string())
         };
-        // Mirrors `short_name` above segment-for-segment: a Field with no
-        // enclosing scope is qualified by the file-name `Path` prefix (the
-        // structured counterpart of `file_scoped_field_name`); every other
-        // case is a plain `Member` off the parent's `fq` or a fresh chain.
+        // Mirrors `short_name` above segment-for-segment. A top-level script
+        // Field uses the shared program identity. A module Field uses its file
+        // identity. Nested fields stay below their structural parent.
         let fq = if kind == brokk_bifrost_core::analyzer::model::CodeUnitType::Field {
             match parent {
                 Some(parent) => parent
                     .fq()
                     .clone()
                     .with_pushed(js_ts_segment(name, SegmentKind::Member)),
-                None => file_scoped_field_fq(file, name),
+                None => top_level_field_identity(file, name).1,
             }
         } else {
             match parent {
