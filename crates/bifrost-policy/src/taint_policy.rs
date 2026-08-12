@@ -613,7 +613,30 @@ impl<'a> TaintPolicyCompiler<'a> {
         // that reaches it (#1936).
         let mut materialization = DiscoveryMaterializationCache::default();
         for root in roots {
-            discoveries.push(self.discover_value_flow(&root, &mut materialization)?);
+            // Each region is an independent source-to-sink analysis, so budget
+            // it independently rather than accumulating every region's
+            // materialization into one shared cap (which makes a corpus abstain
+            // by accumulation). The shared `materialization` cache keeps
+            // cross-region work amortized, so a region's fresh budget only
+            // accounts for the procedures it newly pulls.
+            self.selectors.reset_region_semantic_budget();
+            match self.discover_value_flow(&root, &mut materialization) {
+                Ok(discovery) => discoveries.push(discovery),
+                Err(error) if is_region_budget_exhausted(&error) => {
+                    // This root's forward closure did not fit its own per-region
+                    // budget. `discover_value_flow` errors on exhaustion instead
+                    // of truncating, so the region is complete-or-absent: there
+                    // is no partial region to solve. Skipping it is honest -- the
+                    // root's file simply has no covering region, so any source or
+                    // sink it holds reports `not_analyzed`, never a false clean
+                    // (the scoreboard already treats an uncovered file as an
+                    // abstain). Regions that fit their budget are unaffected, so
+                    // one oversized root -- typically a high call-graph entry
+                    // whose closure spans the workspace -- no longer aborts the
+                    // whole compile and drops every later region (#1936).
+                }
+                Err(error) => return Err(error),
+            }
         }
         // Keep only regions that contain both a selected source and a selected
         // sink: those are the regions where a flow can exist, and each becomes
@@ -2551,6 +2574,19 @@ fn query_budget_error(
         completion: CodeQueryCompletion::Incomplete { codes: vec![code] },
         detail: detail.into(),
     }
+}
+
+/// True when a compile error is a per-region semantic-budget exhaustion, the one
+/// error the discovery loop recovers from by skipping the oversized root rather
+/// than aborting the whole compile (#1936). Every other error still propagates.
+fn is_region_budget_exhausted(error: &TaintPolicyCompileError) -> bool {
+    matches!(
+        error,
+        TaintPolicyCompileError::QueryIncomplete {
+            completion: CodeQueryCompletion::Incomplete { codes },
+            ..
+        } if codes.contains(&CodeQueryDiagnosticCode::SemanticBudgetExhausted)
+    )
 }
 
 fn taint_selector_error(

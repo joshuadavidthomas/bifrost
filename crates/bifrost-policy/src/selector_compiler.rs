@@ -58,6 +58,18 @@ pub(super) struct PolicySelectorSession<'a> {
     semantic_execution_budget: SemanticExecutionBudget,
     query_work: CodeQueryExecutionWork,
     artifacts: HashMap<ProjectFile, Arc<SemanticArtifact>>,
+    materialized_files_limit: usize,
+    // Semantic work retired by prior regions. `reset_region_semantic_budget`
+    // replaces the live budgets, so their `used`/`work` counters only reflect
+    // the current region; without this the reported work would collapse to the
+    // last region's consumption. Accumulating the consumed counters here keeps
+    // the compile-wide work report accurate. The materialization cache charges
+    // each distinct file once, in whichever region first pulls it, so summing
+    // per-region charges still totals distinct materializations, not duplicates.
+    retired_program_points: usize,
+    retired_source_bytes: usize,
+    retired_materialized_files: usize,
+    retired_traversal_steps: usize,
 }
 
 impl<'a> PolicySelectorSession<'a> {
@@ -68,6 +80,21 @@ impl<'a> PolicySelectorSession<'a> {
         max_selector_results: usize,
         cancellation: &'a CancellationToken,
     ) -> Self {
+        // Size the materialized-file budget to the workspace, not the fixed
+        // per-query IDE cap. That cap bounds how much a single interactive query
+        // loads; a policy compile is a whole-workspace analysis that must reach
+        // every source and sink, so on a corpus larger than the cap the endpoint
+        // enumeration exhausts it before discovery even begins and the whole
+        // compile abstains (#1936). The content-keyed materialization cache makes
+        // the real cost proportional to distinct files, which cannot exceed the
+        // project file count, so this is a principled bound rather than an
+        // uncapped one. `max` keeps the per-query default as the floor, so a
+        // small workspace is unaffected. The per-region traversal budget, reset
+        // in `reset_region_semantic_budget`, still bounds each region's work.
+        let materialized_files_limit = query_limits
+            .semantic
+            .max_materialized_files
+            .max(workspace.project_file_count());
         Self {
             workspace,
             analysis,
@@ -77,12 +104,53 @@ impl<'a> PolicySelectorSession<'a> {
             semantic_budget: SemanticBudget::new(semantic_work_limits(query_limits.semantic))
                 .expect("validated CodeQuery semantic limits are positive"),
             semantic_execution_budget: SemanticExecutionBudget::new(
-                query_limits.semantic.max_materialized_files,
+                materialized_files_limit,
                 query_limits.semantic.max_traversal_steps,
             ),
             query_work: CodeQueryExecutionWork::default(),
             artifacts: HashMap::new(),
+            materialized_files_limit,
+            retired_program_points: 0,
+            retired_source_bytes: 0,
+            retired_materialized_files: 0,
+            retired_traversal_steps: 0,
         }
+    }
+
+    /// Reset the semantic and execution budgets to their per-region starting
+    /// limits.
+    ///
+    /// Require-model taint discovers and solves each source-to-sink region
+    /// independently (#1935). Charging every region against one shared budget
+    /// makes an N-file corpus abstain by accumulation, even though each region's
+    /// own materialization is small: at corpus scale the shared `nested_entries`
+    /// lane crosses its cap after ~76 files and the whole compile aborts.
+    /// Resetting per region bounds each region on its own and lets independent
+    /// flows all be analyzed. The shared materialization caches (the `#1936`
+    /// discovery cache and the semantic artifact cache) are untouched, so
+    /// cross-region work stays amortized and each region's budget only accounts
+    /// for the material it newly pulls.
+    pub(super) fn reset_region_semantic_budget(&mut self) {
+        // Retire the finishing region's consumed work before the counters are
+        // discarded, so the compile-wide work report stays a running total.
+        let used = self.semantic_budget.used();
+        self.retired_program_points = self.retired_program_points.saturating_add(used.program_points);
+        self.retired_source_bytes = self.retired_source_bytes.saturating_add(used.source_bytes);
+        let execution = self.semantic_execution_budget.work();
+        self.retired_materialized_files = self
+            .retired_materialized_files
+            .saturating_add(execution.materialized_files);
+        self.retired_traversal_steps = self
+            .retired_traversal_steps
+            .saturating_add(execution.traversal_steps);
+
+        self.semantic_budget =
+            SemanticBudget::new(semantic_work_limits(self.query_limits.semantic))
+                .expect("validated CodeQuery semantic limits are positive");
+        self.semantic_execution_budget = SemanticExecutionBudget::new(
+            self.materialized_files_limit,
+            self.query_limits.semantic.max_traversal_steps,
+        );
     }
 
     pub(super) fn select(
@@ -268,28 +336,33 @@ impl<'a> PolicySelectorSession<'a> {
     }
 
     pub(super) fn work_report(&self, analysis: &str) -> PolicyWorkReport {
+        // Report retired regions' work plus the live region's, so per-region
+        // budget resets do not hide the compile's cumulative semantic cost.
         let semantic = self.semantic_budget.used();
         let execution = self.semantic_execution_budget.work();
         let metrics = [
             (
                 "semantic_materialized_files",
                 PolicyWorkUnit::Count,
-                execution.materialized_files,
+                self.retired_materialized_files
+                    .saturating_add(execution.materialized_files),
             ),
             (
                 "semantic_traversal_steps",
                 PolicyWorkUnit::Count,
-                execution.traversal_steps,
+                self.retired_traversal_steps
+                    .saturating_add(execution.traversal_steps),
             ),
             (
                 "semantic_source_bytes",
                 PolicyWorkUnit::Bytes,
-                semantic.source_bytes,
+                self.retired_source_bytes.saturating_add(semantic.source_bytes),
             ),
             (
                 "semantic_program_points",
                 PolicyWorkUnit::Rows,
-                semantic.program_points,
+                self.retired_program_points
+                    .saturating_add(semantic.program_points),
             ),
         ]
         .into_iter()
