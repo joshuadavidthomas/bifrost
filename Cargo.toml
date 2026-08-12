@@ -155,6 +155,8 @@ zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
 [features]
 default = []
+# CI-only mode that changes internal hash tables to randomly seeded tables.
+randomized-hash = ["brokk-bifrost-analysis/randomized-hash"]
 # Semantic search: brokkai/Muninn embeddings via the PyTorch SDPA sidecar.
 # Opt in with `--features nlp`. Acceleration (CUDA/Metal) is selected inside the sidecar
 # at runtime — no compile-time backend features needed.

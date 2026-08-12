@@ -75,6 +75,8 @@ zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
 [features]
 default = []
+# Propagates the CI-only hash-order check through the analysis graph.
+randomized-hash = ["brokk-bifrost-core/randomized-hash"]
 # Deliberately no `nlp` feature: semantic search is its own crate
 # (brokk-bifrost-nlp), so turning it on cannot change this crate's fingerprint
 # and cannot force a rebuild of the workspace's largest compilation unit.

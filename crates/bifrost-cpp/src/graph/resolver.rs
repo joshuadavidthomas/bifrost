@@ -11,6 +11,7 @@ use crate::graph_support::CppSource;
 use crate::imports::{
     IncludeTargetIndex, include_paths as cpp_include_paths, resolve_include_targets_with_index,
 };
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
     CallableArity, CodeUnitType, CppFieldLinkage, CppTemplateExpression, CppTemplateMetadata,
     CppTemplateParameterMetadata, CppTemplateTerm,
@@ -26,6 +27,7 @@ use std::borrow::Cow;
 #[cfg(any(test, feature = "test-support"))]
 use std::cell::Cell;
 use std::cell::OnceCell;
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::BTreeSet;
 use std::hash::Hash;
 #[cfg(any(test, feature = "test-support"))]
@@ -5680,7 +5682,41 @@ fn sort_lookup_units(units: &mut [CodeUnit]) {
             .cmp(&right.fq_name())
             .then_with(|| left.signature().cmp(&right.signature()))
             .then_with(|| left.source().cmp(right.source()))
+            .then_with(|| left.kind().cmp(&right.kind()))
+            .then_with(|| {
+                left.package_segment_count()
+                    .cmp(&right.package_segment_count())
+            })
+            .then_with(|| left.is_synthetic().cmp(&right.is_synthetic()))
+            .then_with(|| stable_fq_name_cmp(left.fq(), right.fq()))
     });
+}
+
+fn stable_fq_name_cmp(left: &FqName, right: &FqName) -> CmpOrdering {
+    let interner = segment_interner();
+    for (&left_id, &right_id) in left.segments().iter().zip(right.segments()) {
+        let (left_text, left_kind) = interner.resolve(left_id);
+        let (right_text, right_kind) = interner.resolve(right_id);
+        let order = left_text
+            .cmp(right_text)
+            .then_with(|| segment_kind_order(left_kind).cmp(&segment_kind_order(right_kind)));
+        if order != CmpOrdering::Equal {
+            return order;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+const fn segment_kind_order(kind: SegmentKind) -> u8 {
+    match kind {
+        SegmentKind::Path => 0,
+        SegmentKind::Package => 1,
+        SegmentKind::Type => 2,
+        SegmentKind::Companion => 3,
+        SegmentKind::Nested => 4,
+        SegmentKind::Member => 5,
+        SegmentKind::Unknown => 6,
+    }
 }
 
 fn dedup_unit_refs(units: &mut Vec<&CodeUnit>) {
@@ -10823,6 +10859,78 @@ fn enclosing_cpp_field_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_lookup_units_totally_orders_every_identity_field() {
+        let file = ProjectFile::new(std::env::temp_dir(), "issue_1876.cpp");
+        let base = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Function,
+            "scope",
+            "value",
+            Some("()".to_string()),
+            false,
+        );
+        let different_kind = CodeUnit::with_signature(
+            file.clone(),
+            CodeUnitType::Field,
+            "scope",
+            "value",
+            Some("()".to_string()),
+            false,
+        );
+        let synthetic = base.with_synthetic(true);
+
+        let interner = segment_interner();
+        let mut member_fq = FqName::new();
+        member_fq.push(interner.intern("scope", SegmentKind::Package));
+        member_fq.push(interner.intern("value", SegmentKind::Member));
+        let different_package_boundary = CodeUnit::from_fq(
+            file.clone(),
+            CodeUnitType::Function,
+            member_fq,
+            0,
+            Some("()".to_string()),
+            false,
+        );
+
+        let mut unknown_fq = FqName::new();
+        unknown_fq.push(interner.intern("scope", SegmentKind::Package));
+        unknown_fq.push(interner.intern("value", SegmentKind::Unknown));
+        let different_segment_kind = CodeUnit::from_fq(
+            file,
+            CodeUnitType::Function,
+            unknown_fq,
+            1,
+            Some("()".to_string()),
+            false,
+        );
+
+        let input = vec![
+            base,
+            different_kind,
+            synthetic,
+            different_package_boundary,
+            different_segment_kind,
+        ];
+        let mut expected = input.clone();
+        sort_lookup_units(&mut expected);
+        assert!(expected.windows(2).all(|pair| {
+            let mut ordered = pair.to_vec();
+            sort_lookup_units(&mut ordered);
+            ordered == pair && pair[0] != pair[1]
+        }));
+
+        let mut reversed = input.clone();
+        reversed.reverse();
+        sort_lookup_units(&mut reversed);
+        assert_eq!(reversed, expected);
+
+        let mut rotated = input;
+        rotated.rotate_left(2);
+        sort_lookup_units(&mut rotated);
+        assert_eq!(rotated, expected);
+    }
 
     #[test]
     fn displaced_preprocessor_terminator_bounds_the_real_guard() {
