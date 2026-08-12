@@ -16,7 +16,8 @@ After this change, Go, Ruby, PHP, Java, and Kotlin keep that reference. They att
 - [x] (2026-08-12) Confirmed C# rejects the same file in `prepare_file` before hit construction.
 - [x] (2026-08-12) Confirmed Python has no indexed import edge for the rejected file, so target binding stops before hit construction.
 - [x] (2026-08-12) Ran the #1788 and #1785 tests, formatting, and targeted Clippy.
-- [ ] Commit, integrate origin/master, push, close #1788, and record the final result.
+- [x] (2026-08-12) Committed as `e1b9115e`, integrated origin/master, and pushed.
+- [ ] Close #1788 after this final plan update reaches origin/master.
 
 ## Surprises & Discoveries
 
@@ -52,9 +53,9 @@ After this change, Go, Ruby, PHP, Java, and Kotlin keep that reference. They att
 
 ## Outcomes & Retrospective
 
-The implementation is complete. Go, Ruby, PHP, Java, and Kotlin now retain references from explicit unindexed candidates. Each hit uses the shared file-scope identity. Indexed controls keep their callable owner. C# and Python stop before hit construction, so their builders did not change.
+The implementation is complete and pushed as `e1b9115e`. Go, Ruby, PHP, Java, and Kotlin now retain references from explicit unindexed candidates. Each hit uses the shared file-scope identity. Indexed controls keep their callable owner. C# and Python stop before hit construction, so their builders did not change.
 
-The #1788 test passed for all five reachable languages. Both #1785 JavaScript controls passed. Formatting, five language-crate Clippy checks, and `suite_usages` Clippy passed with warnings denied. Commit, integration, push, and issue closure remain.
+The #1788 test passed for all five reachable languages. Both #1785 JavaScript controls passed. Formatting, five language-crate Clippy checks, and `suite_usages` Clippy passed with warnings denied. Only issue closure remains.
 
 ## Context and Orientation
 
@@ -121,3 +122,5 @@ Plan revision, 2026-08-12: Removed C# from the implementation after a production
 Plan revision, 2026-08-12: Removed Python after the production query proved that missing import edges stop target binding before hit construction.
 
 Plan revision, 2026-08-12: Recorded the completed implementation and focused validation before delivery.
+
+Plan revision, 2026-08-12: Recorded commit `e1b9115e` and its push to origin/master.
