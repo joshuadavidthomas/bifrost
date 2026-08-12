@@ -400,8 +400,7 @@ impl TargetSpec {
         if target.is_function() {
             // Free functions declared inside a namespace have a module owner; that namespace is
             // not a call receiver, so resolve them as free functions rather than methods.
-            let owner_resolution = type_owner_resolution(analyzer, target)
-                .or_else(|| target_forward_owner_resolution(analyzer, target));
+            let owner_resolution = target_type_owner_resolution(analyzer, target);
             let owner_is_forward_declaration = owner_resolution
                 .as_ref()
                 .is_some_and(|owner| owner.is_forward_declaration);
@@ -10034,6 +10033,16 @@ fn type_owner_resolution(
     precise_parent_resolution(analyzer, code_unit).filter(|owner| !owner.unit.is_module())
 }
 
+fn target_type_owner_resolution(
+    analyzer: &CppGraphSource<'_>,
+    code_unit: &CodeUnit,
+) -> Option<ResolvedTypeOwner> {
+    match type_owner_resolution(analyzer, code_unit) {
+        Some(owner) if !owner.is_forward_declaration => Some(owner),
+        Some(_) | None => target_forward_owner_resolution(analyzer, code_unit),
+    }
+}
+
 /// Recover method identity for an indexed out-of-line definition when the
 /// analyzer has retained only its unique include-visible class forward
 /// declaration. This is deliberately target-only: canonical declaration
@@ -10144,13 +10153,13 @@ fn precise_parent_resolution(
                     unit: owner,
                     is_forward_declaration: false,
                 }),
-                FullOwnerResolution::None if forwards.len() == 1 => {
-                    forwards.into_iter().next().map(|unit| ResolvedTypeOwner {
+                FullOwnerResolution::None => {
+                    unique_logical_forward_owner(forwards).map(|unit| ResolvedTypeOwner {
                         unit,
                         is_forward_declaration: true,
                     })
                 }
-                FullOwnerResolution::None | FullOwnerResolution::Ambiguous => None,
+                FullOwnerResolution::Ambiguous => None,
             }
         }
         DirectOwnerResolution::None => {
@@ -10366,14 +10375,7 @@ pub fn collapse_owner_candidates(
                 return DirectOwnerResolution::Ambiguous;
             }
             CppClassDeclarationStrength::Full => full_definition = Some(candidate),
-            CppClassDeclarationStrength::Forward => {
-                let duplicate = forwards
-                    .iter()
-                    .any(|forward| same_logical_symbol(forward, &candidate));
-                if !duplicate {
-                    forwards.push(candidate);
-                }
-            }
+            CppClassDeclarationStrength::Forward => forwards.push(candidate),
             CppClassDeclarationStrength::Unknown => return DirectOwnerResolution::Ambiguous,
         }
     }
@@ -10384,6 +10386,19 @@ pub fn collapse_owner_candidates(
     } else {
         DirectOwnerResolution::None
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn unique_logical_forward_owner_for_test(forwards: Vec<CodeUnit>) -> Option<CodeUnit> {
+    unique_logical_forward_owner(forwards)
+}
+
+fn unique_logical_forward_owner(mut forwards: Vec<CodeUnit>) -> Option<CodeUnit> {
+    let first = forwards.pop()?;
+    forwards
+        .iter()
+        .all(|forward| same_logical_symbol(forward, &first))
+        .then_some(first)
 }
 
 pub fn cpp_class_declaration_strength(

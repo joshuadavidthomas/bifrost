@@ -1083,7 +1083,7 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
-    fn owner_candidate_collapse_deduplicates_same_logical_forward_owner() {
+    fn precise_parent_forward_owner_deduplicates_one_logical_class() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let first = CodeUnit::new(
@@ -1105,22 +1105,20 @@ ABSL_NAMESPACE_END
             "encoder",
         );
 
+        assert_eq!(
+            unique_logical_forward_owner_for_test(vec![first.clone(), second.clone()]),
+            Some(second.clone())
+        );
+        assert_eq!(
+            unique_logical_forward_owner_for_test(vec![first, other]),
+            None
+        );
+
         assert!(matches!(
             collapse_owner_candidates(
                 [
-                    (first.clone(), CppClassDeclarationStrength::Forward),
                     (second.clone(), CppClassDeclarationStrength::Forward),
-                ]
-                .into_iter()
-            ),
-            DirectOwnerResolution::ForwardsOnly(forwards)
-                if forwards == vec![first]
-        ));
-        assert!(matches!(
-            collapse_owner_candidates(
-                [
                     (second, CppClassDeclarationStrength::Forward),
-                    (other, CppClassDeclarationStrength::Forward),
                 ]
                 .into_iter()
             ),
