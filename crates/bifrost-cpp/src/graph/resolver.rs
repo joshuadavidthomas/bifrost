@@ -3562,6 +3562,46 @@ impl<'a> VisibilityIndex<'a> {
         LexicalTypeResolution::Missing
     }
 
+    /// Resolve a base class through its injected class name at the nearest
+    /// inheritance tier. Distinct same-named bases at that tier are ambiguous.
+    pub fn inherited_injected_class_owner(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        enclosing_owner: &CodeUnit,
+        injected_name: &str,
+    ) -> Option<CodeUnit> {
+        let hierarchy = analyzer.type_hierarchy_provider()?;
+        let mut frontier = hierarchy.get_direct_ancestors(enclosing_owner);
+        let mut visited = HashSet::default();
+        while !frontier.is_empty() {
+            let mut level_matches = Vec::new();
+            let mut next_frontier = Vec::new();
+            for raw_owner in frontier {
+                let owner = self.canonical_visible_full_type_unit(analyzer, file, &raw_owner)?;
+                if !visited.insert(owner.clone()) {
+                    continue;
+                }
+                if owner.identifier() == injected_name
+                    && !level_matches
+                        .iter()
+                        .any(|existing| same_logical_symbol(existing, &owner))
+                {
+                    level_matches.push(owner.clone());
+                }
+                next_frontier.extend(hierarchy.get_direct_ancestors(&owner));
+            }
+            if let Some(first) = level_matches.first() {
+                return level_matches
+                    .iter()
+                    .all(|candidate| same_logical_symbol(candidate, first))
+                    .then(|| first.clone());
+            }
+            frontier = next_frontier;
+        }
+        None
+    }
+
     /// The one type the candidates name under `resolution`, or why they do not
     /// name one. The two preserving modes only ever reject candidates that
     /// disagree with each other, which is ambiguity; canonicalization can also

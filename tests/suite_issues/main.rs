@@ -49,6 +49,7 @@ mod issue_1833_cpp_template_derived_bases;
 mod issue_1835_cpp_using_declaration_overloads;
 mod issue_1836_cpp_resolution_determinism;
 mod issue_1838_cpp_callable_data_member;
+mod issue_1838_cpp_inherited_nested_type;
 mod issue_1838_cpp_operator_member_pointer;
 mod issue_1838_cpp_qualified_callable_value;
 mod issue_1839_scan_usages_resolution_budget;

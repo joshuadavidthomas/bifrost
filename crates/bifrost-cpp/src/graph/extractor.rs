@@ -920,6 +920,11 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     }
     if !recovered_type && is_nested_type_node(node) {
+        if let Some(hit) = target_guided_nested_type_terminal_hit(node, ctx) {
+            *ctx.raw_match_count += 1;
+            push_type_hit(hit, ctx);
+            return;
+        }
         // A concrete template specialization can be absent from the coarse
         // per-file component-name index: that index contains the primary name
         // while this recovered child may expose only the malformed template
@@ -1329,6 +1334,78 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             push_unproven_hit(hit_node, ctx);
         }
     }
+}
+
+/// Resolve the terminal of `Owner::Nested` when the owner name reaches a base
+/// class through C++ inherited-type lookup. The complete type lookup cannot
+/// express that injected owner as its first qualified component, but the owner
+/// prefix can. Keep the complete reference range after the owner proves the
+/// target's direct nested declaration.
+fn target_guided_nested_type_terminal_hit<'tree>(
+    node: Node<'tree>,
+    ctx: &ScanCtx<'_>,
+) -> Option<Node<'tree>> {
+    let qualified = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_type_identifier"
+        ) && parent.child_by_field_name("name") == Some(node)
+    })?;
+    let owner = qualified_owner_components(qualified, ctx.source)?;
+    let mut complete = qualified;
+    while let Some(parent) = complete.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_type_identifier"
+        )
+    }) {
+        complete = parent;
+    }
+
+    if let LexicalTypeResolution::Resolved {
+        unit, candidates, ..
+    } = resolve_type_node_lexically_for_target(
+        complete,
+        &ctx.analyzer,
+        ctx.visibility,
+        &ctx.ordinary_type_imports,
+        ctx.file,
+        ctx.source,
+        &ctx.spec.target,
+        Some(&ctx.lexical_scope_cache),
+        ctx.recovered_sentinel_scope(complete).as_deref(),
+    ) && type_resolution_matches_target(complete, &unit, &candidates, ctx)
+    {
+        return None;
+    }
+
+    let enclosing_owner = structured_enclosing_owner(node, ctx)?;
+    let lexical_scope = canonical_cpp_scope_components(&enclosing_owner);
+    let owner_resolution = ctx.visibility.resolve_type_components_lexically(
+        &ctx.analyzer,
+        ctx.file,
+        &owner.names,
+        owner.global,
+        &lexical_scope,
+    );
+    let owner_unit = match owner_resolution {
+        LexicalTypeResolution::Resolved { unit, .. } => unit,
+        LexicalTypeResolution::Missing if !owner.global && owner.names.len() == 1 => {
+            ctx.visibility.inherited_injected_class_owner(
+                &ctx.analyzer,
+                ctx.file,
+                &enclosing_owner,
+                owner.names.first()?,
+            )?
+        }
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => return None,
+    };
+    let name = node_text(node, ctx.source);
+    ctx.visibility
+        .visible_members_for_owner_name(ctx.file, &owner_unit, name)
+        .into_iter()
+        .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+        .then_some(complete)
 }
 
 fn push_guarded_owner_hit(
@@ -3236,45 +3313,15 @@ fn inherited_injected_class_qualifier_scope<'tree>(
         return None;
     }
     let enclosing_owner = structured_enclosing_owner(node, ctx)?;
-    let hierarchy = ctx.analyzer.type_hierarchy_provider()?;
-    let mut frontier = hierarchy.get_direct_ancestors(&enclosing_owner);
-    let mut visited = HashSet::default();
-    while !frontier.is_empty() {
-        let mut level_matches = Vec::new();
-        let mut next_frontier = Vec::new();
-        for raw_owner in frontier {
-            let owner = ctx.visibility.canonical_visible_full_type_unit(
-                &ctx.analyzer,
-                ctx.file,
-                &raw_owner,
-            )?;
-            if !visited.insert(owner.clone()) {
-                continue;
-            }
-            if owner.identifier() == injected_name
-                && !level_matches
-                    .iter()
-                    .any(|existing| same_logical_symbol(existing, &owner))
-            {
-                level_matches.push(owner.clone());
-            }
-            next_frontier.extend(hierarchy.get_direct_ancestors(&owner));
-        }
-        if let Some(first) = level_matches.first() {
-            if level_matches
-                .iter()
-                .all(|candidate| same_logical_symbol(candidate, first))
-                && same_visible_symbol(first, &ctx.spec.target)
-            {
-                return qualified.nodes.first().copied();
-            }
-            // A distinct matching base at the nearest hierarchy tier makes
-            // the injected class name ambiguous and hides deeper tiers.
-            return None;
-        }
-        frontier = next_frontier;
-    }
-    None
+    let owner = ctx.visibility.inherited_injected_class_owner(
+        &ctx.analyzer,
+        ctx.file,
+        &enclosing_owner,
+        injected_name,
+    )?;
+    same_visible_symbol(&owner, &ctx.spec.target)
+        .then(|| qualified.nodes.first().copied())
+        .flatten()
 }
 
 /// Resolve each qualified type component against the inverse target while
