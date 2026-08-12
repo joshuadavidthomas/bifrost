@@ -459,9 +459,19 @@ pub static PYTHON_MATERIALIZATION_SUPPORT: DeclarationMaterializationSupport =
 /// JS/TS: default exports (named and anonymous), named exports, and CommonJS
 /// `module.exports` roots and members are export rows, and every declared unit
 /// can state its origin (a CommonJS member is a generated declaration).
+///
+/// TypeScript overload signatures and ambient declarations are
+/// declaration-only signature rows (#1658, the da26602 shape). Unlike Python,
+/// TypeScript merges every overload signature and the implementation of one
+/// callable into a single unit, so a stub with an implementation is one
+/// runnable unit rather than a stub-to-implementation link, and the
+/// declaration-only units the linkage axis reports are exactly the ones whose
+/// implementation is an explicit absence (ambient declarations, orphan
+/// overload sets).
 pub static JS_TS_MATERIALIZATION_SUPPORT: DeclarationMaterializationSupport =
     DeclarationMaterializationSupport::NONE
         .supported(MaterializationAxis::DeclarationState)
+        .supported(MaterializationAxis::ImplementationLinkage)
         .supported(MaterializationAxis::Exports);
 
 /// C++: `#define` sites materialize macro units (generation with exact sets),
@@ -580,7 +590,7 @@ mod tests {
         expect(
             &JS_TS_MATERIALIZATION_SUPPORT,
             "js_ts",
-            &[DeclarationState, Exports],
+            &[DeclarationState, ImplementationLinkage, Exports],
         );
         expect(
             &CPP_MATERIALIZATION_SUPPORT,

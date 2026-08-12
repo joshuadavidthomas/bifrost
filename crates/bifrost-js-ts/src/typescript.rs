@@ -526,7 +526,10 @@ fn visit_ts_function(
         SignatureMetadata::with_parameter_labels(
             signature,
             ts_parameter_labels(definition, source),
-        ),
+        )
+        // An overload signature or ambient declaration has no body and must
+        // never be treated as runnable behavior (#1658, the da26602 shape).
+        .with_declaration_only(definition.kind() == "function_signature"),
     );
     visit_ts_return_object_literal_properties(
         file, source, definition, &code_unit, &top_level, parsed,
@@ -1291,9 +1294,20 @@ fn visit_ts_method(
         ),
         _ => trim_statement(node_text(node, source).split('{').next().unwrap_or("")),
     };
+    // A bodiless `method_signature` in a class body is an overload signature
+    // (or an ambient member): declaration-only, like `function_signature` at
+    // file scope. The same node kind inside an `interface_body` is a contract
+    // member, not a stub awaiting a same-name implementation, and an
+    // `abstract_method_signature` is implemented under a subclass identity;
+    // neither is marked.
+    let declaration_only = node.kind() == "method_signature"
+        && node
+            .parent()
+            .is_some_and(|body| body.kind() == "class_body");
     parsed.add_signature_with_metadata(
         code_unit,
-        SignatureMetadata::with_parameter_labels(signature, ts_parameter_labels(node, source)),
+        SignatureMetadata::with_parameter_labels(signature, ts_parameter_labels(node, source))
+            .with_declaration_only(declaration_only),
     );
     if member_name == "constructor" {
         visit_ts_constructor_assigned_fields(file, source, node, parent, top_level, parsed);

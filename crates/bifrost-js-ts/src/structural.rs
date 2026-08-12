@@ -110,6 +110,12 @@ pub const TS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!(
     ("type_alias_declaration", NormalizedKind::Declaration),
     ("type_identifier", NormalizedKind::Identifier),
     ("nested_identifier", NormalizedKind::Identifier),
+    // Bodiless callable declarations: overload signatures, ambient
+    // declarations, interface members, and abstract methods (#1658). They
+    // are declarations, so their nodes are facts a query can address.
+    ("function_signature", NormalizedKind::Function),
+    ("method_signature", NormalizedKind::Method),
+    ("abstract_method_signature", NormalizedKind::Method),
 );
 
 fn node_text<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
@@ -216,6 +222,7 @@ static JS_TS_OCCURRENCE_ROLE_SUPPORT: OccurrenceRoleSupport = OccurrenceRoleSupp
 
 const JS_TS_DECLARATION_HEADS: &[&str] = &[
     "function_declaration",
+    "function_signature",
     "generator_function_declaration",
     "function_expression",
     "generator_function",
