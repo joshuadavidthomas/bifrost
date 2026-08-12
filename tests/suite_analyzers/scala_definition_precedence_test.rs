@@ -1486,6 +1486,7 @@ object Consumer {
 
   def generic[ParameterCollision](value: ParameterCollision): ParameterCollision = value
 }
+
 "#;
     let project = InlineTestProject::with_language(Language::Scala)
         .file("app/App.scala", source)
@@ -1508,6 +1509,43 @@ object Consumer {
         assert_eq!(result["status"], "no_definition", "{value}");
         assert_eq!(
             result["diagnostics"][0]["kind"], "local_type_binding",
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn scala_type_parameter_binders_are_declaration_sites() {
+    let source = r#"package app
+class F
+class S
+class T
+class JsonFactory
+object Consumer {
+  def objectMapper[F <: JsonFactory, S](value: F): F = value
+}
+trait Variance[+T, -S]
+"#;
+    let project = InlineTestProject::with_language(Language::Scala)
+        .file("app/App.scala", source)
+        .build();
+    let references = [
+        source.find("[F <:").expect("first invariant binder") + 1,
+        source.find(", S]").expect("second invariant binder") + 2,
+        source.find("[+T").expect("covariant binder") + 2,
+        source.find(", -S").expect("contravariant binder") + 3,
+    ]
+    .map(|offset| location_at(source, offset));
+    let value = call_search_tool_json(
+        project.root(),
+        "get_definitions_by_location",
+        &json!({"references": references}).to_string(),
+    );
+
+    for result in value["results"].as_array().expect("definition results") {
+        assert_eq!(result["status"], "no_definition", "{value}");
+        assert_eq!(
+            result["diagnostics"][0]["kind"], "declaration_or_import_site",
             "{value}"
         );
     }
@@ -3053,6 +3091,7 @@ final class Consumer {
 import external.syntax.all.*
 sealed trait ForgeType
 object ForgeType { val all: List[ForgeType] = Nil }
+object UseExternal { val total = count("*") }
 "#;
     let project = InlineTestProject::with_language(Language::Scala)
         .file("app/Use.scala", source)
@@ -3072,6 +3111,13 @@ object ForgeType { val all: List[ForgeType] = Nil }
             "app/ForgeType.scala",
             forge_source,
             forge_source.find("all.*").expect("external wildcard owner"),
+        ),
+        location_in(
+            "app/ForgeType.scala",
+            forge_source,
+            forge_source
+                .find("count(\"*\")")
+                .expect("external lowercase call"),
         ),
         location_in(
             "app/Use.scala",
@@ -3130,10 +3176,10 @@ object ForgeType { val all: List[ForgeType] = Nil }
         &json!({"references": references}).to_string(),
     );
     let results = value["results"].as_array().expect("definition results");
-    for result in &results[..2] {
+    for result in &results[..3] {
         assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
     }
-    for (result, expected) in results[2..].iter().zip([
+    for (result, expected) in results[3..].iter().zip([
         "app.Consumer.catsRepeat",
         "app.Consumer.catsRepeat",
         "app.Consumer.catsRepeat",
