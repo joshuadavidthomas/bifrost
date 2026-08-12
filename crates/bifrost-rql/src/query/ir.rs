@@ -303,6 +303,7 @@ pub enum QueryStep {
     GeneratedBy,
     DeclarationStateOf(DeclarationStateFilter),
     ImplementationOf,
+    StubsOf,
     ExportTarget,
 }
 
@@ -787,6 +788,7 @@ impl QueryStep {
             Self::GeneratedBy => QueryStepOp::GeneratedBy,
             Self::DeclarationStateOf(_) => QueryStepOp::DeclarationStateOf,
             Self::ImplementationOf => QueryStepOp::ImplementationOf,
+            Self::StubsOf => QueryStepOp::StubsOf,
             Self::ExportTarget => QueryStepOp::ExportTarget,
             Self::CandidateTarget => QueryStepOp::CandidateTarget,
             Self::EdgesOf(_) => QueryStepOp::EdgesOf,
@@ -875,6 +877,7 @@ impl QueryStep {
                 Some(Self::DeclarationStateOf(DeclarationStateFilter::default()))
             }
             QueryStepOp::ImplementationOf => Some(Self::ImplementationOf),
+            QueryStepOp::StubsOf => Some(Self::StubsOf),
             QueryStepOp::ExportTarget => Some(Self::ExportTarget),
         }
     }
@@ -1083,6 +1086,7 @@ impl QueryStep {
                 Self::ImplementationOf,
                 QueryValueKind::Declaration | QueryValueKind::DeclarationState,
             ) => Some(QueryValueKind::Declaration),
+            (Self::StubsOf, QueryValueKind::Declaration) => Some(QueryValueKind::DeclarationState),
             (Self::ExportTarget, QueryValueKind::Export) => Some(QueryValueKind::Declaration),
             (Self::EdgesOf(_), QueryValueKind::Declaration) => Some(QueryValueKind::ReferenceEdge),
             (Self::EdgesFrom(_), QueryValueKind::Occurrence) => Some(QueryValueKind::ReferenceEdge),
@@ -1186,6 +1190,7 @@ pub(super) fn validate_query_steps(
             QueryStep::GeneratedBy => "declaration or declaration_state",
             QueryStep::DeclarationStateOf(_) => "declaration",
             QueryStep::ImplementationOf => "declaration_state or declaration",
+            QueryStep::StubsOf => "declaration",
             QueryStep::ExportTarget => "export",
         };
         value_kind = step.output_kind(value_kind).ok_or_else(|| {
