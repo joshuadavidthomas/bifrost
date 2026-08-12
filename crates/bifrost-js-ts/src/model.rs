@@ -128,9 +128,13 @@ pub fn record_named_export(
     });
 }
 
-/// Records one export row per plainly named declarator of an exported
-/// `let`/`const`/`var` statement. Destructuring binders introduce names this
-/// walk does not enumerate; they get no row rather than a guessed one.
+/// Records one export row per binder of each declarator of an exported
+/// `let`/`const`/`var` statement (issue #1659). A plainly named declarator is
+/// one binder; a destructuring pattern (`export const { a, b: renamed } = ...`)
+/// contributes one row per bound identifier, enumerated through the same
+/// pattern walk that [`add_destructured_binder_units`] uses. The walk is total
+/// over the grammar's declarator name shapes, so an empty pattern (`{}`)
+/// legitimately exports nothing.
 pub fn record_named_declarator_exports(
     source: &str,
     export: Node<'_>,
@@ -147,15 +151,18 @@ pub fn record_named_declarator_exports(
         let Some(name) = declarator.child_by_field_name("name") else {
             continue;
         };
-        if name.kind() != "identifier" {
-            continue;
+        for binder in crate::syntax::pattern_binder_identifiers(name) {
+            let exported_name = node_source_text(binder, source).trim().to_string();
+            if exported_name.is_empty() {
+                continue;
+            }
+            parsed.record_materialization(MaterializationRecord::Export {
+                range: node_range(export),
+                form: ExportForm::Named,
+                exported_name,
+                target: None,
+            });
         }
-        parsed.record_materialization(MaterializationRecord::Export {
-            range: node_range(export),
-            form: ExportForm::Named,
-            exported_name: node_source_text(name, source).trim().to_string(),
-            target: None,
-        });
     }
 }
 
