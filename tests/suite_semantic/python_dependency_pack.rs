@@ -3,8 +3,8 @@ use brokk_bifrost::analyzer::semantic_model::{
     CatalogOptions, Compatibility, DeclarationGuard, DependencyPackLimits, ExternalArtifactKind,
     ExternalArtifactPackProducer, GuardVersion, Provenance, ResolvedActiveSemanticModels, Safety,
     SemanticModelActivationRequest, SemanticModelResolutionOutcome, SemanticModelRuntimeLimits,
-    SemanticPackCatalog, prepare_discovered_dependency_semantic_packs,
-    resolve_active_semantic_models,
+    SemanticPackCatalog, TypeIdentity, TypeRef, prepare_discovered_dependency_semantic_packs,
+    resolve_active_semantic_models, type_declaration_id,
 };
 use brokk_bifrost::analyzer::{
     AnalyzerConfig, PythonAnalyzerConfig, PythonArtifactPackProducer, PythonDependencyPackAdapter,
@@ -356,6 +356,62 @@ class Reader(Protocol):
                 .as_ref()
                 .is_some_and(|signature| signature.returns.is_some()))
     );
+}
+
+#[test]
+fn stub_producer_qualifies_local_and_imported_base_classes() {
+    let environment = tempfile::tempdir().unwrap();
+    let artifact = environment.path().join("widgets").join("__init__.pyi");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(
+        &artifact,
+        r#"
+from foundations import Base as ImportedBase
+from .bases import Base as RelativeBase
+import protocols as p
+
+class LocalBase: ...
+class LocalChild(LocalBase): ...
+class ImportedChild(ImportedBase): ...
+class RelativeChild(RelativeBase): ...
+class NamespaceChild(p.Base): ...
+"#,
+    )
+    .unwrap();
+
+    let production = PythonArtifactPackProducer.produce_exact_artifact(
+        &artifact_request(artifact, ExternalArtifactKind::PythonStub),
+        &ArtifactProducerLimits::default(),
+    );
+    let pack = production.pack.unwrap();
+    let AuthoredPayload::DeclarationFacts { types, .. } = &pack.shards[0].payload else {
+        panic!("expected declaration facts");
+    };
+
+    for (child, base) in [
+        ("widgets.LocalChild", "widgets.LocalBase"),
+        ("widgets.ImportedChild", "foundations.Base"),
+        ("widgets.RelativeChild", "widgets.bases.Base"),
+        ("widgets.NamespaceChild", "protocols.Base"),
+    ] {
+        let child = types
+            .iter()
+            .find(|fact| fact.name == child)
+            .unwrap_or_else(|| panic!("missing child {child}: {types:#?}"));
+        assert_eq!(child.hierarchy.len(), 1, "{child:#?}");
+        assert_eq!(
+            child.hierarchy[0].target,
+            TypeRef::Declared {
+                id: type_declaration_id(TypeIdentity {
+                    ecosystem: "python",
+                    name: base,
+                }),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+            "the hierarchy target must keep the qualified declaration identity: {child:#?}"
+        );
+    }
 }
 
 /// Two overloads of one name that share an arity are one declaration unless

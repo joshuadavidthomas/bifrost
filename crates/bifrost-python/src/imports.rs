@@ -996,9 +996,18 @@ pub fn resolve_python_relative_module(
     source_file: &ProjectFile,
     module_expr: &str,
 ) -> Option<String> {
+    resolve_python_relative_module_from_package(&python_current_package(source_file), module_expr)
+}
+
+/// Resolve a structured Python module expression against an already-known
+/// package identity. Dependency-pack producers know module identities without
+/// owning a workspace [`ProjectFile`], so they use this entry point.
+pub fn resolve_python_relative_module_from_package(
+    current_package: &str,
+    module_expr: &str,
+) -> Option<String> {
     let level = module_expr.chars().take_while(|ch| *ch == '.').count();
     let suffix = module_expr[level..].trim_matches('.');
-    let current_package = python_current_package(source_file);
     let mut parts: Vec<_> = current_package
         .split('.')
         .filter(|part| !part.is_empty())
