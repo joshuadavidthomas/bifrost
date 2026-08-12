@@ -1104,6 +1104,7 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::Generates
         | RqlForm::GeneratedBy
         | RqlForm::ImplementationOf
+        | RqlForm::StubsOf
         | RqlForm::ExportTarget
         | RqlForm::SegmentTarget => {
             expect_len(expr, items, 2, head)?;
@@ -1553,6 +1554,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::GeneratedBy
         | RqlForm::DeclarationStateOf
         | RqlForm::ImplementationOf
+        | RqlForm::StubsOf
         | RqlForm::ExportTarget
         | RqlForm::EdgesOf
         | RqlForm::EdgesFrom
@@ -1890,9 +1892,10 @@ mod tests {
         resolve_rql_schema_version(None).unwrap()
     }
 
-    /// The seven materialization forms lower to their canonical JSON (#1476):
-    /// seed filters keep their registry field spellings, the filtered step
-    /// carries its options, and the filterless steps are bare ops.
+    /// The materialization forms lower to their canonical JSON (#1476,
+    /// `stubs-of` from #1660): seed filters keep their registry field
+    /// spellings, the filtered step carries its options, and the filterless
+    /// steps are bare ops.
     #[test]
     fn materialization_forms_lower_to_canonical_json() {
         let version = rql_schema_resolution().version;
@@ -1937,6 +1940,17 @@ mod tests {
                     },
                     { "op": "implementation_of" },
                 ],
+                "limit": 100,
+                "result_detail": "compact",
+                "execution_mode": "results",
+                "schema_version": version,
+            })
+        );
+        assert_eq!(
+            canonical("(stubs-of (enclosing-decl (function)))"),
+            json!({
+                "match": { "kind": "function" },
+                "steps": [ { "op": "enclosing_decl" }, { "op": "stubs_of" } ],
                 "limit": 100,
                 "result_detail": "compact",
                 "execution_mode": "results",

@@ -405,11 +405,16 @@ mod query_content_tests {
 // crate's `include_str!`.
 // Salt bumped again (#1926): JavaScript `field_definition` uses the structured
 // `property` field. Reading it now indexes public and private class fields.
+// Salt bumped again (#1658): the TypeScript declaration walk now records
+// declaration-only signature metadata for overload signatures and ambient
+// declarations. `.js` files can be parsed through the TS grammar, so both
+// dialect salts carry the bump; rows persisted before it read every stub as
+// runnable.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08"
 );
 // TS salt bumped again (#1167): `is_simple_ts_initializer` now includes
 // `regex` (a regex-initialized binding renders its initializer inline in the
@@ -421,11 +426,14 @@ lang_epoch!(
 // Salt bumped again (#1548 stage 3 fleet): the TypeScript `.scm` query assets
 // moved from this crate's `resources/treesitter/typescript/` into
 // `brokk-bifrost-js-ts` alongside JavaScript's -- one crate holds both dialects.
+// Salt bumped again (#1658): overload signatures and ambient declarations now
+// persist declaration-only signature metadata. Rows written before this change
+// read every stub as runnable behavior, the da26602 regression.
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08"
 );
 // Salt bumped (#1548 stage 3 fleet): the Python `.scm` query assets moved from
 // this crate's `resources/treesitter/python/` into `brokk-bifrost-python`, so

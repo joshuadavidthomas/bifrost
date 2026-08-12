@@ -313,6 +313,7 @@ void test("highlights schema-v12 materialization forms and filter options", asyn
       "(generates (generation-sites)) (generated-by (declaration-state-of " +
       ":origin generated :declaration-only true :config-gated false (class))) " +
       "(implementation-of (declaration-state-of :declaration-only true (function))) " +
+      "(stubs-of (function)) " +
       "(export-target (exports))"
   );
   for (const form of [
@@ -322,6 +323,7 @@ void test("highlights schema-v12 materialization forms and filter options", asyn
     "generated-by",
     "declaration-state-of",
     "implementation-of",
+    "stubs-of",
     "export-target"
   ]) {
     assertScoped(tokens, form, "support.function.wrapper.bifrost-rql");

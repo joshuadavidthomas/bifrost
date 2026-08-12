@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, mpsc};
@@ -706,7 +707,8 @@ fn execute_corpus_run(
     );
     let started = Instant::now();
     let progress_repo = format!("{}/{}", selected_repo.language, selected_repo.slug);
-    let result = run_engine(&selected_repo.root, &config, cache_mode, &progress_repo);
+    let result =
+        catch_engine_panic(|| run_engine(&selected_repo.root, &config, cache_mode, &progress_repo));
     let record = repository_record(
         &selected_repo.language,
         &selected_repo.slug,
@@ -726,6 +728,21 @@ fn execute_corpus_run(
         record.elapsed_seconds
     );
     record
+}
+
+fn catch_engine_panic(
+    run: impl FnOnce() -> Result<ReferenceDifferentialReport, String>,
+) -> Result<ReferenceDifferentialReport, String> {
+    catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|payload| {
+        let message = if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        Err(format!("analyzer panicked: {message}"))
+    })
 }
 
 fn run_engine(
@@ -1303,4 +1320,56 @@ fn print_common_options() {
     println!("  --path PATH --start-byte N [--end-byte N]   Re-run one exact site");
     println!("  --strict                 Exit 2 when actionable findings are present");
     println!("  --force                  Ignore completed records already in output");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ReferenceDifferentialReport, RepositoryMetadata, catch_engine_panic, repository_record,
+    };
+
+    #[test]
+    fn repository_engine_panic_becomes_an_engine_error_and_next_run_continues() {
+        let first = catch_engine_panic(|| -> Result<ReferenceDifferentialReport, String> {
+            panic!("fixture analyzer panic")
+        });
+        let mut continued = false;
+        let second = catch_engine_panic(|| {
+            continued = true;
+            Err("fixture ordinary error".to_string())
+        });
+
+        assert_eq!(
+            first
+                .as_ref()
+                .expect_err("the repository panic must become an error result"),
+            "analyzer panicked: fixture analyzer panic"
+        );
+        assert!(continued, "the next repository run must continue");
+        assert_eq!(
+            second.expect_err("the ordinary error must pass through"),
+            "fixture ordinary error"
+        );
+
+        let metadata = RepositoryMetadata {
+            head: "fixture-head".to_string(),
+            dirty: false,
+        };
+        let record = repository_record(
+            "rust",
+            "fixture__panic",
+            Some(1),
+            &metadata,
+            &metadata,
+            "fixture-fingerprint".to_string(),
+            0.0,
+            first,
+        );
+        let value = serde_json::to_value(record).expect("serialize engine-error record");
+        assert_eq!(value["status"], "engine_error");
+        assert_eq!(
+            value["message"],
+            "analyzer panicked: fixture analyzer panic"
+        );
+    }
 }

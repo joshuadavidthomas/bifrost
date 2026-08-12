@@ -605,6 +605,7 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::Generates
         | QueryStep::GeneratedBy
         | QueryStep::ImplementationOf
+        | QueryStep::StubsOf
         | QueryStep::ExportTarget
         | QueryStep::EdgeTarget
         | QueryStep::SegmentTarget

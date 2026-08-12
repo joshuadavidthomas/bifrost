@@ -137,9 +137,41 @@ pub struct CppAnalyzer {
     reconcile_candidate_evaluation_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-crate::analyzer::impl_forward_query_provider!(CppAnalyzer);
+impl ForwardQueryProvider for CppAnalyzer {
+    fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut units = self.inner.forward_definition_fqn(fqn);
+        let reconciled = self.reconciled_definitions(fqn);
+        units.extend(reconciled.rekeyed.iter().cloned());
+        units.sort();
+        units.dedup();
+        units
+    }
+
+    fn forward_file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
+        self.inner.forward_file_identifier(file, identifier)
+    }
+
+    fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        self.inner.forward_direct_children(owner)
+    }
+
+    fn forward_package_exists(&self, package: &str) -> bool {
+        self.inner.forward_package_exists(package)
+    }
+
+    fn forward_fqn_prefix_exists(&self, prefix: &str) -> bool {
+        self.inner.forward_fqn_prefix_exists(prefix)
+    }
+}
 
 impl CppAnalyzer {
+    pub(crate) fn reconciled_provisional(&self, unit: &CodeUnit) -> Option<CodeUnit> {
+        self.reconciled_definitions(&unit.fq_name())
+            .provisional_of
+            .get(unit)
+            .cloned()
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         Self::from_inner(self.inner.clone_with_project(project), self.memo_budget)
     }

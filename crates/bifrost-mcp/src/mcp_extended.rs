@@ -1055,6 +1055,7 @@ mod tests {
                 "generated_by",
                 "declaration_state_of",
                 "implementation_of",
+                "stubs_of",
                 "export_target"
             ])
         );

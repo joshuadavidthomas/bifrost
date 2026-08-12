@@ -459,6 +459,7 @@ query_step_ops! {
     GeneratedBy { label: "generated_by", signature: "declaration|declaration_state -> generation_site", description: "Return the generation site that materialized each generated declaration." }
     DeclarationStateOf { label: "declaration_state_of", signature: "declaration -> declaration_state", description: "Return each declaration's state row: origin, declaration-only flag, and configuration gate." }
     ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to." }
+    StubsOf { label: "stubs_of", signature: "declaration -> declaration_state", description: "Return the declaration-only stub state rows whose implementation link resolves to each declaration; composed with except, this lists the stubs no implementation answers." }
     ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one." }
 }
 
@@ -634,6 +635,7 @@ macro_rules! rql_forms {
                     | Self::GeneratedBy
                     | Self::DeclarationStateOf
                     | Self::ImplementationOf
+                    | Self::StubsOf
                     | Self::ExportTarget
                     | Self::CandidateTarget
                     | Self::EdgesOf
@@ -1267,6 +1269,14 @@ rql_forms! {
         signature: "(implementation-of query)",
         description: (QueryStepOp::ImplementationOf),
         step: ImplementationOf,
+    }
+    StubsOf {
+        labels: ["stubs-of", "stubs_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(stubs-of query)",
+        description: (QueryStepOp::StubsOf),
+        step: StubsOf,
     }
     ExportTarget {
         labels: ["export-target", "export_target"],

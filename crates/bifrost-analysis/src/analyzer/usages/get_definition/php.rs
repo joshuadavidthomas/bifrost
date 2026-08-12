@@ -404,7 +404,7 @@ fn resolve_php_with_session(
             };
             php_callable_outcome(support, candidates, &raw)
         }
-        Some(PhpReferenceNode::StaticMember { scope, name }) => {
+        Some(PhpReferenceNode::StaticMember { scope, name, kind }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
             // `self::`, `static::` and `parent::` spell the enclosing
             // hierarchy rather than a named class's companion side, so only an
@@ -420,9 +420,9 @@ fn resolve_php_with_session(
             };
             let owner =
                 php_static_scope_fqn(php, support, scope, source, &ctx, &enclosing, session);
-            php_member_outcome(php, support, owner, member, access, session)
+            php_member_outcome(php, support, owner, member, access, kind, session)
         }
-        Some(PhpReferenceNode::InstanceMember { object, name }) => {
+        Some(PhpReferenceNode::InstanceMember { object, name, kind }) => {
             let member = php_node_text(name, source).trim_start_matches('$');
             let bindings = php_bindings_before(
                 php,
@@ -444,6 +444,7 @@ fn resolve_php_with_session(
                 owner,
                 member,
                 PhpMemberAccess::Instance,
+                kind,
                 session,
             )
         }
@@ -653,11 +654,43 @@ enum PhpReferenceNode<'tree> {
     StaticMember {
         scope: Node<'tree>,
         name: Node<'tree>,
+        kind: PhpMemberKind,
     },
     InstanceMember {
         object: Node<'tree>,
         name: Node<'tree>,
+        kind: PhpMemberKind,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PhpMemberKind {
+    Callable,
+    Field,
+    Any,
+}
+
+impl PhpMemberKind {
+    fn accepts(self, unit: &CodeUnit) -> bool {
+        match self {
+            Self::Callable => unit.is_function(),
+            Self::Field => unit.is_field(),
+            Self::Any => true,
+        }
+    }
+}
+
+fn php_member_kind(access: Node<'_>) -> PhpMemberKind {
+    match access.kind() {
+        "member_call_expression" | "nullsafe_member_call_expression" | "scoped_call_expression" => {
+            PhpMemberKind::Callable
+        }
+        "member_access_expression"
+        | "nullsafe_member_access_expression"
+        | "scoped_property_access_expression"
+        | "class_constant_access_expression" => PhpMemberKind::Field,
+        _ => PhpMemberKind::Any,
+    }
 }
 
 fn php_reference_node<'tree>(
@@ -670,7 +703,11 @@ fn php_reference_node<'tree>(
     let node = php_qualified_reference_node(node, session)?;
     if let Some(access) = php_static_property_access_for_name(node, session) {
         let (scope, name) = php_static_member_parts(access)?;
-        return Some(PhpReferenceNode::StaticMember { scope, name });
+        return Some(PhpReferenceNode::StaticMember {
+            scope,
+            name,
+            kind: PhpMemberKind::Field,
+        });
     }
     match node.kind() {
         "object_creation_expression" => {
@@ -685,7 +722,11 @@ fn php_reference_node<'tree>(
         | "class_constant_access_expression"
         | "scoped_property_access_expression" => {
             let (scope, name) = php_static_member_parts(node)?;
-            Some(PhpReferenceNode::StaticMember { scope, name })
+            Some(PhpReferenceNode::StaticMember {
+                scope,
+                name,
+                kind: php_member_kind(node),
+            })
         }
         "member_call_expression"
         | "nullsafe_member_call_expression"
@@ -693,7 +734,11 @@ fn php_reference_node<'tree>(
         | "nullsafe_member_access_expression" => {
             let object = node.child_by_field_name("object")?;
             let name = node.child_by_field_name("name")?;
-            Some(PhpReferenceNode::InstanceMember { object, name })
+            Some(PhpReferenceNode::InstanceMember {
+                object,
+                name,
+                kind: php_member_kind(node),
+            })
         }
         "name" | "qualified_name" | "relative_scope" => {
             let parent = node.parent()?;
@@ -714,7 +759,11 @@ fn php_reference_node<'tree>(
                     if parent.child_by_field_name("name") == Some(node) =>
                 {
                     let object = parent.child_by_field_name("object")?;
-                    Some(PhpReferenceNode::InstanceMember { object, name: node })
+                    Some(PhpReferenceNode::InstanceMember {
+                        object,
+                        name: node,
+                        kind: php_member_kind(parent),
+                    })
                 }
                 _ if php_is_instanceof_type_name(node) => Some(PhpReferenceNode::Type(node)),
                 _ if php_is_bare_constant_reference(node) => Some(PhpReferenceNode::Constant(node)),
@@ -761,7 +810,11 @@ fn php_static_access_reference<'tree>(
         return Some(PhpReferenceNode::Type(focus));
     }
     if node_contains_focus(name, focus) {
-        return Some(PhpReferenceNode::StaticMember { scope, name });
+        return Some(PhpReferenceNode::StaticMember {
+            scope,
+            name,
+            kind: php_member_kind(access),
+        });
     }
     None
 }
@@ -947,6 +1000,7 @@ fn php_member_outcome(
     owner: Option<String>,
     member: &str,
     access: PhpMemberAccess,
+    kind: PhpMemberKind,
     session: Option<&ResolutionSession>,
 ) -> DefinitionLookupOutcome {
     let Some(owner) = owner else {
@@ -956,7 +1010,8 @@ fn php_member_outcome(
         );
     };
     let fqn = format!("{owner}.{member}");
-    let candidates = php_fqn_candidates(support, &fqn);
+    let mut candidates = php_fqn_candidates(support, &fqn);
+    candidates.retain(|candidate| kind.accepts(candidate));
     // Attribution is built only while a trace records (#1477); the walk itself
     // consumes nothing from it.
     let mut member_trace = trace::recording().then(|| PhpMemberTrace::rooted(support, &owner));
@@ -967,7 +1022,7 @@ fn php_member_outcome(
         }
         return candidates_outcome(candidates);
     }
-    let inherited = php_inherited_member_candidates(
+    let mut inherited = php_inherited_member_candidates(
         php,
         support,
         &owner,
@@ -975,6 +1030,7 @@ fn php_member_outcome(
         session,
         member_trace.as_mut(),
     );
+    inherited.retain(|candidate| kind.accepts(candidate));
     if !inherited.is_empty() {
         if let Some(state) = member_trace.as_mut() {
             state.stage(php, &inherited, access);
@@ -1990,6 +2046,9 @@ fn php_instance_receiver_fqn(
                 php, analyzer, support, inner, source, enclosing, bindings, ctx, session,
             )
         }),
+        "function_call_expression" | "scoped_call_expression" => {
+            php_assignment_receiver_fqn(php, support, object, source, enclosing, ctx, session)
+        }
         "member_call_expression" | "nullsafe_member_call_expression" => {
             php_member_call_return_type_fqn(
                 php, analyzer, support, object, source, enclosing, bindings, ctx, session,

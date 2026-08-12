@@ -1975,6 +1975,17 @@ impl SignatureMetadata {
         self.declaration_only
     }
 
+    /// Whether a unit whose signature rows are `metadata` is declaration-only
+    /// as a whole: it has signature rows and none of them is runnable.
+    ///
+    /// Python keeps each `@overload` stub as its own unit, so its one row
+    /// decides alone. TypeScript merges every overload signature and the
+    /// implementation of one callable into a single unit, so a unit with any
+    /// runnable row is runnable even though its stub rows are not.
+    pub fn unit_is_declaration_only(metadata: &[Self]) -> bool {
+        !metadata.is_empty() && metadata.iter().all(Self::is_declaration_only)
+    }
+
     pub fn callable_arity(&self) -> Option<CallableArity> {
         self.callable_arity
     }

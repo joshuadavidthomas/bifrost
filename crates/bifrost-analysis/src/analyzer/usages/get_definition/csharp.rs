@@ -559,6 +559,15 @@ fn resolve_csharp_in_session(
         }
         Some(CSharpReferenceNode::Type(type_node)) => {
             let reference = csharp_reference_type_text(type_node, source);
+            if let Some(unit) = resolve_csharp_nested_type_in_enclosing_classes(
+                analyzer,
+                definitions,
+                file,
+                &reference,
+                type_node.start_byte(),
+            ) {
+                return candidates_outcome(vec![unit]);
+            }
             // Prefer a type in the lexically enclosing scope (namespace/class) over
             // the scope-blind type resolver, so a bare `Config` inside `namespace B`
             // resolves to `B.Config` rather than a same-named sibling namespace's

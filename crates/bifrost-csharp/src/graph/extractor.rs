@@ -134,6 +134,7 @@ type ExtensionTargetCacheKey = (Vec<String>, usize, Option<usize>, usize, usize)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TargetMemberResolution {
     MatchesTarget,
+    MatchesEnclosingTarget,
     KnownOther,
     NotFound,
 }
@@ -642,6 +643,7 @@ fn scan_unqualified_member_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
                 // inverted builder routes same-owner calls to unproven inbound
                 // (#1138). Mirrors Java's `bare_method_context_matches_target`.
                 TargetMemberResolution::MatchesTarget => push_self_receiver_hit(node, ctx),
+                TargetMemberResolution::MatchesEnclosingTarget => push_hit(node, ctx),
                 TargetMemberResolution::KnownOther => {}
                 TargetMemberResolution::NotFound => push_unproven_hit(node, ctx),
             }
@@ -894,16 +896,39 @@ fn unqualified_method_call_resolution(
     {
         return TargetMemberResolution::KnownOther;
     }
-    enclosing_declared_type(node, ctx.csharp, ctx.file, ctx.source)
-        .map(|enclosing| {
-            receiver_fqn_target_member_resolution(
-                &enclosing.fq_name(),
-                explicit_generic_arity,
-                Some(argument_count(invocation, ctx.source)),
-                ctx,
-            )
-        })
-        .unwrap_or(TargetMemberResolution::NotFound)
+    let Some(mut owner) = enclosing_declared_type(node, ctx.csharp, ctx.file, ctx.source) else {
+        return TargetMemberResolution::NotFound;
+    };
+    let call_arity = Some(argument_count(invocation, ctx.source));
+    let direct = receiver_fqn_target_member_resolution(
+        &owner.fq_name(),
+        explicit_generic_arity,
+        call_arity,
+        ctx,
+    );
+    if direct != TargetMemberResolution::NotFound {
+        return direct;
+    }
+
+    while let Some(parent) = ctx.csharp.parent_of(&owner) {
+        let resolution = receiver_fqn_target_member_resolution(
+            &parent.fq_name(),
+            explicit_generic_arity,
+            call_arity,
+            ctx,
+        );
+        match resolution {
+            TargetMemberResolution::MatchesTarget => {
+                return TargetMemberResolution::MatchesEnclosingTarget;
+            }
+            TargetMemberResolution::KnownOther => return TargetMemberResolution::KnownOther,
+            TargetMemberResolution::NotFound => owner = parent,
+            TargetMemberResolution::MatchesEnclosingTarget => {
+                unreachable!("receiver lookup cannot classify an enclosing-type relationship")
+            }
+        }
+    }
+    TargetMemberResolution::NotFound
 }
 
 fn receiver_fqn_target_member_resolution(
@@ -992,7 +1017,10 @@ fn member_label_owner_resolution(node: Node<'_>, ctx: &mut ScanCtx<'_>) -> Label
     let mut resolution = LabelOwnerResolution::Unknown;
     for owner in owners {
         match receiver_fqn_target_member_resolution(&owner.fq_name(), None, None, ctx) {
-            TargetMemberResolution::MatchesTarget => return LabelOwnerResolution::MatchesTarget,
+            TargetMemberResolution::MatchesTarget
+            | TargetMemberResolution::MatchesEnclosingTarget => {
+                return LabelOwnerResolution::MatchesTarget;
+            }
             TargetMemberResolution::KnownOther => resolution = LabelOwnerResolution::KnownOther,
             TargetMemberResolution::NotFound => {}
         }
@@ -1021,7 +1049,9 @@ fn object_initializer_label_owner_resolution(
         return LabelOwnerResolution::Unknown;
     };
     match receiver_fqn_target_member_resolution(&receiver_fqn, None, None, ctx) {
-        TargetMemberResolution::MatchesTarget => LabelOwnerResolution::MatchesTarget,
+        TargetMemberResolution::MatchesTarget | TargetMemberResolution::MatchesEnclosingTarget => {
+            LabelOwnerResolution::MatchesTarget
+        }
         TargetMemberResolution::KnownOther => LabelOwnerResolution::KnownOther,
         TargetMemberResolution::NotFound => LabelOwnerResolution::Unknown,
     }
@@ -1063,6 +1093,7 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
             | "record_declaration"
             | "record_struct_declaration"
             | "method_declaration"
+            | "local_function_statement"
             | "constructor_declaration"
             | "property_declaration"
             | "variable_declarator"

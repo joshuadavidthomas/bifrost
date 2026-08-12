@@ -45,10 +45,11 @@ use crate::graph::resolver::{
     infer_cpp_initializer_type, is_declaration_name, is_declarator_node,
     is_globally_qualified_cpp_name, is_nested_type_node, normalize_type_text,
     out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
-    parameter_belongs_to_callable_scope, recovered_macro_decorated_type_node,
-    resolve_declaring_member_owner, same_visible_symbol, type_reference_hit_node,
+    parameter_belongs_to_callable_scope, qualified_owner_components,
+    recovered_macro_decorated_type_node, resolve_declaring_member_owner, same_logical_symbol,
+    same_visible_symbol, type_reference_hit_node,
 };
-use crate::graph::syntax::explicit_qualified_callable_value;
+use crate::graph::syntax::qualified_callable_value;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
@@ -238,7 +239,7 @@ fn record_reference(
         }
         return;
     }
-    if let Some(value) = explicit_qualified_callable_value(node) {
+    if let Some(value) = qualified_callable_value(node) {
         record_qualified_callable_value(
             value.qualified,
             value.global,
@@ -298,6 +299,7 @@ fn record_reference(
                 return;
             }
             if is_nested_type_node(node) && !is_template_argument_type_leaf(node) {
+                record_nested_type_terminal_reference(node, ctx);
                 return;
             }
             // A `X::m(..)` static/scoped call appears as a `qualified_identifier`
@@ -449,6 +451,101 @@ fn record_type_reference(
             type_reference_hit_node(node, ctx.file, ctx.source, bindings),
         ),
         LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {}
+    }
+}
+
+fn record_nested_type_terminal_reference(node: Node<'_>, ctx: &mut CppScan<'_>) {
+    let Some(qualified) = node.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_type_identifier"
+        ) && parent.child_by_field_name("name") == Some(node)
+    }) else {
+        return;
+    };
+    let Some(owner) = qualified_owner_components(qualified, ctx.source) else {
+        return;
+    };
+    let mut complete = qualified;
+    while let Some(parent) = complete.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "qualified_identifier" | "scoped_type_identifier"
+        )
+    }) {
+        complete = parent;
+    }
+    if matches!(
+        resolve_type_node_lexically(
+            complete,
+            &ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+        ),
+        LexicalTypeResolution::Resolved { .. }
+    ) {
+        return;
+    }
+
+    let Some(enclosing_owner) = enclosing_callable_owner(node, ctx) else {
+        return;
+    };
+    let lexical_scope = canonical_cpp_scope_components(&enclosing_owner);
+    let owner_resolution = ctx.visibility.resolve_type_components_lexically(
+        &ctx.analyzer,
+        ctx.file,
+        &owner.names,
+        owner.global,
+        &lexical_scope,
+    );
+    let owner_unit = match owner_resolution {
+        LexicalTypeResolution::Resolved { unit, .. } => unit,
+        LexicalTypeResolution::Missing if !owner.global && owner.names.len() == 1 => {
+            let Some(unit) = ctx.visibility.inherited_injected_class_owner(
+                &ctx.analyzer,
+                ctx.file,
+                &enclosing_owner,
+                &owner.names[0],
+            ) else {
+                return;
+            };
+            unit
+        }
+        LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => return,
+    };
+    let name = node_text(node, ctx.source);
+    let mut candidates = Vec::new();
+    for candidate in ctx
+        .visibility
+        .visible_members_for_owner_name(ctx.file, &owner_unit, name)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.is_class()
+                || ctx
+                    .analyzer
+                    .type_alias_provider()
+                    .is_some_and(|provider| provider.is_type_alias(candidate))
+        })
+        .filter(|candidate| {
+            ctx.visibility.external_type_candidate_visible_in_context(
+                &ctx.analyzer,
+                ctx.file,
+                candidate,
+                node,
+            )
+        })
+    {
+        if !candidates
+            .iter()
+            .any(|existing| same_logical_symbol(existing, candidate))
+        {
+            candidates.push(candidate.clone());
+        }
+    }
+    if let [candidate] = candidates.as_slice() {
+        ctx.record(candidate.fq_name(), complete);
     }
 }
 

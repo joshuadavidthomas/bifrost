@@ -24,7 +24,7 @@ use super::occurrence_rows::ast_id;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::semantic::ContentIdentity;
 use crate::analyzer::structural_spec_for;
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range, SignatureMetadata};
 use crate::hash::HashMap;
 
 /// The axes this producer answers. All six: this layer is the only row
@@ -295,10 +295,8 @@ pub fn materialization_for_file(
     let mut any_config_gated = false;
     for unit in &declarations {
         let declaration = analyzer.ranges(unit).into_iter().next();
-        let declaration_only = analyzer
-            .signature_metadata(unit)
-            .iter()
-            .any(|metadata| metadata.is_declaration_only());
+        let declaration_only =
+            SignatureMetadata::unit_is_declaration_only(&analyzer.signature_metadata(unit));
         let config_gated = declaration.is_some_and(|range| {
             config_intervals.iter().any(|interval| {
                 interval.start_byte <= range.start_byte && range.end_byte <= interval.end_byte
@@ -627,6 +625,56 @@ mod tests {
             .find(|link| link.stub.identifier() == "orphan")
             .expect("orphan stub link");
         assert_eq!(orphan_link.implementation, None);
+    }
+
+    /// TypeScript overload signatures are declaration-only signature rows on
+    /// the same unit as their implementation (#1658). A callable with a
+    /// runnable signature is one runnable unit, never a stub; only a callable
+    /// with no implementation at all (an ambient declaration, an orphan
+    /// overload set) is declaration-only, and its link row records the
+    /// explicit absence.
+    #[test]
+    fn typescript_overload_stubs_are_declaration_only_without_an_implementation() {
+        let fixture = Fixture::new(
+            Language::TypeScript,
+            "over.ts",
+            concat!(
+                "export function parse(value: string): string;\n",
+                "export function parse(value: number): number;\n",
+                "export function parse(value: any): any {\n",
+                "  return value;\n",
+                "}\n",
+                "declare function orphan(value: string): string;\n",
+                "interface Contract {\n",
+                "  parse(value: string): string;\n",
+                "}\n",
+                "class Widget {\n",
+                "  render(value: string): void;\n",
+                "  render(value: unknown): void {}\n",
+                "}\n",
+                "abstract class Base {\n",
+                "  abstract handle(value: string): void;\n",
+                "}\n",
+            ),
+        );
+        let rows = fixture.rows();
+
+        // The merged `parse` unit and the merged `Widget.render` unit each
+        // carry a runnable signature, so neither is declaration-only; the
+        // interface member is a contract, and the abstract method is
+        // implemented under a subclass identity, so neither is a stub. Only
+        // the ambient `orphan` has no implementation.
+        let stubs: Vec<_> = rows
+            .states
+            .iter()
+            .filter(|row| row.declaration_only)
+            .collect();
+        assert_eq!(stubs.len(), 1, "states: {:?}", rows.states);
+        assert_eq!(stubs[0].unit.identifier(), "orphan");
+
+        assert_eq!(rows.links.len(), 1, "links: {:?}", rows.links);
+        assert_eq!(rows.links[0].stub.identifier(), "orphan");
+        assert_eq!(rows.links[0].implementation, None);
     }
 
     /// JS export rows carry their form; the anonymous default's synthetic

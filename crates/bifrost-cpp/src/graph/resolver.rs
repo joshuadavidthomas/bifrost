@@ -2,8 +2,8 @@ use crate::call_match::{
     CppArgType, cpp_signature_param_types, cpp_split_top_level_commas, normalize_cpp_type_name,
 };
 use crate::declarations::{
-    cpp_export_macro_token, cpp_field_declaration_linkage, cpp_template_term, node_text,
-    normalize_cpp_whitespace, recovered_exported_class_has_body,
+    cpp_displaced_preprocessor_terminator, cpp_export_macro_token, cpp_field_declaration_linkage,
+    cpp_template_term, node_text, normalize_cpp_whitespace, recovered_exported_class_has_body,
 };
 use crate::graph::CppGraphSource;
 use crate::graph::extractor::ScanCtx;
@@ -400,8 +400,7 @@ impl TargetSpec {
         if target.is_function() {
             // Free functions declared inside a namespace have a module owner; that namespace is
             // not a call receiver, so resolve them as free functions rather than methods.
-            let owner_resolution = type_owner_resolution(analyzer, target)
-                .or_else(|| target_forward_owner_resolution(analyzer, target));
+            let owner_resolution = target_type_owner_resolution(analyzer, target);
             let owner_is_forward_declaration = owner_resolution
                 .as_ref()
                 .is_some_and(|owner| owner.is_forward_declaration);
@@ -639,6 +638,7 @@ pub struct OrdinaryTypeImport {
     pub scope_start: usize,
     pub scope_end: usize,
     pub scope_depth: usize,
+    pub block_scope: bool,
     pub lexical_depth: usize,
     pub declaration_namespace: Vec<String>,
     pub namespace_scope: Option<Vec<String>>,
@@ -3563,6 +3563,46 @@ impl<'a> VisibilityIndex<'a> {
         LexicalTypeResolution::Missing
     }
 
+    /// Resolve a base class through its injected class name at the nearest
+    /// inheritance tier. Distinct same-named bases at that tier are ambiguous.
+    pub fn inherited_injected_class_owner(
+        &self,
+        analyzer: &CppGraphSource<'_>,
+        file: &ProjectFile,
+        enclosing_owner: &CodeUnit,
+        injected_name: &str,
+    ) -> Option<CodeUnit> {
+        let hierarchy = analyzer.type_hierarchy_provider()?;
+        let mut frontier = hierarchy.get_direct_ancestors(enclosing_owner);
+        let mut visited = HashSet::default();
+        while !frontier.is_empty() {
+            let mut level_matches = Vec::new();
+            let mut next_frontier = Vec::new();
+            for raw_owner in frontier {
+                let owner = self.canonical_visible_full_type_unit(analyzer, file, &raw_owner)?;
+                if !visited.insert(owner.clone()) {
+                    continue;
+                }
+                if owner.identifier() == injected_name
+                    && !level_matches
+                        .iter()
+                        .any(|existing| same_logical_symbol(existing, &owner))
+                {
+                    level_matches.push(owner.clone());
+                }
+                next_frontier.extend(hierarchy.get_direct_ancestors(&owner));
+            }
+            if let Some(first) = level_matches.first() {
+                return level_matches
+                    .iter()
+                    .all(|candidate| same_logical_symbol(candidate, first))
+                    .then(|| first.clone());
+            }
+            frontier = next_frontier;
+        }
+        None
+    }
+
     /// The one type the candidates name under `resolution`, or why they do not
     /// name one. The two preserving modes only ever reject candidates that
     /// disagree with each other, which is ambiguity; canonicalization can also
@@ -6483,7 +6523,9 @@ pub fn preprocessor_conditional_family_range(
     let node = root.descendant_for_byte_range(start_byte, end_byte)?;
     let mut ancestor = Some(node);
     while let Some(current) = ancestor {
-        if is_preprocessor_conditional(current) {
+        if is_preprocessor_conditional(current)
+            && preprocessor_conditional_contains_descendant(current, node)
+        {
             let family = preprocessor_conditional_family_root(current);
             return Some((family.start_byte(), family.end_byte()));
         }
@@ -6495,7 +6537,9 @@ pub fn preprocessor_conditional_family_range(
 fn preprocessor_conditional_family_for_declaration(node: Node<'_>) -> Option<Node<'_>> {
     let mut ancestor = node.parent();
     while let Some(current) = ancestor {
-        if is_preprocessor_conditional(current) {
+        if is_preprocessor_conditional(current)
+            && preprocessor_conditional_contains_descendant(current, node)
+        {
             let family = preprocessor_conditional_family_root(current);
             if preprocessor_conditional_family_has_terminal_else(family) {
                 return Some(family);
@@ -6546,6 +6590,7 @@ pub fn preprocessor_guard_environment(
             conditional.kind(),
             "preproc_if" | "preproc_ifdef" | "preproc_elif"
         ) && !is_file_covering_include_guard(conditional, source)
+            && preprocessor_conditional_contains_descendant(conditional, node)
         {
             let guard = preprocessor_guard_for_descendant(conditional, node, source)?;
             match guard {
@@ -6589,6 +6634,14 @@ fn preprocessor_guard_for_descendant(
         guard = guard.negated();
     }
     Some(guard)
+}
+
+fn preprocessor_conditional_contains_descendant(
+    conditional: Node<'_>,
+    descendant: Node<'_>,
+) -> bool {
+    cpp_displaced_preprocessor_terminator(conditional)
+        .is_none_or(|terminator| descendant.start_byte() < terminator.end_byte())
 }
 
 pub fn merge_preprocessor_guards(
@@ -6812,6 +6865,7 @@ fn callable_preprocessor_context_is_visible_for_reference(
         if matches!(conditional.kind(), "preproc_if" | "preproc_ifdef")
             && !is_file_covering_include_guard(conditional, source)
             && !is_split_cpp_language_linkage_wrapper(conditional, node, source)
+            && preprocessor_conditional_contains_descendant(conditional, node)
         {
             let Some(guard) = preprocessor_guard_for_descendant(conditional, node, source) else {
                 return false;
@@ -8042,8 +8096,12 @@ fn structured_include_path<'a>(path: Node<'_>, source: &'a str) -> Option<&'a st
 }
 
 fn has_preprocessor_conditional_ancestor(mut node: Node<'_>, source: &str) -> bool {
+    let descendant = node;
     while let Some(parent) = node.parent() {
-        if is_preprocessor_conditional(parent) && !is_file_covering_include_guard(parent, source) {
+        if is_preprocessor_conditional(parent)
+            && !is_file_covering_include_guard(parent, source)
+            && preprocessor_conditional_contains_descendant(parent, descendant)
+        {
             return true;
         }
         node = parent;
@@ -8744,10 +8802,57 @@ pub struct QualifiedOwnerComponents<'tree> {
     pub global: bool,
 }
 
+/// True when each structured qualifier on the callable-name path has a real
+/// `::` token. A macro-prefixed return type can make tree-sitter insert a
+/// zero-width missing separator and parse `TYPE Result<T> method()` as the
+/// false qualified declarator `Result<T>::method`.
+pub fn qualified_name_has_concrete_scope_separators(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    let mut found_separator = false;
+    while let Some(current) = stack.pop() {
+        if !matches!(
+            current.kind(),
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+        ) {
+            continue;
+        }
+        let mut current_has_separator = false;
+        for index in 0..current.child_count() {
+            let Some(child) = current.child(index) else {
+                continue;
+            };
+            if child.kind() == "::" {
+                if child.is_missing() {
+                    return false;
+                }
+                current_has_separator = true;
+                found_separator = true;
+            }
+        }
+        if !current_has_separator {
+            return false;
+        }
+        for field in ["scope", "name"] {
+            if let Some(child) = current.child_by_field_name(field)
+                && matches!(
+                    child.kind(),
+                    "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+                )
+            {
+                stack.push(child);
+            }
+        }
+    }
+    found_separator
+}
+
 pub fn qualified_owner_components<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<QualifiedOwnerComponents<'tree>> {
+    if !qualified_name_has_concrete_scope_separators(node) {
+        return None;
+    }
     let mut nodes = cpp_name_component_nodes(node)?;
     nodes.pop()?;
     if nodes.is_empty() {
@@ -10034,6 +10139,16 @@ fn type_owner_resolution(
     precise_parent_resolution(analyzer, code_unit).filter(|owner| !owner.unit.is_module())
 }
 
+fn target_type_owner_resolution(
+    analyzer: &CppGraphSource<'_>,
+    code_unit: &CodeUnit,
+) -> Option<ResolvedTypeOwner> {
+    match type_owner_resolution(analyzer, code_unit) {
+        Some(owner) if !owner.is_forward_declaration => Some(owner),
+        Some(_) | None => target_forward_owner_resolution(analyzer, code_unit),
+    }
+}
+
 /// Recover method identity for an indexed out-of-line definition when the
 /// analyzer has retained only its unique include-visible class forward
 /// declaration. This is deliberately target-only: canonical declaration
@@ -10144,13 +10259,13 @@ fn precise_parent_resolution(
                     unit: owner,
                     is_forward_declaration: false,
                 }),
-                FullOwnerResolution::None if forwards.len() == 1 => {
-                    forwards.into_iter().next().map(|unit| ResolvedTypeOwner {
+                FullOwnerResolution::None => {
+                    unique_logical_forward_owner(forwards).map(|unit| ResolvedTypeOwner {
                         unit,
                         is_forward_declaration: true,
                     })
                 }
-                FullOwnerResolution::None | FullOwnerResolution::Ambiguous => None,
+                FullOwnerResolution::Ambiguous => None,
             }
         }
         DirectOwnerResolution::None => {
@@ -10377,6 +10492,19 @@ pub fn collapse_owner_candidates(
     } else {
         DirectOwnerResolution::None
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn unique_logical_forward_owner_for_test(forwards: Vec<CodeUnit>) -> Option<CodeUnit> {
+    unique_logical_forward_owner(forwards)
+}
+
+fn unique_logical_forward_owner(mut forwards: Vec<CodeUnit>) -> Option<CodeUnit> {
+    let first = forwards.pop()?;
+    forwards
+        .iter()
+        .all(|forward| same_logical_symbol(forward, &first))
+        .then_some(first)
 }
 
 pub fn cpp_class_declaration_strength(
@@ -10695,6 +10823,90 @@ fn enclosing_cpp_field_declaration(mut node: Node<'_>) -> Option<Node<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn displaced_preprocessor_terminator_bounds_the_real_guard() {
+        let damaged = "#ifndef API_H\n#define API_H\nextern char option_buffer[\n#ifdef FEATURE_X\n    16 +\n#endif\n    1];\n\nvoid target(void);\n#endif\n";
+        let guarded = "#ifdef FEATURE_X\nvoid target(void);\n#endif\n";
+        let parse = |source: &str| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&tree_sitter_cpp::LANGUAGE.into())
+                .expect("C++ grammar");
+            parser.parse(source, None).expect("fixture tree")
+        };
+
+        let tree = parse(damaged);
+        let root = tree.root_node();
+        let target = damaged.find("target").expect("target byte");
+        let declaration = root
+            .descendant_for_byte_range(target, target + "target".len())
+            .and_then(|mut node| {
+                loop {
+                    if node.kind() == "declaration" {
+                        break Some(node);
+                    }
+                    node = node.parent()?;
+                }
+            })
+            .expect("declaration after the displaced terminator");
+        let conditional = declaration
+            .parent()
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("damaged inner conditional");
+        let outer = conditional
+            .parent()
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("ordinary outer include guard");
+        let terminator = cpp_displaced_preprocessor_terminator(conditional)
+            .expect("structured displaced #endif");
+        assert_eq!(node_text(terminator, damaged), "#endif");
+        assert!(terminator.end_byte() <= declaration.start_byte());
+        assert!(!preprocessor_conditional_contains_descendant(
+            conditional,
+            declaration
+        ));
+        assert!(cpp_displaced_preprocessor_terminator(outer).is_none());
+        assert!(preprocessor_conditional_contains_descendant(
+            outer,
+            declaration
+        ));
+
+        let tree = parse(guarded);
+        let conditional = tree
+            .root_node()
+            .named_child(0)
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("ordinary conditional");
+        let declaration = conditional
+            .named_children(&mut conditional.walk())
+            .find(|node| node.kind() == "declaration")
+            .expect("guarded declaration");
+        assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
+        assert!(preprocessor_conditional_contains_descendant(
+            conditional,
+            declaration
+        ));
+
+        let damaged_alternative = format!(
+            "#ifndef NO_FEATURE\nvoid enabled(void) {{}}\n#else\nvoid disabled(void) {{\n{}\n}}\n#endif\n",
+            "UNUSED(value)\n".repeat(64)
+        );
+        let tree = parse(&damaged_alternative);
+        let conditional = tree
+            .root_node()
+            .named_child(0)
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("outer conditional with an alternative");
+        assert!(conditional.has_error());
+        assert!(conditional.child_by_field_name("alternative").is_some());
+        assert!(
+            conditional
+                .child(conditional.child_count() - 1)
+                .is_some_and(|child| child.kind() == "#endif" && !child.is_missing())
+        );
+        assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
+    }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {
         let mut parser = Parser::new();
