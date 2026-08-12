@@ -15,7 +15,8 @@ After this change, the C++ lookup sorter gives every distinct unit a stable orde
 - [x] (2026-08-12) Added the randomized hash feature through core, analysis, and the facade.
 - [x] (2026-08-12) Added the scheduled C++ reference test in randomized mode.
 - [x] (2026-08-12) Ran focused tests, formatting, and targeted Clippy.
-- [ ] Commit, integrate origin/master, push, close #1876, and record the final result.
+- [x] (2026-08-12) Committed as `810f4b43`, integrated origin/master, and pushed the fix.
+- [ ] Close #1876 after the final plan update reaches origin/master.
 
 ## Surprises & Discoveries
 
@@ -41,7 +42,7 @@ After this change, the C++ lookup sorter gives every distinct unit a stable orde
 
 ## Outcomes & Retrospective
 
-The implementation is complete and locally validated. The total-order unit test passes. The ten-variant #1836 reference corpus passes with randomly seeded hash tables. Formatting and targeted Clippy pass. The final entry will record the pushed commit and closed issue.
+The implementation is complete in commit `810f4b43`. The total-order unit test passes. The ten-variant #1836 reference corpus passes with randomly seeded hash tables. Formatting and targeted Clippy pass. The daily benchmark workflow now runs this corpus with random hash seeds. The commit is on origin/master.
 
 ## Context and Orientation
 
