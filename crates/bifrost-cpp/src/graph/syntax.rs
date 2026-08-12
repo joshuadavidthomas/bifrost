@@ -44,7 +44,9 @@ fn append_qualified_components<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tre
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
         match current.kind() {
-            "identifier" | "namespace_identifier" | "type_identifier" => out.push(current),
+            "identifier" | "namespace_identifier" | "type_identifier" | "operator_name" => {
+                out.push(current)
+            }
             "qualified_identifier" | "scoped_identifier" => {
                 stack.push(current.child_by_field_name("name")?);
                 if let Some(scope) = current.child_by_field_name("scope") {
