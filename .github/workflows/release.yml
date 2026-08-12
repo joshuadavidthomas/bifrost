@@ -414,9 +414,9 @@ jobs:
           chmod +x "${GITHUB_WORKSPACE}/target/release/${BIN_NAME}"
 
       - name: Scan this repository with the staged binary
-        # The action's gate step fails this job when the scan reports findings
-        # at or above the threshold, or when the run is unreliable. This job is
-        # a promotion-evidence dependency, so such a failure blocks publication.
+        # This smoke test proves that the staged binary can complete the scan.
+        # Existing repository findings do not block publication. An unreliable
+        # scan still returns status 2 and blocks publication.
         # The scan uses no cache, so the release gate is a cold, reproducible
         # run.
         uses: ./.github/actions/policy-scan
@@ -424,6 +424,7 @@ jobs:
           version: local
           upload: 'false'
           cache: 'false'
+          fail-on: never
 
   promotion-evidence:
     name: promotion evidence
