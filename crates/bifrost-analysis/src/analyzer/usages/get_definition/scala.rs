@@ -11816,9 +11816,7 @@ fn scala_import_boundary_for_name(
             continue;
         };
         if import.is_wildcard {
-            if simple.chars().next().is_some_and(char::is_uppercase)
-                && !scala_workspace_package_exists(support, &path)
-            {
+            if !scala_workspace_package_exists(support, &path) {
                 return true;
             }
             continue;

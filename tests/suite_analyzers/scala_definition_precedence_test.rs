@@ -3053,6 +3053,7 @@ final class Consumer {
 import external.syntax.all.*
 sealed trait ForgeType
 object ForgeType { val all: List[ForgeType] = Nil }
+object UseExternal { val total = count("*") }
 "#;
     let project = InlineTestProject::with_language(Language::Scala)
         .file("app/Use.scala", source)
@@ -3072,6 +3073,13 @@ object ForgeType { val all: List[ForgeType] = Nil }
             "app/ForgeType.scala",
             forge_source,
             forge_source.find("all.*").expect("external wildcard owner"),
+        ),
+        location_in(
+            "app/ForgeType.scala",
+            forge_source,
+            forge_source
+                .find("count(\"*\")")
+                .expect("external lowercase call"),
         ),
         location_in(
             "app/Use.scala",
@@ -3130,10 +3138,10 @@ object ForgeType { val all: List[ForgeType] = Nil }
         &json!({"references": references}).to_string(),
     );
     let results = value["results"].as_array().expect("definition results");
-    for result in &results[..2] {
+    for result in &results[..3] {
         assert_eq!(result["status"], "unresolvable_import_boundary", "{value}");
     }
-    for (result, expected) in results[2..].iter().zip([
+    for (result, expected) in results[3..].iter().zip([
         "app.Consumer.catsRepeat",
         "app.Consumer.catsRepeat",
         "app.Consumer.catsRepeat",
