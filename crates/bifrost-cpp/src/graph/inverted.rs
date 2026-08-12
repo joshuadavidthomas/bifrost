@@ -857,7 +857,9 @@ fn record_call(node: Node<'_>, ctx: &mut CppScan<'_>, bindings: &LocalInferenceE
                             .visible_member_for_owner_name(ctx.file, &owner, name)
                         {
                             VisibleMemberResolution::Callable(callables) => {
-                                if let Some(callable) = callables.first() {
+                                if let Some(callable) = callables.iter().find(|callable| {
+                                    cpp_callable_arity(&ctx.analyzer, callable).accepts(call_arity)
+                                }) {
                                     ctx.record(callable.fq_name(), function);
                                 }
                             }

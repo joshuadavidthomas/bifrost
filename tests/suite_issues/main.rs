@@ -71,6 +71,7 @@ mod issue_1861_scala_package_object;
 mod issue_1861_scala_top_level_function;
 mod issue_1861_scala_varargs_precedence;
 mod issue_1866_php_global_namespace_fallback;
+mod issue_1875_cpp_inverted_overload_arity;
 mod issue_1908_reconcile_storm;
 mod issue_1950_cpp_nested_callee_focus;
 mod issue_1960_cpp_macro_activation;
