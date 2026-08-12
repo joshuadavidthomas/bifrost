@@ -14,7 +14,7 @@ Scala definition lookup currently reports no definition when a class extends two
 - [x] (2026-08-12 16:25Z) Returned matching members from ambiguous owners at the blocked hierarchy level.
 - [x] (2026-08-12 16:31Z) Updated the existing end-to-end regression and kept the fail-closed near miss.
 - [x] (2026-08-12 16:35Z) Ran focused formatting, tests, and Clippy checks.
-- [ ] Commit, integrate `origin/master`, push, and close issue #1863.
+- [x] (2026-08-12 16:47Z) Committed, integrated `origin/master`, pushed, and closed issue #1863.
 
 ## Surprises & Discoveries
 
@@ -39,7 +39,7 @@ Scala definition lookup currently reports no definition when a class extends two
 
 ## Outcomes & Retrospective
 
-The implementation now preserves duplicate supertype declarations through the forward lookup cache. Field, parameterless method, and typed overload references return both physical members. The #1851 near miss still fails closed when those owners do not declare the requested member. Commit and delivery remain.
+The implementation preserves duplicate supertype declarations through the forward lookup cache. Field, parameterless method, and typed overload references return both physical members. The #1851 near miss still fails closed when those owners do not declare the requested member. Commit `6415b9ea` delivered the fix. Merge commit `ae89c3ab` put it on `master`, and both focused tests passed again after that merge.
 
 ## Context and Orientation
 
@@ -89,3 +89,5 @@ Do not change `ScalaDirectAncestorResolution` in `brokk-bifrost-jvm`. Add privat
 Revision note: Created this plan before implementation because the fix changes a multi-stage resolution contract.
 
 Revision note: Updated the plan after implementation and focused validation. The results confirm the candidate answer and the fail-closed boundary.
+
+Revision note: Recorded final delivery and issue closure after the post-merge validation passed.
