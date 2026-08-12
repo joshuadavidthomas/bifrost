@@ -1968,6 +1968,12 @@ impl<'a> CppVisitor<'a> {
                                 &template_scope,
                                 stack,
                             );
+                            self.parsed.record_materialization(
+                                MaterializationRecord::RecoveredDeclaration {
+                                    recovery: recovered.range,
+                                    unit: code_unit.clone(),
+                                },
+                            );
                             let mut member_scope = template_scope.clone();
                             member_scope.class_unit = Some(code_unit);
                             member_scope.declarations_are_fields = true;
@@ -2788,6 +2794,45 @@ impl<'a> CppVisitor<'a> {
     /// regions recover recursively: the reparsed interior is walked through the
     /// same `visit_function_definition` path, so a sentinel inside the region hits
     /// this recovery again.
+    /// Runs `reparse_walk` and records every declaration it mints as a
+    /// [`MaterializationRecord::RecoveredDeclaration`] interpreting
+    /// `recovery` (issue #1657). A reparsed sentinel region has no single
+    /// recovered envelope unit: the ordinary visitors mint namespaces,
+    /// classes, and members directly from the reparsed tree, so the walk's
+    /// declaration delta is the recovered set. Records are ordered by
+    /// declaration start byte so the parse product stays deterministic.
+    fn record_recovered_declarations(
+        &mut self,
+        recovery: Range,
+        reparse_walk: impl FnOnce(&mut Self),
+    ) {
+        let before = self.parsed.declarations().clone();
+        reparse_walk(self);
+        let mut minted: Vec<CodeUnit> = self
+            .parsed
+            .declarations()
+            .iter()
+            .filter(|unit| !before.contains(*unit))
+            .cloned()
+            .collect();
+        minted.sort_by_cached_key(|unit| {
+            let start = self
+                .parsed
+                .declaration_ranges(unit)
+                .first()
+                .map(|range| range.start_byte)
+                .unwrap_or(usize::MAX);
+            (start, unit.fq_name().to_string())
+        });
+        for unit in minted {
+            self.parsed
+                .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                    recovery,
+                    unit,
+                });
+        }
+    }
+
     fn visit_sentinel_macro_region<'tree>(
         &mut self,
         node: Node<'tree>,
@@ -2852,6 +2897,11 @@ impl<'a> CppVisitor<'a> {
                 &class_scope,
                 &mut class_stack,
             );
+            self.parsed
+                .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                    recovery: class_range,
+                    unit: class_unit.clone(),
+                });
             let member_scope = ScopeInfo {
                 package_name: class_scope.package_name.clone(),
                 module: class_scope.module.clone(),
@@ -2891,14 +2941,17 @@ impl<'a> CppVisitor<'a> {
         if !cpp_reparsed_items_are_indexable(root, self.source) {
             return false;
         }
-        self.visit_container(
-            root,
-            &scope.package_name,
-            scope.module.clone(),
-            scope.class_unit.clone(),
-            scope.template_signature.clone(),
-            scope.visible_using_namespaces.clone(),
-        );
+        let recovery = cpp_recovery_window(self.source, start, end);
+        self.record_recovered_declarations(recovery, |visitor| {
+            visitor.visit_container(
+                root,
+                &scope.package_name,
+                scope.module.clone(),
+                scope.class_unit.clone(),
+                scope.template_signature.clone(),
+                scope.visible_using_namespaces.clone(),
+            );
+        });
         if end > node.end_byte() {
             self.consumed_fragment_regions
                 .push((node.start_byte(), end));
@@ -3073,6 +3126,12 @@ impl<'a> CppVisitor<'a> {
                         scope,
                         stack,
                     );
+                    self.parsed.record_materialization(
+                        MaterializationRecord::RecoveredDeclaration {
+                            recovery: fragmented.class_range,
+                            unit: code_unit.clone(),
+                        },
+                    );
                     let consume_fragment =
                         self.visit_fragmented_export_class_members(outcome, code_unit, scope);
                     // Everything between the fragmented declaration and its displaced
@@ -3088,7 +3147,7 @@ impl<'a> CppVisitor<'a> {
             }
             let uses_initializer_body = recovered.uses_initializer_body;
             let definition_body_present = recovered.body.is_some();
-            self.visit_named_class_like_shape(
+            let class_unit = self.visit_named_class_like_shape(
                 recovered.declaration_node,
                 recovered.name,
                 recovered.body,
@@ -3098,6 +3157,11 @@ impl<'a> CppVisitor<'a> {
                 scope,
                 stack,
             );
+            self.parsed
+                .record_materialization(MaterializationRecord::RecoveredDeclaration {
+                    recovery: cpp_declaration_range(node),
+                    unit: class_unit,
+                });
             if uses_initializer_body {
                 return;
             }
@@ -3596,6 +3660,25 @@ fn cpp_declaration_range(node: Node<'_>) -> Range {
         end_byte: node.end_byte(),
         start_line: node.start_position().row + 1,
         end_line: node.end_position().row + 1,
+    }
+}
+
+/// A recovery interval as a [`Range`], for materialization records whose
+/// window is a byte region rather than one parser node (the sentinel-macro
+/// region reparses, issue #941/#1657).
+fn cpp_recovery_window(source: &str, start_byte: usize, end_byte: usize) -> Range {
+    let line_at = |byte: usize| {
+        source.as_bytes()[..byte]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+            + 1
+    };
+    Range {
+        start_byte,
+        end_byte,
+        start_line: line_at(start_byte),
+        end_line: line_at(end_byte),
     }
 }
 
