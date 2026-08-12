@@ -522,11 +522,7 @@ fn resolve_direct_named_exported_fqn(
         }
         let module_unit = resolve_module_code_unit(python, &module)?;
         let file = module_unit.source();
-        let local = python
-            .top_level_declarations(file)
-            .into_iter()
-            .filter(|unit| unit.identifier() == export_name)
-            .collect::<Vec<_>>();
+        let local = local_export_declarations(python, file, &export_name);
         let binder = python.import_binder_of(file);
         let binding = binder.bindings.get(&export_name);
         if !local.is_empty() && binding.is_some() {
@@ -655,7 +651,12 @@ fn local_export_declarations(
     index
         .top_level_declarations(file)
         .into_iter()
-        .filter(|unit| unit.identifier() == local_name)
+        .filter(|unit| {
+            unit.identifier() == local_name
+                && index
+                    .parent_of(unit)
+                    .is_some_and(|parent| parent.is_module() && parent.source() == file)
+        })
         .collect()
 }
 

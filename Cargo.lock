@@ -478,6 +478,7 @@ dependencies = [
  "rayon",
  "regex",
  "tempfile",
+ "toml",
  "tree-sitter",
  "tree-sitter-python",
 ]

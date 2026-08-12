@@ -8,8 +8,9 @@ use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashSet;
+use brokk_bifrost_core::path_normalization::NormalizePath;
 use brokk_bifrost_core::text_utils::{compute_line_starts, find_line_index_for_offset};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser, Tree};
 
 /// Intern one qualified-name segment in the process-global interner.
@@ -30,9 +31,13 @@ fn py_segment(text: &str, kind: SegmentKind) -> SegmentId {
 /// hidden-directory segments stay intact in cold extraction, synthesized module
 /// units, and persisted reconstruction.
 pub fn python_module_fq(file: &ProjectFile) -> FqName {
+    python_module_fq_from_components(&python_module_components(file))
+}
+
+fn python_module_fq_from_components(components: &[String]) -> FqName {
     let mut fq = FqName::new();
-    for component in python_module_components(file) {
-        fq.push(py_segment(&component, SegmentKind::Package));
+    for component in components {
+        fq.push(py_segment(component, SegmentKind::Package));
     }
     fq
 }
@@ -58,6 +63,12 @@ fn python_package_components_for_file(file: &ProjectFile) -> Vec<String> {
         return Vec::new();
     }
 
+    if let Some(import_root_rel) = python_configured_import_root(file, parent_rel)
+        && let Ok(relative_package) = parent_rel.strip_prefix(import_root_rel)
+    {
+        return path_components(relative_package);
+    }
+
     let mut effective_package_root_rel: Option<&Path> = None;
     let mut current_rel = Some(parent_rel);
     while let Some(path) = current_rel {
@@ -75,6 +86,41 @@ fn python_package_components_for_file(file: &ProjectFile) -> Vec<String> {
         None => parent_rel,
     };
     path_components(relative_package)
+}
+
+/// Find the nearest setuptools import root that contains this source file.
+///
+/// The manifest is parsed as TOML. An unrelated or malformed `pyproject.toml`
+/// does not change the existing `__init__.py` package-root convention.
+fn python_configured_import_root(file: &ProjectFile, parent_rel: &Path) -> Option<PathBuf> {
+    let mut manifest_dir_rel = Some(parent_rel);
+    while let Some(directory) = manifest_dir_rel {
+        let manifest = file.root().join(directory).join("pyproject.toml");
+        if let Ok(source) = std::fs::read_to_string(manifest)
+            && let Ok(document) = source.parse::<toml::Value>()
+            && let Some(where_entries) = document
+                .get("tool")
+                .and_then(|tool| tool.get("setuptools"))
+                .and_then(|setuptools| setuptools.get("packages"))
+                .and_then(|packages| packages.get("find"))
+                .and_then(|find| find.get("where"))
+                .and_then(toml::Value::as_array)
+        {
+            let mut roots = where_entries
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(|entry| file.root().join(directory).join(entry).normalize())
+                .filter_map(|root| root.strip_prefix(file.root()).ok().map(Path::to_path_buf))
+                .filter(|root| parent_rel.starts_with(root))
+                .collect::<Vec<_>>();
+            roots.sort_by_key(|root| root.components().count());
+            if let Some(root) = roots.pop() {
+                return Some(root);
+            }
+        }
+        manifest_dir_rel = directory.parent();
+    }
+    None
 }
 
 fn path_components(path: &Path) -> Vec<String> {
@@ -118,6 +164,7 @@ pub struct PythonVisitor<'a> {
     pub file: &'a ProjectFile,
     pub source: &'a str,
     pub package_name: &'a str,
+    module_fq: &'a FqName,
     pub parsed: &'a mut ParsedFile,
     pub module: Option<CodeUnit>,
     pub overload_decorators: &'a PythonOverloadDecoratorBindings,
@@ -289,7 +336,10 @@ impl<'a> PythonVisitor<'a> {
                 .fq
                 .clone()
                 .with_pushed(py_segment(name, SegmentKind::Nested)),
-            None => python_module_fq(self.file).with_pushed(py_segment(name, SegmentKind::Type)),
+            None => self
+                .module_fq
+                .clone()
+                .with_pushed(py_segment(name, SegmentKind::Type)),
         };
         let code_unit = CodeUnit::new_fq(
             self.file.clone(),
@@ -385,7 +435,9 @@ impl<'a> PythonVisitor<'a> {
                     .with_pushed(py_segment(name, SegmentKind::Nested)),
             }
         } else {
-            python_module_fq(self.file).with_pushed(py_segment(name, SegmentKind::Member))
+            self.module_fq
+                .clone()
+                .with_pushed(py_segment(name, SegmentKind::Member))
         };
 
         if capture {
@@ -499,7 +551,9 @@ impl<'a> PythonVisitor<'a> {
             } else if module_control_depth <= 1 {
                 (
                     name.clone(),
-                    python_module_fq(self.file).with_pushed(py_segment(&name, SegmentKind::Member)),
+                    self.module_fq
+                        .clone()
+                        .with_pushed(py_segment(&name, SegmentKind::Member)),
                 )
             } else {
                 continue;
@@ -588,13 +642,15 @@ impl<'a> PythonVisitor<'a> {
 /// identifiers, and the declaration walk. `analyzer/python/adapter.rs`'s
 /// `LanguageAdapter::parse_file` is the only caller.
 pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile {
-    let module_fq = python_module_name(file);
-    let mut parsed = ParsedFile::new(module_fq.clone());
+    let module_components = python_module_components(file);
+    let module_name = module_components.join(".");
+    let module_fq = python_module_fq_from_components(&module_components);
+    let mut parsed = ParsedFile::new(module_name.clone());
     let root = tree.root_node();
 
     collect_python_identifiers(root, source, &mut parsed.type_identifiers);
 
-    let module_code_unit = module_code_unit(file, &module_fq);
+    let module_code_unit = module_code_unit_from_fq(file, &module_name, module_fq.clone());
     if let Some(module) = module_code_unit.clone() {
         parsed.add_code_unit(module, root, source, None, None);
     }
@@ -603,7 +659,8 @@ pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
     let mut visitor = PythonVisitor {
         file,
         source,
-        package_name: &module_fq,
+        package_name: &module_name,
+        module_fq: &module_fq,
         parsed: &mut parsed,
         module: module_code_unit,
         overload_decorators: &overload_decorators,
@@ -625,12 +682,22 @@ pub fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<CodeUnit>
     if module_fq.is_empty() {
         return None;
     }
-    let mut components = python_module_components(file);
+    let components = python_module_components(file);
     debug_assert_eq!(
         module_fq,
         components.join("."),
         "module_code_unit must be built from the file's path-derived Python module name"
     );
+    let structured_fq = python_module_fq_from_components(&components);
+    module_code_unit_from_fq(file, module_fq, structured_fq)
+}
+
+fn module_code_unit_from_fq(
+    file: &ProjectFile,
+    module_fq: &str,
+    structured_fq: FqName,
+) -> Option<CodeUnit> {
+    let mut components = module_fq.split('.').map(str::to_string).collect::<Vec<_>>();
     let short_name = components.pop()?;
     let package_name = components.join(".");
     Some(CodeUnit::new_fq(
@@ -638,7 +705,7 @@ pub fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<CodeUnit>
         CodeUnitType::Module,
         package_name,
         short_name,
-        python_module_fq(file),
+        structured_fq,
     ))
 }
 
