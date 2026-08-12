@@ -13,7 +13,7 @@ Python dependency packs must connect a class to its real base class. Today, `cla
 - [x] (2026-08-12T22:07Z) Added failing producer and end-to-end tests for local and imported base classes.
 - [x] (2026-08-12T22:07Z) Resolved base references with source-ordered lexical declarations and structured import bindings.
 - [x] (2026-08-12T22:07Z) Ran focused tests, both Python semantic modules, formatting, and targeted Clippy.
-- [ ] Commit, pull, push to `origin/master`, and close issue #1822.
+- [x] (2026-08-12T22:07Z) Committed the implementation as `8027ee2e`; delivery will push this plan closure with it.
 
 ## Surprises & Discoveries
 
@@ -39,7 +39,7 @@ Python dependency packs must connect a class to its real base class. Today, `cla
 
 ## Outcomes & Retrospective
 
-The producer now emits stable declared identities for local, aliased, relative, and namespace-imported base classes. A complete pack hierarchy now supports a proved missing-member result. One delivery step remains: commit, push, and close issue #1822.
+The producer now emits stable declared identities for local, aliased, relative, and namespace-imported base classes. A complete pack hierarchy now supports a proved missing-member result. The implementation is committed as `8027ee2e` and is ready for delivery.
 
 ## Context and Orientation
 
@@ -100,3 +100,5 @@ Keep `TypeRef` and the semantic-pack schema unchanged. Use `TypeRef::Declared { 
 Plan update note: Created this plan after confirming issue #1822. It records the current producer seam and the required end-to-end proof.
 
 Plan update note: Implemented import-aware hierarchy bindings. The focused producer test, 11 dependency-pack tests, 20 Python diagnostic tests, formatting, and targeted Clippy passed.
+
+Plan update note: Recorded implementation commit `8027ee2e` and closed the plan before delivery.
