@@ -35,6 +35,7 @@ pub mod hierarchy;
 pub mod identity;
 pub mod imports;
 pub mod queries;
+pub mod raii;
 pub mod reconcile;
 pub mod structural;
 pub mod test_detection;

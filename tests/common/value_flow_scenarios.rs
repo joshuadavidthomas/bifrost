@@ -4748,15 +4748,15 @@ void run() {
         kind: ProcedureKind::Function,
         positive_source_call: "dfb_source()",
         positive_sink_call: "dfb_sink(dfb_source())",
-        positive_discovery: SemanticInputStatus::Unknown,
-        positive_result_complete: false,
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
         positive_meeting_count: 3,
         positive_public_endpoint_count: 3,
         positive_public_may_complete_count: 0,
         positive_public_may_partial_count: 0,
-        negative_discovery: SemanticInputStatus::Unknown,
-        negative_result_complete: false,
-        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
     }
 }
 

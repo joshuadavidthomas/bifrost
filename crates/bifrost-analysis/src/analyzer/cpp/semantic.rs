@@ -4,6 +4,7 @@
 //! Graph construction, abrupt-completion routing, cleanup specialization, and
 //! physical adjacency storage remain owned by the shared semantic substrate.
 
+use brokk_bifrost_cpp::raii::CppTemporaryFreeCallIndex;
 use tree_sitter::Node;
 
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner;
@@ -18,7 +19,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{CppAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v2";
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v3";
 
 impl_program_semantics_provider!(CppAnalyzer, CppSemanticLowerer);
 
@@ -190,6 +191,19 @@ fn enumerate_procedures<'tree>(
     let root = prepared.tree().root_node();
     let mut inventory =
         ProcedureInventoryBuilder::new(file, prepared.dialect(), root, "cpp-source", budget)?;
+    // The per-file proof that an exact local free-function call cannot
+    // materialize a destructible temporary (#1984). C never opens RAII
+    // boundaries, so only C++ pays for the extra walk.
+    let temporary_free_calls =
+        (!is_c_source).then(|| CppTemporaryFreeCallIndex::build(prepared.source(), root));
+    if let Some(index) = &temporary_free_calls
+        && let Err(stop) = inventory.observe_additional_work(SemanticWork {
+            nested_entries: index.visited_nodes(),
+            ..SemanticWork::default()
+        })
+    {
+        return Ok(stop.into_outcome());
+    }
     let mut specs: Vec<ProcedureSpec<'tree>> = Vec::new();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
@@ -256,7 +270,7 @@ fn enumerate_procedures<'tree>(
         if let Some((kind, segment_kind, body, mut properties)) = shape {
             let scan = match callable_preflight(
                 frame.node,
-                is_c_source,
+                temporary_free_calls.as_ref(),
                 budget,
                 inventory.observed_work(),
                 cancellation,
@@ -355,11 +369,13 @@ fn enumerate_procedures<'tree>(
 
 fn callable_preflight(
     root: Node<'_>,
-    is_c_source: bool,
+    // `Some` for C++ sources; `None` for C, which never opens RAII boundaries.
+    temporary_free_calls: Option<&CppTemporaryFreeCallIndex<'_>>,
     budget: &SemanticBudget,
     observed: SemanticWork,
     cancellation: &CancellationToken,
 ) -> Result<CallablePreflight, CallablePreflightStop> {
+    let is_c_source = temporary_free_calls.is_none();
     let mut result = CallablePreflight {
         has_raii_boundaries: !is_c_source
             && callable_name_node(root).is_some_and(|name| name.kind() == "destructor_name"),
@@ -411,12 +427,17 @@ fn callable_preflight(
         {
             result.has_vla_boundaries = true;
         }
-        if !is_c_source {
+        if let Some(index) = temporary_free_calls {
+            // A call expression can materialize a class-typed temporary that
+            // is destroyed at the end of the full expression, unless the
+            // per-file index proves this exact call temporary-free (#1984).
             result.has_raii_boundaries |= declaration_may_construct_object(node)
                 || matches!(
                     node.kind(),
-                    "call_expression" | "new_expression" | "compound_literal_expression"
-                );
+                    "new_expression" | "compound_literal_expression"
+                )
+                || (node.kind() == "call_expression"
+                    && !index.call_is_provably_temporary_free(node));
         }
         stack.extend(named_children(node));
     }
