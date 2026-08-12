@@ -5355,12 +5355,12 @@ impl CppMemberTrace {
 /// separate verdict function the trace called per winner. One function now
 /// answers it, so a row can never state a verdict the filter did not act on.
 ///
-/// Two refusals are distinct and stay distinct. A member that is not callable
-/// at all lost the declaration space, not the call shape. A callable whose
-/// parameter list the analyzer never recorded is undecidable: it stays
-/// reachable, exactly as the filter has always left it, and reports `unknown`
-/// rather than being promoted to `applicable` by surviving a check that never
-/// refused it.
+/// Two refusals are distinct and stay distinct. A member that cannot be an
+/// invocation target lost the declaration space, not the call shape. A
+/// function whose parameter list the analyzer never recorded is undecidable.
+/// A field call is also undecidable because its declared value type owns the
+/// call operator or function-pointer signature. Both stay reachable and report
+/// `unknown` rather than claiming a check the resolver did not make.
 fn cpp_candidate_applicability(
     analyzer: &dyn IAnalyzer,
     candidates: &[CodeUnit],
@@ -5373,6 +5373,9 @@ fn cpp_candidate_applicability(
         candidates
             .iter()
             .map(|unit| {
+                if unit.is_field() {
+                    return CandidateApplicability::unknown(unit.clone());
+                }
                 if !unit.is_function() {
                     return CandidateApplicability::inapplicable(
                         unit.clone(),
@@ -5760,12 +5763,23 @@ where
     let non_callable = member_trace.is_some().then(|| {
         found
             .iter()
-            .filter(|unit| !unit.is_callable())
+            .filter(|unit| !unit.is_callable() && !unit.is_field())
             .cloned()
             .collect::<Vec<_>>()
     });
+    let callable_values = found
+        .iter()
+        .filter(|unit| unit.is_field())
+        .cloned()
+        .collect::<Vec<_>>();
     found.retain(CodeUnit::is_callable);
-    let considered = member_trace.is_some().then(|| found.clone());
+    let considered = member_trace.is_some().then(|| {
+        found
+            .iter()
+            .chain(&callable_values)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
     let mut candidates = cpp_filter_candidates_by_call_lazy(
         found,
         arity,
@@ -5774,6 +5788,7 @@ where
         ctx.visibility,
         ctx.file,
     );
+    candidates.extend(callable_values);
     sort_units(&mut candidates);
     candidates.dedup();
     if let Some(state) = member_trace.as_ref() {
@@ -5803,13 +5818,24 @@ where
     let non_callable = member_trace.is_some().then(|| {
         found
             .iter()
-            .filter(|unit| !unit.is_callable())
+            .filter(|unit| !unit.is_callable() && !unit.is_field())
             .cloned()
             .collect::<Vec<_>>()
     });
+    let callable_values = found
+        .iter()
+        .filter(|unit| unit.is_field())
+        .cloned()
+        .collect::<Vec<_>>();
     found.retain(CodeUnit::is_callable);
-    let had_callable = !found.is_empty();
-    let considered = member_trace.is_some().then(|| found.clone());
+    let had_callable = !found.is_empty() || !callable_values.is_empty();
+    let considered = member_trace.is_some().then(|| {
+        found
+            .iter()
+            .chain(&callable_values)
+            .cloned()
+            .collect::<Vec<_>>()
+    });
     let mut candidates = cpp_filter_candidates_by_call_lazy_strict(
         found,
         arity,
@@ -5818,6 +5844,7 @@ where
         ctx.visibility,
         ctx.file,
     );
+    candidates.extend(callable_values);
     sort_units(&mut candidates);
     candidates.dedup();
     if let Some(state) = member_trace.as_ref() {
