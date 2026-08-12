@@ -640,6 +640,7 @@ fn validate_wrapper(
         | RqlForm::Generates
         | RqlForm::GeneratedBy
         | RqlForm::ImplementationOf
+        | RqlForm::StubsOf
         | RqlForm::ExportTarget
         | RqlForm::EdgeTarget
         | RqlForm::SegmentTarget

@@ -20,7 +20,20 @@ const RESOURCE_ACQUIRE: &str =
     include_str!("../fixtures/policy-cli/project/policies/endpoints/resource-acquire.rqlp");
 const RESOURCE_CLOSE: &str =
     include_str!("../fixtures/policy-cli/project/policies/endpoints/resource-close.rqlp");
-const RESOURCE_SOURCE: &str = include_str!("../fixtures/policy-cli/project/src/resource.ts");
+// A genuinely incomplete typestate subject: the unknown-receiver call keeps a
+// real dynamic-dispatch gap open, so the run stays inconclusive even though
+// receiverless local calls now bind completely.
+const INCOMPLETE_RESOURCE_SOURCE: &str = r#"interface Resource {}
+
+function openResource(): Resource {
+  return {};
+}
+
+export function leaksResource(handlers: { notify(): void }): Resource {
+  handlers.notify();
+  return openResource();
+}
+"#;
 
 fn evaluation_options(date: &str) -> PolicyEvaluationOptions {
     PolicyEvaluationOptions::new(date.parse().expect("fixed test date"))
@@ -336,7 +349,7 @@ fn absent_unselected_and_incomplete_policies_are_not_conflated_as_stale() {
     assert!(!review.stale());
 
     let project = InlineTestProject::new()
-        .file("src/resource.ts", RESOURCE_SOURCE)
+        .file("src/resource.ts", INCOMPLETE_RESOURCE_SOURCE)
         .file(POLICY_PATH, RESOURCE_POLICY)
         .file("policies/endpoints/resource-acquire.rqlp", RESOURCE_ACQUIRE)
         .file("policies/endpoints/resource-close.rqlp", RESOURCE_CLOSE)

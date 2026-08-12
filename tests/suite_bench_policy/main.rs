@@ -61,6 +61,7 @@ mod issue_1951_balanced_policy;
 mod issue_1953_ruby_call_binding;
 mod issue_1954_direct_call_witness;
 mod issue_1978_unmaterialized_external_summary;
+mod issue_1987_receiverless_call_binding;
 mod scan_usages_same_owner_policy;
 // Milestone 3 of the procedure-summary foundry (#1871). The fixture engine and
 // its runner are generation-time tooling behind `release-tooling`, so this

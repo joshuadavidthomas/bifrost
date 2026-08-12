@@ -88,12 +88,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     pub(super) fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
-        callable: Node<'tree>,
-        procedure_kind: ProcedureKind,
-        properties: ProcedureProperties,
+        spec: &ProcedureSpec<'tree>,
     ) -> Result<(), TsLoweringError> {
+        let callable = spec.callable;
         let declaration_range = node_range(callable);
-        let layout = if procedure_kind == ProcedureKind::Initializer {
+        let layout = if spec.kind == ProcedureKind::Initializer {
             Default::default()
         } else {
             formal_parameter_slots(
@@ -118,7 +117,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let receiver = self.session.add_value_with_metadata(
                     builder,
                     metadata,
-                    SemanticValueKind::Receiver,
+                    SemanticValueKind::Receiver { dispatch: true },
                 )?;
                 self.receiver = Some(receiver);
             } else {
@@ -139,12 +138,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
         }
 
-        if self.receiver.is_none() && procedure_owns_receiver(procedure_kind, properties) {
+        if self.receiver.is_none() && spec.owns_receiver {
             let metadata = self.value_mapping(builder, callable)?;
             self.receiver = Some(self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver,
+                SemanticValueKind::Receiver { dispatch: true },
             )?);
         }
         Ok(())

@@ -10366,7 +10366,14 @@ pub fn collapse_owner_candidates(
                 return DirectOwnerResolution::Ambiguous;
             }
             CppClassDeclarationStrength::Full => full_definition = Some(candidate),
-            CppClassDeclarationStrength::Forward => forwards.push(candidate),
+            CppClassDeclarationStrength::Forward => {
+                let duplicate = forwards
+                    .iter()
+                    .any(|forward| same_logical_symbol(forward, &candidate));
+                if !duplicate {
+                    forwards.push(candidate);
+                }
+            }
             CppClassDeclarationStrength::Unknown => return DirectOwnerResolution::Ambiguous,
         }
     }

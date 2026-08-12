@@ -451,3 +451,191 @@ fn python_attribute_store_on_the_path_keeps_a_typed_incomplete_result() {
         "an incomplete run must not report a clean negative"
     );
 }
+
+// A bare call whose caller is a member extension function must not bind the
+// caller's receiver as the implicit dispatch receiver: that formal is the
+// extension receiver, not the singleton the callee dispatches on.
+const KOTLIN_EXTENSION_CALLER_SOURCE: &str = r#"
+package balanced
+
+object BalancedFlow {
+    fun source(): String {
+        return "tainted"
+    }
+
+    fun sink(value: String) {}
+
+    fun String.positive() {
+        sink(source())
+    }
+}
+"#;
+
+// A bare call to a companion-object member dispatches on the companion
+// singleton, never on the enclosing instance's `this`.
+const KOTLIN_COMPANION_CALLEE_SOURCE: &str = r#"
+package balanced
+
+class BalancedFlow {
+    companion object {
+        fun source(): String {
+            return "tainted"
+        }
+
+        fun sink(value: String) {}
+    }
+
+    fun positive() {
+        sink(source())
+    }
+}
+"#;
+
+fn assert_kotlin_receiver_binding_stays_open(file: &str, source: &str) {
+    let case = balanced_case(Language::Kotlin, file, source, "positive");
+    assert!(
+        !case.plan.discovery_complete(),
+        "the unproven implicit receiver must keep discovery incomplete"
+    );
+    let cause = case
+        .plan
+        .first_incomplete_cause()
+        .expect("an incomplete discovery retains its first cause");
+    // The unproven implicit receiver keeps the call's binding open, which
+    // also leaves the caller's call-target refinement gaps standing; the plan
+    // reports whichever it reaches first, and both name the same defect.
+    assert!(
+        matches!(
+            cause,
+            ValueFlowIncompleteCause::Snapshot { .. }
+                | ValueFlowIncompleteCause::CallBinding { .. }
+        ),
+        "the first cause is the receiverless call: {cause:?}"
+    );
+    let result = solve(&case);
+    assert!(!result.is_complete(), "the run must not complete");
+    let (sink_id, _) = case.plan.sinks().next().expect("one sink");
+    assert!(
+        !matches!(
+            result.sink_outcome(sink_id),
+            ValueFlowSinkOutcome::NotReached
+        ),
+        "an incomplete run must not report a clean negative"
+    );
+}
+
+/// The implicit dispatch-receiver binding (#1951) accepts only sibling
+/// members of one declaring type. A member extension function's own receiver
+/// is the extension receiver, so its bare sibling calls stay typed
+/// incomplete instead of receiving the wrong actual.
+#[test]
+fn kotlin_extension_caller_keeps_the_receiver_binding_open() {
+    assert_kotlin_receiver_binding_stays_open(
+        "src/BalancedFlow.kt",
+        KOTLIN_EXTENSION_CALLER_SOURCE,
+    );
+}
+
+/// A companion-object member does not share its declaration parent with the
+/// enclosing class's instance members, so a bare call to it keeps the
+/// receiver binding open instead of binding the instance `this`.
+#[test]
+fn kotlin_companion_callee_keeps_the_receiver_binding_open() {
+    assert_kotlin_receiver_binding_stays_open(
+        "src/BalancedFlow.kt",
+        KOTLIN_COMPANION_CALLEE_SOURCE,
+    );
+}
+
+// A by-name sink parameter defers argument evaluation; the callee's own
+// procedure-level DeferredExecution gap must keep the balanced positive
+// typed incomplete now that strict calls carry no blanket caller-side gap.
+const SCALA_BY_NAME_SINK_SOURCE: &str = r#"
+package balanced
+
+object BalancedFlow {
+  def source(): String = {
+    "tainted"
+  }
+
+  def sink(value: => String): Unit = {}
+
+  def positive(): Unit = {
+    sink(source())
+  }
+}
+"#;
+
+// A declared non-Unit result whose body value is not structurally identity
+// keeps the result-adaptation gap: an implicit conversion may run before
+// `source` returns, so the flow through it stays typed incomplete.
+const SCALA_ADAPTED_RESULT_SOURCE: &str = r#"
+package balanced
+
+object BalancedFlow {
+  def raw(): String = {
+    "tainted"
+  }
+
+  def source(): AnyRef = {
+    raw()
+  }
+
+  def sink(value: AnyRef): Unit = {}
+
+  def positive(): Unit = {
+    sink(source())
+  }
+}
+"#;
+
+fn assert_scala_positive_stays_typed_incomplete(source: &str) {
+    let case = balanced_case(
+        Language::Scala,
+        "src/BalancedFlow.scala",
+        source,
+        "positive",
+    );
+    assert!(
+        !case.plan.discovery_complete(),
+        "the path-relevant Scala gap must keep discovery incomplete"
+    );
+    let cause = case
+        .plan
+        .first_incomplete_cause()
+        .expect("an incomplete discovery retains its first cause");
+    assert!(
+        matches!(
+            cause,
+            ValueFlowIncompleteCause::Snapshot { .. }
+                | ValueFlowIncompleteCause::CallBinding { .. }
+        ),
+        "the first cause is the deferring or adapting procedure: {cause:?}"
+    );
+    let result = solve(&case);
+    assert!(!result.is_complete(), "the run must not complete");
+    let (sink_id, _) = case.plan.sinks().next().expect("one sink");
+    assert!(
+        !matches!(
+            result.sink_outcome(sink_id),
+            ValueFlowSinkOutcome::NotReached
+        ),
+        "an incomplete run must not report a clean negative"
+    );
+}
+
+/// Removing the blanket strictness gap (#1989) must not weaken a call whose
+/// resolved callee actually defers evaluation: the by-name callee's own gap
+/// keeps the balanced positive typed incomplete.
+#[test]
+fn scala_by_name_sink_keeps_the_positive_typed_incomplete() {
+    assert_scala_positive_stays_typed_incomplete(SCALA_BY_NAME_SINK_SOURCE);
+}
+
+/// The Unit-discard discharge (#1989) must not extend to a declared non-Unit
+/// result: a body value that is not structurally identity keeps the
+/// result-adaptation gap and a typed incomplete flow.
+#[test]
+fn scala_adapted_result_keeps_the_positive_typed_incomplete() {
+    assert_scala_positive_stays_typed_incomplete(SCALA_ADAPTED_RESULT_SOURCE);
+}

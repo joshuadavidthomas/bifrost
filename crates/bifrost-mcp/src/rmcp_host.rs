@@ -353,7 +353,8 @@ enum WorkspaceBindingSource {
 /// Bifrost therefore keeps only the authorization state.
 struct ConnectionState {
     accepts_client_roots: bool,
-    /// What the handshake established, or nothing if it has not happened.
+    /// What the legacy `initialize` handshake established, or nothing if it
+    /// has not happened.
     ///
     /// This is a phase, not an attribute, and it is deliberately the *only*
     /// route to the values the handshake produces. Bifrost's client-supplied
@@ -365,6 +366,15 @@ struct ConnectionState {
     /// beside `client_supports_roots` and a predicate simply stopped consulting
     /// it, which let a first-message `tools/call` bind an arbitrary directory
     /// through rmcp's stateless SEP-2575 lifecycle.
+    ///
+    /// Connection-level negotiation is the *legacy* form. A `2026-07-28`
+    /// request negotiates version and capabilities per request instead,
+    /// carried in its own `_meta` and validated by rmcp before dispatch;
+    /// [`request_negotiates_per_request`] recognizes that form. Such a
+    /// request never populates this field, and its roots come from the MRTR
+    /// exchange rather than a server-initiated `roots/list` -- so the peer
+    /// handle stored here is genuinely connection-negotiation state, not
+    /// something the stateless path is missing.
     negotiated: Option<NegotiatedConnection>,
     workspace_binding_source: WorkspaceBindingSource,
     codex_sandbox_cwd_uri: Option<String>,
@@ -669,7 +679,8 @@ impl BifrostMcpHandler {
     /// another call may have bound already, and the client may have revoked the
     /// roots it is about to name.
     #[allow(deprecated)] // Roots: see the note on the `Root` import.
-    async fn ensure_client_workspace(&self, cancelled: &McpCancellationToken) {
+    async fn ensure_client_workspace(&self, context: &RequestContext<RoleServer>) {
+        let cancelled = &context.ct;
         let (peer, revocations_at_request) = {
             let mut state = self.workspace.lock().await;
             if self.client_roots_binding_is_stale(&state) {
@@ -681,9 +692,15 @@ impl BifrostMcpHandler {
                 return;
             }
             let Some(negotiated) = state.negotiated.as_ref() else {
-                eprintln!(
-                    "bifrost: refusing to request MCP roots before the initialize handshake completes"
-                );
+                // A stateless 2026-07-28 request has no connection-level
+                // negotiation to consult and no post-handshake roots
+                // lifecycle; its route to a workspace is the MRTR exchange in
+                // `activate_workspace_over_mrtr`, so silence is correct here.
+                if !request_negotiates_per_request(&context.meta) {
+                    eprintln!(
+                        "bifrost: refusing to request MCP roots before the initialize handshake completes"
+                    );
+                }
                 return;
             };
             if !negotiated.client_supports_roots {
@@ -1013,15 +1030,22 @@ impl BifrostMcpHandler {
         arguments: Value,
         meta: &rmcp::model::RequestMetaObject,
     ) -> Result<PreparedToolCall, ErrorData> {
-        // Defence in depth, independent of every binding source below. rmcp's
-        // stateless SEP-2575 lifecycle serves a request whose `_meta` carries
-        // the required keys without ever calling `initialize`, so "a tool call
-        // implies a completed handshake" is false. A client-supplied workspace
-        // is only meaningful once capabilities have been negotiated, and an
-        // explicitly rooted server has nothing to negotiate.
-        if state.accepts_client_roots && state.negotiated.is_none() {
+        // Defence in depth, independent of every binding source below. A
+        // client-supplied workspace is only meaningful once protocol version
+        // and capabilities have been negotiated, and an explicitly rooted
+        // server has nothing to negotiate. Legacy (`2025-11-25`) clients
+        // negotiate once per connection through `initialize`; stateless
+        // `2026-07-28` clients negotiate on every request through the `_meta`
+        // keys rmcp validates before dispatch. A request that carries neither
+        // -- rmcp's SEP-2575 lifecycle will serve one whose session opened
+        // statelessly but whose own `_meta` selects a legacy version -- must
+        // not reach any binding source.
+        if state.accepts_client_roots
+            && state.negotiated.is_none()
+            && !request_negotiates_per_request(meta)
+        {
             eprintln!(
-                "bifrost: refusing a workspace tool call received before the initialize handshake"
+                "bifrost: refusing a workspace tool call that negotiated capabilities neither per connection nor per request"
             );
             return Err(unbound_workspace_error());
         }
@@ -1341,6 +1365,33 @@ fn speaks_2026_07_28(context: &RequestContext<RoleServer>) -> bool {
         .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28)
 }
 
+/// Whether this request negotiated protocol version and capabilities on its
+/// own, through the `2026-07-28` per-request `_meta` keys, instead of through
+/// a connection-level `initialize`.
+///
+/// This is deliberately read from the request's own `_meta`, never from
+/// connection state: it is the per-request counterpart of
+/// [`ConnectionState::negotiated`]. rmcp dispatches a request that declares
+/// `2026-07-28` or newer in its `_meta` only after checking that the version
+/// is one it supports and that the required negotiation keys
+/// (`io.modelcontextprotocol/protocolVersion` and `.../clientCapabilities`)
+/// are present and well formed, so a request this returns `true` for is
+/// exactly as negotiated as a legacy connection is after `initialize` -- per
+/// request rather than per connection.
+fn request_negotiates_per_request(meta: &rmcp::model::RequestMetaObject) -> bool {
+    let negotiated = meta
+        .protocol_version()
+        .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+    // rmcp validated the full 2026-07-28 key set before dispatch; a request
+    // that declares the version but carries no capabilities is a dispatch bug,
+    // not a state to tolerate.
+    debug_assert!(
+        !negotiated || meta.client_capabilities().is_some(),
+        "rmcp dispatched a 2026-07-28 request without client capabilities"
+    );
+    negotiated
+}
+
 /// Echo the client's requested revision when it is one the SDK knows, and
 /// otherwise fall back to the server's own. This mirrors what `rmcp`'s default
 /// `initialize` does; Bifrost overrides `initialize` only to record
@@ -1590,7 +1641,7 @@ impl ServerHandler for BifrostMcpHandler {
         } else {
             // Negotiating a workspace can require a client round trip, so it
             // happens before the preparation lock is taken.
-            self.ensure_client_workspace(&context.ct).await;
+            self.ensure_client_workspace(&context).await;
             let mut state = self.workspace.lock().await;
             if self.client_roots_binding_is_stale(&state) {
                 self.revoke_client_roots(&mut state);

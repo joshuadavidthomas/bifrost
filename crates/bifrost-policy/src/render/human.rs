@@ -4,7 +4,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 use super::super::{
-    CategoryPredicate, CertaintyReason, ClassificationProvenance, CvssAssessment,
+    BoundedWitness, CategoryPredicate, CertaintyReason, ClassificationProvenance, CvssAssessment,
     CvssAssessmentProvenance, CvssAssessmentVariant, CvssComponentResult, CvssEvidenceBasis,
     CvssEvidenceScope, CvssMetricEvidence, CvssNomenclature, CvssSeverity, CvssSystemScope,
     CvssUnscoredReason, CvssVersion, DirectoryScope, EndpointDefinitionSchemaResolution,
@@ -25,10 +25,13 @@ use super::super::{
     StableSemanticIdentity, TaintSourceEvidence, TaintSystemEntry, TaintTrustBoundary,
     TypestateViolationEvidence, WitnessStepKind,
 };
+
 use super::{
     BoundedWriter, PolicyRenderError, ensure_supported_schema, map_io_error,
     should_escape_text_character,
 };
+
+const MAX_CONCISE_WITNESS_STEPS: usize = 12;
 
 /// Amount of policy audit detail included in human output.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -211,7 +214,107 @@ fn write_concise_finding<W: Write>(
     }
     writeln!(output).map_err(map_io_error)?;
     writeln!(output, "    {}", escape_terminal_text(finding.message())).map_err(map_io_error)?;
+    if let Some(witness) = finding.witnesses().first() {
+        writeln!(output).map_err(map_io_error)?;
+        write_concise_witness(output, finding, witness)?;
+
+        write_concise_alternate_paths(
+            output,
+            finding.witnesses().len().saturating_sub(1),
+            finding.witnesses_truncated(),
+            finding.omitted_witnesses_lower_bound(),
+        )?;
+    }
     writeln!(output).map_err(map_io_error)
+}
+
+fn write_concise_alternate_paths<W: Write>(
+    output: &mut BoundedWriter<W>,
+    retained_alternates: usize,
+    witnesses_truncated: bool,
+    omitted_witnesses_lower_bound: u64,
+) -> Result<(), PolicyRenderError> {
+    let alternate_lower_bound = u64::try_from(retained_alternates)
+        .unwrap_or(u64::MAX)
+        .saturating_add(omitted_witnesses_lower_bound);
+    if alternate_lower_bound == 0 {
+        return Ok(());
+    }
+    write!(output, "    ").map_err(map_io_error)?;
+    if witnesses_truncated {
+        write!(output, "at least ").map_err(map_io_error)?;
+    }
+    writeln!(
+        output,
+        "{} alternate path{} omitted; use --verbose for retained evidence",
+        alternate_lower_bound,
+        plural_suffix_u64(alternate_lower_bound),
+    )
+    .map_err(map_io_error)
+}
+
+fn write_concise_witness<W: Write>(
+    output: &mut BoundedWriter<W>,
+    finding: &PolicyFinding,
+    witness: &BoundedWitness,
+) -> Result<(), PolicyRenderError> {
+    let taint_sink = (finding.analysis_type() == PolicyAnalysisType::Taint).then(|| {
+        (
+            finding.primary(),
+            concise_terminal_symbol(finding).unwrap_or("taint sink"),
+        )
+    });
+    write_concise_witness_rows(output, witness, taint_sink)
+}
+
+fn write_concise_witness_rows<W: Write>(
+    output: &mut BoundedWriter<W>,
+    witness: &BoundedWitness,
+    taint_sink: Option<(&PolicySourceLocation, &str)>,
+) -> Result<(), PolicyRenderError> {
+    writeln!(output, "    #   Kind         Location  Code / symbol").map_err(map_io_error)?;
+    let retained_step_limit = MAX_CONCISE_WITNESS_STEPS - usize::from(taint_sink.is_some());
+    for (index, step) in witness.steps().iter().take(retained_step_limit).enumerate() {
+        write!(
+            output,
+            "    {:<3} {:<12} ",
+            index + 1,
+            witness_step_kind(step.kind()),
+        )
+        .map_err(map_io_error)?;
+        if let Some(location) = step.location() {
+            write_location(output, location).map_err(map_io_error)?;
+        } else {
+            write!(output, "-").map_err(map_io_error)?;
+        }
+        writeln!(output, "  {}", escape_terminal_text(step.label())).map_err(map_io_error)?;
+    }
+    if let Some((location, label)) = taint_sink {
+        write!(
+            output,
+            "    {:<3} {:<12} ",
+            witness.steps().len() + 1,
+            "sink"
+        )
+        .map_err(map_io_error)?;
+        write_location(output, location).map_err(map_io_error)?;
+        writeln!(output, "  {}", escape_terminal_text(label)).map_err(map_io_error)?;
+    }
+
+    let renderer_omissions = witness.steps().len().saturating_sub(retained_step_limit);
+    let omitted_lower_bound = u64::try_from(renderer_omissions)
+        .unwrap_or(u64::MAX)
+        .saturating_add(witness.omitted_steps_lower_bound());
+    if omitted_lower_bound > 0 {
+        writeln!(
+            output,
+            "    at least {} witness step{} omitted; use --verbose for retained evidence",
+            omitted_lower_bound,
+            plural_suffix_u64(omitted_lower_bound),
+        )
+        .map_err(map_io_error)?;
+    }
+    Ok(())
 }
 
 fn write_severity_marker<W: Write>(
@@ -3132,7 +3235,7 @@ mod tests {
         CvssEvidenceContentHash, CvssEvidenceSetHash, CvssMetric, CvssMetricEvidence,
         CvssMetricValue, CvssMetricValueToken, CvssUnscoredReason, CvssVersion, EvidenceRef,
         OpaqueFindingKey, PolicyDiagnosticCode, PolicyOverlayScope, SourceScenarioSetHash,
-        SourceSliceHash, VulnerabilityIdentity,
+        SourceSliceHash, VulnerabilityIdentity, WitnessId, WitnessStep,
     };
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
     use brokk_bifrost_analysis::analyzer::structural::CodeQueryDiagnosticCode;
@@ -3147,6 +3250,100 @@ mod tests {
         );
         assert!(!rendered.contains('\n'));
         assert!(!rendered.contains('\u{001B}'));
+    }
+
+    #[test]
+    fn concise_witness_rows_are_bounded_ordered_and_terminal_safe() {
+        let steps = (0..13)
+            .map(|index| {
+                let kind = match index {
+                    0 => WitnessStepKind::Source,
+                    1 => WitnessStepKind::Call,
+                    _ => WitnessStepKind::Propagation,
+                };
+                let location = (index != 1).then(|| {
+                    PolicySourceLocation::span(
+                        WorkspaceRelativePath::new(format!("src/step{index}.rs")).unwrap(),
+                        super::super::super::PolicyByteSpan::new(index, index + 1).unwrap(),
+                        super::super::super::PolicyDisplayRegion::new(
+                            index + 1,
+                            index + 2,
+                            index + 1,
+                            index + 3,
+                        )
+                        .unwrap(),
+                    )
+                });
+                let label = if index == 0 {
+                    "source\nlabel\u{001B}".to_string()
+                } else {
+                    format!("step {index}")
+                };
+                WitnessStep::try_new(
+                    kind,
+                    location,
+                    label,
+                    vec![EvidenceRef::try_new("secret", format!("step-{index}")).unwrap()],
+                )
+                .unwrap()
+            })
+            .collect();
+        let witness = BoundedWitness::try_new(
+            WitnessId::try_new("test", "primary").unwrap(),
+            steps,
+            true,
+            3,
+        )
+        .unwrap();
+        let sink = PolicySourceLocation::span(
+            WorkspaceRelativePath::new("src/sink.rs").unwrap(),
+            super::super::super::PolicyByteSpan::new(40, 44).unwrap(),
+            super::super::super::PolicyDisplayRegion::new(20, 4, 20, 8).unwrap(),
+        );
+
+        let mut rendered = BoundedWriter::new(Vec::new(), usize::MAX);
+        write_concise_witness_rows(&mut rendered, &witness, Some((&sink, "eval\ncall"))).unwrap();
+        let rendered = String::from_utf8(rendered.inner).unwrap();
+
+        assert!(rendered.starts_with("    #   Kind         Location  Code / symbol\n"));
+        assert!(
+            rendered.contains("    1   source       src/step0.rs:1:2  source\\u{A}label\\u{1B}\n")
+        );
+        assert!(rendered.contains("    2   call         -  step 1\n"));
+        assert!(rendered.contains("    11  propagation  src/step10.rs:11:12  step 10\n"));
+        assert!(!rendered.contains("step 11\n"));
+        assert!(rendered.contains("    14  sink         src/sink.rs:20:4  eval\\u{A}call\n"));
+        assert!(rendered.contains(
+            "    at least 5 witness steps omitted; use --verbose for retained evidence\n"
+        ));
+        assert!(!rendered.contains("test:primary"));
+        assert!(!rendered.contains("secret:"));
+        assert!(!rendered.contains('\u{001B}'));
+
+        let mut bounded = BoundedWriter::new(Vec::new(), 20);
+        assert!(matches!(
+            write_concise_witness_rows(&mut bounded, &witness, Some((&sink, "eval"))),
+            Err(PolicyRenderError::SerializedReportLimit {
+                max_serialized_bytes: 20
+            })
+        ));
+    }
+
+    #[test]
+    fn concise_alternate_paths_distinguish_exact_and_lower_bound_counts() {
+        let mut exact = BoundedWriter::new(Vec::new(), usize::MAX);
+        write_concise_alternate_paths(&mut exact, 2, false, 0).unwrap();
+        assert_eq!(
+            String::from_utf8(exact.inner).unwrap(),
+            "    2 alternate paths omitted; use --verbose for retained evidence\n"
+        );
+
+        let mut truncated = BoundedWriter::new(Vec::new(), usize::MAX);
+        write_concise_alternate_paths(&mut truncated, 1, true, 3).unwrap();
+        assert_eq!(
+            String::from_utf8(truncated.inner).unwrap(),
+            "    at least 4 alternate paths omitted; use --verbose for retained evidence\n"
+        );
     }
 
     #[test]

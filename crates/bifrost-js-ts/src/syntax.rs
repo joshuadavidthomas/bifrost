@@ -127,6 +127,10 @@ pub struct JsTsLexicalBindingScope {
 /// their entire scope.
 pub struct JsTsLexicalBindingIndex {
     scopes_by_name: HashMap<String, Vec<JsTsLexicalBindingScope>>,
+    /// Byte offsets of assignment targets, keyed by the assigned name. An
+    /// assignment site whose name resolves to the program scope rebinds the
+    /// program-level callable, so calls through that name stay ambiguous.
+    assignments_by_name: HashMap<String, Vec<usize>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,6 +149,7 @@ impl JsTsLexicalBindingIndex {
     pub fn build(root: Node<'_>, source: &str) -> Self {
         let mut index = Self {
             scopes_by_name: HashMap::default(),
+            assignments_by_name: HashMap::default(),
         };
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
@@ -207,6 +212,16 @@ impl JsTsLexicalBindingIndex {
                         index.insert_pattern(parameter, source, node_scope(node));
                     }
                 }
+                "assignment_expression" | "augmented_assignment_expression" => {
+                    if let Some(target) = node.child_by_field_name("left") {
+                        index.record_assignment_targets(target, source);
+                    }
+                }
+                "update_expression" => {
+                    if let Some(target) = node.child_by_field_name("argument") {
+                        index.record_assignment_targets(target, source);
+                    }
+                }
                 _ => {}
             }
 
@@ -233,6 +248,31 @@ impl JsTsLexicalBindingIndex {
 
     pub fn is_program_binding_at(&self, name: &str, byte: usize, root: Node<'_>) -> bool {
         self.binding_scope_at(name, byte) == Some(node_scope(root))
+    }
+
+    /// Whether an assignment somewhere in the program rebinds `name` at the
+    /// program scope: at the assignment site, `name` resolves to the program
+    /// binding, not to a local shadow.
+    pub fn is_program_binding_reassigned(&self, name: &str, root: Node<'_>) -> bool {
+        self.assignments_by_name
+            .get(name)
+            .is_some_and(|assignments| {
+                assignments
+                    .iter()
+                    .any(|byte| self.is_program_binding_at(name, *byte, root))
+            })
+    }
+
+    fn record_assignment_targets(&mut self, target: Node<'_>, source: &str) {
+        for binder in pattern_binder_identifiers(target) {
+            let name = slice(binder, source);
+            if !name.is_empty() {
+                self.assignments_by_name
+                    .entry(name.to_string())
+                    .or_default()
+                    .push(binder.start_byte());
+            }
+        }
     }
 
     fn insert_parameters(&mut self, function: Node<'_>, source: &str) {
@@ -883,6 +923,30 @@ mod tests {
             .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
             .expect("TypeScript grammar");
         parser.parse(source, None).expect("TypeScript tree")
+    }
+
+    #[test]
+    fn program_binding_reassignment_is_recorded_and_local_shadows_are_not() {
+        let source = r#"
+function target() {}
+function untouched() {}
+
+target = function () {};
+
+function local_shadow() {
+  let untouched = 1;
+  untouched = 2;
+}
+
+function property_write(box) {
+  box.untouched = 3;
+}
+"#;
+        let tree = parse_javascript(source);
+        let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        assert!(index.is_program_binding_reassigned("target", tree.root_node()));
+        assert!(!index.is_program_binding_reassigned("untouched", tree.root_node()));
+        assert!(!index.is_program_binding_reassigned("missing", tree.root_node()));
     }
 
     #[test]

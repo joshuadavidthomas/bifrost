@@ -1815,7 +1815,7 @@ fn java_over_bound_access_path_preserves_public_summary_negative() {
 #[test]
 fn typescript_over_bound_access_path_preserves_public_summary_negative() {
     with_typescript_over_bound_field_flow(|case| {
-        assert_shared_helper_scenario_with_status(case, SemanticInputStatus::Unknown);
+        assert_shared_helper_scenario_with_status(case, SemanticInputStatus::Unproven);
     });
 }
 

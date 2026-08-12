@@ -124,7 +124,7 @@ impl ProcedurePortHandle {
                     .semantics()
                     .values()
                     .iter()
-                    .any(|value| value.kind == SemanticValueKind::Receiver) =>
+                    .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. })) =>
             {
                 return Err(OracleContractError::InvalidReceiverPort);
             }
@@ -1073,7 +1073,7 @@ fn access_root_matches_value(root: &AccessPathRoot, value: &ValueHandle) -> bool
                         .procedure()
                         .semantics()
                         .value(value.id())
-                        .is_some_and(|row| row.kind == SemanticValueKind::Receiver),
+                        .is_some_and(|row| matches!(row.kind, SemanticValueKind::Receiver { .. })),
                     ProcedurePortKind::Parameter { ordinal } => value
                         .procedure()
                         .semantics()

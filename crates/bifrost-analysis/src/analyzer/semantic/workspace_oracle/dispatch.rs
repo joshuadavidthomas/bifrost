@@ -2393,8 +2393,8 @@ fn compare_locator_fields(left: &SemanticLocator, right: &SemanticLocator) -> Or
 mod tests {
     use super::*;
     use crate::analyzer::semantic::{
-        OracleLimitValues, OracleRelationKind, SemanticBudget, SemanticGapId, SemanticGapImpact,
-        SemanticGapImpacts,
+        OracleLimitValues, OracleRelationKind, SemanticBudget, SemanticGapDischarge, SemanticGapId,
+        SemanticGapImpact, SemanticGapImpacts,
     };
     use crate::analyzer::{Language, ProjectFile};
     use crate::cancellation::CancellationToken;
@@ -3240,6 +3240,7 @@ mod tests {
             impacts: SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
+            discharge: SemanticGapDischarge::None,
             detail: "dynamic target exploration exceeded its finite budget".into(),
             source: call_row.source,
             evidence: gap_evidence,
@@ -3331,6 +3332,7 @@ mod tests {
             impacts: SemanticGapImpacts::single(SemanticGapImpact::DispatchCoverage),
             kind: SemanticGapKind::Unsupported,
             budget: None,
+            discharge: SemanticGapDischarge::None,
             detail: "dynamic target discovery is unsupported".into(),
             source: call_row.source,
             evidence: shared_evidence,
@@ -3339,6 +3341,7 @@ mod tests {
             id: SemanticGapId::new(1),
             kind: SemanticGapKind::ExceededBudget,
             budget: Some(exceeded),
+            discharge: SemanticGapDischarge::None,
             detail: "dynamic target exploration exceeded its finite budget".into(),
             ..unsupported_gap.clone()
         };

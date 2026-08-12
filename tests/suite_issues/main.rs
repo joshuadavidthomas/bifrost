@@ -62,5 +62,6 @@ mod issue_1866_php_global_namespace_fallback;
 mod issue_1908_reconcile_storm;
 mod issue_1950_cpp_nested_callee_focus;
 mod issue_1960_cpp_macro_activation;
+mod issue_1975_php_chained_static_factory;
 mod issue_693_profile;
 mod issue_csharp_verbatim_identifiers;

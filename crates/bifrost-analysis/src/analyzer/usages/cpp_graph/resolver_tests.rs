@@ -1083,6 +1083,52 @@ ABSL_NAMESPACE_END
     }
 
     #[test]
+    fn owner_candidate_collapse_deduplicates_same_logical_forward_owner() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let first = CodeUnit::new(
+            ProjectFile::new(root.clone(), "first.h"),
+            CodeUnitType::Class,
+            "proton::codec",
+            "encoder",
+        );
+        let second = CodeUnit::new(
+            ProjectFile::new(root.clone(), "second.h"),
+            CodeUnitType::Class,
+            "proton::codec",
+            "encoder",
+        );
+        let other = CodeUnit::new(
+            ProjectFile::new(root, "other.h"),
+            CodeUnitType::Class,
+            "other",
+            "encoder",
+        );
+
+        assert!(matches!(
+            collapse_owner_candidates(
+                [
+                    (first.clone(), CppClassDeclarationStrength::Forward),
+                    (second.clone(), CppClassDeclarationStrength::Forward),
+                ]
+                .into_iter()
+            ),
+            DirectOwnerResolution::ForwardsOnly(forwards)
+                if forwards == vec![first]
+        ));
+        assert!(matches!(
+            collapse_owner_candidates(
+                [
+                    (second, CppClassDeclarationStrength::Forward),
+                    (other, CppClassDeclarationStrength::Forward),
+                ]
+                .into_iter()
+            ),
+            DirectOwnerResolution::ForwardsOnly(forwards) if forwards.len() == 2
+        ));
+    }
+
+    #[test]
     fn class_strength_reuses_one_prepared_tree_for_qgis_sized_sibling_set() {
         const SIBLING_COUNT: usize = 113;
         let temp = tempfile::tempdir().expect("temp dir");

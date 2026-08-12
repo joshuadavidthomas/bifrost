@@ -1279,27 +1279,28 @@ impl<'a> TaintPolicyCompiler<'a> {
                 // Re-match this closure summary to its unmaterialized external
                 // target by canonical identity. Parameter types are discarded, so
                 // a same-arity overload set collapses to one identity here.
-                let mut exact = unmaterialized
-                    .iter()
-                    .filter(|target| {
-                        target.language().stable_label() == family.language
-                            && target.has_receiver() == summary.target.has_receiver
-                            && target.arity() == summary.target.parameter_count
-                            && split_qualified_member(&summary.target.symbol).is_some_and(
-                                |(owner, member)| {
-                                    owner == target.owner_fqn() && member == target.member()
-                                },
-                            )
-                    })
-                    .collect::<Vec<_>>();
-                exact.sort_unstable_by(|left, right| left.locator().cmp(right.locator()));
-                exact.dedup();
-                let [target] = exact.as_slice() else {
-                    return Err(TaintPolicyCompileError::Model(format!(
+                let binding_error = || {
+                    TaintPolicyCompileError::Model(format!(
                         "unmaterialized procedure summary `{}` dependency closure lacks one external target identity",
                         summary.id
-                    )));
+                    ))
                 };
+                let mut exact = unmaterialized.iter().filter(|target| {
+                    target.language().stable_label() == family.language
+                        && target.has_receiver() == summary.target.has_receiver
+                        && target.arity() == summary.target.parameter_count
+                        && split_qualified_member(&summary.target.symbol).is_some_and(
+                            |(owner, member)| {
+                                owner == target.owner_fqn() && member == target.member()
+                            },
+                        )
+                });
+                let Some(target) = exact.next() else {
+                    return Err(binding_error());
+                };
+                if exact.any(|candidate| candidate != target) {
+                    return Err(binding_error());
+                }
                 let receiver = summary
                     .target
                     .has_receiver

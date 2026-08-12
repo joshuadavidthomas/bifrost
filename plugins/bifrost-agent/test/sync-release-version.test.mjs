@@ -16,9 +16,9 @@ const testDir = path.dirname(fileURLToPath(import.meta.url));
 const releaseVersionScript = path.resolve(testDir, "../../../scripts/release-version.mjs");
 
 const jsonProjections = [
-  "plugins/bifrost-agent/.codex-plugin/plugin.json",
   "plugins/bifrost-agent/.claude-plugin/plugin.json",
   "plugins/bifrost-agent/.cursor-plugin/plugin.json",
+  "plugins/bifrost-agent/plugin.json",
   ".cursor-plugin/marketplace.json",
   "plugins/bifrost-agent/bifrost-release.json",
   "plugins/bifrost-agent/package.json",
@@ -181,9 +181,9 @@ async function createFixture(cargoVersion, projectionVersion, lineEnding) {
   };
 
   const values = new Map([
-    ["plugins/bifrost-agent/.codex-plugin/plugin.json", basicPlugin],
     ["plugins/bifrost-agent/.claude-plugin/plugin.json", basicPlugin],
     ["plugins/bifrost-agent/.cursor-plugin/plugin.json", basicPlugin],
+    ["plugins/bifrost-agent/plugin.json", basicPlugin],
     [".cursor-plugin/marketplace.json", marketplace],
     ["plugins/bifrost-agent/bifrost-release.json", release],
     ["plugins/bifrost-agent/package.json", basicPlugin],

@@ -1,6 +1,7 @@
 import { RQL_POLICY_LANGUAGE_ID } from "./rql_validation";
 
 export const RUN_RQL_POLICY_METHOD = "bifrost/runPolicy";
+export const SUPPORTED_POLICY_REPORT_SCHEMA_VERSION = 3;
 
 export interface RqlPolicyDocument {
   languageId: string;
@@ -76,7 +77,28 @@ export interface PolicySuppressionReview extends PolicySuppressionDecision {
 export interface PolicyReportEvaluation {
   evaluation_date: string;
   suppression_path: string;
-  suppression_document_state: "not_found" | "loaded" | "invalid";
+  suppression_document_state: "not_evaluated" | "not_found" | "loaded" | "invalid";
+  scope_path: string;
+  scope_document_state: "not_evaluated" | "not_found" | "loaded" | "invalid";
+}
+
+export interface PolicyExecutionMetadata {
+  total_elapsed_ms: number;
+  stage_timings: Array<{ stage: string; elapsed_ms: number }>;
+  termination: string | null;
+  terminal_stage: string | null;
+  active_policy_id: string | null;
+  completed_policy_ids: string[];
+  pending_policy_ids: string[];
+}
+
+export interface PolicyScopeReview {
+  path: string;
+  reason: string;
+  matched_findings: number;
+  applied: boolean;
+  result_omitted: boolean;
+  [key: string]: unknown;
 }
 
 export interface PolicyRun {
@@ -122,11 +144,16 @@ export interface PolicyReportDiagnostic {
 }
 
 export interface PolicyReport {
-  schema_version: 2;
+  schema_version: 3;
   evaluation: PolicyReportEvaluation;
+  execution: PolicyExecutionMetadata;
   rules: PolicyRule[];
   runs: PolicyRun[];
   suppressions: PolicySuppressionReview[];
+  scope: PolicyScopeReview[];
+  diff?: unknown;
+  packs?: unknown;
+  baseline?: unknown;
   diagnostics: PolicyReportDiagnostic[];
   diagnostics_truncated: boolean;
   omitted_diagnostics_lower_bound: number;
@@ -180,8 +207,15 @@ export async function runRqlPolicy(
       evaluationDate: utcEvaluationDate()
     });
     if (!isRqlPolicyResponse(response)) {
+      const observed = policyReportSchemaVersion(response);
+      if (observed !== undefined && observed !== SUPPORTED_POLICY_REPORT_SCHEMA_VERSION) {
+        runner.showError(
+          `Bifrost policy report schema ${observed} is not supported. This extension supports schema ${SUPPORTED_POLICY_REPORT_SCHEMA_VERSION}.`
+        );
+        return undefined;
+      }
       runner.showError(
-        "Bifrost policy results require an updated language server. Rebuild and restart Bifrost, then run the policy again."
+        `Bifrost returned an invalid policy report for supported schema ${SUPPORTED_POLICY_REPORT_SCHEMA_VERSION}.`
       );
       return undefined;
     }
@@ -246,11 +280,13 @@ export function isRqlPolicyResponse(value: unknown): value is RqlPolicyResponse 
   const report = value.report;
   if (
     !isRecord(report) ||
-    report.schema_version !== 2 ||
+    report.schema_version !== SUPPORTED_POLICY_REPORT_SCHEMA_VERSION ||
     !isPolicyReportEvaluation(report.evaluation) ||
+    !isPolicyExecutionMetadata(report.execution) ||
     !Array.isArray(report.rules) ||
     !Array.isArray(report.runs) ||
     !Array.isArray(report.suppressions) ||
+    !Array.isArray(report.scope) ||
     !Array.isArray(report.diagnostics) ||
     typeof report.diagnostics_truncated !== "boolean" ||
     typeof report.omitted_diagnostics_lower_bound !== "number"
@@ -261,8 +297,16 @@ export function isRqlPolicyResponse(value: unknown): value is RqlPolicyResponse 
     report.rules.every(isPolicyRule) &&
     report.runs.every(isPolicyRun) &&
     report.suppressions.every(isPolicySuppressionReview) &&
+    report.scope.every(isPolicyScopeReview) &&
     report.diagnostics.every(isPolicyDiagnostic)
   );
+}
+
+function policyReportSchemaVersion(value: unknown): number | undefined {
+  if (!isRecord(value) || !isRecord(value.report)) {
+    return undefined;
+  }
+  return typeof value.report.schema_version === "number" ? value.report.schema_version : undefined;
 }
 
 export function policyCompletionLabel(completion: PolicyRunCompletion): string {
@@ -466,9 +510,47 @@ function isPolicyReportEvaluation(value: unknown): value is PolicyReportEvaluati
     isRecord(value) &&
     isPolicyDate(value.evaluation_date) &&
     typeof value.suppression_path === "string" &&
-    (value.suppression_document_state === "not_found" ||
-      value.suppression_document_state === "loaded" ||
-      value.suppression_document_state === "invalid")
+    isPolicyDocumentState(value.suppression_document_state) &&
+    typeof value.scope_path === "string" &&
+    isPolicyDocumentState(value.scope_document_state)
+  );
+}
+
+function isPolicyDocumentState(value: unknown): boolean {
+  return (
+    value === "not_evaluated" || value === "not_found" || value === "loaded" || value === "invalid"
+  );
+}
+
+function isPolicyExecutionMetadata(value: unknown): value is PolicyExecutionMetadata {
+  return (
+    isRecord(value) &&
+    typeof value.total_elapsed_ms === "number" &&
+    Array.isArray(value.stage_timings) &&
+    value.stage_timings.every(
+      (timing) =>
+        isRecord(timing) &&
+        typeof timing.stage === "string" &&
+        typeof timing.elapsed_ms === "number"
+    ) &&
+    (value.termination === null || typeof value.termination === "string") &&
+    (value.terminal_stage === null || typeof value.terminal_stage === "string") &&
+    (value.active_policy_id === null || typeof value.active_policy_id === "string") &&
+    Array.isArray(value.completed_policy_ids) &&
+    value.completed_policy_ids.every((id) => typeof id === "string") &&
+    Array.isArray(value.pending_policy_ids) &&
+    value.pending_policy_ids.every((id) => typeof id === "string")
+  );
+}
+
+function isPolicyScopeReview(value: unknown): value is PolicyScopeReview {
+  return (
+    isRecord(value) &&
+    typeof value.path === "string" &&
+    typeof value.reason === "string" &&
+    typeof value.matched_findings === "number" &&
+    typeof value.applied === "boolean" &&
+    typeof value.result_omitted === "boolean"
   );
 }
 

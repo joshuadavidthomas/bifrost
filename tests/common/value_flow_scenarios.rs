@@ -1588,15 +1588,15 @@ pub fn with_typescript_exact_helper<T>(
         Language::TypeScript,
         TYPESCRIPT_FILES,
         TYPESCRIPT_PROCEDURES,
-        REACHED_FLOW_INCONCLUSIVE_CLEAN_SINKS,
+        JAVA_SINKS,
         "src/exact_flow.ts",
         "src/exact_flow.ts",
         "relay(input)",
         3,
         3,
-        SemanticInputStatus::Unknown,
-        false,
-        false,
+        SemanticInputStatus::Complete,
+        true,
+        true,
         execute,
     )
 }
@@ -1625,12 +1625,12 @@ pub fn with_typescript_branch_merge<T>(
         Language::TypeScript,
         TYPESCRIPT_BRANCH_FILES,
         TYPESCRIPT_BRANCH_PROCEDURES,
-        REACHED_FLOW_INCONCLUSIVE_CLEAN_SINKS,
+        JAVA_BRANCH_SINKS,
         "src/branch_flow.ts",
-        SemanticInputStatus::Unknown,
+        SemanticInputStatus::Complete,
         3,
         3,
-        false,
+        true,
         execute,
     )
 }
@@ -1657,12 +1657,12 @@ pub fn with_typescript_loop_exit<T>(execute: impl FnOnce(&ValueFlowConformanceCa
         Language::TypeScript,
         TYPESCRIPT_LOOP_FILES,
         TYPESCRIPT_LOOP_PROCEDURES,
-        REACHED_FLOW_INCONCLUSIVE_CLEAN_SINKS,
+        JAVA_BRANCH_SINKS,
         "src/loop_flow.ts",
-        SemanticInputStatus::Unknown,
+        SemanticInputStatus::Complete,
         3,
         3,
-        false,
+        true,
         execute,
     )
 }
@@ -1693,12 +1693,12 @@ pub fn with_typescript_early_return<T>(
         TYPESCRIPT_EARLY_RETURN_FILES,
         TYPESCRIPT_EARLY_RETURN_PROCEDURES,
         "src/early_return_flow.ts",
-        ExpectedSinkOutcome::Inconclusive,
-        ExpectedSinkOutcome::Inconclusive,
-        SemanticInputStatus::Unknown,
+        ExpectedSinkOutcome::NotReached,
+        ExpectedSinkOutcome::NotReached,
+        SemanticInputStatus::Complete,
         3,
         3,
-        false,
+        true,
         execute,
     )
 }
@@ -1730,11 +1730,11 @@ pub fn with_typescript_two_matched_calls<T>(
         TYPESCRIPT_TWO_CALL_FILES,
         TYPESCRIPT_TWO_CALL_PROCEDURES,
         "src/two_call_flow.ts",
-        ExpectedSinkOutcome::Inconclusive,
-        SemanticInputStatus::Unknown,
+        ExpectedSinkOutcome::NotReached,
+        SemanticInputStatus::Complete,
         3,
         3,
-        false,
+        true,
         execute,
     )
 }
@@ -1809,6 +1809,7 @@ pub fn with_java_exceptional_flow<T>(
         3,
         ValueFlowMayStatus::Unproven,
         PathQuality::UNPROVEN_PARTIAL,
+        SemanticInputStatus::Unknown,
         false,
         execute,
     )
@@ -1828,7 +1829,7 @@ pub fn with_typescript_exceptional_flow<T>(
             alias: "clean",
             call: "sink_call",
             argument: 1,
-            outcome: ExpectedSinkOutcome::Inconclusive,
+            outcome: ExpectedSinkOutcome::NotReached,
         },
     ];
     with_exceptional_flow(
@@ -1842,7 +1843,8 @@ pub fn with_typescript_exceptional_flow<T>(
         3,
         ValueFlowMayStatus::Proven,
         PathQuality::PROVEN_COMPLETE,
-        false,
+        SemanticInputStatus::Complete,
+        true,
         execute,
     )
 }
@@ -2038,7 +2040,7 @@ pub fn with_typescript_over_bound_field_flow<T>(
         &files,
         &procedures,
         files[0].path,
-        SemanticInputStatus::Unknown,
+        SemanticInputStatus::Unproven,
         execute,
     )
 }
@@ -2102,7 +2104,7 @@ pub fn with_typescript_index_access_flow<T>(
         &files,
         &procedures,
         files[0].path,
-        SemanticInputStatus::Unknown,
+        SemanticInputStatus::Unproven,
         execute,
     )
 }
@@ -2666,6 +2668,7 @@ fn with_exceptional_flow<T>(
     public_endpoint_count: usize,
     witness_may_status: ValueFlowMayStatus,
     witness_path_quality: PathQuality,
+    expected_discovery_status: SemanticInputStatus,
     expected_result_complete: bool,
     execute: impl FnOnce(&ValueFlowConformanceCase<'_>) -> T,
 ) -> T {
@@ -2719,8 +2722,11 @@ fn with_exceptional_flow<T>(
             ordinal: 0,
         },
         sinks,
-        expected_discovery_status: SemanticInputStatus::Unknown,
-        expected_discovery_complete: false,
+        expected_discovery_status,
+        expected_discovery_complete: matches!(
+            expected_discovery_status,
+            SemanticInputStatus::Complete
+        ),
         expected_result_complete,
         expected_public_ambiguous: false,
         expected_location_relations: &[],
@@ -3861,9 +3867,9 @@ function run(input) {
         "sink(copy, clean)",
         "relayed",
         "copy",
-        ExpectedSinkOutcome::Inconclusive,
-        SemanticInputStatus::Unknown,
-        false,
+        ExpectedSinkOutcome::NotReached,
+        SemanticInputStatus::Complete,
+        true,
         3,
         3,
         0,
@@ -4233,15 +4239,15 @@ function run(): void {
         kind: ProcedureKind::Function,
         positive_source_call: "dfb_source()",
         positive_sink_call: "dfb_sink(dfb_source())",
-        positive_discovery: SemanticInputStatus::Unknown,
-        positive_result_complete: false,
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
         positive_meeting_count: 3,
         positive_public_endpoint_count: 3,
         positive_public_may_complete_count: 0,
         positive_public_may_partial_count: 0,
-        negative_discovery: SemanticInputStatus::Unknown,
-        negative_result_complete: false,
-        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
     }
 }
 
@@ -4276,15 +4282,15 @@ function run() {
         kind: ProcedureKind::Function,
         positive_source_call: "dfb_source()",
         positive_sink_call: "dfb_sink(dfb_source())",
-        positive_discovery: SemanticInputStatus::Unknown,
-        positive_result_complete: false,
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
         positive_meeting_count: 3,
         positive_public_endpoint_count: 3,
         positive_public_may_complete_count: 0,
         positive_public_may_partial_count: 0,
-        negative_discovery: SemanticInputStatus::Unknown,
-        negative_result_complete: false,
-        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
     }
 }
 
@@ -4431,15 +4437,15 @@ object DirectFlow {
         kind: ProcedureKind::Method,
         positive_source_call: "dfb_source()",
         positive_sink_call: "dfb_sink(dfb_source())",
-        positive_discovery: SemanticInputStatus::Unknown,
-        positive_result_complete: false,
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
         positive_meeting_count: 3,
         positive_public_endpoint_count: 3,
         positive_public_may_complete_count: 0,
         positive_public_may_partial_count: 0,
-        negative_discovery: SemanticInputStatus::Unknown,
-        negative_result_complete: false,
-        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
     }
 }
 
@@ -4482,15 +4488,15 @@ object DirectFlow {
         kind: ProcedureKind::Method,
         positive_source_call: "dfb_source()",
         positive_sink_call: "dfb_sink(dfb_source())",
-        positive_discovery: SemanticInputStatus::Unknown,
-        positive_result_complete: false,
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
         positive_meeting_count: 3,
         positive_public_endpoint_count: 3,
         positive_public_may_complete_count: 0,
         positive_public_may_partial_count: 0,
-        negative_discovery: SemanticInputStatus::Unknown,
-        negative_result_complete: false,
-        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
     }
 }
 
@@ -4748,15 +4754,15 @@ void run() {
         kind: ProcedureKind::Function,
         positive_source_call: "dfb_source()",
         positive_sink_call: "dfb_sink(dfb_source())",
-        positive_discovery: SemanticInputStatus::Unknown,
-        positive_result_complete: false,
+        positive_discovery: SemanticInputStatus::Complete,
+        positive_result_complete: true,
         positive_meeting_count: 3,
         positive_public_endpoint_count: 3,
         positive_public_may_complete_count: 0,
         positive_public_may_partial_count: 0,
-        negative_discovery: SemanticInputStatus::Unknown,
-        negative_result_complete: false,
-        negative_outcome: ExpectedSinkOutcome::Inconclusive,
+        negative_discovery: SemanticInputStatus::Complete,
+        negative_result_complete: true,
+        negative_outcome: ExpectedSinkOutcome::NotReached,
     }
 }
 

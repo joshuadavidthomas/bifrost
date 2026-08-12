@@ -6718,6 +6718,9 @@ fn cpp_namespace_scope_for_function(
 fn cpp_declarator_qualified_name_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "qualified_identifier" | "scoped_identifier" => Some(node),
+        "reference_declarator" => node
+            .named_child(0)
+            .and_then(cpp_declarator_qualified_name_node),
         _ => node
             .child_by_field_name("declarator")
             .and_then(cpp_declarator_qualified_name_node),
@@ -8122,6 +8125,24 @@ mod bounded_tests {
     use crate::analyzer::usages::receiver_analysis::ReceiverBudgetLimit;
     use crate::path_utils::rel_path_string;
     use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn qualified_name_descends_through_reference_declarator() {
+        let source = "C& C::operator<<(bool) { return helper(); }";
+        let tree = parse_cpp_tree(source).expect("C++ tree");
+        let function = tree
+            .root_node()
+            .named_child(0)
+            .expect("function definition");
+        let declarator = function
+            .child_by_field_name("declarator")
+            .expect("outer declarator");
+        let qualified = cpp_declarator_qualified_name_node(declarator)
+            .expect("qualified operator name through reference declarator");
+
+        assert_eq!(qualified.kind(), "qualified_identifier");
+        assert_eq!(cpp_node_text(qualified, source), "C::operator<<");
+    }
 
     fn wide_deep_member_fixture() -> (
         AnalyzerFixture,
