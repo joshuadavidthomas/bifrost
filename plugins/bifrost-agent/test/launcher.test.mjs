@@ -389,7 +389,7 @@ test("uses unique managed install temp destinations", async () => {
   assert.notEqual(copiedDestinations[0], copiedDestinations[1]);
 });
 
-test("shared MCP manifest launches package-local executable without treating package cwd as workspace", async () => {
+test("portable MCP manifest launches package-local executable without treating package cwd as workspace", async () => {
   if (process.platform === "win32") {
     return;
   }
@@ -405,7 +405,7 @@ fi
 printf '%s\\n' "$@" > "${recordPath}"
 `);
 
-  const mcpConfig = JSON.parse(await fsp.readFile(path.join(packageDir, ".mcp.json"), "utf8"));
+  const mcpConfig = JSON.parse(await fsp.readFile(path.join(packageDir, "mcp.json"), "utf8"));
   const server = mcpConfig.mcpServers.bifrost;
   const command = path.resolve(packageDir, server.command);
   await execFileAsync(command, server.args, {

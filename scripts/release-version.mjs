@@ -192,13 +192,13 @@ function collectProjectionUpdates(repoRoot, version) {
         );
       }),
     ),
-    updateJson(repoRoot, "plugins/bifrost-agent/.codex-plugin/plugin.json", (json) => {
-      json.version = version;
-    }),
     updateJson(repoRoot, "plugins/bifrost-agent/.claude-plugin/plugin.json", (json) => {
       json.version = version;
     }),
     updateJson(repoRoot, "plugins/bifrost-agent/.cursor-plugin/plugin.json", (json) => {
+      json.version = version;
+    }),
+    updateJson(repoRoot, "plugins/bifrost-agent/plugin.json", (json) => {
       json.version = version;
     }),
     updateJson(repoRoot, ".cursor-plugin/marketplace.json", (json) => {
