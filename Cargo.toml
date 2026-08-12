@@ -128,7 +128,6 @@ rayon = "1.10.0"
 reedline = "0.49"
 regex = "1.12.2"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-rustc-hash = "2"
 rustdoc-types = { version = "=0.60.0", default-features = false }
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
