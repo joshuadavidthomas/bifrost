@@ -4,6 +4,7 @@ use brokk_bifrost_analysis::Language;
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
 use common::{FixtureCorpus, InlineTestProject};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -4172,6 +4173,313 @@ fn stateless_2026_07_28_requests_are_independently_validated() {
             .exists(),
         "no refused request may have analyzed the workspace"
     );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Read messages until the response for `id` arrives, collecting the
+/// `notifications/progress` params seen on the way. Any other interleaved
+/// message fails the test: nothing but progress may precede the response.
+fn read_response_collecting_progress(
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    id: i64,
+) -> (Value, Vec<Value>) {
+    let mut progress = Vec::new();
+    loop {
+        let message = read_line(reader, stderr);
+        if message["id"] == json!(id) {
+            return (message, progress);
+        }
+        assert_eq!(
+            message["method"], "notifications/progress",
+            "unexpected message while waiting for response {id}: {message}"
+        );
+        progress.push(message["params"].clone());
+    }
+}
+
+fn assert_progress_is_monotonic(notifications: &[Value]) {
+    let mut last = f64::NEG_INFINITY;
+    for notification in notifications {
+        let value = notification["progress"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("progress must be a number: {notification}"));
+        assert!(
+            value > last,
+            "progress must increase on every notification: {notifications:?}"
+        );
+        assert!(
+            notification["total"].is_null(),
+            "no phase has a known total; inventing one is forbidden: {notification}"
+        );
+        last = value;
+    }
+}
+
+/// Issue #2005: a caller that supplies `progressToken` observes truthful
+/// phase progress -- readiness, admission, execution -- on its own request,
+/// with the token echoed exactly; a caller that omits the token gets nothing.
+#[test]
+fn progress_token_yields_phase_progress_and_silence_without_it() {
+    let workspace = InlineTestProject::new()
+        .file("Progressive.java", "class Progressive {}\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    // A string token, echoed as a string.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Progressive"] },
+                "_meta": { "progressToken": "progress-abc" }
+            }
+        }),
+    );
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 2);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let messages = progress
+        .iter()
+        .map(|notification| {
+            assert_eq!(
+                notification["progressToken"], "progress-abc",
+                "the token must be preserved exactly: {notification}"
+            );
+            notification["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        vec![
+            "waiting for workspace readiness",
+            "waiting for analyzer admission",
+            "executing search_symbols"
+        ],
+        "{progress:?}"
+    );
+    assert_progress_is_monotonic(&progress);
+
+    // An integer token, echoed as a number, not a string.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Progressive"] },
+                "_meta": { "progressToken": 7 }
+            }
+        }),
+    );
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 3);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert!(!progress.is_empty(), "{response}");
+    for notification in &progress {
+        assert_eq!(
+            notification["progressToken"],
+            json!(7),
+            "an integer token must stay a number: {notification}"
+        );
+    }
+
+    // No token, no notifications: the response is the very next message.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Progressive"] }
+            }
+        }),
+    );
+    let (response, progress) = read_response_collecting_progress(&mut reader, &mut stderr, 4);
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    assert!(
+        progress.is_empty(),
+        "a caller that did not opt in must receive no progress: {progress:?}"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2005: concurrent calls with distinct tokens must never cross-route.
+/// Every notification carries the token of exactly the call whose phases it
+/// reports, and each token's progress is independently monotonic.
+#[test]
+fn concurrent_progress_tokens_never_cross_route() {
+    let workspace = InlineTestProject::new()
+        .file(
+            "Concurrent.java",
+            "public class Concurrent { public void run() {} }\n",
+        )
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    // Both calls are on the wire before either response, so their phase
+    // notifications can interleave freely; routing is what must not.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "scan_usages_by_location",
+                "arguments": { "targets": [{ "path": "Concurrent.java", "line": 1, "symbol": "Concurrent" }] },
+                "_meta": { "progressToken": "scan-token" }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Concurrent"] },
+                "_meta": { "progressToken": "search-token" }
+            }
+        }),
+    );
+
+    let mut responses = HashMap::new();
+    let mut progress_by_token: HashMap<String, Vec<Value>> = HashMap::new();
+    while responses.len() < 2 {
+        let message = read_line(&mut reader, &mut stderr);
+        if let Some(id) = message["id"].as_i64() {
+            responses.insert(id, message);
+            continue;
+        }
+        assert_eq!(message["method"], "notifications/progress", "{message}");
+        let token = message["params"]["progressToken"]
+            .as_str()
+            .unwrap_or_else(|| panic!("string token expected: {message}"))
+            .to_string();
+        progress_by_token
+            .entry(token)
+            .or_default()
+            .push(message["params"].clone());
+    }
+    assert_eq!(responses[&10]["result"]["isError"], false, "{responses:?}");
+    assert_eq!(responses[&11]["result"]["isError"], false, "{responses:?}");
+
+    let scan = &progress_by_token["scan-token"];
+    let search = &progress_by_token["search-token"];
+    assert_eq!(progress_by_token.len(), 2, "{progress_by_token:?}");
+    assert_progress_is_monotonic(scan);
+    assert_progress_is_monotonic(search);
+    assert!(
+        scan.iter()
+            .any(|n| n["message"] == "executing scan_usages_by_location"),
+        "{scan:?}"
+    );
+    assert!(
+        search
+            .iter()
+            .any(|n| n["message"] == "executing search_symbols"),
+        "{search:?}"
+    );
+    assert!(
+        !scan
+            .iter()
+            .any(|n| n["message"] == "executing search_symbols"),
+        "phases of one call must not report under another call's token: {scan:?}"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2005: cancelling a call that opted into progress leaves the session
+/// healthy. The cancelled call's progress stops with the call, and the next
+/// call is served normally.
+#[test]
+fn cancellation_with_progress_in_flight_leaves_the_session_healthy() {
+    let workspace = InlineTestProject::new()
+        .file("Cancellable.java", "class Cancellable {}\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    // Cancel immediately after sending, so the cancellation lands during
+    // readiness, admission, or execution -- whichever phase the call is in.
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "scan_usages_by_location",
+                "arguments": { "targets": [{ "path": "Cancellable.java", "line": 1, "symbol": "Cancellable" }] },
+                "_meta": { "progressToken": "doomed" }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 20, "reason": "test cancels" }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "search_symbols",
+                "arguments": { "patterns": ["Cancellable"] }
+            }
+        }),
+    );
+
+    // The cancelled call may or may not still answer, depending on how far it
+    // got; the follow-up must answer either way, and the only other traffic
+    // permitted on the wire is the doomed call's own progress.
+    loop {
+        let message = read_line(&mut reader, &mut stderr);
+        if message["id"] == json!(21) {
+            assert_eq!(message["result"]["isError"], false, "{message}");
+            break;
+        }
+        if message["id"] == json!(20) {
+            continue;
+        }
+        assert_eq!(message["method"], "notifications/progress", "{message}");
+        assert_eq!(message["params"]["progressToken"], "doomed", "{message}");
+    }
 
     drop(stdin);
     assert!(child.wait().expect("wait bifrost").success());

@@ -578,6 +578,56 @@ impl RootsActivations {
     }
 }
 
+/// Per-request progress reporting through `notifications/progress`, active
+/// only when the caller supplied a `progressToken`.
+///
+/// Truthful and low volume by construction: one notification per phase the
+/// call actually enters -- workspace readiness, analyzer admission, tool
+/// execution, and cooperative cancellation when the request budget expires.
+/// The progress value is a per-request monotonic counter and `total` is never
+/// set, because no phase has a known item count to report: the analyzer
+/// exposes no per-item counters at this boundary, and inventing percentages
+/// is exactly what the progress pattern warns against. A phase notification
+/// says "this call entered this phase", nothing more; a wait that turns out
+/// to be zero-length was still entered.
+///
+/// Every send happens on the request's own async task, never from the
+/// blocking analyzer task, so progress delivery can neither occupy an
+/// analyzer permit nor delay cooperative cancellation.
+struct ProgressReporter {
+    peer: rmcp::service::Peer<RoleServer>,
+    token: rmcp::model::ProgressToken,
+    steps: AtomicU64,
+}
+
+impl ProgressReporter {
+    /// A reporter for this request, or `None` when the caller did not opt in.
+    /// The token is carried through to every notification exactly as
+    /// received, string or number.
+    fn from_request(context: &RequestContext<RoleServer>) -> Option<Self> {
+        Some(Self {
+            peer: context.peer.clone(),
+            token: context.meta.get_progress_token()?,
+            steps: AtomicU64::new(0),
+        })
+    }
+
+    async fn phase(&self, message: impl Into<String>) {
+        let step = self.steps.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Err(error) = self
+            .peer
+            .notify_progress(
+                rmcp::model::ProgressNotificationParam::new(self.token.clone(), step as f64)
+                    .with_message(message),
+            )
+            .await
+        {
+            // A client that stops reading loses progress, not its tool result.
+            eprintln!("bifrost: failed to send MCP progress notification: {error}");
+        }
+    }
+}
+
 /// Bifrost's `ServerHandler`. One instance serves one stdio connection.
 pub struct BifrostMcpHandler {
     service: Arc<SearchToolsService>,
@@ -1163,6 +1213,7 @@ impl BifrostMcpHandler {
         permit: AnalyzerPermit,
         cold_workspace: bool,
         transport_queue_wait: Duration,
+        progress: Option<&ProgressReporter>,
     ) -> Result<CallToolResult, ErrorData> {
         // The deadline was set when the request was accepted, not when it
         // reached the analyzer, so time already spent queueing counts against
@@ -1248,6 +1299,12 @@ impl BifrostMcpHandler {
                 }
             } => {
                 bifrost_cancellation.cancel();
+                // The truthful last phase for this request: its analyzer work
+                // is now cooperatively cancelling. Sent before the error
+                // response, and never again after it.
+                if let Some(progress) = progress {
+                    progress.phase(format!("cancelling {name}")).await;
+                }
                 let budget = mcp_analyzer_request_budget()
                     .unwrap_or(crate::mcp_common::COLD_WORKSPACE_REQUEST_BUDGET);
                 return Err(ErrorData::internal_error(
@@ -1690,6 +1747,12 @@ impl ServerHandler for BifrostMcpHandler {
         // calls.
         let _serial_guard = serial.then_some(state).flatten();
 
+        // Progress is opt-in per request: no `progressToken`, no reporter, no
+        // notifications, no overhead. Workspace-activation rounds returned
+        // above never report progress -- they are answers, not phases of an
+        // executing call.
+        let progress = ProgressReporter::from_request(&context);
+
         let accepted_at = Instant::now();
         let cold_workspace = service.workspace_build_pending();
         let deadline = mcp_request_deadline(
@@ -1697,6 +1760,9 @@ impl ServerHandler for BifrostMcpHandler {
             default_cold_workspace_budget_applies(&name, cold_workspace),
         );
         if !serial {
+            if let Some(progress) = &progress {
+                progress.phase("waiting for workspace readiness").await;
+            }
             let service = Arc::clone(&service);
             let ct = context.ct.clone();
             let readiness = tokio::task::spawn_blocking(move || {
@@ -1723,6 +1789,9 @@ impl ServerHandler for BifrostMcpHandler {
         let admission = if serial {
             Ok(Admission::Granted(AnalyzerPermit::exempt()))
         } else {
+            if let Some(progress) = &progress {
+                progress.phase("waiting for analyzer admission").await;
+            }
             match deadline {
                 Some(deadline) => {
                     tokio::time::timeout(
@@ -1789,6 +1858,9 @@ impl ServerHandler for BifrostMcpHandler {
             ));
         }
 
+        if let Some(progress) = &progress {
+            progress.phase(format!("executing {name}")).await;
+        }
         let response = self
             .execute_tool(
                 Arc::clone(&service),
@@ -1801,6 +1873,7 @@ impl ServerHandler for BifrostMcpHandler {
                 permit,
                 cold_workspace,
                 queue_wait,
+                progress.as_ref(),
             )
             .await;
         // The response -- success or execution error -- is ready the moment

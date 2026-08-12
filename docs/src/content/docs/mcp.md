@@ -47,6 +47,12 @@ Current Codex does not advertise standard roots. For any rootless connection who
 
 Bifrost speaks MCP through [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the official Rust SDK. It accepts every revision that SDK knows, including `2025-11-25` and `2026-07-28`. The negotiated revision is whatever the client asks for.
 
+## Progress
+
+A tool call that carries a `progressToken` in its `_meta` receives `notifications/progress` on its own request as the call moves through its phases; a call without the token receives none. Progress is truthful and low volume: at most one notification per phase the call actually enters -- `waiting for workspace readiness`, `waiting for analyzer admission`, `executing <tool>`, and `cancelling <tool>` when the request budget expires -- so a call sends at most four. The token is echoed exactly as supplied, string or number, and concurrent calls with distinct tokens never share notifications.
+
+All phases are currently indeterminate: the `progress` value is a per-request monotonically increasing counter and `total` is never set, because none of the phases has a known item count -- the analyzer does not expose per-item counters at the MCP boundary, and Bifrost does not invent percentages. Workspace-mutating tools such as `activate_workspace` skip the readiness and admission phases because they take neither wait; `list_policies` reads only the built-in policy pack and reports no progress. An MRTR roots-activation round reports no progress either: it is an answer to the call, not a phase of an executing one. For work that may outlive the request or the connection, progress is the wrong tool; that is what MCP Tasks are for, and Bifrost does not currently implement them.
+
 ## Request budget
 
 Analyzer-backed MCP requests have a five-second wall-clock budget by default. Set
