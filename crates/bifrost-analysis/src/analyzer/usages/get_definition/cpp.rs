@@ -129,6 +129,7 @@ pub(super) fn select_navigation_targets(
     candidates: &[CodeUnit],
     operation: NavigationOperation,
 ) -> CppNavigationSelection {
+    let cpp = resolve_analyzer::<CppAnalyzer>(context.analyzer);
     let mut classified = Vec::new();
     let mut structure_unavailable = false;
     let mut source_ranges_truncated = false;
@@ -148,8 +149,11 @@ pub(super) fn select_navigation_targets(
             structure_unavailable = true;
             continue;
         };
-        let ranges = index.ranges(candidate);
-        source_ranges_truncated |= index.is_truncated(candidate);
+        let range_owner = cpp
+            .and_then(|cpp| cpp.reconciled_provisional(candidate))
+            .unwrap_or_else(|| candidate.clone());
+        let ranges = index.ranges(&range_owner);
+        source_ranges_truncated |= index.is_truncated(&range_owner);
         if ranges.is_empty() && !candidate.is_callable() && !candidate.is_class() {
             classified.push((candidate.clone(), None, CppOccurrenceRole::Both, None));
             continue;
@@ -6816,82 +6820,113 @@ fn cpp_resolve_owner_type_in_lexical_namespace(
             crate::analyzer::symbol_lookup::parse_symbol_path(Language::Cpp, &namespace)
         })
         .unwrap_or_default();
-    let resolved = match visibility.resolve_type_components_lexically_for_forward(
+    let lexical_anchor = node
+        .child_by_field_name("body")
+        .or_else(|| node.child_by_field_name("declarator"))
+        .unwrap_or(node);
+    let reconstructed_owner = match cpp_enclosing_lexical_scope_components(
+        lexical_anchor,
         &dispatch.source(),
+        visibility,
         file,
-        &owner_components,
-        globally_qualified,
-        &lexical_scope,
+        source,
     ) {
-        CppLexicalTypeResolution::Resolved { unit, .. } => Some(unit),
-        CppLexicalTypeResolution::Ambiguous | CppLexicalTypeResolution::Missing => None,
-    }
-    .or_else(|| {
-        // A `using namespace` can make an owner visible even when the
-        // structural namespace walk has no matching tier.  Retry only with
-        // exact structured paths; never fall back to a terminal-name lookup.
-        let names = if globally_qualified {
-            vec![owner.to_string()]
-        } else {
-            cpp_lexical_namespace(node, source)
-                .into_iter()
-                .flat_map(|namespace| cpp_namespace_relative_names(&namespace, owner))
-                .chain(std::iter::once(owner.to_string()))
-                .collect::<Vec<_>>()
-        };
-        names.into_iter().find_map(|name| {
-            let components = crate::analyzer::symbol_lookup::parse_symbol_path(
-                Language::Cpp,
-                name.trim_start_matches("::"),
-            );
-            if components.is_empty() {
-                return None;
-            }
-            let expected = components.join("::");
-            visibility
-                .visible_identifier_candidates(file, components.last()?)
-                .filter(|candidate| candidate.is_class() && cpp_name_for(candidate) == expected)
-                .find(|candidate| {
-                    visibility.external_type_declaration_visible_at(file, candidate, byte)
+        CppLexicalScopeResolution::Resolved(scope) if scope.ends_with(&owner_components) => {
+            let terminal = scope.last()?;
+            let candidates = visibility
+                .visible_identifier_candidates(file, terminal)
+                .filter(|candidate| {
+                    candidate.is_class()
+                        && canonical_cpp_scope_components(candidate) == scope
+                        && visibility.external_type_declaration_visible_at(file, candidate, byte)
                 })
                 .cloned()
+                .collect::<Vec<_>>();
+            cpp_choose_canonical_type(analyzer, candidates)
+        }
+        CppLexicalScopeResolution::Resolved(_)
+        | CppLexicalScopeResolution::Ambiguous
+        | CppLexicalScopeResolution::Missing => None,
+    };
+    let resolved = reconstructed_owner
+        .or_else(|| {
+            match visibility.resolve_type_components_lexically_for_forward(
+                &dispatch.source(),
+                file,
+                &owner_components,
+                globally_qualified,
+                &lexical_scope,
+            ) {
+                CppLexicalTypeResolution::Resolved { unit, .. } => Some(unit),
+                CppLexicalTypeResolution::Ambiguous | CppLexicalTypeResolution::Missing => None,
+            }
         })
-    })
-    .or_else(|| {
-        // A macro namespace wrapper can hide the namespace that contains an
-        // out-of-line member from the parser-derived lexical scope. Recover
-        // the owner from the indexed callable's direct parent. Match the full
-        // owner path, not only its terminal name, so an unrelated nested type
-        // cannot win (for example `Cord::CharIterator` for `btree<P>::iterator`).
-        let declarator = node.child_by_field_name("declarator")?;
-        let qualified = cpp_declarator_qualified_name_node(declarator)?;
-        let mut function_components = cpp_type_name_components(qualified, source)?;
-        let function_name = function_components.pop()?;
-        let lexical_scope = crate::analyzer::symbol_lookup::parse_symbol_path(
-            Language::Cpp,
-            &cpp_lexical_namespace(node, source).unwrap_or_default(),
-        );
-        let mut owners = support
-            .file_identifier(file, &function_name)
-            .into_iter()
-            .filter(|candidate| candidate.is_function())
-            .filter_map(|candidate| analyzer.parent_of(&candidate))
-            .filter(|candidate| {
-                if !candidate.is_class()
-                    || !visibility.external_type_declaration_visible_at(file, candidate, byte)
-                {
-                    return false;
+        .or_else(|| {
+            // A `using namespace` can make an owner visible even when the
+            // structural namespace walk has no matching tier.  Retry only with
+            // exact structured paths; never fall back to a terminal-name lookup.
+            let names = if globally_qualified {
+                vec![owner.to_string()]
+            } else {
+                cpp_lexical_namespace(node, source)
+                    .into_iter()
+                    .flat_map(|namespace| cpp_namespace_relative_names(&namespace, owner))
+                    .chain(std::iter::once(owner.to_string()))
+                    .collect::<Vec<_>>()
+            };
+            names.into_iter().find_map(|name| {
+                let components = crate::analyzer::symbol_lookup::parse_symbol_path(
+                    Language::Cpp,
+                    name.trim_start_matches("::"),
+                );
+                if components.is_empty() {
+                    return None;
                 }
-                let candidate_components = canonical_cpp_scope_components(candidate);
-                candidate_components.ends_with(&owner_components)
-                    && (lexical_scope.is_empty()
-                        || candidate_components.starts_with(&lexical_scope))
+                let expected = components.join("::");
+                visibility
+                    .visible_identifier_candidates(file, components.last()?)
+                    .filter(|candidate| candidate.is_class() && cpp_name_for(candidate) == expected)
+                    .find(|candidate| {
+                        visibility.external_type_declaration_visible_at(file, candidate, byte)
+                    })
+                    .cloned()
             })
-            .collect::<Vec<_>>();
-        sort_units(&mut owners);
-        owners.dedup();
-        cpp_choose_canonical_type(analyzer, owners)
-    })?;
+        })
+        .or_else(|| {
+            // A macro namespace wrapper can hide the namespace that contains an
+            // out-of-line member from the parser-derived lexical scope. Recover
+            // the owner from the indexed callable's direct parent. Match the full
+            // owner path, not only its terminal name, so an unrelated nested type
+            // cannot win (for example `Cord::CharIterator` for `btree<P>::iterator`).
+            let declarator = node.child_by_field_name("declarator")?;
+            let qualified = cpp_declarator_qualified_name_node(declarator)?;
+            let mut function_components = cpp_type_name_components(qualified, source)?;
+            let function_name = function_components.pop()?;
+            let lexical_scope = crate::analyzer::symbol_lookup::parse_symbol_path(
+                Language::Cpp,
+                &cpp_lexical_namespace(node, source).unwrap_or_default(),
+            );
+            let mut owners = support
+                .file_identifier(file, &function_name)
+                .into_iter()
+                .filter(|candidate| candidate.is_function())
+                .filter_map(|candidate| analyzer.parent_of(&candidate))
+                .filter(|candidate| {
+                    if !candidate.is_class()
+                        || !visibility.external_type_declaration_visible_at(file, candidate, byte)
+                    {
+                        return false;
+                    }
+                    let candidate_components = canonical_cpp_scope_components(candidate);
+                    candidate_components.ends_with(&owner_components)
+                        && (lexical_scope.is_empty()
+                            || candidate_components.starts_with(&lexical_scope))
+                })
+                .collect::<Vec<_>>();
+            sort_units(&mut owners);
+            owners.dedup();
+            cpp_choose_canonical_type(analyzer, owners)
+        })?;
     let candidates = support
         .fqn(&resolved.fq_name())
         .into_iter()

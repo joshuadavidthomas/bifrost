@@ -7356,42 +7356,75 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
         let Some((owner, global)) = qualified_callable_owner_components(function, source) else {
             return LexicalScopeResolution::Missing;
         };
-        match visibility.resolve_type_components_lexically(analyzer, file, &owner, global, &scope) {
-            LexicalTypeResolution::Resolved { components, .. } => scope = components,
-            LexicalTypeResolution::Ambiguous => return LexicalScopeResolution::Ambiguous,
-            LexicalTypeResolution::Missing if allow_structured_unresolved_owner => {
-                if let Some(indexed) = indexed_scope.as_ref().filter(|indexed| {
-                    qualified_owner_scope_is_recoverable(
-                        indexed,
-                        &namespace,
-                        &classes,
-                        Some(owner.clone()),
-                    )
-                }) {
-                    scope = indexed.clone();
-                } else {
-                    scope = if global || owner.starts_with(&namespace) {
-                        owner
-                    } else {
-                        let mut relative = namespace;
-                        relative.extend(owner);
-                        relative
-                    };
-                }
+        // Resolve the out-of-line owner from the parser namespace before the
+        // provisional indexed parent can influence the answer. Per-file
+        // extraction can assign the first same-depth using namespace to a
+        // bare owner. The structured using resolver instead selects the
+        // namespace whose visible class has the owner name (#1838).
+        let imports = visibility.ordinary_type_import_cell(file);
+        let owner_resolution = resolve_type_components_lexically_at_scoped(
+            function,
+            &owner,
+            global,
+            analyzer,
+            visibility,
+            &imports,
+            file,
+            source,
+            None,
+            false,
+            false,
+            namespace.clone(),
+        );
+        match owner_resolution {
+            LexicalTypeResolution::Resolved {
+                unit, components, ..
+            } if is_indexed_class_owner(analyzer, &unit) => {
+                scope = components;
+                classes.clear();
             }
-            LexicalTypeResolution::Missing => {
-                // Structural lexical resolution cannot see an owner class that
-                // is reachable only through an in-scope `using namespace`
-                // directive, so it would otherwise hard-fail here. The indexed
-                // definition already carries the true fully-qualified owner
-                // (its package reflects the directive), so recover the real
-                // enclosing scope from the analyzer graph -- exactly the scope
-                // chain real C++ unqualified lookup traverses. Only the strict
-                // callers reach this arm; the best-effort callers above keep
-                // their existing structural guess (and its query profile).
-                match indexed_enclosing_owner_scope(analyzer, visibility, file, node) {
-                    Some(indexed) => scope = indexed,
-                    None => return LexicalScopeResolution::Missing,
+            LexicalTypeResolution::Ambiguous => return LexicalScopeResolution::Ambiguous,
+            LexicalTypeResolution::Resolved { .. } | LexicalTypeResolution::Missing => {
+                match visibility
+                    .resolve_type_components_lexically(analyzer, file, &owner, global, &scope)
+                {
+                    LexicalTypeResolution::Resolved { components, .. } => scope = components,
+                    LexicalTypeResolution::Ambiguous => return LexicalScopeResolution::Ambiguous,
+                    LexicalTypeResolution::Missing if allow_structured_unresolved_owner => {
+                        if let Some(indexed) = indexed_scope.as_ref().filter(|indexed| {
+                            qualified_owner_scope_is_recoverable(
+                                indexed,
+                                &namespace,
+                                &classes,
+                                Some(owner.clone()),
+                            )
+                        }) {
+                            scope = indexed.clone();
+                        } else {
+                            scope = if global || owner.starts_with(&namespace) {
+                                owner
+                            } else {
+                                let mut relative = namespace;
+                                relative.extend(owner);
+                                relative
+                            };
+                        }
+                    }
+                    LexicalTypeResolution::Missing => {
+                        // Structural lexical resolution cannot see an owner class that
+                        // is reachable only through an in-scope `using namespace`
+                        // directive, so it would otherwise hard-fail here. The indexed
+                        // definition already carries the true fully-qualified owner
+                        // (its package reflects the directive), so recover the real
+                        // enclosing scope from the analyzer graph -- exactly the scope
+                        // chain real C++ unqualified lookup traverses. Only the strict
+                        // callers reach this arm; the best-effort callers above keep
+                        // their existing structural guess (and its query profile).
+                        match indexed_enclosing_owner_scope(analyzer, visibility, file, node) {
+                            Some(indexed) => scope = indexed,
+                            None => return LexicalScopeResolution::Missing,
+                        }
+                    }
                 }
             }
         }
