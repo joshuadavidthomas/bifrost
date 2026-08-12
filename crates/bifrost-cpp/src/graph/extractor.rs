@@ -2006,6 +2006,12 @@ pub enum BareCallTargetResolution {
     Missing,
 }
 
+pub enum BlockUsingCallTargetResolution {
+    Target(BareCallTargetResolution),
+    Unindexed(Vec<String>),
+    Ambiguous,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_qualified_call_target(
     call: Node<'_>,
@@ -2225,6 +2231,126 @@ fn resolve_direct_type_candidates(
         LexicalTypeResolution::Resolved { unit, .. } => BareCallTargetResolution::Type(unit),
         LexicalTypeResolution::Ambiguous => BareCallTargetResolution::Ambiguous,
         LexicalTypeResolution::Missing => BareCallTargetResolution::Missing,
+    }
+}
+
+/// Resolve a direct using-declaration in the nearest concrete block before
+/// class-member lookup. A block declaration such as `using std::swap;` adds
+/// that name to the block scope and hides a same-named member. If the imported
+/// target is not indexed, retain its structured path as boundary evidence.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_block_using_call_target(
+    call: Node<'_>,
+    function: Node<'_>,
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    ordinary_type_imports: &OrdinaryTypeImportCell,
+    file: &ProjectFile,
+    source: &str,
+) -> Option<BlockUsingCallTargetResolution> {
+    if !matches!(function.kind(), "identifier" | "template_function") {
+        return None;
+    }
+    let name = node_text(function_terminal_node(function), source);
+    if name.is_empty() {
+        return None;
+    }
+    let lexical_scope =
+        match enclosing_lexical_scope_components(function, analyzer, visibility, file, source) {
+            LexicalScopeResolution::Resolved(scope) => scope,
+            LexicalScopeResolution::Ambiguous => {
+                return Some(BlockUsingCallTargetResolution::Ambiguous);
+            }
+            LexicalScopeResolution::Missing => return None,
+        };
+    let bindings = effective_using_bindings_for_name(
+        visibility,
+        ordinary_type_imports,
+        file,
+        root_node(function),
+        source,
+        name,
+    );
+    let active = bindings
+        .iter()
+        .filter(|binding| {
+            binding.namespace_scope.is_none()
+                && binding.block_scope
+                && matches!(binding.target, EffectiveUsingTarget::Ordinary { .. })
+                && effective_using_binding_active(
+                    binding,
+                    function,
+                    &lexical_scope,
+                    source,
+                    visibility,
+                    file,
+                )
+        })
+        .collect::<Vec<_>>();
+    let depth = active.iter().map(|binding| binding.scope_depth).max()?;
+    let at_tier = active
+        .into_iter()
+        .filter(|binding| binding.scope_depth == depth)
+        .collect::<Vec<_>>();
+    let callable_candidates = at_tier
+        .iter()
+        .flat_map(|binding| {
+            binding_free_function_candidates(
+                binding,
+                &[],
+                analyzer,
+                visibility,
+                file,
+                name,
+                call.start_byte(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !callable_candidates.is_empty() {
+        return Some(BlockUsingCallTargetResolution::Target(
+            resolve_callable_candidates(
+                callable_candidates,
+                visibility.call_arity_evidence(file, call, source).exact(),
+                call.start_byte(),
+                analyzer,
+                visibility,
+                file,
+            ),
+        ));
+    }
+    let type_candidates = at_tier
+        .iter()
+        .flat_map(|binding| {
+            binding_type_candidates(
+                binding,
+                &[],
+                visibility,
+                file,
+                name,
+                None,
+                call.start_byte(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !type_candidates.is_empty() {
+        return Some(BlockUsingCallTargetResolution::Target(
+            resolve_direct_type_candidates(type_candidates, analyzer, visibility, file),
+        ));
+    }
+
+    let mut unindexed = Vec::new();
+    for binding in at_tier {
+        let Some(components) = binding.resolved_target_components.as_ref() else {
+            continue;
+        };
+        if !unindexed.contains(components) {
+            unindexed.push(components.clone());
+        }
+    }
+    match unindexed.as_slice() {
+        [target] => Some(BlockUsingCallTargetResolution::Unindexed(target.clone())),
+        [] => None,
+        _ => Some(BlockUsingCallTargetResolution::Ambiguous),
     }
 }
 
@@ -8010,7 +8136,7 @@ fn using_named_scope(node: Node<'_>, source: &str) -> Option<Vec<String>> {
     Some(enclosing_namespace_components(node, source))
 }
 
-fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize)> {
+fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize, bool)> {
     let mut current = node.parent();
     while let Some(scope) = current {
         if matches!(
@@ -8026,7 +8152,12 @@ fn ordinary_using_scope(node: Node<'_>) -> Option<(usize, usize, usize)> {
                 depth += 1;
                 ancestor = parent.parent();
             }
-            return Some((scope.start_byte(), scope.end_byte(), depth));
+            return Some((
+                scope.start_byte(),
+                scope.end_byte(),
+                depth,
+                scope.kind() == "compound_statement",
+            ));
         }
         current = scope.parent();
     }
@@ -8090,7 +8221,8 @@ fn collect_source_using_index(
             None
         };
         if let Some(target) = target
-            && let Some((scope_start, scope_end, scope_depth)) = ordinary_using_scope(node)
+            && let Some((scope_start, scope_end, scope_depth, block_scope)) =
+                ordinary_using_scope(node)
         {
             let declaration_namespace = enclosing_namespace_components(node, source);
             let declaration_namespace = if declaration_namespace.is_empty() {
@@ -8108,6 +8240,7 @@ fn collect_source_using_index(
                 scope_start,
                 scope_end,
                 scope_depth,
+                block_scope,
                 lexical_depth,
                 declaration_namespace,
                 namespace_scope,
@@ -8495,16 +8628,18 @@ fn project_using_binding_at_activation(
         let mut projected = prefix;
         projected.extend(binding.namespace_scope.take().unwrap_or_default());
         binding.scope_depth = projected.len();
+        binding.block_scope = false;
         binding.lexical_depth = projected.len();
         binding.namespace_scope = Some(projected);
         binding.scope_start = 0;
         binding.scope_end = usize::MAX;
         Some(binding)
-    } else if let Some((start, end, depth)) = ordinary_using_scope(include) {
+    } else if let Some((start, end, depth, block_scope)) = ordinary_using_scope(include) {
         binding.namespace_scope = None;
         binding.scope_start = start;
         binding.scope_end = end;
         binding.scope_depth = depth;
+        binding.block_scope = block_scope;
         binding.lexical_depth = include_namespace.len();
         Some(binding)
     } else {
@@ -8535,9 +8670,19 @@ pub fn effective_using_bindings_for_name(
                 if !visibility.source_is_visible(file, &binding.source) {
                     continue;
                 }
-                let Some(target_components) = using_binding_target_components_for_name(
+                let target_components = using_binding_target_components_for_name(
                     binding, project, visibility, file, name,
-                ) else {
+                )
+                .or_else(|| match &binding.target {
+                    EffectiveUsingTarget::Ordinary {
+                        name: imported_name,
+                        target_components,
+                        ..
+                    } if imported_name == name => Some(target_components.clone()),
+                    EffectiveUsingTarget::Ordinary { .. }
+                    | EffectiveUsingTarget::Namespace { .. } => None,
+                });
+                let Some(target_components) = target_components else {
                     continue;
                 };
                 let mut binding = binding.clone();

@@ -638,6 +638,7 @@ pub struct OrdinaryTypeImport {
     pub scope_start: usize,
     pub scope_end: usize,
     pub scope_depth: usize,
+    pub block_scope: bool,
     pub lexical_depth: usize,
     pub declaration_namespace: Vec<String>,
     pub namespace_scope: Option<Vec<String>>,

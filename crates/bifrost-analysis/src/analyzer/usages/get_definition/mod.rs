@@ -5,13 +5,14 @@ use crate::analyzer::lexical_definitions::{
 use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::common::namespace_prefixes;
 use crate::analyzer::usages::cpp_graph::{
-    CallArityEvidence, CppBareCallTargetResolution, CppDesignatedInitializerOwner, CppDispatch,
-    CppLexicalScopeResolution, CppLexicalTypeResolution, CppTargetKind, CppTemplateResolutionError,
-    CppVisibilityIndex, cpp_argument_children, cpp_constructor_type_node,
-    cpp_designated_initializer_owner, cpp_enclosing_lexical_scope_components,
-    cpp_field_declared_type_binding, cpp_first_type_child, cpp_function_return_type_text,
-    cpp_initialized_effective_using_imports, cpp_is_declaration_name, cpp_is_declarator_node,
-    cpp_name_for, cpp_reference_fqn_candidates, cpp_resolve_bare_call_target, cpp_signature_arity,
+    CallArityEvidence, CppBareCallTargetResolution, CppBlockUsingCallTargetResolution,
+    CppDesignatedInitializerOwner, CppDispatch, CppLexicalScopeResolution,
+    CppLexicalTypeResolution, CppTargetKind, CppTemplateResolutionError, CppVisibilityIndex,
+    cpp_argument_children, cpp_constructor_type_node, cpp_designated_initializer_owner,
+    cpp_enclosing_lexical_scope_components, cpp_field_declared_type_binding, cpp_first_type_child,
+    cpp_function_return_type_text, cpp_initialized_effective_using_imports,
+    cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_reference_fqn_candidates,
+    cpp_resolve_bare_call_target, cpp_resolve_block_using_call_target, cpp_signature_arity,
     cpp_split_top_level_commas, cpp_template_reference_arguments, cpp_type_name_components,
     extract_variable_name, is_globally_qualified_cpp_name, normalize_cpp_type_text,
 };

@@ -4163,6 +4163,43 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     format!("`{name}` is a local C++ value"),
                 );
             }
+            let imports = cpp_initialized_effective_using_imports(
+                ctx.root,
+                &ctx_dispatch.source(),
+                ctx.visibility,
+                ctx.file,
+                ctx.source,
+            );
+            if let Some(using_resolution) = cpp_resolve_block_using_call_target(
+                call,
+                function,
+                &ctx_dispatch.source(),
+                ctx.visibility,
+                &imports,
+                ctx.file,
+                ctx.source,
+            ) {
+                match using_resolution {
+                    CppBlockUsingCallTargetResolution::Target(resolution) => {
+                        if let Some(outcome) =
+                            cpp_bare_call_target_outcome(ctx, call, call_arity, name, resolution)
+                        {
+                            return outcome;
+                        }
+                    }
+                    CppBlockUsingCallTargetResolution::Unindexed(target) => {
+                        return boundary_unchecked(format!(
+                            "block using-declaration `{}` names a C++ callable not indexed in this workspace",
+                            target.join("::")
+                        ));
+                    }
+                    CppBlockUsingCallTargetResolution::Ambiguous => {
+                        return ambiguous_without_candidates(format!(
+                            "C++ block using-declarations for `{name}` are ambiguous"
+                        ));
+                    }
+                }
+            }
             if let Some(owner) = cpp_enclosing_class(
                 ctx.analyzer,
                 ctx.support,
@@ -4215,14 +4252,7 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                     );
                 }
             }
-            let imports = cpp_initialized_effective_using_imports(
-                ctx.root,
-                &ctx_dispatch.source(),
-                ctx.visibility,
-                ctx.file,
-                ctx.source,
-            );
-            match cpp_resolve_bare_call_target(
+            let resolution = cpp_resolve_bare_call_target(
                 call,
                 function,
                 &ctx_dispatch.source(),
@@ -4230,72 +4260,11 @@ fn resolve_cpp_call(ctx: CppLookupCtx<'_, '_>, call: Node<'_>) -> DefinitionLook
                 &imports,
                 ctx.file,
                 ctx.source,
-            ) {
-                CppBareCallTargetResolution::FreeFunctions(units) => {
-                    let mut candidates =
-                        cpp_bare_free_function_definition_candidates(ctx, units, call.start_byte());
-                    candidates = cpp_filter_candidates_by_call_lazy(
-                        candidates,
-                        call_arity,
-                        || {
-                            cpp_call_argument_types(
-                                ctx.analyzer,
-                                ctx.support,
-                                ctx.visibility,
-                                ctx.file,
-                                ctx.source,
-                                ctx.root,
-                                call,
-                            )
-                        },
-                        ctx.analyzer,
-                        ctx.visibility,
-                        ctx.file,
-                    );
-                    return cpp_callable_candidates_outcome(candidates);
-                }
-                CppBareCallTargetResolution::UnprovenFreeFunctions(units) => {
-                    // `resolve_callable_candidates` answers `FreeFunctions` for a
-                    // lone candidate and never builds an empty candidate set, so
-                    // an unproven-arity answer always has something to be
-                    // ambiguous between (#1811).
-                    debug_assert!(
-                        units.len() >= 2,
-                        "unproven-arity C++ call `{name}` must carry competing candidates, got {units:?}"
-                    );
-                    let candidates =
-                        cpp_bare_free_function_definition_candidates(ctx, units, call.start_byte());
-                    return ambiguous_candidates_outcome(
-                        candidates,
-                        format!(
-                            "the argument count for C++ call `{name}` is unknown after macro expansion"
-                        ),
-                    );
-                }
-                CppBareCallTargetResolution::Type(unit) => {
-                    let owners = cpp_type_definition_candidates(
-                        ctx.analyzer,
-                        ctx.visibility,
-                        ctx.file,
-                        ctx.support,
-                        unit,
-                    );
-                    return candidates_outcome(owners);
-                }
-                CppBareCallTargetResolution::CallableShadow => {
-                    return no_definition(
-                        "no_applicable_overload",
-                        format!("`{name}` is declared but has no applicable overload"),
-                    );
-                }
-                CppBareCallTargetResolution::Ambiguous => {
-                    // no candidates: `BareCallTargetResolution::Ambiguous` is the
-                    // resolver's fail-closed verdict and carries no units.
-                    return ambiguous_without_candidates(format!(
-                        "C++ bare call `{name}` has ambiguous lookup candidates"
-                    ));
-                }
-                CppBareCallTargetResolution::Missing => {}
+            );
+            if let Some(outcome) =
+                cpp_bare_call_target_outcome(ctx, call, call_arity, name, resolution)
+            {
+                return outcome;
             }
             let macros = cpp_macro_candidates(
                 ctx.analyzer,
@@ -4364,6 +4333,72 @@ fn cpp_bare_free_function_definition_candidates(
         )
     });
     candidates
+}
+
+fn cpp_bare_call_target_outcome(
+    ctx: CppLookupCtx<'_, '_>,
+    call: Node<'_>,
+    call_arity: Option<usize>,
+    name: &str,
+    resolution: CppBareCallTargetResolution,
+) -> Option<DefinitionLookupOutcome> {
+    match resolution {
+        CppBareCallTargetResolution::FreeFunctions(units) => {
+            let mut candidates =
+                cpp_bare_free_function_definition_candidates(ctx, units, call.start_byte());
+            candidates = cpp_filter_candidates_by_call_lazy(
+                candidates,
+                call_arity,
+                || {
+                    cpp_call_argument_types(
+                        ctx.analyzer,
+                        ctx.support,
+                        ctx.visibility,
+                        ctx.file,
+                        ctx.source,
+                        ctx.root,
+                        call,
+                    )
+                },
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+            );
+            Some(cpp_callable_candidates_outcome(candidates))
+        }
+        CppBareCallTargetResolution::UnprovenFreeFunctions(units) => {
+            debug_assert!(
+                units.len() >= 2,
+                "unproven-arity C++ call `{name}` must carry competing candidates, got {units:?}"
+            );
+            let candidates =
+                cpp_bare_free_function_definition_candidates(ctx, units, call.start_byte());
+            Some(ambiguous_candidates_outcome(
+                candidates,
+                format!(
+                    "the argument count for C++ call `{name}` is unknown after macro expansion"
+                ),
+            ))
+        }
+        CppBareCallTargetResolution::Type(unit) => {
+            let owners = cpp_type_definition_candidates(
+                ctx.analyzer,
+                ctx.visibility,
+                ctx.file,
+                ctx.support,
+                unit,
+            );
+            Some(candidates_outcome(owners))
+        }
+        CppBareCallTargetResolution::CallableShadow => Some(no_definition(
+            "no_applicable_overload",
+            format!("`{name}` is declared but has no applicable overload"),
+        )),
+        CppBareCallTargetResolution::Ambiguous => Some(ambiguous_without_candidates(format!(
+            "C++ bare call `{name}` has ambiguous lookup candidates"
+        ))),
+        CppBareCallTargetResolution::Missing => None,
+    }
 }
 
 fn cpp_explicit_operator_name(call: Node<'_>) -> Option<Node<'_>> {

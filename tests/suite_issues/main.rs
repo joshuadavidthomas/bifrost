@@ -48,6 +48,7 @@ mod issue_1832_cpp_out_of_line_owner_binding;
 mod issue_1833_cpp_template_derived_bases;
 mod issue_1835_cpp_using_declaration_overloads;
 mod issue_1836_cpp_resolution_determinism;
+mod issue_1838_cpp_block_using_call;
 mod issue_1838_cpp_callable_data_member;
 mod issue_1838_cpp_inherited_nested_type;
 mod issue_1838_cpp_operator_member_pointer;
