@@ -14,7 +14,7 @@ Two JavaScript or TypeScript script files share one program scope. Today, a func
 - [x] (2026-08-12T22:07Z) Emitted bare field identities only for program-scope script values, including destructured binders.
 - [x] (2026-08-12T22:07Z) Bumped JavaScript and TypeScript store epoch salts. The existing epoch mechanism hashes each changed salt.
 - [x] (2026-08-12T22:07Z) Ran focused tests, adjacent script and module tests, formatting, and targeted Clippy.
-- [ ] Commit, pull, push to `origin/master`, and close issue #1862.
+- [x] (2026-08-12T22:07Z) Committed the implementation as `4f8abee7`; delivery will push this plan closure with it.
 
 ## Surprises & Discoveries
 
@@ -40,7 +40,7 @@ Two JavaScript or TypeScript script files share one program scope. Today, a func
 
 ## Outcomes & Retrospective
 
-JavaScript and TypeScript scripts now publish scalar and destructured fields under bare program identities. Module fields remain file-scoped. Local bindings still shadow program globals. The tests and targeted quality checks pass. Delivery remains.
+JavaScript and TypeScript scripts now publish scalar and destructured fields under bare program identities. Module fields remain file-scoped. Local bindings still shadow program globals. The tests and targeted quality checks pass. The implementation is committed as `4f8abee7` and is ready for delivery.
 
 ## Context and Orientation
 
@@ -102,3 +102,5 @@ Do not add dependencies. Reuse `js_program_is_external_module`, `FqName`, `Segme
 Plan update note: Created this plan after confirming issue #1862 and its shared JavaScript and TypeScript indexing seam.
 
 Plan update note: Implemented program-scope value identities, added both dialect regressions, bumped both epochs, and recorded passing validation.
+
+Plan update note: Recorded implementation commit `4f8abee7` and closed the plan before delivery.
