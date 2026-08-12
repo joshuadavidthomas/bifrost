@@ -1343,6 +1343,22 @@ export function leak_resource(): object {
     assert_eq!(findings.len(), 1, "{response}");
     assert_eq!(findings[0]["primary"]["path"], "app.ts");
     assert_eq!(response["result"]["report"]["schema_version"], 3);
+    let editor_contract: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/policy-report/v3-one-finding.json"
+    ))
+    .expect("editor policy report contract fixture");
+    assert_eq!(
+        editor_contract["report"]["schema_version"],
+        brokk_bifrost_policy::PolicyReportDocument::SCHEMA_VERSION
+    );
+    assert_eq!(
+        response["result"]["report"]["schema_version"],
+        editor_contract["report"]["schema_version"]
+    );
+    assert_eq!(
+        response["result"]["report"]["runs"][0]["findings"][0]["primary"]["path"],
+        editor_contract["report"]["runs"][0]["findings"][0]["primary"]["path"]
+    );
     assert_eq!(
         response["result"]["report"]["evaluation"]["evaluation_date"],
         "2026-07-27"
