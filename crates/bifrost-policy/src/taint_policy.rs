@@ -224,6 +224,28 @@ impl TaintExecutionBudget {
             remaining_witness_bytes: budget.max_witness_bytes(),
         }
     }
+
+    /// Restore the witness-reconstruction lanes to their per-batch starting
+    /// budget.
+    ///
+    /// Witness reconstruction is a per-batch concern: each solved batch rebuilds
+    /// evidence only for its own findings. These lanes were threaded as one
+    /// request-wide running total, so on a corpus the early batches drained them
+    /// and every later batch failed the `solve_and_project_batch` pre-check and
+    /// dropped its findings to `not_analyzed` by accumulation (#1935). Resetting
+    /// per batch bounds each batch's evidence work on its own; the request-wide
+    /// `remaining_findings` still caps total output, so the aggregate stays
+    /// bounded. Evidence, not the finding, is what a depleted witness lane
+    /// truncates, so this never turns an abstain into a false clean.
+    fn reset_per_batch_witness_budget(&mut self, budget: &PolicyBudget) {
+        let limits = budget.query_limits();
+        self.remaining_witnesses = budget
+            .max_findings()
+            .saturating_mul(budget.max_witnesses_per_finding());
+        self.remaining_witness_steps = budget.max_witness_steps();
+        self.remaining_witness_expansions = limits.value_flow.max_witness_expansions;
+        self.remaining_witness_bytes = budget.max_witness_bytes();
+    }
 }
 
 impl ProductionTaintPolicyEvaluator {
@@ -1367,6 +1389,11 @@ fn solve_and_project_batch(
     retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
     batch_planning_elapsed: Duration,
 ) -> Result<(), String> {
+    // Each batch reconstructs evidence only for its own findings, so give it a
+    // fresh witness budget instead of the request-wide remainder a corpus would
+    // have already drained (#1935). `remaining_findings` is deliberately not
+    // reset: it stays the request-wide cap on total output.
+    execution_budget.reset_per_batch_witness_budget(budget);
     let limits = budget.query_limits();
     let value_flow_limits = limits.value_flow;
     let witness_retention = WitnessRetentionLimits::best_effort(
