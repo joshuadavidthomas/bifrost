@@ -3089,23 +3089,35 @@ fn csharp_receiver_types(
         return CSharpReceiverTypes::default();
     }
 
-    let mut receiver_types = match program.base {
-        CSharpReceiverBase::Expression(base) => {
-            csharp_receiver_base_types(analyzer, csharp, definitions, file, source, root, base)
+    if let CSharpReceiverBase::EnclosingType { byte } = program.base {
+        for owner in csharp_enclosing_class_chain(analyzer, definitions, file, byte) {
+            let receiver_types = csharp_apply_receiver_transitions(
+                analyzer,
+                csharp,
+                definitions,
+                file,
+                source,
+                CSharpReceiverTypes::from_units(vec![owner]),
+                &program.transitions,
+            );
+            if !receiver_types.units.is_empty() || !receiver_types.fq_names.is_empty() {
+                return receiver_types.normalized();
+            }
         }
-        CSharpReceiverBase::EnclosingType { byte } => CSharpReceiverTypes::from_units(
-            csharp_enclosing_class(analyzer, definitions, file, byte)
-                .into_iter()
-                .collect(),
-        ),
+        return CSharpReceiverTypes::default();
+    }
+
+    let CSharpReceiverBase::Expression(base) = program.base else {
+        unreachable!("enclosing receiver bases returned above")
     };
+    let mut receiver_types =
+        csharp_receiver_base_types(analyzer, csharp, definitions, file, source, root, base);
     if !definitions.observe_cancellation() {
         return CSharpReceiverTypes::default();
     }
 
     let mut first_transition = 0usize;
     if receiver_types.units.is_empty()
-        && let CSharpReceiverBase::Expression(base) = program.base
         && !csharp_receiver_base_is_shadowed(csharp, definitions, file, source, root, base)
     {
         if !definitions.scope_step() {
@@ -3136,7 +3148,29 @@ fn csharp_receiver_types(
         }
     }
 
-    for transition in &program.transitions[first_transition..] {
+    csharp_apply_receiver_transitions(
+        analyzer,
+        csharp,
+        definitions,
+        file,
+        source,
+        receiver_types,
+        &program.transitions[first_transition..],
+    )
+    .normalized()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn csharp_apply_receiver_transitions(
+    analyzer: &dyn IAnalyzer,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    mut receiver_types: CSharpReceiverTypes,
+    transitions: &[CSharpReceiverTransition<'_>],
+) -> CSharpReceiverTypes {
+    for transition in transitions {
         if receiver_types.fq_names.is_empty() || !definitions.scope_step() {
             return CSharpReceiverTypes::default();
         }
@@ -3171,7 +3205,7 @@ fn csharp_receiver_types(
             return CSharpReceiverTypes::default();
         }
     }
-    receiver_types.normalized()
+    receiver_types
 }
 
 #[allow(clippy::too_many_arguments)]
