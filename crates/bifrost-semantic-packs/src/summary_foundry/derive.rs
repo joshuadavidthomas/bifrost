@@ -519,7 +519,7 @@ impl ProcedureShape {
         let mut highest_ordinal: Option<u32> = None;
         for value in procedure.semantics().values() {
             match value.kind {
-                SemanticValueKind::Receiver => has_receiver = true,
+                SemanticValueKind::Receiver { .. } => has_receiver = true,
                 SemanticValueKind::Parameter { ordinal, .. } => {
                     highest_ordinal =
                         Some(highest_ordinal.map_or(ordinal, |seen: u32| seen.max(ordinal)));

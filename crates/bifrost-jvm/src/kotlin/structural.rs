@@ -41,6 +41,7 @@ use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::adapter_helpers::{
     attach_role_with_derived_name, attach_terminal_callee, first_named_child,
 };
+use brokk_bifrost_core::analyzer::structural::callable::CallSiteContext;
 use brokk_bifrost_core::analyzer::structural::edges::{
     INVERSE_REFERENCE_EDGE_SUPPORT, ReferenceEdgeSupport,
 };
@@ -431,6 +432,7 @@ impl StructuralSpec for KotlinStructuralSpec {
         kind: NormalizedKind,
         enclosing: Option<NormalizedKind>,
         _source: &str,
+        _context: &CallSiteContext,
     ) -> NormalizedKind {
         match kind {
             NormalizedKind::Function if enclosing == Some(NormalizedKind::Class) => {

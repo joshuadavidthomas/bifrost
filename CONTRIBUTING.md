@@ -121,9 +121,10 @@ node scripts/release-version.mjs sync
 
 That script updates these committed version fields:
 
-- `plugins/bifrost-agent/.codex-plugin/plugin.json`
+- `plugins/bifrost-agent/plugin.json`
 - `plugins/bifrost-agent/.claude-plugin/plugin.json`
 - `plugins/bifrost-agent/.cursor-plugin/plugin.json`
+- `plugins/bifrost-agent/plugin.json`
 - `.cursor-plugin/marketplace.json`
 - `editors/vscode/package.json`
 - `editors/vscode/package-lock.json`
@@ -180,15 +181,16 @@ To cut a release:
 
    ```bash
    node scripts/release-version.mjs check
+   node scripts/check-agent-plugins-v1.mjs
    node scripts/check-codex-plugin-manifest.mjs
    node --test plugins/bifrost-agent/test/*.test.mjs
    ```
 
-   `check-codex-plugin-manifest.mjs` checks the Codex, Claude, Cursor, and Pi
-   manifests, the Cursor marketplace versions, the generated Codex and Amp
-   bundles, and parseability of the Codex and Claude marketplace files. It also
-   checks `plugins/bifrost-agent/bifrost-release.json`, so run it after that
-   release metadata has been prepared for the version being validated.
+   `check-agent-plugins-v1.mjs` checks the portable root `plugin.json` and
+   `mcp.json`. `check-codex-plugin-manifest.mjs` checks the portable package,
+   Claude, Cursor, and Pi adapters, the Cursor marketplace versions, and the
+   release metadata. Run both after
+   the release metadata has been prepared for the version being validated.
 5. Sync the release version projection and every stabilization fix from the RC
    branch back to `master`. An RC-only fix is not complete until its equivalent
    has landed on `master`; use a cherry-pick or an equivalent focused commit and

@@ -515,7 +515,7 @@ fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Resul
             write!(writer, " :language-kind {}", quoted(kind))?;
         }
         SemanticValueKind::Local
-        | SemanticValueKind::Receiver
+        | SemanticValueKind::Receiver { .. }
         | SemanticValueKind::Return
         | SemanticValueKind::Temporary
         | SemanticValueKind::Constant
@@ -1911,7 +1911,7 @@ mod tests {
             },
             SemanticValue {
                 id: super::super::ids::ValueId::new(1),
-                kind: SemanticValueKind::Receiver,
+                kind: SemanticValueKind::Receiver { dispatch: true },
                 source,
                 evidence,
             },

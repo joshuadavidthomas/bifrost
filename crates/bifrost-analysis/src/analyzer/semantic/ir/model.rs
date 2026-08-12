@@ -239,7 +239,13 @@ pub enum SemanticValueKind {
         ordinal: u32,
         multiplicity: FormalMultiplicity,
     },
-    Receiver,
+    /// The procedure's receiver formal. `dispatch` states whether the value
+    /// is the object the call dispatches on (`this`/`self`), as opposed to a
+    /// passed-in receiver -- a Kotlin or Scala extension receiver -- that
+    /// binds like a parameter and is never the caller's own `this`.
+    Receiver {
+        dispatch: bool,
+    },
     Return,
     Temporary,
     Constant,
@@ -315,7 +321,7 @@ impl SemanticValueKind {
         match self {
             Self::Local => "local",
             Self::Parameter { .. } => "parameter",
-            Self::Receiver => "receiver",
+            Self::Receiver { .. } => "receiver",
             Self::Return => "return",
             Self::Temporary => "temporary",
             Self::Constant => "constant",

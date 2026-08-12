@@ -287,7 +287,7 @@ fn workspace_collection_sweeps_disused_older_stores() {
         }
     }
 
-    let outcome = cache_gc::force_gc_for_analyzer(&store, &repo).unwrap();
+    let outcome = cache_gc::force_gc_for_analyzer(&store, &repo, &root).unwrap();
 
     assert!(outcome.ran);
     assert_eq!(outcome.version_stores_removed, 1);

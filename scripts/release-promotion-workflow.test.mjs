@@ -304,14 +304,13 @@ test("Open VSX publisher reuses the validated VSIX and verifies exact-version re
   );
 });
 
-test("agent plugin release smoke follows the packaged Codex manifest and release assets stay immutable", () => {
+test("agent plugin release smoke follows the portable manifest and release assets stay immutable", () => {
   const releaseJob = jobBlock(release, "release");
   assert.match(releaseJob, /overwrite_files: false/u);
 
-  assert.match(agentPluginSmoke, /\.codex-plugin", "plugin\.json"/u);
-  assert.match(agentPluginSmoke, /const mcpConfigPath = path\.resolve\(pluginRoot, manifest\.mcpServers\)/u);
-  assert.match(agentPluginSmoke, /const command = path\.resolve\(mcpConfigDir, server\.command\)/u);
-  assert.match(agentPluginSmoke, /const cwd = path\.resolve\(mcpConfigDir, server\.cwd\)/u);
+  assert.match(agentPluginSmoke, /path\.join\(pluginRoot, "plugin\.json"\)/u);
+  assert.match(agentPluginSmoke, /path\.join\(pluginRoot, "mcp\.json"\)/u);
+  assert.match(agentPluginSmoke, /const command = path\.resolve\(pluginRoot, server\.command\)/u);
   assert.match(agentPluginSmoke, /server\.args, \["--mcp", "symbol\|extended"\]/u);
   for (const tool of ["search_symbols", "list_policies", "run_policy"]) {
     assert.ok(agentPluginSmoke.includes(`tool.name === "${tool}"`));

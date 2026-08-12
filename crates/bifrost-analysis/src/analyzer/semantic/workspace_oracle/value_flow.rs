@@ -15,9 +15,9 @@ use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathRoot,
     AccessPathTail, AccessSelector, AllocationHandle, CallArgumentEndpoint, CallArgumentExpansion,
     CallArgumentGroup, CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings,
-    CallPassingMode, CandidateCoverage, CaptureSource, DispatchCandidate, EvidenceCompleteness,
-    EvidenceHandle, FormalMultiplicity, IndexSelector, MemoryLocationId, MemoryLocationKind,
-    ObjectCardinality, OracleCallContext, OracleCandidate, OracleRelationArena,
+    CallPassingMode, CandidateCoverage, CaptureSource, DeclarationSegmentKind, DispatchCandidate,
+    EvidenceCompleteness, EvidenceHandle, FormalMultiplicity, IndexSelector, MemoryLocationId,
+    MemoryLocationKind, ObjectCardinality, OracleCallContext, OracleCandidate, OracleRelationArena,
     OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
     OracleRelationRecord, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProofStatus,
     ScopedSemanticLocator, SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticGapKind,
@@ -251,6 +251,49 @@ pub(crate) fn implicit_abort_gap_is_discharged(
         && matches!(gap.subject, SemanticGapSubject::Point)
         && gap.kind == SemanticGapKind::Unsupported
         && !abort_user_code
+}
+
+/// The caller value a receiverless call's dispatch receiver binds to, when
+/// that identity is structurally proven.
+///
+/// A bare call between members of one declaring type dispatches on the
+/// caller's own `this`: the caller and callee share a declaration parent
+/// whose innermost segment is a type, in the same file, and both receivers
+/// are dispatch receivers. Each condition carries a semantic boundary:
+///
+/// - A passed-in receiver on either side (a Kotlin or Scala extension
+///   receiver) never carries the caller's `this`.
+/// - An inherited, companion-object, or imported-singleton member does not
+///   share the declaration parent.
+/// - Sibling callables outside a declaring type (JavaScript file-level
+///   functions, Ruby top-level methods) own a `this`/`self` without sharing
+///   it through a bare call.
+///
+/// Those shapes return `None` and the binding stays honestly open.
+fn implicit_dispatch_receiver_actual<'caller>(
+    caller: &'caller ProcedureHandle,
+    callee: &ProcedureHandle,
+    callee_receiver: &crate::analyzer::semantic::SemanticValue,
+) -> Option<&'caller crate::analyzer::semantic::SemanticValue> {
+    if callee_receiver.kind != (SemanticValueKind::Receiver { dispatch: true }) {
+        return None;
+    }
+    let caller_receiver = caller
+        .semantics()
+        .values()
+        .iter()
+        .find(|value| value.kind == SemanticValueKind::Receiver { dispatch: true })?;
+    let caller_locator = caller.semantics().locator();
+    let callee_locator = callee.semantics().locator();
+    let (_, caller_parent) = caller_locator.declaration().segments().split_last()?;
+    let (_, callee_parent) = callee_locator.declaration().segments().split_last()?;
+    (caller_locator.mount() == callee_locator.mount()
+        && caller_locator.path() == callee_locator.path()
+        && caller_parent == callee_parent
+        && caller_parent
+            .last()
+            .is_some_and(|segment| segment.kind() == DeclarationSegmentKind::Type))
+    .then_some(caller_receiver)
 }
 
 fn proven_complete(evidence: &[EvidenceHandle]) -> bool {
@@ -1540,20 +1583,41 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
 
         let mut bound_formals = std::collections::HashSet::new();
         if interrupted.is_none()
-            && let Some(actual_id) = call_row.receiver
             && let Some(receiver_row) = callee
                 .semantics()
                 .values()
                 .iter()
-                .find(|value| value.kind == SemanticValueKind::Receiver)
+                .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         {
+            // A call that spells no receiver operand can still dispatch on
+            // one: a bare call between members of the same declaring type
+            // runs on the caller's own `this`. Bind that implicit actual only
+            // when the sibling identity is structurally proven; otherwise the
+            // missing operand keeps the binding honestly open.
+            let (actual, extra_evidence) = match call_row.receiver {
+                Some(actual_id) => (Some(actual_id), None),
+                None => {
+                    match implicit_dispatch_receiver_actual(call.procedure(), callee, receiver_row)
+                    {
+                        Some(caller_receiver) => (
+                            Some(caller_receiver.id),
+                            Some(evidence_handle(call.procedure(), caller_receiver.evidence)?),
+                        ),
+                        None => (None, None),
+                    }
+                }
+            };
             if request.cancellation.is_cancelled() {
                 interrupted = Some(Interruption::Cancelled);
-            } else {
-                let evidence = dedup_evidence([
-                    call_evidence.clone(),
-                    evidence_handle(callee, receiver_row.evidence)?,
-                ]);
+            } else if let Some(actual_id) = actual {
+                let evidence = dedup_evidence(
+                    [
+                        call_evidence.clone(),
+                        evidence_handle(callee, receiver_row.evidence)?,
+                    ]
+                    .into_iter()
+                    .chain(extra_evidence),
+                );
                 if !proven_complete(&evidence) {
                     build.open = true;
                 } else if build.can_retain(std::slice::from_ref(&evidence), 1, *self.limits()) {
@@ -1578,15 +1642,9 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 } else {
                     build.truncated = true;
                 }
+            } else {
+                build.open = true;
             }
-        } else if interrupted.is_none()
-            && callee
-                .semantics()
-                .values()
-                .iter()
-                .any(|value| value.kind == SemanticValueKind::Receiver)
-        {
-            build.open = true;
         }
 
         let mut formal_cursor = 0usize;

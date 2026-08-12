@@ -43,7 +43,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         abruptness: HashMap::default(),
         cleanups: Vec::new(),
     };
-    context.emit_procedure_inputs(&mut builder, spec.callable, spec.kind, spec.properties)?;
+    context.emit_procedure_inputs(&mut builder, spec)?;
     context.emit_captured_receiver(&mut builder, entry, spec, capture_binding_expected)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
     if spec.properties.is_generator {
@@ -2042,13 +2042,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             None,
             stack,
         )?;
-        let ambiguous_import = function.kind() == "identifier"
+        // A program-level callee name with competing direct imports or a
+        // program-scope reassignment has more than one plausible target, so
+        // the dispatch gap is ambiguous and stays undischargeable.
+        let ambiguous_target = function.kind() == "identifier"
             && node_text(self.prepared.source(), function).is_some_and(|name| {
-                self.lexical_bindings.is_program_binding_at(
-                    name,
-                    function.start_byte(),
-                    self.prepared.tree().root_node(),
-                ) && self.imports.has_competing_direct_imports(name)
+                let root = self.prepared.tree().root_node();
+                self.lexical_bindings
+                    .is_program_binding_at(name, function.start_byte(), root)
+                    && (self.imports.has_competing_direct_imports(name)
+                        || self
+                            .lexical_bindings
+                            .is_program_binding_reassigned(name, root))
             });
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
 
@@ -2057,7 +2062,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             invoke,
             SemanticGapSubject::CallSite(call_site),
             SemanticCapability::DynamicDispatch,
-            if ambiguous_import {
+            if ambiguous_target {
                 SemanticGapKind::Ambiguous
             } else {
                 SemanticGapKind::Unknown

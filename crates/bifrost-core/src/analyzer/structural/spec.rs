@@ -56,13 +56,17 @@ pub trait StructuralSpec: Send + Sync + 'static {
     }
 
     /// Context-sensitive refinement applied after table lookup. `enclosing`
-    /// is the kind of the nearest enclosing normalized node.
+    /// is the kind of the nearest enclosing normalized node, and `context` is
+    /// the per-file [`CallSiteContext`] from [`Self::call_site_context`], for
+    /// refinements that depend on file-wide facts (Ruby's value-position bare
+    /// calls).
     fn refine_kind(
         &self,
         _node: Node<'_>,
         kind: NormalizedKind,
         _enclosing: Option<NormalizedKind>,
         _source: &str,
+        _context: &CallSiteContext,
     ) -> NormalizedKind {
         kind
     }

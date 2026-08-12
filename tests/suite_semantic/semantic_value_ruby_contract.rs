@@ -96,7 +96,7 @@ end
     let formal_receiver = current
         .values()
         .iter()
-        .find(|value| value.kind == SemanticValueKind::Receiver)
+        .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         .expect("Ruby method receiver");
     let input = current
         .values()

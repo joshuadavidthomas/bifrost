@@ -83,7 +83,7 @@ fn assert_value_contract(
     let receiver = procedure
         .values()
         .iter()
-        .find(|value| value.kind == SemanticValueKind::Receiver)
+        .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         .expect("instance method must publish a receiver port");
     let call = procedure
         .call_sites()
@@ -337,7 +337,7 @@ fn assert_receiver_capture(graph: &SemanticGraph) {
     };
     assert_eq!(
         parent.value(captured).unwrap().kind,
-        SemanticValueKind::Receiver
+        SemanticValueKind::Receiver { dispatch: true }
     );
     assert_eq!(
         parent.allocations()[capture.environment.index()].kind,
@@ -870,6 +870,7 @@ fn assert_call_bindings(
     graph: &SemanticGraph,
     source: &str,
     expected_coverage: CandidateCoverage,
+    expects_receiver_binding: bool,
 ) {
     let oracle = analyzer.semantic_oracle_provider();
     let call = call_named(graph, source, "instance", "this.sink(input, made)");
@@ -928,11 +929,18 @@ fn assert_call_bindings(
         call.procedure().semantics().gaps(),
         candidate.target().semantics().gaps()
     );
-    assert!(
+    assert_eq!(
         bindings
             .bindings()
             .iter()
-            .any(|binding| matches!(binding, CallBinding::Receiver { .. }))
+            .any(|binding| matches!(binding, CallBinding::Receiver { .. })),
+        expects_receiver_binding,
+        "receiver binding row for a callee that {} `this`",
+        if expects_receiver_binding {
+            "reads"
+        } else {
+            "never reads"
+        }
     );
     let groups = bindings
         .bindings()
@@ -1898,13 +1906,17 @@ class Sample {
     // Candidate-specific bindings close since #1952: target-set openness
     // lives in the dispatch result (asserted Open above), while the binding
     // rows for one retained candidate are themselves exhaustive.
+    // The TypeScript `sink` never reads `this`, so the adapter publishes no
+    // receiver formal and the binding needs no receiver row; the Java callee
+    // keeps its implicit receiver.
     assert_call_bindings(
         &analyzer,
         &typescript,
         TYPESCRIPT,
         CandidateCoverage::Exhaustive,
+        false,
     );
-    assert_call_bindings(&analyzer, &java, JAVA, CandidateCoverage::Exhaustive);
+    assert_call_bindings(&analyzer, &java, JAVA, CandidateCoverage::Exhaustive, true);
     assert_variadic_and_static_receiver_bindings(&analyzer, &typescript, TYPESCRIPT);
     assert_variadic_and_static_receiver_bindings(&analyzer, &java, JAVA);
     assert_java_dispatch_closure(&analyzer, &java, JAVA);
@@ -1919,7 +1931,7 @@ class Sample {
             factory
                 .values()
                 .iter()
-                .all(|value| value.kind != SemanticValueKind::Receiver),
+                .all(|value| !matches!(value.kind, SemanticValueKind::Receiver { .. })),
             "static methods must not manufacture receiver ports"
         );
     }
@@ -2033,7 +2045,7 @@ class Sample {
         constructor
             .values()
             .iter()
-            .any(|value| value.kind == SemanticValueKind::Receiver),
+            .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. })),
         "instance constructors must publish their receiver port"
     );
     let factory = procedure_named(&csharp, "factory", ProcedureKind::Method);
@@ -2041,7 +2053,7 @@ class Sample {
         factory
             .values()
             .iter()
-            .all(|value| value.kind != SemanticValueKind::Receiver),
+            .all(|value| !matches!(value.kind, SemanticValueKind::Receiver { .. })),
         "static C# methods must not manufacture receiver ports"
     );
     assert_eq!(
@@ -3119,6 +3131,82 @@ class Capture {
 }
 
 #[test]
+fn javascript_typescript_receiver_formals_follow_this_usage() {
+    const SOURCE: &str = r#"
+function no_receiver(value) {
+  return value;
+}
+
+function direct_receiver() {
+  return this;
+}
+
+function arrow_receiver() {
+  return () => this;
+}
+
+function nested_function_owns_its_own() {
+  function inner() {
+    return this;
+  }
+  return inner;
+}
+
+class Host {
+  method_without_this(value) {
+    return value;
+  }
+
+  method_with_this() {
+    return this.value;
+  }
+}
+"#;
+    let project = InlineTestProject::new()
+        .file("receivers/usage.js", SOURCE)
+        .file("receivers/usage.ts", SOURCE)
+        .build();
+    let analyzer = project.workspace_analyzer(AnalyzerConfig::default());
+
+    for path in ["receivers/usage.js", "receivers/usage.ts"] {
+        let graph = SemanticGraph::materialize(&project, &analyzer, path);
+        // The smallest matching procedure is the innermost declaration, so a
+        // fragment inside a nested function selects that function.
+        let procedure = |fragment: &str| {
+            graph
+                .artifact()
+                .procedures()
+                .iter()
+                .filter(|procedure| procedure_source(procedure, SOURCE).contains(fragment))
+                .min_by_key(|procedure| procedure_source(procedure, SOURCE).len())
+                .unwrap_or_else(|| panic!("{path} missing procedure for {fragment:?}"))
+        };
+        let owns_receiver = |procedure: &ProcedureSemantics| {
+            procedure
+                .values()
+                .iter()
+                .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
+        };
+
+        // A dead `this` publishes no receiver formal, so a receiverless call
+        // binds completely (#1987).
+        assert!(!owns_receiver(procedure("function no_receiver")));
+        assert!(!owns_receiver(procedure("method_without_this(value)")));
+        // `this` inside a nested non-arrow function belongs to that function.
+        let outer = procedure("function nested_function_owns_its_own");
+        assert!(!owns_receiver(outer));
+        assert!(owns_receiver(procedure("function inner")));
+
+        assert!(owns_receiver(procedure("function direct_receiver")));
+        assert!(owns_receiver(procedure("method_with_this()")));
+        // The arrow captures the receiver, so the owner publishes it.
+        let arrow_owner = procedure("function arrow_receiver");
+        assert!(owns_receiver(arrow_owner));
+        assert!(!arrow_owner.captures().is_empty());
+    }
+}
+
+#[test]
 fn javascript_typescript_class_initializers_own_receivers() {
     const SOURCE: &str = r#"
 class Host {
@@ -3166,7 +3254,7 @@ class Host {
             procedure
                 .values()
                 .iter()
-                .find(|value| value.kind == SemanticValueKind::Receiver)
+                .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
                 .map(|value| value.id)
                 .unwrap_or_else(|| {
                     panic!(
@@ -3298,7 +3386,7 @@ class Host {
         let outer_receiver = outer
             .values()
             .iter()
-            .find(|value| value.kind == SemanticValueKind::Receiver)
+            .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
             .expect("outer instance method receiver");
         let outer_receiver_flows = outer
             .points()
@@ -3446,7 +3534,7 @@ class Boundary {
                 && procedure
                     .values()
                     .iter()
-                    .any(|value| value.kind == SemanticValueKind::Receiver)
+                    .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         }),
         "the anonymous Java field initializer must own its receiver"
     );

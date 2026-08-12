@@ -978,6 +978,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
                         dispatch: DispatchBoundary {
                             kind: boundary_kind,
                             exact_external_target: None,
+                            unmaterialized_external_target: None,
                             proof: candidate.proof,
                             completeness,
                             provenance,
@@ -4114,6 +4115,7 @@ void raii_caller() {
             dispatch: DispatchBoundary {
                 kind: DispatchBoundaryKind::Unresolved,
                 exact_external_target: None,
+                unmaterialized_external_target: None,
                 proof: ProofStatus::Unproven("fabricated foreign-origin boundary".into()),
                 completeness: EvidenceCompleteness::Partial(
                     "fabricated foreign-origin boundary".into(),

@@ -771,7 +771,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let receiver = self.session.add_value_with_metadata(
                 builder,
                 metadata,
-                SemanticValueKind::Receiver,
+                SemanticValueKind::Receiver { dispatch: true },
             )?;
             self.receiver = Some(receiver);
             self.parameters.insert("this".into(), receiver);
@@ -3076,7 +3076,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             node.kind(),
             "member_call_expression" | "nullsafe_member_call_expression"
         )
-        .then(|| self.value(builder, boundary, SemanticValueKind::Receiver))
+        .then(|| {
+            self.value(
+                builder,
+                boundary,
+                SemanticValueKind::Receiver { dispatch: true },
+            )
+        })
         .transpose()?;
         let kind = match node.kind() {
             "member_call_expression" | "nullsafe_member_call_expression" => {

@@ -97,7 +97,7 @@ class Sample {
     let formal_receiver = instance
         .values()
         .iter()
-        .find(|value| value.kind == SemanticValueKind::Receiver)
+        .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         .expect("PHP instance method receiver");
     let input = instance
         .values()
@@ -239,7 +239,7 @@ class Sample {
         factory
             .values()
             .iter()
-            .all(|value| value.kind != SemanticValueKind::Receiver),
+            .all(|value| !matches!(value.kind, SemanticValueKind::Receiver { .. })),
         "static PHP methods must not publish a current receiver"
     );
     assert!(

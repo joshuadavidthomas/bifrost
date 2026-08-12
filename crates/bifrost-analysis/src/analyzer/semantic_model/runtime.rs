@@ -16,6 +16,7 @@ use super::{
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::is_lower_sha256;
 use crate::analyzer::complete_value_cache::{CompleteValueAcquisition, CompleteValueCache};
+use crate::analyzer::semantic::split_qualified_member;
 use crate::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
 };
@@ -279,6 +280,22 @@ impl ResolvedActiveSemanticModels {
         resolve_procedure_posting(&self.shards, posting)
     }
 
+    /// Select an activated summary for an unmaterialized external callee by its
+    /// canonical identity (#1978).
+    pub fn procedure_summaries_for_member(
+        &self,
+        target: ProcedureSummaryMemberKey<'_>,
+    ) -> ProcedureSummaryMatch<'_> {
+        let posting = self
+            .indexes
+            .procedure_summaries_by_member
+            .get(target.language)
+            .and_then(|owners| owners.get(target.owner))
+            .and_then(|members| members.get(target.member))
+            .and_then(|shapes| shapes.get(&(target.has_receiver, target.parameter_count)));
+        resolve_procedure_posting(&self.shards, posting)
+    }
+
     fn type_match(&self, posting: Option<&Vec<RecordAddress>>) -> SemanticModelMatch<'_, TypeFact> {
         resolve_posting(&self.shards, posting, |shard, record| {
             shard
@@ -373,6 +390,39 @@ impl<'a> ProcedureSummaryTargetKey<'a> {
     }
 }
 
+/// Canonical-identity lookup key for a fully-qualified external callee that never
+/// materializes to an artifact (#1978). It selects an activated summary by owner
+/// FQN and member name rather than by artifact path and parameter-typed symbol,
+/// which an unmaterialized callee cannot present. `parameter_count` is the arity;
+/// same-arity overloads that differ only by parameter type are indistinguishable
+/// here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcedureSummaryMemberKey<'a> {
+    pub language: &'a str,
+    pub owner: &'a str,
+    pub member: &'a str,
+    pub has_receiver: bool,
+    pub parameter_count: u32,
+}
+
+impl<'a> ProcedureSummaryMemberKey<'a> {
+    pub fn new(
+        language: &'a str,
+        owner: &'a str,
+        member: &'a str,
+        has_receiver: bool,
+        parameter_count: u32,
+    ) -> Self {
+        Self {
+            language,
+            owner,
+            member,
+            has_receiver,
+            parameter_count,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ActivatedProcedureSummary<'a> {
     pub record: &'a CompiledProcedureSummary,
@@ -430,6 +480,12 @@ struct MatcherIndexes {
     rules_by_owner: HashMap<String, Vec<RecordAddress>>,
     rules_by_call: HashMap<String, HashMap<String, Vec<RecordAddress>>>,
     procedure_summaries_by_target: ProcedureSummaryTargetPostings,
+    /// Parallel to `procedure_summaries_by_target`, keyed by canonical identity
+    /// (language, owner FQN, member, has_receiver, parameter_count) instead of
+    /// (language, path, parameter-typed symbol). It binds an activated summary to
+    /// a fully-qualified external callee that never materializes to an artifact,
+    /// whose path and parameter types are unrecoverable (#1978).
+    procedure_summaries_by_member: ProcedureSummaryTargetPostings,
 }
 
 impl MatcherIndexes {
@@ -455,6 +511,7 @@ impl MatcherIndexes {
             rules_by_owner: map_with_capacity(active.len()),
             rules_by_call: map_with_capacity(active.len()),
             procedure_summaries_by_target: map_with_capacity(active.len()),
+            procedure_summaries_by_member: map_with_capacity(active.len()),
         };
         let mut entries = 0usize;
         let mut working_bytes = 0u64;
@@ -617,6 +674,35 @@ impl MatcherIndexes {
                         &mut working_bytes,
                         limits,
                     )?;
+                    // #1978: also index by canonical identity so an unmaterialized
+                    // external callee -- which cannot present the authored path or
+                    // parameter-typed symbol -- can still find this summary.
+                    if let Some((owner, member)) = split_qualified_member(&summary.target.symbol) {
+                        let member_key_bytes = selection
+                            .active
+                            .manifest
+                            .language
+                            .len()
+                            .saturating_add(owner.len())
+                            .saturating_add(member.len())
+                            .saturating_add(size_of::<bool>())
+                            .saturating_add(size_of::<u32>());
+                        let owners = indexes
+                            .procedure_summaries_by_member
+                            .entry(selection.active.manifest.language.clone())
+                            .or_default();
+                        let members = owners.entry(owner.to_owned()).or_default();
+                        let shapes = members.entry(member.to_owned()).or_default();
+                        insert_posting(
+                            shapes,
+                            (summary.target.has_receiver, summary.target.parameter_count),
+                            member_key_bytes,
+                            address,
+                            &mut entries,
+                            &mut working_bytes,
+                            limits,
+                        )?;
+                    }
                 }
             }
         }

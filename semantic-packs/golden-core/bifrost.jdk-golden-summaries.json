@@ -1251,7 +1251,7 @@
             "target": {
               "path": "java.base/java/net/URLDecoder.java",
               "symbol": "java.net.URLDecoder.decode(java.lang.String,java.lang.String)",
-              "has_receiver": false,
+              "has_receiver": true,
               "parameter_count": 2
             },
             "completeness": "complete",
