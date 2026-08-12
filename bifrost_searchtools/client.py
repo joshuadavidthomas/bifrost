@@ -230,8 +230,11 @@ class SearchToolsClient:
         source pairs with the ``segments_of`` and ``segment_target`` steps
         over qualified-path rows. The ``generation_sites`` and ``exports``
         sources pair with the ``generates``, ``generated_by``,
-        ``declaration_state_of``, ``implementation_of``, and ``export_target``
-        steps over recorded declaration-materialization provenance.
+        ``declaration_state_of``, ``implementation_of``, ``stubs_of``, and
+        ``export_target`` steps over recorded declaration-materialization
+        provenance; ``stubs_of`` is the inverse of ``implementation_of``, so
+        composed with ``except_`` it lists the declaration-only stubs no
+        implementation answers.
         The canonical reference-edge domain provides
         ``edges_of``, ``edges_from``, and ``edge_target`` over
         canonical ``CodeQueryReferenceEdge`` rows. ``edges_of`` is the inverse

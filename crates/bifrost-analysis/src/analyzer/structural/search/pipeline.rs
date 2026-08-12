@@ -2256,6 +2256,39 @@ pub(super) fn apply_pipeline_step(
                     .map(|found| pipeline_expansion(PipelineValue::Declaration(found)))
                     .collect()
             }
+            (PipelineValue::Declaration(declaration), QueryStep::StubsOf) => {
+                // The inverse of `implementation-of` (#1660): the linkage is
+                // derived per file, and a stub links only within its own file,
+                // so the implementation's file holds every link that answers.
+                let file = declaration.unit.source().clone();
+                let result = materialization_cache.materialization_for(analyzer, &file);
+                materialization_cache.report_completeness(
+                    &file,
+                    &result,
+                    materialization::IMPLEMENTATION_QUERY_AXES,
+                    diagnostics,
+                );
+                result
+                    .links
+                    .iter()
+                    .filter(|link| link.implementation.as_ref() == Some(&declaration.unit))
+                    .filter_map(|link| {
+                        result
+                            .states
+                            .iter()
+                            .position(|state| state.unit == link.stub)
+                    })
+                    .map(|index| {
+                        pipeline_expansion(PipelineValue::DeclarationState(
+                            materialization::DeclarationStateValue {
+                                file: file.clone(),
+                                result: Arc::clone(&result),
+                                index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
             (PipelineValue::Export(value), QueryStep::ExportTarget) => {
                 let indexed = indexed_declarations
                     .as_deref_mut()

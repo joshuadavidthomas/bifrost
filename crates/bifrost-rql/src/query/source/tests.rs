@@ -934,6 +934,28 @@ fn materialization_filter_help_and_value_diagnostics_are_range_precise() {
         validate_query_source(exports)
     );
 
+    // The inverse linkage step (#1660) validates and hovers in both
+    // spellings, exactly like its forward sibling.
+    let stubs = "(stubs-of (enclosing-decl (function)))";
+    for token in ["stubs-of", "enclosing-decl"] {
+        let offset = stubs.find(token).unwrap();
+        let help = query_source_help_at(stubs, offset)
+            .unwrap_or_else(|| panic!("no materialization help for {token}"));
+        assert_eq!(&stubs[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(
+        validate_query_source(stubs).is_empty(),
+        "{stubs}: {:#?}",
+        validate_query_source(stubs)
+    );
+    let underscored = "(stubs_of (enclosing-decl (function)))";
+    assert!(
+        validate_query_source(underscored).is_empty(),
+        "{underscored}: {:#?}",
+        validate_query_source(underscored)
+    );
+
     for (source, token, code) in [
         (
             "(generation-sites :kind accessor_macroo)",
