@@ -3920,6 +3920,263 @@ fn rootless_mcp_binds_through_mrtr_roots_on_2026_07_28() {
     assert!(child.wait().expect("wait bifrost").success());
 }
 
+/// The per-request negotiation keys a stateless `2026-07-28` request carries
+/// in its `_meta` in place of a connection-level `initialize`.
+fn stateless_2026_meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
+
+fn stateless_search_symbols_call(id: i64, pattern: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "search_symbols",
+            "arguments": { "patterns": [pattern] },
+            "_meta": stateless_2026_meta()
+        }
+    })
+}
+
+/// Issue #2007: the `2026-07-28` lifecycle is stateless. A rootless client
+/// that never sends `initialize` discovers the server, is asked for its roots
+/// through MRTR on its first workspace tool call, and executes the retried
+/// call -- every request negotiated independently through its own `_meta`.
+#[test]
+fn rootless_mcp_executes_stateless_2026_07_28_calls_without_initialize() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    fs::write(
+        plugin_dir.path().join("PluginOnly.java"),
+        "class PluginOnly {}\n",
+    )
+    .expect("write plugin fixture");
+    let workspace = InlineTestProject::new()
+        .file("StatelessWorkspace.java", "class StatelessWorkspace {}\n")
+        .build();
+
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    // Discovery opens the session; there is no initialize and no
+    // notifications/initialized anywhere in this exchange.
+    let discover = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": { "_meta": stateless_2026_meta() }
+        }),
+    );
+    assert!(
+        discover["result"]["supportedVersions"]
+            .as_array()
+            .is_some_and(|versions| versions.iter().any(|version| version == "2026-07-28")),
+        "{discover}"
+    );
+
+    let search = stateless_search_symbols_call(2, "StatelessWorkspace");
+    let input_required = round_trip(&mut stdin, &mut reader, &mut stderr, search.clone());
+    assert_eq!(
+        input_required["result"]["resultType"], "input_required",
+        "an unbound stateless call must be answered with an MRTR roots activation: {input_required}"
+    );
+    assert_eq!(
+        input_required["result"]["inputRequests"]["roots"]["method"], "roots/list",
+        "{input_required}"
+    );
+    let request_state = input_required["result"]["requestState"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an activation must carry a requestState: {input_required}"));
+
+    let workspace_uri = url::Url::from_directory_path(workspace.root())
+        .expect("workspace file URI")
+        .to_string();
+    let mut retry = stateless_search_symbols_call(3, "StatelessWorkspace");
+    retry["params"]["requestState"] = json!(request_state);
+    retry["params"]["inputResponses"] = json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
+    let bound = round_trip(&mut stdin, &mut reader, &mut stderr, retry);
+    assert_eq!(
+        bound["result"]["resultType"], "complete",
+        "the retry must bind the validated root and execute: {bound}"
+    );
+    assert_eq!(bound["result"]["isError"], false, "{bound}");
+    assert!(bound.to_string().contains("StatelessWorkspace"), "{bound}");
+    assert!(!bound.to_string().contains("PluginOnly"), "{bound}");
+
+    // A later call on the bound workspace needs no further activation, and
+    // still carries its own negotiation keys like every stateless request.
+    let followup = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        stateless_search_symbols_call(4, "StatelessWorkspace"),
+    );
+    assert_eq!(followup["result"]["resultType"], "complete", "{followup}");
+    assert_eq!(followup["result"]["isError"], false, "{followup}");
+
+    assert!(
+        !plugin_dir
+            .path()
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
+            .exists(),
+        "stateless activation must not analyze the process working directory"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2007 negative coverage: every stateless request is validated on its
+/// own, and nothing short of a Bifrost-issued activation binds a workspace.
+#[test]
+fn stateless_2026_07_28_requests_are_independently_validated() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    let workspace = InlineTestProject::new()
+        .file("Validated.java", "class Validated {}\n")
+        .build();
+    let workspace_uri = url::Url::from_directory_path(workspace.root())
+        .expect("workspace file URI")
+        .to_string();
+
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+
+    round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": { "_meta": stateless_2026_meta() }
+        }),
+    );
+
+    // Required request metadata is per request: declaring the version without
+    // the capabilities key is refused at dispatch, before any tool runs.
+    let mut missing_capabilities = stateless_search_symbols_call(2, "Validated");
+    missing_capabilities["params"]["_meta"] =
+        json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28" });
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, missing_capabilities);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("required fields")),
+        "a stateless request missing required metadata must be refused: {refused}"
+    );
+
+    // So is omitting `_meta` entirely on a session that opened statelessly.
+    let mut no_meta = stateless_search_symbols_call(3, "Validated");
+    no_meta["params"]
+        .as_object_mut()
+        .expect("params object")
+        .remove("_meta");
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, no_meta);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("required fields")),
+        "a stateless request without _meta must be refused: {refused}"
+    );
+
+    // An unknown protocol version is refused per request as well.
+    let mut unknown_version = stateless_search_symbols_call(4, "Validated");
+    unknown_version["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+        json!("2099-01-01");
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, unknown_version);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Unsupported protocol version")),
+        "an unknown protocol version must be refused: {refused}"
+    );
+
+    // A requestState Bifrost never issued must not bind, however well-formed
+    // the roots beside it are.
+    let mut tampered = stateless_search_symbols_call(5, "Validated");
+    tampered["params"]["requestState"] = json!("bifrost-roots-0-0");
+    tampered["params"]["inputResponses"] =
+        json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, tampered);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "an unsolicited requestState must not bind a workspace: {refused}"
+    );
+
+    // A genuine activation answered with unusable roots binds nothing, and
+    // only one round is offered: the retry gets the plain unbound error.
+    let activation = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        stateless_search_symbols_call(6, "Validated"),
+    );
+    assert_eq!(
+        activation["result"]["resultType"], "input_required",
+        "{activation}"
+    );
+    let request_state = activation["result"]["requestState"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an activation must carry a requestState: {activation}"));
+    let missing_dir_uri = url::Url::from_directory_path(workspace.root().join("no-such-dir"))
+        .expect("missing dir URI")
+        .to_string();
+    let mut unusable = stateless_search_symbols_call(7, "Validated");
+    unusable["params"]["requestState"] = json!(request_state);
+    unusable["params"]["inputResponses"] = json!({ "roots": { "roots": [
+        { "uri": "https://example.com/not-a-file-root" },
+        { "uri": missing_dir_uri }
+    ] } });
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, unusable);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "unusable roots must leave the server unbound: {refused}"
+    );
+
+    // The spent requestState is single use: replaying it with usable roots is
+    // no longer an activation.
+    let mut replay = stateless_search_symbols_call(8, "Validated");
+    replay["params"]["requestState"] = json!(request_state);
+    replay["params"]["inputResponses"] =
+        json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
+    let refused = round_trip(&mut stdin, &mut reader, &mut stderr, replay);
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("not bound to a workspace")),
+        "a replayed requestState must not bind a workspace: {refused}"
+    );
+
+    assert!(
+        !workspace
+            .root()
+            .join(".bifrost/cache")
+            .join(brokk_bifrost_analysis::cache_db::cache_db_file_name())
+            .exists(),
+        "no refused request may have analyzed the workspace"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
 fn assert_codex_metadata_cannot_bind_before_initialize(
     cwd: &std::path::Path,
     sandbox_root: &std::path::Path,
