@@ -5,6 +5,7 @@ use crate::analyzer::Language;
 mod client;
 mod model;
 mod plan;
+mod provider;
 mod result;
 
 /// Languages whose production semantic adapters have source-backed parity
@@ -40,6 +41,7 @@ pub use plan::{
     ValueFlowCuratedCallModel, ValueFlowIncompleteCause, ValueFlowInput, ValueFlowPlan,
     ValueFlowPlanError, ValueFlowPlanLimits, ValueFlowSummaryLocationBinding,
 };
+pub use provider::{ValueFlowCache, ValueFlowProvider, WorkspaceValueFlowProvider};
 pub use result::{
     ValueFlowMayStatus, ValueFlowMeeting, ValueFlowMustStatus, ValueFlowSinkOutcome,
     ValueFlowSummaryResult,
