@@ -5200,12 +5200,29 @@ fn class_has_displaced_preprocessor_terminator(class_node: Node<'_>) -> bool {
 pub fn cpp_displaced_preprocessor_terminator<'tree>(
     conditional: Node<'tree>,
 ) -> Option<Node<'tree>> {
+    if !conditional.has_error() {
+        return None;
+    }
+    let has_concrete_direct_terminator = conditional
+        .child_count()
+        .checked_sub(1)
+        .and_then(|index| conditional.child(index))
+        .is_some_and(|child| child.kind() == "#endif" && !child.is_missing());
+    if has_concrete_direct_terminator && conditional.child_by_field_name("alternative").is_some() {
+        // A structured alternative proves that the direct `#endif` closes
+        // this family. An error-owned terminator inside either branch belongs
+        // to a damaged nested conditional, not to this one.
+        return None;
+    }
     let mut displaced = None;
     let mut stack = (0..conditional.child_count())
         .filter_map(|index| conditional.child(index))
         .map(|child| (child, false))
         .collect::<Vec<_>>();
     while let Some((node, inside_error)) = stack.pop() {
+        if !inside_error && node.kind() != "ERROR" && !node.has_error() {
+            continue;
+        }
         if node.kind() == "#endif" && !node.is_missing() && inside_error {
             if displaced.is_none_or(|current: Node<'_>| node.end_byte() > current.end_byte()) {
                 displaced = Some(node);

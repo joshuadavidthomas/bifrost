@@ -10887,6 +10887,25 @@ mod tests {
             conditional,
             declaration
         ));
+
+        let damaged_alternative = format!(
+            "#ifndef NO_FEATURE\nvoid enabled(void) {{}}\n#else\nvoid disabled(void) {{\n{}\n}}\n#endif\n",
+            "UNUSED(value)\n".repeat(64)
+        );
+        let tree = parse(&damaged_alternative);
+        let conditional = tree
+            .root_node()
+            .named_child(0)
+            .filter(|node| node.kind() == "preproc_ifdef")
+            .expect("outer conditional with an alternative");
+        assert!(conditional.has_error());
+        assert!(conditional.child_by_field_name("alternative").is_some());
+        assert!(
+            conditional
+                .child(conditional.child_count() - 1)
+                .is_some_and(|child| child.kind() == "#endif" && !child.is_missing())
+        );
+        assert!(cpp_displaced_preprocessor_terminator(conditional).is_none());
     }
 
     fn first_enum_flattened_namespace(source: &str) -> Option<Vec<String>> {
