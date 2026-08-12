@@ -427,15 +427,14 @@ mod tests {
         let declarations = extract(
             "class Outer { class Hidden {}; public: struct Visible {}; protected: class Guarded {}; };",
         );
-
         assert!(declarations.types.iter().any(|record| {
-            record.name == "Outer.Hidden" && record.visibility == CppExternalVisibility::Private
+            record.name == "Outer$Hidden" && record.visibility == CppExternalVisibility::Private
         }));
         assert!(declarations.types.iter().any(|record| {
-            record.name == "Outer.Visible" && record.visibility == CppExternalVisibility::Public
+            record.name == "Outer$Visible" && record.visibility == CppExternalVisibility::Public
         }));
         assert!(declarations.types.iter().any(|record| {
-            record.name == "Outer.Guarded" && record.visibility == CppExternalVisibility::Protected
+            record.name == "Outer$Guarded" && record.visibility == CppExternalVisibility::Protected
         }));
     }
 

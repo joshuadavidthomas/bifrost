@@ -41,9 +41,9 @@ use crate::graph::resolver::{
     VisibilityIndex, VisibleMemberResolution, canonical_cpp_scope_components,
     constructor_style_local_declaration, cpp_callable_arity, cpp_template_reference_arguments,
     cpp_type_name_components, declarator_name_node, designated_initializer_owner,
-    extract_variable_name, first_type_child, function_terminal_node, infer_cpp_initializer_binding,
-    infer_cpp_initializer_type, is_declaration_name, is_declarator_node,
-    is_globally_qualified_cpp_name, is_nested_type_node, normalize_type_text,
+    extract_variable_name, first_type_child, function_terminal_node, has_ancestor_kind,
+    infer_cpp_initializer_binding, infer_cpp_initializer_type, is_declaration_name,
+    is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node, normalize_type_text,
     out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
     parameter_belongs_to_callable_scope, qualified_owner_components,
     recovered_macro_decorated_type_node, resolve_declaring_member_owner, same_logical_symbol,
@@ -236,6 +236,29 @@ fn record_reference(
             LexicalTypeResolution::Ambiguous | LexicalTypeResolution::Missing => {
                 ctx.record_unproven(node_text(type_node, ctx.source), type_node);
             }
+        }
+        return;
+    }
+    if has_ancestor_kind(node, "using_declaration") {
+        return;
+    }
+    if matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+        && is_declaration_name(node)
+        && let Some(owners) = out_of_line_member_definition_owner(
+            &ctx.analyzer,
+            ctx.visibility,
+            ctx.file,
+            ctx.source,
+            node,
+        )
+    {
+        let terminal_destructor = out_of_line_destructor_type_reference(node);
+        let innermost = owners.innermost().map(|(_, owner)| owner.clone());
+        for (owner_node, owner) in owners.owners {
+            ctx.record(owner.fq_name(), owner_node);
+        }
+        if let (Some(terminal), Some(owner)) = (terminal_destructor, innermost) {
+            ctx.record(owner.fq_name(), terminal);
         }
         return;
     }
