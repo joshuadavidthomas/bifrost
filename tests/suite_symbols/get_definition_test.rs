@@ -3904,6 +3904,28 @@ fn csharp_nested_sibling_type_resolves_from_property_type_position() {
     );
 }
 
+#[test]
+fn csharp_nested_type_precedes_same_named_namespace_type() {
+    let source = "namespace N { class Result {} class Outer<T> { public class Result {} private class Inner { public Result Value => null!; } } }";
+    let project = InlineTestProject::with_language(Language::CSharp)
+        .file("CollectionTally.cs", source)
+        .build();
+    let reference = source
+        .find("Result Value")
+        .expect("nested result type reference");
+    let value = lookup(
+        project.root(),
+        &location_reference("CollectionTally.cs", source, reference),
+    );
+
+    let result = &value["results"][0];
+    assert_eq!(result["status"], "resolved", "{value}");
+    assert_eq!(
+        result["definitions"][0]["fqn"], "N.Outer`1$Result",
+        "{value}"
+    );
+}
+
 // #1802 (naps2 `XmlSerializer.cs`): C# simple-name lookup continues into every
 // ENCLOSING type declaration after the innermost type and its base chain are
 // exhausted. The nested caller's own base chain is empty here, so only the
