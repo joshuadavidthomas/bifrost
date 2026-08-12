@@ -458,8 +458,7 @@ pub fn reachable_bloom(repo: &Repository) -> Result<GrowableBloom> {
         "--all".to_string(),
     ];
     args.extend(worktree_heads(repo)?);
-    let mut child = Command::new("git")
-        .current_dir(workdir)
+    let mut child = background_git(workdir)
         .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -519,8 +518,7 @@ pub fn worktree_roots(repo: &Repository) -> Result<Vec<PathBuf>> {
 
 fn worktree_porcelain(repo: &Repository) -> Result<String> {
     let workdir = workdir(repo)?;
-    let output = Command::new("git")
-        .current_dir(workdir)
+    let output = background_git(workdir)
         .args(["worktree", "list", "--porcelain"])
         .output()
         .map_err(|e| format!("git worktree list failed to spawn: {e}"))?;
@@ -590,6 +588,23 @@ pub fn existing_working_tree_oids(root: &Path) -> Result<HashSet<String>> {
 fn workdir(repo: &Repository) -> Result<&Path> {
     repo.workdir()
         .ok_or_else(|| "repository has no working directory".to_string())
+}
+
+/// A git subprocess in `workdir` that takes no optional locks.
+///
+/// Bifrost is a background analyzer of someone else's repository. A plain
+/// `git status` opportunistically takes `.git/index.lock` to write a
+/// refreshed index stat cache, and that lock races the user's own git
+/// commands: their `git commit` (or a test harness's libgit2 index write)
+/// fails with "the index is locked" for work Bifrost was doing behind their
+/// back. `GIT_OPTIONAL_LOCKS=0` is git's documented contract for exactly
+/// this kind of tooling -- the command completes without performing any
+/// optional sub-operation that requires a lock. Every git spawn goes through
+/// here so no future call site can reintroduce the race.
+fn background_git(workdir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.current_dir(workdir).env("GIT_OPTIONAL_LOCKS", "0");
+    command
 }
 
 fn resolve_path_oid(workdir: &Path, index: &git2::Index, rel: &str) -> Result<Oid> {
@@ -671,8 +686,7 @@ fn dirty_worktree_paths(repo: &Repository) -> Result<HashSet<String>> {
     // one entry at a time. Native Git uses its optimized index and filesystem
     // checks for the same dirty overlay. This matters for repositories such as
     // Firefox, where the libgit2 scan exceeded the MCP request budget.
-    let output = Command::new("git")
-        .current_dir(workdir)
+    let output = background_git(workdir)
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output()
         .map_err(|error| format!("git status failed to spawn: {error}"))?;
