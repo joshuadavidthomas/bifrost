@@ -118,19 +118,28 @@ pub(crate) fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> b
 /// of this shape is answered by a complete resolution of its call and must
 /// not independently open the selected path. `Unsupported`, `Ambiguous`, and
 /// `ExceededBudget` gaps are never of this shape.
+///
+/// A gap that declares `SemanticGapDischarge::CallResolution` is dischargeable
+/// by the same rule regardless of its capability (#1989): the adapter states
+/// that a complete resolution and binding of its call answers the question --
+/// for example Scala argument-evaluation strictness, where a deferring callee
+/// carries its own procedure-level gap that keeps every binding to it open.
 pub(crate) fn call_target_refinement_call(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     gap: &crate::analyzer::semantic::SemanticGap,
 ) -> Option<crate::analyzer::semantic::CallSiteId> {
-    if !matches!(
+    let refinement_shape = matches!(
         gap.kind,
         SemanticGapKind::Unknown | SemanticGapKind::Unproven
-    ) || !matches!(
+    ) && matches!(
         gap.capability,
         SemanticCapability::Calls
             | SemanticCapability::CallableReferences
             | SemanticCapability::DynamicDispatch
-    ) {
+    );
+    if !refinement_shape
+        && gap.discharge != crate::analyzer::semantic::SemanticGapDischarge::CallResolution
+    {
         return None;
     }
     match gap.subject {

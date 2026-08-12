@@ -686,7 +686,12 @@ fn lower_procedure<'tree>(
                     target: value,
                 },
             )?;
-        } else if result.is_some() {
+        } else if result.is_some()
+            && !callable_declares_unit_result(spec.callable, context.prepared.source())
+        {
+            // A declared `Unit` result is a value discard: the body value is
+            // dropped, no conversion applies, and the return carries nothing,
+            // so omitting both the flow and the gap is the proven lowering.
             context.session.add_gap_with_impacts(
                 &mut builder,
                 entry,
@@ -2418,11 +2423,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         if !argument_nodes.is_empty() {
-            let detail = if has_structured_argument {
-                "trailing block, case, or colon syntax does not prove by-name evaluation; execution is withheld until parameter strictness is resolved"
-            } else {
-                "argument evaluation strictness depends on the resolved Scala parameter signature"
-            };
             if has_structured_argument {
                 self.session.add_gap_with_impacts(
                     builder,
@@ -2431,16 +2431,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     SemanticCapability::DeferredExecution,
                     SemanticGapImpacts::CALL_EVALUATION,
                     SemanticGapKind::Unknown,
-                    detail,
+                    "trailing block, case, or colon syntax does not prove by-name evaluation; execution is withheld until parameter strictness is resolved",
                 )?;
             } else {
-                self.add_gap(
+                // Ordinary arguments are lowered strictly: every expression
+                // is scheduled before the invoke. The resolved signature
+                // answers whether that is right, so the gap declares a
+                // call-resolution discharge; a callee that defers evaluation
+                // (a by-name parameter) carries its own procedure-level gap,
+                // which keeps every binding to it open and the discharge
+                // unearned.
+                self.session.add_gap_with_impacts_and_discharge(
                     builder,
                     invoke,
                     SemanticGapSubject::CallSite(call_site),
                     SemanticCapability::DeferredExecution,
+                    SemanticGapImpacts::NONE,
                     SemanticGapKind::Unknown,
-                    detail,
+                    SemanticGapDischarge::CallResolution,
+                    "argument evaluation strictness depends on the resolved Scala parameter signature",
                 )?;
             }
         }
@@ -2727,12 +2736,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         if !argument_nodes.is_empty() {
-            self.add_gap(
+            // Strict operator/postfix argument evaluation with the same
+            // call-resolution discharge as in `call_expression`.
+            self.session.add_gap_with_impacts_and_discharge(
                 builder,
                 invoke,
                 SemanticGapSubject::CallSite(call_site),
                 SemanticCapability::DeferredExecution,
+                SemanticGapImpacts::NONE,
                 SemanticGapKind::Unknown,
+                SemanticGapDischarge::CallResolution,
                 "argument evaluation strictness depends on the resolved Scala parameter signature",
             )?;
         }
@@ -3448,6 +3461,24 @@ fn identifier_has_auto_application_ambiguity(node: Node<'_>) -> bool {
                 | "type_arguments"
         )
     })
+}
+
+/// Whether the callable declares a `Unit` (or `scala.Unit`) result type.
+/// Adaptation to `Unit` is a value discard, never an implicit conversion.
+fn callable_declares_unit_result(callable: Node<'_>, source: &str) -> bool {
+    callable
+        .child_by_field_name("return_type")
+        .is_some_and(|declared| {
+            let segments = super::scala_type_lookup_segments(declared, source);
+            matches!(
+                segments
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["Unit"] | ["scala", "Unit"]
+            )
+        })
 }
 
 fn callable_has_by_name_parameter(callable: Node<'_>) -> bool {
