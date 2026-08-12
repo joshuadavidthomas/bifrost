@@ -9,9 +9,9 @@
 //! typed results for rows the adapter cannot represent.
 //!
 //! Ruby value-position bare calls (`dfb_sink(dfb_source)` and
-//! `value = dfb_source`) produce no structural call row today, so a call
-//! selector cannot find them; #1956 owns that selection gap. The tests here
-//! pin the current honest zero-selection outcome for those forms.
+//! `value = dfb_source`) produce structural call rows since #1956, gated by
+//! the same local-binding timeline the semantic lowering uses, so a call
+//! selector selects them and binding lands on their exact semantic calls.
 
 use crate::common::InlineTestProject;
 use brokk_bifrost::AnalyzerConfig;
@@ -344,14 +344,12 @@ end
     assert_capability_incomplete(&outcome, "does not identify a semantic call site");
 }
 
-/// Ruby bare calls in value positions produce no structural call row yet
-/// (#1956), so the source selection is honestly empty and the run compiles
-/// clean without a propagation solve. This pins the current boundary; when
-/// #1956 lands, these forms must move to the exact-binding positives above.
+/// A bare source call in argument position (#1956) produces a structural
+/// call row, binds to its exact semantic call — the anchor is the bare
+/// identifier itself — and the production policy retains the finding.
 #[test]
-fn value_position_bare_calls_are_not_selectable_yet() {
-    for source in [
-        r#"
+fn value_position_bare_call_in_argument_position_produces_the_finding() {
+    let source = r#"
 def dfb_source
   "tainted"
 end
@@ -362,38 +360,57 @@ end
 def run
   dfb_sink(dfb_source)
 end
-"#,
-        r#"
+"#;
+    let outcome = evaluate_ruby(
+        source,
+        &call_source_policy("test.issue-1953.value-position-argument"),
+    );
+    assert_reached_propagation(&outcome);
+    let (sources, sinks) = bound_endpoint_spans(&outcome);
+    let sink_span = span_of(source, "dfb_sink(dfb_source)");
+    let bare_source_start = sink_span.start + "dfb_sink(".len();
+    assert_eq!(
+        sources,
+        vec![bare_source_start..bare_source_start + "dfb_source".len()]
+    );
+    assert_eq!(sinks, vec![sink_span]);
+    let run = &outcome.report().runs()[0];
+    assert_eq!(run.findings().len(), 1, "{:?}", run.diagnostics());
+    assert_eq!(outcome.taint_findings().len(), 1);
+}
+
+/// A bare source call on an assignment right side (#1956) produces a
+/// structural call row and binds to its exact semantic call; the flow into
+/// the sink passes through the assigned local.
+#[test]
+fn value_position_bare_call_behind_a_local_assignment_produces_the_finding() {
+    let source = r#"
 def dfb_source
   "tainted"
 end
 
-def dfb_sink(value)
+def dfb_sink(arg)
 end
 
 def run
   value = dfb_source
   dfb_sink(value)
 end
-"#,
-    ] {
-        let outcome = evaluate_ruby(
-            source,
-            &call_source_policy("test.issue-1953.value-position"),
-        );
-        let run = &outcome.report().runs()[0];
-        assert!(
-            matches!(run.completion(), PolicyRunCompletion::Complete),
-            "completion: {:?}, diagnostics: {:?}",
-            run.completion(),
-            run.diagnostics()
-        );
-        assert!(run.findings().is_empty());
-        assert_eq!(
-            propagation_solves(&outcome),
-            None,
-            "empty source selection must not reach a solve"
-        );
-        assert!(outcome.taint_analysis_results().is_empty());
-    }
+"#;
+    let outcome = evaluate_ruby(
+        source,
+        &call_source_policy("test.issue-1953.value-position-assignment"),
+    );
+    assert_reached_propagation(&outcome);
+    let (sources, sinks) = bound_endpoint_spans(&outcome);
+    let assignment_span = span_of(source, "value = dfb_source");
+    let bare_source_start = assignment_span.start + "value = ".len();
+    assert_eq!(
+        sources,
+        vec![bare_source_start..bare_source_start + "dfb_source".len()]
+    );
+    assert_eq!(sinks, vec![span_of(source, "dfb_sink(value)")]);
+    let run = &outcome.report().runs()[0];
+    assert_eq!(run.findings().len(), 1, "{:?}", run.diagnostics());
+    assert_eq!(outcome.taint_findings().len(), 1);
 }

@@ -269,6 +269,7 @@ impl StructuralSpec for CppStructuralSpec {
         kind: NormalizedKind,
         enclosing: Option<NormalizedKind>,
         source: &str,
+        _context: &CallSiteContext,
     ) -> NormalizedKind {
         if kind == NormalizedKind::Function
             && (enclosing == Some(NormalizedKind::Class)

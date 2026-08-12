@@ -143,6 +143,7 @@ pub(crate) fn extract_file_facts_limited(
                         kind,
                         enclosing.map(|id| nodes[id as usize].kind),
                         source,
+                        &call_site_context,
                     );
                     let fact_id = nodes.len() as u32;
                     nodes.push(NormalizedNode {
