@@ -510,50 +510,36 @@ void test("requires restart only for process launch settings", () => {
   }
 });
 
-void test("detects existing bifrost gitignore entries", () => {
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost/cache\n"), true);
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry("/.bifrost/cache/\n"), true);
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost\n"), false);
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry("!/.bifrost/cache/\n"), false);
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry("# .bifrost/cache\nnode_modules\n"), false);
-  assert.equal(lifecycle.gitignoreIncludesBifrostEntry(".bifrost-cache\n"), false);
+void test("detects legacy bifrost gitignore entries", () => {
   assert.equal(lifecycle.gitignoreIncludesLegacyBifrostEntry("/.bifrost/\n"), true);
   assert.equal(lifecycle.gitignoreIncludesLegacyBifrostEntry(".bifrost/**\n"), false);
 });
 
 void test("distinguishes accepting, declining, and deferring the bifrost gitignore prompt", () => {
-  assert.equal(lifecycle.decideBifrostGitignorePrompt("Add", "Add"), "accept");
-  assert.equal(lifecycle.decideBifrostGitignorePrompt("Replace", "Replace"), "accept");
+  assert.equal(lifecycle.decideBifrostGitignorePrompt("Replace"), "accept");
   assert.equal(
-    lifecycle.decideBifrostGitignorePrompt(lifecycle.BIFROST_GITIGNORE_DONT_ASK_AGAIN, "Add"),
+    lifecycle.decideBifrostGitignorePrompt(lifecycle.BIFROST_GITIGNORE_DONT_ASK_AGAIN),
     "decline"
   );
   assert.equal(
-    lifecycle.decideBifrostGitignorePrompt(lifecycle.BIFROST_GITIGNORE_ASK_AGAIN_LATER, "Replace"),
+    lifecycle.decideBifrostGitignorePrompt(lifecycle.BIFROST_GITIGNORE_ASK_AGAIN_LATER),
     "defer"
   );
-  assert.equal(lifecycle.decideBifrostGitignorePrompt(undefined, "Add"), "defer");
+  assert.equal(lifecycle.decideBifrostGitignorePrompt(undefined), "defer");
 });
 
-void test("appends bifrost gitignore entry when missing", async () => {
+void test("does not request migration when the gitignore has no legacy entry", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const gitignorePath = path.join(temp, ".gitignore");
-  fs.writeFileSync(gitignorePath, "target");
+  fs.writeFileSync(gitignorePath, "target\n.bifrost/cache/\n");
 
-  assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), true);
-  await lifecycle.appendBifrostGitignoreEntry(temp);
-
-  assert.equal(fs.readFileSync(gitignorePath, "utf8"), "target\n.bifrost/cache/\n");
-  assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), false);
+  assert.equal(await lifecycle.workspaceGitignoreIncludesLegacyBifrostEntry(temp), false);
 });
 
-void test("creates gitignore with bifrost entry when missing", async () => {
+void test("does not request migration when gitignore is missing", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
 
-  assert.equal(await lifecycle.workspaceGitignoreNeedsBifrostEntry(temp), true);
-  await lifecycle.appendBifrostGitignoreEntry(temp);
-
-  assert.equal(fs.readFileSync(path.join(temp, ".gitignore"), "utf8"), ".bifrost/cache/\n");
+  assert.equal(await lifecycle.workspaceGitignoreIncludesLegacyBifrostEntry(temp), false);
 });
 
 void test("classifies and replaces only exact legacy bifrost ignore entries", async () => {
@@ -561,21 +547,21 @@ void test("classifies and replaces only exact legacy bifrost ignore entries", as
   const gitignorePath = path.join(temp, ".gitignore");
   fs.writeFileSync(gitignorePath, "target\r\n /.bifrost/  \r\n!.bifrost/keep\r\n.bifrost/**\r\n");
 
-  assert.equal(await lifecycle.inspectWorkspaceBifrostGitignore(temp), "legacy-whole-directory");
+  assert.equal(await lifecycle.workspaceGitignoreIncludesLegacyBifrostEntry(temp), true);
   await lifecycle.replaceLegacyBifrostGitignoreEntry(temp);
 
   assert.equal(
     fs.readFileSync(gitignorePath, "utf8"),
     "target\r\n .bifrost/cache/  \r\n!.bifrost/keep\r\n.bifrost/**\r\n"
   );
-  assert.equal(await lifecycle.inspectWorkspaceBifrostGitignore(temp), "configured");
+  assert.equal(await lifecycle.workspaceGitignoreIncludesLegacyBifrostEntry(temp), false);
 });
 
 void test("legacy bifrost ignore takes priority over a cache-only entry", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   fs.writeFileSync(path.join(temp, ".gitignore"), ".bifrost/cache/\n.bifrost/\n");
 
-  assert.equal(await lifecycle.inspectWorkspaceBifrostGitignore(temp), "legacy-whole-directory");
+  assert.equal(await lifecycle.workspaceGitignoreIncludesLegacyBifrostEntry(temp), true);
 });
 
 void test("parses bifrost --version output", () => {

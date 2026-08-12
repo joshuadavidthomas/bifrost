@@ -24,15 +24,14 @@ import {
   buildMcpHostCommands,
   decideBifrostGitignorePrompt,
   formatError,
-  appendBifrostGitignoreEntry,
-  inspectWorkspaceBifrostGitignore,
   parseExtraArgs,
   replaceLegacyBifrostGitignoreEntry,
   selectTrustedFormatterCommands,
   sourceFileWatchers,
   spawnBifrostServer,
   supportedWorkspaceRoot,
-  validateLaunchCommand
+  validateLaunchCommand,
+  workspaceGitignoreIncludesLegacyBifrostEntry
 } from "./lifecycle";
 import {
   findManagedBinary,
@@ -87,7 +86,7 @@ let rqlValidation: RqlValidationController<vscode.CancellationToken> | undefined
 let lastLaunchConfig: BifrostLaunchConfig | undefined;
 let startInFlight: Promise<void> | undefined;
 let extensionActive = false;
-const BIFROST_GITIGNORE_DECLINED_KEY_PREFIX = "bifrost.gitignoreCachePromptDeclined:";
+const BIFROST_GITIGNORE_DECLINED_KEY_PREFIX = "bifrost.legacyGitignoreMigrationDeclined:";
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionActive = true;
@@ -470,7 +469,7 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
     log("No workspace folder is open; Bifrost language server was not started.");
     return;
   }
-  void promptAppendBifrostGitignore(context, root);
+  void promptReplaceLegacyBifrostGitignore(context, root);
 
   const config = vscode.workspace.getConfiguration("bifrost");
   const command = config.get<string>("serverPath") || "bifrost";
@@ -762,7 +761,7 @@ async function promptRestartAfterConfigurationChange(
   }
 }
 
-async function promptAppendBifrostGitignore(
+async function promptReplaceLegacyBifrostGitignore(
   context: vscode.ExtensionContext,
   workspaceRoot: string
 ): Promise<void> {
@@ -771,54 +770,40 @@ async function promptAppendBifrostGitignore(
     return;
   }
 
-  let state: Awaited<ReturnType<typeof inspectWorkspaceBifrostGitignore>>;
+  let hasLegacyEntry: boolean;
   try {
-    state = await inspectWorkspaceBifrostGitignore(workspaceRoot);
+    hasLegacyEntry = await workspaceGitignoreIncludesLegacyBifrostEntry(workspaceRoot);
   } catch (error) {
-    log(`Failed to inspect .gitignore for Bifrost cache entry: ${formatError(error)}`);
+    log(`Failed to inspect .gitignore for legacy Bifrost entry: ${formatError(error)}`);
     return;
   }
 
-  if (state === "configured") {
+  if (!hasLegacyEntry) {
     await context.workspaceState.update(declinedKey, undefined);
     return;
   }
 
-  const legacy = state === "legacy-whole-directory";
-  const acceptedChoice = legacy ? "Replace" : "Add";
   const choice = await vscode.window.showInformationMessage(
-    legacy
-      ? "Bifrost now tracks project configuration in .bifrost. Replace the legacy .bifrost ignore rule with .bifrost/cache/?"
-      : "Bifrost stores generated workspace state in .bifrost/cache. Add .bifrost/cache/ to .gitignore?",
-    acceptedChoice,
+    "Bifrost now tracks project configuration in .bifrost. Replace the legacy .bifrost ignore rule with .bifrost/cache/?",
+    "Replace",
     BIFROST_GITIGNORE_ASK_AGAIN_LATER,
     BIFROST_GITIGNORE_DONT_ASK_AGAIN
   );
-  const decision = decideBifrostGitignorePrompt(choice, acceptedChoice);
+  const decision = decideBifrostGitignorePrompt(choice);
   if (decision === "defer") {
-    log(
-      `User deferred ${legacy ? "replacing the legacy .bifrost ignore" : "adding .bifrost/cache to .gitignore"}.`
-    );
+    log("User deferred replacing the legacy .bifrost ignore.");
     return;
   }
   if (decision === "decline") {
     await context.workspaceState.update(declinedKey, true);
-    log(
-      `User declined ${legacy ? "replacing the legacy .bifrost ignore" : "adding .bifrost/cache to .gitignore"}.`
-    );
+    log("User declined replacing the legacy .bifrost ignore.");
     return;
   }
 
   try {
-    if (legacy) {
-      await replaceLegacyBifrostGitignoreEntry(workspaceRoot);
-    } else {
-      await appendBifrostGitignoreEntry(workspaceRoot);
-    }
+    await replaceLegacyBifrostGitignoreEntry(workspaceRoot);
     await context.workspaceState.update(declinedKey, undefined);
-    log(
-      `${legacy ? "Replaced legacy .bifrost ignore with" : "Added"} .bifrost/cache/ in .gitignore.`
-    );
+    log("Replaced legacy .bifrost ignore with .bifrost/cache/ in .gitignore.");
   } catch (error) {
     const message = formatError(error);
     log(`Failed to update .gitignore for Bifrost cache entry: ${message}`);
