@@ -191,13 +191,32 @@ To cut a release:
    Claude, Cursor, and Pi adapters, the Cursor marketplace versions, and the
    release metadata. Run both after
    the release metadata has been prepared for the version being validated.
-5. Sync the release version projection and every stabilization fix from the RC
+5. Before you create the final tag, treat the RC commit as green only after its
+   required branch checks and these release-specific checks pass:
+
+   ```bash
+   scripts/pre-push-gate.sh
+   cargo build --release --locked --bin bifrost
+   target/release/bifrost \
+     --root . \
+     --format sarif \
+     --output target/release-rc-policy.sarif \
+     --fail-on never \
+     --policy-pack bifrost.code-smells
+   ```
+
+   The policy command is a release-artifact smoke test. Existing findings do
+   not fail it. An unreliable scan still exits with status 2 and blocks the
+   release. Do not tag the RC commit only because its ordinary branch CI is
+   green. Confirm that each release-only promotion gate has an equivalent
+   pre-tag check, and run it on the frozen RC commit.
+6. Sync the release version projection and every stabilization fix from the RC
    branch back to `master`. An RC-only fix is not complete until its equivalent
    has landed on `master`; use a cherry-pick or an equivalent focused commit and
    resolve any conflicts against current `master` deliberately. Changes that
    land on `master` after the branch point remain outside the release unless
    they are explicitly selected for the RC branch.
-6. After the RC branch is frozen and validated, tag the validated RC commit -
+7. After the RC branch is frozen and validated, tag the validated RC commit -
    not the current `master` tip - and push the tag:
 
    ```bash
@@ -293,12 +312,28 @@ from a clean, reviewed commit. Then set the crate owners and configure the
 trusted publisher per the checklist above, and verify that configuration
 before you tag.
 
-Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual release. If a target fails,
-use GitHub Actions' **Re-run failed jobs** for that workflow run to reuse its
-validated artifacts. If a new run is necessary, dispatch the same tag again; never
-recover a partial release from a different branch, commit, or tag. The release
-summary records completed and pending publication targets, including the VS Code
-release attachment and Marketplace publication separately.
+Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual
+release. Dispatch it from `master`. The workflow definition comes from
+`master`, but every build and publication input comes from the immutable tag.
+This separation permits a workflow-only recovery without moving the tag or
+changing the released source.
+
+If a target fails, first use GitHub Actions' **Re-run failed jobs** for that
+workflow run. This action reuses its validated artifacts. If a new run is
+necessary, dispatch the same tag again. Never recover a partial release from a
+different branch, commit, or tag.
+
+Registry visibility can lag after a successful upload. For example, Open VSX
+can accept a VSIX before its version API returns it. If the upload succeeded
+but the visibility check timed out, confirm that the public artifact has the
+expected version and checksum. Then rerun the failed job. Do not upload a
+different artifact for the same version.
+
+The npm publication workflow starts only after the parent Release workflow
+succeeds. After recovery, confirm both workflows are green. Also confirm the
+root npm package and all platform packages expose the released version. The
+release summary records completed and pending publication targets, including
+the VS Code release attachment and Marketplace publication separately.
 
 To announce a published GitHub Release in Discord, set the
 `DISCORD_RELEASE_WEBHOOK_URL` repository Actions secret to the target channel's
