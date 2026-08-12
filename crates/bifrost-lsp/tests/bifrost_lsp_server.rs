@@ -1598,12 +1598,7 @@ export function leak_resource(): object {
     );
     assert!(typestate["error"].is_null(), "{typestate}");
     assert_eq!(
-        typestate["result"]["report"]["runs"][0]["completion"]["type"], "inconclusive",
-        "{typestate}"
-    );
-    assert_eq!(
-        typestate["result"]["report"]["runs"][0]["completion"]["reasons"],
-        json!(["partial_discovery"]),
+        typestate["result"]["report"]["runs"][0]["completion"]["type"], "complete",
         "{typestate}"
     );
     assert_eq!(

@@ -914,7 +914,7 @@ fn strict_versions_endpoint_roots_and_typestate_execution_have_typed_statuses() 
             "json",
         ],
     );
-    assert_status(&resource, 2);
+    assert_status(&resource, 1);
     let report = json_stdout(&resource);
     assert_eq!(report["rules"].as_array().unwrap().len(), 1);
     assert_eq!(report["runs"].as_array().unwrap().len(), 1);
@@ -925,11 +925,7 @@ fn strict_versions_endpoint_roots_and_typestate_execution_have_typed_statuses() 
             .len(),
         2
     );
-    assert_eq!(report["runs"][0]["completion"]["type"], "inconclusive");
-    assert_eq!(
-        report["runs"][0]["completion"]["reasons"],
-        serde_json::json!(["partial_discovery"])
-    );
+    assert_eq!(report["runs"][0]["completion"]["type"], "complete");
     assert_eq!(report["runs"][0]["findings"].as_array().unwrap().len(), 1);
     for finding in report["runs"][0]["findings"].as_array().unwrap() {
         assert_eq!(finding["analysis_type"], "typestate");
@@ -1149,15 +1145,15 @@ fn mixed_invalid_and_typestate_batches_retain_valid_findings_with_typed_statuses
             "sarif",
         ],
     );
-    assert_status(&typestate, 2);
+    assert_status(&typestate, 1);
     let sarif = json_stdout(&typestate);
     assert_eq!(sarif["runs"][0]["results"].as_array().unwrap().len(), 2);
     assert_eq!(
         sarif["runs"][0]["invocations"][0]["executionSuccessful"],
-        false
+        true
     );
     assert!(
-        sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+        !sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
             .as_array()
             .unwrap()
             .iter()
@@ -1180,7 +1176,7 @@ fn typestate_finding_identity_locations_and_witnesses_match_human_and_sarif() {
         project.root(),
         &[&arguments[..], &["--format", "json"]].concat(),
     );
-    assert_status(&json, 2);
+    assert_status(&json, 0);
     let json = json_stdout(&json);
     let findings = json["runs"][0]["findings"].as_array().unwrap();
     assert_eq!(findings.len(), 1);
@@ -1195,7 +1191,7 @@ fn typestate_finding_identity_locations_and_witnesses_match_human_and_sarif() {
     }
 
     let human = run(project.root(), &[&arguments[..], &["--verbose"]].concat());
-    assert_status(&human, 2);
+    assert_status(&human, 0);
     let human = String::from_utf8(human.stdout).expect("UTF-8 typestate report");
     for finding_id in &finding_ids {
         assert!(
@@ -1229,7 +1225,7 @@ fn typestate_finding_identity_locations_and_witnesses_match_human_and_sarif() {
         project.root(),
         &[&arguments[..], &["--format", "sarif"]].concat(),
     );
-    assert_status(&sarif, 2);
+    assert_status(&sarif, 0);
     let sarif = json_stdout(&sarif);
     let results = sarif["runs"][0]["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
@@ -1295,12 +1291,12 @@ fn typestate_finding_identity_locations_and_witnesses_match_human_and_sarif() {
 
 #[test]
 fn java_and_typescript_resource_rqlp_retain_identity_through_all_renderers() {
-    // Java's typestate run completes since #1952 (exit 0); TypeScript still
-    // carries open binding evidence and stays unreliable (exit 2).
+    // Both typestate runs complete: Java since #1952, TypeScript once
+    // receiverless local calls bind completely (#1951).
     for (language, expected_status, project) in [
         (
             "typescript",
-            2,
+            0,
             resource_policy_project("src/resource.ts", CROSS_LANGUAGE_TYPESCRIPT_RESOURCE_SOURCE),
         ),
         (
@@ -1579,7 +1575,7 @@ fn typestate_analysis_root_exit_event_executes_its_transition() {
             "never",
         ],
     );
-    assert_status(&output, 2);
+    assert_status(&output, 0);
     let report = json_stdout(&output);
     assert_eq!(
         report["runs"][0]["findings"]
@@ -1616,7 +1612,7 @@ fn typestate_projection_honors_authored_report_caps_before_authority_validation(
             "never",
         ],
     );
-    assert_status(&output, 2);
+    assert_status(&output, 0);
     let report = json_stdout(&output);
     let finding = &report["runs"][0]["findings"][0];
     assert!(finding["witnesses"].as_array().unwrap().is_empty());
