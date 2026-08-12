@@ -34,6 +34,9 @@ pub fn qualified_callable_value(node: Node<'_>) -> Option<QualifiedCallableValue
     if node.kind() != "qualified_identifier" {
         return None;
     }
+    if crate::graph::resolver::is_declaration_name(node) {
+        return None;
+    }
     if node.parent().is_some_and(|parent| {
         parent.child_by_field_name("type") == Some(node)
             || (parent.kind() == "call_expression"
