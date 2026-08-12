@@ -2046,6 +2046,9 @@ fn php_instance_receiver_fqn(
                 php, analyzer, support, inner, source, enclosing, bindings, ctx, session,
             )
         }),
+        "function_call_expression" | "scoped_call_expression" => {
+            php_assignment_receiver_fqn(php, support, object, source, enclosing, ctx, session)
+        }
         "member_call_expression" | "nullsafe_member_call_expression" => {
             php_member_call_return_type_fqn(
                 php, analyzer, support, object, source, enclosing, bindings, ctx, session,
