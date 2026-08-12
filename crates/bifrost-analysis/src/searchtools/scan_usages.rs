@@ -3028,7 +3028,6 @@ pub(super) fn filter_and_dedupe_hits(
             .or_default()
             .extend(external_usage_definition_ranges(analyzer, overload));
     }
-
     let mut rows: BTreeMap<(String, usize, usize, String, UsageHitKind), UsageHitRow> =
         BTreeMap::new();
     // Same-owner (self/this receiver, own-type static) sites, deduped by the same

@@ -5220,16 +5220,25 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         maybe_record_using_member_hit(node, ctx);
         return;
     }
+    if has_ancestor_kind(node, "using_declaration") {
+        return;
+    }
+    if node.kind() == "function_definition" {
+        maybe_record_method_definition_hit(node, ctx);
+        return;
+    }
+    if node_inside_function_definition_declarator(node) {
+        return;
+    }
+    if is_declaration_name(node) {
+        return;
+    }
     if let Some(member) = recovered_direct_initializer_qualified_callable(node) {
         maybe_record_qualified_method_value_hit(node, member, ctx);
         return;
     }
     if let Some(value) = qualified_callable_value(node) {
         maybe_record_qualified_method_value_hit(value.qualified, value.member, ctx);
-        return;
-    }
-    if node.kind() == "function_definition" {
-        maybe_record_method_definition_hit(node, ctx);
         return;
     }
     if node.kind() != "call_expression" {
@@ -5353,6 +5362,22 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         MethodReceiverTargetResolution::Missing => {}
     }
+}
+
+fn node_inside_function_definition_declarator(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "function_definition" {
+            return parent
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| {
+                    node.start_byte() >= declarator.start_byte()
+                        && node.end_byte() <= declarator.end_byte()
+                });
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 fn recovered_direct_initializer_qualified_callable(node: Node<'_>) -> Option<Node<'_>> {
