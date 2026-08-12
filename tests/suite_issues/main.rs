@@ -36,6 +36,7 @@ mod issue_1342_rust_module_declaration_files;
 mod issue_1347_rust_alias_cycle;
 mod issue_1546_rust_cfg_test_module_files;
 mod issue_1786_flow_dialect_degradation;
+mod issue_1808_csharp_enclosing_member_inverse;
 mod issue_1811_c_single_candidate_unproven_arity;
 mod issue_1812_c_no_candidate_macro_fallback;
 mod issue_1824_cpp_complete_guard_family_callable;
