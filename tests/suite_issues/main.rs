@@ -39,6 +39,7 @@ mod issue_1786_flow_dialect_degradation;
 mod issue_1808_csharp_enclosing_member_inverse;
 mod issue_1811_c_single_candidate_unproven_arity;
 mod issue_1812_c_no_candidate_macro_fallback;
+mod issue_1818_cpp_recursive_usage;
 mod issue_1824_cpp_complete_guard_family_callable;
 mod issue_1825_cpp_macro_namespace_callable;
 mod issue_1826_cpp_member_unproven_arity;
