@@ -17,6 +17,7 @@ mod get_definition_test;
 mod issue_1963_ignored_nested_workspace;
 mod most_relevant_files;
 mod optional_chain_reference_site;
+mod php_ranks21_30_regression;
 mod reusable_summaries;
 mod searchtools_definition_selectors;
 mod searchtools_fuzzy_symbol_lookup;
