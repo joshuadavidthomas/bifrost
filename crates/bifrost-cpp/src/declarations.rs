@@ -8154,6 +8154,11 @@ fn cpp_sentinel_macro_region(node: Node<'_>, source: &str) -> Option<(usize, usi
     } else {
         node.end_byte()
     };
+    if class_start.is_none()
+        && let Some(namespace_end) = cpp_sentinel_following_namespace_end(node, source)
+    {
+        end = end.max(namespace_end);
+    }
     let mut sibling = node.next_named_sibling();
     while let Some(current) = sibling {
         if !cpp_is_stray_semicolon(current, source) {
@@ -8163,6 +8168,61 @@ fn cpp_sentinel_macro_region(node: Node<'_>, source: &str) -> Option<(usize, usi
         sibling = current.next_named_sibling();
     }
     (start < end).then_some((start, end))
+}
+
+/// Extend a sentinel reparse through a following namespace that tree-sitter
+/// flattened into the sentinel node's sibling list.
+///
+/// Fmt places `FMT_END_EXPORT` immediately before `namespace detail`. The
+/// unknown macro becomes a false function return type and consumes the first
+/// namespace body. A second `namespace detail` then loses its enclosing node:
+/// tree-sitter retains the `namespace`, name, and `{` as direct siblings, but
+/// attaches its declarations to the surrounding error tree. Reparse from that
+/// structured keyword so tree-sitter, rather than a source-text brace scan,
+/// supplies the complete namespace boundary.
+fn cpp_sentinel_following_namespace_end(node: Node<'_>, source: &str) -> Option<usize> {
+    let mut sibling = node.next_sibling();
+    let keyword = loop {
+        let candidate = sibling?;
+        sibling = candidate.next_sibling();
+        if candidate.kind() != "comment" {
+            break candidate;
+        }
+    };
+    if keyword.kind() != "namespace" {
+        return None;
+    }
+    let name = loop {
+        let candidate = sibling?;
+        sibling = candidate.next_sibling();
+        if candidate.kind() != "comment" {
+            break candidate;
+        }
+    };
+    if cpp_namespace_name_components(name, source).is_empty() {
+        return None;
+    }
+    let open = loop {
+        let candidate = sibling?;
+        sibling = candidate.next_sibling();
+        if candidate.kind() != "comment" {
+            break candidate;
+        }
+    };
+    if open.kind() != "{" {
+        return None;
+    }
+
+    let tree = cpp_reparse_region_items(source, keyword.start_byte(), source.len())?;
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let namespace = root
+        .named_children(&mut cursor)
+        .find(|candidate| candidate.kind() != "comment")?;
+    (namespace.kind() == "namespace_definition"
+        && namespace.start_byte() == keyword.start_byte()
+        && namespace.child_by_field_name("body").is_some())
+    .then_some(namespace.end_byte())
 }
 
 /// Parse the source suffix beginning at a structurally recovered class/template
