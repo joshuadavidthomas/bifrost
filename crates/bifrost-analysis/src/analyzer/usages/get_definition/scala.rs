@@ -3772,7 +3772,7 @@ fn resolve_scala_with_context(
         }
         Some(ScalaReferenceNode::Call(call)) => resolve_scala_call(ctx, &resolver, root, call),
         Some(ScalaReferenceNode::NamedArgument { owner, name }) => {
-            resolve_scala_named_argument(ctx, &resolver, owner, name)
+            resolve_scala_named_argument(ctx, &resolver, root, owner, name)
         }
         Some(ScalaReferenceNode::InfixCall(call)) => {
             resolve_scala_infix_call(ctx, &resolver, root, call)
@@ -6530,6 +6530,7 @@ fn scala_compiler_intrinsic_type_reference(segments: &[String]) -> Option<&str> 
 fn resolve_scala_named_argument(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
+    root: Node<'_>,
     owner: Node<'_>,
     name_node: Node<'_>,
 ) -> DefinitionLookupOutcome {
@@ -6537,6 +6538,23 @@ fn resolve_scala_named_argument(
     if arg_name.is_empty() {
         return no_definition("no_reference_text", "Scala named argument is blank");
     }
+    let declaring_callables = scala_named_argument_call(owner)
+        .map(|invocation| match invocation.kind() {
+            "call_expression" => resolve_scala_call(ctx, resolver, root, invocation),
+            "instance_expression" => resolve_scala_constructor(ctx, resolver, invocation),
+            _ => unreachable!("named arguments have call or constructor owners"),
+        })
+        .map(|outcome| {
+            let mut callables = outcome
+                .definitions
+                .into_iter()
+                .filter(|unit| scala_callable_declares_parameter(ctx, unit, arg_name))
+                .collect::<Vec<_>>();
+            sort_units(&mut callables);
+            callables.dedup();
+            callables
+        })
+        .unwrap_or_default();
     let function = matches!(
         owner.kind(),
         "identifier" | "type_identifier" | "stable_type_identifier" | "generic_type"
@@ -6551,13 +6569,22 @@ fn resolve_scala_named_argument(
                     arg_name,
                     false,
                 ) {
-                    ScalaExactMemberResolution::Found(candidates) => candidates_outcome(candidates),
+                    ScalaExactMemberResolution::Found(candidates) => {
+                        scala_named_argument_member_or_callable_outcome(
+                            ctx,
+                            candidates,
+                            declaring_callables,
+                        )
+                    }
                     ScalaExactMemberResolution::Ambiguous => no_definition(
                         "ambiguous_scala_named_argument",
                         format!(
                             "named argument `{arg_name}` has multiple declarations on the exact callee owner"
                         ),
                     ),
+                    ScalaExactMemberResolution::NoMatch if !declaring_callables.is_empty() => {
+                        candidates_outcome(declaring_callables)
+                    }
                     ScalaExactMemberResolution::NoMatch => no_definition(
                         "no_indexed_definition",
                         format!(
@@ -6589,6 +6616,9 @@ fn resolve_scala_named_argument(
         .filter(|callee| !callee.is_empty())
         .and_then(|callee| resolver.resolve(callee));
     let Some(owner_fqn) = owner_fqn else {
+        if !declaring_callables.is_empty() {
+            return candidates_outcome(declaring_callables);
+        }
         return no_definition(
             "no_indexed_definition",
             format!("named argument `{arg_name}` receiver could not be typed"),
@@ -6596,12 +6626,70 @@ fn resolve_scala_named_argument(
     };
     let candidates = scala_member_candidate_units(ctx, &owner_fqn, arg_name, false);
     if candidates.is_empty() {
+        if !declaring_callables.is_empty() {
+            return candidates_outcome(declaring_callables);
+        }
         return no_definition(
             "no_indexed_definition",
             format!("named argument `{arg_name}` is not a member of `{owner_fqn}`"),
         );
     }
-    candidates_outcome(candidates)
+    scala_named_argument_member_or_callable_outcome(ctx, candidates, declaring_callables)
+}
+
+fn scala_named_argument_member_or_callable_outcome(
+    ctx: ScalaLookupCtx<'_>,
+    members: Vec<CodeUnit>,
+    declaring_callables: Vec<CodeUnit>,
+) -> DefinitionLookupOutcome {
+    if declaring_callables.is_empty() {
+        return candidates_outcome(members);
+    }
+    let callable_owners = declaring_callables
+        .iter()
+        .filter_map(|unit| ctx.scala.structural_parent_of(unit))
+        .collect::<Vec<_>>();
+    let matching = members
+        .into_iter()
+        .filter(|candidate| {
+            ctx.scala
+                .structural_parent_of(candidate)
+                .is_some_and(|owner| callable_owners.contains(&owner))
+        })
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        candidates_outcome(declaring_callables)
+    } else {
+        candidates_outcome(matching)
+    }
+}
+
+fn scala_named_argument_call(owner: Node<'_>) -> Option<Node<'_>> {
+    let mut current = owner;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "call_expression" | "instance_expression" => return Some(parent),
+            "generic_function" | "generic_type" => current = parent,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn scala_callable_declares_parameter(
+    ctx: ScalaLookupCtx<'_>,
+    callable: &CodeUnit,
+    label: &str,
+) -> bool {
+    let metadata = if let Some(session) = ctx.session {
+        session.query_limited_rows(|limit| ctx.scala.signature_metadata_limited(callable, limit))
+    } else {
+        ctx.scala.signature_metadata(callable)
+    };
+    metadata
+        .iter()
+        .flat_map(|metadata| metadata.parameters())
+        .any(|parameter| parameter.label() == label)
 }
 
 fn scala_same_file_root_function_units(ctx: ScalaLookupCtx<'_>, name: &str) -> Vec<CodeUnit> {
