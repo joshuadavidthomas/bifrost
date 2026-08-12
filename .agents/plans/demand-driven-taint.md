@@ -1,5 +1,49 @@
 # ExecPlan: demand-driven require-model taint
 
+## Outcome (2026-08-12): corpus one-pass reached by scaling the eager path, not by full demand
+
+What landed (commits 7796e08cb, 363ff108e) makes the OWASP pathtraver subset run
+in one pass with zero false greens, but it is **not** the Stage C lazy provider
+below. Two findings redirected the work:
+
+1. **Full demand (Stage C) is blocked.** The require-model fallback
+   (`value_flow/plan.rs` `visit_fallback_outputs`) reads plan-global
+   `bounded_globals` / `by_component` at every unmodeled-call boundary; those are
+   complete only after every procedure has loaded. A lazy per-procedure plan
+   cannot serve that read mid-solve without an Option-C solver-core change, which
+   is out of scope. The lazy `ValueFlowProvider` was prototyped and abandoned.
+
+2. **Endpoint seeding (Stage B) sacrifices cross-procedure completeness.**
+   Forward-from-source and backward-to-sink miss a flow whose source and sink sit
+   in sibling callees joined only through a common caller (the Stage-A
+   cross-procedure fixture). So the all-procedures roots were kept for
+   completeness.
+
+Instead the eager materialization was made to **scale** by fixing three shared
+budgets that abstained "by accumulation" at corpus scale (each honest per-file
+cost summed into one request-wide cap):
+- per-region `SemanticBudget` reset (was: `nested_entries` crossed 1M at ~76 files),
+- `max_materialized_files` sized to the workspace, not the 256 per-query IDE cap
+  (the endpoint enumeration is O(corpus) and the content cache bounds real cost to
+  distinct files),
+- per-batch reset of the witness-reconstruction lanes (a per-finding cap of 1,024
+  witness steps had been threaded request-wide),
+plus non-fatal catch-and-skip of a root whose closure exceeds its per-region
+budget (its file reports `not_analyzed`, never a false clean), and compile-wide
+work-report accounting across the resets.
+
+Result on pathtraver (268 cases, one pass): `not_analyzed` 268 -> 48; analyzed 0
+-> 220; TP 0 -> 6, FP 8; **false greens 0** throughout. Guardrail (Stage A
+known-answer fixtures) green. The remaining 48 abstain on a capability gap (an
+unsupported procedure value-flow snapshot), not a budget. The one-pass TP (6) is
+below the batched-eager baseline (9); that gap is not yet attributed per case
+(modeling/capability vs a per-region-vs-shared difference) and is the open
+follow-up. The eager roots loop is therefore **not** retired (Stage D), because
+the lazy replacement is blocked and endpoint seeding is incomplete.
+
+The Stages B-D below are the original design and are kept for context; read the
+outcome above for what is actually true today.
+
 ## Motivation (for David)
 
 Require-model taint cannot run at corpus scale. On the OWASP Benchmark taint
