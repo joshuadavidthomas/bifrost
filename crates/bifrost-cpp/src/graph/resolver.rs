@@ -8784,10 +8784,57 @@ pub struct QualifiedOwnerComponents<'tree> {
     pub global: bool,
 }
 
+/// True when each structured qualifier on the callable-name path has a real
+/// `::` token. A macro-prefixed return type can make tree-sitter insert a
+/// zero-width missing separator and parse `TYPE Result<T> method()` as the
+/// false qualified declarator `Result<T>::method`.
+pub fn qualified_name_has_concrete_scope_separators(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    let mut found_separator = false;
+    while let Some(current) = stack.pop() {
+        if !matches!(
+            current.kind(),
+            "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+        ) {
+            continue;
+        }
+        let mut current_has_separator = false;
+        for index in 0..current.child_count() {
+            let Some(child) = current.child(index) else {
+                continue;
+            };
+            if child.kind() == "::" {
+                if child.is_missing() {
+                    return false;
+                }
+                current_has_separator = true;
+                found_separator = true;
+            }
+        }
+        if !current_has_separator {
+            return false;
+        }
+        for field in ["scope", "name"] {
+            if let Some(child) = current.child_by_field_name(field)
+                && matches!(
+                    child.kind(),
+                    "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+                )
+            {
+                stack.push(child);
+            }
+        }
+    }
+    found_separator
+}
+
 pub fn qualified_owner_components<'tree>(
     node: Node<'tree>,
     source: &str,
 ) -> Option<QualifiedOwnerComponents<'tree>> {
+    if !qualified_name_has_concrete_scope_separators(node) {
+        return None;
+    }
     let mut nodes = cpp_name_component_nodes(node)?;
     nodes.pop()?;
     if nodes.is_empty() {

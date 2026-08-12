@@ -2255,14 +2255,6 @@ pub fn resolve_block_using_call_target(
     if name.is_empty() {
         return None;
     }
-    let lexical_scope =
-        match enclosing_lexical_scope_components(function, analyzer, visibility, file, source) {
-            LexicalScopeResolution::Resolved(scope) => scope,
-            LexicalScopeResolution::Ambiguous => {
-                return Some(BlockUsingCallTargetResolution::Ambiguous);
-            }
-            LexicalScopeResolution::Missing => return None,
-        };
     let bindings = effective_using_bindings_for_name(
         visibility,
         ordinary_type_imports,
@@ -2271,20 +2263,36 @@ pub fn resolve_block_using_call_target(
         source,
         name,
     );
-    let active = bindings
+    let block_bindings = bindings
         .iter()
         .filter(|binding| {
             binding.namespace_scope.is_none()
                 && binding.block_scope
                 && matches!(binding.target, EffectiveUsingTarget::Ordinary { .. })
-                && effective_using_binding_active(
-                    binding,
-                    function,
-                    &lexical_scope,
-                    source,
-                    visibility,
-                    file,
-                )
+        })
+        .collect::<Vec<_>>();
+    if block_bindings.is_empty() {
+        return None;
+    }
+    let lexical_scope =
+        match enclosing_lexical_scope_components(function, analyzer, visibility, file, source) {
+            LexicalScopeResolution::Resolved(scope) => scope,
+            LexicalScopeResolution::Ambiguous => {
+                return Some(BlockUsingCallTargetResolution::Ambiguous);
+            }
+            LexicalScopeResolution::Missing => return None,
+        };
+    let active = block_bindings
+        .into_iter()
+        .filter(|binding| {
+            effective_using_binding_active(
+                binding,
+                function,
+                &lexical_scope,
+                source,
+                visibility,
+                file,
+            )
         })
         .collect::<Vec<_>>();
     let depth = active.iter().map(|binding| binding.scope_depth).max()?;
@@ -7059,6 +7067,7 @@ fn qualified_owner_is_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> boo
 
 fn is_structurally_qualified(node: Node<'_>) -> bool {
     matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+        && qualified_name_has_concrete_scope_separators(node)
 }
 
 fn qualified_owner_resolution(node: Node<'_>, ctx: &ScanCtx<'_>) -> QualifiedOwnerResolution {
@@ -7116,7 +7125,9 @@ fn qualified_callable_owner_components(
     node: Node<'_>,
     source: &str,
 ) -> Option<(Vec<String>, bool)> {
-    if !matches!(node.kind(), "qualified_identifier" | "scoped_identifier") {
+    if !matches!(node.kind(), "qualified_identifier" | "scoped_identifier")
+        || !qualified_name_has_concrete_scope_separators(node)
+    {
         return None;
     }
     let global = is_globally_qualified_cpp_name(node);
