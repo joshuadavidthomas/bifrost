@@ -5644,6 +5644,8 @@ fn scala_exact_singleton_apply_outcome(
         call_shape,
         ScalaCallableSiteRole::Ordinary,
     );
+    let candidates =
+        scala_prefer_fixed_callable_candidates(ctx.scala, ctx.support, candidates, call_shape);
     match scala_physical_callable_candidates(ctx.scala, candidates) {
         ScalaPhysicalCallableCandidates::Unique(candidates) => candidates_outcome(candidates),
         ScalaPhysicalCallableCandidates::Ambiguous => no_definition(
@@ -5655,6 +5657,95 @@ fn scala_exact_singleton_apply_outcome(
             format!("`{reference}` has no applicable lexical singleton `apply`"),
         ),
     }
+}
+
+/// Apply Scala's fixed-arity precedence after ordinary shape applicability.
+///
+/// A repeated parameter can accept the same argument count as a fixed
+/// overload. Scala considers the fixed alternative first when both remain
+/// applicable. Literal types can first prove that one alternative cannot
+/// apply. Unknown argument types stay eligible, so this step does not invent a
+/// type mismatch.
+fn scala_prefer_fixed_callable_candidates(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    mut candidates: Vec<CodeUnit>,
+    call_shape: Option<&ScalaCallSiteShape>,
+) -> Vec<CodeUnit> {
+    let Some(call_shape) = call_shape else {
+        return candidates;
+    };
+    let [arguments] = call_shape.lists.as_slice() else {
+        return candidates;
+    };
+    if arguments.kind != ScalaCallArgumentListKind::Ordinary || candidates.len() < 2 {
+        return candidates;
+    }
+
+    if let Some(actual_types) = call_shape.leading_literal_argument_types.as_deref() {
+        let exact_arguments = actual_types
+            .iter()
+            .copied()
+            .map(|actual| actual.map(ScalaExactArgument::Builtin))
+            .collect::<Option<Vec<_>>>();
+        if let Some(exact_arguments) = exact_arguments {
+            let verdicts = candidates
+                .iter()
+                .map(|candidate| {
+                    scala_callable_matches_exact_arguments(
+                        scala,
+                        support,
+                        None,
+                        candidate,
+                        call_shape,
+                        &exact_arguments,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if verdicts
+                .iter()
+                .any(|verdict| *verdict != ScalaTypedCandidateMatch::Mismatch)
+            {
+                candidates = candidates
+                    .into_iter()
+                    .zip(verdicts)
+                    .filter_map(|(candidate, verdict)| {
+                        (verdict != ScalaTypedCandidateMatch::Mismatch).then_some(candidate)
+                    })
+                    .collect();
+            }
+        }
+    }
+
+    let fixed = candidates
+        .iter()
+        .filter(|candidate| scala_callable_has_applicable_fixed_shape(scala, candidate, call_shape))
+        .cloned()
+        .collect::<Vec<_>>();
+    if fixed.is_empty() { candidates } else { fixed }
+}
+
+fn scala_callable_has_applicable_fixed_shape(
+    scala: &ScalaAnalyzer,
+    candidate: &CodeUnit,
+    call_shape: &ScalaCallSiteShape,
+) -> bool {
+    let alternatives = scala_forward_callable_source_alternatives(scala, candidate);
+    if alternatives.is_empty() {
+        return true;
+    }
+    alternatives.iter().any(|alternative| {
+        scala_callable_alternative_is_candidate(
+            alternative.role,
+            &alternative.shape,
+            alternative.result,
+            call_shape,
+            ScalaCallableSiteRole::Ordinary,
+        ) && alternative
+            .shape
+            .iter()
+            .all(|list| !list.arity.is_repeated())
+    })
 }
 
 fn scala_exact_type_apply_or_constructor_outcome(
@@ -5697,6 +5788,12 @@ fn scala_exact_type_apply_or_constructor_outcome(
                 .collect(),
             call_shape,
             ScalaCallableSiteRole::Ordinary,
+        );
+        let apply_candidates = scala_prefer_fixed_callable_candidates(
+            ctx.scala,
+            ctx.support,
+            apply_candidates,
+            call_shape,
         );
         if !apply_candidates.is_empty() {
             return candidates_outcome(apply_candidates);
@@ -5747,18 +5844,19 @@ fn scala_apply_or_constructor_outcome(
         .filter(|unit| unit.source() == reference_file)
         .cloned()
         .collect::<Vec<_>>();
+    let apply_candidates = scala_filter_callable_units(
+        scala,
+        if same_file_apply_units.is_empty() {
+            apply_units
+        } else {
+            same_file_apply_units
+        },
+        call_shape,
+        ScalaCallableSiteRole::Ordinary,
+    );
     let apply_candidates = scala_physical_callable_candidates(
         scala,
-        scala_filter_callable_units(
-            scala,
-            if same_file_apply_units.is_empty() {
-                apply_units
-            } else {
-                same_file_apply_units
-            },
-            call_shape,
-            ScalaCallableSiteRole::Ordinary,
-        ),
+        scala_prefer_fixed_callable_candidates(scala, support, apply_candidates, call_shape),
     );
     match apply_candidates {
         ScalaPhysicalCallableCandidates::Unique(candidates) => {
@@ -7966,7 +8064,25 @@ fn scala_callable_matches_constructed_arguments(
     call_shape: &ScalaCallSiteShape,
     arguments: &[ScalaExactArgument],
 ) -> ScalaTypedCandidateMatch {
-    let alternatives = scala_forward_callable_alternatives(ctx.scala, ctx.support, candidate);
+    scala_callable_matches_exact_arguments(
+        ctx.scala,
+        ctx.support,
+        Some(ctx),
+        candidate,
+        call_shape,
+        arguments,
+    )
+}
+
+fn scala_callable_matches_exact_arguments(
+    scala: &ScalaAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    ctx: Option<ScalaLookupCtx<'_>>,
+    candidate: &CodeUnit,
+    call_shape: &ScalaCallSiteShape,
+    arguments: &[ScalaExactArgument],
+) -> ScalaTypedCandidateMatch {
+    let alternatives = scala_forward_callable_alternatives(scala, support, candidate);
     if alternatives.is_empty() {
         return ScalaTypedCandidateMatch::Unknown;
     }
@@ -7992,12 +8108,24 @@ fn scala_callable_matches_constructed_arguments(
             saw_unknown = true;
             continue;
         };
-        if parameter_types.len() != arguments.len() {
+        let arity = alternative.shape[parameter_list_index].arity;
+        if !arity.accepts(arguments.len()) {
             continue;
         }
         let mut alternative_matches = true;
-        for (actual, expected) in arguments.iter().zip(parameter_types) {
-            let Some(expected) = expected else {
+        for (index, actual) in arguments.iter().enumerate() {
+            let parameter_index = if index < parameter_types.len() {
+                index
+            } else if arity.is_repeated() {
+                parameter_types.len().saturating_sub(1)
+            } else {
+                alternative_matches = false;
+                break;
+            };
+            let Some(expected) = parameter_types
+                .get(parameter_index)
+                .and_then(Option::as_ref)
+            else {
                 saw_unknown = true;
                 alternative_matches = false;
                 break;
@@ -8014,7 +8142,9 @@ fn scala_callable_matches_constructed_arguments(
                 (
                     ScalaParameterTypeIdentity::Declaration(expected),
                     ScalaExactArgument::Constructed(actual),
-                ) => scala_exact_subtype_relation(ctx, actual, expected),
+                ) => ctx.map_or(ScalaTypedCandidateMatch::Unknown, |ctx| {
+                    scala_exact_subtype_relation(ctx, actual, expected)
+                }),
                 (
                     ScalaParameterTypeIdentity::Logical(_)
                     | ScalaParameterTypeIdentity::LogicalCandidates(_)
