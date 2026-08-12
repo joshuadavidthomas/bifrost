@@ -546,3 +546,96 @@ fn kotlin_companion_callee_keeps_the_receiver_binding_open() {
         KOTLIN_COMPANION_CALLEE_SOURCE,
     );
 }
+
+// A by-name sink parameter defers argument evaluation; the callee's own
+// procedure-level DeferredExecution gap must keep the balanced positive
+// typed incomplete now that strict calls carry no blanket caller-side gap.
+const SCALA_BY_NAME_SINK_SOURCE: &str = r#"
+package balanced
+
+object BalancedFlow {
+  def source(): String = {
+    "tainted"
+  }
+
+  def sink(value: => String): Unit = {}
+
+  def positive(): Unit = {
+    sink(source())
+  }
+}
+"#;
+
+// A declared non-Unit result whose body value is not structurally identity
+// keeps the result-adaptation gap: an implicit conversion may run before
+// `source` returns, so the flow through it stays typed incomplete.
+const SCALA_ADAPTED_RESULT_SOURCE: &str = r#"
+package balanced
+
+object BalancedFlow {
+  def raw(): String = {
+    "tainted"
+  }
+
+  def source(): AnyRef = {
+    raw()
+  }
+
+  def sink(value: AnyRef): Unit = {}
+
+  def positive(): Unit = {
+    sink(source())
+  }
+}
+"#;
+
+fn assert_scala_positive_stays_typed_incomplete(source: &str) {
+    let case = balanced_case(
+        Language::Scala,
+        "src/BalancedFlow.scala",
+        source,
+        "positive",
+    );
+    assert!(
+        !case.plan.discovery_complete(),
+        "the path-relevant Scala gap must keep discovery incomplete"
+    );
+    let cause = case
+        .plan
+        .first_incomplete_cause()
+        .expect("an incomplete discovery retains its first cause");
+    assert!(
+        matches!(
+            cause,
+            ValueFlowIncompleteCause::Snapshot { .. }
+                | ValueFlowIncompleteCause::CallBinding { .. }
+        ),
+        "the first cause is the deferring or adapting procedure: {cause:?}"
+    );
+    let result = solve(&case);
+    assert!(!result.is_complete(), "the run must not complete");
+    let (sink_id, _) = case.plan.sinks().next().expect("one sink");
+    assert!(
+        !matches!(
+            result.sink_outcome(sink_id),
+            ValueFlowSinkOutcome::NotReached
+        ),
+        "an incomplete run must not report a clean negative"
+    );
+}
+
+/// Removing the blanket strictness gap (#1989) must not weaken a call whose
+/// resolved callee actually defers evaluation: the by-name callee's own gap
+/// keeps the balanced positive typed incomplete.
+#[test]
+fn scala_by_name_sink_keeps_the_positive_typed_incomplete() {
+    assert_scala_positive_stays_typed_incomplete(SCALA_BY_NAME_SINK_SOURCE);
+}
+
+/// The Unit-discard discharge (#1989) must not extend to a declared non-Unit
+/// result: a body value that is not structurally identity keeps the
+/// result-adaptation gap and a typed incomplete flow.
+#[test]
+fn scala_adapted_result_keeps_the_positive_typed_incomplete() {
+    assert_scala_positive_stays_typed_incomplete(SCALA_ADAPTED_RESULT_SOURCE);
+}

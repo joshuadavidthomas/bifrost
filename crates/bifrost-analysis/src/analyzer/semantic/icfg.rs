@@ -25,9 +25,9 @@ use super::{
     OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
     OracleRelationRecord, OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind,
     ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite,
-    SemanticCapability, SemanticGap, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue, SemanticValueKind,
-    SemanticWork,
+    SemanticCapability, SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind,
+    SemanticGapSubject, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue,
+    SemanticValueKind, SemanticWork,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1853,6 +1853,15 @@ fn materialize_exit_profile(
     let abort_user_code =
         crate::analyzer::semantic::workspace_oracle::abort_paths_run_user_code(semantics);
     let is_return_gap = |gap: &SemanticGap| {
+        // A gap that declares a call-resolution discharge asks a question the
+        // resolution and binding path always answers: an unresolved call
+        // surfaces as a dispatch boundary, and a resolved callee that defers
+        // evaluation carries its own procedure-level gap into its exit
+        // profile and bindings (#1989). It must not weaken this caller's
+        // exit profile a second time.
+        if gap.discharge == SemanticGapDischarge::CallResolution {
+            return false;
+        }
         let return_affecting = gap.impacts.contains(SemanticGapImpact::ReturnTransfer);
         let scoped_to_return_path = match gap.subject {
             SemanticGapSubject::Procedure => true,
@@ -2647,6 +2656,7 @@ mod tests {
             impacts,
             kind: SemanticGapKind::Unproven,
             budget: None,
+            discharge: SemanticGapDischarge::None,
             detail: "caller-side evaluation is incomplete".into(),
             source: call.source,
             evidence: call.evidence,

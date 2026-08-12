@@ -948,6 +948,21 @@ impl SemanticGapImpacts {
     }
 }
 
+/// What answers a gap, stated by the adapter that published it.
+///
+/// `CallResolution` marks a call-site-scoped gap whose question a complete
+/// workspace resolution and binding of that call answers -- for example
+/// Scala argument-evaluation strictness, which the resolved signature proves
+/// because a deferring callee carries its own procedure-level gap that keeps
+/// every binding to it open. A gap without a declared discharge (`None`)
+/// stands until the adapter itself lowers the construct.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SemanticGapDischarge {
+    #[default]
+    None,
+    CallResolution,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SemanticGap {
     pub id: SemanticGapId,
@@ -958,6 +973,8 @@ pub struct SemanticGap {
     pub kind: SemanticGapKind,
     /// Required exactly when `kind` is `ExceededBudget`.
     pub budget: Option<SemanticBudgetExceeded>,
+    /// Must be `None` unless `subject` is a call site.
+    pub discharge: SemanticGapDischarge,
     pub detail: Box<str>,
     pub source: SourceMappingId,
     pub evidence: EvidenceId,

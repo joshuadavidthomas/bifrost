@@ -523,6 +523,18 @@ fn validate_procedure(
                 format!("gap {} has no diagnostic detail", gap.id),
             ));
         }
+        if gap.discharge == SemanticGapDischarge::CallResolution
+            && !matches!(gap.subject, SemanticGapSubject::CallSite(_))
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                format!(
+                    "gap {} declares a call-resolution discharge without a call-site subject",
+                    gap.id
+                ),
+            ));
+        }
         if gap.kind == SemanticGapKind::Unproven
             && !matches!(
                 procedure.evidence_rows[gap.evidence.index()].proof,
