@@ -6176,12 +6176,18 @@ fn scala_forward_method_value_arity(
         CodeUnit::is_function,
     ) {
         methods.push(method);
-    } else if let Some(owner) =
-        scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte())
+    }
+    let enclosing_owner =
+        scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte());
+    if methods.is_empty()
+        && let Some(owner) = enclosing_owner.as_ref()
         && let ScalaExactMemberResolution::Found(candidates) =
-            scala_exact_owner_member_candidate_units(ctx, &owner, function_name, false)
+            scala_exact_owner_member_candidate_units(ctx, owner, function_name, false)
     {
         methods.extend(candidates);
+    }
+    if methods.is_empty() && enclosing_owner.is_none() {
+        methods.extend(scala_same_file_root_function_units(ctx, function_name));
     }
     methods.sort();
     methods.dedup();
@@ -6500,6 +6506,18 @@ fn resolve_scala_named_argument(
     candidates_outcome(candidates)
 }
 
+fn scala_same_file_root_function_units(ctx: ScalaLookupCtx<'_>, name: &str) -> Vec<CodeUnit> {
+    let mut candidates = ctx
+        .support
+        .fqn(name)
+        .into_iter()
+        .filter(|unit| unit.is_function() && unit.source() == ctx.file && unit.fq_name() == name)
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
 fn resolve_scala_call(
     ctx: ScalaLookupCtx<'_>,
     resolver: &ScalaNameResolver,
@@ -6566,17 +6584,28 @@ fn resolve_scala_call(
             {
                 return candidates_outcome(vec![unit]);
             }
+            let enclosing_owner = if function.kind() == "identifier" {
+                scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte())
+            } else {
+                None
+            };
+            if enclosing_owner.is_none() {
+                let root_candidates = scala_filter_callable_units(
+                    ctx.scala,
+                    scala_same_file_root_function_units(ctx, name),
+                    call_shape.as_ref(),
+                    ScalaCallableSiteRole::Ordinary,
+                );
+                if !root_candidates.is_empty() {
+                    return candidates_outcome(root_candidates);
+                }
+            }
             // Set when the enclosing owner's supertype closure is not fully
             // indexed here. That is a last-resort answer, never a pre-emption:
             // an unindexed parent cannot hide a target this workspace owns.
             let mut incomplete_hierarchy_owner = None;
             if function.kind() == "identifier"
-                && let Some(owner) = scala_enclosing_class(
-                    ctx.analyzer,
-                    ctx.support,
-                    ctx.file,
-                    function.start_byte(),
-                )
+                && let Some(owner) = enclosing_owner
                 && owner.identifier() != name
             {
                 match scala_exact_owner_typed_overload_resolution(
@@ -11708,7 +11737,20 @@ fn scala_call_result_type(
                 return scala_coherent_function_return_type(ctx, candidates);
             }
             let owner =
-                scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte())?;
+                scala_enclosing_class(ctx.analyzer, ctx.support, ctx.file, function.start_byte());
+            if owner.is_none() {
+                let root_candidates = scala_same_file_root_function_units(ctx, name);
+                let call_shape = scala_call_site_shape(ctx, root, function);
+                let candidates = scala_applicable_callable_candidate_units(
+                    ctx,
+                    root_candidates,
+                    call_shape.as_ref(),
+                );
+                if let Some(result) = scala_coherent_function_return_type(ctx, candidates) {
+                    return Some(result);
+                }
+            }
+            let owner = owner?;
             let call_shape = scala_call_site_shape(ctx, root, function);
             let ScalaExactMemberResolution::Found(candidates) =
                 scala_exact_owner_member_candidate_units(ctx, &owner, name, false)
