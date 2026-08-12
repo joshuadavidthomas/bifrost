@@ -14,7 +14,7 @@ use crate::graph::hits::{
     push_unproven_definition_hit, push_unproven_hit,
 };
 use crate::graph::resolver::*;
-use crate::graph::syntax::explicit_qualified_callable_value;
+use crate::graph::syntax::qualified_callable_value;
 use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::usages::common::same_node;
@@ -5043,7 +5043,7 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         maybe_record_qualified_method_value_hit(node, member, ctx);
         return;
     }
-    if let Some(value) = explicit_qualified_callable_value(node) {
+    if let Some(value) = qualified_callable_value(node) {
         maybe_record_qualified_method_value_hit(value.qualified, value.member, ctx);
         return;
     }

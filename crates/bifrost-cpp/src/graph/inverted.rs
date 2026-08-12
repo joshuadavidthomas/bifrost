@@ -48,7 +48,7 @@ use crate::graph::resolver::{
     parameter_belongs_to_callable_scope, recovered_macro_decorated_type_node,
     resolve_declaring_member_owner, same_visible_symbol, type_reference_hit_node,
 };
-use crate::graph::syntax::explicit_qualified_callable_value;
+use crate::graph::syntax::qualified_callable_value;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
@@ -238,7 +238,7 @@ fn record_reference(
         }
         return;
     }
-    if let Some(value) = explicit_qualified_callable_value(node) {
+    if let Some(value) = qualified_callable_value(node) {
         record_qualified_callable_value(
             value.qualified,
             value.global,
