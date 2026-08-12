@@ -4485,6 +4485,450 @@ fn cancellation_with_progress_in_flight_leaves_the_session_healthy() {
     assert!(child.wait().expect("wait bifrost").success());
 }
 
+/// Open a session declaring the MCP Tasks extension (SEP-2663).
+fn initialize_tasks_session(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    protocol_version: &str,
+) -> Value {
+    let initialize = round_trip(
+        stdin,
+        reader,
+        stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": { "extensions": { "io.modelcontextprotocol/tasks": {} } },
+                "clientInfo": { "name": "tasks-client", "version": "1" }
+            }
+        }),
+    );
+    write_line(
+        stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+    initialize
+}
+
+fn run_policy_request(id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "run_policy",
+            "arguments": {
+                "policy_files": ["policies/dynamic-eval.rqlp"],
+                "evaluation_date": "2026-07-27",
+                "fail_on": "warning"
+            }
+        }
+    })
+}
+
+/// Poll `tasks/get` until the task reaches a terminal status, returning the
+/// terminal response. Polls faster than the advertised interval because this
+/// is a test, not a considerate client.
+fn poll_task_until_terminal(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    stderr: &mut impl Read,
+    task_id: &str,
+    first_id: i64,
+) -> Value {
+    let give_up_at = std::time::Instant::now() + Duration::from_secs(60);
+    let mut id = first_id;
+    loop {
+        let response = round_trip(
+            stdin,
+            reader,
+            stderr,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tasks/get",
+                "params": { "taskId": task_id }
+            }),
+        );
+        let status = response["result"]["status"]
+            .as_str()
+            .unwrap_or_else(|| panic!("tasks/get must report a status: {response}"));
+        if matches!(status, "completed" | "failed" | "cancelled") {
+            return response;
+        }
+        assert!(
+            std::time::Instant::now() < give_up_at,
+            "task never settled: {response}"
+        );
+        id += 1;
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A workspace whose cold snapshot build and policy run are slow enough to
+/// observe a task in flight: enough files that readiness alone takes long
+/// past any cancellation or tiny-TTL window a test needs to hit.
+fn slow_policy_project() -> common::BuiltInlineTestProject {
+    let mut project = InlineTestProject::with_language(Language::Python)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY);
+    for index in 0..300 {
+        project = project.file(
+            format!("src/module_{index}.py"),
+            format!("def handler_{index}(value):\n    return eval(value)\n"),
+        );
+    }
+    project.build()
+}
+
+/// Issue #2006: a capable `2026-07-28` client calling `run_policy` receives a
+/// durable task handle and collects the finished report by polling, after the
+/// initiating request has ended. The terminal result preserves the synchronous
+/// content/structured-content contract, pinned by comparing the embedded
+/// report against a direct in-process policy evaluation.
+#[test]
+fn mcp_tasks_run_policy_completes_through_a_task_handle() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", MCP_POLICY_APP)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
+        .build();
+    let expected = evaluate_policy_files(
+        workspace.root(),
+        &[PathBuf::from("policies/dynamic-eval.rqlp")],
+        &PolicyEvaluationOptions::new("2026-07-27".parse().expect("fixed evaluation date"))
+            .with_fail_on(PolicyFailOn::Warning),
+    )
+    .expect("direct policy evaluation");
+    let expected_report = serde_json::to_value(expected.report()).expect("serialize report");
+
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    let initialize = initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+    assert!(
+        initialize["result"]["capabilities"]["extensions"]
+            .get("io.modelcontextprotocol/tasks")
+            .is_some(),
+        "the server must advertise the tasks extension: {initialize}"
+    );
+
+    let created = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert_eq!(created["result"]["resultType"], "task", "{created}");
+    assert_eq!(created["result"]["status"], "working", "{created}");
+    assert!(created["result"]["ttlMs"].is_number(), "{created}");
+    let task_id = created["result"]["taskId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a task handle must carry a taskId: {created}"))
+        .to_string();
+
+    let terminal = poll_task_until_terminal(&mut stdin, &mut reader, &mut stderr, &task_id, 10);
+    assert_eq!(terminal["result"]["status"], "completed", "{terminal}");
+    let result = &terminal["result"]["result"];
+    assert_eq!(result["isError"], false, "{terminal}");
+    assert!(
+        result["content"][0]["text"].is_string(),
+        "the terminal result must keep the synchronous content contract: {terminal}"
+    );
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["status"], "finding", "{terminal}");
+    assert_eq!(structured["exit_status"], 1, "{terminal}");
+    assert_eq!(structured["report"], expected_report, "{terminal}");
+    assert!(
+        structured["request_correlation_id"]
+            .as_str()
+            .is_some_and(|correlation| correlation.starts_with("sha256:")),
+        "task results keep the run_policy correlation contract: {terminal}"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2006: clients without the extension must never receive a
+/// task-shaped result -- neither a `2026-07-28` client that did not declare
+/// it, nor a legacy `2025-11-25` client that did (tasks require the new
+/// revision's result discriminators).
+#[test]
+fn mcp_tasks_never_reach_incapable_or_legacy_clients() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", MCP_POLICY_APP)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
+        .build();
+
+    // A 2026-07-28 client without the capability keeps synchronous behavior,
+    // and its tasks/get is refused before reaching Bifrost's handler.
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": { "name": "no-tasks", "version": "1" }
+            }
+        }),
+    );
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+    let synchronous = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert_eq!(
+        synchronous["result"]["resultType"], "complete",
+        "{synchronous}"
+    );
+    assert_eq!(
+        synchronous["result"]["structuredContent"]["status"], "finding",
+        "{synchronous}"
+    );
+    let refused = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tasks/get",
+            "params": { "taskId": "irrelevant" }
+        }),
+    );
+    assert!(
+        !refused["error"].is_null(),
+        "tasks/get without the capability must be refused: {refused}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+
+    // A 2025-11-25 client declaring the capability still gets synchronous
+    // results: the task result shape does not exist in its revision.
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2025-11-25");
+    let synchronous = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert!(
+        synchronous["result"]["resultType"].is_null(),
+        "a legacy session has no result discriminators at all: {synchronous}"
+    );
+    assert_eq!(
+        synchronous["result"]["structuredContent"]["status"], "finding",
+        "{synchronous}"
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2006: `tasks/cancel` requests cooperative cancellation and the task
+/// settles as terminal `cancelled`, stopping the underlying analyzer work.
+#[test]
+fn mcp_tasks_cancel_settles_cancelled() {
+    let workspace = slow_policy_project();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+
+    let created = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert_eq!(created["result"]["resultType"], "task", "{created}");
+    let task_id = created["result"]["taskId"]
+        .as_str()
+        .expect("taskId")
+        .to_string();
+
+    // Cancel immediately: the task is still waiting for the cold snapshot
+    // build, so cancellation lands during readiness or admission.
+    let ack = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tasks/cancel",
+            "params": { "taskId": task_id }
+        }),
+    );
+    assert!(ack["error"].is_null(), "{ack}");
+
+    let terminal = poll_task_until_terminal(&mut stdin, &mut reader, &mut stderr, &task_id, 10);
+    assert_eq!(terminal["result"]["status"], "cancelled", "{terminal}");
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2006: an expired task is observed as terminal `failed`; the TTL is
+/// also the execution deadline, so the analyzer work stops rather than
+/// running on behind a dead handle.
+#[test]
+fn mcp_tasks_expire_to_failed() {
+    let workspace = slow_policy_project();
+    let mut child = mcp_server_command(workspace.root(), "searchtools", &[])
+        .env("BIFROST_MCP_TASK_TTL_MS", "300")
+        .spawn()
+        .expect("spawn bifrost");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+
+    let created = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert_eq!(created["result"]["resultType"], "task", "{created}");
+    assert_eq!(created["result"]["ttlMs"], 300, "{created}");
+    let task_id = created["result"]["taskId"]
+        .as_str()
+        .expect("taskId")
+        .to_string();
+
+    // The 300-file cold build cannot finish in 300 ms; the task must be
+    // observed as failed, not left working forever.
+    let terminal = poll_task_until_terminal(&mut stdin, &mut reader, &mut stderr, &task_id, 10);
+    assert_eq!(terminal["result"]["status"], "failed", "{terminal}");
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2006: unknown task ids fail safely.
+#[test]
+fn mcp_tasks_unknown_ids_fail_safely() {
+    let workspace = InlineTestProject::new()
+        .file("Anything.java", "class Anything {}\n")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+
+    for (id, method) in [(1, "tasks/get"), (2, "tasks/update"), (3, "tasks/cancel")] {
+        let mut params = json!({ "taskId": "no-such-task" });
+        if method == "tasks/update" {
+            params["inputResponses"] = json!({});
+        }
+        let refused = round_trip(
+            &mut stdin,
+            &mut reader,
+            &mut stderr,
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+        );
+        assert!(
+            !refused["error"].is_null(),
+            "{method} with an unknown id must fail safely: {refused}"
+        );
+    }
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Issue #2006: a task handle is bound to the workspace authorization it was
+/// created under. After the client revokes its roots, polling the old handle
+/// is refused -- the handle must never carry results across a workspace
+/// boundary, even though the task itself completed before the revocation.
+#[test]
+fn mcp_tasks_handles_die_with_workspace_rebinding() {
+    let plugin_dir = TempDir::new().expect("plugin dir");
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", MCP_POLICY_APP)
+        .file("policies/dynamic-eval.rqlp", MCP_DYNAMIC_EVAL_POLICY)
+        .build();
+    let workspace_uri = url::Url::from_directory_path(workspace.root())
+        .expect("workspace file URI")
+        .to_string();
+
+    let mut child = spawn_rootless_server(plugin_dir.path(), "workspace|symbol|extended");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+
+    // Rootless 2026-07-28 binding goes through MRTR: the first call is
+    // answered with a roots activation, and the retry that carries the roots
+    // is the call that becomes the task.
+    let activation = round_trip(&mut stdin, &mut reader, &mut stderr, run_policy_request(1));
+    assert_eq!(
+        activation["result"]["resultType"], "input_required",
+        "{activation}"
+    );
+    let request_state = activation["result"]["requestState"]
+        .as_str()
+        .expect("requestState")
+        .to_string();
+    let mut retry = run_policy_request(2);
+    retry["params"]["requestState"] = json!(request_state);
+    retry["params"]["inputResponses"] = json!({ "roots": { "roots": [{ "uri": workspace_uri }] } });
+    let created = round_trip(&mut stdin, &mut reader, &mut stderr, retry);
+    assert_eq!(
+        created["result"]["resultType"], "task",
+        "an MRTR retry from a capable client must still task-ify: {created}"
+    );
+    let task_id = created["result"]["taskId"]
+        .as_str()
+        .expect("taskId")
+        .to_string();
+    let terminal = poll_task_until_terminal(&mut stdin, &mut reader, &mut stderr, &task_id, 10);
+    assert_eq!(terminal["result"]["status"], "completed", "{terminal}");
+
+    // The client withdraws its roots. The next tool call proves the
+    // revocation landed (the server is unbound again and starts a fresh MRTR
+    // round), and the old handle must now be dead.
+    write_line(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "method": "notifications/roots/list_changed" }),
+    );
+    let reactivation = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 40,
+            "method": "tools/call",
+            "params": { "name": "search_symbols", "arguments": { "patterns": ["handler"] } }
+        }),
+    );
+    assert_eq!(
+        reactivation["result"]["resultType"], "input_required",
+        "the roots change must unbind the workspace: {reactivation}"
+    );
+
+    let refused = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tasks/get",
+            "params": { "taskId": task_id }
+        }),
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("workspace authorization was revoked")),
+        "a rebound workspace must kill outstanding handles: {refused}"
+    );
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
 fn assert_codex_metadata_cannot_bind_before_initialize(
     cwd: &std::path::Path,
     sandbox_root: &std::path::Path,

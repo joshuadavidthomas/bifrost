@@ -31,12 +31,15 @@ use crate::{
     searchtools_render::RenderOptions,
 };
 use rmcp::model::{
-    Annotations, CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-    CustomRequest, CustomResult, ErrorData, Implementation, InitializeRequestParams,
-    InitializeResult, ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
+    Annotations, CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult,
+    CancelTaskParams, ContentBlock, CreateTaskResult, CustomRequest, CustomResult, ErrorData,
+    GetTaskParams, GetTaskResult, Implementation, InitializeRequestParams, InitializeResult,
+    ListResourcesResult, ListToolsResult, MetaObject, PaginatedRequestParams,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, Role, ServerCapabilities, ServerInfo, Tool,
+    ResourceContents, Role, ServerCapabilities, ServerInfo, TASKS_EXTENSION_ID, Tool,
+    UpdateTaskParams,
 };
+use rmcp::task_manager::{TaskContext, TaskExit, TaskManager, TaskOptions};
 // MCP 2026-07-28 deprecates Roots wholesale (SEP-2577) without yet shipping a
 // replacement for "which directory may this server analyze". Bifrost's whole
 // security model depends on that answer, and every client Bifrost is
@@ -513,6 +516,89 @@ impl Drop for InFlightGuard {
 /// `inputResponses` of an MRTR retry.
 const ROOTS_INPUT_REQUEST_KEY: &str = "roots";
 
+/// Env var overriding the MCP task TTL in whole milliseconds.
+///
+/// Exists so the expiry behavior test can use a tiny TTL instead of waiting
+/// out the default. Operators can also raise it for very large corpora.
+#[doc(hidden)]
+pub const MCP_TASK_TTL_ENV: &str = "BIFROST_MCP_TASK_TTL_MS";
+
+/// How long a task may run and how long its terminal result stays pollable.
+///
+/// Tasks exist precisely because the interactive request budget is wrong for
+/// batch work, so they get their own bound: large policy runs fit in ten
+/// minutes, and rmcp's manager additionally retains the terminal result for
+/// one further TTL window so a poller always gets to observe it. The TTL is
+/// also the execution deadline -- the task's cancellation token expires at
+/// `created + ttl` -- so "the manager marks the task failed" and "the
+/// analyzer actually stops" are the same moment, not two drifting timers.
+const DEFAULT_TASK_TTL: Duration = Duration::from_secs(600);
+
+/// Suggested `tasks/get` polling interval advertised on every task handle.
+const TASK_POLL_INTERVAL_MS: u64 = 1_000;
+
+/// The tools eligible for durable task execution.
+///
+/// Deliberately narrow: `run_policy` is the one registry tool whose runtime
+/// scales with the whole corpus times the policy count, which is the batch
+/// shape MCP Tasks exists for. Navigation tools stay synchronous by design --
+/// waiting out cold initialization is the intended readiness model, not a
+/// reason to hand back a task handle.
+fn task_eligible_tool(name: &str) -> bool {
+    name == "run_policy"
+}
+
+fn mcp_task_ttl() -> Duration {
+    match std::env::var(MCP_TASK_TTL_ENV) {
+        Err(std::env::VarError::NotPresent) => DEFAULT_TASK_TTL,
+        Ok(value) => match value.parse::<u64>() {
+            Ok(millis) if millis >= 1 => Duration::from_millis(millis),
+            _ => {
+                eprintln!(
+                    "bifrost: {MCP_TASK_TTL_ENV} must be a whole number of milliseconds >= 1, not `{value}`; using the default {DEFAULT_TASK_TTL:?}"
+                );
+                DEFAULT_TASK_TTL
+            }
+        },
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!(
+                "bifrost: {MCP_TASK_TTL_ENV} is not valid unicode; using the default {DEFAULT_TASK_TTL:?}"
+            );
+            DEFAULT_TASK_TTL
+        }
+    }
+}
+
+/// Workspace authorization records for issued task handles.
+///
+/// Each task is bound at creation to the workspace generation it was
+/// authorized under; every later `tasks/*` call re-checks that generation, so
+/// a handle can never cross a workspace rebind. Entries expire on the same
+/// clock as rmcp's own terminal retention (two TTL windows past creation) and
+/// are swept opportunistically, which bounds the map without a background
+/// sweeper -- the same policy `rmcp::task_manager::TaskManager` applies to
+/// the tasks themselves.
+#[derive(Default)]
+struct TaskScopes {
+    entries: Mutex<HashMap<String, (WorkspaceRequestScope, Instant)>>,
+}
+
+impl TaskScopes {
+    fn record(&self, task_id: String, scope: WorkspaceRequestScope, ttl: Duration) {
+        let mut entries = self.entries.lock().expect("task scope lock poisoned");
+        let now = Instant::now();
+        entries.retain(|_, (_, expires_at)| *expires_at > now);
+        entries.insert(task_id, (scope, now + ttl + ttl));
+    }
+
+    fn lookup(&self, task_id: &str) -> Option<WorkspaceRequestScope> {
+        let mut entries = self.entries.lock().expect("task scope lock poisoned");
+        let now = Instant::now();
+        entries.retain(|_, (_, expires_at)| *expires_at > now);
+        entries.get(task_id).map(|(scope, _)| *scope)
+    }
+}
+
 /// How many roots activations may be outstanding at once.
 ///
 /// A client that asks for activation and never retries must not grow server
@@ -637,8 +723,17 @@ pub struct BifrostMcpHandler {
     tools: Vec<Tool>,
     tool_names: HashSet<String>,
     render_options: McpRenderOptions,
-    analyzer_pool: AnalyzerExecutionPool,
+    /// Shared with task futures, which are `'static` and must own their
+    /// admission path: a task queues for a real analyzer slot exactly like a
+    /// synchronous call, so tasks cannot overcommit the analyzer.
+    analyzer_pool: Arc<AnalyzerExecutionPool>,
     in_flight: Arc<InFlightRequests>,
+    /// Durable state for the MCP Tasks extension (SEP-2663). rmcp owns the
+    /// lifecycle (TTL expiry, terminal retention, input routing, cancel
+    /// signals); Bifrost supplies the operation future and the workspace
+    /// authorization policy in [`TaskScopes`].
+    task_manager: TaskManager,
+    task_scopes: TaskScopes,
     roots_activations: RootsActivations,
     roots_revocations: Arc<RootsRevocations>,
     /// Shared with [`ResponseTimingTransport`]: the handler arms a response's
@@ -699,8 +794,10 @@ impl BifrostMcpHandler {
             tools,
             tool_names,
             render_options,
-            analyzer_pool: AnalyzerExecutionPool::default(),
+            analyzer_pool: Arc::new(AnalyzerExecutionPool::default()),
             in_flight: Arc::new(InFlightRequests::default()),
+            task_manager: TaskManager::new(),
+            task_scopes: TaskScopes::default(),
             roots_activations: RootsActivations::default(),
             roots_revocations,
             response_timings,
@@ -1333,6 +1430,100 @@ impl BifrostMcpHandler {
         }
     }
 
+    /// Materialize one eligible tool call as a durable task (SEP-2663).
+    ///
+    /// The handle is pollable via `tasks/get` before this returns -- rmcp's
+    /// manager inserts the entry ahead of spawning the operation -- and the
+    /// operation itself reuses the synchronous path's semantics under
+    /// task-mode bounds (see [`run_tool_as_task`]).
+    fn create_tool_task(
+        &self,
+        name: String,
+        arguments: Value,
+        workspace_scope: WorkspaceRequestScope,
+        request_correlation_id: Option<String>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        // Bounded storage: tie the number of live tasks to the analyzer
+        // backlog allowance rather than inventing a second knob. The task
+        // future still queues for a real analyzer permit, so this only
+        // bounds bookkeeping, not analyzer pressure.
+        if self.task_manager.running_task_count() >= MAX_QUEUED_ANALYZER_REQUESTS {
+            eprintln!(
+                "bifrost: refusing a task for {name}; {MAX_QUEUED_ANALYZER_REQUESTS} tasks are already running"
+            );
+            return Err(ErrorData::internal_error(
+                format!(
+                    "too many analyzer tasks are running; retry {name} once earlier tasks complete"
+                ),
+                None,
+            ));
+        }
+
+        let ttl = mcp_task_ttl();
+        let service = Arc::clone(&self.service);
+        let analyzer_pool = Arc::clone(&self.analyzer_pool);
+        let in_flight = Arc::clone(&self.in_flight);
+        let render_options = RenderOptions {
+            render_line_numbers: self.render_options.render_line_numbers,
+        };
+        let task_name = name.clone();
+        let task = self.task_manager.spawn(
+            TaskOptions::new()
+                .with_ttl_ms(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX))
+                .with_poll_interval_ms(TASK_POLL_INTERVAL_MS)
+                .with_status_message(format!("{name}: created")),
+            move |task_context| {
+                Box::pin(run_tool_as_task(
+                    service,
+                    analyzer_pool,
+                    in_flight,
+                    render_options,
+                    task_name,
+                    arguments,
+                    workspace_scope,
+                    ttl,
+                    request_correlation_id,
+                    task_context,
+                ))
+            },
+        );
+        self.task_scopes
+            .record(task.task_id.clone(), workspace_scope, ttl);
+        eprintln!(
+            "bifrost: created MCP task tool={name} task_id={}",
+            escape_terminal_text(&task.task_id)
+        );
+        Ok(CallToolResponse::Task(CreateTaskResult::new(task)))
+    }
+
+    /// Refuse any task operation whose handle predates the current workspace
+    /// authorization.
+    ///
+    /// The scope map records the workspace generation each task was created
+    /// under; a differing current generation means the client rebound or
+    /// revoked its workspace, and the handle must never carry results across
+    /// that boundary. An unknown handle falls through so rmcp's manager can
+    /// answer with its own unknown-task error, which leaks nothing about
+    /// whether the id ever existed here.
+    fn check_task_authorization(&self, task_id: &str) -> Result<(), ErrorData> {
+        let Some(scope) = self.task_scopes.lookup(task_id) else {
+            return Ok(());
+        };
+        if scope.generation != self.service.workspace_generation() {
+            // Stop the underlying work before refusing. A handle that is
+            // already terminal has nothing left to stop; the manager's error
+            // says so and does not change the refusal.
+            if let Err(error) = self.task_manager.cancel_task(task_id) {
+                eprintln!(
+                    "bifrost: revoked task {} was already settled: {error}",
+                    escape_terminal_text(task_id)
+                );
+            }
+            return Err(workspace_revoked_error());
+        }
+        Ok(())
+    }
+
     fn build_identity_meta(&self) -> MetaObject {
         let mut meta = MetaObject::new();
         meta.0.insert(
@@ -1356,6 +1547,180 @@ enum PreparedToolCall {
         workspace_scope: Option<WorkspaceRequestScope>,
     },
     Reply(CallToolResult),
+}
+
+/// The operation behind one durable task: the synchronous execution path's
+/// semantics -- readiness wait, analyzer admission, blocking execution,
+/// workspace-generation re-checks -- under task-mode bounds.
+///
+/// The TTL is the deadline: the Bifrost cancellation token expires at
+/// `created + ttl`, the same moment rmcp's manager would mark an unfinished
+/// task `failed`, so the analyzer actually stops when the handle dies.
+/// `tasks/cancel` is bridged into the same token, and the in-flight
+/// registration means a workspace rebind cancels this work exactly as it
+/// cancels a synchronous call's. Guards move into the blocking closure so
+/// the registration and the bridge outlive a timed-out future for as long as
+/// the blocking work is still unwinding, mirroring `execute_tool`.
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_as_task(
+    service: Arc<SearchToolsService>,
+    analyzer_pool: Arc<AnalyzerExecutionPool>,
+    in_flight: Arc<InFlightRequests>,
+    render_options: RenderOptions,
+    name: String,
+    arguments: Value,
+    workspace_scope: WorkspaceRequestScope,
+    ttl: Duration,
+    request_correlation_id: Option<String>,
+    task_context: TaskContext,
+) -> Result<CallToolResult, TaskExit> {
+    let deadline = Instant::now() + ttl;
+    let cancellation = crate::CancellationToken::default().with_deadline(deadline);
+
+    // tasks/cancel flows into both cancellation domains: the async token
+    // unparks admission waits, the Bifrost token stops the analyzer.
+    let cancel_ct = McpCancellationToken::new();
+    let finished = McpCancellationToken::new();
+    let finished_guard = finished.clone().drop_guard();
+    {
+        let cancel_ct = cancel_ct.clone();
+        let bifrost = cancellation.clone();
+        let observed = task_context.clone();
+        let finished = finished.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = observed.cancelled() => {
+                    cancel_ct.cancel();
+                    bifrost.cancel();
+                }
+                () = finished.cancelled() => {}
+            }
+        });
+    }
+
+    let in_flight_guard = in_flight.register(workspace_scope, cancellation.clone());
+
+    task_context.set_status_message(format!("{name}: waiting for workspace readiness"));
+    let readiness_service = Arc::clone(&service);
+    let readiness_cancellation = cancellation.clone();
+    tokio::task::spawn_blocking(move || {
+        readiness_service
+            .wait_workspace_ready_until(&|| readiness_cancellation.is_cancelled(), Some(deadline))
+    })
+    .await
+    .map_err(|error| {
+        TaskExit::Error(ErrorData::internal_error(
+            format!("task readiness wait panicked: {error}"),
+            None,
+        ))
+    })?
+    .map_err(|error| task_exit(&task_context, map_service_error(error.code, error.message)))?;
+
+    task_context.set_status_message(format!("{name}: waiting for analyzer admission"));
+    let admission = tokio::time::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        analyzer_pool.acquire(&cancel_ct),
+    )
+    .await;
+    let permit = match admission {
+        Ok(Admission::Granted(permit)) => permit,
+        Ok(Admission::Cancelled) => return Err(TaskExit::Cancelled),
+        Ok(Admission::Saturated) => {
+            return Err(TaskExit::Error(ErrorData::internal_error(
+                format!(
+                    "too many analyzer requests are queued; retry {name} once earlier calls complete"
+                ),
+                None,
+            )));
+        }
+        Err(_elapsed) => {
+            return Err(TaskExit::Error(ErrorData::internal_error(
+                format!("{name} exhausted its {ttl:?} task TTL waiting for analyzer capacity"),
+                None,
+            )));
+        }
+    };
+
+    // Admission can take arbitrarily long; do not spend a slot on a scope the
+    // client has since revoked.
+    if service.workspace_generation() != workspace_scope.generation {
+        return Err(TaskExit::Error(workspace_revoked_error()));
+    }
+
+    task_context.set_status_message(format!("{name}: executing"));
+    let execution_service = Arc::clone(&service);
+    let execution_cancellation = cancellation.clone();
+    let execution_name = name.clone();
+    let mut output = tokio::task::spawn_blocking(move || {
+        // Held until cooperative cancellation has actually unwound the
+        // blocking work: the analyzer slot, the revocation registration, and
+        // the cancel bridge must not disappear while the scan still runs.
+        let _permit = permit;
+        let _in_flight = in_flight_guard;
+        let _finished_guard = finished_guard;
+        let output = execution_service.call_tool_output_with_cancellation(
+            &execution_name,
+            arguments,
+            render_options,
+            Some(&execution_cancellation),
+        )?;
+        Ok::<_, crate::SearchToolsServiceError>(if execution_name == "run_policy" {
+            attach_run_policy_correlation(output, request_correlation_id.as_deref())
+        } else {
+            output
+        })
+    });
+    let output = tokio::select! {
+        output = &mut output => output.map_err(|error| {
+            TaskExit::Error(ErrorData::internal_error(
+                format!("MCP task execution panicked: {error}"),
+                None,
+            ))
+        })?,
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+            cancellation.cancel();
+            return Err(task_exit(
+                &task_context,
+                ErrorData::internal_error(
+                    format!("{name} exhausted its {ttl:?} task TTL; cancellation continues in the background"),
+                    None,
+                ),
+            ));
+        }
+    };
+
+    // The result must never leak a scope the client revoked mid-run.
+    if service.workspace_generation() != workspace_scope.generation {
+        return Err(TaskExit::Error(workspace_revoked_error()));
+    }
+
+    match output {
+        Ok(output) => Ok(tool_success_result(output)),
+        Err(error) if error.code == SearchToolsServiceErrorCode::UnknownTool => {
+            Ok(tool_error_result(error.message))
+        }
+        Err(error) => Err(task_exit(
+            &task_context,
+            map_service_error(error.code, error.message),
+        )),
+    }
+}
+
+/// Settle as `cancelled` when the failure is the client's own `tasks/cancel`
+/// unwinding the work, and as `failed` with the error otherwise.
+fn task_exit(task_context: &TaskContext, error: ErrorData) -> TaskExit {
+    if task_context.is_cancel_requested() {
+        TaskExit::Cancelled
+    } else {
+        TaskExit::Error(error)
+    }
+}
+
+fn workspace_revoked_error() -> ErrorData {
+    ErrorData::invalid_params(
+        "the task's workspace authorization was revoked; the handle is no longer valid",
+        None,
+    )
 }
 
 fn tool_success_result(output: crate::ToolOutput) -> CallToolResult {
@@ -1488,6 +1853,18 @@ fn agents_guidance_resource() -> Resource {
         )
 }
 
+impl BifrostMcpHandler {
+    /// Whether this server offers durable task execution (SEP-2663).
+    ///
+    /// Only the single-workspace host does. Named-workspace mode is excluded
+    /// to keep the initial contract narrow; adding it later means recording
+    /// the named workspace id in the task's scope, which
+    /// [`WorkspaceRequestScope`] already carries.
+    fn tasks_active(&self) -> bool {
+        self.named_workspaces.is_none()
+    }
+}
+
 impl ServerHandler for BifrostMcpHandler {
     fn get_info(&self) -> ServerInfo {
         let mut info = InitializeResult::new(
@@ -1498,6 +1875,16 @@ impl ServerHandler for BifrostMcpHandler {
         )
         .with_server_info(Implementation::new("bifrost", env!("CARGO_PKG_VERSION")))
         .with_instructions(self.instructions.clone());
+        if self.tasks_active() {
+            // Advertised only while the complete contract is live: eligible
+            // tools return task handles and tasks/get, tasks/update, and
+            // tasks/cancel are all served. `server/discover` and `initialize`
+            // both derive from this, so both entry paths see it.
+            info.capabilities
+                .extensions
+                .get_or_insert_with(Default::default)
+                .insert(TASKS_EXTENSION_ID.to_string(), serde_json::Map::new());
+        }
         info.meta = Some(self.build_identity_meta());
         info
     }
@@ -1747,6 +2134,26 @@ impl ServerHandler for BifrostMcpHandler {
         // calls.
         let _serial_guard = serial.then_some(state).flatten();
 
+        // Durable task execution (SEP-2663) for eligible batch tools. The
+        // decision is server-directed and deterministic: a capable
+        // `2026-07-28` request calling an eligible tool gets a task handle,
+        // everyone else keeps the synchronous path -- rmcp's dispatch
+        // additionally refuses a task-shaped response to a client that never
+        // declared the capability. Argument validation and workspace
+        // authorization already happened above, synchronously, so a
+        // malformed call fails immediately instead of parking its error
+        // inside a task the client must poll to discover.
+        if self.tasks_active()
+            && task_eligible_tool(&name)
+            && speaks_2026_07_28(&context)
+            && context
+                .client_capabilities()
+                .is_some_and(|capabilities| capabilities.supports_tasks())
+            && let Some(workspace_scope) = workspace_scope
+        {
+            return self.create_tool_task(name, arguments, workspace_scope, correlation_id);
+        }
+
         // Progress is opt-in per request: no `progressToken`, no reporter, no
         // notifications, no overhead. Workspace-activation rounds returned
         // above never report progress -- they are answers, not phases of an
@@ -1883,6 +2290,40 @@ impl ServerHandler for BifrostMcpHandler {
         self.response_timings
             .arm(context.id.clone(), name, correlation_id);
         Ok(response?.into())
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        self.check_task_authorization(&request.task_id)?;
+        Ok(GetTaskResult::new(
+            self.task_manager.get_task(&request.task_id)?,
+        ))
+    }
+
+    /// Bifrost issues no mid-task input requests yet, so every update
+    /// necessarily names a key that is not outstanding; rmcp's manager
+    /// answers accordingly. The method is still served so the extension
+    /// contract is complete.
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.check_task_authorization(&request.task_id)?;
+        self.task_manager
+            .update_task(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.check_task_authorization(&request.task_id)?;
+        self.task_manager.cancel_task(&request.task_id)
     }
 
     async fn on_custom_request(
