@@ -85,6 +85,7 @@ mod issue_2027_php_qualified_ancestry;
 mod issue_2028_2084_symbolic_reference_site;
 mod issue_2038_typescript_export_alias;
 mod issue_2047_java_nested_plain_type_names;
+mod issue_2049_java_class_interface_member_precedence;
 mod issue_2058_python_literal_annotation_values;
 mod issue_2092_c_this_binding;
 mod issue_2093_c_ordinary_macro_references;
