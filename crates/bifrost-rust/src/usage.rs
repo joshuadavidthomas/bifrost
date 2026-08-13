@@ -1686,7 +1686,7 @@ pub fn usage_reference_at(
                             file,
                             byte,
                             seeds,
-                            resolved_fqn,
+                            &resolved_fqn,
                             &[],
                             namespace,
                         )

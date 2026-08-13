@@ -21,7 +21,6 @@ use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use tree_sitter::Node;
 
 /// Owned, query-shaped declaration access used by Rust forward resolution.
@@ -45,11 +44,11 @@ pub trait RustDefinitionProvider {
         true
     }
 
-    fn forward_reference_context(
-        &self,
-        rust: &dyn RustFactSource,
+    fn forward_reference_context<'r>(
+        &'r self,
+        rust: &'r dyn RustFactSource,
         file: &ProjectFile,
-    ) -> Option<Arc<RustReferenceContext>> {
+    ) -> Option<RustReferenceContext<'r>> {
         Some(rust.forward_reference_context_of(file))
     }
 
@@ -115,12 +114,11 @@ pub struct RustGraphSeeds {
 
 pub fn resolve_rust_path_fqn(
     rust: &dyn RustFactSource,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     full_path: &str,
 ) -> Option<String> {
     refs.resolve_bare(full_path)
-        .map(str::to_string)
         .or_else(|| refs.resolve_scoped_owner(full_path))
         .or_else(|| resolve_module_package(rust, file, full_path))
 }
@@ -148,7 +146,7 @@ pub struct ResolvedRustTokenPathSegment<'tree> {
 pub fn resolve_rust_token_tree_paths<'tree>(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     source: &str,
     token_tree: Node<'tree>,
@@ -168,7 +166,7 @@ pub fn resolve_rust_token_tree_paths<'tree>(
 pub fn resolve_rust_token_tree_paths_admitting<'tree>(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     source: &str,
     token_tree: Node<'tree>,
@@ -203,7 +201,7 @@ pub fn resolve_rust_token_tree_paths_admitting<'tree>(
 fn resolve_token_tree_path_container<'tree>(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     source: &str,
     container: Node<'tree>,
@@ -371,7 +369,7 @@ fn resolve_direct_token_path_child(
 fn resolve_token_path_segment_fqn(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -454,7 +452,6 @@ pub fn lexical_import_fqn(
         forward
             .resolve_bare(name)
             .filter(|fqn| !support.fqn(fqn).is_empty())
-            .map(str::to_string)
     })
 }
 
@@ -1008,7 +1005,7 @@ fn rust_member_roles_match(
 pub fn resolve_scoped_associated_item(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     path: &str,
     method_name: &str,
@@ -1030,7 +1027,7 @@ pub fn resolve_scoped_associated_item(
 pub fn resolve_scoped_associated_item_matching(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     path: &str,
     item_name: &str,
@@ -1067,7 +1064,7 @@ pub fn resolve_scoped_associated_item_matching(
 pub fn resolve_owner_associated_item_matching(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     owner_fqn: &str,
     item_name: &str,
@@ -1104,7 +1101,7 @@ pub fn resolve_owner_associated_item_matching(
 pub fn resolve_exact_owner_associated_item_matching(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     owner: &CodeUnit,
     item_name: &str,
@@ -1148,7 +1145,7 @@ pub fn resolve_exact_owner_associated_item_matching(
 pub fn resolve_trait_associated_item(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     owner_fqn: &str,
     method_name: &str,
@@ -1170,7 +1167,7 @@ pub fn resolve_trait_associated_item(
 pub fn resolve_trait_associated_item_matching(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     owner_fqn: &str,
     item_name: &str,
@@ -1213,7 +1210,7 @@ pub fn resolve_trait_associated_item_matching(
 pub fn resolve_trait_associated_item_for_owner_matching(
     rust: &dyn RustFactSource,
     support: &dyn RustDefinitionProvider,
-    _refs: &RustReferenceContext,
+    _refs: &RustReferenceContext<'_>,
     file: &ProjectFile,
     owner: &CodeUnit,
     item_name: &str,
@@ -1290,21 +1287,34 @@ pub fn local_impl_target_importer_files(
     rust: &dyn RustFactSource,
     target: &CodeUnit,
 ) -> HashSet<ProjectFile> {
+    local_impl_target_importer_files_while(rust, target, &|| true).unwrap_or_default()
+}
+
+pub fn local_impl_target_importer_files_while(
+    rust: &dyn RustFactSource,
+    target: &CodeUnit,
+    keep_going: &(impl Fn() -> bool + Sync),
+) -> Option<HashSet<ProjectFile>> {
+    keep_going().then_some(())?;
     let Some(resolved_fqn) = imported_impl_target_fqn(rust, target) else {
-        return HashSet::default();
+        return Some(HashSet::default());
     };
     if rust.definitions(&resolved_fqn).next().is_some() {
-        return HashSet::default();
+        return Some(HashSet::default());
     }
 
-    rust.get_analyzed_files()
-        .into_iter()
-        .filter(|file| {
-            rust.reference_context_of(file)
-                .bare_names_resolving_to(&resolved_fqn)
-                .contains(target.identifier())
-        })
-        .collect()
+    let mut importers = HashSet::default();
+    for file in rust.get_analyzed_files() {
+        keep_going().then_some(())?;
+        let refs = rust.reference_context_of_with_progress(&file, keep_going)?;
+        if refs
+            .bare_names_resolving_to(&resolved_fqn)
+            .contains(target.identifier())
+        {
+            importers.insert(file);
+        }
+    }
+    Some(importers)
 }
 
 pub fn infer_graph_seeds(analyzer: &dyn RustFactSource, target: &CodeUnit) -> RustGraphSeeds {

@@ -72,7 +72,7 @@ pub(crate) use brokk_bifrost_rust::imports::{
     rust_crate_root_package, rust_focused_use_path,
 };
 use brokk_bifrost_rust::test_detection::detect_rust_test_assertion_smells;
-use cache::{weight_export_index, weight_reference_context};
+use cache::weight_export_index;
 use clones::build_rust_clone_candidate_data;
 pub use dependency_discovery::resolve_rust_semantic_pack_dependencies;
 pub use external::RustDependencyPackAdapter;
@@ -109,8 +109,6 @@ pub struct RustAnalyzer {
     memo_budget: u64,
     imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
-    reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
-    forward_reference_contexts: Cache<ProjectFile, Arc<RustReferenceContext>>,
     export_indexes: Cache<ProjectFile, Arc<crate::analyzer::usages::ExportIndex>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     // PoolSafeMemo, not OnceLock: the build hydrates and parses every file on
@@ -122,6 +120,8 @@ pub struct RustAnalyzer {
     /// the export name being resolved, so this count is what proves the
     /// per-export-name recomputation is gone (#1230 item 4).
     module_file_resolution_count: Arc<AtomicUsize>,
+    export_name_canonicalization_count: Arc<AtomicUsize>,
+    scanned_candidate_file_count: Arc<AtomicUsize>,
     /// Files the Cargo-route build had to parse because their blob carried no
     /// persisted module-route rows (#1793).
     module_route_fact_fallback_count: Arc<AtomicUsize>,
@@ -304,6 +304,39 @@ impl RustAnalyzer {
     #[doc(hidden)]
     pub fn module_file_resolution_count_for_test(&self) -> usize {
         self.module_file_resolution_count.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn note_export_name_canonicalization(&self) {
+        self.export_name_canonicalization_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn reset_export_name_canonicalization_count_for_test(&self) {
+        self.export_name_canonicalization_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn export_name_canonicalization_count_for_test(&self) -> usize {
+        self.export_name_canonicalization_count
+            .load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_scanned_candidate_file(&self) {
+        self.scanned_candidate_file_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn reset_scanned_candidate_file_count_for_test(&self) {
+        self.scanned_candidate_file_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[doc(hidden)]
+    pub fn scanned_candidate_file_count_for_test(&self) -> usize {
+        self.scanned_candidate_file_count.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]
@@ -524,16 +557,13 @@ impl RustAnalyzer {
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
-            forward_reference_contexts: build_weighted_cache(
-                memo_budget / 8,
-                weight_reference_context,
-            ),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
+            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
+            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
@@ -563,16 +593,13 @@ impl RustAnalyzer {
             memo_budget,
             imported_code_units: build_weighted_cache(memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
-            reference_contexts: build_weighted_cache(memo_budget / 8, weight_reference_context),
-            forward_reference_contexts: build_weighted_cache(
-                memo_budget / 8,
-                weight_reference_context,
-            ),
             export_indexes: build_weighted_cache(memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
+            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
+            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(memo_budget / 8, weight_declaration_facts),
@@ -624,8 +651,9 @@ impl TypeAliasProvider for RustAnalyzer {
     }
 }
 
-/// The analyzer is the only owner of the lazy cells, so it is the only
-/// implementor of the source traits the Rust language logic is written against.
+/// The analyzer owns the retained bounded indexes, so it is the only implementor
+/// of the source traits the Rust language logic is written against. Reference
+/// contexts themselves are query-scoped views over these indexes.
 /// Every method here forwards to an inherent accessor; inherent methods win
 /// name resolution, so these bodies do not recurse.
 impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
@@ -669,6 +697,10 @@ impl brokk_bifrost_rust::graph_support::RustSource for RustAnalyzer {
 
     fn note_module_file_resolution(&self) {
         self.note_module_file_resolution();
+    }
+
+    fn note_export_name_canonicalization(&self) {
+        self.note_export_name_canonicalization();
     }
 }
 
@@ -741,28 +773,28 @@ impl RustFactSource for RustAnalyzer {
         self.ensure_rust_facts_caught_up();
     }
 
-    fn reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
+    fn reference_context_of<'a>(&'a self, file: &ProjectFile) -> RustReferenceContext<'a> {
         self.reference_context_of(file)
     }
 
-    fn reference_context_of_with_progress(
-        &self,
+    fn reference_context_of_with_progress<'a>(
+        &'a self,
         file: &ProjectFile,
-        progress: &dyn Fn() -> bool,
-    ) -> Option<Arc<RustReferenceContext>> {
-        self.reference_context_of_with_progress(file, progress)
+        progress: &'a dyn Fn() -> bool,
+    ) -> Option<RustReferenceContext<'a>> {
+        progress().then(|| self.reference_context_of_while(file, progress))
     }
 
-    fn forward_reference_context_of(&self, file: &ProjectFile) -> Arc<RustReferenceContext> {
+    fn forward_reference_context_of<'a>(&'a self, file: &ProjectFile) -> RustReferenceContext<'a> {
         self.forward_reference_context_of(file)
     }
 
-    fn forward_reference_context_of_with_progress(
-        &self,
+    fn forward_reference_context_of_with_progress<'a>(
+        &'a self,
         file: &ProjectFile,
-        progress: &dyn Fn() -> bool,
-    ) -> Option<Arc<RustReferenceContext>> {
-        self.forward_reference_context_of_with_progress(file, progress)
+        progress: &'a dyn Fn() -> bool,
+    ) -> Option<RustReferenceContext<'a>> {
+        progress().then(|| self.forward_reference_context_of_while(file, progress))
     }
 }
 
@@ -1017,19 +1049,13 @@ impl IAnalyzer for RustAnalyzer {
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            reference_contexts: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_reference_context,
-            ),
-            forward_reference_contexts: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_reference_context,
-            ),
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
+            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
+            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
@@ -1046,19 +1072,13 @@ impl IAnalyzer for RustAnalyzer {
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(self.memo_budget / 4, weight_code_unit_set),
             referencing_files: build_weighted_cache(self.memo_budget / 8, weight_project_file_set),
-            reference_contexts: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_reference_context,
-            ),
-            forward_reference_contexts: build_weighted_cache(
-                self.memo_budget / 8,
-                weight_reference_context,
-            ),
             export_indexes: build_weighted_cache(self.memo_budget / 8, weight_export_index),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
             cargo_routes: Arc::new(PoolSafeMemo::new()),
             package_file_index: Arc::new(OnceLock::new()),
             module_file_resolution_count: Arc::new(AtomicUsize::new(0)),
+            export_name_canonicalization_count: Arc::new(AtomicUsize::new(0)),
+            scanned_candidate_file_count: Arc::new(AtomicUsize::new(0)),
             module_route_fact_fallback_count: Arc::new(AtomicUsize::new(0)),
             rust_usage_facts: build_weighted_cache(self.memo_budget / 8, weight_rust_usage_facts),
             declaration_facts: build_weighted_cache(self.memo_budget / 8, weight_declaration_facts),
@@ -1356,8 +1376,7 @@ impl LanguageSupport for RustSupport {
         ))
     }
 
-    /// Pre-build the lazily constructed Rust usage/re-export index (plus the
-    /// cargo route index it depends on) and the per-file reference contexts.
+    /// Pre-build persisted Rust usage facts and the Cargo route index.
     /// These are otherwise charged to whichever request first touches the Rust
     /// usage graph, which can push a single interactive `scan_usages` call
     /// past its wall-clock budget on a large workspace (issue #1416). A no-op

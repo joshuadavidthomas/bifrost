@@ -12,7 +12,9 @@ use crate::analyzer::rust::{
 };
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::ImportKind;
-use crate::analyzer::usages::common::{reclassify_import_hit_at, same_node};
+use crate::analyzer::usages::common::{
+    classify_recursive_hits, reclassify_import_hit_at, same_node,
+};
 // Relocated to `brokk_bifrost_rust::graph::ast` with the inverted pass (W7): the
 // five helpers it needed from this file and `hits.rs` are pure AST readers, and
 // this file is parked on the definition route's `RustTypeLookupCache`.
@@ -22,7 +24,7 @@ use crate::analyzer::usages::get_definition::{
     rust_is_type_definition, rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
-use crate::analyzer::usages::model::UsageHit;
+use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisOutcome;
 use crate::analyzer::usages::rust_graph::hits::{
     member_hit_enclosing, push_member_hit, push_self_receiver_member_hit, push_unproven_member_hit,
@@ -57,6 +59,7 @@ use brokk_bifrost_rust::usage_includes::RustIncludeRoutes;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tree_sitter::{Node, Parser, Tree};
 
 pub(super) fn effective_scan_files(
@@ -133,6 +136,35 @@ pub(super) fn effective_scan_files(
         .collect()
 }
 
+struct UsageCapStop {
+    proven_external_hits: AtomicUsize,
+    max_usages: usize,
+}
+
+impl UsageCapStop {
+    fn new(max_usages: usize) -> Self {
+        Self {
+            proven_external_hits: AtomicUsize::new(0),
+            max_usages,
+        }
+    }
+
+    fn reached(&self) -> bool {
+        self.proven_external_hits.load(Ordering::Relaxed) > self.max_usages
+    }
+
+    fn record(&self, hits: &BTreeSet<UsageHit>) {
+        let external = hits
+            .iter()
+            .filter(|hit| hit.kind.included_in(UsageHitSurface::ExternalUsages))
+            .count();
+        if external != 0 {
+            self.proven_external_hits
+                .fetch_add(external, Ordering::Relaxed);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn scan_files_for_target(
     analyzer: &dyn IAnalyzer,
@@ -141,10 +173,12 @@ pub(super) fn scan_files_for_target(
     target: &CodeUnit,
     seeds: Option<&RustBindingSeeds>,
     cancellation: Option<&CancellationToken>,
+    max_usages: usize,
 ) -> BTreeSet<UsageHit> {
     let target_fqn = target.fq_name();
     let support = analyzer.global_usage_definition_index();
     let hits = Mutex::new(BTreeSet::new());
+    let cap = UsageCapStop::new(max_usages);
     let files_vec: Vec<_> = files.into_iter().collect();
     // Shared across every file: the alias closure reachable from the target
     // roots. `effective_scan_files` already treats these names as the textual
@@ -158,9 +192,10 @@ pub(super) fn scan_files_for_target(
     // up front, keeps hits accumulating from the first file onward: a scan that
     // runs out of budget still reports the sites it proved.
     files_vec.par_iter().for_each(|file| {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        if cap.reached() || cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
+        rust.note_scanned_candidate_file();
         let Some(prepared) = rust.prepared_syntax(file) else {
             return;
         };
@@ -243,7 +278,9 @@ pub(super) fn scan_files_for_target(
             return;
         }
 
+        let local_hits = classify_recursive_hits(analyzer, local_hits, target);
         if !local_hits.is_empty() {
+            cap.record(&local_hits);
             let mut sink = hits.lock().expect("poisoned Rust graph collector");
             sink.extend(local_hits);
         }
@@ -258,7 +295,7 @@ pub(super) struct ScanCtx<'a> {
     pub(super) line_starts: &'a [usize],
     pub(super) analyzer: &'a dyn IAnalyzer,
     pub(super) rust: &'a RustAnalyzer,
-    pub(super) refs: &'a RustReferenceContext,
+    pub(super) refs: &'a RustReferenceContext<'a>,
     pub(super) support: &'a DefinitionIndexHandle<'a>,
     seeds: Option<&'a RustBindingSeeds>,
     target: &'a CodeUnit,
@@ -763,7 +800,7 @@ impl ScanCtx<'_> {
         }
         !shadowed
             && self.refs.resolve_bare(text).is_some_and(|fqn| {
-                self.matches_unique_visible_resolved_fqn_in_namespace(fqn, byte, namespace)
+                self.matches_unique_visible_resolved_fqn_in_namespace(&fqn, byte, namespace)
                     && self.authorize_exact_target_segments(&[text], byte, namespace, false)
             })
     }
@@ -903,7 +940,7 @@ impl ScanCtx<'_> {
         match namespace {
             RustReferenceNamespace::PathPrefix => {
                 if let [name] = segments {
-                    self.refs.resolve_bare(name).map(str::to_string)
+                    self.refs.resolve_bare(name)
                 } else {
                     self.refs.resolve_scoped_owner(&segments.join("::"))
                 }
@@ -914,7 +951,7 @@ impl ScanCtx<'_> {
             | RustReferenceNamespace::Any => {
                 let (name, prefix) = segments.split_last()?;
                 if prefix.is_empty() {
-                    self.refs.resolve_bare(name).map(str::to_string)
+                    self.refs.resolve_bare(name)
                 } else {
                     self.refs.resolve_scoped(&prefix.join("::"), name)
                 }
@@ -1404,6 +1441,7 @@ pub(super) fn scan_files_for_member_target(
     target: &CodeUnit,
     requested_target: &CodeUnit,
     cancellation: Option<&CancellationToken>,
+    max_usages: usize,
 ) -> RustMemberScanResult {
     let Some(owner) = rust
         .structural_parent_of(target)
@@ -1417,6 +1455,7 @@ pub(super) fn scan_files_for_member_target(
     let member_name = target.identifier().to_string();
     let hits = Mutex::new(BTreeSet::new());
     let unproven_hits = Mutex::new(BTreeSet::new());
+    let cap = UsageCapStop::new(max_usages);
     let support = analyzer.global_usage_definition_index();
     let constructor_returns = self_like_constructor_returns(rust, &support, &owner);
     let self_like_constructors = self_like_constructor_seeds(rust, &constructor_returns);
@@ -1426,9 +1465,10 @@ pub(super) fn scan_files_for_member_target(
     // up front, keeps hits accumulating from the first file onward: a scan that
     // runs out of budget still reports the sites it proved.
     files_vec.par_iter().for_each(|file| {
-        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        if cap.reached() || cancellation.is_some_and(CancellationToken::is_cancelled) {
             return;
         }
+        rust.note_scanned_candidate_file();
         let Some(prepared) = rust.prepared_syntax(file) else {
             return;
         };
@@ -1545,7 +1585,9 @@ pub(super) fn scan_files_for_member_target(
             return;
         }
 
+        let local_hits = classify_recursive_hits(analyzer, local_hits, requested_target);
         if !local_hits.is_empty() {
+            cap.record(&local_hits);
             let mut sink = hits.lock().expect("poisoned Rust member collector");
             sink.extend(local_hits);
         }
@@ -1575,7 +1617,7 @@ struct MemberScanCtx<'a> {
     analyzer: &'a dyn IAnalyzer,
     rust: &'a RustAnalyzer,
     support: &'a DefinitionIndexHandle<'a>,
-    refs: &'a RustReferenceContext,
+    refs: &'a RustReferenceContext<'a>,
     file: &'a ProjectFile,
     source: &'a str,
     root: Node<'a>,
@@ -3208,7 +3250,7 @@ fn structured_owner_candidate_fqn(
         .collect::<Option<Vec<_>>>()?;
     let (name, prefix) = names.split_last()?;
     let resolved = if prefix.is_empty() {
-        ctx.refs.resolve_bare(name).map(str::to_string)
+        ctx.refs.resolve_bare(name)
     } else {
         let path = prefix.join("::");
         ctx.refs.resolve_scoped(&path, name)
@@ -3479,7 +3521,7 @@ fn constructor_type_node_fqn(
     match type_node.kind() {
         "type_identifier" | "identifier" => {
             let name = simple_node_text(type_node, ctx.source)?;
-            refs.resolve_bare(&name).map(str::to_string)
+            refs.resolve_bare(&name)
         }
         "scoped_type_identifier" | "scoped_identifier" => {
             let path = type_node

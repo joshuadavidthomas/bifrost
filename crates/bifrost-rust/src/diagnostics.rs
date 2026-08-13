@@ -22,7 +22,7 @@
 //! implementations read retained analyzer state only.
 
 use crate::graph::ast::is_rust_declaration_name;
-use crate::graph_support::RustFactSource;
+use crate::graph_support::{RustFactSource, RustReferenceContext};
 use crate::proof::{RustNameProof, RustProofGap, record_rust_name_proof};
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,
@@ -170,8 +170,10 @@ pub fn collect_rust_semantic_diagnostics(
     let line_starts = compute_line_starts(source);
     let root = tree.root_node();
     let visible_uses = collect_rust_use_bindings(root, source);
+    let refs = rust.reference_context_of(file);
     let mut collector = RustDiagnosticCollector {
         rust,
+        refs,
         support,
         external,
         file,
@@ -188,6 +190,7 @@ pub fn collect_rust_semantic_diagnostics(
 
 struct RustDiagnosticCollector<'a, 'tree> {
     rust: &'a dyn RustFactSource,
+    refs: RustReferenceContext<'a>,
     support: &'a dyn BoundedDefinitionLookup,
     external: &'a dyn RustExternalEvidence,
     file: &'a ProjectFile,
@@ -398,8 +401,8 @@ impl RustDiagnosticCollector<'_, '_> {
         // context already resolves; everything else may leave the workspace.
         if is_crate_local_path(path_node, self.source) {
             let path = node_text(path_node, self.source).trim();
-            let refs = self.rust.reference_context_of(self.file);
-            let resolved = refs
+            let resolved = self
+                .refs
                 .resolve_scoped(path, name)
                 .is_some_and(|resolved| self.fqn_has_matching_declaration(&resolved, kind));
             let proof = if resolved {
@@ -424,8 +427,8 @@ impl RustDiagnosticCollector<'_, '_> {
         // A workspace sibling may still answer the path before any dependency
         // pack is consulted.
         let path = node_text(path_node, self.source).trim();
-        let refs = self.rust.reference_context_of(self.file);
-        if refs
+        if self
+            .refs
             .resolve_scoped(path, name)
             .is_some_and(|resolved| self.fqn_has_matching_declaration(&resolved, kind))
         {
@@ -496,9 +499,8 @@ impl RustDiagnosticCollector<'_, '_> {
             }
             return Some(RustNameProof::Workspace);
         }
-        let refs = self.rust.reference_context_of(self.file);
-        if let Some(resolved) = refs.resolve_bare(name)
-            && self.fqn_has_matching_declaration(resolved, kind)
+        if let Some(resolved) = self.refs.resolve_bare(name)
+            && self.fqn_has_matching_declaration(&resolved, kind)
         {
             return Some(RustNameProof::Workspace);
         }

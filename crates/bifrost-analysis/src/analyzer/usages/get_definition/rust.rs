@@ -94,14 +94,19 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
             .is_none_or(ResolutionSession::observe_cancellation)
     }
 
-    fn forward_reference_context(
-        &self,
-        rust: &dyn RustFactSource,
+    fn forward_reference_context<'r>(
+        &'r self,
+        rust: &'r dyn RustFactSource,
         file: &ProjectFile,
-    ) -> Option<std::sync::Arc<RustReferenceContext>> {
+    ) -> Option<RustReferenceContext<'r>> {
         match self.session {
-            Some(session) => rust.forward_reference_context_of_with_progress(file, &|| {
-                session.observe_cancellation()
+            Some(session) => session.observe_cancellation().then(|| {
+                RustReferenceContext::new(
+                    rust,
+                    file,
+                    true,
+                    Box::new(move || session.observe_cancellation()),
+                )
             }),
             None => Some(rust.forward_reference_context_of(file)),
         }
@@ -1234,7 +1239,7 @@ fn resolve_rust_unscoped(
                 return no_definition("cancelled", "Rust definition resolution was cancelled");
             };
             refs.resolve_bare(reference)
-                .map(|fqn| support.fqn(fqn))
+                .map(|fqn| support.fqn(&fqn))
                 .unwrap_or_default()
         };
         (resolved, false)
@@ -2120,7 +2125,7 @@ fn rust_scoped_glob_forward_import_candidates(
                     .reference_context_of(&target_file)
                     .resolve_bare(reference)
                     .into_iter()
-                    .flat_map(|fqn| support.fqn(fqn))
+                    .flat_map(|fqn| support.fqn(&fqn))
                     .filter(|candidate| rust_role_accepts_imported(rust, role, candidate))
                     .collect::<Vec<_>>();
                 if imported.is_empty() {
@@ -3123,7 +3128,7 @@ fn rust_scoped_owner_candidates_from_path(
     file: &ProjectFile,
     source: &str,
     path: Node<'_>,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
 ) -> Option<Vec<CodeUnit>> {
     let owner_text = rust_node_text(path, source).trim();
     if owner_text.is_empty() {
@@ -3848,7 +3853,7 @@ fn rust_owner_root_availability(
 fn rust_scoped_prefix_uses_module_package_fallback(
     rust: &RustAnalyzer,
     file: &ProjectFile,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     prefix: Node<'_>,
     source: &str,
 ) -> bool {
@@ -3875,7 +3880,7 @@ fn rust_focused_prefix_resolution_outcome(
     file: &ProjectFile,
     source: &str,
     site: &ResolvedReferenceSite,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     root: Node<'_>,
     focused_text: &str,
     focused_path: &str,
@@ -4322,13 +4327,13 @@ fn rust_extern_prelude_root(
     rust: &RustAnalyzer,
     support: &dyn RustDefinitionProvider,
     file: &ProjectFile,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     root: Node<'_>,
     root_name: &str,
 ) -> bool {
     matches!(root.kind(), "identifier" | "type_identifier")
         && refs.resolve_bare(root_name).is_none_or(|fqn| {
-            !support.fqn(fqn).into_iter().any(|candidate| {
+            !support.fqn(&fqn).into_iter().any(|candidate| {
                 rust_role_accepts_imported(rust, RustBareReferenceRole::Owner, &candidate)
             })
         })
@@ -4377,7 +4382,7 @@ fn rust_focused_nonterminal_prefix<'tree>(focused: Node<'tree>) -> Option<Node<'
 fn rust_scoped_prefix_fqn(
     rust: &RustAnalyzer,
     file: &ProjectFile,
-    refs: &RustReferenceContext,
+    refs: &RustReferenceContext<'_>,
     prefix: Node<'_>,
     source: &str,
 ) -> Option<String> {
@@ -4394,7 +4399,6 @@ fn rust_scoped_prefix_fqn(
         "identifier" | "type_identifier" => {
             let name = rust_node_text(prefix, source).trim();
             refs.resolve_bare(name)
-                .map(str::to_string)
                 .or_else(|| resolve_module_package(rust, file, name))
         }
         "crate" | "self" | "super" => {
@@ -6223,10 +6227,10 @@ pub(crate) fn rust_resolve_type_node_fqn(
             }
         } else if let Some(resolved) = refs.resolve_bare(name)
             && support
-                .fqn(resolved)
+                .fqn(&resolved)
                 .into_iter()
                 .any(|unit| rust_is_type_definition(analyzer, &unit))
-            && rust_type_fqn_visible_from_file(file, resolved)
+            && rust_type_fqn_visible_from_file(file, &resolved)
         {
             return Some(resolved.to_string());
         }
