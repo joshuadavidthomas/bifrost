@@ -3,9 +3,9 @@ use brokk_bifrost_analysis::Language;
 use brokk_bifrost_runtime::extension::{
     CodeQuery, ExtensionCancellation, ExtensionCompatibility, ExtensionCompletion, ExtensionError,
     ExtensionLimitValues, ExtensionLimits, ExtensionRequest, ExtensionResponse, ExtensionWorkspace,
-    ExtensionWorkspaceOptions, NormalizedRelativePath, SemanticDirection, SemanticRelationKind,
-    SemanticRelationRequest, SemanticRelationScope, SemanticSeed, SourceSpan, StructuralRequest,
-    decode_request_json, encode_request_json, encode_response_json,
+    ExtensionWorkspaceOptions, NormalizedRelativePath, SemanticDirection, SemanticRelationDetail,
+    SemanticRelationKind, SemanticRelationRequest, SemanticRelationScope, SemanticSeed, SourceSpan,
+    StructuralRequest, decode_request_json, encode_request_json, encode_response_json,
 };
 use serde_json::json;
 
@@ -184,6 +184,51 @@ fn semantic_control_dependence_preserves_typed_branch_evidence() {
                 .flat_map(|evidence| evidence.mappings.iter())
                 .all(|span| span.path.as_str() == "src/app.ts")
     }));
+}
+
+#[test]
+fn semantic_value_dependence_uses_typed_source_backed_occurrences() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file(
+            "src/app.ts",
+            "export function answer(input: number) { const value = input + 1; return value; }\n",
+        )
+        .build();
+    let workspace =
+        ExtensionWorkspace::open(ExtensionWorkspaceOptions::new(project.root())).unwrap();
+    let request = SemanticRelationRequest::new(
+        workspace.generation().clone(),
+        vec![SemanticSeed::Source {
+            span: SourceSpan {
+                path: NormalizedRelativePath::new("src/app.ts").unwrap(),
+                start_utf8_byte: 20,
+                end_utf8_byte: 20,
+            },
+        }],
+        SemanticRelationScope::Procedure,
+        vec![SemanticRelationKind::ValueDependence],
+        SemanticDirection::Outgoing,
+        ExtensionLimits::default().values().into(),
+    )
+    .unwrap();
+    let snapshot = workspace
+        .semantic_relations(request, &ExtensionCancellation::new())
+        .unwrap()
+        .value
+        .unwrap();
+    assert!(!snapshot.edges.is_empty());
+    assert!(
+        snapshot
+            .edges
+            .iter()
+            .all(|edge| edge.kind == SemanticRelationKind::ValueDependence)
+    );
+    assert!(
+        snapshot
+            .edges
+            .iter()
+            .any(|edge| matches!(edge.detail, SemanticRelationDetail::ValueDependence { .. }))
+    );
 }
 
 #[test]

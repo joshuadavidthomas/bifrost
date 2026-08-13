@@ -394,6 +394,9 @@ impl ExtensionWorkspace {
                 max_materialized_files: document.limits.max_materialized_files,
                 max_traversal_steps: document.limits.max_traversal_steps,
                 max_source_bytes: document.limits.max_source_bytes,
+                max_value_definitions: document.limits.max_candidate_nodes,
+                max_value_uses: document.limits.max_candidate_nodes,
+                max_value_dependence_edges: 1,
             };
             let request = SemanticRelationRequest::new(
                 self.generation().clone(),
