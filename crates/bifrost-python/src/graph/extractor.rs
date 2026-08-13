@@ -19,12 +19,13 @@ use crate::usage_index::{
     usage_matching_edges, usage_module_binding_timeline, usage_resolve_module_files,
     usage_scope_facts,
 };
+use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalBindingsSnapshot, LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 use brokk_bifrost_core::analyzer::usages::model::{ImportKind, UsageHit};
 use brokk_bifrost_core::analyzer::usages::{ImportEdge, ImportEdgeKind};
-use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile, Range};
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::text_utils::compute_line_starts;
@@ -187,20 +188,20 @@ pub fn scan_files_for_seeds(
         ) {
             return;
         }
-        let module_bindings = {
+        let raw_module_bindings = {
             let _scope =
                 brokk_bifrost_core::profiling::scope("python_graph::module_binding_timeline");
-            let raw_module_bindings = usage_module_binding_timeline(python, file, || {
+            usage_module_binding_timeline(python, file, || {
                 collect_module_binding_timeline(tree_ref.root_node(), source_str)
-            });
-            classify_module_binding_timeline(
-                python,
-                file,
-                raw_module_bindings.as_ref(),
-                seeds,
-                &edges,
-            )
+            })
         };
+        let module_bindings = classify_module_binding_timeline(
+            python,
+            file,
+            raw_module_bindings.as_ref(),
+            seeds,
+            &edges,
+        );
         let scoped_import_bindings = parse_python_import_bindings(source_str);
         let target_self_file = *file == target.source();
         let scope_facts = {
@@ -237,6 +238,7 @@ pub fn scan_files_for_seeds(
             edges: &edges,
             target_self_file,
             member_best_effort_unique: target_self_file && member_unique_in_target_file,
+            raw_module_bindings: raw_module_bindings.as_ref(),
             module_bindings: &module_bindings,
             scoped_import_bindings: &scoped_import_bindings,
             scope_facts: scope_facts.as_ref(),
@@ -336,6 +338,7 @@ pub struct ScanCtx<'a> {
     /// an un-inferrable `recv` unambiguously means the target). Cross-file
     /// untyped receivers stay conservative.
     member_best_effort_unique: bool,
+    raw_module_bindings: &'a ModuleBindingTimeline,
     module_bindings: &'a HashMap<String, Vec<ClassifiedModuleBindingEvent>>,
     scoped_import_bindings: &'a [PythonImportBinding],
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
@@ -1128,50 +1131,58 @@ fn module_binding_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) ->
         return None;
     }
 
-    let imported_module = imported_module_binding_fqn(ctx, root, node)?;
-    let mut written_module = imported_module.clone();
-    for attribute in &attributes[..attributes.len() - 1] {
-        let segment = slice(*attribute, ctx.source);
-        if segment.is_empty() {
-            return None;
+    for binding in imported_module_bindings(ctx, root, node) {
+        let mut written_module = binding.module.clone();
+        for attribute in attributes
+            [binding.consumed_attributes.min(attributes.len() - 1)..attributes.len() - 1]
+            .iter()
+        {
+            let segment = slice(*attribute, ctx.source);
+            if segment.is_empty() {
+                return None;
+            }
+            written_module.push('.');
+            written_module.push_str(segment);
         }
-        written_module.push('.');
-        written_module.push_str(segment);
-    }
-    if usage_resolve_module_files(ctx.python, ctx.file, &written_module)
-        .iter()
-        .any(|resolved| {
-            ctx.seeds
-                .contains(&(resolved.clone(), terminal_name.to_string()))
-        })
-    {
-        return Some(terminal);
-    }
+        if usage_resolve_module_files(ctx.python, ctx.file, &written_module)
+            .iter()
+            .any(|resolved| {
+                ctx.seeds
+                    .contains(&(resolved.clone(), terminal_name.to_string()))
+            })
+        {
+            return Some(terminal);
+        }
 
-    let mut written_fqn = imported_module;
-    for attribute in attributes {
-        let segment = slice(attribute, ctx.source);
-        if segment.is_empty() {
-            return None;
+        let mut written_fqn = binding.module;
+        for attribute in attributes.iter().skip(binding.consumed_attributes) {
+            let segment = slice(*attribute, ctx.source);
+            if segment.is_empty() {
+                return None;
+            }
+            written_fqn.push('.');
+            written_fqn.push_str(segment);
         }
-        written_fqn.push('.');
-        written_fqn.push_str(segment);
+        if resolve_fqn_candidates(ctx.python, &written_fqn, |name| {
+            ctx.graph.index.definitions(name).collect()
+        })
+        .into_iter()
+        .any(|candidate| &candidate == ctx.target)
+        {
+            return Some(terminal);
+        }
     }
-    resolve_fqn_candidates(ctx.python, &written_fqn, |name| {
-        ctx.graph.index.definitions(name).collect()
-    })
-    .into_iter()
-    .any(|candidate| &candidate == ctx.target)
-    .then_some(terminal)
+    None
 }
 
 fn imported_root_targets_module(ctx: &ScanCtx<'_>, root: Node<'_>, reference: Node<'_>) -> bool {
-    let Some(module_fqn) = imported_module_binding_fqn(ctx, root, reference) else {
-        return false;
-    };
-    usage_resolve_module_files(ctx.python, ctx.file, &module_fqn)
+    imported_module_bindings(ctx, root, reference)
         .into_iter()
-        .any(|resolved_file| &resolved_file == ctx.target_source)
+        .any(|binding| {
+            usage_resolve_module_files(ctx.python, ctx.file, &binding.module)
+                .into_iter()
+                .any(|resolved_file| &resolved_file == ctx.target_source)
+        })
 }
 
 fn module_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<Node<'a>> {
@@ -1179,27 +1190,29 @@ fn module_attribute_target_hit<'a>(node: Node<'a>, ctx: &ScanCtx<'_>) -> Option<
     if attributes.is_empty() {
         return None;
     }
-    let mut module_fqn = imported_module_binding_fqn(ctx, root, node)?;
-    for attribute in attributes {
-        let segment = slice(attribute, ctx.source);
-        if segment.is_empty() {
-            return None;
-        }
-        if module_fqn.ends_with('.') {
-            module_fqn.push_str(segment);
-        } else {
-            module_fqn.push('.');
-            module_fqn.push_str(segment);
-        }
-        let resolved = usage_resolve_module_files(ctx.python, ctx.file, &module_fqn);
-        if resolved.is_empty() {
-            return None;
-        }
-        if resolved
-            .iter()
-            .any(|resolved_file| resolved_file == ctx.target_source)
-        {
-            return Some(attribute);
+    for binding in imported_module_bindings(ctx, root, node) {
+        let mut module_fqn = binding.module;
+        for attribute in attributes.iter().skip(binding.consumed_attributes) {
+            let segment = slice(*attribute, ctx.source);
+            if segment.is_empty() {
+                return None;
+            }
+            if module_fqn.ends_with('.') {
+                module_fqn.push_str(segment);
+            } else {
+                module_fqn.push('.');
+                module_fqn.push_str(segment);
+            }
+            let resolved = usage_resolve_module_files(ctx.python, ctx.file, &module_fqn);
+            if resolved.is_empty() {
+                break;
+            }
+            if resolved
+                .iter()
+                .any(|resolved_file| resolved_file == ctx.target_source)
+            {
+                return Some(*attribute);
+            }
         }
     }
     None
@@ -1452,36 +1465,93 @@ fn attribute_chain<'a>(node: Node<'a>) -> Option<(Node<'a>, Vec<Node<'a>>)> {
     }
 }
 
-fn imported_module_binding_fqn(
+struct ImportedModuleBinding {
+    module: String,
+    consumed_attributes: usize,
+}
+
+fn imported_module_bindings(
     ctx: &ScanCtx<'_>,
     root: Node<'_>,
     reference: Node<'_>,
-) -> Option<String> {
+) -> Vec<ImportedModuleBinding> {
     let root_text = slice(root, ctx.source);
-    if root_text.is_empty() {
-        return None;
+    if root_text.is_empty() || import_root_shadowed(ctx, root_text, root, reference) {
+        return Vec::new();
     }
-    if import_root_shadowed(ctx, root_text, root, reference)
-        || !ctx.module_binding_targets_query(root_text, reference)
-    {
-        return None;
+
+    if let Some(binding) = ctx.scoped_import_bindings.iter().rev().find(|binding| {
+        binding.is_function_scoped()
+            && binding.start_byte <= reference.start_byte()
+            && binding.scope_start_byte <= reference.start_byte()
+            && reference.end_byte() <= binding.scope_end_byte
+            && binding.local_name == root_text
+    }) {
+        return if usage_resolve_module_files(ctx.python, ctx.file, &binding.qualified_name)
+            .is_empty()
+        {
+            Vec::new()
+        } else {
+            vec![ImportedModuleBinding {
+                module: binding.qualified_name.clone(),
+                consumed_attributes: binding.consumed_attributes,
+            }]
+        };
     }
-    let binder = ctx.python.import_binder_of(ctx.file);
-    let binding = binder.bindings.get(root_text)?;
-    match binding.kind {
-        ImportKind::Namespace => Some(binding.module_specifier.clone()),
-        ImportKind::Named => {
-            let imported = binding.imported_name.as_ref()?;
-            let candidate = if binding.module_specifier.ends_with('.') {
-                format!("{}{}", binding.module_specifier, imported)
-            } else {
-                format!("{}.{}", binding.module_specifier, imported)
-            };
-            (!usage_resolve_module_files(ctx.python, ctx.file, &candidate).is_empty())
-                .then_some(candidate)
-        }
-        _ => None,
-    }
+
+    let Some(events) = ctx.raw_module_bindings.get(root_text) else {
+        return Vec::new();
+    };
+    let cutoff = if reference_is_deferred_function_body(reference) {
+        usize::MAX
+    } else {
+        reference.start_byte()
+    };
+    let visible: Vec<_> = events
+        .iter()
+        .filter(|event| event.visible_from <= cutoff)
+        .collect();
+    let start = visible
+        .iter()
+        .rposition(|event| !event.conditional)
+        .unwrap_or(0);
+    let mut modules = visible[start..]
+        .iter()
+        .filter_map(|event| match &event.kind {
+            ModuleBindingEventKind::ImportModule {
+                module,
+                consumed_attributes,
+            } => Some(ImportedModuleBinding {
+                module: module.clone(),
+                consumed_attributes: *consumed_attributes,
+            }),
+            ModuleBindingEventKind::FromImport {
+                module,
+                imported_name,
+            } => {
+                let submodule = if module.ends_with('.') {
+                    format!("{module}{imported_name}")
+                } else {
+                    format!("{module}.{imported_name}")
+                };
+                (!usage_resolve_module_files(ctx.python, ctx.file, &submodule).is_empty())
+                    .then_some(ImportedModuleBinding {
+                        module: submodule,
+                        consumed_attributes: 0,
+                    })
+            }
+            ModuleBindingEventKind::Other => None,
+        })
+        .collect::<Vec<_>>();
+    modules.sort_by(|left, right| {
+        left.module
+            .cmp(&right.module)
+            .then_with(|| left.consumed_attributes.cmp(&right.consumed_attributes))
+    });
+    modules.dedup_by(|left, right| {
+        left.module == right.module && left.consumed_attributes == right.consumed_attributes
+    });
+    modules
 }
 
 fn import_root_shadowed(
@@ -1698,12 +1768,22 @@ fn collect_import_binding_events(
                 continue;
             };
             let module = slice(name, source).trim();
+            let consumed_attributes = if imported.child_by_field_name("alias").is_some() {
+                0
+            } else {
+                parse_symbol_path(Language::Python, module)
+                    .len()
+                    .saturating_sub(1)
+            };
             record_module_binding(
                 timeline,
                 slice(local, source),
                 node.end_byte(),
                 binding_is_conditional(node),
-                ModuleBindingEventKind::ImportModule(module.to_string()),
+                ModuleBindingEventKind::ImportModule {
+                    module: module.to_string(),
+                    consumed_attributes,
+                },
             );
         }
         return;
@@ -1761,7 +1841,7 @@ fn classify_module_binding_timeline(
             .iter()
             .map(|event| {
                 let kind = match &event.kind {
-                    ModuleBindingEventKind::ImportModule(module) => {
+                    ModuleBindingEventKind::ImportModule { module, .. } => {
                         if *module_targets
                             .entry(module.clone())
                             .or_insert_with(|| module_contains_seed(python, file, module, seeds))

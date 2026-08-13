@@ -1782,7 +1782,7 @@ fn python_visible_module_binding_candidates(
                     candidates.extend(resolved_candidates);
                 }
             }
-            ModuleBindingEventKind::ImportModule(module) => {
+            ModuleBindingEventKind::ImportModule { module, .. } => {
                 let bound_module = context
                     .namespace
                     .get(name)
