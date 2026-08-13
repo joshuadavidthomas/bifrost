@@ -111,17 +111,10 @@ fn typescript_local_schema_builder_call_materializes_object_shape() {
             });
         "#,
     )]);
-    let file = project.file("schema.ts");
-    let declarations = analyzer.declarations(&file);
-
-    assert!(declarations.contains(&CodeUnit::with_signature(
-        file,
-        CodeUnitType::Field,
-        "",
-        "schema.ts.LocalSchema.isEnabled",
-        None,
-        true,
-    )));
+    let field = definition(&analyzer, "LocalSchema.isEnabled");
+    assert_eq!(field.source(), &project.file("schema.ts"));
+    assert_eq!(field.kind(), CodeUnitType::Field);
+    assert!(field.is_synthetic());
 }
 
 #[test]
@@ -137,10 +130,7 @@ fn typescript_regex_initializer_included_in_variable_skeleton() {
     let skeletons = analyzer.get_skeletons(&file);
     assert_eq!(
         "const p = /x/",
-        skeletons
-            .get(&definition(&analyzer, "pattern.ts.p"))
-            .unwrap()
-            .trim()
+        skeletons.get(&definition(&analyzer, "p")).unwrap().trim()
     );
 }
 

@@ -206,7 +206,6 @@ dependencies = [
  "reedline",
  "regex",
  "rusqlite",
- "rustc-hash",
  "rustdoc-types",
  "semver",
  "serde",

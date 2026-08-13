@@ -650,7 +650,7 @@ pub fn parse_python_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
 
     collect_python_identifiers(root, source, &mut parsed.type_identifiers);
 
-    let module_code_unit = module_code_unit_from_fq(file, &module_name, module_fq.clone());
+    let module_code_unit = module_code_unit_from_fq(file, &module_components, module_fq.clone());
     if let Some(module) = module_code_unit.clone() {
         parsed.add_code_unit(module, root, source, None, None);
     }
@@ -689,22 +689,21 @@ pub fn module_code_unit(file: &ProjectFile, module_fq: &str) -> Option<CodeUnit>
         "module_code_unit must be built from the file's path-derived Python module name"
     );
     let structured_fq = python_module_fq_from_components(&components);
-    module_code_unit_from_fq(file, module_fq, structured_fq)
+    module_code_unit_from_fq(file, &components, structured_fq)
 }
 
 fn module_code_unit_from_fq(
     file: &ProjectFile,
-    module_fq: &str,
+    components: &[String],
     structured_fq: FqName,
 ) -> Option<CodeUnit> {
-    let mut components = module_fq.split('.').map(str::to_string).collect::<Vec<_>>();
-    let short_name = components.pop()?;
-    let package_name = components.join(".");
+    let (short_name, package_components) = components.split_last()?;
+    let package_name = package_components.join(".");
     Some(CodeUnit::new_fq(
         file.clone(),
         CodeUnitType::Module,
         package_name,
-        short_name,
+        short_name.clone(),
         structured_fq,
     ))
 }

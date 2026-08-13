@@ -9,7 +9,7 @@ use crate::common::InlineTestProject;
 use brokk_bifrost::searchtools::{
     DefinitionReferenceQuery, GetDefinitionParams, get_definitions_by_location,
 };
-use brokk_bifrost::usages::{ExplicitCandidateProvider, UsageFinder};
+use brokk_bifrost::usages::{ExplicitCandidateProvider, UsageFinder, UsageHitKind};
 use brokk_bifrost::{CodeUnitIndex, CodeUnitType, CppAnalyzer, Language};
 use std::sync::Arc;
 
@@ -372,13 +372,10 @@ int use() { return fact(5) + Counter().down(3); }
 }
 
 #[test]
-fn c_recursive_call_keeps_the_inverse_surface_of_the_usage_scan() {
+fn c_recursive_call_keeps_editor_and_external_usage_surfaces_distinct() {
     // The usage scan reads the same activation seam, so the recursive call now
-    // resolves to the function there too. A same-file recursive call still
-    // reaches no usage surface: `push_recursive_reference_hit` drops a site
-    // that stands inside the target's own declaration range, which for a
-    // definition-only function is its whole body. That drop is a separate seam
-    // from the activation point, and this fixture pins the surface it leaves.
+    // resolves to the function there too. The editor surface keeps this
+    // self-reference, while the external usage graph excludes it.
     let source = r#"static int fact(int n) {
     if (n <= 1) return 1;
     return n * fact(n - 1);
@@ -425,10 +422,11 @@ int use(void) { return fact(5); }
         "the ordinary call must be an inverse hit: {editor_hits:#?}"
     );
     assert!(
-        editor_hits
-            .iter()
-            .all(|hit| (hit.start_offset, hit.end_offset) != recursive_call),
-        "a same-file recursive call stays outside every usage surface: {editor_hits:#?}"
+        editor_hits.iter().any(|hit| {
+            (hit.start_offset, hit.end_offset) == recursive_call
+                && hit.kind == UsageHitKind::SelfReceiver
+        }),
+        "the recursive call must be an editor self-reference: {editor_hits:#?}"
     );
     assert!(
         result
