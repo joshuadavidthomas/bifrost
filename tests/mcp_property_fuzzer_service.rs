@@ -72,6 +72,7 @@ fn fuzzer_config(language: &str) -> FuzzerConfig {
         max_service_symbols: 1_000,
         max_scan_probes: 100,
         symbol_time_budget_ms: 0,
+        anomaly_percent: 0,
         symbol_filter: None,
         path_filter: None,
         shard: None,
