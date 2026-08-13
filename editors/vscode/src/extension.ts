@@ -34,13 +34,15 @@ import {
   workspaceGitignoreIncludesLegacyBifrostEntry
 } from "./lifecycle";
 import {
+  activatePreparedManagedBinary,
   findCompatibleManagedBinary,
   installManagedBinary,
   normalizeBinaryCompatibility,
   releaseAssetFor,
-  releaseTargetFor
+  releaseTargetFor,
+  selectManagedBinaryAndPreparePreferred
 } from "./provisioning";
-import type { BinaryCompatibility } from "./provisioning";
+import type { BinaryCompatibility, ManagedBinaryPreparation } from "./provisioning";
 import type {
   RqlQueryDocument,
   RqlQueryNavigationTarget,
@@ -85,6 +87,7 @@ let rqlDiagnostics: vscode.DiagnosticCollection | undefined;
 let rqlValidation: RqlValidationController<vscode.CancellationToken> | undefined;
 let lastLaunchConfig: BifrostLaunchConfig | undefined;
 let startInFlight: Promise<void> | undefined;
+let pendingManagedBinaryPreparation: ManagedBinaryPreparation | undefined;
 let extensionActive = false;
 const BIFROST_GITIGNORE_DECLINED_KEY_PREFIX = "bifrost.legacyGitignoreMigrationDeclined:";
 
@@ -455,6 +458,7 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
       startInFlight = undefined;
     }
   }
+  schedulePreparedManagedBinaryActivation(context);
 }
 
 async function startClientInner(context: vscode.ExtensionContext): Promise<void> {
@@ -481,7 +485,9 @@ async function startClientInner(context: vscode.ExtensionContext): Promise<void>
 
   let launchConfig: BifrostLaunchConfig;
   try {
-    const managedBinaryPath = await prepareManagedBinary(context, mode, command);
+    const managedBinary = await prepareManagedBinary(context, mode, command);
+    const managedBinaryPath = managedBinary?.selected.path ?? null;
+    pendingManagedBinaryPreparation = managedBinary?.preferredInstall ? managedBinary : undefined;
     launchConfig = buildLaunchConfig(
       root,
       context.extensionUri.fsPath,
@@ -891,7 +897,8 @@ async function resolveMcpConfig(context: vscode.ExtensionContext): Promise<Bifro
   const config = vscode.workspace.getConfiguration("bifrost");
   const command = config.get<string>("serverPath") || "bifrost";
   const mode = config.get<LaunchMode>("launchMode") || "auto";
-  const managedBinaryPath = await prepareManagedBinary(context, mode, command);
+  const managedBinary = await prepareManagedBinary(context, mode, command);
+  const managedBinaryPath = managedBinary?.selected.path ?? null;
   return buildMcpConfig(root, context.extensionUri.fsPath, mode, command, managedBinaryPath);
 }
 
@@ -905,7 +912,7 @@ async function prepareManagedBinary(
   context: vscode.ExtensionContext,
   mode: LaunchMode,
   configuredPath: string
-): Promise<string | null> {
+): Promise<ManagedBinaryPreparation | null> {
   const configured = configuredPath.trim();
   if (mode === "path" || (mode === "auto" && configured && configured !== "bifrost")) {
     return null;
@@ -926,7 +933,11 @@ async function prepareManagedBinary(
     return null;
   }
 
-  const managed = await findCompatibleManagedBinary(storageDir, compatibility);
+  const managed = await selectManagedBinaryAndPreparePreferred(
+    () => findCompatibleManagedBinary(storageDir, compatibility),
+    () => installManagedBinaryForContext(context, compatibility, archiveSha256),
+    log
+  );
   if (!managed) {
     const binaryPath = await promptAndInstallManagedBinary(
       context,
@@ -939,12 +950,45 @@ async function prepareManagedBinary(
         `Bifrost ${binaryVersion} is not installed for ${process.platform}-${process.arch}.`
       );
     }
-    return binaryPath;
+    return binaryPath
+      ? {
+          selected: {
+            path: binaryPath,
+            version: binaryVersion,
+            compatibilityMode: "exact"
+          },
+          preferredInstall: null
+        }
+      : null;
   }
-  if (managed.compatibilityMode === "compatible") {
-    log(`Using compatible managed Bifrost ${managed.version}; preferred ${binaryVersion}.`);
+  if (managed.selected.compatibilityMode === "compatible") {
+    log(
+      `Using compatible managed Bifrost ${managed.selected.version}; preferred ${binaryVersion}.`
+    );
   }
-  return managed.path;
+  return managed;
+}
+
+function schedulePreparedManagedBinaryActivation(context: vscode.ExtensionContext): void {
+  const preparation = pendingManagedBinaryPreparation;
+  pendingManagedBinaryPreparation = undefined;
+  if (!preparation) {
+    return;
+  }
+
+  void activatePreparedManagedBinary(
+    preparation,
+    (selectedPath) =>
+      extensionActive &&
+      client?.state === State.Running &&
+      lastLaunchConfig?.command === selectedPath,
+    async (preferredPath) => {
+      log(`Preferred managed Bifrost is ready at ${preferredPath}; restarting language server.`);
+      await restartClient(context);
+    }
+  ).catch((error: unknown) => {
+    log(`Preferred managed Bifrost activation failed: ${formatError(error)}`);
+  });
 }
 
 async function promptAndInstallManagedBinary(

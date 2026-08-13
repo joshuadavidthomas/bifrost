@@ -201,6 +201,131 @@ void test("selects exact then newest compatible managed binaries", async () => {
   assert.equal(newest?.compatibilityMode, "compatible");
 });
 
+void test("starts a compatible binary while preparing and activating the preferred binary", async () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
+  const fallbackPath = provisioning.managedBinaryPath(temp, "0.9.1", "linux", "x64");
+  fs.mkdirSync(path.dirname(fallbackPath), { recursive: true });
+  fs.writeFileSync(fallbackPath, "0.9.1");
+  let finishInstall: ((path: string) => void) | undefined;
+  const install = new Promise<string>((resolve) => {
+    finishInstall = resolve;
+  });
+  let installStarted = false;
+  const preparation = await provisioning.selectManagedBinaryAndPreparePreferred(
+    () =>
+      provisioning.findCompatibleManagedBinary(
+        temp,
+        { binaryVersion: "0.9.4", minimumBinaryVersion: "0.9.0", allowPrerelease: false },
+        "linux",
+        "x64",
+        (binary) => Promise.resolve({ version: fs.readFileSync(binary, "utf8"), rawOutput: "" })
+      ),
+    () => {
+      installStarted = true;
+      return install;
+    },
+    () => undefined
+  );
+
+  assert.equal(preparation?.selected.path, fallbackPath);
+  assert.equal(preparation?.selected.version, "0.9.1");
+  assert.ok(preparation);
+  assert.equal(installStarted, true);
+
+  const activations: string[] = [];
+  const activation = provisioning.activatePreparedManagedBinary(
+    preparation,
+    (selectedPath) => selectedPath === fallbackPath,
+    (preferredPath) => {
+      activations.push(preferredPath);
+      return Promise.resolve();
+    }
+  );
+  finishInstall!("/managed/0.9.4/bifrost");
+
+  assert.equal(await activation, true);
+  assert.deepEqual(activations, ["/managed/0.9.4/bifrost"]);
+});
+
+void test("does not prepare the preferred binary when the exact binary is selected", async () => {
+  let installStarted = false;
+  const preparation = await provisioning.selectManagedBinaryAndPreparePreferred(
+    () =>
+      Promise.resolve({
+        path: "/managed/0.9.4/bifrost",
+        version: "0.9.4",
+        compatibilityMode: "exact"
+      }),
+    () => {
+      installStarted = true;
+      return Promise.resolve("/managed/0.9.4/bifrost");
+    },
+    () => undefined
+  );
+
+  assert.equal(preparation?.selected.version, "0.9.4");
+  assert.equal(preparation?.preferredInstall, null);
+  assert.equal(installStarted, false);
+});
+
+void test("keeps the compatible binary active when preferred preparation fails", async () => {
+  const messages: string[] = [];
+  const preparation = await provisioning.selectManagedBinaryAndPreparePreferred(
+    () =>
+      Promise.resolve({
+        path: "/managed/0.9.1/bifrost",
+        version: "0.9.1",
+        compatibilityMode: "compatible"
+      }),
+    () => Promise.reject(new Error("release unavailable")),
+    (message) => messages.push(message)
+  );
+  let activated = false;
+  assert.ok(preparation);
+
+  assert.equal(
+    await provisioning.activatePreparedManagedBinary(
+      preparation,
+      () => true,
+      () => {
+        activated = true;
+        return Promise.resolve();
+      }
+    ),
+    false
+  );
+  assert.equal(activated, false);
+  assert.deepEqual(messages, ["Preferred managed Bifrost preparation failed: release unavailable"]);
+});
+
+void test("does not replace a server that moved on before preferred preparation completed", async () => {
+  const preparation = await provisioning.selectManagedBinaryAndPreparePreferred(
+    () =>
+      Promise.resolve({
+        path: "/managed/0.9.1/bifrost",
+        version: "0.9.1",
+        compatibilityMode: "compatible"
+      }),
+    () => Promise.resolve("/managed/0.9.4/bifrost"),
+    () => undefined
+  );
+  let activated = false;
+  assert.ok(preparation);
+
+  assert.equal(
+    await provisioning.activatePreparedManagedBinary(
+      preparation,
+      () => false,
+      () => {
+        activated = true;
+        return Promise.resolve();
+      }
+    ),
+    false
+  );
+  assert.equal(activated, false);
+});
+
 void test("skips mislabeled, prerelease, and cross-minor managed binaries", async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-vscode-test-"));
   const reported = new Map([
