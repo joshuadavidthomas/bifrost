@@ -1,5 +1,5 @@
 use crate::graph::ast::{
-    declared_names, is_definition_identifier, parameter_names, selector_parts,
+    declared_names, for_each_var_spec, is_definition_identifier, parameter_names, selector_parts,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
@@ -268,12 +268,16 @@ fn seed_go_bindings_before(
 
     match node.kind() {
         "import_declaration" => return,
-        "function_declaration" | "method_declaration" => {
+        "func_literal" | "function_declaration" | "method_declaration" => {
             if !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte()) {
                 return;
             }
             locals.enter_scope();
-            seed_go_parameters_before(node, source, cutoff_start, locals);
+            if node.child_by_field_name("body").is_some_and(|body| {
+                body.start_byte() <= cutoff_start && cutoff_start < body.end_byte()
+            }) {
+                seed_go_parameters(node, source, locals);
+            }
             seed_go_children_before(
                 node,
                 source,
@@ -301,13 +305,8 @@ fn seed_go_bindings_before(
             locals.exit_scope();
             return;
         }
-        "parameter_declaration" if node.start_byte() < cutoff_start => {
-            for parameter in parameter_names(node, source) {
-                locals.declare_shadow(parameter);
-            }
-        }
-        "var_declaration" | "short_var_declaration"
-            if node.start_byte() < cutoff_start && !go_is_top_level_decl(node) =>
+        "short_var_declaration"
+            if node.end_byte() <= cutoff_start && !go_is_top_level_decl(node) =>
         {
             // A *package-level* `var` is the declaration a reference resolves TO,
             // not a local shadow — only function/block-scoped `var`/`:=` bindings
@@ -316,6 +315,18 @@ fn seed_go_bindings_before(
             for declared in declared_names(node, source) {
                 locals.declare_shadow(declared);
             }
+        }
+        "var_declaration" if !go_is_top_level_decl(node) => {
+            // A VarSpec's names begin after that spec. In a grouped declaration,
+            // an earlier completed spec is visible to later initializers, while a
+            // spec never shadows its own initializer.
+            for_each_var_spec(node, &mut |spec| {
+                if spec.end_byte() <= cutoff_start {
+                    for declared in declared_names(spec, source) {
+                        locals.declare_shadow(declared);
+                    }
+                }
+            });
         }
         "selector_expression" | "qualified_type" => {
             if selector_is_lookup_target(node, source, cutoff_start) {
@@ -344,21 +355,18 @@ fn seed_go_bindings_before(
     );
 }
 
-fn seed_go_parameters_before(
-    node: Node<'_>,
-    source: &str,
-    cutoff_start: usize,
-    locals: &mut LocalInferenceEngine<String>,
-) {
+fn seed_go_parameters(node: Node<'_>, source: &str, locals: &mut LocalInferenceEngine<String>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if child.kind() != "parameter_list" || child.start_byte() >= cutoff_start {
+        if child.kind() != "parameter_list" {
             continue;
         }
         let mut params = child.walk();
         for parameter in child.named_children(&mut params) {
-            if parameter.kind() == "parameter_declaration" && parameter.start_byte() < cutoff_start
-            {
+            if matches!(
+                parameter.kind(),
+                "parameter_declaration" | "variadic_parameter_declaration"
+            ) {
                 for name in parameter_names(parameter, source) {
                     locals.declare_shadow(name);
                 }
